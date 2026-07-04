@@ -33,11 +33,31 @@ use crate::bridge::{BridgedToolInfo, DescribeRequest, DescribeResponse};
 /// readers clone only a pointer.
 pub type SharedCatalog = Arc<RwLock<Arc<DescribeResponse>>>;
 
-/// Build the describe catalog from the lowered tools.
-pub fn build_catalog(lowered: &[LoweredTool]) -> DescribeResponse {
-    DescribeResponse {
-        tools: lowered.iter().map(to_bridged_tool_info).collect(),
-    }
+/// A tool's stored JSON-schema string failed to parse while building the
+/// describe catalog. Surfaced rather than silently downgraded to a permissive
+/// `{}` schema (which would let malformed input pass the demand side's
+/// pre-flight validation). In practice this never fires — the schema string is
+/// produced by serializing a `serde_json::Value` in the lowering — so a failure
+/// signals real corruption worth reporting, not masking.
+#[derive(Debug, thiserror::Error)]
+#[error("bridged tool {tool:?} has a malformed {field} schema: {reason}")]
+pub struct CatalogError {
+    /// The tool whose schema failed to parse.
+    pub tool: String,
+    /// Which schema (`input` / `output`).
+    pub field: &'static str,
+    /// The underlying parse error.
+    pub reason: String,
+}
+
+/// Build the describe catalog from the lowered tools. Fails if any tool's
+/// stored schema string does not parse (see [`CatalogError`]).
+pub fn build_catalog(lowered: &[LoweredTool]) -> Result<DescribeResponse, CatalogError> {
+    let tools = lowered
+        .iter()
+        .map(to_bridged_tool_info)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DescribeResponse { tools })
 }
 
 /// Wrap a [`DescribeResponse`] as a fresh [`SharedCatalog`].
@@ -50,24 +70,34 @@ pub fn shared_catalog(response: DescribeResponse) -> SharedCatalog {
 /// off the `tool::<id>::<field>` metadata the same lowering produced. A missing
 /// classification defaults to empty, which the demand side reads as `unknown`
 /// (the spicy default) — never a bypass.
-fn to_bridged_tool_info(lt: &LoweredTool) -> BridgedToolInfo {
+fn to_bridged_tool_info(lt: &LoweredTool) -> Result<BridgedToolInfo, CatalogError> {
     let d = &lt.descriptor;
     let id = &d.tool_id;
     let meta = |key: String| lt.bridge_metadata.get(&key).cloned().unwrap_or_default();
 
     // The lowering stores schemas as JSON strings; parse them back to objects
-    // so the demand side gets structured schemas without re-parsing strings.
-    let input_schema = d
-        .input_schema
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let output_schema = d
-        .output_schema
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    // so the demand side gets structured schemas. A parse failure is
+    // propagated, never downgraded to a permissive `{}` — a malformed input
+    // schema must not silently become "accepts anything" on the demand side.
+    // A missing input schema is a no-argument tool and lowers to `{}`.
+    let input_schema = match d.input_schema.as_deref() {
+        Some(s) => serde_json::from_str(s).map_err(|e| CatalogError {
+            tool: id.clone(),
+            field: "input",
+            reason: e.to_string(),
+        })?,
+        None => serde_json::json!({}),
+    };
+    let output_schema = match d.output_schema.as_deref() {
+        Some(s) => Some(serde_json::from_str(s).map_err(|e| CatalogError {
+            tool: id.clone(),
+            field: "output",
+            reason: e.to_string(),
+        })?),
+        None => None,
+    };
 
-    BridgedToolInfo {
+    Ok(BridgedToolInfo {
         tool_id: id.clone(),
         name: d.name.clone(),
         description: d.description.clone(),
@@ -79,7 +109,7 @@ fn to_bridged_tool_info(lt: &LoweredTool) -> BridgedToolInfo {
         substitutability: meta(substitutability_key(id)),
         visibility: meta(visibility_key(id)),
         invocation_scope: meta(invocation_scope_key(id)),
-    }
+    })
 }
 
 /// Serves [`bridge::DESCRIBE_SERVICE`](crate::bridge::DESCRIBE_SERVICE): returns
@@ -183,7 +213,8 @@ mod tests {
         let catalog = build_catalog(&[
             lowered("echo", CredentialStatus::None),
             lowered("secret", CredentialStatus::Credentialed),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(catalog.tools.len(), 2);
         let echo = catalog.tools.iter().find(|t| t.tool_id == "echo").unwrap();
         assert_eq!(echo.credential_status, "none");
@@ -204,7 +235,8 @@ mod tests {
         let catalog = build_catalog(&[
             lowered("echo", CredentialStatus::None),
             lowered("add", CredentialStatus::None),
-        ]);
+        ])
+        .unwrap();
         let bytes = render(&DescribeRequest::default(), &catalog).unwrap();
         let resp: DescribeResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(resp.tools.len(), 2);
@@ -215,7 +247,8 @@ mod tests {
         let catalog = build_catalog(&[
             lowered("echo", CredentialStatus::None),
             lowered("add", CredentialStatus::None),
-        ]);
+        ])
+        .unwrap();
         let req = DescribeRequest {
             tool_id: Some("add".to_string()),
         };
@@ -227,12 +260,23 @@ mod tests {
 
     #[test]
     fn render_filter_miss_yields_empty() {
-        let catalog = build_catalog(&[lowered("echo", CredentialStatus::None)]);
+        let catalog = build_catalog(&[lowered("echo", CredentialStatus::None)]).unwrap();
         let req = DescribeRequest {
             tool_id: Some("nope".to_string()),
         };
         let bytes = render(&req, &catalog).unwrap();
         let resp: DescribeResponse = serde_json::from_slice(&bytes).unwrap();
         assert!(resp.tools.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_schema_string_fails_the_build_instead_of_masking() {
+        // A corrupt stored schema must surface as a build error, not silently
+        // become a permissive `{}` that would weaken demand-side validation.
+        let mut lt = lowered("echo", CredentialStatus::None);
+        lt.descriptor.input_schema = Some("{ not valid json".to_string());
+        let err = build_catalog(&[lt]).unwrap_err();
+        assert_eq!(err.tool, "echo");
+        assert_eq!(err.field, "input");
     }
 }

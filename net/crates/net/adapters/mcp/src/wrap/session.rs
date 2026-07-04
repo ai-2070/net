@@ -53,6 +53,10 @@ pub enum WrapError {
         /// not part of this crate's surface).
         reason: String,
     },
+    /// A wrapped tool's stored schema could not be parsed while building the
+    /// describe catalog.
+    #[error("describe catalog build failed: {0}")]
+    Catalog(#[from] super::catalog::CatalogError),
 }
 
 /// What a [`WrapSession::refresh`] changed.
@@ -139,7 +143,7 @@ impl WrapSession {
         // Refresh the describe catalog so demand-side describes see the new
         // schemas/status. The describe service keeps serving; only its data
         // swaps ("always up-to-date types" for the describe path too).
-        *self.describe_catalog.write().await = std::sync::Arc::new(build_catalog(&lowered));
+        *self.describe_catalog.write().await = std::sync::Arc::new(build_catalog(&lowered)?);
 
         // Serve tools that appeared.
         let mut added = Vec::new();
@@ -293,7 +297,7 @@ pub async fn wrap_server(
     // Serve the describe service so demand-side gateways can read the bridged
     // tools' full descriptors (schema + credential status). Owner-scoped like
     // invoke — describe is visibility. If it fails, roll back the announcement.
-    let describe_catalog = shared_catalog(build_catalog(&lowered));
+    let describe_catalog = shared_catalog(build_catalog(&lowered)?);
     let describe_handle = match mesh.serve_rpc(
         DESCRIBE_SERVICE,
         Arc::new(DescribeHandler::new(
