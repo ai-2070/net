@@ -19,8 +19,8 @@ use std::time::Duration;
 use net_mcp::bridge::BRIDGE_PROVIDER_TAG;
 use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError};
 use net_mcp::serve::MeshGateway;
-use net_mcp::spec::Implementation;
-use net_mcp::wrap::{wrap_server, OwnerScope, WrapConfig};
+use net_mcp::spec::{CallToolResult, Implementation};
+use net_mcp::wrap::{wrap_server, CredentialOverride, OwnerScope, Substitutability, WrapConfig};
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use serde_json::json;
@@ -191,4 +191,142 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
 
     drop(session);
     host.shutdown().await.ok();
+}
+
+/// One-way connect `caller` → `host` (accept + connect), without starting the
+/// receive loops — the caller starts once after connecting to every host.
+async fn connect(caller: &Mesh, host: &Mesh) {
+    let pub_h = *host.inner().public_key();
+    let nid_h = host.inner().node_id();
+    let nid_c = caller.inner().node_id();
+    let addr_h = host.inner().local_addr();
+    let (r1, r2) = tokio::join!(host.inner().accept(nid_c), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.inner().connect(addr_h, &pub_h, nid_h).await
+    });
+    r1.expect("accept");
+    r2.expect("connect");
+}
+
+/// A substitutable, uncredentialed wrap config — the two conditions the demand
+/// side requires to collapse a capability across providers and fail over.
+fn substitutable_config(owner_origin: u64) -> WrapConfig {
+    let mut config = WrapConfig::owner_only(client_info(), owner_origin);
+    config.substitutability = Substitutability::ProviderEquivalent;
+    config.credential_override = CredentialOverride::NoCredentials;
+    config.force = true;
+    config
+}
+
+/// Invoke with a short retry — the first cross-node call to a provider can lose
+/// its reply to the reply-channel race even after the gateway's own retries.
+async fn invoke_retry(gateway: &MeshGateway, id: &CapabilityId, message: &str) -> CallToolResult {
+    for _ in 0..6 {
+        if let Ok(result) = gateway.invoke(id, json!({ "message": message })).await {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    panic!("invoke never succeeded for {}", id.display());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invoke_fails_over_when_the_primary_provider_goes_down() {
+    let psk = [0x53u8; 32];
+    let caller = Arc::new(build_mesh(&psk).await);
+    let host_a = build_mesh(&psk).await;
+    let host_b = build_mesh(&psk).await;
+
+    // Caller connects to both providers (hub), then everyone starts.
+    connect(&caller, &host_a).await;
+    connect(&caller, &host_b).await;
+    caller.inner().start();
+    host_a.inner().start();
+    host_b.inner().start();
+
+    let id_a = host_a.inner().node_id();
+    let id_b = host_b.inner().node_id();
+
+    // Wrap the same fixture on both hosts as a substitutable, uncredentialed
+    // tool so the demand side collapses them and can fail over.
+    let session_a = wrap_server(
+        &host_a,
+        FIXTURE,
+        &[],
+        &[],
+        substitutable_config(caller.origin_hash()),
+    )
+    .await
+    .expect("wrap on host a");
+    let session_b = wrap_server(
+        &host_b,
+        FIXTURE,
+        &[],
+        &[],
+        substitutable_config(caller.origin_hash()),
+    )
+    .await
+    .expect("wrap on host b");
+
+    // The caller discovers echo on BOTH providers.
+    assert!(
+        wait_until(
+            || {
+                let nodes = caller.find_nodes(&CapabilityFilter::new().require_tag("echo"));
+                nodes.contains(&id_a) && nodes.contains(&id_b)
+            },
+            Duration::from_secs(5),
+        )
+        .await,
+        "echo discovered on both providers",
+    );
+
+    let gateway = MeshGateway::new(Arc::clone(&caller));
+
+    // Search collapses the two providers into ONE logical capability.
+    let mut summaries = Vec::new();
+    for _ in 0..5 {
+        summaries = gateway.search("echo").await.expect("search");
+        if summaries
+            .iter()
+            .any(|s| s.id.capability == "echo" && s.providers.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let echo = summaries
+        .iter()
+        .find(|s| s.id.capability == "echo")
+        .expect("echo group discovered");
+    assert_eq!(
+        echo.providers.len(),
+        2,
+        "collapsed group: {:?}",
+        echo.providers
+    );
+    // Providers are sorted; the id points at the primary (lowest node id).
+    let primary = echo.providers[0];
+    assert_eq!(echo.id.provider, primary.to_string());
+    let id = CapabilityId::new(primary.to_string(), "echo");
+
+    // Invoke succeeds via the primary.
+    let before = invoke_retry(&gateway, &id, "before").await;
+    assert!(!before.is_error, "{before:?}");
+    assert_eq!(before.text(), "before");
+
+    // Kill the primary provider mid-session.
+    if primary == id_a {
+        drop(session_a);
+        host_a.shutdown().await.ok();
+    } else {
+        drop(session_b);
+        host_b.shutdown().await.ok();
+    }
+
+    // Invoke again — the primary is gone, so it transparently fails over to the
+    // surviving provider. The model never sees the failure.
+    let after = invoke_retry(&gateway, &id, "after").await;
+    assert!(!after.is_error, "failover invoke should succeed: {after:?}");
+    assert_eq!(after.text(), "after");
 }
