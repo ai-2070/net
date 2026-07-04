@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +40,11 @@ use crate::spec::{
 /// approval and emit `tools/list_changed`. Interactive-paced; overridable in
 /// tests via [`Shim::with_pin_poll_interval`].
 const DEFAULT_PIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Max approved pins described concurrently when building the promoted-tool
+/// list, so a `tools/list` bounds its latency to the slowest single describe
+/// rather than the sum (mirrors the gateway's own search fan-out).
+const MAX_CONCURRENT_PIN_DESCRIBES: usize = 8;
 
 /// The demand-side shim: a stdio MCP server exposing the mesh's capabilities
 /// as meta-tools, backed by a [`CapabilityGateway`].
@@ -311,14 +317,21 @@ impl<G: CapabilityGateway> Shim<G> {
     /// The approved-pinned capabilities, each as a first-class typed tool named
     /// by its host-safe name with its real input schema. A pin whose provider
     /// is currently unreachable is skipped rather than listed without a schema.
+    ///
+    /// The describes run with **bounded concurrency**, not serially: a pin whose
+    /// provider is down can burn the gateway's full retry budget, and doing them
+    /// one at a time would block the single-threaded serve loop (including the
+    /// pin-store poll) for the *sum* of those timeouts on every `tools/list`.
+    /// `buffered` (not `buffer_unordered`) preserves the deterministic
+    /// [`assign_pinned_tool_names`] order.
     async fn promoted_pinned_tools(&self) -> Vec<crate::spec::Tool> {
         let Some(store) = self.load_pins().await else {
             return Vec::new();
         };
-        let mut tools = Vec::new();
-        for (id, name) in assign_pinned_tool_names(&store.approved()) {
-            if let Ok(detail) = self.gateway.describe(&id).await {
-                tools.push(crate::spec::Tool {
+        stream::iter(assign_pinned_tool_names(&store.approved()))
+            .map(|(id, name)| async move {
+                let detail = self.gateway.describe(&id).await.ok()?;
+                Some(crate::spec::Tool {
                     name,
                     title: Some(id.display()),
                     description: detail
@@ -326,10 +339,12 @@ impl<G: CapabilityGateway> Shim<G> {
                         .or_else(|| Some(format!("Pinned capability {}", id.display()))),
                     input_schema: detail.input_schema,
                     output_schema: detail.output_schema,
-                });
-            }
-        }
-        tools
+                })
+            })
+            .buffered(MAX_CONCURRENT_PIN_DESCRIBES)
+            .filter_map(|tool| async move { tool })
+            .collect()
+            .await
     }
 
     /// Resolve a called first-class tool name to the approved-pinned capability
@@ -1425,6 +1440,35 @@ mod tests {
             "pinned first-class tool runs: {invoked:?}"
         );
         assert!(invoked.text().contains("invoked nodeb/secret"));
+    }
+
+    #[tokio::test]
+    async fn multiple_pins_are_all_promoted() {
+        // F4: promoted_pinned_tools describes pins with bounded concurrency;
+        // every approved pin must still appear (none dropped by the fan-out).
+        let (_dir, path) = pin_path();
+        {
+            let mut store = PinStore::load(&path).await.unwrap();
+            store.approve(&CapabilityId::parse("nodeb/echo").unwrap());
+            store.approve(&CapabilityId::parse("nodeb/secret").unwrap());
+            store.save().await.unwrap();
+        }
+        let out = run_pinned(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            path,
+            &[req(1, method::TOOLS_LIST, json!({}))],
+        )
+        .await;
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        // 5 meta-tools + the 2 promoted pins.
+        assert_eq!(tools.len(), 7, "{tools:?}");
+        let titles: Vec<&str> = tools.iter().filter_map(|t| t["title"].as_str()).collect();
+        assert!(titles.contains(&"nodeb/echo"), "echo promoted: {titles:?}");
+        assert!(
+            titles.contains(&"nodeb/secret"),
+            "secret promoted: {titles:?}"
+        );
     }
 
     #[tokio::test]
