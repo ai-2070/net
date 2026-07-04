@@ -159,12 +159,12 @@ async fn run_serve(
     // Serve until the host closes stdin (EOF) or the operator hits Ctrl-C.
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    tokio::select! {
-        r = shim.serve(reader, writer) => {
-            r.map_err(|e| generic(format!("mcp serve loop: {e}")))?;
-        }
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    // Capture the outcome, then run cleanup *unconditionally* — a serve-loop
+    // error must not skip the graceful mesh shutdown via an early `?`.
+    let serve_result = tokio::select! {
+        r = shim.serve(reader, writer) => r,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
 
     // Reclaim the mesh — the shim + gateway held the other `Arc` and are now
     // dropped — and shut it down. If a stray reference lingers, fall back to a
@@ -172,6 +172,8 @@ async fn run_serve(
     if let Ok(mesh) = Arc::try_unwrap(mesh) {
         mesh.shutdown().await.ok();
     }
+
+    serve_result.map_err(|e| generic(format!("mcp serve loop: {e}")))?;
     Ok(())
 }
 
