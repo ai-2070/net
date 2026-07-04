@@ -16,7 +16,6 @@
 //! `AsyncBufRead` / `AsyncWrite`, so tests drive it over an in-memory pipe and
 //! the CLI drives it over real stdio.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
