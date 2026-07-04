@@ -403,7 +403,7 @@ mod tests {
     fn initialize_params_carry_the_pinned_protocol_version() {
         let p = InitializeParams::new(Implementation {
             name: "net".into(),
-            version: SERVER_VERSION.into(),
+            version: SERVER_VERSION0.31 .0.into(),
         });
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
