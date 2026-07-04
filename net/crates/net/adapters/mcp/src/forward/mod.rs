@@ -88,7 +88,7 @@ pub use header::{
 };
 pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
-    ProviderScope, SecretPolicy, SendGrant,
+    PolicyError, ProviderScope, SecretPolicy, SendGrant,
 };
 pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
 pub use assemble::{AssembleError, ForwardedContextBuilder};

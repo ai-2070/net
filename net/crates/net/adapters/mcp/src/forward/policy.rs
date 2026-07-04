@@ -56,6 +56,16 @@ pub struct SecretPolicy {
     /// Optional audit-legibility label (`purpose: github-api`). No enforcement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// Whether a `cookie` / `set-cookie` header was explicitly acknowledged at
+    /// write time (the `--force`). Required for cookie secrets — validated on
+    /// load and at decision time — so a hand-edited config can't quietly enable
+    /// cookie forwarding. Ignored for non-cookie headers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_cookie: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Policy for one non-secret (plain) header.
@@ -64,6 +74,96 @@ pub struct SecretPolicy {
 pub struct PlainHeaderPolicy {
     /// Where and to what this header may be sent. Empty (the default) = never.
     pub allow: AllowList,
+}
+
+/// Why a persisted or in-memory policy entry is invalid — the rules the
+/// write-time mutators enforce, factored out so a loaded config can be
+/// revalidated against exactly the same checks (see the store's `load`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyError {
+    /// The configured wire header is not a valid header name.
+    #[error("header {name:?} is not a valid header name")]
+    InvalidHeader {
+        /// The offending header string.
+        name: String,
+    },
+    /// The configured header is hop-by-hop and can never be forwarded.
+    #[error("header {name:?} is hop-by-hop and cannot be forwarded")]
+    HopByHop {
+        /// The offending header name.
+        name: String,
+    },
+    /// A cookie secret was configured without the recorded acknowledgement.
+    #[error("secret header {name:?} needs the explicit cookie acknowledgement")]
+    CookieNotAcknowledged {
+        /// The offending header name.
+        name: String,
+    },
+    /// A secret was bound to *any* provider — secrets must name specific ones.
+    #[error(
+        "secret ref {ref_name:?} allows any provider; secrets must be bound to specific providers"
+    )]
+    SecretProviderAny {
+        /// The offending ref.
+        ref_name: String,
+    },
+    /// A security-sensitive header was configured as a plain (non-secret) one.
+    #[error("header {name:?} is security-sensitive and cannot be a plain header; use a secret")]
+    SensitiveAsPlain {
+        /// The offending header name.
+        name: String,
+    },
+}
+
+impl SecretPolicy {
+    /// Validate this secret policy against the forwarding rules: the header
+    /// must be a valid, non-hop-by-hop name; a cookie header requires the
+    /// acknowledgement; and the provider scope must name specific providers,
+    /// never [`ProviderScope::Any`] (a credential to "any" destination is
+    /// almost always an exfiltration hole). Applied at write time, on load, and
+    /// defensively at decision time.
+    pub fn validate(&self, ref_name: &str) -> Result<(), PolicyError> {
+        let header = HeaderName::parse(&self.header).map_err(|_| PolicyError::InvalidHeader {
+            name: self.header.clone(),
+        })?;
+        if !header.is_forwardable() {
+            return Err(PolicyError::HopByHop {
+                name: header.as_str().to_string(),
+            });
+        }
+        if matches!(header.as_str(), "cookie" | "set-cookie") && !self.allow_cookie {
+            return Err(PolicyError::CookieNotAcknowledged {
+                name: header.as_str().to_string(),
+            });
+        }
+        if matches!(self.allow.providers, ProviderScope::Any) {
+            return Err(PolicyError::SecretProviderAny {
+                ref_name: ref_name.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PlainHeaderPolicy {
+    /// Validate this plain-header policy: the header must be end-to-end
+    /// (not hop-by-hop) and non-credential (not security-sensitive).
+    pub fn validate(&self, name: &str) -> Result<(), PolicyError> {
+        let header = HeaderName::parse(name).map_err(|_| PolicyError::InvalidHeader {
+            name: name.to_string(),
+        })?;
+        if !header.is_forwardable() {
+            return Err(PolicyError::HopByHop {
+                name: header.as_str().to_string(),
+            });
+        }
+        if header.is_security_sensitive() {
+            return Err(PolicyError::SensitiveAsPlain {
+                name: header.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A destination-and-capability allowlist. Both dimensions must match for a
@@ -237,11 +337,21 @@ impl ForwardingConfig {
             return Err(DenialLevel::Global);
         }
         let policy = self.secrets.get(secret_ref).ok_or(DenialLevel::PerHeader)?;
+        // A secret must be bound to specific providers — never "any" (a
+        // credential to any destination is an exfiltration hole). Defense in
+        // depth: the store rejects such a config at write and load time.
+        if matches!(policy.allow.providers, ProviderScope::Any) {
+            return Err(DenialLevel::PerIdentity);
+        }
         policy.allow.permits(provider, capability)?;
         // A misconfigured non-forwardable header (hop-by-hop) or an unparseable
         // one denies at the header level rather than injecting something unsafe.
         let header = HeaderName::parse(&policy.header).map_err(|_| DenialLevel::PerHeader)?;
         if !header.is_forwardable() {
+            return Err(DenialLevel::PerHeader);
+        }
+        // Cookie secrets require the recorded acknowledgement (see `allow_cookie`).
+        if matches!(header.as_str(), "cookie" | "set-cookie") && !policy.allow_cookie {
             return Err(DenialLevel::PerHeader);
         }
         Ok(SendGrant {
@@ -574,6 +684,93 @@ mod tests {
             cfg.decide_secret("t", "node-1", "github.issues"),
             Err(DenialLevel::PerCapability),
         );
+    }
+
+    #[test]
+    fn secret_to_any_provider_is_denied() {
+        // A secret bound to "any" provider is an exfiltration hole — denied at
+        // decision time regardless of capability match.
+        let cfg = cfg_json(serde_json::json!({
+            "enabled": true,
+            "secrets": {
+                "t": { "header": "Authorization",
+                       "allow": { "providers": "any", "capabilities": ["*"] } }
+            }
+        }));
+        assert_eq!(
+            cfg.decide_secret("t", "any-node", "any.cap"),
+            Err(DenialLevel::PerIdentity),
+        );
+    }
+
+    #[test]
+    fn cookie_secret_requires_acknowledgement() {
+        // Without allow_cookie a cookie secret is denied even on a full match.
+        let denied = cfg_json(serde_json::json!({
+            "enabled": true,
+            "secrets": {
+                "sess": { "header": "Cookie",
+                          "allow": { "providers": ["n"], "capabilities": ["*"] } }
+            }
+        }));
+        assert_eq!(denied.decide_secret("sess", "n", "x"), Err(DenialLevel::PerHeader));
+
+        // With the acknowledgement recorded, it is allowed.
+        let allowed = cfg_json(serde_json::json!({
+            "enabled": true,
+            "secrets": {
+                "sess": { "header": "Cookie", "allow_cookie": true,
+                          "allow": { "providers": ["n"], "capabilities": ["*"] } }
+            }
+        }));
+        assert!(allowed.decide_secret("sess", "n", "x").is_ok());
+    }
+
+    #[test]
+    fn secret_policy_validate_enforces_the_rules() {
+        let ok: SecretPolicy = serde_json::from_value(serde_json::json!({
+            "header": "Authorization", "allow": { "providers": ["n"], "capabilities": ["*"] }
+        }))
+        .unwrap();
+        assert!(ok.validate("t").is_ok());
+
+        let any: SecretPolicy = serde_json::from_value(serde_json::json!({
+            "header": "Authorization", "allow": { "providers": "any" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            any.validate("t"),
+            Err(PolicyError::SecretProviderAny { .. })
+        ));
+
+        let cookie: SecretPolicy = serde_json::from_value(serde_json::json!({
+            "header": "Cookie", "allow": { "providers": ["n"] }
+        }))
+        .unwrap();
+        assert!(matches!(
+            cookie.validate("t"),
+            Err(PolicyError::CookieNotAcknowledged { .. })
+        ));
+
+        let hop: SecretPolicy = serde_json::from_value(serde_json::json!({
+            "header": "Connection", "allow": { "providers": ["n"] }
+        }))
+        .unwrap();
+        assert!(matches!(hop.validate("t"), Err(PolicyError::HopByHop { .. })));
+    }
+
+    #[test]
+    fn plain_policy_validate_rejects_sensitive_and_hop() {
+        let p = PlainHeaderPolicy::default();
+        assert!(matches!(
+            p.validate("Authorization"),
+            Err(PolicyError::SensitiveAsPlain { .. })
+        ));
+        assert!(matches!(
+            p.validate("Connection"),
+            Err(PolicyError::HopByHop { .. })
+        ));
+        assert!(p.validate("X-Trace-Id").is_ok());
     }
 
     #[test]

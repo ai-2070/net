@@ -30,7 +30,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::header::{HeaderError, HeaderName};
-use super::policy::{AllowList, ForwardingConfig, PlainHeaderPolicy, ProviderScope, SecretPolicy};
+use super::policy::{
+    AllowList, ForwardingConfig, PlainHeaderPolicy, PolicyError, ProviderScope, SecretPolicy,
+};
 
 /// Max length of a secret ref name. Names are audit-legible labels, not values.
 const MAX_REF_NAME_LEN: usize = 64;
@@ -90,6 +92,12 @@ pub enum StoreError {
         /// The offending header name.
         name: String,
     },
+    /// A secret was bound to *any* provider — secrets must name specific ones.
+    #[error("secret ref {ref_name:?} allows any provider; secrets must be bound to specific providers")]
+    SecretProviderAny {
+        /// The offending ref name.
+        ref_name: String,
+    },
     /// A header name could not be canonicalized.
     #[error(transparent)]
     Header(#[from] HeaderError),
@@ -100,6 +108,28 @@ impl StoreError {
         StoreError::Io {
             path: path.display().to_string(),
             reason: e.to_string(),
+        }
+    }
+}
+
+// A policy-validation failure (shared write-time / load-time rules) maps onto
+// the store's error surface so both `set_*` and `load` report the same reasons.
+impl From<PolicyError> for StoreError {
+    fn from(e: PolicyError) -> Self {
+        match e {
+            PolicyError::InvalidHeader { name } => StoreError::HeaderNotForwardable {
+                name,
+                reason: "not a valid header name",
+            },
+            PolicyError::HopByHop { name } => StoreError::HeaderNotForwardable {
+                name,
+                reason: "hop-by-hop headers are never forwarded",
+            },
+            PolicyError::CookieNotAcknowledged { name } => StoreError::CookieRequiresForce { name },
+            PolicyError::SecretProviderAny { ref_name } => {
+                StoreError::SecretProviderAny { ref_name }
+            }
+            PolicyError::SensitiveAsPlain { name } => StoreError::SensitiveHeaderNotPlain { name },
         }
     }
 }
@@ -287,15 +317,20 @@ impl ForwardingStore {
         force: bool,
     ) -> Result<(), StoreError> {
         validate_ref_name(ref_name)?;
-        let canon = validate_forwardable_header(header, force)?;
-        self.config.secrets.insert(
-            ref_name.to_string(),
-            SecretPolicy {
-                header: canon.as_str().to_string(),
-                allow,
-                purpose,
-            },
-        );
+        let canon = HeaderName::parse(header)?;
+        let is_cookie = matches!(canon.as_str(), "cookie" | "set-cookie");
+        let policy = SecretPolicy {
+            header: canon.as_str().to_string(),
+            allow,
+            purpose,
+            // `force` records the cookie acknowledgement — only meaningful for
+            // cookie headers, ignored otherwise.
+            allow_cookie: is_cookie && force,
+        };
+        // The same rules the store revalidates on load: forwardable header,
+        // cookie acknowledgement, and no `providers: any` for a secret.
+        policy.validate(ref_name)?;
+        self.config.secrets.insert(ref_name.to_string(), policy);
         Ok(())
     }
 
@@ -309,20 +344,12 @@ impl ForwardingStore {
     /// credentials. Stored under the canonical header name.
     pub fn set_plain_header(&mut self, header: &str, allow: AllowList) -> Result<(), StoreError> {
         let canon = HeaderName::parse(header)?;
-        if !canon.is_forwardable() {
-            return Err(StoreError::HeaderNotForwardable {
-                name: canon.as_str().to_string(),
-                reason: "hop-by-hop headers are never forwarded",
-            });
-        }
-        if canon.is_security_sensitive() {
-            return Err(StoreError::SensitiveHeaderNotPlain {
-                name: canon.as_str().to_string(),
-            });
-        }
+        let policy = PlainHeaderPolicy { allow };
+        // End-to-end + non-credential — the same rules as load-time revalidation.
+        policy.validate(canon.as_str())?;
         self.config
             .plain_headers
-            .insert(canon.as_str().to_string(), PlainHeaderPolicy { allow });
+            .insert(canon.as_str().to_string(), policy);
         Ok(())
     }
 
@@ -513,24 +540,6 @@ fn validate_ref_name(name: &str) -> Result<(), StoreError> {
         return reject("only lowercase [a-z0-9._-] allowed");
     }
     Ok(())
-}
-
-/// Canonicalize `header` and confirm it may be forwarded as a secret: not
-/// hop-by-hop ever, and `cookie` / `set-cookie` only with `force`.
-fn validate_forwardable_header(header: &str, force: bool) -> Result<HeaderName, StoreError> {
-    let canon = HeaderName::parse(header)?;
-    if !canon.is_forwardable() {
-        return Err(StoreError::HeaderNotForwardable {
-            name: canon.as_str().to_string(),
-            reason: "hop-by-hop headers are never forwarded",
-        });
-    }
-    if !force && matches!(canon.as_str(), "cookie" | "set-cookie") {
-        return Err(StoreError::CookieRequiresForce {
-            name: canon.as_str().to_string(),
-        });
-    }
-    Ok(canon)
 }
 
 #[cfg(test)]

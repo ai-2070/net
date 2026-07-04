@@ -201,6 +201,7 @@ fn store_err(e: StoreError) -> CliError {
         | StoreError::HeaderNotForwardable { .. }
         | StoreError::CookieRequiresForce { .. }
         | StoreError::SensitiveHeaderNotPlain { .. }
+        | StoreError::SecretProviderAny { .. }
         | StoreError::Header(_) => invalid_args(e.to_string()),
         StoreError::Io { .. } | StoreError::Corrupt { .. } => generic(e.to_string()),
     }
