@@ -1,17 +1,27 @@
-//! Supply side — wrap a local MCP server as a mesh capability.
+//! Supply side — publish local MCP servers as mesh capabilities.
+//!
+//! The public entry point is [`ServerPublisher::publish_server`]
+//! (`MCP_BRIDGE_SDK_PLAN.md` P0) — spawn, discover, lower, announce, serve —
+//! returning a [`PublicationHandle`] that scopes the publication's lifetime.
+//! The pieces it orchestrates:
 //!
 //! - [`stdio`] — [`StdioMcpClient`]: spawn a stdio MCP server and speak
 //!   JSON-RPC 2.0 to it (no mesh dependency).
-//! - [`credentials`] — classify a wrapped server's credential exposure,
-//!   conservatively (unknown is gated like credentialed).
-//! - [`descriptor`] — lower a `tools/list` entry to `net_sdk::tool::ToolDescriptor`
-//!   plus the MCP-bridge metadata carried as `CapabilitySet` tags.
+//! - [`credentials`] — [`classify`]: score a wrapped server's credential
+//!   exposure, conservatively (unknown is gated like credentialed). A **pure
+//!   helper** native integrations may call to *display* risk before
+//!   publishing through the general SDK.
+//! - [`descriptor`] — [`lower_tool`]: lower a `tools/list` entry to
+//!   `net_sdk::tool::ToolDescriptor` plus the MCP-bridge metadata carried as
+//!   `CapabilitySet` tags. The other pure helper — lowering stays
+//!   single-sourced here for every consumer.
 //! - [`invoke`] — [`WrapInvokeHandler`]: bridge an incoming nRPC call to the
 //!   wrapped `tools/call`, gated by the caller's owner scope.
-//!
-//! Still to land (Phase 1): the announce/serve wiring that discovers the
-//! wrapped tools, lowers them, and serves each [`WrapInvokeHandler`] on the
-//! mesh — plus the `net wrap` CLI command that drives it.
+//! - [`catalog`] — the describe service internals (one service per node,
+//!   merged + per-publication-scoped when a node carries several
+//!   publications).
+//! - [`session`] — [`ServerPublisher`] / [`PublicationHandle`]: the
+//!   orchestration + the per-node merge behind them.
 
 pub mod catalog;
 pub mod credentials;
@@ -24,7 +34,7 @@ pub use credentials::{classify, ClassifyError, CredentialOverride, CredentialSta
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 pub use invoke::{OwnerScope, WrapInvokeHandler};
 pub use session::{
-    build_capability_set, wrap_server, RefreshDelta, WrapConfig, WrapError, WrapSession,
+    build_capability_set, PublicationHandle, RefreshDelta, ServerPublisher, WrapConfig, WrapError,
 };
 pub use stdio::StdioMcpClient;
 

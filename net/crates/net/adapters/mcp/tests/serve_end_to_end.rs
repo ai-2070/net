@@ -20,7 +20,9 @@ use net_mcp::bridge::BRIDGE_PROVIDER_TAG;
 use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
 use net_mcp::serve::MeshGateway;
 use net_mcp::spec::{CallToolResult, Implementation};
-use net_mcp::wrap::{wrap_server, CredentialOverride, OwnerScope, Substitutability, WrapConfig};
+use net_mcp::wrap::{
+    CredentialOverride, OwnerScope, ServerPublisher, Substitutability, WrapConfig,
+};
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use serde_json::json;
@@ -73,17 +75,19 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_searches_describes_and_invokes_across_two_nodes() {
     let caller = Arc::new(build_mesh(&[0x51u8; 32]).await); // node A (demand)
-    let host = build_mesh(&[0x51u8; 32]).await; // node B (supply)
+    let host = Arc::new(build_mesh(&[0x51u8; 32]).await); // node B (supply)
     handshake(&caller, &host).await;
     let host_id = host.inner().node_id();
 
-    // Wrap the fixture on the host, owner-scoped to the caller's origin (the
-    // value its outbound calls carry) so both describe and invoke admit it.
+    // Publish the fixture on the host, owner-scoped to the caller's origin
+    // (the value its outbound calls carry) so both describe and invoke admit it.
     let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
-    let session = wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture on the host");
-    assert!(session.tools().iter().any(|t| t == "echo"));
+        .expect("publish the fixture on the host");
+    assert!(publication.tools().iter().any(|t| t == "echo"));
 
     // The caller discovers the host as a bridge provider through the fold.
     assert!(
@@ -138,15 +142,18 @@ async fn gateway_searches_describes_and_invokes_across_two_nodes() {
     assert!(!result.is_error, "{result:?}");
     assert_eq!(result.text(), "hi gateway");
 
-    drop(session);
-    host.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
     // `caller` is an Arc held by the gateway; it drops with the test.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
     let caller = Arc::new(build_mesh(&[0x52u8; 32]).await);
-    let host = build_mesh(&[0x52u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x52u8; 32]).await);
     handshake(&caller, &host).await;
     let host_id = host.inner().node_id();
 
@@ -154,9 +161,11 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
     // both describe (visibility) and invoke.
     let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
     config.scope = OwnerScope::owner_only(0xDEAD_BEEF);
-    let session = wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture on the host");
+        .expect("publish the fixture on the host");
 
     // The provider tag is still discoverable (v0 does not scope the announcement
     // itself) — search never implies invocation.
@@ -205,8 +214,11 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
         "an out-of-scope caller must not get a result; got {outcome:?}",
     );
 
-    drop(session);
-    host.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
 
 /// One-way connect `caller` → `host` (accept + connect), without starting the
@@ -257,8 +269,8 @@ async fn invoke_retry(gateway: &MeshGateway, id: &CapabilityId, message: &str) -
 async fn invoke_fails_over_when_the_primary_provider_goes_down() {
     let psk = [0x53u8; 32];
     let caller = Arc::new(build_mesh(&psk).await);
-    let host_a = build_mesh(&psk).await;
-    let host_b = build_mesh(&psk).await;
+    let host_a = Arc::new(build_mesh(&psk).await);
+    let host_b = Arc::new(build_mesh(&psk).await);
 
     // Caller connects to both providers (hub), then everyone starts.
     connect(&caller, &host_a).await;
@@ -270,26 +282,28 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
     let id_a = host_a.inner().node_id();
     let id_b = host_b.inner().node_id();
 
-    // Wrap the same fixture on both hosts as a substitutable, uncredentialed
-    // tool so the demand side collapses them and can fail over.
-    let session_a = wrap_server(
-        &host_a,
-        FIXTURE,
-        &[],
-        &[],
-        substitutable_config(caller.origin_hash()),
-    )
-    .await
-    .expect("wrap on host a");
-    let session_b = wrap_server(
-        &host_b,
-        FIXTURE,
-        &[],
-        &[],
-        substitutable_config(caller.origin_hash()),
-    )
-    .await
-    .expect("wrap on host b");
+    // Publish the same fixture on both hosts as a substitutable,
+    // uncredentialed tool so the demand side collapses them and can fail over.
+    let publisher_a = ServerPublisher::new(Arc::clone(&host_a));
+    let publication_a = publisher_a
+        .publish_server(
+            FIXTURE,
+            &[],
+            &[],
+            substitutable_config(caller.origin_hash()),
+        )
+        .await
+        .expect("publish on host a");
+    let publisher_b = ServerPublisher::new(Arc::clone(&host_b));
+    let publication_b = publisher_b
+        .publish_server(
+            FIXTURE,
+            &[],
+            &[],
+            substitutable_config(caller.origin_hash()),
+        )
+        .await
+        .expect("publish on host b");
 
     // The caller discovers echo on BOTH providers.
     assert!(
@@ -347,11 +361,17 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
 
     // Kill the primary provider mid-session.
     if primary == id_a {
-        drop(session_a);
-        host_a.shutdown().await.ok();
+        drop(publication_a);
+        drop(publisher_a);
+        if let Ok(host_a) = Arc::try_unwrap(host_a) {
+            host_a.shutdown().await.ok();
+        }
     } else {
-        drop(session_b);
-        host_b.shutdown().await.ok();
+        drop(publication_b);
+        drop(publisher_b);
+        if let Ok(host_b) = Arc::try_unwrap(host_b) {
+            host_b.shutdown().await.ok();
+        }
     }
 
     // Invoke again — the primary is gone, so it transparently fails over to the

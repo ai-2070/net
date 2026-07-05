@@ -3,10 +3,11 @@
 //!
 //! Builds a mesh node under the operator's identity, joins the mesh via a
 //! remote-attach peer, then hands the wrapped server to
-//! [`net_mcp::wrap::wrap_server`] which discovers its tools, announces them,
-//! and serves an owner-scoped nRPC handler per tool. The process stays up
-//! serving until Ctrl-C; on shutdown the wrap session drops (withdrawing the
-//! services and stopping the wrapped process) and the mesh shuts down.
+//! [`net_mcp::wrap::ServerPublisher::publish_server`] which discovers its
+//! tools, announces them, and serves an owner-scoped nRPC handler per tool.
+//! The process stays up serving until Ctrl-C; on server exit the publication
+//! is withdrawn (announcement cleared, services + child stopped) and the mesh
+//! shuts down.
 //!
 //! Owner-only is keyed on the wrap node's own `origin_hash` (doctrine #3);
 //! `--allow <origin>` widens it to specific peer origins. Mapping a whole root
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use net_mcp::spec::Implementation;
-use net_mcp::wrap::{wrap_server, CredentialOverride, Substitutability, WrapConfig};
+use net_mcp::wrap::{CredentialOverride, ServerPublisher, Substitutability, WrapConfig};
 use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
@@ -140,8 +141,10 @@ pub async fn run(
         })?;
     let identity = load_operator_identity(identity_path).await?;
 
-    // Build a mesh under that identity and join via the peer.
-    let mesh = build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?;
+    // Build a mesh under that identity and join via the peer. `Arc` because
+    // the publisher (and each publication) holds the mesh alongside us.
+    let mesh =
+        std::sync::Arc::new(build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?);
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args
@@ -172,7 +175,9 @@ pub async fn run(
         config.scope.allow(origin);
     }
 
-    let mut session = wrap_server(&mesh, program, prog_args, &envs, config)
+    let publisher = ServerPublisher::new(std::sync::Arc::clone(&mesh));
+    let mut publication = publisher
+        .publish_server(program, prog_args, &envs, config)
         .await
         .map_err(|e| sdk(format!("wrap failed: {e}")))?;
 
@@ -183,8 +188,8 @@ pub async fn run(
         fmt,
         &WrapEvent::Wrapped {
             name: &args.name,
-            tools: session.tools(),
-            skipped: session.skipped_tools(),
+            tools: publication.tools(),
+            skipped: publication.skipped_tools(),
             visibility: "owner_only",
             scope: "same_root_identity",
             allowed_origins: &allow,
@@ -193,36 +198,20 @@ pub async fn run(
     .map_err(|e| generic(format!("write output: {e}")))?;
 
     // Serve until Ctrl-C, refreshing whenever the wrapped server changes its
-    // tool set (`tools/list_changed`) so bridged descriptors stay current. On
-    // teardown the session drops (withdrawing services + stopping the child)
-    // and the mesh shuts down.
-    let mut changed = session.client().subscribe_list_changed();
-    // A separate Arc so the `closed()` select branch doesn't borrow `session`
-    // (which `refresh` borrows mutably in another branch's body).
-    let client = std::sync::Arc::clone(session.client());
-    loop {
+    // tool set (`tools/list_changed`) so bridged descriptors stay current.
+    let mut changed = publication.client().subscribe_list_changed();
+    // A separate Arc so the `closed()` select branch doesn't borrow
+    // `publication` (which `refresh` borrows mutably in another branch's body).
+    let client = std::sync::Arc::clone(publication.client());
+    let server_exited = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => break false,
             // The wrapped server exited (clean or crash) — withdraw and stop.
-            _ = client.closed() => {
-                // Withdraw the announcement so peers stop advertising tools
-                // whose handlers are about to drop. Log a failure (stderr, off
-                // the structured stdout stream) rather than swallowing it —
-                // otherwise a stale announcement could linger with no live
-                // backing handler and no diagnostic. Mirrors the refresh path.
-                if let Err(e) = mesh
-                    .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
-                    .await
-                {
-                    eprintln!("withdrawing capabilities on server exit failed: {e}");
-                }
-                let _ = emit_stream_row(fmt, &WrapEvent::ServerExited);
-                break;
-            }
+            _ = client.closed() => break true,
             recv = changed.recv() => match recv {
                 // A change (or a lagged signal) — reconcile the mesh.
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match session.refresh(&mesh).await {
+                    match publication.refresh().await {
                         Ok(delta) if !delta.is_empty() => {
                             let _ = emit_stream_row(
                                 fmt,
@@ -238,12 +227,30 @@ pub async fn run(
                     }
                 }
                 // Broadcast channel closed (client dropped) — stop.
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => break false,
             },
         }
+    };
+
+    if server_exited {
+        // Withdraw the publication so peers stop advertising tools whose
+        // handlers are about to drop. Log a failure (stderr, off the
+        // structured stdout stream) rather than swallowing it — otherwise a
+        // stale announcement could linger with no live backing handler and no
+        // diagnostic. Mirrors the refresh path.
+        if let Err(e) = publication.withdraw().await {
+            eprintln!("withdrawing capabilities on server exit failed: {e}");
+        }
+        let _ = emit_stream_row(fmt, &WrapEvent::ServerExited);
+    } else {
+        // Ctrl-C: the whole node is going down, so the announcement dies with
+        // it — dropping the publication stops the services and the child.
+        drop(publication);
     }
-    drop(session);
-    mesh.shutdown().await.ok();
+    drop(publisher);
+    if let Ok(mesh) = std::sync::Arc::try_unwrap(mesh) {
+        mesh.shutdown().await.ok();
+    }
     Ok(())
 }
 

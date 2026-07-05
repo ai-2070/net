@@ -1,22 +1,23 @@
-//! End-to-end supply side: wrap the fixture on one node, discover + invoke it
-//! from another, over a real two-node mesh.
+//! End-to-end supply side: publish the fixture on one node, discover + invoke
+//! it from another, over a real two-node mesh.
 //!
-//! Proves the whole Phase-1 wrap path the unit tests can't: `wrap_server`
-//! announces the tools, the caller discovers them through the capability fold,
-//! the nRPC call reaches the served handler, the owner-scope gate admits or
-//! rejects on the AEAD-verified caller origin, and the wrapped `tools/call`
-//! result comes back over the wire.
+//! Proves the whole Phase-1 wrap path the unit tests can't:
+//! `ServerPublisher::publish_server` announces the tools, the caller discovers
+//! them through the capability fold, the nRPC call reaches the served handler,
+//! the owner-scope gate admits or rejects on the AEAD-verified caller origin,
+//! and the wrapped `tools/call` result comes back over the wire.
 //!
 //! Two directly-connected nodes are built with `MeshBuilder` + a manual
 //! handshake — the same idiom the SDK's own cross-node RPC tests use. The
 //! handshake reaches through `Mesh::inner()`; everything else stays on the
 //! public `Mesh` surface.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use net_mcp::spec::{CallToolResult, Implementation};
-use net_mcp::wrap::{wrap_server, OwnerScope, WrapConfig};
+use net_mcp::wrap::{OwnerScope, ServerPublisher, WrapConfig};
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::CallOptions;
@@ -120,7 +121,7 @@ async fn call_retry(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrap_discover_and_invoke_across_two_nodes() {
     let caller = build_mesh(&[0x42u8; 32]).await; // node A
-    let host = build_mesh(&[0x42u8; 32]).await; // node B
+    let host = Arc::new(build_mesh(&[0x42u8; 32]).await); // node B
     handshake(&caller, &host).await;
     let b_id = host.inner().node_id();
 
@@ -128,10 +129,12 @@ async fn wrap_discover_and_invoke_across_two_nodes() {
     // outbound calls carry as `caller_origin`. The successful invoke below
     // then proves `caller_origin == caller.origin_hash()` (the SDK accessor).
     let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
-    let session = wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture on the host");
-    assert!(session.tools().iter().any(|t| t == "echo"));
+        .expect("publish the fixture on the host");
+    assert!(publication.tools().iter().any(|t| t == "echo"));
 
     // The caller discovers the host advertising `echo` through the fold.
     let filter = CapabilityFilter::new().require_tag("echo");
@@ -154,8 +157,20 @@ async fn wrap_discover_and_invoke_across_two_nodes() {
     assert!(!result.is_error);
     assert_eq!(result.text(), "hi mesh");
 
+    // Explicit withdraw reverses the publication (services + announcement) —
+    // then the host Arc is unique again and can shut down.
+    publication.withdraw().await.expect("withdraw");
+    assert!(
+        !host
+            .find_nodes(&CapabilityFilter::new().require_tag("echo"))
+            .contains(&b_id),
+        "withdraw clears the announced tool set",
+    );
     caller.shutdown().await.ok();
-    host.shutdown().await.ok();
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -164,22 +179,24 @@ async fn a_non_channel_safe_tool_name_is_sanitized_and_still_invokable() {
     // be BRIDGED under a sanitized service id — not dropped — and invoking that
     // id must reach the original `getCaps` on the wrapped server.
     let caller = build_mesh(&[0x46u8; 32]).await;
-    let host = build_mesh(&[0x46u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x46u8; 32]).await);
     handshake(&caller, &host).await;
     let b_id = host.inner().node_id();
 
     let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
-    let session = wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture on the host");
+        .expect("publish the fixture on the host");
     // Nothing was dropped for being non-channel-safe.
     assert!(
-        session.skipped_tools().is_empty(),
+        publication.skipped_tools().is_empty(),
         "no tool dropped: {:?}",
-        session.skipped_tools(),
+        publication.skipped_tools(),
     );
     // `getCaps` is served under a sanitized id (never verbatim).
-    let safe_id = session
+    let safe_id = publication
         .tools()
         .iter()
         .find(|t| t.starts_with("getcaps_"))
@@ -206,22 +223,30 @@ async fn a_non_channel_safe_tool_name_is_sanitized_and_still_invokable() {
     assert_eq!(result.text(), "caps-ok");
 
     caller.shutdown().await.ok();
-    host.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_outside_the_owner_scope_is_rejected() {
     let caller = build_mesh(&[0x43u8; 32]).await;
-    let host = build_mesh(&[0x43u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x43u8; 32]).await);
     handshake(&caller, &host).await;
     let b_id = host.inner().node_id();
 
     // Owner scope admits only an unrelated origin — the caller is excluded.
     let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
     config.scope = OwnerScope::owner_only(0xDEAD_BEEF);
-    wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    // Keep the publication alive so the served handler (not a missing
+    // service) is what rejects the out-of-scope caller.
+    let _publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture on the host");
+        .expect("publish the fixture on the host");
 
     // The service is discoverable — search never implies invocation.
     let filter = CapabilityFilter::new().require_tag("echo");
@@ -250,21 +275,27 @@ async fn a_caller_outside_the_owner_scope_is_rejected() {
     );
 
     caller.shutdown().await.ok();
-    host.shutdown().await.ok();
+    drop(_publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refresh_reconciles_the_tool_set_on_list_changed() {
-    // Single node: `wrap_server` self-indexes its announcement and serves
+    // Single node: `publish_server` self-indexes its announcement and serves
     // locally, so no peer is needed to observe the reconcile.
-    let host = build_mesh(&[0x45u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x45u8; 32]).await);
 
     let mut config = WrapConfig::owner_only(client_info(), 0);
     config.scope = OwnerScope::any();
-    let mut session = wrap_server(&host, FIXTURE, &[], &[], config)
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let mut publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
         .await
-        .expect("wrap the fixture");
-    let before: Vec<String> = session.tools().to_vec();
+        .expect("publish the fixture");
+    let before: Vec<String> = publication.tools().to_vec();
     assert!(
         !before.iter().any(|t| t == "bonus"),
         "bonus is absent before the bump",
@@ -276,14 +307,14 @@ async fn refresh_reconciles_the_tool_set_on_list_changed() {
 
     // Change the wrapped server's tool set (`_bump` makes `bonus` appear and the
     // server emit tools/list_changed).
-    session
+    publication
         .client()
         .call_tool("_bump", json!({}))
         .await
         .expect("bump");
 
     // Refresh reconciles the mesh to the new set.
-    let delta = session.refresh(&host).await.expect("refresh");
+    let delta = publication.refresh().await.expect("refresh");
     assert!(
         delta.added.contains(&"bonus".to_string()),
         "bonus is newly served: {delta:?}",
@@ -293,16 +324,20 @@ async fn refresh_reconciles_the_tool_set_on_list_changed() {
     // dropping tools that are still present.
     for tool in &before {
         assert!(
-            session.tools().iter().any(|t| t == tool),
+            publication.tools().iter().any(|t| t == tool),
             "pre-existing tool {tool:?} must remain served after refresh",
         );
     }
-    assert!(session.tools().iter().any(|t| t == "bonus"));
+    assert!(publication.tools().iter().any(|t| t == "bonus"));
     assert!(
         host.find_nodes(&CapabilityFilter::new().require_tag("bonus"))
             .contains(&host.inner().node_id()),
         "the host now announces the `bonus` tool",
     );
 
-    host.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
