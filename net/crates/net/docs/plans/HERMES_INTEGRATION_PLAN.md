@@ -8,9 +8,9 @@
 |---|---|---|
 | Hermes has a full MCP client: stdio + remote, OAuth, sampling, elicitation, dynamic tool register/deregister with diffing | `tools/mcp_tool.py` (`_register_server_tools`, deregister-diff on refresh) | **Zero-code integration exists today** via `mcp_servers` config → `net mcp serve`. Also: the pin-promotion registration pattern is already written — mirror it. |
 | Hermes has progressive tool disclosure built in: `tool_search` / `tool_describe` / `tool_call` bridge tools, threshold-gated, stateless catalog rebuilt per assembly, core tools never defer | `tools/tool_search.py` | Don't build a parallel meta-tool surface for *registered* tools. Net's search tool covers the *mesh index* (unregistered capabilities); Hermes's tool_search covers registered/pinned ones. Two levels, distinct jobs. |
-| Tool registry: `ToolEntry(name, toolset, schema, handler, check_fn, requires_env, is_async, description, emoji, max_result_size_chars, dynamic_schema_overrides)`; `check_fn` has TTL cache + transient-failure grace | `tools/registry.py` | Pinned capability = one `ToolEntry` in toolset `net`. `check_fn` = daemon liveness (TTL/grace semantics fit mesh flakiness perfectly). `dynamic_schema_overrides` = live descriptor updates — "always up-to-date types" maps onto an existing field. |
+| Tool registry: `ToolEntry(name, toolset, schema, handler, check_fn, requires_env, is_async, description, emoji, max_result_size_chars, dynamic_schema_overrides)`; `check_fn` has TTL cache + transient-failure grace | `tools/registry.py` | Pinned capability = one `ToolEntry` in toolset `net`. `check_fn` = mesh reachability (TTL/grace semantics fit mesh flakiness perfectly). `dynamic_schema_overrides` = live descriptor updates — "always up-to-date types" maps onto an existing field. |
 | Plugin system: `plugin.yaml` manifests (`kind`, `provides_tools`, `hooks`, `platforms`); plugin override policy prevents silent built-in overrides | `plugins/*/plugin.yaml`, `tools/registry.py` override policy | Integration ships as `plugins/net/` — first-party plugin, no core patches. |
-| Cross-platform approval machinery: interactive CLI + gateway approval contexts, `permissions_list_open` / `permissions_respond` exposed over Hermes's own MCP server | `tools/approval.py`, `mcp_serve.py` | Pin approval renders through Hermes's existing approval UX (approve from Telegram/Discord/CLI) — but resolves against the **Net daemon's** pin store. Hermes surface, daemon state. |
+| Cross-platform approval machinery: interactive CLI + gateway approval contexts, `permissions_list_open` / `permissions_respond` exposed over Hermes's own MCP server | `tools/approval.py`, `mcp_serve.py` | Pin approval renders through Hermes's existing approval UX (approve from Telegram/Discord/CLI) — but resolves against the **shared SDK** pin store. Hermes surface, shared state. |
 | Subagent delegation exists (`delegate_task`, spawn depth/concurrency limits) | `tools/delegate_tool.py`, `tools/async_delegation.py` | Delegation chain extends: root → machine → hermes gateway → subagent. Per-subagent attribution is a natural Phase 3 extension. |
 | `net-mesh-sdk` 0.30.0 on PyPI (Python binding over the Rust core) | PyPI | `plugins/net/` depends on it; no FFI work in Hermes. |
 | Schema sanitizer for third-party tool schemas | `tools/schema_sanitizer.py` | Run mesh descriptors through it before registry entry, same as MCP tools. |
@@ -19,10 +19,12 @@
 
 ---
 
-## Doctrine (H-rules, unchanged)
+## Doctrine (H-rules)
 
-1. **H1 — Client, not node.** Hermes talks to the local running Net daemon via `net-mesh-sdk`. No embedded node.
-2. **H2 — One consent engine, daemon-side.** Pin store, consent state, arg validation, credentialed blocklist, audit: daemon-owned. Hermes approval UX and CLI are views over it. Approved anywhere = approved everywhere.
+**The invariant: adapters attach; nodes participate. The MCP bridge translates protocol surfaces; Hermes holds identity as a Net participant.**
+
+1. **H1 — Embedded first-class node.** Hermes embeds the Net node in-process via `net-mesh-sdk` (pyo3 over the Rust core): own keypair, directly addressable, joins the mesh itself. Marginal memory/CPU buys direct addressability — which A2A, streams, and migration all require. No daemon exists; if per-machine node count ever hurts, a shared daemon returns later as an optimization *behind the same SDK API*, invisible to Hermes. **The SDK API must never expose whether the local participant is an embedded node or a shared daemon** — that opacity is what keeps the refactor possible.
+2. **H2 — One consent engine, one implementation.** Pin store, consent state, arg validation, credentialed blocklist, audit: implemented once in the Rust SDK, shared across every process on the machine (locked per-user store). Hermes approval UX, the shim, and the CLI are views over the same state. Approved anywhere = approved everywhere. **The shared store is policy/consent state, not shared node identity** — each first-class app/agent node keeps its own identity and delegation; nobody flattens keypairs into the store.
 3. **H3 — Delegation before publication.** No side-effectful tool publication until per-agent identity exists.
 4. **H4 — Explicit, tagged publication.** Selected tools only, owner-only default, risk-tagged.
 5. **H5 — Streams feed state; models query folds.** Raw chunks never enter context.
@@ -37,9 +39,9 @@ No MCP awareness inside `plugins/net/` (it sees `ToolDescriptor`s); no full mesh
 
 ## Cross-plan dependency
 
-Phase 1 requires the daemon-side consent/pin/validation engine (bridge plan Phases 2–3) exposed via `net-mesh-sdk`:
+Phase 1 requires the consent/pin/validation engine exposed via `net-mesh-sdk` (graduated out of the bridge crate per the SDK plan):
 `capability.search/describe/invoke`, `pins.list/request/state`, consent resolved inside `invoke`, audit events, and a pin-change subscription.
-**Gate test:** a pin approved via `net mcp pin approve` is immediately visible to a Python SDK client. Can't write that test → the engine isn't daemon-side → refactor first.
+**Gate test:** a pin approved via `net mcp pin approve` is immediately visible to a Python SDK client, under concurrent access. Can't write that test → the engine isn't actually shared → refactor first.
 
 ---
 
@@ -76,16 +78,16 @@ plugins/net/
                          #   net_describe_capability, net_invoke_capability,
                          #   net_list_pinned_capabilities, net_request_pin]
   __init__.py
-  daemon.py              # net-mesh-sdk client wrapper + liveness probe (feeds check_fn)
+  node.py                # embedded Net node lifecycle (join on plugin init, clean shutdown) + mesh-reachability probe (feeds check_fn)
   tools.py               # the five ToolEntry definitions, toolset "net"
   pins.py                # pin-change subscription -> dynamic registration (Phase 2)
   folds.py               # stream fold consumers (Phase 6)
 ```
 
 - [ ] `plugin.yaml` + registration through the standard plugin loader; respects plugin override policy (Net tools never shadow built-ins)
-- [ ] The five tools registered as `ToolEntry`s, toolset `net`, `check_fn` = daemon liveness via SDK ping (TTL cache + grace absorbs mesh flaps — if daemon down past grace, Net tools cleanly vanish from the tools array instead of erroring mid-turn)
-- [ ] `net_invoke_capability` calls daemon `capability.invoke`; `validation_error` returned verbatim to the model (self-repair); `requires_approval` returns the pin instruction string
-- [ ] `net_request_pin` creates a pending request daemon-side and returns a **structured response** the model can relay: `{status: "pending_approval", request_id, approval_channels: ["cli","telegram",...], message: "Approve with: net mcp pin approve <id>"}` — never approves
+- [ ] The five tools registered as `ToolEntry`s, toolset `net`, `check_fn` = **local node initialized + SDK usable** — never "remote peers visible." A healthy-but-isolated node keeps its tools; remote absence surfaces as empty search results or per-call mesh-unreachable errors, not tool flicker. Only local node/SDK failure past grace removes tools from the array
+- [ ] `net_invoke_capability` calls SDK `capability.invoke` (validation + consent applied inside the SDK, never re-derived in Python); `validation_error` returned verbatim to the model (self-repair); `requires_approval` returns the pin instruction string
+- [ ] `net_request_pin` creates a pending request in the shared pin store and returns a **structured response** the model can relay: `{status: "pending_approval", request_id, approval_channels: ["cli","telegram",...], message: "Approve with: net mcp pin approve <id>"}` — never approves
 - [ ] **Meta-tools are always-load** (exempt from `tool_search` deferral) while the plugin is enabled — five small, high-leverage tools; a search-to-find-search double indirection kills the flow. Pinned/promoted tools remain deferrable if the set grows large
 - [ ] Mesh descriptors pass through `schema_sanitizer` before any model-visible surface
 - [ ] Tool descriptions explicitly disambiguate mesh search from Hermes's local `tool_search`
@@ -98,13 +100,13 @@ plugins/net/
 
 Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exact problem:
 
-- [ ] `pins.py` subscribes to daemon pin-store changes; on approval, registers a real `ToolEntry` (real schema, risk tags in description, provider info); on unpin/revoke, deregisters — diff-based like `_register_server_tools`, no nuke-and-repave
-- [ ] **Pinned tool names are allocated by the daemon and stable** (persist across sessions, retired on unpin). Hermes never invents names. Daemon handles collisions deterministically (two GitHub accounts, same tool on multiple nodes → preferred alias from pin request, else provider-suffixed). One source of truth for what a tool is called across Hermes, the shim, and OpenClaw
-- [ ] Every pinned `ToolEntry` gets `check_fn` = daemon liveness, same TTL/grace as the meta-tools — daemon gone past grace means pinned tools cleanly vanish, no stale calls into a void
+- [ ] `pins.py` subscribes to shared pin-store changes via the SDK; on approval, registers a real `ToolEntry` (real schema, risk tags in description, provider info); on unpin/revoke, deregisters — diff-based like `_register_server_tools`, no nuke-and-repave
+- [ ] **Pinned tool names are allocated by the shared pin store (SDK-side) and stable** (persist across sessions, retired on unpin). Hermes never invents names. The SDK handles collisions deterministically (two GitHub accounts, same tool on multiple nodes → preferred alias from pin request, else provider-suffixed). One source of truth for what a tool is called across Hermes, the shim, and OpenClaw
+- [ ] Every pinned `ToolEntry` gets the same check_fn semantics as the meta-tools (local node/SDK health, not peer visibility) — local failure past grace means pinned tools cleanly vanish, no stale calls into a void
 - [ ] Structured results/logs carry **audit refs**: invocation id, provider node, capability id, delegation chain id — not necessarily user-visible, always log-present
 - [ ] `dynamic_schema_overrides` wired to the live descriptor: schema changes flow through live — the "always up-to-date types" claim, demonstrated inside Hermes. (Pin records carry descriptor_hash for deferred cross-ownership hardening; no v1 enforcement)
 - [ ] Pinned tools flow through Hermes's normal pipeline: `handle_function_call`, guardrails, hooks, truncation, and `tool_search` deferral if the pinned set grows large — zero special-casing
-- [ ] **Approval UX:** pin requests surface through Hermes's existing approval flow (interactive CLI prompt; gateway `permissions_list_open`/`permissions_respond` for Telegram/Discord approval). Resolution writes to the **daemon** pin store. Test: approve a pin from Telegram, verify `net mcp pin list` (CLI) and Claude Code (shim) both see it.
+- [ ] **Approval UX:** pin requests surface through Hermes's existing approval flow (interactive CLI prompt; gateway `permissions_list_open`/`permissions_respond` for Telegram/Discord approval). Resolution writes to the **shared** pin store. Test: approve a pin from Telegram, verify `net mcp pin list` (CLI) and Claude Code (shim) both see it.
 
 **Acceptance:** pinned remote capability appears as a first-class typed Hermes tool; arg accuracy ≈ local-tool baseline; pin approved in Hermes visible in the shim within seconds and vice versa; descriptor update on the remote side propagates to the model-visible schema without restart.
 
@@ -112,7 +114,7 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 
 ## Phase 3 — Delegated agent identity
 
-- [ ] Chain: `user root → machine → hermes-gateway agent identity`, requested from the daemon at plugin init
+- [ ] Chain: `user root → machine → hermes-gateway agent identity`, derived from the user root identity via the SDK at node init
 - [ ] Every invocation carries the chain; remote wrapper audit shows *which* Hermes
 - [ ] Extension: `delegate_task` subagents get child delegations (`… → hermes-gateway → subagent-N`), so a spawned subagent's mesh calls are attributable and individually revocable — this is a Net-native answer to subagent audit that no MCP setup has
 - [ ] `net identity delegations list/revoke` honored: revoking the gateway delegation kills all its subagents' access
@@ -137,7 +139,7 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 | desktop/network control | `computer_use_tool`, browser actions | **not publishable until the shared policy engine (Phase 9) exists** — a mesh-published desktop is a remote-control primitive |
 - [ ] Risk tags derived from toolset membership + Hermes's own approval classification (it already knows which tools are dangerous — reuse that judgment, don't re-tag by hand)
 - [ ] Enforced gate: `side_effectful`-tagged tools cannot publish pre-delegation or without the explicit dangerous flag
-- [ ] Published tools are ordinary mesh capabilities: invocable from CLI, shim, or another Hermes, subject to the caller's daemon consent engine
+- [ ] Published tools are ordinary mesh capabilities: invocable from CLI, shim, or another Hermes, subject to caller-side consent **and provider-side policy** — the provider retains authority; caller consent alone is never sufficient
 
 **Acceptance:** Hermes B publishes one read-only tool; CLI and Hermes A invoke it; a `terminal` publish attempt without the flag is rejected; audit shows full chains both sides.
 
@@ -148,7 +150,7 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 - [ ] Announce `agent.hermes.message` / `agent.hermes.task` / `agent.hermes.status`; A2A *begins* as capability invocation
 - [ ] Task lifecycle day one: `requested, accepted, completed, failed, cancelled` — **cancel maps to nRPC end-to-end cancellation and demonstrably stops remote work**, wired into Hermes's interrupt machinery (`tools/interrupt.py`)
 - [ ] Inbound A2A renders as a Hermes conversation/session (it already multiplexes platforms — the mesh is one more channel surface); event chain visible
-- [ ] A2A calls subject to the same daemon consent engine — an agent capability is a capability
+- [ ] A2A calls subject to the same shared consent engine — an agent capability is a capability
 
 **Acceptance:** Hermes A (laptop) tasks Hermes B (desktop); full traceable chain both sides. Run 2: cancel mid-task, B's work stops (verify via B's session), both chains show `cancelled`.
 
@@ -187,8 +189,8 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 
 ## Phase 9 — Shared permission model
 
-- [ ] One daemon/gateway policy engine mediates tools, A2A, artifacts, streams, publication visibility
-- [ ] Hermes consumes decisions; its approval UX renders daemon prompts; it never grows its own parallel policy layer
+- [ ] One shared policy engine (SDK-side locally, enforced mesh-side by providers) mediates tools, A2A, artifacts, streams, publication visibility
+- [ ] Hermes consumes decisions; its approval UX renders the shared engine's prompts; it never grows its own parallel policy layer
 - [ ] Fixture policies tested: same-root read-only allowed; `shell` denied unless approved; A2A between named machines; artifact roots; confirmation for `desktop_control`
 
 **Acceptance:** one policy config gates a tool call AND an A2A message; policy change alters both without touching plugin code.
@@ -197,10 +199,10 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 
 ## Failure semantics (registry stability)
 
-- **No mid-turn tool mutation.** Hermes never changes the model-visible tool list mid-turn (prompt-cache and schema-stability invariants). Pin/schema/revocation changes update daemon state immediately; the registry reflects them at the next tools-assembly boundary.
-- **Revocation fails closed anyway.** Invocation handlers check daemon state at call time — a revoked pin returns structured `capability_revoked` even if the model still holds the stale schema this turn.
-- **Daemon disappearance:** meta-tools and pinned tools share the same check_fn TTL/grace — transient flap absorbed, sustained outage removes them cleanly at next assembly; in-flight calls return the canonical daemon-unavailable error.
-- **Schema drift:** `dynamic_schema_overrides` pulls the live descriptor at assembly time; a call against a just-changed remote schema gets daemon-side validation against the *current* descriptor, and the validation error names the drift.
+- **No mid-turn tool mutation.** Hermes never changes the model-visible tool list mid-turn (prompt-cache and schema-stability invariants). Pin/schema/revocation changes update shared state immediately; the registry reflects them at the next tools-assembly boundary.
+- **Revocation fails closed anyway.** Invocation handlers check shared consent state at call time — a revoked pin returns structured `capability_revoked` even if the model still holds the stale schema this turn.
+- **Node/mesh loss:** meta-tools and pinned tools share the same check_fn TTL/grace — transient flap absorbed, sustained loss removes them cleanly at next assembly; in-flight calls return the canonical mesh-unreachable error.
+- **Schema drift:** `dynamic_schema_overrides` pulls the live descriptor at assembly time; a call against a just-changed remote schema gets SDK-side validation against the *current* descriptor, and the validation error names the drift.
 
 ## Non-goals
 Untrusted discovery, attestations, spend limits, billing, paid tasks (later ladder); the OpenClaw plugin (bridge plan, optional); Hermes as a horizontal product; patches to Hermes core outside `plugins/net/`.
@@ -212,9 +214,9 @@ Phase 0.5 config-to-first-invoke time; pinned-tool arg accuracy vs local baselin
 
 | Risk | Mitigation |
 |---|---|
-| Daemon engine partially shim-side | Cross-plan gate test before Phase 1 |
+| Consent engine partially shim-private instead of SDK-shared | Cross-plan gate test before Phase 1 |
 | Model confuses `tool_search` (local) with `net_search_capabilities` (mesh) | Explicit disambiguating descriptions; measure misroutes in Phase 1 |
 | Meta-tools always-load costs 5 tool defs in every prompt | Trivial vs the double-indirection failure mode; revisit only if measured context pressure demands it |
 | net-mesh-sdk Python API gaps (pin subscription, delegation context) | SDK gap = blocker filed against Net repo, not worked around with private hooks (H6) |
 | Hermes upstream churn (1.3M LOC, fast-moving) | Everything in `plugins/net/`; only stable surfaces used (registry, plugin API, approval hooks); pin tested Hermes versions in CI |
-| Pin approval UX drift between Hermes/CLI/shim | Single daemon store + the cross-client propagation test in Phase 2 |
+| Pin approval UX drift between Hermes/CLI/shim | Single shared store + the cross-client propagation test in Phase 2 |
