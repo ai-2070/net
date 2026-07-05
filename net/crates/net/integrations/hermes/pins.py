@@ -244,7 +244,16 @@ class PinPromotionService:
             loop.call_soon_threadsafe(task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-            self._thread = None
+            # Only clear the handle if the thread actually stopped — otherwise a
+            # later start() would see `_thread is None` and spawn a SECOND
+            # promotion loop alongside the still-running one.
+            if self._thread.is_alive():
+                logger.warning(
+                    "net plugin: pin promotion thread did not stop within 2s; "
+                    "keeping the handle so start() won't spawn a second loop"
+                )
+            else:
+                self._thread = None
 
 
 def start_pin_promotion() -> PinPromotionService:
