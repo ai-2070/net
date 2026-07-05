@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN.md
+  s_1539b6b2705f81::t_db6fa2cbd783f7 131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d2417308092306d078c8e4b70c70967c2780487b",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
