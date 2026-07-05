@@ -22,11 +22,18 @@ move it adds:
 - A large rewrite of `wrap/session.rs` (the `ServerPublisher` / shared-publisher
   merge model) and cross-language golden-vector conformance tests.
 
-> **Status — OPEN (2026-07-05).** Findings below are unfixed at the time of
-> review. File/line anchors point at the code **as reviewed** (`master...HEAD`
-> HEAD). F1–F5 are all in the Go/cgo path, which per the branch notes is
-> **Linux-CI-only** (the cdylib can't build on the Windows dev box), so it is the
-> least-exercised surface on the branch — verify these on Linux CI.
+> **Status — RESOLVED (2026-07-05).** All nine findings and the two actioned
+> minors were fixed on `mcp-sdk`, each as its own commit (see the Resolution
+> table at the end). File/line anchors below point at the code **as reviewed**
+> (pre-fix) and are left intact as the record. The Rust fixes (F5–F9 + the
+> mcp-ffi/CLI minors) build and pass their tests locally — sdk lib (58), adapter
+> lib (204), the classify/lower + consent golden vectors, and the wrap/serve
+> end-to-end suites. F1–F4 are in the Go/cgo path, which per the branch notes is
+> **Linux-CI-only** (the cdylib can't build on the Windows dev box); they are
+> `gofmt`-clean with new tests and must be run under `go test -race` on Linux
+> CI. One minor (the `cstr`/`opt_cstr` unbounded lifetime) is deliberately left
+> as-is — latent and not triggerable by any current caller, and the fix would
+> touch every FFI function.
 
 ---
 
@@ -359,3 +366,27 @@ independently corrupts all Go-side error reporting; **F4** matters as soon as a
 wrap refresh path. **F6/F8** are altitude/efficiency; **F7/F9** and the minors are
 lower-stakes. F1–F4 need Linux CI to exercise (the cdylib doesn't build on the
 Windows dev box).
+
+---
+
+## Resolution (2026-07-05)
+
+Each finding fixed as its own commit on `mcp-sdk`.
+
+| # | Fix | Commit | Test |
+|---|-----|--------|------|
+| F1 | Pin the OS thread across each FFI call + its thread-local error drain (`pinThread`) | `fix(go/mcp): pin the OS thread…` | gofmt; Linux CI |
+| F2 | Fail closed: `Decide` never returns `("", nil)`; `RequiresApproval` gates on any non-`"allowed"`/error | `fix(go/mcp): fail closed…` | `TestConsentPolicyFailsClosedOnError` |
+| F3 | `runtime.KeepAlive(p)` on every `ConsentPolicy` method that passes `p.ptr` to cgo | `fix(go/mcp): keep ConsentPolicy alive…` | gofmt; Linux CI |
+| F4 | `sync.Mutex` serializes all FFI access; `Close` atomic (no double-free) | `fix(go/mcp): serialize…with a mutex` | `TestConsentPolicyConcurrentAccessIsSafe` (`-race`) |
+| F5 | `refresh()` captures the prior contribution (`swap`) and rolls back (`restore` + re-announce) on any failure | `fix(mcp/wrap): roll back refresh()…` | `swap_captures_the_prior_contribution_and_restore_reverts_it` + wrap e2e |
+| F6 | `ConsentDecision::as_str`, `PinState::as_str`, `CredentialOverride::from_wire`, `Substitutability::from_label`; three bindings delegate | `refactor(mcp): give the wire vocabulary one source…` | classify/lower + consent golden vectors |
+| F7 | Acquire the pin-store lock via `try_lock_exclusive` + async backoff (no parked pool thread) | `fix(sdk/pins): acquire store lock without parking…` | `contended_mutations_make_progress_under_a_tiny_blocking_pool` |
+| F8 | `build_capability_set` takes an iterator; `merged()` streams tools instead of deep-cloning | `perf(mcp/wrap): stop deep-cloning…` | wrap::session unit tests |
+| F9 | Correct the inverted `credential_requires_consent` docstring (`False` → `True`) | `fix(python): correct inverted…docstring` | doc-only |
+| minor | `opt_cstr` returns `Err` on bad UTF-8 instead of coercing to the default | `fix(mcp-ffi): report invalid UTF-8…` | golden vectors unchanged |
+| minor | Log when graceful mesh shutdown is skipped (`Arc::try_unwrap` fails) | `fix(cli/wrap): note when graceful…skipped` | builds |
+| minor | `cstr`/`opt_cstr` unbounded `&'a str` lifetime | *deferred* | latent, not triggerable |
+
+Branch HEAD: sdk + adapter tests green (lib, golden vectors, wrap/serve e2e);
+Go fixes gofmt-clean pending Linux-CI `go test -race`.
