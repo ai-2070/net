@@ -1,4 +1,4 @@
-# Implementation Plan: Payments — x402-Native Core + Mock Facilitator (burn-down)
+# Implementation Plan: Payments P0 — x402-Native Core + Mock Facilitator (burn-down)
 
 **Implements:** `PAYMENTS_SDK_PLAN.md` stage P0, **reshaped x402-first.** Prerequisite commits: (1) sync the stale in-repo plan doc from the final revision; (2) revise its object-model section per this reshape — Net envelopes around x402 v2 structures, not a parallel vocabulary.
 
@@ -27,7 +27,7 @@ net/crates/net/payments/            # net-payments; depends on net-mesh-sdk, NEV
 - [ ] Envelopes: `net.pricing.terms@1` embeds `accepts[]` templates in the capability announcement (pricing visible at discovery — no 402 round-trip needed on the mesh); `net.payment.quote@1` = provider-identity-signed envelope over instantiated PaymentRequirements + capability/invocation binding + registry ref; `net.settlement.ref@1` wraps the x402 settlement response + tx hash. Client payload travels in the invocation envelope — no separate intent object
 - [ ] Identifiers are CAIP-2 (network) / CAIP-19 (asset). The signed registry survives as **policy over CAIP-19 ids** — allowed assets, decimals cross-check, display, equivalence classes — not as the identity authority. Amounts: atomic/minor units as strings, matching x402; checked math; no floats
 - [ ] `net.payment.verification@1` (tiered, chained, immutable) and `net.billing.event@1` unchanged — these are Net's value-add, x402 has no equivalent
-- [ ] Golden vectors in `tests/cross_lang_payments/`: envelope canonicalization + **x402 fixture byte-preservation** (round-trip a real v2 requirements/payload fixture through every binding, assert byte-identical), CAIP confusion vectors, decimals mismatch, unknown-field preservation. Four verifiers in CI
+- [ ] Golden vectors in `tests/cross_lang_payments/`: envelope canonicalization + **x402 fixture byte-preservation** (round-trip captured, **version-pinned** v2 fixtures — `fixtures/x402/v2.0/...`, never "latest" — through every binding, assert byte-identical), CAIP confusion vectors, decimals mismatch, unknown-field preservation. Four verifiers in CI
 
 **Acceptance:** vectors byte-identical across Rust/Node/Python/Go; a captured real-world x402 v2 fixture survives every binding untouched.
 
@@ -35,7 +35,7 @@ net/crates/net/payments/            # net-payments; depends on net-mesh-sdk, NEV
 
 The mock is an **in-process x402 facilitator** implementing verify/settle against a `mock` scheme on a `mock` CAIP-2 network — exercising the real P1 interfaces, not a bespoke trait:
 
-- [ ] `facilitator/traits.rs`: verify/settle client interface + `finality_model()` and confidence mapping per network — the same interface `facilitator/client.rs` implements against real facilitators in P1
+- [ ] `facilitator/traits.rs`: verify/settle client interface; confidence mapping into the **fixed tier enum `observed | confirmed(n) | final`** per network; structured retryable errors for facilitator failure (policy: fail-closed default / retry / fallback — paid capabilities never silently serve unverified) — the same interface `facilitator/client.rs` implements against real facilitators in P1
 - [ ] Injectable modes as facilitator behaviors: `success, wrong_amount, late_finality, reorg_invalidate` (receipt issued then invalidated), `replay, expired_requirements, verification_timeout` — per-quote test knob, deterministic
 - [ ] Consumed-payload replay index (policy-store-backed); verification chains with `invalidated{reorg}` regression; billing events reference the chain
 - [ ] Idempotency: key scoped `{caller, provider, capability, quote}` — same-key retry = one settle, one serve, one billing event id
