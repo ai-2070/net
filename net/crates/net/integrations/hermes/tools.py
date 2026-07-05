@@ -177,6 +177,17 @@ async def handle_net_invoke(args: Dict[str, Any], **_kw) -> str:
     cap_id = str(args.get("cap_id") or "").strip()
     if not cap_id:
         return _json({"status": "error", "error": "cap_id is required"})
+    if not node.delegation_valid_for_invoke():
+        # Never invoke under a revoked/expired delegation chain (the provider
+        # would reject it too, but fail fast + honestly here).
+        return _json(
+            {
+                "status": "denied",
+                "cap_id": cap_id,
+                "error": "the gateway delegation is revoked or expired; "
+                "re-approve or renew it before invoking",
+            }
+        )
     arguments = args.get("arguments")
     if arguments is None:
         arguments = {}

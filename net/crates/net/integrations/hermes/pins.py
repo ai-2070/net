@@ -81,6 +81,14 @@ def make_pinned_handler(cap_id: str) -> Callable:
     consent-gated gateway (so a revoked pin fails closed here)."""
 
     async def handler(args: Dict[str, Any], **_kw) -> str:
+        if not node.delegation_valid_for_invoke():
+            return json.dumps(
+                {
+                    "status": "denied",
+                    "error": "the gateway delegation is revoked or expired; "
+                    "re-approve or renew it before invoking",
+                }
+            )
         return await node.gateway().invoke(cap_id, json.dumps(args or {}))
 
     handler.__name__ = f"pinned_{pinned_tool_name(cap_id)}"

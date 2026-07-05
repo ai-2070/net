@@ -93,3 +93,47 @@ def test_gateway_delegation_exposes_the_signer_inputs(plugin):
     cb = gd.chain_bytes()
     assert isinstance(cb, (bytes, bytearray)) and len(cb) > 0
     assert net.DelegationChain.from_bytes(cb).leaf == gd.gateway_id
+
+
+def test_machine_label_is_unique_and_persistent(plugin, monkeypatch, tmp_path):
+    # The default machine label must be unique + persistent (not the unstable
+    # hostname), so two machines sharing a hostname don't derive identical
+    # machine/gateway identities from the same root.
+    delegation = plugin.delegation
+    monkeypatch.setenv("NET_MESH_PIN_STORE", str(tmp_path / "pins.json"))
+    monkeypatch.delenv("NET_MESH_MACHINE_ID", raising=False)
+
+    label1 = delegation._machine_label()
+    label2 = delegation._machine_label()
+    assert label1 == label2, "label must be stable across calls"
+    assert label1 and label1 != "unknown-host"
+    # It embeds a persistent random id, not just the bare hostname.
+    pid = delegation._persistent_machine_id()
+    assert pid and pid in label1
+
+
+def test_explicit_machine_id_overrides_the_default(plugin, monkeypatch):
+    delegation = plugin.delegation
+    monkeypatch.setenv("NET_MESH_MACHINE_ID", "my-unique-box-42")
+    assert delegation._machine_label() == "my-unique-box-42"
+
+
+def test_invoke_refuses_when_the_delegation_is_invalid(plugin, monkeypatch):
+    # A revoked/expired delegation must short-circuit the invoke BEFORE the
+    # gateway is touched — proving the invoke path enforces validity, not just
+    # check_fn. (The mesh/gateway slots are bare objects with no .invoke, so a
+    # non-short-circuit would AttributeError.)
+    import asyncio
+    import json
+
+    tools = plugin.tools
+    node = plugin.node
+
+    class _InvalidDelegation:
+        def verify(self):
+            return False
+
+    monkeypatch.setattr(node, "_state", (object(), object(), "unused", _InvalidDelegation()))
+    res = json.loads(asyncio.run(tools.handle_net_invoke({"cap_id": "42/x"})))
+    assert res["status"] == "denied"
+    assert "revoked or expired" in res["error"]

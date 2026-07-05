@@ -231,6 +231,28 @@ def delegation():
     return get_state()[3]
 
 
+def delegation_valid_for_invoke() -> bool:
+    """``True`` unless a delegation is present but no longer verifies
+    (revoked / expired).
+
+    The invoke path checks this so it never signs + sends under an invalid chain
+    — the provider re-verifies revocation on every invoke and would reject it
+    anyway, but this fails fast at the source (and covers callers that bypass
+    the tools' ``check_fn``, e.g. promoted pinned-tool handlers). Search /
+    describe don't carry the chain, so they don't consult this.
+    """
+    try:
+        d = get_state()[3]
+    except Exception:  # noqa: BLE001 — a node-build failure surfaces via gateway() instead
+        return True
+    if d is None:
+        return True
+    try:
+        return d.verify()
+    except Exception:  # noqa: BLE001 — a verify error is "invalid", not a crash
+        return False
+
+
 def shutdown() -> None:
     """Tear the node down (best-effort, idempotent). Called at session end."""
     global _state

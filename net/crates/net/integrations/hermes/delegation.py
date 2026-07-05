@@ -38,19 +38,95 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TTL_SECONDS = 24 * 60 * 60
 
 
-def _machine_label() -> str:
-    """A stable per-machine label for the delegation namespace.
-
-    Overridable via ``NET_MESH_MACHINE_ID`` (set this when the hostname isn't
-    stable, e.g. containers); defaults to the hostname.
-    """
-    override = (os.environ.get("NET_MESH_MACHINE_ID") or "").strip()
-    if override:
-        return override
+def _hostname() -> str:
     try:
         return socket.gethostname() or platform.node() or "unknown-host"
     except Exception:  # noqa: BLE001 — a hostname lookup must never sink the node
         return "unknown-host"
+
+
+def _machine_id_path() -> Optional["pathlib.Path"]:
+    """Where the persistent per-machine id lives — next to the machine-shared
+    pin store (a stable per-user net-mesh dir). ``None`` if no dir resolves."""
+    import pathlib
+
+    pin = (os.environ.get("NET_MESH_PIN_STORE") or "").strip()
+    if pin:
+        return pathlib.Path(pin).parent / "machine-id"
+    try:
+        from net_sdk import default_pin_store_path
+
+        base = default_pin_store_path()
+    except Exception:  # noqa: BLE001
+        base = None
+    if base:
+        return pathlib.Path(base).parent / "machine-id"
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if home:
+        import pathlib as _pl
+
+        return _pl.Path(home) / ".net-mesh" / "machine-id"
+    return None
+
+
+def _persistent_machine_id() -> str:
+    """A unique, persistent per-machine id — generated once and stored so it
+    survives restarts. Returns ``""`` if it can't be read or written (the caller
+    then warns and falls back to the hostname)."""
+    import secrets
+
+    idfile = _machine_id_path()
+    if idfile is None:
+        return ""
+    try:
+        existing = idfile.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    try:
+        idfile.parent.mkdir(parents=True, exist_ok=True)
+        value = secrets.token_hex(16)
+        # Exclusive create so two racing starts on one machine agree on ONE id
+        # (whoever creates first wins; the loser reads it) rather than deriving
+        # two different machine identities.
+        try:
+            with open(idfile, "x", encoding="utf-8") as f:
+                f.write(value)
+            return value
+        except FileExistsError:
+            return (idfile.read_text(encoding="utf-8").strip()) or value
+    except OSError:
+        return ""
+
+
+def _machine_label() -> str:
+    """A **unique, persistent** per-machine label for the delegation namespace.
+
+    Machine + gateway identities are derived deterministically from this label
+    (`derive_child_seed(root, f"machine:{label}")`), so two machines sharing a
+    label produce identical `machine_id` / `gateway_id` from the same root —
+    breaking per-machine revocation isolation and conflating audit trails.
+
+    Order: explicit ``NET_MESH_MACHINE_ID`` → a persistent random per-machine id
+    (host-prefixed for readability) → **hostname with a loud warning** (the only
+    unstable path, and only when no id can be persisted).
+    """
+    override = (os.environ.get("NET_MESH_MACHINE_ID") or "").strip()
+    if override:
+        return override
+    host = _hostname()
+    persistent = _persistent_machine_id()
+    if persistent:
+        return f"{host}:{persistent}" if host != "unknown-host" else persistent
+    logger.warning(
+        "net plugin: could not establish a unique persistent machine id; "
+        "delegation identities derive from the hostname (%s) and may COLLIDE "
+        "with another machine sharing it (breaking per-machine revocation). Set "
+        "NET_MESH_MACHINE_ID to a unique, stable value.",
+        host,
+    )
+    return host
 
 
 class GatewayDelegation:
