@@ -188,14 +188,13 @@ async def handle_net_invoke(args: Dict[str, Any], **_kw) -> str:
 async def handle_net_list_pinned(args: Dict[str, Any], **_kw) -> str:
     from net_sdk import AsyncPinStore
 
-    store = AsyncPinStore(node.pin_store_path())
-    return _json(
-        {
-            "status": "ok",
-            "approved": await store.approved(),
-            "pending": await store.pending(),
-        }
-    )
+    try:
+        store = AsyncPinStore(node.pin_store_path())
+        approved = await store.approved()
+        pending = await store.pending()
+    except Exception as e:  # noqa: BLE001 — surface store failures as data, never raise
+        return _json({"status": "error", "error": f"could not list pinned capabilities: {e}"})
+    return _json({"status": "ok", "approved": approved, "pending": pending})
 
 
 async def handle_net_request_pin(args: Dict[str, Any], **_kw) -> str:

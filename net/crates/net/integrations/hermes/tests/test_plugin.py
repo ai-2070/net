@@ -118,6 +118,20 @@ def test_request_pin_requires_cap_id(plugin, node_ready):
     assert _run(tools.handle_net_request_pin({}))["status"] == "error"
 
 
+def test_list_pinned_surfaces_store_errors_as_data(plugin, node_ready, monkeypatch):
+    # A pin-store read failure must come back as structured JSON, never raise
+    # out of the tool call.
+    tools = plugin.tools
+
+    def _boom():
+        raise RuntimeError("store unreadable")
+
+    monkeypatch.setattr(plugin.node, "pin_store_path", _boom)
+    res = _run(tools.handle_net_list_pinned({}))
+    assert res["status"] == "error"
+    assert "store unreadable" in res["error"]
+
+
 def test_request_pin_on_an_already_approved_cap_says_so(plugin, node_ready):
     # `request` never downgrades an approved pin, so the response must not claim
     # approval is still required — the message reflects the real state.
