@@ -40,6 +40,10 @@
 //!   It forwards nothing — it exists so future phases can't smuggle forwarding
 //!   past these hostile-by-default types. **Never bound**: bindings see secret
 //!   *refs* and policy surfaces only.
+//! - [`bridge`] — the small inter-node describe protocol shared by the supply
+//!   and demand sides: the [`bridge::BRIDGE_PROVIDER_TAG`] a demand-side
+//!   gateway finds bridge providers by, and the [`bridge::DESCRIBE_SERVICE`]
+//!   nRPC service name it fetches each provider's scoped catalog through.
 
 pub mod bridge;
 pub mod forward;
