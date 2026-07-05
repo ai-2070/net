@@ -22,12 +22,17 @@ fixture = []
 # `keychain` gates the OS-keychain secret value backend
 # (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1) — macOS Keychain, Windows
 # Credential Manager, and the Linux kernel `keyutils` (all pure Rust, no C
-# system library; see the `keyring` dependency note for the keyutils vs Secret
-# Service trade-off). NOT a default feature: it pulls the `keyring` dependency
-# and needs a keychain-capable host to *run*, so the default build / CI /
-# `cargo install` never compile it. Enable it to build the backend:
+# system library and no D-Bus / Secret Service; see the dependency note below).
+# NOT a default feature: it pulls the keyring-core stack and needs a
+# keychain-capable host to *run*, so the default build / CI / `cargo install`
+# never compile it. Enable it to build the backend:
 #   cargo test -p net-mesh-mcp --features keychain
-keychain = ["dep:keyring"]
+keychain = [
+    "dep:keyring-core",
+    "dep:linux-keyutils-keyring-store",
+    "dep:windows-native-keyring-store",
+    "dep:apple-native-keyring-store",
+]
 
 # ---------------------------------------------------------------------------
 # Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
@@ -69,25 +74,35 @@ fs2 = "0.4"
 # side's `search` (`buffer_unordered`).
 futures = "0.3"
 # OS-keychain secret value backend, behind the non-default `keychain` feature
-# (see `[features]`). `default-features = false` + explicit native backends
-# keeps EVERY platform on a store that needs no C system library: Windows
-# Credential Manager, macOS Keychain, and — deliberately — the Linux kernel
-# `keyutils` backend (`linux-native`) rather than Secret Service. keyring's
-# Secret Service path pulls `dbus-secret-service` -> `libdbus-sys`, a C lib
-# (`libdbus-1-dev`) that headless CI and minimal images lack; keyutils is pure
-# Rust and needs no dbus. Trade-off: a keyutils keyring persists for the login
-# session, not across reboots — a persistent Linux backend (Secret Service) can
-# be swapped in later by enabling `sync-secret-service` and shipping libdbus.
-# Only compiled when `keychain` is enabled.
-keyring = { version = "3", optional = true, default-features = false, features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-] }
+# (see `[features]`). We link `keyring-core` + the individual native store
+# crates directly (below), NOT the `keyring` façade: keyring 4's `v1` compat
+# feature force-selects the Secret Service (zbus) store on Linux, which needs a
+# running D-Bus session that a headless server / CI / minimal image lacks and
+# drags in the whole zbus/secret-service tree. Linking the stores directly lets
+# `keychain.rs` set the Linux kernel `keyutils` store (pure Rust, no C lib, no
+# dbus, works headless) as the process default. Trade-off: a keyutils keyring
+# persists for the login session, not across reboots — for a reboot-persistent
+# Linux backend, add `zbus-secret-service-keyring-store` (pure Rust) or
+# `dbus-secret-service-keyring-store` (needs libdbus) and select it in
+# `keychain.rs`. Only compiled when `keychain` is enabled.
+keyring-core = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time", "fs"] }
+
+# Native keychain stores for the `keychain` feature — one per OS, each
+# target-gated so only the host platform's store compiles (and Linux gets
+# `keyutils`, never Secret Service). Activated by the `keychain` feature above;
+# the store is set as the process default in `keychain.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { version = "1", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1", optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+apple-native-keyring-store = { version = "1", optional = true, features = ["keychain"] }
 
 [dev-dependencies]
 # Parses this crate's own manifest in the dependency-boundary test.
