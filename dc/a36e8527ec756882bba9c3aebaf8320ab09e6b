@@ -1,0 +1,35 @@
+web/src/content/docs/guides/wrap-mcp-server.md
+  s_cdbc9688784d9a::t_431d24e21b84c5 99-108
+net/crates/net/adapters/mcp/Cargo.toml
+  s_cdbc9688784d9a::t_1f4e3bcf8bd64d 89-91
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_cdbc9688784d9a::t_29cc5fbada1936 229
+  s_cdbc9688784d9a::t_b6446b858a2d6c 36
+  s_cdbc9688784d9a::t_3ee1a9bf57ca40 604,608
+  s_cdbc9688784d9a::t_c5b758f922459a 166,178,183,187,193
+  s_cdbc9688784d9a::t_a8355a63a1d1b1 248-249
+  s_cdbc9688784d9a::t_32443903894775 270,274
+  s_cdbc9688784d9a::t_6e67b96e6c737e 42
+net/crates/net/sdk/src/lib.rs
+  s_cdbc9688784d9a::t_e61c85e650d7d1 75-77
+net/crates/net/Cargo.lock
+  s_cdbc9688784d9a::t_d127ac40e7ea0d 2557
+net/crates/net/docs/plans/MCP_BRIDGE_SDK_PLAN.md
+  s_cdbc9688784d9a::t_84a76ddc781320 40-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dca36e8527ec756882bba9c3aebaf8320ab09e6b",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
