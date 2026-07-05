@@ -1,0 +1,23 @@
+net/crates/net/tools/hermes-gate/probe_propagation.py
+  s_4b449b0a181874::t_7f11fd4ed0c78d 1-77
+net/crates/net/tools/hermes-gate/probe_full_gate.py
+  s_4b449b0a181874::t_1fe2c90d73d1e1 19
+  s_4b449b0a181874::t_4f0ede9caf0e8b 1-18,20-63,73-98
+  s_4b449b0a181874::t_906bdde0240e53 64-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a8284c8ac18931bd375c97146d8bb470bed6d84",
+  "prompts": {},
+  "sessions": {
+    "s_4b449b0a181874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f19c588e-03dd-49aa-bfa8-acdee181ed34",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
