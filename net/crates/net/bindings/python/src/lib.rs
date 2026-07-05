@@ -3166,6 +3166,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<delegation::PyDelegationChain>()?;
         m.add_class::<delegation::PyRevocationRegistry>()?;
         m.add_function(wrap_pyfunction!(delegation::derive_child_identity, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            delegation::default_revocation_store_path,
+            m
+        )?)?;
         m.add(
             "GATEWAY_DELEGATION_CHANNEL",
             delegation::GATEWAY_DELEGATION_CHANNEL,

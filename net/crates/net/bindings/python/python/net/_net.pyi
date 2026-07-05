@@ -978,6 +978,14 @@ def derive_child_identity(parent: Identity, label: str) -> Identity:
     vs ``"gateway:hostA:hermes"``."""
     ...
 
+def default_revocation_store_path() -> Optional[str]:
+    """The per-user default revocation-store path — the same file a
+    ``net wrap --owner-root`` provider honors and ``net identity revoke``
+    writes — or ``None`` if neither a data-local nor a home directory resolves.
+    Pass it (or the ``NET_MESH_REVOCATION_STORE`` override) to
+    :meth:`RevocationRegistry.load_from_store`."""
+    ...
+
 class RevocationRegistry:
     """Shared per-issuer revocation floor. Bumping an issuer's floor
     invalidates every outstanding delegation from that issuer — including
@@ -996,6 +1004,15 @@ class RevocationRegistry:
         ...
     def floor(self, issuer: bytes) -> int:
         """Current revocation floor for ``issuer`` (0 if never revoked)."""
+        ...
+    def load_from_store(self, path: str) -> None:
+        """Reload the machine-shared revocation floors at ``path`` into this
+        registry (monotonic — floors only rise, so re-loading is idempotent). A
+        missing store file is a no-op; an unreadable/corrupt store raises. Lets a
+        caller's self-check observe an operator's ``net identity revoke`` (the
+        same file a ``net wrap --owner-root`` provider honors), so a revoked chain
+        fails :meth:`DelegationChain.verify` on the caller side too. Use
+        :func:`default_revocation_store_path` for ``path``."""
         ...
 
 class DelegationChain:

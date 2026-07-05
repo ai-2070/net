@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -24,6 +25,7 @@ use net::adapter::net::identity::{EntityId, EntityKeypair, TokenCache};
 use net_sdk::delegation::{
     derive_child_seed, DelegationChain, RevocationRegistry, DEFAULT_DELEGATION_DEPTH,
 };
+use net_sdk::revocation::RevocationStore;
 use net_sdk::Identity as SdkIdentity;
 
 use crate::identity::{identity_err, token_err, Identity};
@@ -114,6 +116,37 @@ impl PyRevocationRegistry {
         let id = entity_id_from_bytes(issuer)?;
         Ok(self.inner.floor(&id))
     }
+
+    /// Reload the machine-shared revocation floors at `path` into this registry
+    /// (monotonic — floors only ever rise, so re-loading is idempotent and
+    /// composes with any in-process `revoke`). A missing store file is a no-op
+    /// (nothing revoked yet); an unreadable or corrupt store raises.
+    ///
+    /// This is what lets a *caller's* self-check observe an operator's
+    /// `net identity revoke` — written to the same file a `net wrap --owner-root`
+    /// provider honors — so a revoked chain fails `DelegationChain.verify` on the
+    /// caller side too, not only when the provider re-verifies. Use
+    /// [`default_revocation_store_path`] (or the `NET_MESH_REVOCATION_STORE`
+    /// override) for `path`.
+    fn load_from_store(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let owned = path.to_string();
+        let store = py
+            .detach(|| RevocationStore::load(&owned))
+            .map_err(|e| PyRuntimeError::new_err(format!("revocation store: {e}")))?;
+        store.apply_to(&self.inner);
+        Ok(())
+    }
+}
+
+/// The per-user default revocation-store path — the same file a
+/// `net wrap --owner-root` provider honors and `net identity revoke` writes —
+/// or `None` if neither a data-local nor a home directory resolves. Pass it (or
+/// the `NET_MESH_REVOCATION_STORE` override) to
+/// [`RevocationRegistry.load_from_store`](PyRevocationRegistry::load_from_store)
+/// so a caller-side check observes an operator revocation.
+#[pyfunction]
+pub fn default_revocation_store_path() -> Option<String> {
+    net_sdk::revocation::default_revocation_store_path().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// A `root → … → leaf` delegation chain that attributes a capability

@@ -36,6 +36,39 @@ def test_revoke_gateway_makes_verify_false(plugin):
     assert gd.verify() is False
 
 
+def test_store_revocation_makes_verify_false(plugin, tmp_path):
+    # Provider-parity: an operator's `net identity revoke` written to the
+    # machine-shared store is observed by the caller-side self-check, so a revoked
+    # gateway's chain fails verify() (and thus check_fn) — not only rejected at
+    # the provider.
+    import json
+
+    store = tmp_path / "delegation-revocations.json"
+    gd = plugin.delegation.GatewayDelegation(
+        _SEED, machine_label="hostA", revocation_store_path=str(store)
+    )
+    assert gd.verify() is True  # no store file yet → empty → still valid
+
+    # An operator revokes this machine's gateway delegation in the shared store.
+    store.write_text(
+        json.dumps({"floors": [{"issuer": gd.machine_id.hex(), "generation": 1}]})
+    )
+    # verify() reloads the store on each call and now observes the revocation.
+    assert gd.verify() is False
+
+
+def test_verify_survives_a_corrupt_revocation_store(plugin, tmp_path):
+    # A store that can't be parsed must not crash verify() or open a hole: keep
+    # the last-known floors (here none), so a still-valid chain stays valid rather
+    # than failing shut or raising out of check_fn.
+    store = tmp_path / "delegation-revocations.json"
+    store.write_text("{ not valid json")
+    gd = plugin.delegation.GatewayDelegation(
+        _SEED, machine_label="hostA", revocation_store_path=str(store)
+    )
+    assert gd.verify() is True
+
+
 def test_subagent_extension_verifies(plugin):
     import net
 

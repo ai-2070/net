@@ -332,6 +332,7 @@ try:
         GATEWAY_DELEGATION_CHANNEL,
         DelegationChain,
         RevocationRegistry,
+        default_revocation_store_path,
         derive_child_identity,
     )
 except ImportError:  # pragma: no cover - minimal build
@@ -341,6 +342,7 @@ else:
         "GATEWAY_DELEGATION_CHANNEL",
         "DelegationChain",
         "RevocationRegistry",
+        "default_revocation_store_path",
         "derive_child_identity",
     ]
 

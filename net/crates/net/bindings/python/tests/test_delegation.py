@@ -128,6 +128,50 @@ def test_gateway_delegation_channel_is_a_nonempty_string():
     assert net.GATEWAY_DELEGATION_CHANNEL
 
 
+def test_load_from_store_applies_floors(tmp_path):
+    # A caller-side registry observes an operator's revocation written to the
+    # machine-shared store (the same file `net wrap --owner-root` honors and
+    # `net identity revoke` writes), so a revoked chain fails verify on the caller
+    # side too — not only when the provider re-verifies.
+    import json
+
+    root, machine, gateway = _root_machine_gateway()
+    chain = net.DelegationChain.derive_gateway(root, machine, gateway, 3600)
+    reg = net.RevocationRegistry()
+    assert chain.verify(gateway.entity_id, root.entity_id, reg) is True
+
+    store = tmp_path / "delegation-revocations.json"
+    # A missing store file is a no-op (nothing revoked yet).
+    reg.load_from_store(str(store))
+    assert reg.floor(machine.entity_id) == 0
+    assert chain.verify(gateway.entity_id, root.entity_id, reg) is True
+
+    # An operator revokes the machine issuer (bumps its floor) in the shared store.
+    store.write_text(
+        json.dumps({"floors": [{"issuer": machine.entity_id.hex(), "generation": 1}]})
+    )
+    reg.load_from_store(str(store))
+    assert reg.floor(machine.entity_id) == 1
+    # The gateway chain (issued by that machine) now fails verify — monotonic, so
+    # re-loading composes with the applied floor.
+    assert chain.verify(gateway.entity_id, root.entity_id, reg) is False
+
+
+def test_load_from_store_raises_on_a_corrupt_store(tmp_path):
+    # A corrupt store must surface (not silently drop revocations) so a caller can
+    # decide — the Hermes plugin swallows it and keeps last-known floors.
+    store = tmp_path / "delegation-revocations.json"
+    store.write_text("{ not valid json")
+    reg = net.RevocationRegistry()
+    with pytest.raises(Exception):  # noqa: B017 - RuntimeError-ish; shape isn't the point
+        reg.load_from_store(str(store))
+
+
+def test_default_revocation_store_path_shape():
+    p = net.default_revocation_store_path()
+    assert p is None or (isinstance(p, str) and p.endswith("delegation-revocations.json"))
+
+
 # --- caller-side auto-attach (Slice B2) ------------------------------------
 
 _GW = pytest.importorskip("net")  # AsyncCapabilityGateway needs net+mcp

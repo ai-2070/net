@@ -129,6 +129,24 @@ def _machine_label() -> str:
     return host
 
 
+def _revocation_store_path() -> Optional[str]:
+    """The machine-shared delegation-revocation store path — the same file a
+    ``net wrap --owner-root`` provider honors and ``net identity revoke`` writes.
+
+    ``NET_MESH_REVOCATION_STORE`` overrides; otherwise the SDK's per-user default.
+    ``None`` when neither resolves — the caller-side check then can't observe a
+    revocation (the provider still enforces it on every invoke)."""
+    override = (os.environ.get("NET_MESH_REVOCATION_STORE") or "").strip()
+    if override:
+        return override
+    try:
+        from net_sdk import default_revocation_store_path
+
+        return default_revocation_store_path()
+    except Exception:  # noqa: BLE001 — resolver unavailable ⇒ no caller-side reload
+        return None
+
+
 class GatewayDelegation:
     """The plugin's ``root -> machine -> gateway`` chain plus its shared
     revocation registry and the gateway identity handle (for subagent
@@ -147,6 +165,7 @@ class GatewayDelegation:
         machine_label: Optional[str] = None,
         gateway_label: str = "hermes",
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        revocation_store_path: Optional[str] = None,
     ) -> None:
         # Deferred so importing this module never requires the native wheel;
         # `node` catches the ImportError and degrades to an un-delegated node.
@@ -175,6 +194,16 @@ class GatewayDelegation:
         self._registry = RevocationRegistry()
         self._chain = DelegationChain.derive_gateway(
             root, machine, gateway, ttl_seconds
+        )
+
+        # The machine-shared revocation store `verify()` reloads before each
+        # check, so an operator's `net identity revoke` is observed caller-side.
+        # An explicit path wins (tests, non-default deployments); otherwise the
+        # per-user default (env override or SDK resolver).
+        self._revocation_store_path: Optional[str] = (
+            revocation_store_path
+            if revocation_store_path is not None
+            else _revocation_store_path()
         )
 
     # --- accessors ---------------------------------------------------------
@@ -223,7 +252,23 @@ class GatewayDelegation:
 
     def verify(self) -> bool:
         """``True`` iff the gateway chain still verifies — anchored at the
-        root, presented by the gateway, and neither expired nor revoked."""
+        root, presented by the gateway, and neither expired nor revoked.
+
+        Reloads the machine-shared revocation store first (when a path resolved),
+        so an operator's ``net identity revoke`` — written to the same file the
+        provider honors — makes this caller-side check fail fast too, not only the
+        provider's per-invoke re-verify. Floors are monotonic, so a transient
+        store-read error keeps the last-known floors (logged) and never opens a
+        hole; the chain's own TTL still bounds a store that can't be read at all.
+        """
+        if self._revocation_store_path:
+            try:
+                self._registry.load_from_store(self._revocation_store_path)
+            except Exception:  # noqa: BLE001 — keep last-known floors on a read error
+                logger.debug(
+                    "net plugin: revocation store reload failed; keeping last-known floors",
+                    exc_info=True,
+                )
         return self._chain.verify(self._gateway.entity_id, self._root_id, self._registry)
 
     def delegate_subagent(self, subagent_id: bytes):

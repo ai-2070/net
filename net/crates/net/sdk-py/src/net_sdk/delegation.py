@@ -31,6 +31,7 @@ from net import (
     GATEWAY_DELEGATION_CHANNEL,
     DelegationChain,
     RevocationRegistry,
+    default_revocation_store_path,
     derive_child_identity,
 )
 
@@ -38,5 +39,6 @@ __all__ = [
     "GATEWAY_DELEGATION_CHANNEL",
     "DelegationChain",
     "RevocationRegistry",
+    "default_revocation_store_path",
     "derive_child_identity",
 ]
