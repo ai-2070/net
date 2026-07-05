@@ -21,6 +21,7 @@ use bytes::Bytes;
 use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus};
 use serde_json::Value;
 
+use super::delegation::{DelegationGate, HDR_DELEGATION, HDR_DELEGATION_SIG};
 use super::stdio::StdioMcpClient;
 use crate::spec::CallToolResult;
 
@@ -44,6 +45,21 @@ pub const ERR_UPSTREAM: u16 = 0x8003;
 /// `ERR_UPSTREAM` so a caller can tell "the tool said no" from "the bridge
 /// couldn't reach the tool".
 pub const ERR_TOOL: u16 = 0x8004;
+/// A delegated invoke (carrying a [`HDR_DELEGATION`] chain) failed
+/// verification — bad/missing signature, replay, stale, revoked, or a chain
+/// that doesn't root at the provider's owner. Distinct from
+/// [`ERR_OWNER_SCOPE`] (the no-chain origin-allowlist path).
+pub const ERR_DELEGATION: u16 = 0x8005;
+
+/// Find the first request header named `name` in `ctx.payload.headers`
+/// (`Vec<(String, Vec<u8>)>` — the substrate's `RpcHeader` alias). First match
+/// wins, mirroring `predicate_from_rpc_headers`.
+fn find_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_slice())
+}
 
 /// Who may invoke a wrapped tool. Owner-only by default (doctrine #3): only
 /// caller origins the operator has admitted. Widening flags
@@ -123,17 +139,32 @@ pub struct WrapInvokeHandler {
     client: Arc<StdioMcpClient>,
     tool: String,
     scope: OwnerScope,
+    /// Optional delegation gate (Phase 3 Slice B). When set, an invoke that
+    /// carries a [`HDR_DELEGATION`] chain is admitted iff the chain + its
+    /// per-invoke signature verify; a no-chain invoke still uses `scope`.
+    delegation: Option<Arc<DelegationGate>>,
 }
 
 impl WrapInvokeHandler {
     /// Build a handler that invokes `tool` on `client`, admitting only
-    /// callers in `scope`.
+    /// callers in `scope`. No delegation gate — use [`Self::with_delegation`]
+    /// to add one.
     pub fn new(client: Arc<StdioMcpClient>, tool: impl Into<String>, scope: OwnerScope) -> Self {
         Self {
             client,
             tool: tool.into(),
             scope,
+            delegation: None,
         }
+    }
+
+    /// Attach a delegation gate (or `None` to leave the owner-scope-only
+    /// behavior). Builder-style so `WrapInvokeHandler::new(...).with_delegation(g)`
+    /// reads cleanly at the serve site.
+    #[must_use]
+    pub fn with_delegation(mut self, delegation: Option<Arc<DelegationGate>>) -> Self {
+        self.delegation = delegation;
+        self
     }
 
     /// A successful nRPC response carrying `body`.
@@ -149,14 +180,41 @@ impl WrapInvokeHandler {
 #[async_trait::async_trait]
 impl RpcHandler for WrapInvokeHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
-        // [1] Owner-scope gate — the wrapper-side identity check. The origin
-        //     is AEAD-verified by the bus, not self-claimed, so this cannot
-        //     be spoofed from the request body.
-        if !self.scope.allows(ctx.caller_origin) {
-            return Err(RpcHandlerError::Application {
-                code: ERR_OWNER_SCOPE,
-                message: OWNER_SCOPE_REJECTION.to_string(),
-            });
+        // [1] Admission. A caller that presents a delegation chain
+        //     (`net-delegation`) is admitted iff the chain + its per-invoke
+        //     leaf signature verify against the provider's owner root — sound
+        //     even though `caller_origin` is spoofable within a channel
+        //     (`identity/origin.rs`), because the *signature* proves leaf-key
+        //     possession. A caller with no chain falls back to the owner-scope
+        //     origin allowlist (the AEAD-verified `caller_origin`), unchanged.
+        match (
+            &self.delegation,
+            find_header(&ctx.payload.headers, HDR_DELEGATION),
+        ) {
+            (Some(gate), Some(chain_bytes)) => {
+                let sig = find_header(&ctx.payload.headers, HDR_DELEGATION_SIG).ok_or_else(|| {
+                    RpcHandlerError::Application {
+                        code: ERR_DELEGATION,
+                        message: "delegation chain present but signature header missing".to_string(),
+                    }
+                })?;
+                // Fail-closed: any verification error rejects the invoke; the
+                // gate audits the admitted leaf on success.
+                gate.verify(&self.tool, &ctx.payload.body, chain_bytes, sig)
+                    .map_err(|e| RpcHandlerError::Application {
+                        code: ERR_DELEGATION,
+                        message: e.to_string(),
+                    })?;
+            }
+            _ => {
+                // No chain (or no gate configured): owner-scope path.
+                if !self.scope.allows(ctx.caller_origin) {
+                    return Err(RpcHandlerError::Application {
+                        code: ERR_OWNER_SCOPE,
+                        message: OWNER_SCOPE_REJECTION.to_string(),
+                    });
+                }
+            }
         }
 
         // [2] Translate the request body into tool arguments.

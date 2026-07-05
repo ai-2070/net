@@ -77,6 +77,17 @@ impl EntityId {
             .map_err(|_| EntityError::InvalidSignature)
     }
 
+    /// Verify a raw 64-byte ed25519 signature over `message`.
+    ///
+    /// Convenience for callers holding signature *bytes* (an application-level
+    /// signed envelope — e.g. the wrap adapter's per-invoke delegation
+    /// signature) rather than a typed [`Signature`], so they need no ed25519
+    /// dependency of their own. Same strict (`verify_strict`) semantics as
+    /// [`Self::verify`].
+    pub fn verify_bytes(&self, message: &[u8], signature: &[u8; 64]) -> Result<(), EntityError> {
+        self.verify(message, &Signature::from_bytes(signature))
+    }
+
     /// Compute BLAKE2s-MAC hash of the public key with a domain label.
     #[expect(
         clippy::expect_used,

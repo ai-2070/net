@@ -25,14 +25,19 @@
 
 pub mod catalog;
 pub mod credentials;
+pub mod delegation;
 pub mod descriptor;
 pub mod invoke;
 pub mod session;
 pub mod stdio;
 
 pub use credentials::{classify, ClassifyError, CredentialOverride, CredentialStatus, WrapEnv};
+pub use delegation::{
+    build_challenge, build_envelope, AuditSink, DelegationAudit, DelegationGate, DelegationReject,
+    HDR_DELEGATION, HDR_DELEGATION_SIG,
+};
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
-pub use invoke::{OwnerScope, WrapInvokeHandler};
+pub use invoke::{OwnerScope, WrapInvokeHandler, ERR_DELEGATION};
 pub use session::{
     build_capability_set, PublicationHandle, RefreshDelta, ServerPublisher, WrapConfig, WrapError,
 };
