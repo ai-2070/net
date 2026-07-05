@@ -1,0 +1,40 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_a772df20f47a78::t_41e984e6e9121e 3169-3172
+net/crates/net/bindings/python/python/net/__init__.py
+  s_a772df20f47a78::t_89e8f13cc5f142 844,856
+net/crates/net/sdk-py/src/net_sdk/delegation.py
+  s_a772df20f47a78::t_80e83b21d47f94 34,42
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a772df20f47a78::t_367f2854fe80db 981-988
+  s_a772df20f47a78::t_835d365afa46da 1008-1016
+net/crates/net/bindings/python/tests/test_delegation.py
+  s_a772df20f47a78::t_616d1025a38a08 131-174
+net/crates/net/integrations/hermes/delegation.py
+  s_a772df20f47a78::t_bfd2c737f88271 199-208
+  s_a772df20f47a78::t_e6fc52723db4a6 132-149
+  s_a772df20f47a78::t_218a25d86daca5 168
+  s_a772df20f47a78::t_3e7fa3ec27fdee 255-271
+net/crates/net/integrations/hermes/tests/test_delegation.py
+  s_a772df20f47a78::t_4c4ddddf964c55 39-71
+net/crates/net/bindings/python/src/delegation.rs
+  s_a772df20f47a78::t_816dabeca0fab8 119-149
+  s_a772df20f47a78::t_916b1cd737862e 20,28
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_a772df20f47a78::t_8b100a6da0fc2f 335,345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "efedde9663a992e61737effe847f53de5664b9aa",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
