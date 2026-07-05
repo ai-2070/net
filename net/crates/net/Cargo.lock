@@ -2636,6 +2636,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "net-mesh",
+ "net-mesh-mcp",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
  "postcard",

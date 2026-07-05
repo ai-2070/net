@@ -533,7 +533,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
