@@ -3136,6 +3136,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(all(feature = "net", feature = "mcp"))]
     {
         m.add_class::<capability_gateway::PyCapabilityGateway>()?;
+        m.add_class::<capability_gateway::PyAsyncCapabilityGateway>()?;
     }
     #[cfg(feature = "net")]
     {

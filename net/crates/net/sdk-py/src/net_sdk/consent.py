@@ -40,12 +40,12 @@ __all__ = [
     "default_pin_store_path",
 ]
 
-# The native capability gateway needs both the `net` and `mcp` features. The
-# shipped wheel has both; guard the import so a minimal build still exposes the
-# consent/pins surface.
+# The native capability gateway (sync + awaitable duals) needs both the `net`
+# and `mcp` features. The shipped wheel has both; guard the import so a minimal
+# build still exposes the consent/pins surface.
 try:
-    from net import CapabilityGateway
+    from net import AsyncCapabilityGateway, CapabilityGateway
 except ImportError:  # pragma: no cover - minimal build
     pass
 else:
-    __all__.append("CapabilityGateway")
+    __all__.extend(["AsyncCapabilityGateway", "CapabilityGateway"])

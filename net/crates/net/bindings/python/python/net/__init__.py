@@ -815,15 +815,15 @@ else:
     __all__.extend(["classify_mcp_server", "lower_mcp_tool"])
 
 # The native consent-gated capability gateway (search / describe / invoke over
-# an embedded NetMesh node). Present iff the module was built with BOTH the
-# `net` and `mcp` features (the default wheel is).
+# an embedded NetMesh node), sync + awaitable duals. Present iff the module was
+# built with BOTH the `net` and `mcp` features (the default wheel is).
 try:
-    from ._net import CapabilityGateway
+    from ._net import AsyncCapabilityGateway, CapabilityGateway
 except ImportError:
-    # `net`+`mcp` not both compiled in; symbol stays undefined.
+    # `net`+`mcp` not both compiled in; symbols stay undefined.
     pass
 else:
-    __all__.append("CapabilityGateway")
+    __all__.extend(["AsyncCapabilityGateway", "CapabilityGateway"])
 
 
 __version__ = "0.31.0"

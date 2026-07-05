@@ -2597,3 +2597,27 @@ class CapabilityGateway:
         ...
 
     def __repr__(self) -> str: ...
+
+class AsyncCapabilityGateway:
+    """Awaitable dual of :class:`CapabilityGateway` — the same ``search`` /
+    ``describe`` / ``invoke`` as coroutines for ``asyncio`` code, resolving to
+    the same structured JSON strings. Each awaits the gateway op on the mesh's
+    own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
+    was built with the ``net`` + ``mcp`` features."""
+
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = None) -> None: ...
+    @property
+    def pin_store_path(self) -> Optional[str]: ...
+    async def search(self, query: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.search`."""
+        ...
+
+    async def describe(self, cap_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.describe`."""
+        ...
+
+    async def invoke(self, cap_id: str, arguments_json: str = "{}") -> str:
+        """Awaitable :meth:`CapabilityGateway.invoke`."""
+        ...
+
+    def __repr__(self) -> str: ...

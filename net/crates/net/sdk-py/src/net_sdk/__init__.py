@@ -310,10 +310,13 @@ __all__ += [
 ]
 
 try:
-    from net_sdk.consent import CapabilityGateway  # noqa: E402
+    from net_sdk.consent import (  # noqa: E402
+        AsyncCapabilityGateway,
+        CapabilityGateway,
+    )
 except ImportError:  # pragma: no cover - minimal build
     pass
 else:
-    __all__.append("CapabilityGateway")
+    __all__ += ["AsyncCapabilityGateway", "CapabilityGateway"]
 
 __version__ = "0.31.0"

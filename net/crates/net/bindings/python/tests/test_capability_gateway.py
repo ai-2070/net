@@ -18,6 +18,7 @@ second node running ``net wrap`` (see ``tools/hermes-gate/probe_full_gate.py``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -28,7 +29,9 @@ from net import NetMesh  # noqa: E402
 
 # The gateway is only present when the module was built with both `net` and
 # `mcp` (the default wheel is). Skip the whole module cleanly otherwise.
-CapabilityGateway = pytest.importorskip("net").__dict__.get("CapabilityGateway")
+_net = pytest.importorskip("net")
+CapabilityGateway = _net.__dict__.get("CapabilityGateway")
+AsyncCapabilityGateway = _net.__dict__.get("AsyncCapabilityGateway")
 if CapabilityGateway is None:
     pytest.skip("CapabilityGateway not built (needs net+mcp features)", allow_module_level=True)
 
@@ -110,3 +113,63 @@ def test_every_surface_returns_valid_json(gateway):
         parsed = json.loads(raw)
         assert isinstance(parsed, dict)
         assert "status" in parsed
+
+
+# ---------------------------------------------------------------------------
+# Awaitable dual — same contract, driven by the event loop. Each method spawns
+# the gateway op on the mesh's own runtime, so mesh I/O stays on the right
+# reactor; asserting an unreachable provider resolves to a structured error
+# (rather than hanging or raising a reactor-affinity error) is the real check.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def async_gateway(mesh, tmp_path):
+    return AsyncCapabilityGateway(mesh, pin_store_path=str(tmp_path / "pins.json"))
+
+
+def test_async_pin_store_path_round_trips(async_gateway, tmp_path):
+    assert async_gateway.pin_store_path == str(tmp_path / "pins.json")
+    assert "AsyncCapabilityGateway" in repr(async_gateway)
+
+
+def test_async_search_on_an_empty_mesh_is_ok_and_empty(async_gateway):
+    async def body():
+        return json.loads(await async_gateway.search("anything"))
+
+    result = asyncio.run(body())
+    assert result == {"status": "ok", "capabilities": []}
+
+
+def test_async_describe_and_invoke_of_unreachable_are_structured(async_gateway):
+    async def body():
+        d = json.loads(await async_gateway.describe("42/echo"))
+        i = json.loads(await async_gateway.invoke("42/echo", json.dumps({"m": 1})))
+        return d, i
+
+    described, invoked = asyncio.run(body())
+    assert described["status"] in {"transport_error", "not_found"}
+    assert invoked["status"] in {"transport_error", "not_found"}
+
+
+def test_async_concurrent_invokes_all_resolve(async_gateway):
+    async def body():
+        raws = await asyncio.gather(
+            *(async_gateway.invoke("42/echo", "{}") for _ in range(5))
+        )
+        return [json.loads(r) for r in raws]
+
+    results = asyncio.run(body())
+    assert len(results) == 5
+    assert all(r["status"] in {"transport_error", "not_found"} for r in results)
+
+
+def test_async_malformed_id_and_arguments_are_structured(async_gateway):
+    async def body():
+        bad_id = json.loads(await async_gateway.invoke("bareword", "{}"))
+        bad_args = json.loads(await async_gateway.invoke("42/echo", "not json"))
+        return bad_id, bad_args
+
+    bad_id, bad_args = asyncio.run(body())
+    assert bad_id["status"] == "invalid_capability_id"
+    assert bad_args["status"] == "invalid_arguments"

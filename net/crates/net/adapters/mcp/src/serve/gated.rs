@@ -16,7 +16,7 @@
 //!
 //! The composition is deliberately protocol-neutral: it takes a
 //! [`CapabilityGateway`] (the mesh seam), a [`ConsentPolicy`] (config allowlist
-//! + in-memory pins), and a freshly-loaded [`PinStore`] snapshot. It knows
+//! plus in-memory pins), and a freshly-loaded [`PinStore`] snapshot. It knows
 //! nothing about JSON-RPC, stdio, or PyO3.
 
 use serde_json::{json, Value};
