@@ -19,11 +19,13 @@
 //! captured chain can't be replayed by a member spoofing the leaf's origin.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use net_sdk::delegation::{DelegationChain, RevocationRegistry};
 use net_sdk::identity::EntityId;
+use net_sdk::Identity;
 
 /// Request header carrying the serialized [`DelegationChain`] (`root → leaf`).
 pub const HDR_DELEGATION: &str = "net-delegation";
@@ -274,6 +276,66 @@ pub fn build_envelope(ts: u64, nonce: u64, sig: &[u8; 64]) -> Vec<u8> {
     env
 }
 
+/// Caller-side counterpart to [`DelegationGate`]: holds the leaf identity (its
+/// signing key) plus the serialized chain, and mints the two request headers
+/// ([`HDR_DELEGATION`] + a fresh [`HDR_DELEGATION_SIG`]) for each invoke.
+///
+/// A caller (the demand-side gateway) attaches [`Self::headers`] to every
+/// invoke; the provider's [`DelegationGate`] verifies them. Each call mints a
+/// fresh timestamp + nonce + signature, so the provider's replay guard admits
+/// every distinct attempt (and a retry after a lost reply is a *new* nonce, not
+/// a replay).
+pub struct DelegationSigner {
+    leaf: Identity,
+    chain_bytes: Vec<u8>,
+    /// Monotone nonce source. Seeded randomly so two signers (distinct leaves)
+    /// hitting the same provider don't emit colliding nonce sequences — the
+    /// provider's cache keys on the nonce value regardless of leaf.
+    nonce: AtomicU64,
+}
+
+impl DelegationSigner {
+    /// Build a signer from the leaf `Identity` (must own its signing key) and a
+    /// serialized [`DelegationChain`] whose leaf is that identity.
+    pub fn new(leaf: Identity, chain_bytes: Vec<u8>) -> Self {
+        // Random seed so distinct signers don't share a nonce sequence; a
+        // clock-derived fallback keeps this infallible if the RNG is
+        // unavailable.
+        let mut seed = [0u8; 8];
+        let base = match getrandom::fill(&mut seed) {
+            Ok(()) => u64::from_le_bytes(seed),
+            Err(_) => now_secs().wrapping_mul(2_654_435_761),
+        };
+        Self {
+            leaf,
+            chain_bytes,
+            nonce: AtomicU64::new(base),
+        }
+    }
+
+    /// The `(net-delegation, net-delegation-sig)` headers for invoking `service`
+    /// with request `body`. Signs [`build_challenge`] with the leaf key over a
+    /// fresh timestamp + nonce.
+    pub fn headers(&self, service: &str, body: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let ts = now_secs();
+        let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
+        let sig = self.leaf.sign(&build_challenge(service, body, ts, nonce));
+        vec![
+            (HDR_DELEGATION.to_string(), self.chain_bytes.clone()),
+            (HDR_DELEGATION_SIG.to_string(), build_envelope(ts, nonce, &sig)),
+        ]
+    }
+}
+
+impl std::fmt::Debug for DelegationSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationSigner")
+            .field("leaf", self.leaf.entity_id())
+            .field("chain_len", &self.chain_bytes.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +512,43 @@ mod tests {
             g.verify(TOOL, ARGS, &chain, b"short"),
             Err(DelegationReject::MalformedEnvelope)
         ));
+    }
+
+    #[test]
+    fn signer_headers_verify_through_the_gate() {
+        // The caller-side DelegationSigner and the provider-side DelegationGate
+        // are a matched pair: what the signer mints, the gate admits.
+        let (root, machine, gateway) = identities();
+        let chain = chain_for(&root, &machine, &gateway);
+        let signer = DelegationSigner::new(gateway.clone(), chain.to_bytes());
+        let g = gate(&root, Arc::new(RevocationRegistry::new()));
+
+        let headers = signer.headers(TOOL, ARGS);
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_slice())
+                .unwrap()
+        };
+        let leaf = g
+            .verify(TOOL, ARGS, find(HDR_DELEGATION), find(HDR_DELEGATION_SIG))
+            .expect("signer output must verify");
+        assert_eq!(&leaf, gateway.entity_id());
+
+        // A second mint for the same (tool, args) is a fresh nonce → also
+        // admitted (not a self-replay).
+        let headers2 = signer.headers(TOOL, ARGS);
+        let find2 = |name: &str| {
+            headers2
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_slice())
+                .unwrap()
+        };
+        assert!(g
+            .verify(TOOL, ARGS, find2(HDR_DELEGATION), find2(HDR_DELEGATION_SIG))
+            .is_ok());
     }
 
     #[test]

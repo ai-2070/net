@@ -23,7 +23,8 @@ use net_mcp::serve::{gated_invoke, ConsentPolicy, GatedOutcome, MeshGateway, Pin
 use net_mcp::spec::{CallToolResult, Implementation};
 use net_mcp::wrap::{
     build_challenge, build_envelope, CredentialOverride, DelegationAudit, DelegationGate,
-    OwnerScope, ServerPublisher, Substitutability, WrapConfig, HDR_DELEGATION, HDR_DELEGATION_SIG,
+    DelegationSigner, OwnerScope, ServerPublisher, Substitutability, WrapConfig, HDR_DELEGATION,
+    HDR_DELEGATION_SIG,
 };
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::delegation::{
@@ -331,6 +332,85 @@ async fn a_delegated_invoke_admits_via_the_chain_and_audits_the_leaf() {
             && &a.root == root.entity_id()
             && a.tool == "echo"),
         "provider audit must record the delegated gateway leaf; got {recorded:?}",
+    );
+
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
+/// Phase 3 Slice B2: the demand-side `MeshGateway` auto-attaches the delegation
+/// headers itself — a `DelegationSigner` holding the leaf key + chain signs each
+/// invoke — so an owner-scope-EXCLUDED caller invokes successfully through the
+/// ordinary `gateway.invoke` path (no hand-built headers), and the provider
+/// audits the leaf. This is the B1 wire proof driven through the real caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_auto_attaches_delegation_and_invokes() {
+    let caller = Arc::new(build_mesh(&[0x56u8; 32]).await); // node A (demand)
+    let host = Arc::new(build_mesh(&[0x56u8; 32]).await); // node B (supply)
+    handshake(&caller, &host).await;
+    let host_id = host.inner().node_id();
+
+    // root -> machine -> gateway(leaf), derived as the plugin does.
+    let root = Identity::generate();
+    let seed = root.to_bytes();
+    let machine = Identity::from_seed(derive_child_seed(&seed, "machine:h"));
+    let gateway_id = Identity::from_seed(derive_child_seed(&seed, "gateway:h:hermes"));
+    let chain = DelegationChain::derive_gateway(
+        &root,
+        &machine,
+        gateway_id.entity_id(),
+        Duration::from_secs(3600),
+        DEFAULT_DELEGATION_DEPTH,
+    )
+    .expect("derive the gateway chain");
+
+    // Provider excludes the caller from owner-scope; only the delegation gate
+    // (anchored at `root`) can admit — so a successful invoke proves the
+    // gateway auto-attached a valid chain + signature.
+    let seen: Arc<std::sync::Mutex<Vec<DelegationAudit>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let gate = Arc::new(
+        DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_audit(Arc::new(move |a: &DelegationAudit| {
+            sink_seen.lock().expect("audit lock").push(a.clone());
+        })),
+    );
+    let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
+    config.scope = OwnerScope::owner_only(0xDEAD_BEEF); // excludes the caller
+    config.delegation = Some(gate);
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
+        .await
+        .expect("publish the fixture on the host");
+    assert!(publication.tools().iter().any(|t| t == "echo"));
+
+    // The gateway signs + attaches on every invoke via the held leaf key.
+    let signer = Arc::new(DelegationSigner::new(gateway_id.clone(), chain.to_bytes()));
+    let gateway = MeshGateway::new(Arc::clone(&caller))
+        .with_invoke_timeout(Duration::from_secs(3))
+        .with_delegation(signer);
+
+    // Invoke directly (owner-scope excludes the caller, so describe would show
+    // nothing — the B2 delegation path is invoke-only).
+    let id = CapabilityId::new(host_id.to_string(), "echo");
+    let result = invoke_retry(&gateway, &id, "delegated via gateway").await;
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.text(), "delegated via gateway");
+
+    let recorded = seen.lock().expect("audit lock");
+    assert!(
+        recorded.iter().any(|a| &a.leaf == gateway_id.entity_id()
+            && &a.root == root.entity_id()
+            && a.tool == "echo"),
+        "provider must audit the delegated leaf; got {recorded:?}",
     );
 
     drop(publication);

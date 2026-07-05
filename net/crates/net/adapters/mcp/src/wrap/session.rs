@@ -419,6 +419,7 @@ impl ServerPublisher {
                 lt.mcp_name.clone(),
                 config.scope.clone(),
             )
+            .with_service(tool_id.clone())
             .with_delegation(config.delegation.clone());
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
@@ -586,6 +587,7 @@ impl PublicationHandle {
                     lt.mcp_name.clone(),
                     self.scope.clone(),
                 )
+                .with_service(tool_id.clone())
                 .with_delegation(self.delegation.clone());
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {

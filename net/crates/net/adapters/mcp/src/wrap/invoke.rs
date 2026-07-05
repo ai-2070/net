@@ -137,7 +137,12 @@ pub fn encode_result(result: &CallToolResult) -> Result<Vec<u8>, String> {
 /// `Mesh::serve_rpc(tool_id, Arc::new(handler))`.
 pub struct WrapInvokeHandler {
     client: Arc<StdioMcpClient>,
+    /// The wrapped tool's MCP name — what `tools/call` is issued against.
     tool: String,
+    /// The nRPC service name this handler is served under (the channel-safe
+    /// `tool_id`) — what the caller invokes and signs the delegation challenge
+    /// over. Equals `tool` unless the name was sanitized.
+    service: String,
     scope: OwnerScope,
     /// Optional delegation gate (Phase 3 Slice B). When set, an invoke that
     /// carries a [`HDR_DELEGATION`] chain is admitted iff the chain + its
@@ -150,12 +155,24 @@ impl WrapInvokeHandler {
     /// callers in `scope`. No delegation gate — use [`Self::with_delegation`]
     /// to add one.
     pub fn new(client: Arc<StdioMcpClient>, tool: impl Into<String>, scope: OwnerScope) -> Self {
+        let tool = tool.into();
         Self {
             client,
-            tool: tool.into(),
+            service: tool.clone(),
+            tool,
             scope,
             delegation: None,
         }
+    }
+
+    /// Set the nRPC service name (the served `tool_id`) used for the delegation
+    /// challenge. Defaults to `tool`; the serve site sets it to the `tool_id`
+    /// so the caller-signed and provider-verified challenge agree even when the
+    /// name was sanitized (`tool_id != mcp_name`).
+    #[must_use]
+    pub fn with_service(mut self, service: impl Into<String>) -> Self {
+        self.service = service.into();
+        self
     }
 
     /// Attach a delegation gate (or `None` to leave the owner-scope-only
@@ -199,8 +216,10 @@ impl RpcHandler for WrapInvokeHandler {
                     }
                 })?;
                 // Fail-closed: any verification error rejects the invoke; the
-                // gate audits the admitted leaf on success.
-                gate.verify(&self.tool, &ctx.payload.body, chain_bytes, sig)
+                // gate audits the admitted leaf on success. Verify over the
+                // SERVICE name (tool_id) the caller signed, not the internal
+                // mcp_name.
+                gate.verify(&self.service, &ctx.payload.body, chain_bytes, sig)
                     .map_err(|e| RpcHandlerError::Application {
                         code: ERR_DELEGATION,
                         message: e.to_string(),

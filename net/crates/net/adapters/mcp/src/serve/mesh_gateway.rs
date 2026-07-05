@@ -45,6 +45,7 @@ use crate::bridge::{
 };
 use crate::spec::CallToolResult;
 use crate::wrap::invoke::{ERR_BAD_REQUEST, ERR_OWNER_SCOPE, ERR_TOOL, ERR_UPSTREAM};
+use crate::wrap::DelegationSigner;
 
 /// How many times a bounded call is retried before giving up (covers the
 /// reply-channel first-reply race).
@@ -83,6 +84,13 @@ pub struct MeshGateway {
     /// receiving the operator's arguments. The operator opts in only when the
     /// mesh's peers are trustworthy-equivalent (their own nodes).
     trust_equivalent_providers: bool,
+    /// Optional caller-side delegation signer (Phase 3 Slice B2). When set,
+    /// every **invoke** carries a `net-delegation` chain + a fresh
+    /// per-invoke `net-delegation-sig` so a provider running a `DelegationGate`
+    /// admits the call by verified delegation (not the spoofable owner-scope
+    /// origin). Describe / search calls never carry it (their visibility is the
+    /// provider's owner-scope concern).
+    delegation: Option<Arc<DelegationSigner>>,
 }
 
 impl MeshGateway {
@@ -93,7 +101,18 @@ impl MeshGateway {
             fingerprints: Mutex::new(HashMap::new()),
             invoke_timeout: DEFAULT_INVOKE_TIMEOUT,
             trust_equivalent_providers: false,
+            delegation: None,
         }
+    }
+
+    /// Attach a caller-side [`DelegationSigner`] so every invoke carries a
+    /// verified delegation chain + per-invoke signature. The gateway invokes as
+    /// the chain's leaf identity; a provider running a `DelegationGate` anchored
+    /// at the matching owner root admits the call regardless of the (spoofable)
+    /// owner-scope origin, and audits the leaf.
+    pub fn with_delegation(mut self, signer: Arc<DelegationSigner>) -> Self {
+        self.delegation = Some(signer);
+        self
     }
 
     /// Override the per-attempt invoke deadline (default 120s). Describe keeps a
@@ -145,13 +164,13 @@ impl MeshGateway {
         service: &str,
         body: Bytes,
         timeout: Duration,
+        headers: Vec<(String, Vec<u8>)>,
     ) -> Result<Bytes, RpcError> {
-        match tokio::time::timeout(
-            timeout,
-            self.mesh.call(node, service, body, CallOptions::default()),
-        )
-        .await
-        {
+        let opts = CallOptions {
+            request_headers: headers,
+            ..CallOptions::default()
+        };
+        match tokio::time::timeout(timeout, self.mesh.call(node, service, body, opts)).await {
             Ok(Ok(reply)) => Ok(reply.body),
             Ok(Err(e)) => Err(e),
             Err(_elapsed) => Err(RpcError::Timeout {
@@ -173,10 +192,26 @@ impl MeshGateway {
         body: Bytes,
         timeout: Duration,
         retriable: fn(&RpcError) -> bool,
+        delegate: bool,
     ) -> Result<Bytes, RpcError> {
         let mut last: Option<RpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match self.call_once(node, service, body.clone(), timeout).await {
+            // Mint fresh delegation headers PER ATTEMPT: the provider's replay
+            // guard rejects a reused nonce, so a retry after a lost reply must
+            // carry a new signature. Only invokes delegate; describe/search
+            // never do.
+            let headers = if delegate {
+                self.delegation
+                    .as_ref()
+                    .map(|s| s.headers(service, &body))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            match self
+                .call_once(node, service, body.clone(), timeout, headers)
+                .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) if retriable(&e) => {
                     last = Some(e);
@@ -201,7 +236,7 @@ impl MeshGateway {
                 .map_err(|e| GatewayError::Other(format!("encode describe request: {e}")))?,
         );
         match self
-            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT, is_retriable)
+            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT, is_retriable, false)
             .await
         {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -311,7 +346,7 @@ impl MeshGateway {
         retriable: fn(&RpcError) -> bool,
     ) -> Result<CallToolResult, GatewayError> {
         match self
-            .call_retry(node, capability, body, self.invoke_timeout, retriable)
+            .call_retry(node, capability, body, self.invoke_timeout, retriable, true)
             .await
         {
             // Success: the wrap handler encoded the CallToolResult as the body.
