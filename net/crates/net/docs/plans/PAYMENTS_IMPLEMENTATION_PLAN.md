@@ -1,4 +1,4 @@
-# Implementation Plan: Payments P0 — x402-Native Core + Mock Facilitator (burn-down)
+# Implementation Plan: Payments — x402-Native Core + Mock Facilitator (burn-down)
 
 **Implements:** `PAYMENTS_SDK_PLAN.md` stage P0, **reshaped x402-first.** Prerequisite commits: (1) sync the stale in-repo plan doc from the final revision; (2) revise its object-model section per this reshape — Net envelopes around x402 v2 structures, not a parallel vocabulary.
 
