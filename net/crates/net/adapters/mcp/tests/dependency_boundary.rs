@@ -3,6 +3,10 @@
 //! crate *directly* (its only path to core is through the SDK). This test
 //! parses the crate's own `Cargo.toml` and fails the build if a forbidden
 //! direct dependency appears, so a violation is caught wherever the tests run.
+//!
+//! Also guards the P0 carve-out (`MCP_BRIDGE_SDK_PLAN.md`): the consent /
+//! pin-store types the bridge re-exports must *be* the SDK's types, never a
+//! bridge-local reimplementation — one lock implementation on one file, ever.
 
 /// The crate's manifest, embedded at compile time.
 const MANIFEST: &str = include_str!("../Cargo.toml");
@@ -41,3 +45,31 @@ fn adapter_depends_on_the_sdk_only_never_core_directly() {
         }
     }
 }
+
+/// Compile-time identity proofs: each `const` compiles only when the bridge
+/// path and the SDK path name the *same* type (`std::convert::identity` is
+/// `fn(T) -> T`, so the two sides must unify). If a bridge-local
+/// reimplementation of consent, pins, capability identity, or the credential
+/// vocabulary ever replaced a re-export, this file would stop compiling —
+/// the "one lock implementation" doctrine enforced by the type system rather
+/// than review vigilance. (No `#[test]` needed; the assertions run at
+/// compile time.)
+const _PIN_STORE_IS_THE_SDK_TYPE: fn(net_mcp::serve::PinStore) -> net_sdk::pins::PinStore =
+    std::convert::identity;
+const _PIN_STATE_IS_THE_SDK_TYPE: fn(net_mcp::serve::PinState) -> net_sdk::pins::PinState =
+    std::convert::identity;
+const _PIN_ERROR_IS_THE_SDK_TYPE: fn(
+    net_mcp::serve::PinStoreError,
+) -> net_sdk::pins::PinStoreError = std::convert::identity;
+const _CONSENT_POLICY_IS_THE_SDK_TYPE: fn(
+    net_mcp::serve::ConsentPolicy,
+) -> net_sdk::consent::ConsentPolicy = std::convert::identity;
+const _CONSENT_DECISION_IS_THE_SDK_TYPE: fn(
+    net_mcp::serve::ConsentDecision,
+) -> net_sdk::consent::ConsentDecision = std::convert::identity;
+const _CAPABILITY_ID_IS_THE_SDK_TYPE: fn(
+    net_mcp::serve::CapabilityId,
+) -> net_sdk::consent::CapabilityId = std::convert::identity;
+const _CREDENTIAL_STATUS_IS_THE_SDK_TYPE: fn(
+    net_mcp::wrap::CredentialStatus,
+) -> net_sdk::consent::CredentialStatus = std::convert::identity;
