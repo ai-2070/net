@@ -89,9 +89,26 @@ func (e *McpError) Error() string {
 
 func (e *McpError) Unwrap() error { return ErrMcp }
 
+// pinThread locks the calling goroutine to its OS thread and returns the
+// unlock func; use as `defer pinThread()()`. The Rust side records its
+// last-error in a thread_local!, and lastMcpError drains it with SEPARATE cgo
+// calls (message, kind, clear). Without pinning, Go may migrate the goroutine
+// between the failing FFI call and the drain, so the getters would read a
+// different OS thread's slot — losing the error (yielding a nil error on a
+// real failure), returning a stale error from an unrelated operation, or
+// clearing an in-flight error another goroutine was about to read. Holding the
+// OS thread across the whole call + drain keeps them on one thread. (Counted
+// and reentrancy-safe, so nesting through helpers is fine.)
+func pinThread() func() {
+	runtime.LockOSThread()
+	return runtime.UnlockOSThread
+}
+
 // lastMcpError drains the thread-local last-error pair into a Go error. Call
 // immediately after a C function signalled failure (NULL / -1), before any
-// other FFI call on this goroutine's thread overwrites the thread-local.
+// other FFI call on this goroutine's thread overwrites the thread-local. The
+// caller must hold its OS thread (see pinThread) for the whole call + drain so
+// the thread-local is read on the thread the failure was recorded on.
 func lastMcpError() error {
 	e := &McpError{}
 	if p := C.net_mcp_last_error_message(); p != nil {
@@ -144,6 +161,7 @@ func optCstr(s string) (*C.char, func()) {
 // override is "" (detect) / "credentialed" / "no-credentials"; a downward
 // override needs force=true, mirroring `net wrap --no-credentials --force`.
 func Classify(program string, args []string, envs map[string]string, override string, force bool) (string, error) {
+	defer pinThread()()
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
 		return "", fmt.Errorf("mcp: marshal args: %w", err)
@@ -193,6 +211,7 @@ type LoweredTool struct {
 // produced (trusted local input — "none" is accepted verbatim);
 // substitutability is "" (provider_local) / "provider_equivalent".
 func LowerTool(toolJSON, serverVersion, credentialStatus, substitutability string) (LoweredTool, error) {
+	defer pinThread()()
 	var out LoweredTool
 
 	cTool, freeTool := cstr(toolJSON)
@@ -231,6 +250,7 @@ func CredentialRequiresConsent(status string) bool {
 // (trims whitespace, rewrites a 0x-hex node id to decimal), so "0x2a/echo"
 // and "42/echo" return the same string. Errors on a missing/empty half.
 func CanonicalizeCapID(display string) (string, error) {
+	defer pinThread()()
 	cDisplay, free := cstr(display)
 	defer free()
 	s, ok := takeString(C.net_mcp_cap_id_canonicalize(cDisplay))
@@ -250,6 +270,7 @@ type ConsentPolicy struct {
 // NewConsentPolicy allocates an empty policy. Call Close (or rely on the
 // finalizer) to free it.
 func NewConsentPolicy() (*ConsentPolicy, error) {
+	defer pinThread()()
 	ptr := C.net_mcp_consent_policy_new()
 	if ptr == nil {
 		return nil, lastMcpError()
@@ -269,6 +290,7 @@ func (p *ConsentPolicy) Close() {
 }
 
 func (p *ConsentPolicy) mutate(capID string, fn func(*C.ConsentPolicyHandle, *C.char) C.int) error {
+	defer pinThread()()
 	cCap, free := cstr(capID)
 	defer free()
 	if fn(p.ptr, cCap) != 0 {
@@ -300,6 +322,7 @@ func (p *ConsentPolicy) Unpin(capID string) error {
 
 // IsPinned reports whether the capability is pinned.
 func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
+	defer pinThread()()
 	cCap, free := cstr(capID)
 	defer free()
 	rc := C.net_mcp_consent_policy_is_pinned(p.ptr, cCap)
@@ -312,6 +335,7 @@ func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
 // Decide returns "allowed" or "requires_approval" for the capability with
 // the given wire credential status (the SDK enum's stable string).
 func (p *ConsentPolicy) Decide(capID, credentialStatus string) (string, error) {
+	defer pinThread()()
 	cCap, freeCap := cstr(capID)
 	defer freeCap()
 	cStatus, freeStatus := cstr(credentialStatus)
@@ -334,6 +358,7 @@ func (p *ConsentPolicy) RequiresApproval(capID, credentialStatus string) (bool, 
 
 // Pinned returns the pinned capabilities' display ids, sorted.
 func (p *ConsentPolicy) Pinned() ([]string, error) {
+	defer pinThread()()
 	js, ok := takeString(C.net_mcp_consent_policy_pinned(p.ptr))
 	if !ok {
 		return nil, lastMcpError()
@@ -375,6 +400,7 @@ func OpenPinStore(path string) *PinStore {
 func (s *PinStore) Path() string { return s.path }
 
 func (s *PinStore) stringOp(fn func(cPath, cCap *C.char) *C.char, capID string) (string, bool, error) {
+	defer pinThread()()
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	cCap, freeCap := cstr(capID)
@@ -387,6 +413,7 @@ func (s *PinStore) stringOp(fn func(cPath, cCap *C.char) *C.char, capID string) 
 }
 
 func (s *PinStore) intOp(fn func(cPath, cCap *C.char) C.int, capID string) (bool, error) {
+	defer pinThread()()
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	cCap, freeCap := cstr(capID)
@@ -447,6 +474,7 @@ func (s *PinStore) State(capID string) (state string, ok bool, err error) {
 
 // List returns all records, sorted by cap id.
 func (s *PinStore) List() ([]PinRecord, error) {
+	defer pinThread()()
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	js, ok := takeString(C.net_mcp_pin_list(cPath))
