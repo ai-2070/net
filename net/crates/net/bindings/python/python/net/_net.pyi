@@ -2522,3 +2522,69 @@ def lower_mcp_tool(
     shape. Returns JSON: ``{"tool_id", "mcp_name", "descriptor",
     "bridge_metadata"}`` — classification labels only, never a secret."""
     ...
+
+class CapabilityGateway:
+    """The demand side of the bridge, natively — ``search`` / ``describe`` /
+    ``invoke`` over the mesh with the consent gate applied *inside*, no stdio
+    MCP shim in the middle. Built with the ``net`` + ``mcp`` features (the
+    default wheel has both).
+
+    Wraps a joined :class:`NetMesh` node and the machine-shared pin store (the
+    same file ``net mcp pin`` and ``net mcp serve`` use, so an approval made
+    anywhere is honored here). It applies the one Rust consent gate the shim
+    also uses — describe -> validate arguments -> consent/pins -> invoke — so
+    the native path and the MCP-compat path can never diverge.
+
+    Every method returns a JSON **string** with a ``status`` discriminant and
+    never raises for a gate outcome, so an embedding agent relays a pin
+    instruction or lets a model self-repair a bad argument:
+
+    - ``search(query)`` -> ``{"status":"ok","capabilities":[{cap_id, name,
+      description, compat_tier, credential_status, providers,
+      requires_approval}, ...]}``
+    - ``describe(cap_id)`` -> ``{"status":"ok", cap_id, name, description,
+      input_schema, output_schema, compat_tier, credential_status,
+      substitutability, version, requires_approval}``
+    - ``invoke(cap_id, arguments_json)`` -> ``{"status": "ok" |
+      "requires_approval" | "validation_error" | "denied" | "not_found" |
+      "transport_error" | "no_daemon" | "error", ...}``. On ``ok`` inspect
+      ``is_error`` for a tool-level failure; on ``requires_approval`` relay
+      ``approve_command``.
+
+    The methods release the GIL while the mesh call is in flight, so an
+    ``async`` caller can await them off the event loop without blocking it::
+
+        result = await asyncio.to_thread(gateway.invoke, cap_id, args_json)
+    """
+
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = None) -> None:
+        """Build a gateway over a started ``mesh``. ``pin_store_path`` should
+        be the machine-shared pin store so approvals are honored both ways;
+        omit it to keep consent in-memory (every gated capability then always
+        requires approval)."""
+        ...
+
+    @property
+    def pin_store_path(self) -> Optional[str]:
+        """The machine-shared pin store path this gateway consults, if any."""
+        ...
+
+    def search(self, query: str) -> str:
+        """Search the mesh for capabilities matching ``query`` (substring over
+        id / name / description). Returns the JSON described above; an empty
+        index is ``ok`` with an empty list, never an error."""
+        ...
+
+    def describe(self, cap_id: str) -> str:
+        """Full detail for one capability, including its input schema and the
+        caller-side ``requires_approval`` flag. Returns the JSON described
+        above."""
+        ...
+
+    def invoke(self, cap_id: str, arguments_json: str = "{}") -> str:
+        """Invoke a capability through the consent gate. ``arguments_json`` is
+        the tool's own arguments as a JSON object string. Returns the
+        structured JSON described above; never raises for a gate outcome."""
+        ...
+
+    def __repr__(self) -> str: ...
