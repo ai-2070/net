@@ -58,6 +58,46 @@ class _FakeRegistrar:
         self.registered.pop(name, None)
 
 
+def test_promote_survives_a_registration_error(plugin):
+    # A registry rejection (e.g. a name collision) or a bad schema must not
+    # propagate out of the promote loop and silently stop all future promotion.
+    pins = plugin.pins
+
+    class _RaisingRegistrar:
+        def __init__(self):
+            self.registered = {}
+
+        def register_pinned(self, *, name, schema, handler, check_fn, description):
+            if "boom" in name:
+                raise RuntimeError("registry rejected the name")
+            self.registered[name] = schema
+
+        def deregister_pinned(self, name):
+            self.registered.pop(name, None)
+
+    async def fake_describe(cap_id):
+        return {
+            "status": "ok",
+            "name": cap_id,
+            "description": f"desc {cap_id}",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+
+    reg = _RaisingRegistrar()
+    promoter = pins.PinPromoter(reg, fake_describe, lambda: True, "unused")
+
+    async def body():
+        # The pinned name for "prov/boom" embeds "boom" → register_pinned raises;
+        # the promoter must swallow it, not propagate.
+        await promoter._promote("prov/boom")
+        # A later good cap still promotes — the loop wasn't poisoned.
+        await promoter._promote("prov/ok")
+
+    asyncio.run(body())
+    assert not any("boom" in n for n in reg.registered), reg.registered
+    assert any("ok" in n for n in reg.registered), reg.registered
+
+
 def test_promoter_promotes_snapshot_then_applies_deltas(plugin, tmp_path):
     pins = plugin.pins
     from net_sdk import AsyncPinStore

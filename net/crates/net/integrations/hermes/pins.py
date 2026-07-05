@@ -110,32 +110,43 @@ class PinPromoter:
     async def _promote(self, cap_id: str) -> None:
         if cap_id in self._registered:
             return
+        # The WHOLE promote is guarded — not just describe. A bad describe
+        # response, an invalid schema, or a registry rejection (e.g. a name
+        # collision) must not propagate out of the watcher loop and silently
+        # stop all future promotion for the session.
         try:
             detail = await self._describe(cap_id)
-        except Exception as e:  # noqa: BLE001 — one bad describe must not sink the loop
-            logger.warning("net plugin: describe failed promoting %s: %s", cap_id, e)
+            status = detail.get("status")
+            if status not in (None, "ok"):
+                logger.warning(
+                    "net plugin: cannot promote %s yet (describe: %s)", cap_id, status
+                )
+                return
+            schema = build_pinned_schema(cap_id, detail)
+            name = schema["name"]
+            self._registrar.register_pinned(
+                name=name,
+                schema=schema,
+                handler=make_pinned_handler(cap_id),
+                check_fn=self._check_fn,
+                description=schema["description"],
+            )
+        except Exception as e:  # noqa: BLE001 — one bad capability must not sink the loop
+            logger.warning("net plugin: could not promote %s: %s", cap_id, e)
             return
-        status = detail.get("status")
-        if status not in (None, "ok"):
-            logger.warning("net plugin: cannot promote %s yet (describe: %s)", cap_id, status)
-            return
-        schema = build_pinned_schema(cap_id, detail)
-        name = schema["name"]
-        self._registrar.register_pinned(
-            name=name,
-            schema=schema,
-            handler=make_pinned_handler(cap_id),
-            check_fn=self._check_fn,
-            description=schema["description"],
-        )
         self._registered[cap_id] = name
         logger.info("net plugin: promoted pinned capability %s -> tool %s", cap_id, name)
 
     def _retire(self, cap_id: str) -> None:
         name = self._registered.pop(cap_id, None)
-        if name is not None:
+        if name is None:
+            return
+        try:
             self._registrar.deregister_pinned(name)
-            logger.info("net plugin: retired pinned capability %s (tool %s)", cap_id, name)
+        except Exception as e:  # noqa: BLE001 — a failed retire must not sink the loop
+            logger.warning("net plugin: could not retire %s (tool %s): %s", cap_id, name, e)
+            return
+        logger.info("net plugin: retired pinned capability %s (tool %s)", cap_id, name)
 
     async def run(self) -> None:
         """Promote the current snapshot, then apply each subscription delta until
