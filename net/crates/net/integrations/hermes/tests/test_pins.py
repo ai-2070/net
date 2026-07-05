@@ -16,6 +16,20 @@ pytest.importorskip("net")
 pytest.importorskip("net_sdk")
 
 
+async def _wait_until(cond, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """Poll ``cond`` until true or ``timeout`` elapses, yielding to the loop so
+    the promoter task runs. Decouples correctness from OS file-watcher latency
+    (fixed sleeps flake under CI load)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(interval)
+    return cond()
+
+
 def test_pinned_tool_name_is_stable_and_hermes_safe(plugin):
     pins = plugin.pins
     a = pins.pinned_tool_name("42/github.create_issue")
@@ -113,27 +127,33 @@ def test_promoter_promotes_snapshot_then_applies_deltas(plugin, tmp_path):
             "credential_status": "none",
         }
 
+    name_a = pins.pinned_tool_name("prov/a")
+    name_b = pins.pinned_tool_name("prov/b")
+
     async def body() -> _FakeRegistrar:
         registrar = _FakeRegistrar()
         store = AsyncPinStore(path)
         assert await store.approve("prov/a")  # seed one approved pin
         promoter = pins.PinPromoter(registrar, fake_describe, lambda: True, path)
         task = asyncio.create_task(promoter.run())
-        await asyncio.sleep(0.35)  # the snapshot promotes prov/a
-        await store.approve("prov/b")  # -> a promote event
-        await asyncio.sleep(0.45)
-        await store.reject("prov/a")  # -> a retire event
-        await asyncio.sleep(0.45)
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            # Poll for each event (not fixed sleeps): the snapshot promotes
+            # prov/a; only THEN mutate again, so the 120ms watcher debounce can't
+            # coalesce successive mutations into one delta.
+            assert await _wait_until(lambda: name_a in registrar.registered), registrar.registered
+            await store.approve("prov/b")  # -> a promote event
+            assert await _wait_until(lambda: name_b in registrar.registered), registrar.registered
+            await store.reject("prov/a")  # -> a retire event
+            assert await _wait_until(lambda: name_a in registrar.deregistered), registrar.deregistered
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         return registrar
 
     registrar = asyncio.run(body())
-    name_a = pins.pinned_tool_name("prov/a")
-    name_b = pins.pinned_tool_name("prov/b")
 
     # prov/b (approved while watching) is now a registered tool; prov/a (rejected)
     # was retired.
