@@ -440,14 +440,29 @@ impl PinWatcher {
             };
             let now: std::collections::HashSet<CapabilityId> =
                 store.approved().into_iter().collect();
-            let added: Vec<CapabilityId> = now.difference(&self.approved).cloned().collect();
-            let removed: Vec<CapabilityId> = self.approved.difference(&now).cloned().collect();
+            let change = diff_approved(&self.approved, &now);
             self.approved = now;
-            if !added.is_empty() || !removed.is_empty() {
-                return Some(PinChange { added, removed });
+            if !change.added.is_empty() || !change.removed.is_empty() {
+                return Some(change);
             }
         }
     }
+}
+
+/// Diff two approved-sets into a [`PinChange`] with `added` / `removed` in a
+/// **stable order** (by `CapabilityId::display()`). `HashSet::difference` yields
+/// arbitrary order, so without this the payload — and any downstream handling or
+/// test asserting on it — could flap across runs.
+#[cfg(feature = "pin-watch")]
+fn diff_approved(
+    old: &std::collections::HashSet<CapabilityId>,
+    now: &std::collections::HashSet<CapabilityId>,
+) -> PinChange {
+    let mut added: Vec<CapabilityId> = now.difference(old).cloned().collect();
+    let mut removed: Vec<CapabilityId> = old.difference(now).cloned().collect();
+    added.sort_by(|a, b| a.display().cmp(&b.display()));
+    removed.sort_by(|a, b| a.display().cmp(&b.display()));
+    PinChange { added, removed }
 }
 
 #[cfg(feature = "pin-watch")]
@@ -537,6 +552,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("pins.json");
         (dir, path)
+    }
+
+    #[cfg(feature = "pin-watch")]
+    #[test]
+    fn diff_approved_orders_added_and_removed_by_display() {
+        use std::collections::HashSet;
+        // Disjoint sets: `added` = all of `now`, `removed` = all of `old`, each
+        // inserted out of order so a stable payload can only come from sorting.
+        let old: HashSet<CapabilityId> =
+            [cap("p/b"), cap("p/y"), cap("p/m")].into_iter().collect();
+        let now: HashSet<CapabilityId> =
+            [cap("p/c"), cap("p/a"), cap("p/z")].into_iter().collect();
+        let change = diff_approved(&old, &now);
+        assert_eq!(
+            change.added.iter().map(|c| c.display()).collect::<Vec<_>>(),
+            vec!["p/a", "p/c", "p/z"],
+        );
+        assert_eq!(
+            change.removed.iter().map(|c| c.display()).collect::<Vec<_>>(),
+            vec!["p/b", "p/m", "p/y"],
+        );
     }
 
     #[cfg(feature = "pin-watch")]
