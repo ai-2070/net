@@ -136,8 +136,9 @@ fn lower_parity() {
         let name = case["name"].as_str().unwrap();
         let tool: net_mcp::spec::Tool =
             serde_json::from_value(case["tool"].clone()).expect("fixture tool deserializes");
-        let credential_status = CredentialStatus::from_label(case["credential_status"].as_str().unwrap())
-            .expect("fixture credential_status is a valid label");
+        let credential_status =
+            CredentialStatus::from_label(case["credential_status"].as_str().unwrap())
+                .expect("fixture credential_status is a valid label");
         let substitutability = match case["substitutability"].as_str().unwrap() {
             "provider_local" => Substitutability::ProviderLocal,
             "provider_equivalent" => Substitutability::ProviderEquivalent,
@@ -156,7 +157,8 @@ fn lower_parity() {
         let got = normalize_lowered(&lowered);
         let want = &case["expected"];
         assert_eq!(
-            &got, want,
+            &got,
+            want,
             "[{name}] lower DTO mismatch\n got: {}\nwant: {}",
             serde_json::to_string_pretty(&got).unwrap(),
             serde_json::to_string_pretty(want).unwrap(),

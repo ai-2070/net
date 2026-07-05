@@ -564,8 +564,7 @@ mod tests {
                 .map(|i| {
                     let path = path.clone();
                     tokio::spawn(async move {
-                        PinStore::mutate(path, move |s| s.approve(&cap(&format!("b/cap{i}"))))
-                            .await
+                        PinStore::mutate(path, move |s| s.approve(&cap(&format!("b/cap{i}")))).await
                     })
                 })
                 .collect();

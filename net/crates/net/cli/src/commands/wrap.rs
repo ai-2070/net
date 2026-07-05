@@ -256,9 +256,7 @@ pub async fn run(
             // A lingering Arc<Mesh> clone means the graceful shutdown is
             // skipped; say so rather than exit silently (process teardown
             // still reclaims it).
-            eprintln!(
-                "note: mesh still has other references at exit; skipping graceful shutdown"
-            );
+            eprintln!("note: mesh still has other references at exit; skipping graceful shutdown");
         }
     }
     Ok(())
