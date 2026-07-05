@@ -92,7 +92,13 @@ def test_request_pin_records_pending_and_list_reflects_it(plugin, node_ready):
     res = _run(tools.handle_net_request_pin({"cap_id": cap}))
     assert res["status"] == "pending_approval"
     assert res["cap_id"] == cap
-    assert f"net mcp pin approve {cap}" in res["message"]
+    # H9: operator-surface-first. The CLI is a *fallback* channel, listed last
+    # and never the lead of the model-facing message.
+    assert res["approval_channels"] == ["telegram", "desktop", "cli_fallback"]
+    assert res["approval_channels"][-1] == "cli_fallback"
+    assert "operator surface" in res["message"].lower()
+    assert res["message"].lower().index("hermes") < res["message"].lower().index("cli")
+    assert f"net mcp pin approve {cap}" in res["message"]  # still present as the fallback
 
     listed = _run(tools.handle_net_list_pinned({}))
     assert listed["status"] == "ok"

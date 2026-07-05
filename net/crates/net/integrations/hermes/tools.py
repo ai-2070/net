@@ -134,9 +134,11 @@ NET_REQUEST_PIN_SCHEMA: Dict[str, Any] = {
         "Request approval to invoke a Net MESH capability that currently needs "
         "it (you saw `status: requires_approval` from net_invoke_capability). "
         "This records a PENDING request only — it grants nothing by itself. A "
-        "human approves it out of band (e.g. `net mcp pin approve <cap_id>`); "
-        "once approved, net_invoke_capability will succeed. Do not tell the "
-        "user the capability is usable until it has actually been approved."
+        "human approves it out of band from a trusted operator surface — Hermes's "
+        "own approval UX, or another trusted frontend (the `net mcp pin approve "
+        "<cap_id>` CLI is a fallback channel, not the canonical one). Once "
+        "approved, net_invoke_capability will succeed. Do not tell the user the "
+        "capability is usable until it has actually been approved."
     ),
     "parameters": {
         "type": "object",
@@ -214,10 +216,14 @@ async def handle_net_request_pin(args: Dict[str, Any], **_kw) -> str:
         {
             "status": "pending_approval" if state == "pending" else state,
             "cap_id": cap_id,
-            "approval_channels": ["cli"],
+            # H9: the CLI is a fallback channel, never the canonical approval UX —
+            # a human approves in Hermes (or another trusted operator surface),
+            # which writes to the same shared pin store.
+            "approval_channels": ["telegram", "desktop", "cli_fallback"],
             "message": (
-                f"Approval requested for `{cap_id}`. A human must approve it out "
-                f"of band before it becomes usable: net mcp pin approve {cap_id}"
+                f"Approval required for `{cap_id}` in Hermes or another trusted "
+                f"operator surface before it becomes usable. "
+                f"CLI fallback: net mcp pin approve {cap_id}"
             ),
         }
     )
