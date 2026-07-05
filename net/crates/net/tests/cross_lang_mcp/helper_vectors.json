@@ -1,0 +1,144 @@
+{
+  "description": "Cross-language MCP bridge helper-parity fixture (MCP_BRIDGE_SDK_PLAN.md P1-P3 conformance). Each binding's test loads this file and asserts: (1) classify(program, args, envs, override, force) returns expected_status for every case, and (2) lower_tool(tool, server_version, credential_status, substitutability) produces the expected DTO. The DTO comparison is deep-equality after normalizing the descriptor's `input_schema` JSON STRING to an object (each binding compares parsed values, not byte strings, so whitespace / key order do not matter). Rust impl is net_mcp::wrap::{classify, lower_tool}; Python is net.classify_mcp_server / net.lower_mcp_tool; Node is classifyMcpServer / lowerMcpTool; Go is net.Classify / net.LowerTool. The impls stay parity-equal — adding a case here means updating all four verifiers in lockstep. NOTE: only env KEYS drive classification; the values here are deliberately secret-shaped to also serve the secret-negative check (no value must ever appear in a lower result).",
+  "classify": [
+    {
+      "name": "secret_shaped_env_is_credentialed",
+      "program": "npx",
+      "args": ["-y", "some-server"],
+      "envs": { "GITHUB_TOKEN": "ghp_must_never_cross" },
+      "credential_override": null,
+      "force": false,
+      "expected_status": "credentialed"
+    },
+    {
+      "name": "known_external_api_is_external_api",
+      "program": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "envs": {},
+      "credential_override": null,
+      "force": false,
+      "expected_status": "external_api"
+    },
+    {
+      "name": "unrecognized_is_unknown_and_still_gated",
+      "program": "uvx",
+      "args": ["mcp-server-time"],
+      "envs": { "TZ": "UTC" },
+      "credential_override": null,
+      "force": false,
+      "expected_status": "unknown"
+    },
+    {
+      "name": "forced_downgrade_is_none",
+      "program": "uvx",
+      "args": ["mcp-server-time"],
+      "envs": {},
+      "credential_override": "no-credentials",
+      "force": true,
+      "expected_status": "none"
+    },
+    {
+      "name": "upward_override_is_credentialed",
+      "program": "uvx",
+      "args": ["mcp-server-time"],
+      "envs": {},
+      "credential_override": "credentialed",
+      "force": false,
+      "expected_status": "credentialed"
+    }
+  ],
+  "lower": [
+    {
+      "name": "echo_credentialed_provider_local",
+      "tool": {
+        "name": "echo",
+        "description": "echo it back",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "message": { "type": "string" } }
+        }
+      },
+      "server_version": "2.0.0",
+      "credential_status": "credentialed",
+      "substitutability": "provider_local",
+      "expected": {
+        "tool_id": "echo",
+        "mcp_name": "echo",
+        "bridge_metadata": {
+          "tool::echo::compat_tier": "mcp_bridge",
+          "tool::echo::credential_status": "credentialed",
+          "tool::echo::invocation_scope": "same_root_identity",
+          "tool::echo::substitutability": "provider_local",
+          "tool::echo::visibility": "owner_only"
+        },
+        "descriptor": {
+          "tool_id": "echo",
+          "name": "echo",
+          "version": "2.0.0",
+          "description": "echo it back",
+          "input_schema_object": {
+            "type": "object",
+            "properties": { "message": { "type": "string" } }
+          },
+          "output_schema_object": null,
+          "requires": [],
+          "estimated_time_ms": 0,
+          "stateless": false,
+          "streaming": false,
+          "tags": [],
+          "node_count": 0
+        }
+      }
+    },
+    {
+      "name": "add_none_provider_equivalent",
+      "tool": {
+        "name": "add",
+        "description": "add two numbers",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "a": { "type": "number" },
+            "b": { "type": "number" }
+          },
+          "required": ["a", "b"]
+        }
+      },
+      "server_version": "1.4.0",
+      "credential_status": "none",
+      "substitutability": "provider_equivalent",
+      "expected": {
+        "tool_id": "add",
+        "mcp_name": "add",
+        "bridge_metadata": {
+          "tool::add::compat_tier": "mcp_bridge",
+          "tool::add::credential_status": "none",
+          "tool::add::invocation_scope": "same_root_identity",
+          "tool::add::substitutability": "provider_equivalent",
+          "tool::add::visibility": "owner_only"
+        },
+        "descriptor": {
+          "tool_id": "add",
+          "name": "add",
+          "version": "1.4.0",
+          "description": "add two numbers",
+          "input_schema_object": {
+            "type": "object",
+            "properties": {
+              "a": { "type": "number" },
+              "b": { "type": "number" }
+            },
+            "required": ["a", "b"]
+          },
+          "output_schema_object": null,
+          "requires": [],
+          "estimated_time_ms": 0,
+          "stateless": false,
+          "streaming": false,
+          "tags": [],
+          "node_count": 0
+        }
+      }
+    }
+  ]
+}
