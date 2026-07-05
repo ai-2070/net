@@ -177,6 +177,24 @@ impl CredentialStatus {
         }
     }
 
+    /// Parse a **trusted, locally produced** status label — the exact
+    /// [`Self::as_str`] forms — back to the enum. Unlike
+    /// [`Self::from_wire`], which gates every unrecognised value and never
+    /// yields the ungated `None`, this accepts `"none"` verbatim, because
+    /// the caller vouches for the label's origin (e.g. a language binding
+    /// marshaling the operator's own forced downgrade back into a helper
+    /// call). Returns `None` for an unknown label rather than guessing —
+    /// never use this on a value read off the wire.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "credentialed" => Some(CredentialStatus::Credentialed),
+            "external_api" => Some(CredentialStatus::ExternalApi),
+            "unknown" => Some(CredentialStatus::Unknown),
+            "none" => Some(CredentialStatus::None),
+            _ => None,
+        }
+    }
+
     /// Does invoking this capability require local consent (an allowlist
     /// entry or an approved pin)? Everything except an explicitly-boring
     /// `None` is gated — credentialed, external, and unknown alike.
@@ -356,6 +374,24 @@ mod tests {
             let parsed = CredentialStatus::from_wire(spicy);
             assert_eq!(parsed, CredentialStatus::Unknown, "{spicy:?}");
             assert!(parsed.requires_consent());
+        }
+    }
+
+    #[test]
+    fn from_label_round_trips_exactly_and_rejects_unknowns() {
+        // The trusted-input parse is exact: every `as_str` form round-trips
+        // (INCLUDING the ungated `none` — the caller vouches for the label),
+        // and anything else is `None`, never a guess.
+        for status in [
+            CredentialStatus::Credentialed,
+            CredentialStatus::ExternalApi,
+            CredentialStatus::Unknown,
+            CredentialStatus::None,
+        ] {
+            assert_eq!(CredentialStatus::from_label(status.as_str()), Some(status));
+        }
+        for bad in ["", "bogus", "None", "credentialed ", "NONE"] {
+            assert_eq!(CredentialStatus::from_label(bad), None, "{bad:?}");
         }
     }
 

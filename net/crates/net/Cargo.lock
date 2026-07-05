@@ -2655,6 +2655,7 @@ dependencies = [
  "futures",
  "hex",
  "net-mesh",
+ "net-mesh-mcp",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
  "postcard",

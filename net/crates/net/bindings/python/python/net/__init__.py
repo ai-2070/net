@@ -800,4 +800,17 @@ else:
     )
 
 
+# MCP bridge pure helpers (`MCP_BRIDGE_SDK_PLAN.md` P1): classify a
+# server's credential exposure before publishing, and lower an MCP
+# `tools/list` entry to the Net ToolDescriptor + bridge metadata. Present
+# iff the native module was built with the `mcp` feature.
+try:
+    from ._net import classify_mcp_server, lower_mcp_tool
+except ImportError:
+    # `mcp` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(["classify_mcp_server", "lower_mcp_tool"])
+
+
 __version__ = "0.31.0"

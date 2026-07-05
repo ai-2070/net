@@ -28,8 +28,12 @@ mod compute;
 mod consent;
 #[cfg(feature = "groups")]
 mod groups;
+// MCP bridge pure helpers — classify + lower_tool only (the bridge's
+// forwarding/keychain internals are never bound).
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "mcp")]
+mod mcp_helpers;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3116,6 +3120,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<consent::PyAsyncPinStore>()?;
         m.add_function(wrap_pyfunction!(consent::credential_requires_consent, m)?)?;
         m.add("PinsError", m.py().get_type::<consent::PinsError>())?;
+    }
+    #[cfg(feature = "mcp")]
+    {
+        m.add_function(wrap_pyfunction!(mcp_helpers::classify_mcp_server, m)?)?;
+        m.add_function(wrap_pyfunction!(mcp_helpers::lower_mcp_tool, m)?)?;
     }
     #[cfg(feature = "net")]
     {

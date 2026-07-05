@@ -2493,3 +2493,29 @@ class AsyncPinStore:
     async def is_approved(self, cap_id: "str | CapabilityId") -> bool: ...
     async def list(self) -> list[tuple[str, str]]: ...
     def __repr__(self) -> str: ...
+
+def classify_mcp_server(
+    program: str,
+    args: list[str],
+    envs: list[tuple[str, str]],
+    credential_override: Optional[str] = None,
+    force: bool = False,
+) -> str:
+    """Classify a wrapped MCP server's credential exposure:
+    ``"credentialed"`` | ``"external_api"`` | ``"unknown"`` | ``"none"``.
+    Conservative by construction — detection never yields the ungated
+    ``"none"``; only ``credential_override="no-credentials"`` with
+    ``force=True`` can. Only env KEYS drive detection; values never
+    appear in the result."""
+    ...
+
+def lower_mcp_tool(
+    tool_json: str,
+    server_version: str,
+    credential_status: str,
+    substitutability: str = "provider_local",
+) -> str:
+    """Lower one MCP ``tools/list`` entry (JSON) to the Net discovery
+    shape. Returns JSON: ``{"tool_id", "mcp_name", "descriptor",
+    "bridge_metadata"}`` — classification labels only, never a secret."""
+    ...
