@@ -14,6 +14,9 @@
 | Subagent delegation exists (`delegate_task`, spawn depth/concurrency limits) | `tools/delegate_tool.py`, `tools/async_delegation.py` | Delegation chain extends: root → machine → hermes gateway → subagent. Per-subagent attribution is a natural Phase 3 extension. |
 | `net-mesh-sdk` 0.30.0 on PyPI (Python binding over the Rust core) | PyPI | `plugins/net/` depends on it; no FFI work in Hermes. |
 | Schema sanitizer for third-party tool schemas | `tools/schema_sanitizer.py` | Run mesh descriptors through it before registry entry, same as MCP tools. |
+| Hermes's stdio MCP client delegates version acceptance to the installed `mcp` package (optional extra: `uv sync --extra mcp`); `mcp==1.26.0` accepts `2024-11-05 / 2025-03-26 / 2025-06-18 / 2025-11-25` and **raises** on anything else. (`tools/mcp_tool.py`'s own `LATEST_PROTOCOL_VERSION="2025-03-26"` is the HTTP-transport header, not the stdio accept-set.) | `mcp/client/session.py` (venv), `tools/mcp_tool.py` | The shim must echo a mutually-supported version in `initialize` — the L58 version adapter is **required**, not hypothetical. Verified live 2026-07-05: shim answered `2026-07-28` to a `2025-03-26` offer → stock Hermes's `ClientSession.initialize()` raises `Unsupported protocol version`. |
+
+**Workspace layout (decided 2026-07-05):** `hermes-agent/` is a gitignored sibling clone at the workspace root (same convention as `openclaw/`), never vendored into the monorepo — H6 requires an upstreamable clone of NousResearch/hermes-agent for `plugins/net/` PRs. CI pinning = record the tested Hermes SHA, not vendoring.
 
 **Naming collision to avoid:** Hermes already has `tool_search`/`tool_describe`/`tool_call`. The Net plugin's mesh-index tools must be unambiguous to the model: `net_search_capabilities` ("searches the Net mesh across your machines — NOT local tools"), `net_describe_capability`, `net_invoke_capability`. Descriptions must state the local/mesh distinction explicitly or models will pick the wrong search.
 
@@ -41,6 +44,8 @@ Phase 1 requires the daemon-side consent/pin/validation engine (bridge plan Phas
 `capability.search/describe/invoke`, `pins.list/request/state`, consent resolved inside `invoke`, audit events, and a pin-change subscription.
 **Gate test:** a pin approved via `net mcp pin approve` is immediately visible to a Python SDK client. Can't write that test → the engine isn't daemon-side → refactor first.
 
+**Status 2026-07-05:** today the pin store is a per-user JSON file (`<data_local>/net-mesh/mcp-pins.json`) shared by every shim + the pin CLI — cross-*client* propagation works on one machine, but consent/validation run inside the shim process and none of `capability.*`/`pins.*` is exposed via `net-mesh-sdk` yet. The gate test cannot be written today; this dependency is real work, not a formality.
+
 ---
 
 ## Phase 0.5 — Zero-code path (NEW: ship this week)
@@ -51,11 +56,20 @@ No Hermes code changes. Hermes's existing MCP client consumes the bridge shim:
 # ~/.hermes/config.yaml
 mcp_servers:
   net:
-    command: net
-    args: ["mcp", "serve"]
+    command: net-mesh   # today's CLI binary (`net` is the future product alias — and on
+                        # Windows bare `net` resolves to C:\Windows\System32\net.exe)
+    args: ["mcp", "serve", "--identity", "<operator.toml>"]
 ```
 
-- [ ] **Compatibility gate:** verify Hermes's MCP client against the shim (stdio, 2026-07-28 stateless shape). If it can't consume the stateless shim cleanly, fix Hermes's client or add a version adapter in the shim — **never downgrade the shim to old session semantics**
+**Prerequisites discovered 2026-07-05** (the snippet above is not yet config-only on a fresh machine):
+
+- `net mcp serve` refuses to start without a mesh peer to attach to (`MSG_NO_DAEMON` — "Start one with: net up"). `net up` doesn't exist yet; today the peer is `net-aggregator-daemon --config <toml> --print-bootstrap`, and the shim needs `--node-addr/--node-pubkey/--node-id/--psk-hex` (or profile-level defaults in `config.toml`). A `net up`-shaped daemon UX (or profile defaults doc) is part of making this phase genuinely zero-code.
+- An operator identity file is mandatory (`net-mesh identity generate`).
+- Hermes side: the MCP client needs the optional extra — `uv sync --extra mcp`.
+
+- [x] **Compatibility gate:** verify Hermes's MCP client against the shim (stdio, 2026-07-28 stateless shape). If it can't consume the stateless shim cleanly, fix Hermes's client or add a version adapter in the shim — **never downgrade the shim to old session semantics**
+  - **Result (2026-07-05, live probe):** it can't — the shim's `initialize` ignores the client's offer and hard-codes `2026-07-28`; Hermes's `mcp==1.26.0` client raises `Unsupported protocol version` and the server is marked failed. Everything else already works: shim attaches to a daemon, `tools/list` returns the 5 meta-tools.
+  - [x] **Resolution (chosen, per the rule above): shim version adapter.** `initialize` echoes the client's offered `protocolVersion` when it's in the stdio-compatible set (`COMPAT_PROTOCOL_VERSIONS` in `adapters/mcp/src/spec/mod.rs`: `2025-03-26`, `2025-06-18`, `2025-11-25` — the tools surface the shim serves is shape-identical across them over stdio); any other offer still gets `2026-07-28`. No session-semantics change; MCP-spec-correct (server SHOULD echo a supported requested version). **Verified 2026-07-05:** Hermes-venv `mcp==1.26.0` `ClientSession.initialize()` + `list_tools()` against a live `net-mesh mcp serve` (daemon-attached) → negotiated `2025-11-25`, all 5 meta-tools listed.
 - [ ] Test Hermes restart behavior and MCP reload path (if supported): promoted pin appears without a full restart
 - [ ] Test pin approval from a gateway platform (Telegram/Discord) with the gateway running
 - [ ] Verify tool-list refresh: pin approved → shim emits listChanged → Hermes's `_register_server_tools` diff picks up the promoted tool without restart
