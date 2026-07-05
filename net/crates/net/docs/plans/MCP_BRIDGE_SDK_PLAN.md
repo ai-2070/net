@@ -59,7 +59,7 @@
 
 ## Conformance (extends the golden-vector suite)
 
-- DTO vectors: `CapabilityId`, pin records, consent decisions, descriptor + bridge tags — byte-identical across all five. ✅ **descriptor + bridge tags** covered by the helper golden vectors (below); CapabilityId/pin/consent DTOs are exercised per-binding, not yet a single shared fixture.
+- DTO vectors: `CapabilityId`, pin records, consent decisions, descriptor + bridge tags — byte-identical across all five. ✅ **done 2026-07-05** for CapabilityId (canonicalization + invalid), consent decisions, and the credential gate via `tests/cross_lang_mcp/consent_vectors.json` (source of truth `sdk/tests/consent_golden_vectors.rs`; Rust/Python/Node green, Go under CI); descriptor + bridge tags via the helper golden vectors; pin records via the per-binding on-disk-format-matches-the-core assertions.
 - Behavior vectors: credential classification parity (same inputs → same status/tags in every binding), validation-error parity (same bad args → same field-naming error). ✅ classification parity is the golden-vector `classify` set.
 - **Concurrent pin-store test in every binding** — the lock protocol is the contract; this is the test that keeps doctrine 1 honest. ✅ done: Python (8-thread), Node (60-way), Go/C ABI (40-thread).
 - Secret negative test per binding (doctrine 3). ✅ done in all three.
