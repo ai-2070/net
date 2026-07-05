@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use net_mcp::bridge::BRIDGE_PROVIDER_TAG;
 use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
-use net_mcp::serve::MeshGateway;
+use net_mcp::serve::{gated_invoke, ConsentPolicy, GatedOutcome, MeshGateway, PinStore};
 use net_mcp::spec::{CallToolResult, Implementation};
 use net_mcp::wrap::{
     CredentialOverride, OwnerScope, ServerPublisher, Substitutability, WrapConfig,
@@ -379,4 +379,104 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
     let after = invoke_retry(&gateway, &id, "after").await;
     assert!(!after.is_error, "failover invoke should succeed: {after:?}");
     assert_eq!(after.text(), "after");
+}
+
+/// `gated_invoke`, retried past the reply-channel first-reply race: a transient
+/// `Transport` failure on the first describe/invoke RPC is not the gate's
+/// verdict, so retry until the outcome is stable.
+async fn gated_invoke_stable(
+    gateway: &MeshGateway,
+    consent: &ConsentPolicy,
+    pins: Option<&PinStore>,
+    id: &CapabilityId,
+    args: &serde_json::Value,
+) -> GatedOutcome {
+    let mut out = gated_invoke(gateway, consent, pins, id, args.clone()).await;
+    for _ in 0..6 {
+        if !matches!(out, GatedOutcome::Failed(GatewayError::Transport(_))) {
+            return out;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        out = gated_invoke(gateway, consent, pins, id, args.clone()).await;
+    }
+    out
+}
+
+/// The consent gate, end to end against the live wrapped fixture — the exact
+/// SDK path the Python `CapabilityGateway` wraps. An unapproved invoke is held
+/// at `RequiresApproval` and never reaches the provider; once the operator
+/// approves the pin in the shared store (as `net mcp pin approve` would), the
+/// same call clears consent, reaches the provider, and the wrapped tool runs.
+/// Consent (`gated_invoke` + `PinStore`) and provider owner-scope (the wrap
+/// config) are two independent gates, both satisfied here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_invoke_holds_until_the_pin_is_approved() {
+    let caller = Arc::new(build_mesh(&[0x54u8; 32]).await); // node A (demand)
+    let host = Arc::new(build_mesh(&[0x54u8; 32]).await); // node B (supply)
+    handshake(&caller, &host).await;
+    let host_id = host.inner().node_id();
+
+    // Wrap the fixture, owner-scoped to the caller's origin so the provider
+    // admits the invoke once consent clears.
+    let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
+        .await
+        .expect("publish the fixture on the host");
+    assert!(publication.tools().iter().any(|t| t == "echo"));
+
+    assert!(
+        wait_until(
+            || caller
+                .find_nodes(&CapabilityFilter::new().require_tag(BRIDGE_PROVIDER_TAG))
+                .contains(&host_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "caller discovers the wrapped provider",
+    );
+
+    let gateway = MeshGateway::new(Arc::clone(&caller)).with_invoke_timeout(Duration::from_secs(3));
+
+    // Consumer-side consent: an empty policy (so everything is gated) plus the
+    // real, machine-shared pin store on disk — the same file `net mcp pin`
+    // writes and a running shim reads.
+    let consent = ConsentPolicy::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pin_path = dir.path().join("mcp-pins.json");
+
+    let id = CapabilityId::new(host_id.to_string(), "echo");
+    let args = json!({ "message": "gated hello" });
+
+    // [1] No approval yet → the gate fires; the wrapped tool is never reached.
+    let out = gated_invoke_stable(&gateway, &consent, None, &id, &args).await;
+    assert!(
+        matches!(out, GatedOutcome::RequiresApproval),
+        "an unapproved capability must be held at RequiresApproval; got {out:?}",
+    );
+
+    // [2] The operator approves the pin out of band — a full locked
+    // load->apply->save on the shared store, exactly as `net mcp pin approve`.
+    PinStore::mutate(pin_path.clone(), |s| s.approve(&id))
+        .await
+        .expect("approve the pin");
+
+    // [3] With the fresh approval visible, consent clears and the same invoke
+    // reaches the provider; the wrapped echo round-trips the argument.
+    let pins = PinStore::load(pin_path.clone()).await.ok();
+    let out = gated_invoke_stable(&gateway, &consent, pins.as_ref(), &id, &args).await;
+    match out {
+        GatedOutcome::Invoked(result) => {
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(result.text(), "gated hello");
+        }
+        other => panic!("an approved capability must reach the provider; got {other:?}"),
+    }
+
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }
