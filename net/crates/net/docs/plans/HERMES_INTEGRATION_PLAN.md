@@ -19,13 +19,15 @@
 
 **Workspace layout (decided 2026-07-05):** `hermes-agent/` is a gitignored sibling clone at the workspace root (same convention as `openclaw/`), never vendored into the monorepo — H6 requires an upstreamable clone of NousResearch/hermes-agent for `plugins/net/` PRs. CI pinning = record the tested Hermes SHA, not vendoring.
 
-**Plugin home & distribution (decided 2026-07-05):** the plugin is developed in the **Net monorepo** at `net/crates/net/adapters/hermes/` (beside `adapters/mcp`) — every plugin-side open risk in this plan is a `net-mesh-sdk` gap, and one repo makes SDK + plugin + tests a same-commit change. Existing Hermes installs get it with one command:
+**Plugin home & distribution (decided 2026-07-05):** the plugin is developed in the **Net monorepo** at `net/crates/net/adapters/hermes/` (beside `adapters/mcp`) — every plugin-side open risk in this plan is a `net-mesh-sdk` gap, and one repo makes SDK + plugin + tests a same-commit change. The **user-facing channel** is a read-only release mirror, `github.com/hermes-pro/net`, whose root *is* the plugin (`plugin.yaml` at top level — required, because the bare `owner/repo` shorthand has no subdir):
 
 ```
-hermes plugins install ai-2070/net/net/crates/net/adapters/hermes
+hermes plugins install hermes-pro/net
 ```
 
-which lands at `~/.hermes/plugins/net/` (dir named from `plugin.yaml`'s `name: net`; the monorepo's full-history pack is ~46 MiB, comfortably inside the installer's 60 s shallow-clone timeout). Later channels, same source of truth: `hermes-plugin-net` on PyPI via the `hermes_agent.plugins` entry-point group, and — once stable — upstreaming to NousResearch as a bundled plugin. Upstreaming is a distribution *promotion*, not a move: user plugins deliberately override bundled ones on name collision, so the `net` identity survives all three channels. This refines H6's "official plugin": it means public plugin API + zero core patches — in-tree residence is not required.
+lands at `~/.hermes/plugins/net/` (dir named from `plugin.yaml`'s `name: net`, not the repo name). Monorepo CI publishes the mirror on tagged releases — subtree split or snapshot commit, stamped with the source monorepo SHA for traceability — so `hermes plugins update` tracks *releases*, not every monorepo commit; the mirror doubles as the release gate. Mirror README marks it as generated and points issues/PRs at the monorepo. Developers install unreleased states straight from the source with the subdir identifier: `hermes plugins install ai-2070/net/net/crates/net/adapters/hermes` (identical layout; monorepo full-history pack ~46 MiB, inside the installer's 60 s shallow-clone timeout).
+
+Later channels, same source of truth: `hermes-plugin-net` on PyPI via the `hermes_agent.plugins` entry-point group, and — once stable — upstreaming to NousResearch as a bundled plugin. Upstreaming is a distribution *promotion*, not a move: user plugins deliberately override bundled ones on name collision, so the `net` identity survives every channel. This refines H6's "official plugin": it means public plugin API + zero core patches — in-tree residence is not required.
 
 **Naming collision to avoid:** Hermes already has `tool_search`/`tool_describe`/`tool_call`. The Net plugin's mesh-index tools must be unambiguous to the model: `net_search_capabilities` ("searches the Net mesh across your machines — NOT local tools"), `net_describe_capability`, `net_invoke_capability`. Descriptions must state the local/mesh distinction explicitly or models will pick the wrong search.
 
@@ -108,7 +110,8 @@ net/crates/net/adapters/hermes/   # source of truth (Net monorepo); installs as 
 ```
 
 - [ ] `plugin.yaml` + registration through the standard plugin loader; respects plugin override policy (Net tools never shadow built-ins)
-- [ ] Single-command install proven on a stock Hermes: `hermes plugins install ai-2070/net/net/crates/net/adapters/hermes` → `~/.hermes/plugins/net/`, `register(ctx)` runs, meta-tools appear; `hermes plugins update` picks up a new monorepo commit; `after-install.md` walks the daemon/identity prerequisites
+- [ ] Single-command install proven on a stock Hermes: `hermes plugins install hermes-pro/net` → `~/.hermes/plugins/net/`, `register(ctx)` runs, meta-tools appear; `hermes plugins update` picks up a new mirror release; `after-install.md` walks the daemon/identity prerequisites. Dev channel (`hermes plugins install ai-2070/net/net/crates/net/adapters/hermes`) exercised in CI so unreleased states stay installable
+- [ ] Mirror publish workflow: monorepo CI pushes `net/crates/net/adapters/hermes/` → `github.com/hermes-pro/net` on tagged release (snapshot or subtree split, commit stamped with source SHA); mirror README marks it read-only and redirects issues to the monorepo; publish is CI-only so the mirror can't drift by hand
 - [ ] The five tools registered as `ToolEntry`s, toolset `net`, `check_fn` = daemon liveness via SDK ping (TTL cache + grace absorbs mesh flaps — if daemon down past grace, Net tools cleanly vanish from the tools array instead of erroring mid-turn)
 - [ ] `net_invoke_capability` calls daemon `capability.invoke`; `validation_error` returned verbatim to the model (self-repair); `requires_approval` returns the pin instruction string
 - [ ] `net_request_pin` creates a pending request daemon-side and returns a **structured response** the model can relay: `{status: "pending_approval", request_id, approval_channels: ["cli","telegram",...], message: "Approve with: net mcp pin approve <id>"}` — never approves
