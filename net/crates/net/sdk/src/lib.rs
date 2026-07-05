@@ -72,9 +72,9 @@ pub mod meshdb;
 #[cfg(feature = "meshos")]
 pub mod meshos;
 mod net;
-/// Persistent pin store — the machine-shared, lock-protected consent
-/// records behind [`consent`]. See the module docs for the two rules
-/// (no model self-approval; cross-process lock on every mutation).
+// Persistent pin store — the machine-shared, lock-protected consent
+// records behind `consent`. See the module docs for the two rules
+// (no model self-approval; cross-process lock on every mutation).
 pub mod pins;
 #[cfg(feature = "redis")]
 pub mod redis_dedup;

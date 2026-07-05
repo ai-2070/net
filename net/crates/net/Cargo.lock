@@ -2554,6 +2554,7 @@ dependencies = [
  "keyring-core",
  "linux-keyutils-keyring-store",
  "net-mesh-sdk",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "tempfile",

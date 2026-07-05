@@ -96,9 +96,13 @@ events, artifact transfer, migration) belongs to **native** capabilities. Reach
 for a native capability ([Discover and Invoke](/docs/guides/discover-and-invoke))
 when a wrapped tool's request/response shape isn't enough.
 
-## Embedding it (SDK)
+## Embedding it (library)
 
-The CLI wraps the SDK primitive `net_mcp::wrap::wrap_server`. To wrap a server
-from inside your own process (so the wrapping node is one you also program
-against), call it directly against a `Mesh` you built — the end-to-end path is
-demonstrated in `adapters/mcp/tests/wrap_end_to_end.rs`.
+The CLI is a thin frontend over the bridge library's public surface:
+`net_mcp::wrap::ServerPublisher::publish_server` spawns and publishes the
+server, returning a `PublicationHandle` you `refresh()` on tool changes and
+`withdraw()` to reverse. A publisher is scoped to one `Mesh` and merges every
+publication it makes into the node's single announcement, so one process can
+publish several MCP servers (with distinct tool ids) and withdraw them
+independently. The end-to-end path is demonstrated in
+`adapters/mcp/tests/wrap_end_to_end.rs`.

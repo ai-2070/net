@@ -33,12 +33,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use net_sdk::capabilities::CapabilitySet;
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::tool::description_metadata_key;
+use parking_lot::Mutex;
 
 use super::catalog::{build_catalog, shared_catalog, CatalogPart, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
@@ -162,7 +163,7 @@ struct Contribution {
 struct PublisherShared {
     /// Live contributions keyed by publication id. `BTreeMap` so the merged
     /// announcement and catalog are assembled in a deterministic order.
-    contributions: StdMutex<BTreeMap<u64, Contribution>>,
+    contributions: Mutex<BTreeMap<u64, Contribution>>,
     /// The next publication id.
     next_id: AtomicU64,
     /// Serializes every announce + catalog swap: announcements are
@@ -174,31 +175,22 @@ struct PublisherShared {
     catalog: SharedCatalog,
     /// The describe-service handle: served when the first publication lands,
     /// dropped (withdrawing the service) when the last one leaves.
-    describe: StdMutex<Option<ServeHandle>>,
+    describe: Mutex<Option<ServeHandle>>,
 }
 
 impl PublisherShared {
-    /// Lock the contribution map, recovering from a poisoned lock: every
-    /// mutation is a single insert/remove, so a panicked holder can never
-    /// leave the map half-updated.
-    fn contributions(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Contribution>> {
-        self.contributions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     fn insert(&self, id: u64, contribution: Contribution) {
-        self.contributions().insert(id, contribution);
+        self.contributions.lock().insert(id, contribution);
     }
 
     fn remove(&self, id: u64) {
-        self.contributions().remove(&id);
+        self.contributions.lock().remove(&id);
     }
 
     /// Compute the merged mesh state from the live contributions: the union
     /// capability set to announce and the scoped describe-catalog parts.
     fn merged(&self) -> Result<(CapabilitySet, Vec<CatalogPart>), WrapError> {
-        let contributions = self.contributions();
+        let contributions = self.contributions.lock();
         let all: Vec<LoweredTool> = contributions
             .values()
             .flat_map(|c| c.lowered.iter().cloned())
@@ -234,10 +226,7 @@ impl PublisherShared {
     /// [`DescribeHandler`] reads the merged catalog and gates each part by
     /// its own publication's scope.
     fn ensure_describe(&self, mesh: &Mesh) -> Result<(), WrapError> {
-        let mut describe = self
-            .describe
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut describe = self.describe.lock();
         if describe.is_none() {
             let handle = mesh
                 .serve_rpc(
@@ -256,11 +245,8 @@ impl PublisherShared {
     /// Withdraw the describe service when no publication is left (dropping
     /// the handle reverses its `serve_rpc`).
     fn drop_describe_if_idle(&self) {
-        if self.contributions().is_empty() {
-            self.describe
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+        if self.contributions.lock().is_empty() {
+            self.describe.lock().take();
         }
     }
 }
@@ -281,11 +267,11 @@ impl ServerPublisher {
         Self {
             mesh,
             shared: Arc::new(PublisherShared {
-                contributions: StdMutex::new(BTreeMap::new()),
+                contributions: Mutex::new(BTreeMap::new()),
                 next_id: AtomicU64::new(0),
                 sync: tokio::sync::Mutex::new(()),
                 catalog: shared_catalog(Vec::new()),
-                describe: StdMutex::new(None),
+                describe: Mutex::new(None),
             }),
         }
     }
@@ -615,11 +601,11 @@ mod tests {
 
     fn shared_with(contributions: Vec<(u64, Vec<LoweredTool>)>) -> PublisherShared {
         let shared = PublisherShared {
-            contributions: StdMutex::new(BTreeMap::new()),
+            contributions: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(0),
             sync: tokio::sync::Mutex::new(()),
             catalog: shared_catalog(Vec::new()),
-            describe: StdMutex::new(None),
+            describe: Mutex::new(None),
         };
         for (id, lowered) in contributions {
             shared.insert(
