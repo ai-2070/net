@@ -90,10 +90,15 @@ const CHILD_SEED_CONTEXT: &str = "net-mesh-sdk delegation child-seed v1";
 /// `"gateway:hostA:hermes"`). The root seed is secret material; treat the
 /// returned bytes the same way.
 pub fn derive_child_seed(parent_seed: &[u8; 32], label: &str) -> [u8; 32] {
-    let mut material = Vec::with_capacity(32 + label.len());
-    material.extend_from_slice(parent_seed);
-    material.extend_from_slice(label.as_bytes());
-    blake3::derive_key(CHILD_SEED_CONTEXT, &material)
+    // Feed the secret seed straight into the derive-key hasher via incremental
+    // `update`s — NOT via an intermediate `Vec` that would linger in the heap
+    // un-zeroized after this returns (swap / core-dump / heap-inspection
+    // exposure). `update(seed).update(label)` hashes exactly `seed ‖ label`, so
+    // the derived value is identical to the prior `derive_key(ctx, seed‖label)`.
+    let mut hasher = blake3::Hasher::new_derive_key(CHILD_SEED_CONTEXT);
+    hasher.update(parent_seed);
+    hasher.update(label.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// An ordered `root → … → leaf` delegation chain that attributes a
