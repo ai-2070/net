@@ -21,7 +21,11 @@
 //! Built bottom-up like the wrap side:
 //! - [`backend`] — the [`CapabilityGateway`] trait + the DTOs it returns.
 //! - [`validation`] — pre-flight argument validation against a tool's schema.
-//! - [`consent`] — the shim-side allowlist / pin consent gate.
+//! - [`consent`] / [`pins`] — the allowlist / pin consent gate and the
+//!   persistent pin store. Both **graduated to `net-mesh-sdk`**
+//!   (`MCP_BRIDGE_SDK_PLAN.md` P0 — consent isn't MCP-specific); these
+//!   modules re-export `net_sdk::consent` / `net_sdk::pins`, and the shim
+//!   only *wires* them per request.
 //! - [`meta_tools`] — the `net_*` meta-tool surface the host sees.
 //! - [`shim`] — the JSON-RPC server loop that wires it all together.
 

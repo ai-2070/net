@@ -9,68 +9,15 @@
 //! classifier is unsure about lands on [`CredentialStatus::Unknown`], which
 //! is treated exactly like `Credentialed` for consent.
 
-/// How the wrapper classifies a wrapped tool's credential exposure. The
-/// value rides on the announcement as a `credential_status` metadata tag
-/// (see [`super::descriptor`]) and gates invocation in the shim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialStatus {
-    /// Secrets are configured — env additions or secret-shaped variables.
-    Credentialed,
-    /// A known external-API server (talks to a third-party service).
-    ExternalApi,
-    /// Could not classify. Treated **exactly** like `Credentialed` for
-    /// consent — the spicy default.
-    Unknown,
-    /// Explicitly declared to carry no credentials. Reachable only via the
-    /// forced downward override; never inferred.
-    None,
-}
-
-impl CredentialStatus {
-    /// The wire/tag form carried in the announcement metadata.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CredentialStatus::Credentialed => "credentialed",
-            CredentialStatus::ExternalApi => "external_api",
-            CredentialStatus::Unknown => "unknown",
-            CredentialStatus::None => "none",
-        }
-    }
-
-    /// Parse the wire/tag form back to a status — the demand side (`net mcp
-    /// serve`) reads it off a discovered capability's metadata to decide
-    /// consent.
-    ///
-    /// **Trust boundary: a wire `"none"` is NOT trusted.** The ungated
-    /// [`Self::None`] is reachable on the supply side only through the local
-    /// operator's forced `--no-credentials` override; it must never be granted
-    /// by a value read off the wire. Discovery metadata is not cryptographically
-    /// authenticated in v0, so a hostile or compromised provider could
-    /// self-declare `credential_status = "none"` to slip past the allowlist /
-    /// pin gate. So `"none"` — like `"unknown"`, anything unrecognised, or an
-    /// absent value — maps to [`Self::Unknown`] (gated). This keeps "spicy until
-    /// proven boring" across the trust boundary: a discovered capability can
-    /// only ever *over*-gate here, never bypass consent. An operator who trusts
-    /// a specific remote capability admits it explicitly (allowlist or pin).
-    /// (Trusting `"none"` from a cryptographically-verified same-root provider
-    /// is a later refinement, tied to the owner root-identity model.)
-    pub fn from_wire(s: &str) -> Self {
-        match s {
-            "credentialed" => CredentialStatus::Credentialed,
-            "external_api" => CredentialStatus::ExternalApi,
-            // "none", "unknown", and anything unrecognised are all gated — a
-            // wire value can never reach the ungated `None` (see above).
-            _ => CredentialStatus::Unknown,
-        }
-    }
-
-    /// Does invoking this capability require local consent (an allowlist
-    /// entry or an approved pin)? Everything except an explicitly-boring
-    /// `None` is gated — credentialed, external, and unknown alike.
-    pub fn requires_consent(self) -> bool {
-        !matches!(self, CredentialStatus::None)
-    }
-}
+// The status vocabulary graduated to the SDK (`net_sdk::consent`,
+// `MCP_BRIDGE_SDK_PLAN.md` P0): the demand-side consent gate shares this
+// exact enum, so wrap and serve can never drift on what counts as "spicy" —
+// and its `from_wire` trust boundary (a wire `"none"` is never trusted) is
+// documented with the implementation. What stays bridge-side is only the
+// *classifier* below: it reasons over MCP server commands and env, which is
+// MCP-specific. The status value it produces rides on the announcement as a
+// `credential_status` metadata tag (see [`super::descriptor`]).
+pub use net_sdk::consent::CredentialStatus;
 
 /// Operator override of the detected status (the `net wrap` flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -302,37 +249,8 @@ mod tests {
         assert!(!ok.requires_consent(), "explicitly boring ⇒ not gated");
     }
 
-    #[test]
-    fn from_wire_gates_everything_except_credentialed_and_external() {
-        // Only the two explicitly-spicy statuses round-trip verbatim.
-        assert_eq!(
-            CredentialStatus::from_wire("credentialed"),
-            CredentialStatus::Credentialed,
-        );
-        assert_eq!(
-            CredentialStatus::from_wire("external_api"),
-            CredentialStatus::ExternalApi,
-        );
-        // "unknown", a garbled value, or an absent one all gate as Unknown.
-        for spicy in ["unknown", "", "bogus", "credentialed ", "None", "UNKNOWN"] {
-            let parsed = CredentialStatus::from_wire(spicy);
-            assert_eq!(parsed, CredentialStatus::Unknown, "{spicy:?}");
-            assert!(parsed.requires_consent());
-        }
-    }
-
-    /// Trust-boundary invariant: a wire-declared `"none"` never reaches the
-    /// ungated `None` — it gates like anything else, so a discovered
-    /// capability cannot self-declare its way past the consent gate.
-    #[test]
-    fn wire_none_is_gated_not_trusted() {
-        let parsed = CredentialStatus::from_wire(CredentialStatus::None.as_str());
-        assert_eq!(parsed, CredentialStatus::Unknown);
-        assert!(
-            parsed.requires_consent(),
-            "a wire `none` must be gated, not trusted",
-        );
-    }
+    // The `from_wire` / wire-`"none"` trust-boundary tests moved to
+    // `net_sdk::consent` with the enum (MCP_BRIDGE_SDK_PLAN.md P0).
 
     /// The safety invariant: detection can never yield the ungated `None`.
     /// Only a *forced* downward override can — so a misclassification can

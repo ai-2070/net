@@ -2572,6 +2572,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
+ "fs2",
  "futures",
  "hdrhistogram",
  "net-mesh",
@@ -2583,6 +2584,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

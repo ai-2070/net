@@ -43,6 +43,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(feature = "compute")]
 pub mod compute;
 pub mod config;
+// Local consent surface — capability identity, the credential-status
+// vocabulary, and the allowlist/pin consent gate + persistent pin
+// store. Graduated from the MCP bridge adapter (MCP_BRIDGE_SDK_PLAN.md
+// P0) because consent isn't MCP-specific: every surface that exposes
+// mesh capabilities to a model-driven caller gates on the same local
+// decision, and the pin-store lock protocol must have exactly one
+// implementation. Unconditional (no feature gate): pure local-state
+// primitives with no mesh dependency.
+pub mod consent;
 #[cfg(feature = "cortex")]
 pub mod cortex;
 #[cfg(feature = "dataforts")]
@@ -63,6 +72,10 @@ pub mod meshdb;
 #[cfg(feature = "meshos")]
 pub mod meshos;
 mod net;
+/// Persistent pin store — the machine-shared, lock-protected consent
+/// records behind [`consent`]. See the module docs for the two rules
+/// (no model self-approval; cross-process lock on every mutation).
+pub mod pins;
 #[cfg(feature = "redis")]
 pub mod redis_dedup;
 pub mod stream;
