@@ -248,8 +248,18 @@ pub async fn run(
         drop(publication);
     }
     drop(publisher);
-    if let Ok(mesh) = std::sync::Arc::try_unwrap(mesh) {
-        mesh.shutdown().await.ok();
+    match std::sync::Arc::try_unwrap(mesh) {
+        Ok(mesh) => {
+            mesh.shutdown().await.ok();
+        }
+        Err(_) => {
+            // A lingering Arc<Mesh> clone means the graceful shutdown is
+            // skipped; say so rather than exit silently (process teardown
+            // still reclaims it).
+            eprintln!(
+                "note: mesh still has other references at exit; skipping graceful shutdown"
+            );
+        }
     }
     Ok(())
 }
