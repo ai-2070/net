@@ -469,7 +469,7 @@ mod tests {
         store.save().await.unwrap();
         let reloaded = PinStore::load(&path).await.unwrap();
         let mut listed = reloaded.list();
-        listed.sort_by(|a, b| a.0.display().cmp(&b.0.display()));
+        listed.sort_by_key(|x| x.0.display());
         assert_eq!(
             listed,
             vec![
