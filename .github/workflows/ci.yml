@@ -686,10 +686,12 @@ jobs:
       # `StandbyGroup` / `GroupError`; `meshdb` / `meshos` / `deck`
       # enable the corresponding test modules (each guarded by
       # `pytest.skip` when the feature is absent) plus the stub-drift
-      # test's MeshDB class coverage. Default `redis` is omitted
-      # because the suite doesn't exercise the Redis adapter.
+      # test's MeshDB class coverage. `delegation` (a shipped default
+      # feature) surfaces `derive_child_identity` / `DelegationChain` /
+      # `RevocationRegistry` for `test_delegation.py`. Default `redis` is
+      # omitted because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
