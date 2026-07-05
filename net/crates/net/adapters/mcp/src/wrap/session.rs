@@ -161,6 +161,7 @@ impl WrapConfig {
 /// One publication's contribution to the node's merged mesh state: its
 /// lowered tools (announcement tags/metadata + describe catalog) and the
 /// owner scope gating their describe visibility.
+#[derive(Clone)]
 struct Contribution {
     lowered: Vec<LoweredTool>,
     scope: OwnerScope,
@@ -192,6 +193,26 @@ impl PublisherShared {
 
     fn remove(&self, id: u64) {
         self.contributions.lock().remove(&id);
+    }
+
+    /// Replace publication `id`'s contribution, returning the prior one (if
+    /// any) so a failed reconcile can put it back via [`Self::restore`].
+    fn swap(&self, id: u64, contribution: Contribution) -> Option<Contribution> {
+        self.contributions.lock().insert(id, contribution)
+    }
+
+    /// Restore a contribution captured by [`Self::swap`]: reinstate the prior
+    /// one, or remove the entry entirely if there was none.
+    fn restore(&self, id: u64, prior: Option<Contribution>) {
+        let mut contributions = self.contributions.lock();
+        match prior {
+            Some(p) => {
+                contributions.insert(id, p);
+            }
+            None => {
+                contributions.remove(&id);
+            }
+        }
     }
 
     /// Compute the merged mesh state from the live contributions: the union
@@ -472,21 +493,39 @@ impl PublicationHandle {
             .collect();
 
         let shared = &self.registration.shared;
+        let mesh = &self.registration.mesh;
+        let id = self.registration.id;
         let _sync = shared.sync.lock().await;
 
-        // Swap this publication's contribution, then re-announce the union and
-        // refresh the merged describe catalog so demand-side describes see the
-        // new schemas/status ("always up-to-date types" for describe too).
-        shared.insert(
-            self.registration.id,
+        // Swap this publication's contribution, keeping the prior one so any
+        // failure past this point can restore it. Without the rollback, a
+        // failed re-announce or a tool-id collision would leave the shared map
+        // advertising this publication's new tool set with no live handler —
+        // and a sibling publication's later re-announce would keep propagating
+        // it. `publish_server` already rolls back the same way.
+        let prior = shared.swap(
+            id,
             Contribution {
                 lowered: lowered.clone(),
                 scope: self.scope.clone(),
             },
         );
-        shared.sync_mesh(&self.registration.mesh).await?;
 
-        // Serve tools that appeared.
+        // Re-announce the union and refresh the merged describe catalog so
+        // demand-side describes see the new schemas/status ("always
+        // up-to-date types" for describe too). On failure, put the prior
+        // contribution back and re-announce the prior union.
+        if let Err(e) = shared.sync_mesh(mesh).await {
+            shared.restore(id, prior.clone());
+            let _ = shared.sync_mesh(mesh).await;
+            return Err(e);
+        }
+
+        // Serve tools that appeared. On a serve failure (e.g. a tool-id
+        // collision with a sibling publication), undo this refresh: drop the
+        // handles served in this call (each reverses its `serve_rpc`), restore
+        // the prior contribution, and re-announce the prior union — so the mesh
+        // never keeps advertising a tool this publication can't handle.
         let mut added = Vec::new();
         for lt in &lowered {
             let tool_id = lt.descriptor.tool_id.clone();
@@ -499,16 +538,23 @@ impl PublicationHandle {
                     lt.mcp_name.clone(),
                     self.scope.clone(),
                 );
-                let handle = self
-                    .registration
-                    .mesh
-                    .serve_rpc(&tool_id, Arc::new(handler))
-                    .map_err(|e| WrapError::Serve {
-                        tool: tool_id.clone(),
-                        reason: e.to_string(),
-                    })?;
-                self.handles.insert(tool_id.clone(), handle);
-                added.push(tool_id);
+                match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
+                    Ok(handle) => {
+                        self.handles.insert(tool_id.clone(), handle);
+                        added.push(tool_id);
+                    }
+                    Err(e) => {
+                        for served in &added {
+                            self.handles.remove(served);
+                        }
+                        shared.restore(id, prior.clone());
+                        let _ = shared.sync_mesh(mesh).await;
+                        return Err(WrapError::Serve {
+                            tool: tool_id,
+                            reason: e.to_string(),
+                        });
+                    }
+                }
             }
         }
         // Withdraw tools that vanished (dropping the handle reverses serve_rpc).
@@ -725,6 +771,50 @@ mod tests {
             .require_tag(BRIDGE_PROVIDER_TAG)
             .matches(&caps));
         assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn swap_captures_the_prior_contribution_and_restore_reverts_it() {
+        // The refresh() rollback primitive. swap() replaces a contribution and
+        // hands back the prior one; restore() puts it back, or removes the
+        // entry when there was none. This is what lets a failed refresh (a
+        // sync_mesh error or a tool-id collision) revert the shared merged
+        // state instead of leaving it advertising a tool set with no handler.
+        let shared = shared_with(vec![(0, lowered(&[("echo", "echo it")]))]);
+
+        // Swapping in a new tool set returns the prior contribution and the
+        // merged view goes live with the new tools.
+        let prior = shared.swap(
+            0,
+            Contribution {
+                lowered: lowered(&[("write", "writes")]),
+                scope: OwnerScope::owner_only(0),
+            },
+        );
+        assert!(prior.is_some(), "swap returns the prior contribution");
+        let (caps, _) = shared.merged().expect("merge");
+        assert!(CapabilityFilter::new().require_tag("write").matches(&caps));
+        assert!(!CapabilityFilter::new().require_tag("echo").matches(&caps));
+
+        // Restoring the prior reverts to the pre-swap tool set exactly.
+        shared.restore(0, prior);
+        let (caps, parts) = shared.merged().expect("merge");
+        assert!(CapabilityFilter::new().require_tag("echo").matches(&caps));
+        assert!(!CapabilityFilter::new().require_tag("write").matches(&caps));
+        assert_eq!(parts.len(), 1);
+
+        // A publication that had no prior: restore(None) removes it entirely,
+        // so a first-time refresh that fails leaves nothing advertised.
+        let none_prior = shared.swap(
+            9,
+            Contribution {
+                lowered: lowered(&[("temp", "temp")]),
+                scope: OwnerScope::owner_only(9),
+            },
+        );
+        assert!(none_prior.is_none());
+        shared.restore(9, none_prior);
+        assert!(shared.contributions.lock().get(&9).is_none());
     }
 
     #[test]
