@@ -1,0 +1,36 @@
+net/crates/net/sdk/src/revocation.rs
+  s_1539b6b2705f81::t_7b9ed16a562566 1-273,276-324
+  s_1539b6b2705f81::t_d675ef425d7ec7 274-275
+net/crates/net/sdk/src/lib.rs
+  s_1539b6b2705f81::t_675a37b4219192 127-132
+  s_1539b6b2705f81::t_562549cd7e901a 228-229
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_1539b6b2705f81::t_23bce1c6b07c1b 165,554-582
+  s_1539b6b2705f81::t_ef0a797beedea2 123-129
+  s_1539b6b2705f81::t_a447a76ca463ab 155,159-164
+  s_1539b6b2705f81::t_d30c11b8d4d415 255-268
+  s_1539b6b2705f81::t_39e9e4ea56a814 139
+  s_1539b6b2705f81::t_a6e1c065b58329 22,29
+  s_1539b6b2705f81::t_5715bc2d2a6161 229-235
+  s_1539b6b2705f81::t_c238e956470aac 166
+  s_1539b6b2705f81::t_a2edf87740ca5b 553
+net/crates/net/cli/src/commands/wrap.rs
+  s_1539b6b2705f81::t_d46d8e427fa403 206-226,230-233
+  s_1539b6b2705f81::t_b1985930d6d761 112-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3cba8d54c7f850d0c4c9dc98560014504f34e77c",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
