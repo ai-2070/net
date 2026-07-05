@@ -43,6 +43,14 @@ Phase 1 requires the consent/pin/validation engine exposed via `net-mesh-sdk` (g
 `capability.search/describe/invoke`, `pins.list/request/state`, consent resolved inside `invoke`, audit events, and a pin-change subscription.
 **Gate test:** a pin approved via `net mcp pin approve` is immediately visible to a Python SDK client, under concurrent access. Can't write that test → the engine isn't actually shared → refactor first.
 
+> **Gate status (2026-07-05, branch `hermes-plan`).** The gate was audited against both codebases; two of the five primitives were missing from Python, so the "refactor first" ran as **Step 1** (5 commits):
+> - ✅ **`capability.search/describe/invoke` with consent resolved inside** — the `describe → validate → consent/pins → invoke` composition was extracted into `net_mcp::serve::gated_invoke` (one implementation; the stdio shim delegates) and exposed as **`net_sdk.CapabilityGateway`** (`net.CapabilityGateway`) returning a structured `{status}` result. This speaks the `net wrap` bridge protocol, so it discovers/invokes exactly the wrapped capabilities Phase 1 targets.
+> - ✅ **`pins.list/request/state`** — already shared (`net_sdk.PinStore`/`AsyncPinStore`, cross-process-locked, same file as `net mcp pin`); the propagation gate test (`test_consent_pins.py::test_cli_approval_is_visible_from_python`) passes. The per-user default path is now `net_sdk.default_pin_store_path()` (graduated from the CLI).
+> - ❌ **pin-change subscription** — still poll-only everywhere (the reference shim itself polls at 1 s). **Not a Phase-1 blocker** (Phase 1 is search/describe/invoke/request_pin); Phase 2's dynamic (de)registration polls `AsyncPinStore.approved()` until a watch API lands.
+> - **audit events** — deferred (Phase 2/3; no per-invocation audit crosses to Python yet).
+>
+> Net: the Phase-1 native path is unblocked. Remaining: the async gateway dual (plugin uses `asyncio.to_thread` meanwhile) and the pin subscription (Phase 2).
+
 ---
 
 ## Phase 0.5 — Zero-code path (NEW: ship this week)
