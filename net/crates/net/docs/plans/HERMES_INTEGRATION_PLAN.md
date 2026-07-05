@@ -204,6 +204,19 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 - **Node/mesh loss:** meta-tools and pinned tools share the same check_fn TTL/grace — transient flap absorbed, sustained loss removes them cleanly at next assembly; in-flight calls return the canonical mesh-unreachable error.
 - **Schema drift:** `dynamic_schema_overrides` pulls the live descriptor at assembly time; a call against a just-changed remote schema gets SDK-side validation against the *current* descriptor, and the validation error names the drift.
 
+
+## Distribution: stable mirror at `github.com/hermes-pro/net`
+
+Hermes installs plugins by cloning GitHub shorthand: `hermes plugins install hermes-pro/net`. That makes the mirror repo the release artifact, with rules:
+
+- **Mirror is a build output, not a dev repo.** Source of truth is the main tree; CI syncs release-tagged builds one-way. No direct PRs (redirect to source), no force-push, ever.
+- **HEAD of main = latest stable**, because clone-install takes HEAD. Pre-releases live on tags/branches only. Breaking HEAD breaks every new install that hour.
+- Repo layout is exactly what the Hermes plugin loader expects at root (plugin manifest + package), with `net-mesh-sdk` **pinned** in requirements per release — the plugin never floats the SDK.
+- Each release states provenance in the README/tag: built from `<source>@<sha>`. Signed tags.
+- `hermes plugins update` re-pulls — same HEAD discipline covers updates.
+
+Install line (docs + homepage): `hermes plugins install hermes-pro/net`
+
 ## Non-goals
 Untrusted discovery, attestations, spend limits, billing, paid tasks (later ladder); the OpenClaw plugin (bridge plan, optional); Hermes as a horizontal product; patches to Hermes core outside `plugins/net/`.
 
@@ -218,5 +231,5 @@ Phase 0.5 config-to-first-invoke time; pinned-tool arg accuracy vs local baselin
 | Model confuses `tool_search` (local) with `net_search_capabilities` (mesh) | Explicit disambiguating descriptions; measure misroutes in Phase 1 |
 | Meta-tools always-load costs 5 tool defs in every prompt | Trivial vs the double-indirection failure mode; revisit only if measured context pressure demands it |
 | net-mesh-sdk Python API gaps (pin subscription, delegation context) | SDK gap = blocker filed against Net repo, not worked around with private hooks (H6) |
-| Hermes upstream churn (1.3M LOC, fast-moving) | Everything in `plugins/net/`; only stable surfaces used (registry, plugin API, approval hooks); pin tested Hermes versions in CI |
+| Hermes upstream churn (1.3M LOC, fast-moving) | Everything in `plugins/net/`; only stable surfaces used (registry, plugin API, approval hooks); CI matrix pins **commit SHAs, not tags** — Hermes installs pull master, so a tag identifies a lower bound, not a code state. Plus a rolling `master HEAD` CI row, since that's what real users run |
 | Pin approval UX drift between Hermes/CLI/shim | Single shared store + the cross-client propagation test in Phase 2 |
