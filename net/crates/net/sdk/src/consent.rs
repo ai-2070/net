@@ -75,8 +75,11 @@ impl CapabilityId {
         let (provider, capability) = s
             .split_once('/')
             .ok_or_else(|| CapabilityIdError::MissingProvider(s.to_string()))?;
-        let provider = canonical_provider(provider);
-        if provider.is_empty() || capability.is_empty() {
+        // `Self::new` canonicalizes the provider, so don't canonicalize here
+        // too. Guard emptiness on the trimmed raw provider: `canonical_provider`
+        // only ever trims or rewrites to a non-empty decimal, so a trimmed-empty
+        // provider is exactly a canonical-empty one.
+        if provider.trim().is_empty() || capability.is_empty() {
             return Err(CapabilityIdError::Empty(s.to_string()));
         }
         Ok(Self::new(provider, capability))
