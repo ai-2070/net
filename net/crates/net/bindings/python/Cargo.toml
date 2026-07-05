@@ -42,6 +42,7 @@ default = [
     "redis",
     "aggregator",
     "tool",
+    "consent",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -114,6 +115,14 @@ deck = ["meshos", "net/meshos", "net-sdk/deck"]
 # the SDK's `aggregator` re-export module so the binding gets
 # RegistryClient / FoldQueryClient + the typed error hierarchy.
 aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
+# Local consent surface (`MCP_BRIDGE_SDK_PLAN.md` P1): CapabilityId,
+# the ConsentPolicy gate, and the lock-protocol PinStore — thin
+# wrappers over `net_sdk::consent` / `net_sdk::pins`, which are
+# unconditional SDK modules (no net-sdk sub-feature to forward; pure
+# local-state primitives with no mesh dependency). The one lock
+# implementation stays in Rust — the binding never opens the store
+# file directly.
+consent = ["dep:net-sdk"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

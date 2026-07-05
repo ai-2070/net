@@ -768,4 +768,36 @@ else:
     )
 
 
+# Local consent surface (`MCP_BRIDGE_SDK_PLAN.md` P1): capability
+# identity, the allowlist/pin consent gate, and the machine-shared,
+# lock-protocol pin store — the same file the `net mcp pin` CLI and a
+# running `net mcp serve` shim honor. Present iff the native module was
+# built with the `consent` feature (default in the maturin-shipped
+# wheel). The store + lock live entirely in Rust: mutations here can
+# never race an out-of-band CLI approval.
+try:
+    from ._net import (
+        AsyncPinStore,
+        CapabilityId,
+        ConsentPolicy,
+        PinsError,
+        PinStore,
+        credential_requires_consent,
+    )
+except ImportError:
+    # `consent` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "AsyncPinStore",
+            "CapabilityId",
+            "ConsentPolicy",
+            "PinsError",
+            "PinStore",
+            "credential_requires_consent",
+        ]
+    )
+
+
 __version__ = "0.31.0"

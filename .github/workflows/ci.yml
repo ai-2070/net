@@ -689,7 +689,7 @@ jobs:
       # test's MeshDB class coverage. Default `redis` is omitted
       # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
