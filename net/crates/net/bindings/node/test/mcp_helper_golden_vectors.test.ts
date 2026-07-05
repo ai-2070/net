@@ -76,7 +76,13 @@ function normalize(result: {
   }
 }
 
-describe('MCP helper golden vectors', () => {
+// napi-rs exports are `undefined` when the backing `mcp` Cargo feature isn't
+// compiled. Skip (not fail opaquely with "not a function") when that's the
+// case, so a slimmed build variant reads as skipped rather than broken.
+const mcpBindingAvailable =
+  typeof classifyMcpServer === 'function' && typeof lowerMcpTool === 'function'
+
+describe.skipIf(!mcpBindingAvailable)('MCP helper golden vectors', () => {
   for (const c of FIXTURE.classify) {
     it(`classify: ${c.name}`, () => {
       const envs = Object.entries(c.envs).map(([key, value]) => ({ key, value }))
