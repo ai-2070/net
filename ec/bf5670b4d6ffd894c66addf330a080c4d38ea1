@@ -1,0 +1,26 @@
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_1539b6b2705f81::t_8e2a10e9b00091 228,231-337
+  s_1539b6b2705f81::t_a79b5d4f313729 19,25-26,29-31,33-34
+  s_1539b6b2705f81::t_04032a35bbe68c 226-227
+  s_1539b6b2705f81::t_66b1f74da91ab0 229-230
+net/crates/net/adapters/mcp/Cargo.toml
+  s_1539b6b2705f81::t_c6074a5212371e 115-118
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN.md
+  s_1539b6b2705f81::t_1caf023587a384 130-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ecbf5670b4d6ffd894c66addf330a080c4d38ea1",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
