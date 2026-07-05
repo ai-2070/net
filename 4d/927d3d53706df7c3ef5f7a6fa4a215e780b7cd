@@ -1,0 +1,20 @@
+go/mcp_helper_golden_vectors_test.go
+  s_1539b6b2705f81::t_67d6fc2d712630 78-81
+  s_1539b6b2705f81::t_42534d7f0f0496 135-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4d927d3d53706df7c3ef5f7a6fa4a215e780b7cd",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
