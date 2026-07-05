@@ -47,6 +47,8 @@
 
 **P2 — TypeScript equivalents** (napi): same SDK surfaces + helpers, Promise-native. **Unlocks OpenClaw.**
 
+> **Status: P2 landed 2026-07-05** (branch `mcp-sdk`). New `consent` + `mcp` **node** binding features mirror P1's Python surfaces in the napi construction (auto-collected `#[napi]` items, `index.d.ts` regenerated on build): `CapabilityId` / `ConsentPolicy` / `PinStore` wrap `net_sdk::consent`+`pins`, and `classifyMcpServer` / `lowerMcpTool` bind the two pure helpers. Promise-native throughout — `PinStore`'s methods are `#[napi] async fn` awaiting the core's locked `mutate`/`load` directly (no sync/async split, no GIL to release; the collapse the Python binding couldn't make). Acceptance green (vitest, 18): parity vectors, name sanitization, canonical-identity pinning, corrupt-store errors, **60-way concurrent locked mutations lose nothing**, on-disk format identical to the Rust core both ways, and the secret-negative rule. Cross-binding **helper parity verified byte-identical Python↔Node** (same `classify` label, `tool_id`, bridge-metadata map, and nested descriptor `input_schema` string). Full node suite green (373 passed), no regressions.
+
 **P3 — Go bridge helper bindings (cgo over `net_mcp.h`).** Spawn/wrap mode, `lower`/`classify` helpers, shim/gateway DTOs where needed, context cancellation for bridge calls. No attach-mode callbacks in v1. Acceptance: same suite.
 
 **P4 — C.** `net_mcp.h` documented as public (it exists implicitly under Go from P3); callback contracts, free-functions, ownership rules spelled out like the existing headers. Acceptance: header-only consumer sample compiles and passes the fixture round-trip.
