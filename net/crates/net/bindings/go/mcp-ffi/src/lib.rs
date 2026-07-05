@@ -45,6 +45,7 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr;
 use std::sync::OnceLock;
 
+use parking_lot::Mutex;
 use serde::Serialize;
 
 use net_mcp::wrap::{
@@ -491,16 +492,16 @@ pub unsafe extern "C" fn net_mcp_cap_id_canonicalize(display: *const c_char) -> 
 /// flight — is still the caller's responsibility; the Go binding guards it with
 /// its own mutex.)
 pub struct ConsentPolicyHandle {
-    inner: std::sync::Mutex<CoreConsentPolicy>,
+    inner: Mutex<CoreConsentPolicy>,
 }
 
 impl ConsentPolicyHandle {
-    /// Lock the inner policy, tolerating a poisoned mutex: the consent ops
-    /// leave no inconsistent state on a panic and every entry point is
-    /// `catch_unwind`-guarded, so a poisoned lock must not permanently wedge
-    /// the handle.
-    fn lock(&self) -> std::sync::MutexGuard<'_, CoreConsentPolicy> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// Lock the inner policy. parking_lot's mutex has no poisoning (per the
+    /// repo's lock-hardening rule), so no unwrap/poison handling is needed —
+    /// a panic inside a locked section (every entry point is
+    /// `catch_unwind`-guarded anyway) leaves the mutex usable.
+    fn lock(&self) -> parking_lot::MutexGuard<'_, CoreConsentPolicy> {
+        self.inner.lock()
     }
 }
 
@@ -511,7 +512,7 @@ pub extern "C" fn net_mcp_consent_policy_new() -> *mut ConsentPolicyHandle {
     clear_last_error();
     ffi_guard!(ptr::null_mut(), {
         Box::into_raw(Box::new(ConsentPolicyHandle {
-            inner: std::sync::Mutex::new(CoreConsentPolicy::new()),
+            inner: Mutex::new(CoreConsentPolicy::new()),
         }))
     })
 }
@@ -1129,19 +1130,18 @@ mod tests {
                     std::thread::spawn(move || {
                         let p = addr as *mut ConsentPolicyHandle;
                         let cap = c(&format!("b/cap{i}"));
-                        // SAFETY: `p` is live (freed only after join); the inner
-                        // Mutex serializes these concurrent calls.
-                        unsafe {
-                            net_mcp_consent_policy_allow(p, cap.as_ptr());
-                            net_mcp_consent_policy_pin(p, cap.as_ptr());
-                            net_mcp_consent_policy_is_pinned(p, cap.as_ptr());
-                            let _ = take(net_mcp_consent_policy_decide(
-                                p,
-                                cap.as_ptr(),
-                                c("credentialed").as_ptr(),
-                            ));
-                            let _ = take(net_mcp_consent_policy_pinned(p));
-                        }
+                        // SAFETY: `p` is live (freed only after join); the
+                        // inner Mutex serializes these concurrent calls. The
+                        // enclosing `unsafe` covers the closure body.
+                        net_mcp_consent_policy_allow(p, cap.as_ptr());
+                        net_mcp_consent_policy_pin(p, cap.as_ptr());
+                        net_mcp_consent_policy_is_pinned(p, cap.as_ptr());
+                        let _ = take(net_mcp_consent_policy_decide(
+                            p,
+                            cap.as_ptr(),
+                            c("credentialed").as_ptr(),
+                        ));
+                        let _ = take(net_mcp_consent_policy_pinned(p));
                     })
                 })
                 .collect();

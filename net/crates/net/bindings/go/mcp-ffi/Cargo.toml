@@ -42,6 +42,9 @@ net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../../adapt
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The consent-policy handle's interior lock. parking_lot (not std::sync) per
+# the repo's permanent lock-hardening rule — its guards don't poison.
+parking_lot = "0.12"
 
 [dev-dependencies]
 # Isolated temp dirs for the pin-store round-trip / concurrency tests

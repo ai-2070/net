@@ -2496,6 +2496,7 @@ version = "0.31.0"
 dependencies = [
  "net-mesh-mcp",
  "net-mesh-sdk",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "tempfile",
