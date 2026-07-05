@@ -117,8 +117,11 @@ pub struct DelegationGate {
     /// Half-width of the accepted window for the per-invoke signature
     /// timestamp (reject if `|now - ts| > window`).
     window_secs: u64,
-    /// nonce → expiry-secs. Only authenticated invokes are recorded.
-    nonces: Mutex<HashMap<u64, u64>>,
+    /// `(leaf entity-id, nonce) → expiry-secs`. Keyed by leaf so two distinct
+    /// authenticated delegates can't collide on nonce values (relevant on the
+    /// `getrandom`-failure seed fallback, where same-second signers can emit
+    /// identical nonce sequences). Only authenticated invokes are recorded.
+    nonces: Mutex<HashMap<([u8; 32], u64), u64>>,
     audit: Option<AuditSink>,
     /// Optional machine-shared revocation store. When set, each verify reloads
     /// its floors into `revocation` (cheap JSON read) *before* the chain check,
@@ -238,8 +241,10 @@ impl DelegationGate {
             .map_err(|e| DelegationReject::Chain(format!("{e:?}")))?;
 
         // [4] Replay: only now, after authentication, touch the nonce cache —
-        //     so an unauthenticated peer can't grow it. Check + insert atomic.
-        self.check_and_record_nonce(nonce, now)?;
+        //     so an unauthenticated peer can't grow it. Keyed by the leaf, so
+        //     one delegate's nonces can't false-replay another's. Check + insert
+        //     atomic.
+        self.check_and_record_nonce(&leaf, nonce, now)?;
 
         // [5] Audit the admitted leaf / root.
         if let Some(audit) = &self.audit {
@@ -266,12 +271,20 @@ impl DelegationGate {
         }
     }
 
-    fn check_and_record_nonce(&self, nonce: u64, now: u64) -> Result<(), DelegationReject> {
+    fn check_and_record_nonce(
+        &self,
+        leaf: &EntityId,
+        nonce: u64,
+        now: u64,
+    ) -> Result<(), DelegationReject> {
         let expiry = now.saturating_add(self.window_secs.saturating_mul(2));
+        let mut leaf_key = [0u8; 32];
+        leaf_key.copy_from_slice(leaf.as_bytes());
+        let key = (leaf_key, nonce);
         let mut cache = self.nonces.lock().unwrap_or_else(|p| p.into_inner());
         // Prune expired first so the cap reflects live entries.
         cache.retain(|_, &mut exp| exp > now);
-        if cache.contains_key(&nonce) {
+        if cache.contains_key(&key) {
             return Err(DelegationReject::Replay);
         }
         if cache.len() >= MAX_NONCES {
@@ -279,7 +292,7 @@ impl DelegationGate {
             // hits this; only a flood would, and dropping it is the safe move.
             return Err(DelegationReject::Replay);
         }
-        cache.insert(nonce, expiry);
+        cache.insert(key, expiry);
         Ok(())
     }
 }
@@ -477,6 +490,40 @@ mod tests {
             matches!(g.verify(TOOL, ARGS, &chain, &env), Err(DelegationReject::Replay)),
             "replaying the same (ts, nonce, sig) is rejected"
         );
+    }
+
+    #[test]
+    fn two_delegates_with_the_same_nonce_do_not_false_replay() {
+        // Two distinct gateways under the same root sign the SAME (ts, nonce).
+        // Keyed by leaf, neither is rejected as the other's replay — but each
+        // still can't replay its OWN nonce.
+        let root = Identity::generate();
+        let seed = root.to_bytes();
+        let machine = Identity::from_seed(derive_child_seed(&seed, "machine:h"));
+        let g1 = Identity::from_seed(derive_child_seed(&seed, "gateway:h:one"));
+        let g2 = Identity::from_seed(derive_child_seed(&seed, "gateway:h:two"));
+        let chain1 = DelegationChain::derive_gateway(
+            &root, &machine, g1.entity_id(), Duration::from_secs(3600), DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap()
+        .to_bytes();
+        let chain2 = DelegationChain::derive_gateway(
+            &root, &machine, g2.entity_id(), Duration::from_secs(3600), DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap()
+        .to_bytes();
+
+        let g = gate(&root, Arc::new(RevocationRegistry::new()));
+        let ts = now_secs();
+        let nonce = 42;
+        assert!(g.verify(TOOL, ARGS, &chain1, &envelope(&g1, TOOL, ARGS, ts, nonce)).is_ok());
+        // Same nonce, different leaf — NOT a replay of g1.
+        assert!(g.verify(TOOL, ARGS, &chain2, &envelope(&g2, TOOL, ARGS, ts, nonce)).is_ok());
+        // g1 replaying its own (leaf, nonce) is still rejected.
+        assert!(matches!(
+            g.verify(TOOL, ARGS, &chain1, &envelope(&g1, TOOL, ARGS, ts, nonce)),
+            Err(DelegationReject::Replay)
+        ));
     }
 
     #[test]
