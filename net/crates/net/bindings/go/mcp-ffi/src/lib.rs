@@ -226,6 +226,7 @@ fn pin_state_str(state: PinState) -> &'static str {
 /// `s` must be a pointer returned by this library, or null.
 #[no_mangle]
 pub unsafe extern "C" fn net_mcp_free_string(s: *mut c_char) {
+    clear_last_error();
     ffi_guard!((), {
         if !s.is_null() {
             drop(CString::from_raw(s));
@@ -501,6 +502,7 @@ impl ConsentPolicyHandle {
 /// capability requires approval. Free with [`net_mcp_consent_policy_free`].
 #[no_mangle]
 pub extern "C" fn net_mcp_consent_policy_new() -> *mut ConsentPolicyHandle {
+    clear_last_error();
     ffi_guard!(ptr::null_mut(), {
         Box::into_raw(Box::new(ConsentPolicyHandle {
             inner: std::sync::Mutex::new(CoreConsentPolicy::new()),
@@ -515,6 +517,7 @@ pub extern "C" fn net_mcp_consent_policy_new() -> *mut ConsentPolicyHandle {
 /// null, and must not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn net_mcp_consent_policy_free(policy: *mut ConsentPolicyHandle) {
+    clear_last_error();
     ffi_guard!((), {
         if !policy.is_null() {
             drop(Box::from_raw(policy));
