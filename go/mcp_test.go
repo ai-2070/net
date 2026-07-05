@@ -203,6 +203,35 @@ func TestConsentPolicyGatesUntilAdmitted(t *testing.T) {
 	}
 }
 
+func TestConsentPolicyFailsClosedOnError(t *testing.T) {
+	p, err := NewConsentPolicy()
+	if err != nil {
+		t.Fatalf("NewConsentPolicy: %v", err)
+	}
+	defer p.Close()
+
+	// A malformed capability id (no provider/capability slash) makes the gate
+	// unable to decide. It must fail CLOSED: even a caller that ignores the
+	// error must not treat an undecidable capability as invocable.
+	req, err := p.RequiresApproval("no-slash", "credentialed")
+	if err == nil {
+		t.Fatal("RequiresApproval on a malformed id must return an error")
+	}
+	if !req {
+		t.Error("RequiresApproval must fail closed (true) when the gate can't decide")
+	}
+
+	// Decide must never report a failure as ("", nil) — that empty string
+	// would read as "not requires_approval" = allowed at the boolean layer.
+	d, err := p.Decide("no-slash", "credentialed")
+	if err == nil {
+		t.Fatal("Decide on a malformed id must return an error")
+	}
+	if d != "" {
+		t.Errorf("a failed Decide should return an empty decision, got %q", d)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Pin store
 // ---------------------------------------------------------------------------

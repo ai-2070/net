@@ -342,18 +342,28 @@ func (p *ConsentPolicy) Decide(capID, credentialStatus string) (string, error) {
 	defer freeStatus()
 	s, ok := takeString(C.net_mcp_consent_policy_decide(p.ptr, cCap, cStatus))
 	if !ok {
-		return "", lastMcpError()
+		// A NULL decision is a failure — never report it as ("", nil), which
+		// RequiresApproval would read as "not requires_approval" = allowed. If
+		// the FFI signalled failure but left no error detail, synthesize one so
+		// the decision fails closed rather than silently opening the gate.
+		if err := lastMcpError(); err != nil {
+			return "", err
+		}
+		return "", &McpError{Kind: "invalid_arg", Message: "consent decision unavailable"}
 	}
 	return s, nil
 }
 
-// RequiresApproval is the boolean convenience over Decide.
+// RequiresApproval is the boolean convenience over Decide. It fails CLOSED:
+// on any error the capability is treated as requiring approval, and only an
+// explicit "allowed" decision clears the gate — an unexpected or empty
+// decision string requires approval rather than being mistaken for allowed.
 func (p *ConsentPolicy) RequiresApproval(capID, credentialStatus string) (bool, error) {
 	decision, err := p.Decide(capID, credentialStatus)
 	if err != nil {
-		return false, err
+		return true, err
 	}
-	return decision == "requires_approval", nil
+	return decision != "allowed", nil
 }
 
 // Pinned returns the pinned capabilities' display ids, sorted.
