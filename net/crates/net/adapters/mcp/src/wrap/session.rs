@@ -75,6 +75,34 @@ pub enum WrapError {
     /// describe catalog.
     #[error("describe catalog build failed: {0}")]
     Catalog(#[from] super::catalog::CatalogError),
+    /// A publish/refresh step failed AND the rollback re-announce that would
+    /// restore a consistent mesh state also failed — the node may be left
+    /// advertising tools with no live handler. Both errors are surfaced so the
+    /// inconsistency is diagnosable rather than silent.
+    #[error(
+        "{original}; ALSO failed to roll back the announcement \
+         (the mesh may still advertise stale tools): {rollback}"
+    )]
+    RollbackFailed {
+        /// The original failure that triggered the rollback.
+        original: String,
+        /// The failure of the rollback re-announce.
+        rollback: String,
+    },
+}
+
+/// Fold a rollback re-announce result into the error to return: if the
+/// rollback succeeded, return the original failure unchanged; if it also
+/// failed, surface both as [`WrapError::RollbackFailed`] so a left-inconsistent
+/// mesh state is never hidden behind a single error.
+fn rollback_result(original: WrapError, rollback: Result<(), WrapError>) -> WrapError {
+    match rollback {
+        Ok(()) => original,
+        Err(rb) => WrapError::RollbackFailed {
+            original: original.to_string(),
+            rollback: rb.to_string(),
+        },
+    }
 }
 
 /// What a [`PublicationHandle::refresh`] changed.
@@ -366,8 +394,7 @@ impl ServerPublisher {
         }
         if let Err(e) = self.shared.ensure_describe(&self.mesh) {
             self.shared.remove(id);
-            let _ = self.shared.sync_mesh(&self.mesh).await;
-            return Err(e);
+            return Err(rollback_result(e, self.shared.sync_mesh(&self.mesh).await));
         }
 
         // Serve one caller-aware handler per tool. If any serve fails
@@ -392,11 +419,14 @@ impl ServerPublisher {
                     drop(handles);
                     self.shared.remove(id);
                     self.shared.drop_describe_if_idle();
-                    let _ = self.shared.sync_mesh(&self.mesh).await;
-                    return Err(WrapError::Serve {
+                    let serve_err = WrapError::Serve {
                         tool: tool_id,
                         reason: e.to_string(),
-                    });
+                    };
+                    return Err(rollback_result(
+                        serve_err,
+                        self.shared.sync_mesh(&self.mesh).await,
+                    ));
                 }
             }
         }
@@ -522,8 +552,7 @@ impl PublicationHandle {
         // contribution back and re-announce the prior union.
         if let Err(e) = shared.sync_mesh(mesh).await {
             shared.restore(id, prior.clone());
-            let _ = shared.sync_mesh(mesh).await;
-            return Err(e);
+            return Err(rollback_result(e, shared.sync_mesh(mesh).await));
         }
 
         // Serve tools that appeared. On a serve failure (e.g. a tool-id
@@ -553,11 +582,11 @@ impl PublicationHandle {
                             self.handles.remove(served);
                         }
                         shared.restore(id, prior.clone());
-                        let _ = shared.sync_mesh(mesh).await;
-                        return Err(WrapError::Serve {
+                        let serve_err = WrapError::Serve {
                             tool: tool_id,
                             reason: e.to_string(),
-                        });
+                        };
+                        return Err(rollback_result(serve_err, shared.sync_mesh(mesh).await));
                     }
                 }
             }
@@ -820,6 +849,36 @@ mod tests {
         assert!(none_prior.is_none());
         shared.restore(9, none_prior);
         assert!(shared.contributions.lock().get(&9).is_none());
+    }
+
+    #[test]
+    fn rollback_result_surfaces_both_failures() {
+        // A rollback that succeeds returns the original error unchanged.
+        let folded = rollback_result(WrapError::Announce("boom".to_string()), Ok(()));
+        assert!(matches!(folded, WrapError::Announce(ref m) if m == "boom"));
+
+        // A rollback that ALSO fails is surfaced as RollbackFailed carrying
+        // both, so a left-inconsistent mesh state is never hidden behind a
+        // single error.
+        let folded = rollback_result(
+            WrapError::Announce("original boom".to_string()),
+            Err(WrapError::Announce("rollback boom".to_string())),
+        );
+        match folded {
+            WrapError::RollbackFailed { original, rollback } => {
+                assert!(original.contains("original boom"), "{original}");
+                assert!(rollback.contains("rollback boom"), "{rollback}");
+            }
+            other => panic!("expected RollbackFailed, got {other}"),
+        }
+
+        // The rendered message flags the stale-advertisement risk.
+        let msg = WrapError::RollbackFailed {
+            original: "x".to_string(),
+            rollback: "y".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("may still advertise stale tools"), "{msg}");
     }
 
     #[test]
