@@ -89,7 +89,12 @@ struct LockGuard {
 
 impl LockGuard {
     async fn acquire(store_path: &Path) -> Result<Self, PinStoreError> {
-        let lock_path = PathBuf::from(format!("{}.lock", store_path.display()));
+        // Append ".lock" to the raw OS path bytes rather than the lossy
+        // `display()` form, so the sidecar sits next to the store even for a
+        // non-UTF-8 path. `display` below is only for error messages.
+        let mut lock_os = store_path.as_os_str().to_os_string();
+        lock_os.push(".lock");
+        let lock_path = PathBuf::from(lock_os);
         let display = lock_path.display().to_string();
         // Open (creating) the lock file on a blocking thread — a bounded op
         // that never waits on the lock itself. A lock file: created if absent,
@@ -252,12 +257,28 @@ impl PinStore {
         #[cfg(unix)]
         opts.mode(0o600);
         let mut f = opts.open(&tmp).await.map_err(io_err)?;
-        f.write_all(&bytes).await.map_err(io_err)?;
-        f.flush().await.map_err(io_err)?;
+        // Write, fsync, then atomically rename. `sync_all` before the rename so
+        // a crash right after the rename can never surface an empty/truncated
+        // store — the bytes are durable before they become the live file.
+        let written: Result<(), PinStoreError> = async {
+            f.write_all(&bytes).await.map_err(io_err)?;
+            f.flush().await.map_err(io_err)?;
+            f.sync_all().await.map_err(io_err)?;
+            Ok(())
+        }
+        .await;
         drop(f);
 
-        tokio::fs::rename(&tmp, &self.path).await.map_err(io_err)?;
-        Ok(())
+        let result = match written {
+            Ok(()) => tokio::fs::rename(&tmp, &self.path).await.map_err(io_err),
+            Err(e) => Err(e),
+        };
+        // On any failure, remove the temp so a failed save never leaks a
+        // `.tmp.<pid>` sibling in the store directory.
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        result
     }
 
     /// Atomically apply a mutation under a **cross-process exclusive lock**, so
