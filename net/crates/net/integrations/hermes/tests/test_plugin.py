@@ -76,11 +76,31 @@ def test_invoke_and_describe_require_cap_id(plugin, node_ready):
     assert _run(tools.handle_net_describe({}))["status"] == "error"
 
 
-def test_invoke_defaults_arguments_to_empty(plugin, node_ready):
+def test_invoke_defaults_absent_arguments_to_empty_object(plugin, node_ready, monkeypatch):
+    # Prove the handler passes "{}" (an empty object) — NOT "null" — when
+    # `arguments` is absent or explicitly None. The previous version invoked an
+    # unreachable cap and asserted transport_error/not_found, which held true
+    # regardless of the defaulting logic (false confidence). Capture what the
+    # gateway actually receives instead.
     tools = plugin.tools
-    # No `arguments` key: still well-formed, only the (unreachable) provider fails.
-    result = _run(tools.handle_net_invoke({"cap_id": "42/nope"}))
-    assert result["status"] in {"transport_error", "not_found"}
+
+    class _RecordingGateway:
+        def __init__(self):
+            self.last_args = None
+
+        async def invoke(self, cap_id, arguments_json):
+            self.last_args = arguments_json
+            return '{"status": "ok", "content": []}'
+
+    fake = _RecordingGateway()
+    monkeypatch.setattr(plugin.node, "gateway", lambda: fake)
+
+    # Absent `arguments`.
+    _run(tools.handle_net_invoke({"cap_id": "42/x"}))
+    assert fake.last_args == "{}"
+    # Explicit null also normalizes to an empty object at the handler.
+    _run(tools.handle_net_invoke({"cap_id": "42/x", "arguments": None}))
+    assert fake.last_args == "{}"
 
 
 def test_request_pin_records_pending_and_list_reflects_it(plugin, node_ready):
