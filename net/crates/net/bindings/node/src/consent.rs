@@ -63,12 +63,9 @@ fn parse_cap(cap_id: &str) -> Result<CoreCapabilityId> {
     CoreCapabilityId::parse(cap_id).map_err(consent_err)
 }
 
-/// The stable string form of a pin state.
+/// The stable string form of a pin state (the SDK's — never re-tabulated).
 fn pin_state_str(state: PinState) -> &'static str {
-    match state {
-        PinState::Pending => "pending",
-        PinState::Approved => "approved",
-    }
+    state.as_str()
 }
 
 /// One pin record — the JS shape `{ capId, state }`.
@@ -210,16 +207,9 @@ impl ConsentPolicy {
     #[napi]
     pub fn decide(&self, cap_id: String, credential_status: String) -> Result<String> {
         let id = parse_cap(&cap_id)?;
-        let requires = self
-            .inner
-            .lock()
-            .decide(&id, &credential_status)
-            .requires_approval();
-        Ok(if requires {
-            "requires_approval".to_string()
-        } else {
-            "allowed".to_string()
-        })
+        // The SDK enum's stable string form — never re-derived here.
+        let decision = self.inner.lock().decide(&id, &credential_status);
+        Ok(decision.as_str().to_string())
     }
 
     /// Convenience: does invoking the capability require approval the

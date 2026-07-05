@@ -46,6 +46,19 @@ pub enum PinState {
     Approved,
 }
 
+impl PinState {
+    /// The stable wire/string form (`"pending"` / `"approved"`) — the same
+    /// spelling `#[serde(rename_all = "snake_case")]` persists. The one source
+    /// of the pin-state vocabulary: language bindings marshal this rather than
+    /// re-tabulating the strings (bridge-SDK doctrine #1).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinState::Pending => "pending",
+            PinState::Approved => "approved",
+        }
+    }
+}
+
 /// A failure loading or saving the pin store.
 #[derive(Debug, thiserror::Error)]
 pub enum PinStoreError {

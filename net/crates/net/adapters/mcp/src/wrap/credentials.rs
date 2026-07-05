@@ -33,6 +33,34 @@ pub enum CredentialOverride {
     NoCredentials,
 }
 
+impl CredentialOverride {
+    /// Human-readable list of the accepted wire/CLI labels, for error
+    /// messages. Kept next to [`Self::from_wire`] so the two never drift.
+    pub const EXPECTED: &'static str = "detect | credentialed | no-credentials";
+
+    /// The wire/CLI label for this override.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialOverride::Detect => "detect",
+            CredentialOverride::Credentialed => "credentialed",
+            CredentialOverride::NoCredentials => "no-credentials",
+        }
+    }
+
+    /// Parse a wire/CLI override label; an unrecognised label returns `None`
+    /// (the caller reports it, e.g. citing [`Self::EXPECTED`]). This is the
+    /// one place the override vocabulary lives — the language bindings
+    /// delegate here instead of each re-tabulating the match.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "detect" => Some(CredentialOverride::Detect),
+            "credentialed" => Some(CredentialOverride::Credentialed),
+            "no-credentials" => Some(CredentialOverride::NoCredentials),
+            _ => None,
+        }
+    }
+}
+
 /// The inputs the classifier reasons over: the wrapped command and the
 /// environment additions passed to it.
 #[derive(Debug, Clone, Copy)]

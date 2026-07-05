@@ -39,11 +39,26 @@ pub enum Substitutability {
 }
 
 impl Substitutability {
+    /// Human-readable list of the accepted labels, for error messages. Kept
+    /// next to [`Self::from_label`] so the two never drift.
+    pub const EXPECTED: &'static str = "provider_local | provider_equivalent";
+
     /// The wire/tag form.
     pub fn as_str(self) -> &'static str {
         match self {
             Substitutability::ProviderLocal => "provider_local",
             Substitutability::ProviderEquivalent => "provider_equivalent",
+        }
+    }
+
+    /// Parse a wire/tag label; an unrecognised label returns `None` (the
+    /// caller reports it, citing [`Self::EXPECTED`]). The one source of the
+    /// substitutability vocabulary — bindings delegate here.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "provider_local" => Some(Substitutability::ProviderLocal),
+            "provider_equivalent" => Some(Substitutability::ProviderEquivalent),
+            _ => None,
         }
     }
 }

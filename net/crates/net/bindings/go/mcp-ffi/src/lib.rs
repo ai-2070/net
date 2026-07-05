@@ -200,11 +200,9 @@ fn parse_cap(display: &str) -> Option<CapabilityId> {
     }
 }
 
+/// The stable string form of a pin state (the SDK's — never re-tabulated).
 fn pin_state_str(state: PinState) -> &'static str {
-    match state {
-        PinState::Pending => "pending",
-        PinState::Approved => "approved",
-    }
+    state.as_str()
 }
 
 // =====================================================================
@@ -280,16 +278,20 @@ pub unsafe extern "C" fn net_mcp_classify(
             _ => Vec::new(),
         };
         let over = match opt_cstr(credential_override) {
-            None | Some("detect") => CredentialOverride::Detect,
-            Some("credentialed") => CredentialOverride::Credentialed,
-            Some("no-credentials") => CredentialOverride::NoCredentials,
-            Some(other) => {
-                set_last_error(
-                    format!("unknown credential_override {other:?} (expected detect | credentialed | no-credentials)"),
-                    "invalid_arg",
-                );
-                return ptr::null_mut();
-            }
+            None => CredentialOverride::Detect,
+            Some(label) => match CredentialOverride::from_wire(label) {
+                Some(o) => o,
+                None => {
+                    set_last_error(
+                        format!(
+                            "unknown credential_override {label:?} (expected {})",
+                            CredentialOverride::EXPECTED
+                        ),
+                        "invalid_arg",
+                    );
+                    return ptr::null_mut();
+                }
+            },
         };
         match classify(
             &WrapEnv {
@@ -365,15 +367,20 @@ pub unsafe extern "C" fn net_mcp_lower_tool(
             return ptr::null_mut();
         };
         let substitutability = match opt_cstr(substitutability) {
-            None | Some("provider_local") => Substitutability::ProviderLocal,
-            Some("provider_equivalent") => Substitutability::ProviderEquivalent,
-            Some(other) => {
-                set_last_error(
-                    format!("unknown substitutability {other:?} (expected provider_local | provider_equivalent)"),
-                    "invalid_arg",
-                );
-                return ptr::null_mut();
-            }
+            None => Substitutability::ProviderLocal,
+            Some(label) => match Substitutability::from_label(label) {
+                Some(s) => s,
+                None => {
+                    set_last_error(
+                        format!(
+                            "unknown substitutability {label:?} (expected {})",
+                            Substitutability::EXPECTED
+                        ),
+                        "invalid_arg",
+                    );
+                    return ptr::null_mut();
+                }
+            },
         };
         let lowered = lower_tool(
             &tool,
@@ -598,11 +605,8 @@ pub unsafe extern "C" fn net_mcp_consent_policy_decide(
         let Some(id) = parse_cap(display) else {
             return ptr::null_mut();
         };
-        let decision = if (*policy).inner.requires_approval(&id, status) {
-            "requires_approval"
-        } else {
-            "allowed"
-        };
+        // The SDK enum's stable string form — never re-derived here.
+        let decision = (*policy).inner.decide(&id, status).as_str();
         into_cstr(decision.to_string())
     })
 }

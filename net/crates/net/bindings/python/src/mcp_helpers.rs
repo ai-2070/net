@@ -43,14 +43,13 @@ pub fn classify_mcp_server(
     force: bool,
 ) -> PyResult<&'static str> {
     let over = match credential_override {
-        None | Some("detect") => CredentialOverride::Detect,
-        Some("credentialed") => CredentialOverride::Credentialed,
-        Some("no-credentials") => CredentialOverride::NoCredentials,
-        Some(other) => {
-            return Err(mcp_err(format!(
-                "unknown credential_override {other:?} (expected detect | credentialed | no-credentials)"
-            )))
-        }
+        None => CredentialOverride::Detect,
+        Some(label) => CredentialOverride::from_wire(label).ok_or_else(|| {
+            mcp_err(format!(
+                "unknown credential_override {label:?} (expected {})",
+                CredentialOverride::EXPECTED
+            ))
+        })?,
     };
     classify(
         &WrapEnv {
@@ -93,15 +92,12 @@ pub fn lower_mcp_tool(
             "unknown credential_status {credential_status:?} (expected credentialed | external_api | unknown | none)"
         ))
     })?;
-    let substitutability = match substitutability {
-        "provider_local" => Substitutability::ProviderLocal,
-        "provider_equivalent" => Substitutability::ProviderEquivalent,
-        other => {
-            return Err(mcp_err(format!(
-                "unknown substitutability {other:?} (expected provider_local | provider_equivalent)"
-            )))
-        }
-    };
+    let substitutability = Substitutability::from_label(substitutability).ok_or_else(|| {
+        mcp_err(format!(
+            "unknown substitutability {substitutability:?} (expected {})",
+            Substitutability::EXPECTED
+        ))
+    })?;
 
     let lowered = lower_tool(
         &tool,

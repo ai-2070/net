@@ -71,12 +71,9 @@ fn extract_cap_id(obj: &Bound<'_, PyAny>) -> PyResult<CapabilityId> {
     CapabilityId::parse(&s).map_err(|e| PyValueError::new_err(format!("consent: {e}")))
 }
 
-/// The stable string form of a pin state.
+/// The stable string form of a pin state (the SDK's — never re-tabulated).
 fn pin_state_str(state: PinState) -> &'static str {
-    match state {
-        PinState::Pending => "pending",
-        PinState::Approved => "approved",
-    }
+    state.as_str()
 }
 
 /// A capability's canonical identity: `provider/capability`. Construction
@@ -203,17 +200,8 @@ impl PyConsentPolicy {
     /// decision is the SDK enum's stable string form — never re-derive it.
     fn decide(&self, cap_id: &Bound<'_, PyAny>, credential_status: &str) -> PyResult<&'static str> {
         let id = extract_cap_id(cap_id)?;
-        Ok(
-            if self
-                .inner
-                .decide(&id, credential_status)
-                .requires_approval()
-            {
-                "requires_approval"
-            } else {
-                "allowed"
-            },
-        )
+        // The SDK enum's stable string form — never re-derived here.
+        Ok(self.inner.decide(&id, credential_status).as_str())
     }
 
     /// Convenience: does invoking the capability require approval the

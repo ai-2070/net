@@ -78,14 +78,13 @@ pub fn classify_mcp_server(
     force: Option<bool>,
 ) -> Result<String> {
     let over = match credential_override.as_deref() {
-        None | Some("detect") => CredentialOverride::Detect,
-        Some("credentialed") => CredentialOverride::Credentialed,
-        Some("no-credentials") => CredentialOverride::NoCredentials,
-        Some(other) => {
-            return Err(mcp_err(format!(
-                "unknown credentialOverride {other:?} (expected detect | credentialed | no-credentials)"
-            )))
-        }
+        None => CredentialOverride::Detect,
+        Some(label) => CredentialOverride::from_wire(label).ok_or_else(|| {
+            mcp_err(format!(
+                "unknown credentialOverride {label:?} (expected {})",
+                CredentialOverride::EXPECTED
+            ))
+        })?,
     };
     let envs: Vec<(String, String)> = envs.into_iter().map(|e| (e.key, e.value)).collect();
     classify(
@@ -123,13 +122,13 @@ pub fn lower_mcp_tool(
         ))
     })?;
     let substitutability = match substitutability.as_deref() {
-        None | Some("provider_local") => Substitutability::ProviderLocal,
-        Some("provider_equivalent") => Substitutability::ProviderEquivalent,
-        Some(other) => {
-            return Err(mcp_err(format!(
-                "unknown substitutability {other:?} (expected provider_local | provider_equivalent)"
-            )))
-        }
+        None => Substitutability::ProviderLocal,
+        Some(label) => Substitutability::from_label(label).ok_or_else(|| {
+            mcp_err(format!(
+                "unknown substitutability {label:?} (expected {})",
+                Substitutability::EXPECTED
+            ))
+        })?,
     };
 
     let lowered = lower_tool(

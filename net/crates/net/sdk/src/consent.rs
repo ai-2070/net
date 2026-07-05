@@ -214,6 +214,17 @@ pub enum ConsentDecision {
 }
 
 impl ConsentDecision {
+    /// The stable wire/string form (`"allowed"` / `"requires_approval"`). The
+    /// one source of the decision vocabulary — language bindings marshal this
+    /// rather than re-tabulating the strings, so they cannot drift from the
+    /// gate (bridge-SDK doctrine #1).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsentDecision::Allowed => "allowed",
+            ConsentDecision::RequiresApproval => "requires_approval",
+        }
+    }
+
     /// Is this capability blocked pending approval?
     pub fn requires_approval(self) -> bool {
         matches!(self, ConsentDecision::RequiresApproval)
