@@ -1,0 +1,27 @@
+go/consent_golden_vectors_test.go
+  s_cdbc9688784d9a::t_4a2730615bb8a9 1-123
+net/crates/net/sdk/tests/consent_golden_vectors.rs
+  s_cdbc9688784d9a::t_e2f03587a58a2d 1-101
+net/crates/net/tests/cross_lang_mcp/consent_vectors.json
+  s_cdbc9688784d9a::t_815ed58d018f30 1-73
+net/crates/net/bindings/node/test/consent_golden_vectors.test.ts
+  s_cdbc9688784d9a::t_0b6d8b6c52e8cc 1-69
+net/crates/net/bindings/python/tests/test_consent_golden_vectors.py
+  s_cdbc9688784d9a::t_7a10ca6382df99 1-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3b597c19689b54b41b568ed769a29faceee3b651",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
