@@ -1,0 +1,45 @@
+go/mcp.go
+  s_cdbc9688784d9a::t_483139b1c8c650 1-487
+net/crates/net/Cargo.toml
+  s_cdbc9688784d9a::t_49a828e00f6619 17
+go/mcp_test.go
+  s_cdbc9688784d9a::t_fce11fd4ebe87d 18,20
+  s_cdbc9688784d9a::t_d2332f6b5a3046 131
+  s_cdbc9688784d9a::t_4d26279abe93d9 1-17,19,21-130,132-258,260-311
+  s_cdbc9688784d9a::t_70b92b687898a8 259
+net/crates/net/include/net_mcp.h
+  s_cdbc9688784d9a::t_92bfc17275d97c 1-205
+.github/workflows/ci.yml
+  s_cdbc9688784d9a::t_65d432eb0f3a3a 812,816
+  s_cdbc9688784d9a::t_75487651f2caa2 947,955-956
+  s_cdbc9688784d9a::t_f7859e5d7c81ea 1075,1078,1094-1098
+  s_cdbc9688784d9a::t_247d8fc3b14e47 985-989,1099
+net/crates/net/bindings/go/mcp-ffi/Cargo.toml
+  s_cdbc9688784d9a::t_6acaa5b7365f27 34-35
+  s_cdbc9688784d9a::t_9bc413d8610fb3 37-42,45-50
+  s_cdbc9688784d9a::t_955835ffc0c8d1 1-33,36,43-44,51-55
+net/crates/net/bindings/go/mcp-ffi/src/lib.rs
+  s_cdbc9688784d9a::t_e38a2d7fe679c7 176-180,184
+  s_cdbc9688784d9a::t_4d075ba38c8704 1-175,181-183,185-839,1111
+  s_cdbc9688784d9a::t_da92bdd4de50fb 840-1110
+  s_cdbc9688784d9a::t_6ed945e760c393 1112-1114
+  s_cdbc9688784d9a::t_b3a0959e5faeaa 1115-1141
+net/crates/net/Cargo.lock
+  s_cdbc9688784d9a::t_1232c95ad03ca2 2493-2504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "213a7d8dd7c00451993395138f715bc9a8d07448",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
