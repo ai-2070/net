@@ -59,13 +59,13 @@
 
 ## Conformance (extends the golden-vector suite)
 
-- DTO vectors: `CapabilityId`, pin records, consent decisions, descriptor + bridge tags — byte-identical across all five.
-- Behavior vectors: credential classification parity (same inputs → same status/tags in every binding), validation-error parity (same bad args → same field-naming error).
-- **Concurrent pin-store test in every binding** — the lock protocol is the contract; this is the test that keeps doctrine 1 honest.
-- Secret negative test per binding (doctrine 3).
-- Spawn-mode round-trip per binding against `net-mcp-fixture`, including the erroring/slow/schema-changing tools.
-- Shim round-trip: a Net capability exposed through `net mcp serve` and invoked by a real MCP client.
-- Helper parity: `lower(...)` and `classify(...)` produce identical DTOs/tags across all bindings.
+- DTO vectors: `CapabilityId`, pin records, consent decisions, descriptor + bridge tags — byte-identical across all five. ✅ **descriptor + bridge tags** covered by the helper golden vectors (below); CapabilityId/pin/consent DTOs are exercised per-binding, not yet a single shared fixture.
+- Behavior vectors: credential classification parity (same inputs → same status/tags in every binding), validation-error parity (same bad args → same field-naming error). ✅ classification parity is the golden-vector `classify` set.
+- **Concurrent pin-store test in every binding** — the lock protocol is the contract; this is the test that keeps doctrine 1 honest. ✅ done: Python (8-thread), Node (60-way), Go/C ABI (40-thread).
+- Secret negative test per binding (doctrine 3). ✅ done in all three.
+- Spawn-mode round-trip per binding against `net-mcp-fixture`, including the erroring/slow/schema-changing tools. ⏳ deferred (needs a bound `Mesh` handle + the fixture — the one item outstanding across all bindings).
+- Shim round-trip: a Net capability exposed through `net mcp serve` and invoked by a real MCP client. ⏳ deferred (same integration).
+- Helper parity: `lower(...)` and `classify(...)` produce identical DTOs/tags across all bindings. ✅ **done 2026-07-05** — a committed shared fixture (`tests/cross_lang_mcp/helper_vectors.json`) with a Rust source-of-truth verifier (`adapters/mcp/tests/helper_golden_vectors.rs`) + Python / Node / Go verifiers; each normalizes the descriptor's schema strings to objects and deep-compares. Rust/Python/Node green locally, Go under CI.
 
 ## Non-goals
 
