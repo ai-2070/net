@@ -80,3 +80,16 @@ def test_isolated_node_runs_undelegated(node_ready):
     # its tools still load (delegation is opt-in via the root seed).
     assert node_ready.delegation() is None
     assert node_ready.check_net_available() is True
+
+
+def test_gateway_delegation_exposes_the_signer_inputs(plugin):
+    # The gateway leaf Identity + chain bytes node.py hands to the
+    # AsyncCapabilityGateway (Slice B2 auto-attach) must be self-consistent.
+    import net
+
+    gd = plugin.delegation.GatewayDelegation(_SEED, machine_label="hostA")
+    # The leaf handle's entity-id is the chain leaf.
+    assert gd.gateway_identity.entity_id == gd.gateway_id
+    cb = gd.chain_bytes()
+    assert isinstance(cb, (bytes, bytearray)) and len(cb) > 0
+    assert net.DelegationChain.from_bytes(cb).leaf == gd.gateway_id

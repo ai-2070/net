@@ -38,7 +38,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
@@ -48,7 +48,28 @@ use net_mcp::serve::{
     gated_invoke, CapabilityDetail, CapabilityGateway, CapabilityId, ConsentPolicy, GatedOutcome,
     GatewayError, MeshGateway, PinStore,
 };
+use net_mcp::wrap::DelegationSigner;
 use net_sdk::mesh::Mesh as SdkMesh;
+use net_sdk::Identity as SdkIdentity;
+
+/// Build the caller-side delegation input from the Python kwargs. `leaf` is the
+/// gateway `Identity` handle (its signing key stays in Rust — H8) and `chain`
+/// is the serialized `DelegationChain`. Both or neither: passing exactly one is
+/// a caller error.
+fn build_delegation(
+    delegation_leaf: Option<&crate::identity::Identity>,
+    delegation_chain: Option<Vec<u8>>,
+) -> PyResult<Option<(SdkIdentity, Vec<u8>)>> {
+    match (delegation_leaf, delegation_chain) {
+        (Some(leaf), Some(chain)) => {
+            Ok(Some((SdkIdentity::from_seed(*leaf.keypair.secret_bytes()), chain)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(
+            "delegation_leaf and delegation_chain must be provided together",
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared marshaling helpers
@@ -217,6 +238,7 @@ impl GatewayState {
     fn from_mesh(
         mesh: &crate::mesh_bindings::NetMesh,
         pin_store_path: Option<String>,
+        delegation: Option<(SdkIdentity, Vec<u8>)>,
     ) -> PyResult<Self> {
         // Mirror `DaemonRuntime`: reuse the live node + its runtime so the
         // gateway drives mesh I/O on the same scheduler the node runs on.
@@ -224,8 +246,16 @@ impl GatewayState {
         let channel_configs = mesh.channel_configs_arc();
         let runtime = mesh.runtime_arc();
         let sdk_mesh = SdkMesh::from_node_arc(node, channel_configs, None);
+        let mut gateway = MeshGateway::new(Arc::new(sdk_mesh));
+        if let Some((leaf, chain_bytes)) = delegation {
+            // Phase 3 Slice B2: sign + attach the delegation chain on every
+            // invoke, so a provider running a `DelegationGate` admits by
+            // verified delegation (not the spoofable owner-scope origin) and
+            // audits this gateway's leaf.
+            gateway = gateway.with_delegation(Arc::new(DelegationSigner::new(leaf, chain_bytes)));
+        }
         Ok(Self {
-            gateway: Arc::new(MeshGateway::new(Arc::new(sdk_mesh))),
+            gateway: Arc::new(gateway),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
             runtime,
@@ -272,10 +302,16 @@ pub struct PyCapabilityGateway {
 #[pymethods]
 impl PyCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None))]
-    fn new(mesh: &crate::mesh_bindings::NetMesh, pin_store_path: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None))]
+    fn new(
+        mesh: &crate::mesh_bindings::NetMesh,
+        pin_store_path: Option<String>,
+        delegation_leaf: Option<&crate::identity::Identity>,
+        delegation_chain: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path)?,
+            state: GatewayState::from_mesh(mesh, pin_store_path, delegation)?,
         })
     }
 
@@ -361,10 +397,16 @@ pub struct PyAsyncCapabilityGateway {
 #[pymethods]
 impl PyAsyncCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None))]
-    fn new(mesh: &crate::mesh_bindings::NetMesh, pin_store_path: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None))]
+    fn new(
+        mesh: &crate::mesh_bindings::NetMesh,
+        pin_store_path: Option<String>,
+        delegation_leaf: Option<&crate::identity::Identity>,
+        delegation_chain: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path)?,
+            state: GatewayState::from_mesh(mesh, pin_store_path, delegation)?,
         })
     }
 

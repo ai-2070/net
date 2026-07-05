@@ -115,13 +115,24 @@ def _build() -> Tuple[object, object, str, object]:
         raise RuntimeError(
             "net plugin: no pin-store path could be resolved; set NET_MESH_PIN_STORE"
         )
-    gateway = AsyncCapabilityGateway(mesh, pin_store_path=pin_store)
+    # Phase 3 Slice B2: when delegated, the gateway signs + attaches the
+    # delegation chain on every invoke (from the gateway leaf key held in the
+    # chain), so a remote provider running a DelegationGate admits by verified
+    # delegation and audits this gateway. Un-delegated ⇒ plain gateway.
     if delegation is not None:
+        gateway = AsyncCapabilityGateway(
+            mesh,
+            pin_store_path=pin_store,
+            delegation_leaf=delegation.gateway_identity,
+            delegation_chain=delegation.chain_bytes(),
+        )
         logger.info(
             "net plugin: gateway delegation acquired (machine=%s, gateway=0x%s)",
             delegation._machine_label,
             delegation.gateway_id.hex()[:16],
         )
+    else:
+        gateway = AsyncCapabilityGateway(mesh, pin_store_path=pin_store)
     logger.info(
         "net plugin: node up (id=%s, bind=%s, pin_store=%s, delegated=%s)",
         getattr(mesh, "node_id", "?"),

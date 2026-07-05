@@ -126,3 +126,60 @@ def test_revocation_registry_floor_is_monotonic():
 def test_gateway_delegation_channel_is_a_nonempty_string():
     assert isinstance(net.GATEWAY_DELEGATION_CHANNEL, str)
     assert net.GATEWAY_DELEGATION_CHANNEL
+
+
+# --- caller-side auto-attach (Slice B2) ------------------------------------
+
+_GW = pytest.importorskip("net")  # AsyncCapabilityGateway needs net+mcp
+
+
+def _mesh():
+    return net.NetMesh("127.0.0.1:0", "42" * 32)
+
+
+def test_async_gateway_accepts_delegation_params(tmp_path):
+    import asyncio
+    import json
+
+    AsyncCapabilityGateway = getattr(net, "AsyncCapabilityGateway", None)
+    if AsyncCapabilityGateway is None:
+        pytest.skip("net+mcp features not built")
+
+    mesh = _mesh()
+    mesh.start()
+    try:
+        root = net.Identity.generate()
+        machine = net.derive_child_identity(root, "machine:h")
+        gateway = net.derive_child_identity(root, "gateway:h:hermes")
+        chain = net.DelegationChain.derive_gateway(root, machine, gateway, 3600)
+        gw = AsyncCapabilityGateway(
+            mesh,
+            pin_store_path=str(tmp_path / "pins.json"),
+            delegation_leaf=gateway,
+            delegation_chain=chain.to_bytes(),
+        )
+
+        # On an isolated node search returns structured ok/empty — proving the
+        # delegated gateway is wired and callable (no live provider needed).
+        async def body():
+            return await gw.search("anything")
+
+        res = json.loads(asyncio.run(body()))
+        assert res["status"] == "ok"
+    finally:
+        mesh.shutdown()
+
+
+def test_gateway_delegation_params_are_both_or_neither(tmp_path):
+    AsyncCapabilityGateway = getattr(net, "AsyncCapabilityGateway", None)
+    if AsyncCapabilityGateway is None:
+        pytest.skip("net+mcp features not built")
+
+    mesh = _mesh()
+    mesh.start()
+    try:
+        gateway = net.derive_child_identity(net.Identity.generate(), "gateway:h")
+        with pytest.raises(ValueError):
+            AsyncCapabilityGateway(mesh, delegation_leaf=gateway)  # chain missing
+    finally:
+        mesh.shutdown()

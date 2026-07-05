@@ -2700,11 +2700,23 @@ class CapabilityGateway:
         result = await asyncio.to_thread(gateway.invoke, cap_id, args_json)
     """
 
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = None,
+        delegation_leaf: Optional["Identity"] = None,
+        delegation_chain: Optional[bytes] = None,
+    ) -> None:
         """Build a gateway over a started ``mesh``. ``pin_store_path`` should
         be the machine-shared pin store so approvals are honored both ways;
         omit it to keep consent in-memory (every gated capability then always
-        requires approval)."""
+        requires approval).
+
+        Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
+        ``delegation_chain`` (a serialized ``DelegationChain``) together to have
+        every invoke carry a per-invoke signed delegation (Phase 3): a remote
+        provider running a delegation gate then admits by verified delegation
+        and audits this gateway's leaf. Both or neither."""
         ...
 
     @property
@@ -2739,7 +2751,17 @@ class AsyncCapabilityGateway:
     own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
     was built with the ``net`` + ``mcp`` features."""
 
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = None) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = None,
+        delegation_leaf: Optional["Identity"] = None,
+        delegation_chain: Optional[bytes] = None,
+    ) -> None:
+        """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
+        ``delegation_chain`` together to sign + attach a delegation on every
+        invoke (Phase 3)."""
+        ...
     @property
     def pin_store_path(self) -> Optional[str]: ...
     async def search(self, query: str) -> str:

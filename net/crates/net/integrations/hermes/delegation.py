@@ -121,6 +121,18 @@ class GatewayDelegation:
         return self._gateway.entity_id
 
     @property
+    def gateway_identity(self):
+        """The gateway (leaf) :class:`~net.Identity` **handle** — used to build
+        the caller-side signer that signs each invoke. The private key stays
+        inside the handle (H8); this is plugin-internal plumbing, never
+        model-visible."""
+        return self._gateway
+
+    def chain_bytes(self) -> bytes:
+        """The serialized gateway chain, for the caller-side signer."""
+        return self._chain.to_bytes()
+
+    @property
     def root_id(self) -> bytes:
         """The user-root entity-id the chain anchors at."""
         return self._root_id
