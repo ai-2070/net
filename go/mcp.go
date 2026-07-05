@@ -65,6 +65,7 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"sync"
 	"unsafe"
 )
 
@@ -263,7 +264,14 @@ func CanonicalizeCapID(display string) (string, error) {
 // ConsentPolicy is the consumer-side consent gate: a config allowlist plus
 // a pinned set. With no entries, EVERY discovered capability requires
 // approval. The decision logic lives in Rust; this wraps the opaque handle.
+//
+// The Rust handle has no interior lock and its mutators take &mut, so `mu`
+// serializes every FFI access and the free: without it, concurrent
+// Allow/Pin/Unpin (or a mutator racing a reader) would create aliasing &mut
+// in Rust — a data race — and two concurrent Close calls would double-free.
+// A *ConsentPolicy may therefore be shared across goroutines.
 type ConsentPolicy struct {
+	mu  sync.Mutex
 	ptr *C.ConsentPolicyHandle
 }
 
@@ -280,8 +288,12 @@ func NewConsentPolicy() (*ConsentPolicy, error) {
 	return p, nil
 }
 
-// Close frees the underlying handle. Idempotent.
+// Close frees the underlying handle. Idempotent and safe to call
+// concurrently: the mutex serializes it against in-flight methods and a
+// second Close, so the handle is freed at most once.
 func (p *ConsentPolicy) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.ptr != nil {
 		C.net_mcp_consent_policy_free(p.ptr)
 		p.ptr = nil
@@ -290,6 +302,8 @@ func (p *ConsentPolicy) Close() {
 }
 
 func (p *ConsentPolicy) mutate(capID string, fn func(*C.ConsentPolicyHandle, *C.char) C.int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	defer pinThread()()
 	// Keep p reachable until the cgo call returns: p's finalizer frees the
 	// Rust handle, and without this the GC could run it (freeing p.ptr) while
@@ -327,6 +341,8 @@ func (p *ConsentPolicy) Unpin(capID string) error {
 
 // IsPinned reports whether the capability is pinned.
 func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	defer pinThread()()
 	defer runtime.KeepAlive(p)
 	cCap, free := cstr(capID)
@@ -341,6 +357,8 @@ func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
 // Decide returns "allowed" or "requires_approval" for the capability with
 // the given wire credential status (the SDK enum's stable string).
 func (p *ConsentPolicy) Decide(capID, credentialStatus string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	defer pinThread()()
 	defer runtime.KeepAlive(p)
 	cCap, freeCap := cstr(capID)
@@ -375,6 +393,8 @@ func (p *ConsentPolicy) RequiresApproval(capID, credentialStatus string) (bool, 
 
 // Pinned returns the pinned capabilities' display ids, sorted.
 func (p *ConsentPolicy) Pinned() ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	defer pinThread()()
 	defer runtime.KeepAlive(p)
 	js, ok := takeString(C.net_mcp_consent_policy_pinned(p.ptr))

@@ -232,6 +232,49 @@ func TestConsentPolicyFailsClosedOnError(t *testing.T) {
 	}
 }
 
+func TestConsentPolicyConcurrentAccessIsSafe(t *testing.T) {
+	// Meaningful under `go test -race`: the Rust handle has no interior lock,
+	// so unsynchronized concurrent access would race on its &mut mutators, and
+	// concurrent Close would double-free. The binding's mutex must serialize
+	// both.
+	p, err := NewConsentPolicy()
+	if err != nil {
+		t.Fatalf("NewConsentPolicy: %v", err)
+	}
+
+	const n = 32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("b/cap%d", i)
+			_ = p.Allow(id)
+			_, _ = p.IsPinned(id)
+			_ = p.Pin(id)
+			_, _ = p.Decide(id, "credentialed")
+			_, _ = p.Pinned()
+		}(i)
+	}
+	wg.Wait()
+
+	// Every id was allowlisted and pinned, so each decides "allowed".
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("b/cap%d", i)
+		if d, _ := p.Decide(id, "credentialed"); d != "allowed" {
+			t.Errorf("%s decide = %q, want allowed", id, d)
+		}
+	}
+
+	// Concurrent Close must free the handle at most once (no double-free).
+	var closers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		closers.Add(1)
+		go func() { defer closers.Done(); p.Close() }()
+	}
+	closers.Wait()
+}
+
 // ---------------------------------------------------------------------------
 // Pin store
 // ---------------------------------------------------------------------------
