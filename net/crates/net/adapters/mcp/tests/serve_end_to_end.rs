@@ -16,15 +16,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use net_mcp::bridge::BRIDGE_PROVIDER_TAG;
 use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
 use net_mcp::serve::{gated_invoke, ConsentPolicy, GatedOutcome, MeshGateway, PinStore};
 use net_mcp::spec::{CallToolResult, Implementation};
 use net_mcp::wrap::{
-    CredentialOverride, OwnerScope, ServerPublisher, Substitutability, WrapConfig,
+    build_challenge, build_envelope, CredentialOverride, DelegationAudit, DelegationGate,
+    OwnerScope, ServerPublisher, Substitutability, WrapConfig, HDR_DELEGATION, HDR_DELEGATION_SIG,
 };
 use net_sdk::capabilities::CapabilityFilter;
+use net_sdk::delegation::{
+    derive_child_seed, DelegationChain, RevocationRegistry, DEFAULT_DELEGATION_DEPTH,
+};
 use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::mesh_rpc::CallOptions;
+use net_sdk::Identity;
 use serde_json::json;
 
 const FIXTURE: &str = env!("CARGO_BIN_EXE_net-mcp-fixture");
@@ -212,6 +219,118 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
             Err(GatewayError::Denied(_)) | Err(GatewayError::Transport(_))
         ),
         "an out-of-scope caller must not get a result; got {outcome:?}",
+    );
+
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
+/// Phase 3 Slice B, over a live mesh: a caller the owner-scope allowlist
+/// EXCLUDES is nonetheless admitted when it presents a valid delegation chain
+/// (rooted at the provider's owner) plus a per-invoke signature by the chain
+/// leaf — proving the delegation path admits independently of the (spoofable)
+/// origin allowlist, and that the provider audits the admitted leaf.
+///
+/// The chain + signed envelope ride in the `net-delegation` / `net-delegation-sig`
+/// request headers; each retry mints a FRESH nonce because the gate's replay
+/// guard (correctly) rejects a reused one, and the reply-channel first-reply
+/// race can force a retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegated_invoke_admits_via_the_chain_and_audits_the_leaf() {
+    let caller = Arc::new(build_mesh(&[0x55u8; 32]).await); // node A (demand)
+    let host = Arc::new(build_mesh(&[0x55u8; 32]).await); // node B (supply)
+    handshake(&caller, &host).await;
+    let host_id = host.inner().node_id();
+
+    // The user's delegation tree: root -> machine -> gateway(leaf), derived
+    // exactly as the plugin does (deterministic children from the root seed).
+    let root = Identity::generate();
+    let seed = root.to_bytes();
+    let machine = Identity::from_seed(derive_child_seed(&seed, "machine:h"));
+    let gateway = Identity::from_seed(derive_child_seed(&seed, "gateway:h:hermes"));
+    let chain = DelegationChain::derive_gateway(
+        &root,
+        &machine,
+        gateway.entity_id(),
+        Duration::from_secs(3600),
+        DEFAULT_DELEGATION_DEPTH,
+    )
+    .expect("derive the gateway chain");
+    let chain_bytes = chain.to_bytes();
+
+    // Provider: owner-scope admits only an UNRELATED origin (so it excludes the
+    // caller), plus a delegation gate anchored at `root`. Only a verified chain
+    // can admit the caller — proving the delegation path, not owner-scope.
+    let seen: Arc<std::sync::Mutex<Vec<DelegationAudit>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let gate = Arc::new(
+        DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_audit(Arc::new(move |a: &DelegationAudit| {
+            sink_seen.lock().expect("audit lock").push(a.clone());
+        })),
+    );
+    let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
+    config.scope = OwnerScope::owner_only(0xDEAD_BEEF); // excludes the caller
+    config.delegation = Some(gate);
+
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], config)
+        .await
+        .expect("publish the fixture on the host");
+    assert!(publication.tools().iter().any(|t| t == "echo"));
+
+    // Directly invoke the "echo" service (nRPC service name == tool id) with the
+    // delegation headers. Fresh nonce per attempt (replay guard + reply race).
+    let args = json!({ "message": "delegated hi" });
+    let body = serde_json::to_vec(&args).expect("encode args");
+
+    let mut result: Option<CallToolResult> = None;
+    for attempt in 0..8u64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let nonce = attempt + 1;
+        let sig = gateway.sign(&build_challenge("echo", &body, ts, nonce));
+        let env = build_envelope(ts, nonce, &sig);
+        let opts = CallOptions {
+            request_headers: vec![
+                (HDR_DELEGATION.to_string(), chain_bytes.clone()),
+                (HDR_DELEGATION_SIG.to_string(), env),
+            ],
+            ..CallOptions::default()
+        };
+        match caller
+            .call(host_id, "echo", Bytes::from(body.clone()), opts)
+            .await
+        {
+            Ok(reply) => {
+                result = Some(serde_json::from_slice(&reply.body).expect("decode tool result"));
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+
+    let result = result.expect("a valid delegated invoke must reach the provider");
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.text(), "delegated hi");
+
+    // The provider audited the admitted LEAF (the gateway), under the root.
+    let recorded = seen.lock().expect("audit lock");
+    assert!(
+        recorded.iter().any(|a| &a.leaf == gateway.entity_id()
+            && &a.root == root.entity_id()
+            && a.tool == "echo"),
+        "provider audit must record the delegated gateway leaf; got {recorded:?}",
     );
 
     drop(publication);
