@@ -1,0 +1,21 @@
+net/crates/net/cli/src/commands/identity.rs
+  s_a772df20f47a78::t_27e3b78719d8db 4-5
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_a772df20f47a78::t_8ca2c8f4facc30 297-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c92b106e566dd0338189e5ca4541adf4fe7507f3",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
