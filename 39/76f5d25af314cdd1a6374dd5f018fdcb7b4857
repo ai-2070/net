@@ -1,0 +1,26 @@
+net/crates/net/integrations/hermes/tests/test_plugin.py
+  s_1539b6b2705f81::t_948bdb7cbe80e2 46
+net/crates/net/integrations/hermes/pins.py
+  s_1539b6b2705f81::t_7ca8eb45a0e92d 1-256
+net/crates/net/integrations/hermes/__init__.py
+  s_1539b6b2705f81::t_3eb73118954c14 35-48,61,66-68,80
+  s_1539b6b2705f81::t_fe751521536dc4 23,25,30-34,51-56
+net/crates/net/integrations/hermes/tests/test_pins.py
+  s_1539b6b2705f81::t_aa2568c8465f95 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3976f5d25af314cdd1a6374dd5f018fdcb7b4857",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
