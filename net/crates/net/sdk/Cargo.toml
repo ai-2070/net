@@ -55,7 +55,7 @@ net-mesh-sdk-macros = { version = "0.31.0", path = "../sdk-macros", optional = t
 # surfaces as an event rather than being polled for. Gated by
 # `pin-watch` so consumers that only read/write the store don't pay
 # for the watcher backend.
-notify = { version = "6", optional = true }
+notify = { version = "8", optional = true }
 # blake3 KDF (`derive_key`) behind `delegation::derive_child_seed`, so a
 # machine / gateway agent identity is reproducibly derived from the user
 # root seed with no extra persistence. Pulled in with the `net` feature
