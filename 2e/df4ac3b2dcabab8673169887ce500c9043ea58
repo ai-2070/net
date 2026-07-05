@@ -1,0 +1,43 @@
+net/crates/net/sdk/src/pins.rs
+  s_cdbc9688784d9a::t_20a2867e71ceca 1-481
+net/crates/net/sdk/Cargo.toml
+  s_cdbc9688784d9a::t_c3876759bf71a5 29-32,35-36
+  s_cdbc9688784d9a::t_7c12d30447ade5 52-53
+net/crates/net/adapters/mcp/src/wrap/credentials.rs
+  s_cdbc9688784d9a::t_2496893a12fcbf 252-253
+  s_cdbc9688784d9a::t_766b6f4b3f1504 12-20
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_cdbc9688784d9a::t_395de1184af4b5 172-173
+  s_cdbc9688784d9a::t_de58a521aca369 21-28
+net/crates/net/sdk/src/lib.rs
+  s_cdbc9688784d9a::t_9b75ad9d552daa 46-54
+  s_cdbc9688784d9a::t_bbcbe200f12a01 75-78
+net/crates/net/adapters/mcp/src/serve/consent.rs
+  s_cdbc9688784d9a::t_b33de171b44258 1-2,4-8,10-14,16
+net/crates/net/adapters/mcp/Cargo.toml
+  s_cdbc9688784d9a::t_4e57cc6d7838d4 69-71
+net/crates/net/adapters/mcp/src/serve/pins.rs
+  s_cdbc9688784d9a::t_6f52b396c4f3d7 1-2,4-8,10-13,15
+net/crates/net/sdk/src/consent.rs
+  s_cdbc9688784d9a::t_f139d3117ba02d 1-429
+net/crates/net/adapters/mcp/src/serve/mod.rs
+  s_cdbc9688784d9a::t_681259171aad13 24-28
+net/crates/net/Cargo.lock
+  s_cdbc9688784d9a::t_f0a7d606039e09 2575,2587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2edf4ac3b2dcabab8673169887ce500c9043ea58",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
