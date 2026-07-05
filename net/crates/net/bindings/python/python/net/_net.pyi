@@ -1960,7 +1960,7 @@ class FoldQueryClient:
 # siblings' shapes.
 # =============================================================================
 
-from typing import AsyncIterator, Awaitable, Callable, Tuple, Union
+from typing import AsyncIterator, Awaitable, Callable, Tuple, Union, overload
 
 # ----- T1: net mesh + streams -----
 
@@ -2700,6 +2700,19 @@ class CapabilityGateway:
         result = await asyncio.to_thread(gateway.invoke, cap_id, args_json)
     """
 
+    # Both-or-neither is enforced at runtime (passing exactly one delegation
+    # arg raises ValueError), so express the two valid signatures as overloads
+    # — a partial call then fails static analysis instead of only at runtime.
+    @overload
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    @overload
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str],
+        delegation_leaf: "Identity",
+        delegation_chain: bytes,
+    ) -> None: ...
     def __init__(
         self,
         mesh: "NetMesh",
@@ -2714,9 +2727,10 @@ class CapabilityGateway:
 
         Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
         ``delegation_chain`` (a serialized ``DelegationChain``) together to have
-        every invoke carry a per-invoke signed delegation (Phase 3): a remote
+        every invoke carry a per-invoke signed delegation (Phase 3); a remote
         provider running a delegation gate then admits by verified delegation
-        and audits this gateway's leaf. Both or neither."""
+        and audits this gateway's leaf. **Both or neither** — passing exactly
+        one raises ``ValueError``."""
         ...
 
     @property
@@ -2751,6 +2765,16 @@ class AsyncCapabilityGateway:
     own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
     was built with the ``net`` + ``mcp`` features."""
 
+    @overload
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    @overload
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str],
+        delegation_leaf: "Identity",
+        delegation_chain: bytes,
+    ) -> None: ...
     def __init__(
         self,
         mesh: "NetMesh",
@@ -2759,8 +2783,8 @@ class AsyncCapabilityGateway:
         delegation_chain: Optional[bytes] = None,
     ) -> None:
         """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
-        ``delegation_chain`` together to sign + attach a delegation on every
-        invoke (Phase 3)."""
+        ``delegation_chain`` together (both or neither) to sign + attach a
+        delegation on every invoke (Phase 3)."""
         ...
     @property
     def pin_store_path(self) -> Optional[str]: ...
