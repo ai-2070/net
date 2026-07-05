@@ -281,7 +281,10 @@ async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<()
 /// Parse an issuer entity-id: 64 hex chars (optional `0x`) → 32-byte
 /// [`EntityId`].
 fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
-    let trimmed = raw.strip_prefix("0x").unwrap_or(raw);
+    let trimmed = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
     let bytes =
         hex::decode(trimmed).map_err(|e| invalid_args(format!("issuer: invalid hex: {e}")))?;
     let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
@@ -549,6 +552,10 @@ mod tests {
         );
         assert_eq!(
             parse_entity_hex(&format!("0x{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert_eq!(
+            parse_entity_hex(&format!("0X{hexed}")).unwrap().as_bytes(),
             id.entity_id().as_bytes()
         );
         assert!(parse_entity_hex("deadbeef").is_err()); // wrong length

@@ -59,6 +59,12 @@ enum WrapEvent<'a> {
         /// output states exactly who beyond same-root may invoke, rather than
         /// implying only same-root through the static `scope`.
         allowed_origins: &'a [u64],
+        /// The user-root entity id (`--owner-root`) a delegation gate is
+        /// anchored at, when enabled. Present iff delegated callers are admitted
+        /// — so the structured output reflects that admission path too, not just
+        /// the origin allowlist (`None`/omitted when no gate is configured).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delegation_root: Option<&'a str>,
     },
     /// The wrapped server changed its tool set; the mesh was reconciled.
     ToolsChanged {
@@ -252,6 +258,7 @@ pub async fn run(
             visibility: "owner_only",
             scope: "same_root_identity",
             allowed_origins: &allow,
+            delegation_root: args.owner_root.as_deref(),
         },
     )
     .map_err(|e| generic(format!("write output: {e}")))?;
@@ -345,7 +352,10 @@ fn parse_allow_origins(raw: &[String]) -> Result<Vec<u64>, CliError> {
 /// Parse `--owner-root` — a 32-byte ed25519 entity id as 64 hex chars (optional
 /// `0x` prefix).
 fn parse_owner_root(raw: &str) -> Result<EntityId, CliError> {
-    let trimmed = raw.strip_prefix("0x").unwrap_or(raw);
+    let trimmed = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
     let bytes = hex::decode(trimmed)
         .map_err(|e| invalid_args(format!("--owner-root: invalid hex: {e}")))?;
     let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
@@ -393,6 +403,10 @@ mod tests {
             parse_owner_root(&format!("0x{hexed}")).unwrap().as_bytes(),
             id.entity_id().as_bytes()
         );
+        assert_eq!(
+            parse_owner_root(&format!("0X{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
         // Wrong length and non-hex are rejected.
         assert!(parse_owner_root("deadbeef").is_err());
         assert!(parse_owner_root(&"zz".repeat(32)).is_err());
@@ -431,8 +445,30 @@ mod tests {
             visibility: "owner_only",
             scope: "same_root_identity",
             allowed_origins: allow,
+            delegation_root: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn wrapped_event_reports_the_delegation_root_when_a_gate_is_enabled() {
+        let tools = vec!["echo".to_string()];
+        let skipped: Vec<String> = Vec::new();
+        let root_hex = "aa".repeat(32);
+        let v = serde_json::to_value(WrapEvent::Wrapped {
+            name: "gh",
+            tools: &tools,
+            skipped: &skipped,
+            visibility: "owner_only",
+            scope: "same_root_identity",
+            allowed_origins: &[],
+            delegation_root: Some(&root_hex),
+        })
+        .unwrap();
+        // The delegation admission path is reported alongside the origin allowlist.
+        assert_eq!(v["delegation_root"], root_hex);
+        // With no gate, the field is omitted entirely (not serialized as null).
+        assert!(wrapped_event(&[]).get("delegation_root").is_none());
     }
 
     #[test]
