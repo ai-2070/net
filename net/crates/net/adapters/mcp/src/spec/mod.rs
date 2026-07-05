@@ -20,6 +20,19 @@ use serde::{Deserialize, Serialize};
 /// through to final (`MCP_BRIDGE_PLAN.md` "Spec tracking").
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Older spec versions the shim's `initialize` echoes back when a client
+/// offers one (`HERMES_INTEGRATION_PLAN.md` Phase 0.5 version adapter).
+///
+/// Membership is a claim: everything the shim serves over stdio —
+/// `tools/list`, `tools/call`, `notifications/tools/list_changed` — is
+/// shape-identical from these versions through [`PROTOCOL_VERSION`], so
+/// echoing is honest, not a downgrade to old session semantics (the
+/// statelessness changes live in the Streamable HTTP transport, which the
+/// shim doesn't speak). Real hosts enforce this: the Python SDK client
+/// (`mcp` 1.26.0, what Hermes ships) rejects an `initialize` result naming
+/// a version it doesn't know.
+pub const COMPAT_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2025-06-18", "2025-11-25"];
+
 /// The JSON-RPC 2.0 version tag every message carries.
 pub const JSONRPC_VERSION: &str = "2.0";
 

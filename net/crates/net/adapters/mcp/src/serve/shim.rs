@@ -32,8 +32,9 @@ use super::{
 };
 use crate::spec::{
     method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcSuccess, RequestId, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION, SERVER_VERSION,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcSuccess, RequestId,
+    COMPAT_PROTOCOL_VERSIONS, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+    PROTOCOL_VERSION, SERVER_VERSION,
 };
 
 /// How often the serve loop polls the pin store to detect an out-of-band
@@ -230,8 +231,23 @@ impl<G: CapabilityGateway> Shim<G> {
             method::INITIALIZE => {
                 // The client sends `notifications/initialized` next; be lenient
                 // and answer regardless of handshake ordering.
+                //
+                // Version adapter (`HERMES_INTEGRATION_PLAN.md` Phase 0.5):
+                // echo a compatible offered version — SDK clients hard-fail on
+                // an `initialize` result naming a version they don't know, and
+                // everything the shim serves over stdio is shape-identical
+                // across [`COMPAT_PROTOCOL_VERSIONS`]. An unknown or missing
+                // offer gets our own version, per spec.
+                let offered = params
+                    .as_ref()
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(Value::as_str);
+                let negotiated = match offered {
+                    Some(v) if COMPAT_PROTOCOL_VERSIONS.contains(&v) => v,
+                    _ => PROTOCOL_VERSION,
+                };
                 let result = json!({
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": negotiated,
                     // We serve tools/list and emit list_changed when the pin set
                     // changes (a pinned capability is promoted to a first-class
                     // tool), so advertise the capability.
@@ -951,6 +967,46 @@ mod tests {
         let tools = out[1]["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 5);
         assert!(tools.iter().any(|t| t["name"] == meta_tools::name::SEARCH));
+    }
+
+    #[tokio::test]
+    async fn initialize_echoes_compatible_client_version() {
+        // The Phase 0.5 version adapter: a client offering a version in
+        // COMPAT_PROTOCOL_VERSIONS gets it echoed back — Hermes's Python SDK
+        // client rejects a version it doesn't know, so answering
+        // PROTOCOL_VERSION here would fail the whole handshake.
+        for &offered in COMPAT_PROTOCOL_VERSIONS {
+            let out = run(
+                gateway_with_echo_and_secret(),
+                ConsentPolicy::new(),
+                &[req(
+                    1,
+                    method::INITIALIZE,
+                    json!({ "protocolVersion": offered }),
+                )],
+            )
+            .await;
+            assert_eq!(out.len(), 1, "got {out:?}");
+            assert_eq!(out[0]["result"]["protocolVersion"], offered);
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_answers_own_version_to_unknown_offer() {
+        // Unknown (or future) offers get our version, per spec — the client
+        // then decides whether it can proceed.
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[req(
+                1,
+                method::INITIALIZE,
+                json!({ "protocolVersion": "2199-01-01" }),
+            )],
+        )
+        .await;
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert_eq!(out[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
     }
 
     #[tokio::test]
