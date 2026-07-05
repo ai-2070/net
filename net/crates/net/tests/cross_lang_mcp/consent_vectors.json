@@ -1,0 +1,73 @@
+{
+  "description": "Cross-language consent-surface parity fixture (MCP_BRIDGE_SDK_PLAN.md conformance: 'DTO vectors — CapabilityId, consent decisions'). Each binding's verifier loads this file and asserts its net_sdk::consent bindings agree with the Rust core on: (1) CapabilityId canonicalization (provider spelling normalization), (2) which cap-id strings are invalid, (3) the wire-`none`-is-never-trusted credential gate, and (4) ConsentPolicy decisions after a sequence of allow/pin/unpin ops. Rust source-of-truth is sdk/tests/consent_golden_vectors.rs; Python is net.{CapabilityId,ConsentPolicy,credential_requires_consent}; Node is {CapabilityId,ConsentPolicy,credentialRequiresConsent}; Go is net.{CanonicalizeCapID,NewConsentPolicy,CredentialRequiresConsent}. Adding a case means updating all four verifiers in lockstep.",
+  "cap_id_canonicalize": [
+    { "name": "plain_decimal", "input": "42/echo", "expected": "42/echo" },
+    { "name": "hex_lower", "input": "0x2a/echo", "expected": "42/echo" },
+    { "name": "hex_upper", "input": "0X2A/echo", "expected": "42/echo" },
+    { "name": "leading_space", "input": " 42/echo", "expected": "42/echo" },
+    { "name": "trailing_space_in_provider", "input": "42 /echo", "expected": "42/echo" },
+    { "name": "nested_capability_hex_provider", "input": "0x10/svc/sub", "expected": "16/svc/sub" },
+    { "name": "non_numeric_provider_trimmed", "input": " nodeb /echo", "expected": "nodeb/echo" },
+    { "name": "named_provider", "input": "homelab/github.create_issue", "expected": "homelab/github.create_issue" }
+  ],
+  "cap_id_invalid": [
+    { "name": "missing_slash", "input": "bareword" },
+    { "name": "empty_provider", "input": "/cap" },
+    { "name": "empty_capability", "input": "prov/" }
+  ],
+  "credential_requires_consent": [
+    { "name": "none_is_gated_not_trusted", "status": "none", "expected": true },
+    { "name": "credentialed", "status": "credentialed", "expected": true },
+    { "name": "external_api", "status": "external_api", "expected": true },
+    { "name": "unknown", "status": "unknown", "expected": true },
+    { "name": "empty", "status": "", "expected": true },
+    { "name": "unrecognized", "status": "bogus", "expected": true }
+  ],
+  "consent_decision": [
+    {
+      "name": "empty_policy_gates_everything",
+      "ops": [],
+      "cap_id": "b/echo",
+      "credential_status": "none",
+      "expected": "requires_approval"
+    },
+    {
+      "name": "allow_admits",
+      "ops": [{ "op": "allow", "cap_id": "b/echo" }],
+      "cap_id": "b/echo",
+      "credential_status": "credentialed",
+      "expected": "allowed"
+    },
+    {
+      "name": "allow_is_specific",
+      "ops": [{ "op": "allow", "cap_id": "b/echo" }],
+      "cap_id": "b/other",
+      "credential_status": "credentialed",
+      "expected": "requires_approval"
+    },
+    {
+      "name": "pin_admits",
+      "ops": [{ "op": "pin", "cap_id": "b/slack.post" }],
+      "cap_id": "b/slack.post",
+      "credential_status": "external_api",
+      "expected": "allowed"
+    },
+    {
+      "name": "pin_hex_admits_decimal",
+      "ops": [{ "op": "pin", "cap_id": "0x2a/echo" }],
+      "cap_id": "42/echo",
+      "credential_status": "external_api",
+      "expected": "allowed"
+    },
+    {
+      "name": "unpin_re_gates",
+      "ops": [
+        { "op": "pin", "cap_id": "b/x" },
+        { "op": "unpin", "cap_id": "b/x" }
+      ],
+      "cap_id": "b/x",
+      "credential_status": "credentialed",
+      "expected": "requires_approval"
+    }
+  ]
+}
