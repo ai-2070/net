@@ -269,13 +269,41 @@ fn immediate(py: Python<'_>, s: String) -> PyResult<Bound<'_, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(s) })
 }
 
+/// Aborts the mesh-runtime task if its owning future is dropped before the task
+/// finishes — i.e. the Python awaitable was cancelled (`asyncio.wait_for` /
+/// `task.cancel()`). Dropping a `JoinHandle` only *detaches* the task, so
+/// without this the spawned mesh op would keep running after the caller stopped
+/// awaiting. Aborting an already-finished task is a documented no-op, so the
+/// guard is safe to hold across the happy path too.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Bridge a mesh-runtime `JoinHandle<String>` to a Python awaitable. The task
 /// ran on the mesh's runtime; awaiting the handle here (on the process-global
 /// `future_into_py` runtime) is a plain channel await — no reactor affinity.
+///
+/// **Cancellation.** The gateway spawns on the mesh's own runtime for reactor
+/// affinity, so the vanilla `async_bridge::await_with_cancel` (which runs on the
+/// global runtime) doesn't fit. Instead an [`AbortOnDrop`] guard rides inside
+/// the wrapper future: a Python `task.cancel()` drops the future, aborting the
+/// mesh-runtime task — matching the client-side-cancel semantics `await_substrate`
+/// documents. (A server-side CANCEL frame would need a cancel-token threaded
+/// through `MeshGateway::{search,describe,invoke}` -> `CallOptions`, a deeper
+/// substrate-surface follow-up.)
 fn spawn_bridge(py: Python<'_>, join: JoinHandle<String>) -> PyResult<Bound<'_, PyAny>> {
+    let abort = AbortOnDrop(join.abort_handle());
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        join.await
-            .map_err(|e| PyRuntimeError::new_err(format!("gateway task failed: {e}")))
+        let out = join
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("gateway task failed: {e}")))?;
+        // Completed — release the guard explicitly (abort would be a no-op now).
+        drop(abort);
+        Ok(out)
     })
 }
 
