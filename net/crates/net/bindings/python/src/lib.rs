@@ -19,10 +19,21 @@ mod transport;
 mod capabilities;
 #[cfg(feature = "compute")]
 mod compute;
+// Local consent surface — CapabilityId, ConsentPolicy, and the
+// lock-protocol PinStore, graduated to net-mesh-sdk by the MCP
+// bridge SDK plan's P0 and bound here in P1. Pure local-state
+// primitives (no mesh dependency), so the feature pulls only the
+// net-sdk dep itself.
+#[cfg(feature = "consent")]
+mod consent;
 #[cfg(feature = "groups")]
 mod groups;
+// MCP bridge pure helpers — classify + lower_tool only (the bridge's
+// forwarding/keychain internals are never bound).
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "mcp")]
+mod mcp_helpers;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3101,6 +3112,20 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ChannelError", m.py().get_type::<ChannelError>())?;
     #[cfg(feature = "net")]
     m.add("ChannelAuthError", m.py().get_type::<ChannelAuthError>())?;
+    #[cfg(feature = "consent")]
+    {
+        m.add_class::<consent::PyCapabilityId>()?;
+        m.add_class::<consent::PyConsentPolicy>()?;
+        m.add_class::<consent::PyPinStore>()?;
+        m.add_class::<consent::PyAsyncPinStore>()?;
+        m.add_function(wrap_pyfunction!(consent::credential_requires_consent, m)?)?;
+        m.add("PinsError", m.py().get_type::<consent::PinsError>())?;
+    }
+    #[cfg(feature = "mcp")]
+    {
+        m.add_function(wrap_pyfunction!(mcp_helpers::classify_mcp_server, m)?)?;
+        m.add_function(wrap_pyfunction!(mcp_helpers::lower_mcp_tool, m)?)?;
+    }
     #[cfg(feature = "net")]
     {
         m.add_class::<identity::Identity>()?;

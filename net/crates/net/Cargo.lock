@@ -2491,6 +2491,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-mcp-ffi"
+version = "0.31.0"
+dependencies = [
+ "net-mesh-mcp",
+ "net-mesh-sdk",
+ "parking_lot 0.12.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "net-mesh"
 version = "0.31.0"
 dependencies = [
@@ -2554,6 +2567,7 @@ dependencies = [
  "keyring-core",
  "linux-keyutils-keyring-store",
  "net-mesh-sdk",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -2572,6 +2586,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
+ "fs2",
  "futures",
  "hdrhistogram",
  "net-mesh",
@@ -2583,6 +2598,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2633,6 +2649,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "net-mesh",
+ "net-mesh-mcp",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
  "postcard",
@@ -2652,6 +2669,7 @@ dependencies = [
  "futures",
  "hex",
  "net-mesh",
+ "net-mesh-mcp",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
  "postcard",

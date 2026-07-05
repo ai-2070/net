@@ -42,6 +42,8 @@ default = [
     "redis",
     "aggregator",
     "tool",
+    "consent",
+    "mcp",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -114,10 +116,27 @@ deck = ["meshos", "net/meshos", "net-sdk/deck"]
 # the SDK's `aggregator` re-export module so the binding gets
 # RegistryClient / FoldQueryClient + the typed error hierarchy.
 aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
+# Local consent surface (`MCP_BRIDGE_SDK_PLAN.md` P1): CapabilityId,
+# the ConsentPolicy gate, and the lock-protocol PinStore — thin
+# wrappers over `net_sdk::consent` / `net_sdk::pins`, which are
+# unconditional SDK modules (no net-sdk sub-feature to forward; pure
+# local-state primitives with no mesh dependency). The one lock
+# implementation stays in Rust — the binding never opens the store
+# file directly.
+consent = ["dep:net-sdk"]
+# MCP bridge pure helpers (`MCP_BRIDGE_SDK_PLAN.md` P1): thin bindings
+# for `classify` (credential-risk scoring a native node may DISPLAY
+# before publishing an MCP-backed tool) and `lower_tool` (MCP
+# `tools/list` entry -> Net ToolDescriptor + bridge metadata). Helpers
+# only — publishing itself goes through the general SDK path; the
+# forwarding/keychain internals are never bound (bridge doctrine #3).
+mcp = ["consent", "dep:net-mcp"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }
 net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../../sdk", default-features = false, optional = true }
+# The MCP bridge adapter, for the two pure helpers only (feature `mcp`).
+net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../adapters/mcp", optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }

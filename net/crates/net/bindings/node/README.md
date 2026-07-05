@@ -31,8 +31,11 @@ The five feature flags that gate the storage / query / OS surfaces on this bindi
 | `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
 | `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`, plus the `libnet_meshdb` cdylib. |
 | `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+| `consent` | `CapabilityId`, `ConsentPolicy`, `PinStore` — the local consent / pin surface (no mesh dep). In the default features. |
+| `mcp` | `classifyMcpServer`, `lowerMcpTool` — the MCP bridge pure helpers. In the default features. |
 
-Enable at build time:
+Enable at build time (`consent` + `mcp` are on by default — add them explicitly
+if you build with `--no-default-features`):
 
 ```bash
 napi build --platform --release --features "cortex netdb redex-disk meshdb meshos"

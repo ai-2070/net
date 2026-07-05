@@ -66,9 +66,9 @@ blake2 = "0.10"
 chacha20poly1305 = "0.11"
 getrandom = "0.4"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-# Cross-process advisory file locking for the shared pin store, so a
-# load→modify→save transaction can't interleave with another shim / the pin
-# CLI and resurrect a removed consent decision.
+# Cross-process advisory file locking for the forwarding policy store
+# (`forward::store`). The pin store, which pioneered the pattern, graduated to
+# `net-mesh-sdk` (MCP_BRIDGE_SDK_PLAN.md P0) and carries its own fs2 dep.
 fs2 = "0.4"
 # Stream combinators for bounded-concurrency provider fan-out in the demand
 # side's `search` (`buffer_unordered`).
@@ -86,6 +86,9 @@ futures = "0.3"
 # `dbus-secret-service-keyring-store` (needs libdbus) and select it in
 # `keychain.rs`. Only compiled when `keychain` is enabled.
 keyring-core = { version = "1", optional = true }
+# Poison-free locks for the publisher's publication registry + describe
+# handle (clippy.toml disallows `std::sync::Mutex::lock` workspace-wide).
+parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

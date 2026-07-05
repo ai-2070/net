@@ -26,9 +26,14 @@ net = { package = "net-mesh", version = "0.31.0", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
+# Cross-process advisory file locking for the pin store (`pins`), so a
+# load→modify→save transaction can't interleave with a concurrent shim
+# or pin-CLI invocation and resurrect a removed consent decision.
+fs2 = "0.4"
 futures = "0.3"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["rt", "time", "sync"] }
+# `fs` powers the pin store's atomic temp+rename persistence.
+tokio = { version = "1", features = ["rt", "time", "sync", "fs"] }
 pin-project-lite = "0.2"
 thiserror = "2"
 async-trait = "0.1"
@@ -44,6 +49,8 @@ net-mesh-sdk-macros = { version = "0.31.0", path = "../sdk-macros", optional = t
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+# Isolated temp dirs for the pin-store file tests.
+tempfile = "3"
 criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 postcard = { version = "1", features = ["use-std"] }

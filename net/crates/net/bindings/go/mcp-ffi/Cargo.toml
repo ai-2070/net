@@ -1,0 +1,58 @@
+[package]
+name = "net-mcp-ffi"
+version = "0.31.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C ABI for the MCP bridge pure helpers + consent/pin surface (Go binding of Net)"
+# Distributed as a cdylib alongside the Go binding, not via crates.io.
+# Block accidental `cargo publish`.
+publish = false
+
+[lib]
+# `cdylib` for the shared object Go links against; `staticlib` for
+# platforms that prefer `.a` archives. `rlib` lets in-crate
+# `#[cfg(test)] mod tests` blocks compile (cargo requires rlib for the
+# test harness). The shipped artifact is the cdylib.
+#
+# The lib name is `net_mcp_ffi` (NOT `net_mcp`) on purpose: the MCP
+# bridge adapter crate `net-mesh-mcp` already owns the lib name
+# `net_mcp`, so an rlib output collision would occur. The Go side links
+# `-lnet_mcp_ffi`; the exported C symbols keep the `net_mcp_*` prefix.
+name = "net_mcp_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+# The graduated consent/pins surface (unconditional SDK modules — pure
+# local-state primitives, no mesh feature needed) and the MCP bridge's
+# two pure helpers. This FFI is the C face of exactly what the Python
+# (`bindings/python/src/{consent,mcp_helpers}.rs`) and Node
+# (`bindings/node/src/{consent,mcp_helpers}.rs`) bindings expose — the
+# one Rust implementation, three faces.
+net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../../../sdk", default-features = false }
+net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../../adapters/mcp" }
+# `block_on` the async `PinStore::mutate` / `load` from the blocking C
+# ABI entry points. A multi-thread runtime so concurrent FFI calls (the
+# C ABI is called from any thread) can `block_on` the shared runtime
+# without contending on a single-threaded scheduler core — the pin
+# store's own cross-process file lock is what actually serializes
+# writers, but the runtime must tolerate concurrent `block_on`.
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The consent-policy handle's interior lock. parking_lot (not std::sync) per
+# the repo's permanent lock-hardening rule — its guards don't poison.
+parking_lot = "0.12"
+
+[dev-dependencies]
+# Isolated temp dirs for the pin-store round-trip / concurrency tests
+# that exercise the C ABI symbols directly (no cgo needed — the rlib
+# crate-type links them into the test harness).
+tempfile = "3"
+
+# `[profile.release]` intentionally omitted — cargo ignores non-root
+# profiles ("profiles for the non root package will be ignored"). The
+# workspace root governs release-profile settings (lto = true and
+# friends) for every member crate.

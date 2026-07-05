@@ -533,7 +533,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
@@ -689,7 +689,7 @@ jobs:
       # test's MeshDB class coverage. Default `redis` is omitted
       # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
@@ -778,7 +778,7 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against SIX cdylibs via cgo:
+      # The Go bindings link against SEVEN cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
@@ -793,7 +793,9 @@ jobs:
       #     mesh_rpc.go / mesh_rpc_typed.go / tool.go. Added in the
       #     NET_GO_NRPC_PORT slices (G-1..G-5) — without it the
       #     typed/streaming/tool tests fail at link.
-      # All six end up in `net/crates/net/target/release/`.
+      #   - `-lnet_mcp` (libnet_mcp_ffi.so, the `net-mcp-ffi`
+      #     workspace member at bindings/go/mcp-ffi) from mcp.go
+      # All seven end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -805,15 +807,16 @@ jobs:
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
       #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
-      #     `net-rpc-ffi` have no extra features beyond their defaults.
+      #     `net-rpc-ffi`, `net-mcp-ffi` have no extra features beyond
+      #     their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc + net_mcp cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi
+          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi
           --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
@@ -944,7 +947,7 @@ jobs:
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
             # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers,dataforts,nat-traversal,port-mapping
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,test-helpers,dataforts,nat-traversal,port-mapping
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /
@@ -952,7 +955,8 @@ jobs:
             # because the python build / test jobs compile them (the
             # earlier set even omitted `meshdb`, which `python-tests`
             # builds) — without them those pyo3 surfaces went unlinted.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping
+            # `consent` / `mcp` are the P1 consent + bridge-helper modules.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -980,6 +984,11 @@ jobs:
             features: ""
           - name: go-deck-ffi
             path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+          - name: go-mcp-ffi
+            # MCP bridge pure helpers + consent/pin C ABI, consumed by
+            # `go/mcp.go` (MCP_BRIDGE_SDK_PLAN P3). Default features only.
+            path: net/crates/net/bindings/go/mcp-ffi
             features: ""
           - name: sdk-macros
             # `net-mesh-sdk-macros` ships the `#[tool]` attribute
@@ -1066,10 +1075,10 @@ jobs:
         crate:
           - name: node
             path: net/crates/net/bindings/node
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""
@@ -1084,6 +1093,12 @@ jobs:
             features: ""
           - name: go-deck-ffi
             path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+          - name: go-mcp-ffi
+            # MCP bridge C ABI — its #[cfg(test)] mod tests drive the
+            # net_mcp_* symbols directly (classify/lower parity, secret-
+            # negative, pin-store round-trip + concurrent mutations).
+            path: net/crates/net/bindings/go/mcp-ffi
             features: ""
     steps:
       - uses: actions/checkout@v7

@@ -21,6 +21,13 @@ mod capability_aggregation;
 mod common;
 #[cfg(feature = "compute")]
 mod compute;
+// Local consent surface — CapabilityId, ConsentPolicy, and the
+// lock-protocol PinStore, graduated to net-mesh-sdk by the MCP
+// bridge SDK plan's P0 and bound here in P2. Pure local-state
+// primitives (no mesh dependency), so the feature pulls only the
+// net-sdk dep itself.
+#[cfg(feature = "consent")]
+mod consent;
 #[cfg(feature = "cortex")]
 mod cortex;
 #[cfg(feature = "net")]
@@ -45,6 +52,10 @@ mod meshdb;
 // for the `MeshDaemon` trait + `Identity` wrapper.
 #[cfg(feature = "meshos")]
 mod meshos;
+// MCP bridge pure helpers — classify + lower_tool only (the bridge's
+// forwarding/keychain internals are never bound).
+#[cfg(feature = "mcp")]
+mod mcp_helpers;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
 #[cfg(feature = "aggregator")]

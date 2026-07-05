@@ -14,15 +14,17 @@
 //! T1+ slices ([`AsyncMeshRpc`](..)) build atop this with the
 //! per-shape Async classes.
 
-#[cfg(feature = "net")]
+// `Arc` and the pyo3 prelude are unconditional: `await_substrate` /
+// `await_with_notify` (and their guards) compile in every feature
+// combination — a no-`net` build (e.g. `consent`-only) still needs them.
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+use pyo3::prelude::*;
+
 #[cfg(feature = "net")]
 use ::net::adapter::net::MeshNode;
-#[cfg(feature = "net")]
-use pyo3::prelude::*;
 #[cfg(feature = "net")]
 use pyo3::types::PyBytes;
 

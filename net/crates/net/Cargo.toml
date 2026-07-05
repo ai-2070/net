@@ -14,6 +14,7 @@ members = [
     "bindings/go/meshdb-ffi",
     "bindings/go/meshos-ffi",
     "bindings/go/deck-ffi",
+    "bindings/go/mcp-ffi",
 ]
 
 [package]
