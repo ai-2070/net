@@ -24,9 +24,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use net_mcp::serve::{
-    CapabilityId, ConsentPolicy, MeshGateway, PinState, PinStore, Shim, MSG_NO_DAEMON,
-};
+use net_mcp::serve::{MeshGateway, Shim, MSG_NO_DAEMON};
+// Consent + pins come from the SDK directly (MCP_BRIDGE_SDK_PLAN.md P0):
+// they graduated out of the bridge, and the CLI consuming them here is what
+// keeps the SDK surface proven daily. The shim honors the same store.
+use net_sdk::consent::{CapabilityId, ConsentPolicy};
+use net_sdk::pins::{PinState, PinStore};
 use serde::Serialize;
 use tokio::io::BufReader;
 
