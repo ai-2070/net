@@ -26,6 +26,16 @@ The branch lands the Hermes integration as a **first-class embedded Net node**
   shared `gated_invoke` (`adapters/mcp/src/serve/gated.rs`) used by both the
   stdio shim and the native gateway.
 
+> **Status — RESOLVED (2026-07-05).** All three findings and both nits were fixed
+> on `hermes-plan`, each as its own commit (see the Resolution table at the end).
+> File/line anchors below point at the code **as reviewed** (pre-fix). The Rust
+> fixes build clippy-clean and pass their tests locally (net-mesh-mcp: the new
+> `map_invoke_server_error` cases + the 14 delegation-gate tests; net-cli: the
+> identity suite). The Python fixes pass against a freshly `maturin develop`-built
+> wheel — the binding delegation suite (15) and the Hermes plugin
+> delegation + pins suites (17), including the new caller-side-revocation and
+> stop()-idempotency regression tests.
+
 ---
 
 ## Overall assessment
@@ -195,3 +205,18 @@ gate, consent composition, pin-store locking) and the PyO3 surface are excellent
 merge are **F1** (align `node.py`'s revocation claim with reality) and **F2**
 (map `ERR_DELEGATION → Denied`), which are cheap and reinforce each other. **F3**
 and the nits are optional cleanup.
+
+---
+
+## Resolution (2026-07-05)
+
+| # | Sev | Fix | Commit |
+|---|-----|-----|--------|
+| F1 | Medium | `RevocationRegistry.load_from_store` + `default_revocation_store_path` exposed on the PyO3/`net_sdk` surface; `GatewayDelegation.verify()` reloads the machine-shared store before each check (env override → SDK default), swallowing a read error to keep last-known floors. So an operator's `net identity revoke` now flips `check_net_available` / `delegation_valid_for_invoke`, not just the provider. Binding + plugin regression tests. | `feat(hermes,py): caller-side observes store-based delegation revocation` |
+| F2 | Low-Med | `ERR_DELEGATION` now maps to `GatewayError::Denied` (like `ERR_OWNER_SCOPE`) instead of falling through to an opaque `is_error` tool result. Extracted `map_invoke_server_error` and unit-tested authorization/tool/upstream/unknown statuses. | `fix(mcp/gateway): map ERR_DELEGATION to Denied, not an opaque tool error` |
+| F3 | Low | `PinPromotionService.stop()` guards the cancel on `not loop.is_closed()` and drops the `_loop`/`_task` handles once the thread stops, so a repeat stop() is a clean no-op. Regression test (start → stop ×3). | `fix(hermes-plugin): make PinPromotionService.stop() idempotent` |
+| Nit | — | Replay-nonce expiry retains one extra second to close the max-future-skew boundary; `identity.rs` module header corrected to `net-mesh/identities`. | `fix(mcp,cli): close nonce-replay boundary; correct identity-path doc` |
+
+The O(n)-per-verify nonce prune is **intentionally left as-is** — it is fine at
+the expected delegated-invoke volume and hard-capped at `MAX_NONCES`; an
+amortized/bucketed prune would add complexity for marginal benefit.
