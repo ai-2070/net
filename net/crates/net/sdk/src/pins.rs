@@ -35,6 +35,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::CapabilityId;
 
+/// The per-user default pin-store path: `<local data dir>/net-mesh/mcp-pins.json`,
+/// falling back to `<home>/net-mesh/mcp-pins.json` when no data-local directory
+/// resolves.
+///
+/// This is the single machine-shared store every consumer converges on — the
+/// `net mcp` CLI, a running `net mcp serve` shim, and any SDK client (e.g. a
+/// Hermes plugin) — so an approval made through one path is honored by all.
+/// Resolving it in one place (bridge-SDK doctrine #1) is what keeps them from
+/// silently drifting onto different files. Returns `None` only when neither a
+/// data-local nor a home directory can be determined; the caller then requires
+/// an explicit path.
+pub fn default_pin_store_path() -> Option<PathBuf> {
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .map(|d| d.join("net-mesh").join("mcp-pins.json"))
+}
+
 /// Whether a pin has been approved by the operator, or is still awaiting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +396,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("pins.json");
         (dir, path)
+    }
+
+    #[test]
+    fn default_path_is_the_shared_net_mesh_file() {
+        // On any dev/CI host a data-local or home dir resolves, so the default
+        // is present and ends with the one canonical machine-shared location
+        // the CLI, shim, and SDK clients all converge on.
+        let path = default_pin_store_path().expect("a data-local or home dir must resolve");
+        assert!(
+            path.ends_with(std::path::Path::new("net-mesh").join("mcp-pins.json")),
+            "unexpected default pin-store path: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]

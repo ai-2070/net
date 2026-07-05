@@ -783,6 +783,7 @@ try:
         PinsError,
         PinStore,
         credential_requires_consent,
+        default_pin_store_path,
     )
 except ImportError:
     # `consent` feature not compiled in; symbols stay undefined.
@@ -796,6 +797,7 @@ else:
             "PinsError",
             "PinStore",
             "credential_requires_consent",
+            "default_pin_store_path",
         ]
     )
 

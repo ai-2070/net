@@ -2438,6 +2438,15 @@ def credential_requires_consent(status: str) -> bool:
     over-gate, never bypass consent."""
     ...
 
+def default_pin_store_path() -> Optional[str]:
+    """The per-user default pin-store path
+    (``<local data>/net-mesh/mcp-pins.json``, falling back to the home
+    directory), or ``None`` if neither resolves. The same file the
+    ``net mcp pin`` CLI and a running ``net mcp serve`` shim use — pass it to
+    :class:`PinStore` / :class:`AsyncPinStore` / ``CapabilityGateway`` to
+    share consent decisions machine-wide without hard-coding the path."""
+    ...
+
 class ConsentPolicy:
     """The consumer-side consent gate: config allowlist + pinned set.
     With no entries EVERY discovered capability requires approval. The

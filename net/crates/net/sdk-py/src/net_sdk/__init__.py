@@ -285,4 +285,35 @@ __all__ += [
     "watch_tools",
 ]
 
+# Consent, pins, and the native consent-gated capability gateway — the bridge's
+# demand surface (`HERMES_INTEGRATION_PLAN.md` Phase 1). Re-exported from the
+# `net` wheel via `net_sdk.consent`; `CapabilityGateway` is present iff the
+# wheel was built with the `net` + `mcp` features (the default one is).
+from net_sdk.consent import (  # noqa: E402
+    AsyncPinStore,
+    CapabilityId,
+    ConsentPolicy,
+    PinsError,
+    PinStore,
+    credential_requires_consent,
+    default_pin_store_path,
+)
+
+__all__ += [
+    "AsyncPinStore",
+    "CapabilityId",
+    "ConsentPolicy",
+    "PinsError",
+    "PinStore",
+    "credential_requires_consent",
+    "default_pin_store_path",
+]
+
+try:
+    from net_sdk.consent import CapabilityGateway  # noqa: E402
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__.append("CapabilityGateway")
+
 __version__ = "0.31.0"

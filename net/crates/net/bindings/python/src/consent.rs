@@ -145,6 +145,20 @@ pub fn credential_requires_consent(status: &str) -> bool {
     CredentialStatus::from_wire(status).requires_consent()
 }
 
+/// The per-user default pin-store path — `<local data>/net-mesh/mcp-pins.json`,
+/// falling back to the home directory — or `None` if neither resolves.
+///
+/// This is the same file the `net mcp pin` CLI and a running `net mcp serve`
+/// shim use. Pass it to :class:`PinStore` / :class:`AsyncPinStore` (or a
+/// `CapabilityGateway`) so a Python client shares consent decisions with the
+/// rest of the machine — an approval made anywhere is honored everywhere —
+/// without hard-coding the path. The resolver lives once in the Rust SDK, so
+/// the CLI, the shim, and this binding cannot drift onto different files.
+#[pyfunction]
+pub fn default_pin_store_path() -> Option<String> {
+    net_sdk::pins::default_pin_store_path().map(|p| p.to_string_lossy().into_owned())
+}
+
 /// The consumer-side consent gate: a config allowlist plus a set of pinned
 /// capabilities, deciding per capability + wire credential status. The
 /// decision logic is the SDK's — this class only carries state.

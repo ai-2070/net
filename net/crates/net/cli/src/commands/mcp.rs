@@ -197,15 +197,14 @@ fn resolve_pin_store(override_: Option<&Path>) -> Result<PathBuf, CliError> {
     if let Some(p) = override_ {
         return Ok(p.to_path_buf());
     }
-    dirs::data_local_dir()
-        .or_else(dirs::home_dir)
-        .map(|d| d.join("net-mesh").join("mcp-pins.json"))
-        .ok_or_else(|| {
-            generic(
-                "could not determine a per-user data directory for the pin store; \
-                 pass --pin-store <PATH>",
-            )
-        })
+    // The one resolver, in the SDK — so the CLI, the shim, and any SDK client
+    // (e.g. a Hermes plugin) converge on the same machine-shared file.
+    net_sdk::pins::default_pin_store_path().ok_or_else(|| {
+        generic(
+            "could not determine a per-user data directory for the pin store; \
+             pass --pin-store <PATH>",
+        )
+    })
 }
 
 /// One `pin approve` / `pin reject` result row.

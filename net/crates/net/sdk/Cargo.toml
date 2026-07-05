@@ -30,6 +30,9 @@ bytes = "1"
 # load→modify→save transaction can't interleave with a concurrent shim
 # or pin-CLI invocation and resurrect a removed consent decision.
 fs2 = "0.4"
+# Resolves the per-user default pin-store path (`default_pin_store_path`) so
+# the CLI, the shim, and SDK clients converge on one machine-shared file.
+dirs = "6"
 futures = "0.3"
 parking_lot = "0.12"
 # `fs` powers the pin store's atomic temp+rename persistence.
