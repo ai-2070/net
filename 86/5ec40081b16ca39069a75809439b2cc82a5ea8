@@ -1,0 +1,41 @@
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_1539b6b2705f81::t_f37baf72b3936d 209-212,284-287
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_1539b6b2705f81::t_c6c0c30c2cc854 239-246
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_1539b6b2705f81::t_af63e0b4361f81 31
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_1539b6b2705f81::t_d15880b51ba003 83-86,89-92,212-213,391-394,455-457,511-518,534-538,543-547,555-557,559-561,630-635,657-661,665-668,676-679,728-729,731-732
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_1539b6b2705f81::t_f67ffdd2ff2dd7 212-219
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_1539b6b2705f81::t_86c24e9c38706c 47
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_1539b6b2705f81::t_71443da30dc8fd 78-81,380,413-416,421-423,473-476,511-514
+net/crates/net/cli/src/commands/wrap.rs
+  s_1539b6b2705f81::t_946bcc879748e4 401-404
+net/crates/net/sdk/src/delegation.rs
+  s_1539b6b2705f81::t_d1fd3385f28541 170,207-211,289-296,321-323,385-400,407-409,418-419,423-425,440-443
+net/crates/net/sdk/src/lib.rs
+  s_1539b6b2705f81::t_1ac1aac7641b55 137-138,224
+net/crates/net/sdk/src/pins.rs
+  s_1539b6b2705f81::t_c91bb3a04b9504 562,602-603,610-614
+net/crates/net/sdk/src/revocation.rs
+  s_1539b6b2705f81::t_8cb6d792bcc832 324-327,329-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "865ec40081b16ca39069a75809439b2cc82a5ea8",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
