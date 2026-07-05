@@ -124,6 +124,12 @@ pub mod capabilities;
 // core `TokenChain` / `RevocationRegistry` machinery.
 #[cfg(feature = "net")]
 pub mod delegation;
+// Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
+// 3): the provider side of revocation — a running `net wrap` honors an
+// operator's revocation of a delegated gateway without a restart. Mirrors the
+// pin store's file discipline; composes with a future mesh-published layer.
+#[cfg(feature = "net")]
+pub mod revocation;
 /// Gang-claim resource-island scheduler value types (live ops on [`mesh::Mesh`]).
 #[cfg(feature = "net")]
 pub mod gang;
@@ -218,6 +224,8 @@ pub use crate::delegation::{
     derive_child_seed, DelegationChain, RevocationRegistry, TokenChain,
     GATEWAY_DELEGATION_CHANNEL,
 };
+#[cfg(feature = "net")]
+pub use crate::revocation::{default_revocation_store_path, RevocationStore};
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
 

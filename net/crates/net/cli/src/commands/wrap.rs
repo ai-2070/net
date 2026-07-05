@@ -109,6 +109,13 @@ pub struct WrapArgs {
     #[arg(long = "owner-root", value_name = "ENTITY_ID_HEX")]
     pub owner_root: Option<String>,
 
+    /// Path to the machine-shared delegation-revocation store the gate honors
+    /// (default: the per-user shared file). A revocation written there — of a
+    /// delegated gateway's access — takes effect on this running provider
+    /// without a restart. Only meaningful with `--owner-root`.
+    #[arg(long = "revocation-store", value_name = "PATH")]
+    pub revocation_store: Option<PathBuf>,
+
     /// Operator identity file. Defaults to the profile's `identity`. Owner-only
     /// scoping keys on it, so a stable identity (not an ephemeral key) is
     /// required.
@@ -196,20 +203,34 @@ pub async fn run(
     // it via `RevocationRegistry`).
     if let Some(owner_root_hex) = &args.owner_root {
         let owner_root = parse_owner_root(owner_root_hex)?;
-        let gate = DelegationGate::new(owner_root, std::sync::Arc::new(RevocationRegistry::new()))
-            .with_audit(std::sync::Arc::new(|a: &DelegationAudit| {
-                // Diagnostics on stderr, off the structured stdout stream.
-                eprintln!(
-                    "net wrap: delegated invoke admitted — tool={} leaf={} root={}",
-                    a.tool,
-                    hex::encode(a.leaf.as_bytes()),
-                    hex::encode(a.root.as_bytes()),
-                );
-            }));
+        let mut gate =
+            DelegationGate::new(owner_root, std::sync::Arc::new(RevocationRegistry::new()))
+                .with_audit(std::sync::Arc::new(|a: &DelegationAudit| {
+                    // Diagnostics on stderr, off the structured stdout stream.
+                    eprintln!(
+                        "net wrap: delegated invoke admitted — tool={} leaf={} root={}",
+                        a.tool,
+                        hex::encode(a.leaf.as_bytes()),
+                        hex::encode(a.root.as_bytes()),
+                    );
+                }));
+        // Honor a machine-shared revocation store so an operator can revoke a
+        // gateway's access without restarting this provider. Falls back to the
+        // per-user default path when the flag is omitted.
+        let rev_path = args
+            .revocation_store
+            .clone()
+            .or_else(net_sdk::revocation::default_revocation_store_path);
+        if let Some(p) = &rev_path {
+            gate = gate.with_revocation_store(p.clone());
+        }
         config.delegation = Some(std::sync::Arc::new(gate));
         eprintln!(
             "net wrap: delegation gate enabled (owner root {owner_root_hex}); \
-             chain-rooted callers are verified + audited"
+             chain-rooted callers are verified + audited{}",
+            rev_path
+                .map(|p| format!("; revocations honored from {}", p.display()))
+                .unwrap_or_default()
         );
     }
 

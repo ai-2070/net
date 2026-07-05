@@ -19,12 +19,14 @@
 //! captured chain can't be replayed by a member spoofing the leaf's origin.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use net_sdk::delegation::{DelegationChain, RevocationRegistry};
 use net_sdk::identity::EntityId;
+use net_sdk::revocation::RevocationStore;
 use net_sdk::Identity;
 
 /// Request header carrying the serialized [`DelegationChain`] (`root → leaf`).
@@ -118,6 +120,13 @@ pub struct DelegationGate {
     /// nonce → expiry-secs. Only authenticated invokes are recorded.
     nonces: Mutex<HashMap<u64, u64>>,
     audit: Option<AuditSink>,
+    /// Optional machine-shared revocation store. When set, each verify reloads
+    /// its floors into `revocation` (cheap JSON read) *before* the chain check,
+    /// so an operator's `RevocationStore::revoke_below` reaches a running
+    /// provider without a restart. Floors are monotonic, so a transient read
+    /// error just keeps the last-known floors (logged, never fail-open into
+    /// *granting* — the chain must still root-anchor + verify).
+    revocation_store: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for DelegationGate {
@@ -127,6 +136,7 @@ impl std::fmt::Debug for DelegationGate {
             .field("skew_secs", &self.skew_secs)
             .field("window_secs", &self.window_secs)
             .field("audit", &self.audit.is_some())
+            .field("revocation_store", &self.revocation_store)
             .finish()
     }
 }
@@ -142,7 +152,16 @@ impl DelegationGate {
             window_secs: 60,
             nonces: Mutex::new(HashMap::new()),
             audit: None,
+            revocation_store: None,
         }
+    }
+
+    /// Honor a machine-shared [`RevocationStore`] at `path`: each verify reloads
+    /// its floors first, so an operator's revocation of a delegated gateway
+    /// reaches this running provider without a restart.
+    pub fn with_revocation_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.revocation_store = Some(path.into());
+        self
     }
 
     /// Override the per-invoke signature window (seconds).
@@ -207,10 +226,13 @@ impl DelegationGate {
         leaf.verify_bytes(&challenge, &sig)
             .map_err(|_| DelegationReject::BadSignature)?;
 
-        // [3] The chain must root at the owner and be unrevoked / valid. The
-        //     presenter is the leaf itself (step [2] already bound the caller to
-        //     the leaf), so `verify` enforces root-anchor + continuity + scope +
-        //     revocation + time bounds.
+        // [3] The chain must root at the owner and be unrevoked / valid. Reload
+        //     the machine-shared revocation floors first (if configured) so an
+        //     operator's just-written revocation takes effect on this running
+        //     provider. The presenter is the leaf itself (step [2] already bound
+        //     the caller to the leaf), so `verify` enforces root-anchor +
+        //     continuity + scope + revocation + time bounds.
+        self.refresh_revocations();
         chain
             .verify(&leaf, &self.owner_root, &self.revocation, self.skew_secs)
             .map_err(|e| DelegationReject::Chain(format!("{e:?}")))?;
@@ -228,6 +250,20 @@ impl DelegationGate {
             });
         }
         Ok(leaf)
+    }
+
+    /// Reload the shared revocation floors into `revocation` (monotonic). A
+    /// read/parse error keeps the last-known floors and logs — never opens a
+    /// hole, since the chain must still root-anchor + verify regardless.
+    fn refresh_revocations(&self) {
+        if let Some(path) = &self.revocation_store {
+            match RevocationStore::load(path) {
+                Ok(store) => store.apply_to(&self.revocation),
+                Err(e) => eprintln!(
+                    "net wrap: revocation store unreadable ({e}); keeping last-known floors"
+                ),
+            }
+        }
     }
 
     fn check_and_record_nonce(&self, nonce: u64, now: u64) -> Result<(), DelegationReject> {
@@ -512,6 +548,36 @@ mod tests {
             g.verify(TOOL, ARGS, &chain, b"short"),
             Err(DelegationReject::MalformedEnvelope)
         ));
+    }
+
+    #[test]
+    fn a_store_revocation_propagates_to_a_running_gate() {
+        // The provider side of revocation: an operator revokes a delegated
+        // gateway in the machine-shared store, and the running gate rejects the
+        // next invoke — no restart.
+        use net_sdk::revocation::RevocationStore;
+
+        let (root, machine, gateway) = identities();
+        let chain = chain_for(&root, &machine, &gateway).to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+
+        let g = DelegationGate::new(root.entity_id().clone(), Arc::new(RevocationRegistry::new()))
+            .with_revocation_store(&path);
+
+        // Admits before any revocation.
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok(), "admits before revocation");
+
+        // An operator revokes this machine's gateway delegation in the store.
+        RevocationStore::revoke_below(&path, machine.entity_id(), 1).unwrap();
+
+        // The next invoke reloads the store and is rejected.
+        let env2 = envelope(&gateway, TOOL, ARGS, now_secs(), 2);
+        assert!(
+            matches!(g.verify(TOOL, ARGS, &chain, &env2), Err(DelegationReject::Chain(_))),
+            "a store revocation must reject the next invoke",
+        );
     }
 
     #[test]
