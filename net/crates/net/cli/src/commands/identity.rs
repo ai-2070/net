@@ -1,8 +1,8 @@
 //! `net identity (generate|show|fingerprint)` — operator-identity
 //! authoring + inspection.
 //!
-//! Identity files are TOML at `$XDG_CONFIG_HOME/net/identities/`
-//! by default. Format:
+//! Identity files are TOML at `$XDG_CONFIG_HOME/net-mesh/identities/`
+//! by default (see [`default_identity_path`]). Format:
 //!
 //! ```toml
 //! operator_id = "0x1234..."

@@ -294,7 +294,16 @@ impl DelegationGate {
         nonce: u64,
         now: u64,
     ) -> Result<(), DelegationReject> {
-        let expiry = now.saturating_add(self.window_secs.saturating_mul(2));
+        // Retain past the last instant the envelope can still pass the freshness
+        // window. An accepted `ts` is at most `now + window` (max future skew), so
+        // the envelope stays window-valid until wall-clock `ts + window` =
+        // `now + 2*window`. The prune below is `exp > now` and the window bound is
+        // inclusive, so without the `+ 1` a max-future-skew envelope could be
+        // pruned on the exact tick it is still acceptable — a 1s replay seam. The
+        // extra second closes it (over-retaining a nonce is harmless).
+        let expiry = now
+            .saturating_add(self.window_secs.saturating_mul(2))
+            .saturating_add(1);
         let mut leaf_key = [0u8; 32];
         leaf_key.copy_from_slice(leaf.as_bytes());
         let key = (leaf_key, nonce);
