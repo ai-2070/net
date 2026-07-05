@@ -60,7 +60,9 @@
  * Functions returning `char*` yield NULL on error. net_mcp_pin_state also
  * returns an empty string "" for "no record" (states are never empty, so
  * it is unambiguous). Functions returning `int` use -1 for error; a
- * non-negative value is the result (0/1 for a bool).
+ * non-negative value is the result (0/1 for a bool) — except
+ * net_mcp_credential_requires_consent, which has no error return and gates
+ * (returns 1) if a runtime panic is trapped, so a failure never under-gates.
  *
  * Detail for the most recent failure is available per-thread via
  * net_mcp_last_error_message (human-readable) and net_mcp_last_error_kind
