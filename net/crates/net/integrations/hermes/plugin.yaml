@@ -1,0 +1,13 @@
+name: net
+version: 0.31.0
+description: "Reach capabilities running on your OTHER machines (published there with `net wrap`) as five net_* tools — search, describe, invoke, list-pinned, request-pin — with local consent + pin approval. Embeds a first-class Net mesh node in-process via net-mesh-sdk (no daemon, no MCP shim). The net_* tools search the MESH index across your nodes and are distinct from Hermes's local tool_search. Enable with plugins.enabled: [net]; join your mesh via NET_MESH_PSK / NET_MESH_PEERS."
+author: NousResearch
+kind: standalone
+provides_tools:
+  - net_search_capabilities
+  - net_describe_capability
+  - net_invoke_capability
+  - net_list_pinned_capabilities
+  - net_request_pin
+hooks:
+  - on_session_end
