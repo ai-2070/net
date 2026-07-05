@@ -65,6 +65,7 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -135,6 +136,20 @@ func takeString(cs *C.char) (string, bool) {
 	return C.GoString(cs), true
 }
 
+// checkNoNUL rejects strings containing a NUL byte, which C.CString would
+// silently truncate at — a cap id or store path could otherwise be
+// reinterpreted as a shorter, different value once it crosses into C.
+// (JSON args marshaled via encoding/json are NUL-escaped, so only the
+// raw-passed strings need this.)
+func checkNoNUL(args ...string) error {
+	for _, s := range args {
+		if strings.IndexByte(s, 0) >= 0 {
+			return &McpError{Kind: "invalid_arg", Message: "argument contains a NUL byte"}
+		}
+	}
+	return nil
+}
+
 // cstr is C.CString + a cleanup func; the caller must call free().
 func cstr(s string) (*C.char, func()) {
 	cs := C.CString(s)
@@ -163,6 +178,9 @@ func optCstr(s string) (*C.char, func()) {
 // override needs force=true, mirroring `net wrap --no-credentials --force`.
 func Classify(program string, args []string, envs map[string]string, override string, force bool) (string, error) {
 	defer pinThread()()
+	if err := checkNoNUL(program, override); err != nil {
+		return "", err
+	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
 		return "", fmt.Errorf("mcp: marshal args: %w", err)
@@ -214,6 +232,9 @@ type LoweredTool struct {
 func LowerTool(toolJSON, serverVersion, credentialStatus, substitutability string) (LoweredTool, error) {
 	defer pinThread()()
 	var out LoweredTool
+	if err := checkNoNUL(toolJSON, serverVersion, credentialStatus, substitutability); err != nil {
+		return out, err
+	}
 
 	cTool, freeTool := cstr(toolJSON)
 	defer freeTool()
@@ -242,6 +263,11 @@ func LowerTool(toolJSON, serverVersion, credentialStatus, substitutability strin
 // status requires local consent. A wire "none" is NOT trusted (gates like
 // "unknown"), so "none" / "" / anything unrecognised returns true.
 func CredentialRequiresConsent(status string) bool {
+	// No error channel here; a NUL-bearing status would truncate in C, so gate
+	// it (require consent) rather than risk under-gating a reinterpreted value.
+	if strings.IndexByte(status, 0) >= 0 {
+		return true
+	}
 	cStatus, free := optCstr(status)
 	defer free()
 	return C.net_mcp_credential_requires_consent(cStatus) != 0
@@ -252,6 +278,9 @@ func CredentialRequiresConsent(status string) bool {
 // and "42/echo" return the same string. Errors on a missing/empty half.
 func CanonicalizeCapID(display string) (string, error) {
 	defer pinThread()()
+	if err := checkNoNUL(display); err != nil {
+		return "", err
+	}
 	cDisplay, free := cstr(display)
 	defer free()
 	s, ok := takeString(C.net_mcp_cap_id_canonicalize(cDisplay))
@@ -302,6 +331,9 @@ func (p *ConsentPolicy) Close() {
 }
 
 func (p *ConsentPolicy) mutate(capID string, fn func(*C.ConsentPolicyHandle, *C.char) C.int) error {
+	if err := checkNoNUL(capID); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	defer pinThread()()
@@ -341,6 +373,9 @@ func (p *ConsentPolicy) Unpin(capID string) error {
 
 // IsPinned reports whether the capability is pinned.
 func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
+	if err := checkNoNUL(capID); err != nil {
+		return false, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	defer pinThread()()
@@ -357,6 +392,9 @@ func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
 // Decide returns "allowed" or "requires_approval" for the capability with
 // the given wire credential status (the SDK enum's stable string).
 func (p *ConsentPolicy) Decide(capID, credentialStatus string) (string, error) {
+	if err := checkNoNUL(capID, credentialStatus); err != nil {
+		return "", err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	defer pinThread()()
@@ -439,6 +477,9 @@ func (s *PinStore) Path() string { return s.path }
 
 func (s *PinStore) stringOp(fn func(cPath, cCap *C.char) *C.char, capID string) (string, bool, error) {
 	defer pinThread()()
+	if err := checkNoNUL(s.path, capID); err != nil {
+		return "", false, err
+	}
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	cCap, freeCap := cstr(capID)
@@ -452,6 +493,9 @@ func (s *PinStore) stringOp(fn func(cPath, cCap *C.char) *C.char, capID string) 
 
 func (s *PinStore) intOp(fn func(cPath, cCap *C.char) C.int, capID string) (bool, error) {
 	defer pinThread()()
+	if err := checkNoNUL(s.path, capID); err != nil {
+		return false, err
+	}
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	cCap, freeCap := cstr(capID)
@@ -513,6 +557,9 @@ func (s *PinStore) State(capID string) (state string, ok bool, err error) {
 // List returns all records, sorted by cap id.
 func (s *PinStore) List() ([]PinRecord, error) {
 	defer pinThread()()
+	if err := checkNoNUL(s.path); err != nil {
+		return nil, err
+	}
 	cPath, freePath := cstr(s.path)
 	defer freePath()
 	js, ok := takeString(C.net_mcp_pin_list(cPath))

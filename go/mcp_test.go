@@ -275,6 +275,33 @@ func TestConsentPolicyConcurrentAccessIsSafe(t *testing.T) {
 	closers.Wait()
 }
 
+func TestRejectsNULInStringInputs(t *testing.T) {
+	// A NUL byte would be silently truncated by C.CString, reinterpreting a
+	// cap id / path as a shorter, different value. Every entry that passes a
+	// raw string to C must reject it.
+	p, err := NewConsentPolicy()
+	if err != nil {
+		t.Fatalf("NewConsentPolicy: %v", err)
+	}
+	defer p.Close()
+
+	if err := p.Allow("a/b\x00c"); err == nil {
+		t.Error("Allow must reject a cap id containing a NUL byte")
+	}
+	if _, err := p.Decide("a/b\x00c", "credentialed"); err == nil {
+		t.Error("Decide must reject a cap id containing a NUL byte")
+	}
+	// CredentialRequiresConsent has no error channel, so it fails closed.
+	if !CredentialRequiresConsent("none\x00") {
+		t.Error("a NUL-bearing status must gate (require consent)")
+	}
+
+	store := OpenPinStore(filepath.Join(t.TempDir(), "pins.json"))
+	if _, err := store.Approve("a/b\x00c"); err == nil {
+		t.Error("PinStore.Approve must reject a cap id containing a NUL byte")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Pin store
 // ---------------------------------------------------------------------------
