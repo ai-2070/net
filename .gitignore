@@ -59,11 +59,12 @@ net/crates/net/bindings/node/tool.js
 .profiling/
 DEBUG_*.md
 
-# Hermes
-hermes/
-hermes-agent/
+# Hermes — root-level reference clones only (anchored so they don't also
+# ignore in-tree integration sources like net/crates/net/integrations/hermes/).
+/hermes/
+/hermes-agent/
 .cocoindex_code/
 .codegraph/
 
-# OpenClaw
-openclaw/
+# OpenClaw — root-level reference clone only (anchored, same reason).
+/openclaw/

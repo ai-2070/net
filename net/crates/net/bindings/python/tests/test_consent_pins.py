@@ -268,3 +268,38 @@ def test_async_pin_store_round_trip(tmp_path) -> None:
     assert rows == [("b/kept", "approved")]
     # The sync handle sees the async handle's writes — one store, one lock.
     assert PinStore(path).is_approved("b/kept")
+
+
+def test_async_pin_watch_emits_approved_deltas(tmp_path) -> None:
+    # The change subscription: an OS file watcher over the store, so a
+    # (cross-handle here, cross-process in production) approve/reject arrives as
+    # an event — no polling. snapshot_and_watch is atomic: the snapshot is the
+    # baseline, the watcher yields only subsequent approved-set deltas.
+    path = str(tmp_path / "pins.json")
+
+    async def _run() -> list:
+        from net import AsyncPinWatcher
+
+        store = AsyncPinStore(path)
+        assert await store.approve("a/x")  # seed one approved pin
+        snapshot, watcher = await store.snapshot_and_watch()
+        assert snapshot == ["a/x"], snapshot
+        assert isinstance(watcher, AsyncPinWatcher)
+
+        # Mutate ONE thing, then await its delta — never time the mutations.
+        # Awaiting each event before the next mutation means the 120ms watcher
+        # debounce can't coalesce two mutations into a single delta (the failure
+        # mode of fixed sleeps under CI load). Mirrors the Rust core test's
+        # mutate-then-await-per-event pattern.
+        await store.approve("a/y")  # -> added delta
+        added = await asyncio.wait_for(anext(watcher), timeout=5)
+        await store.reject("a/x")  # -> removed delta
+        removed = await asyncio.wait_for(anext(watcher), timeout=5)
+        return [
+            (list(added.added), list(added.removed)),
+            (list(removed.added), list(removed.removed)),
+        ]
+
+    changes = asyncio.run(_run())
+    assert (["a/y"], []) in changes, changes
+    assert ([], ["a/x"]) in changes, changes

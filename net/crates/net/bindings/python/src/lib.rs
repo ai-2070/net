@@ -34,6 +34,18 @@ mod groups;
 mod identity;
 #[cfg(feature = "mcp")]
 mod mcp_helpers;
+// Native consent-gated capability gateway (search / describe / invoke over an
+// embedded NetMesh node) — the `HERMES_INTEGRATION_PLAN.md` Phase 1 enabler.
+// Needs both a live node (`net`) and the bridge's gateway + shared gate
+// (`mcp`), so it is gated on both.
+#[cfg(all(feature = "net", feature = "mcp"))]
+mod capability_gateway;
+// Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
+// DelegationChain (root → machine → gateway → subagent) + shared
+// RevocationRegistry + child-`Identity` derivation. Thin wrappers over
+// `net_sdk::delegation`; needs the SDK's `net` feature.
+#[cfg(feature = "delegation")]
+mod delegation;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3118,13 +3130,21 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<consent::PyConsentPolicy>()?;
         m.add_class::<consent::PyPinStore>()?;
         m.add_class::<consent::PyAsyncPinStore>()?;
+        m.add_class::<consent::PyAsyncPinWatcher>()?;
+        m.add_class::<consent::PyPinChange>()?;
         m.add_function(wrap_pyfunction!(consent::credential_requires_consent, m)?)?;
+        m.add_function(wrap_pyfunction!(consent::default_pin_store_path, m)?)?;
         m.add("PinsError", m.py().get_type::<consent::PinsError>())?;
     }
     #[cfg(feature = "mcp")]
     {
         m.add_function(wrap_pyfunction!(mcp_helpers::classify_mcp_server, m)?)?;
         m.add_function(wrap_pyfunction!(mcp_helpers::lower_mcp_tool, m)?)?;
+    }
+    #[cfg(all(feature = "net", feature = "mcp"))]
+    {
+        m.add_class::<capability_gateway::PyCapabilityGateway>()?;
+        m.add_class::<capability_gateway::PyAsyncCapabilityGateway>()?;
     }
     #[cfg(feature = "net")]
     {
@@ -3140,6 +3160,20 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m.py().get_type::<identity::IdentityError>(),
         )?;
         m.add("TokenError", m.py().get_type::<identity::TokenError>())?;
+    }
+    #[cfg(feature = "delegation")]
+    {
+        m.add_class::<delegation::PyDelegationChain>()?;
+        m.add_class::<delegation::PyRevocationRegistry>()?;
+        m.add_function(wrap_pyfunction!(delegation::derive_child_identity, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            delegation::default_revocation_store_path,
+            m
+        )?)?;
+        m.add(
+            "GATEWAY_DELEGATION_CHANNEL",
+            delegation::GATEWAY_DELEGATION_CHANNEL,
+        )?;
     }
     #[cfg(feature = "cortex")]
     {

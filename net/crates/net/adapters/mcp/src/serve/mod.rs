@@ -26,11 +26,15 @@
 //!   (`MCP_BRIDGE_SDK_PLAN.md` P0 — consent isn't MCP-specific); these
 //!   modules re-export `net_sdk::consent` / `net_sdk::pins`, and the shim
 //!   only *wires* them per request.
+//! - [`gated`] — the one `describe → validate → consent → invoke` composition,
+//!   shared by the shim here and the native SDK gateway (so the gate can't
+//!   fork between the MCP-compat path and the native path).
 //! - [`meta_tools`] — the `net_*` meta-tool surface the host sees.
 //! - [`shim`] — the JSON-RPC server loop that wires it all together.
 
 pub mod backend;
 pub mod consent;
+pub mod gated;
 pub mod grouping;
 pub mod mesh_gateway;
 pub mod meta_tools;
@@ -43,6 +47,7 @@ pub use backend::{
     GatewayError, InvokeSafety,
 };
 pub use consent::{ConsentDecision, ConsentPolicy};
+pub use gated::{gated_invoke, GatedOutcome};
 pub use mesh_gateway::MeshGateway;
 pub use pins::{PinState, PinStore, PinStoreError};
 pub use shim::Shim;

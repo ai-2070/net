@@ -44,6 +44,7 @@ default = [
     "tool",
     "consent",
     "mcp",
+    "delegation",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -118,12 +119,13 @@ deck = ["meshos", "net/meshos", "net-sdk/deck"]
 aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
 # Local consent surface (`MCP_BRIDGE_SDK_PLAN.md` P1): CapabilityId,
 # the ConsentPolicy gate, and the lock-protocol PinStore — thin
-# wrappers over `net_sdk::consent` / `net_sdk::pins`, which are
-# unconditional SDK modules (no net-sdk sub-feature to forward; pure
-# local-state primitives with no mesh dependency). The one lock
-# implementation stays in Rust — the binding never opens the store
-# file directly.
-consent = ["dep:net-sdk"]
+# wrappers over `net_sdk::consent` / `net_sdk::pins` (unconditional SDK
+# modules, pure local-state primitives with no mesh dependency). Forwards
+# `net-sdk/pin-watch` for the pin-change subscription (`PinStore::watch`
+# / `AsyncPinWatcher`, `HERMES_INTEGRATION_PLAN.md` Phase 2) — an OS file
+# watcher over the shared store, not polling. The one lock implementation
+# stays in Rust — the binding never opens the store file directly.
+consent = ["dep:net-sdk", "net-sdk/pin-watch"]
 # MCP bridge pure helpers (`MCP_BRIDGE_SDK_PLAN.md` P1): thin bindings
 # for `classify` (credential-risk scoring a native node may DISPLAY
 # before publishing an MCP-backed tool) and `lower_tool` (MCP
@@ -131,6 +133,14 @@ consent = ["dep:net-sdk"]
 # only — publishing itself goes through the general SDK path; the
 # forwarding/keychain internals are never bound (bridge doctrine #3).
 mcp = ["consent", "dep:net-mcp"]
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3):
+# DelegationChain (root → machine → gateway → subagent), a shared
+# RevocationRegistry, and stable child-`Identity` derivation — thin
+# wrappers over `net_sdk::delegation`. Needs the SDK's `net` feature (the
+# identity + token-chain surface `delegation` composes), which `consent`
+# alone does not activate. H8-clean: takes/returns opaque `Identity`
+# handles + public entity-ids; private seeds never cross into Python.
+delegation = ["net", "dep:net-sdk", "net-sdk/net"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

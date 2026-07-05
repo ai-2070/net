@@ -35,6 +35,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::CapabilityId;
 
+/// The per-user default pin-store path: `<local data dir>/net-mesh/mcp-pins.json`,
+/// falling back to `<home>/net-mesh/mcp-pins.json` when no data-local directory
+/// resolves.
+///
+/// This is the single machine-shared store every consumer converges on — the
+/// `net mcp` CLI, a running `net mcp serve` shim, and any SDK client (e.g. a
+/// Hermes plugin) — so an approval made through one path is honored by all.
+/// Resolving it in one place (bridge-SDK doctrine #1) is what keeps them from
+/// silently drifting onto different files. Returns `None` only when neither a
+/// data-local nor a home directory can be determined; the caller then requires
+/// an explicit path.
+pub fn default_pin_store_path() -> Option<PathBuf> {
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .map(|d| d.join("net-mesh").join("mcp-pins.json"))
+}
+
 /// Whether a pin has been approved by the operator, or is still awaiting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -367,6 +384,201 @@ impl PinStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Change subscription (feature `pin-watch`)
+// ---------------------------------------------------------------------------
+
+/// The approved-set delta between two snapshots of the store — what a
+/// subscriber acts on: promote the `added`, retire the `removed`.
+#[cfg(feature = "pin-watch")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinChange {
+    /// Capabilities newly `approved` since the last event.
+    pub added: Vec<CapabilityId>,
+    /// Capabilities no longer `approved` (rejected / removed).
+    pub removed: Vec<CapabilityId>,
+}
+
+/// Signal from the notify callback to [`PinWatcher::next`]: either a file event
+/// that may be a store change, or a backend error/shutdown that ends the
+/// subscription (so `next()` returns `None` rather than blocking forever if the
+/// backend stops delivering).
+#[cfg(feature = "pin-watch")]
+enum WatchSignal {
+    Dirty,
+    Backend,
+}
+
+/// A live subscription to approved-pin changes in the machine-shared store.
+///
+/// Backed by an OS file watcher over the store's directory (**not** polling),
+/// so a change made by ANY process — `net mcp pin approve`, a running shim,
+/// another SDK client — arrives as a push event. Each [`PinWatcher::next`]
+/// resolves to the approved-set delta; file changes that don't alter the
+/// approved set (e.g. a new *pending* request) are absorbed silently.
+#[cfg(feature = "pin-watch")]
+pub struct PinWatcher {
+    path: PathBuf,
+    // The watcher is kept alive here; dropping it stops the subscription.
+    _watcher: notify::RecommendedWatcher,
+    dirty_rx: tokio::sync::mpsc::UnboundedReceiver<WatchSignal>,
+    approved: std::collections::HashSet<CapabilityId>,
+}
+
+#[cfg(feature = "pin-watch")]
+impl PinWatcher {
+    /// Debounce window: coalesce the burst of events a single atomic save
+    /// (temp write + rename) generates into one reload.
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+    /// Await the next approved-set change, or `None` once the watcher backend
+    /// stops (e.g. the watched directory is removed) or this handle is dropped.
+    pub async fn next(&mut self) -> Option<PinChange> {
+        loop {
+            // Wait for a file event; a backend error/shutdown ends the stream.
+            match self.dirty_rx.recv().await? {
+                WatchSignal::Backend => return None,
+                WatchSignal::Dirty => {}
+            }
+            // Coalesce the save burst, ending the stream if the backend died
+            // mid-burst.
+            if self.drain_burst() {
+                return None;
+            }
+            tokio::time::sleep(Self::DEBOUNCE).await;
+            if self.drain_burst() {
+                return None;
+            }
+
+            // Reload and diff the approved set. A transient read / corrupt error
+            // is not a verdict — wait for the next event rather than emit
+            // spurious removals.
+            let store = match PinStore::load(self.path.clone()).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let now: std::collections::HashSet<CapabilityId> =
+                store.approved().into_iter().collect();
+            let change = diff_approved(&self.approved, &now);
+            self.approved = now;
+            if !change.added.is_empty() || !change.removed.is_empty() {
+                return Some(change);
+            }
+        }
+    }
+
+    /// Drain buffered signals (coalescing the save burst). Returns `true` if a
+    /// backend error/shutdown signal was among them — the caller then ends the
+    /// stream (`next()` returns `None`).
+    fn drain_burst(&mut self) -> bool {
+        let mut backend_gone = false;
+        while let Ok(sig) = self.dirty_rx.try_recv() {
+            if matches!(sig, WatchSignal::Backend) {
+                backend_gone = true;
+            }
+        }
+        backend_gone
+    }
+}
+
+/// Diff two approved-sets into a [`PinChange`] with `added` / `removed` in a
+/// **stable order** (by `CapabilityId::display()`). `HashSet::difference` yields
+/// arbitrary order, so without this the payload — and any downstream handling or
+/// test asserting on it — could flap across runs.
+#[cfg(feature = "pin-watch")]
+fn diff_approved(
+    old: &std::collections::HashSet<CapabilityId>,
+    now: &std::collections::HashSet<CapabilityId>,
+) -> PinChange {
+    let mut added: Vec<CapabilityId> = now.difference(old).cloned().collect();
+    let mut removed: Vec<CapabilityId> = old.difference(now).cloned().collect();
+    added.sort_by_key(|a| a.display());
+    removed.sort_by_key(|a| a.display());
+    PinChange { added, removed }
+}
+
+#[cfg(feature = "pin-watch")]
+impl PinStore {
+    /// Snapshot the currently-approved capabilities AND begin watching for
+    /// changes, atomically — so a subscriber promotes the snapshot and then
+    /// consumes only subsequent [`PinChange`] deltas, with no gap or double
+    /// registration. The snapshot is a fresh read of the same file
+    /// `net mcp pin` writes.
+    pub async fn snapshot_and_watch(
+        path: impl Into<PathBuf>,
+    ) -> Result<(Vec<CapabilityId>, PinWatcher), PinStoreError> {
+        use notify::Watcher;
+
+        let path = path.into();
+        // Watch the store's DIRECTORY: the atomic temp+rename replaces the file
+        // inode, so watching the file itself would miss the rename. Ensure the
+        // directory exists first — the store's own save creates it lazily, but
+        // the watcher needs it up front.
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| PinStoreError::Io {
+                path: dir.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        let want = path.file_name().map(|n| n.to_os_string());
+
+        let (tx, dirty_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            match res {
+                Ok(event) => {
+                    // Fire on any event that names the store file (or carries no
+                    // path, which some backends emit for directory-level changes).
+                    let touches = event.paths.is_empty()
+                        || event.paths.iter().any(|p| p.file_name() == want.as_deref());
+                    if touches {
+                        let _ = tx.send(WatchSignal::Dirty);
+                    }
+                }
+                // A backend error can mean the watch has stopped delivering events
+                // — signal termination so `next()` returns None instead of
+                // blocking forever on `recv()`.
+                Err(_) => {
+                    let _ = tx.send(WatchSignal::Backend);
+                }
+            }
+        })
+        .map_err(|e| PinStoreError::Io {
+            path: dir.display().to_string(),
+            reason: format!("pin watcher init: {e}"),
+        })?;
+        watcher
+            .watch(&dir, notify::RecursiveMode::NonRecursive)
+            .map_err(|e| PinStoreError::Io {
+                path: dir.display().to_string(),
+                reason: format!("pin watch: {e}"),
+            })?;
+
+        let store = PinStore::load(path.clone()).await?;
+        let approved = store.approved();
+        let baseline: std::collections::HashSet<CapabilityId> = approved.iter().cloned().collect();
+        Ok((
+            approved,
+            PinWatcher {
+                path,
+                _watcher: watcher,
+                dirty_rx,
+                approved: baseline,
+            },
+        ))
+    }
+
+    /// Begin watching for approved-set changes, discarding the initial
+    /// snapshot. Convenience over [`snapshot_and_watch`] when the caller has
+    /// already read the current set.
+    pub async fn watch(path: impl Into<PathBuf>) -> Result<PinWatcher, PinStoreError> {
+        Ok(Self::snapshot_and_watch(path).await?.1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +591,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("pins.json");
         (dir, path)
+    }
+
+    #[cfg(feature = "pin-watch")]
+    #[test]
+    fn diff_approved_orders_added_and_removed_by_display() {
+        use std::collections::HashSet;
+        // Disjoint sets: `added` = all of `now`, `removed` = all of `old`, each
+        // inserted out of order so a stable payload can only come from sorting.
+        let old: HashSet<CapabilityId> = [cap("p/b"), cap("p/y"), cap("p/m")].into_iter().collect();
+        let now: HashSet<CapabilityId> = [cap("p/c"), cap("p/a"), cap("p/z")].into_iter().collect();
+        let change = diff_approved(&old, &now);
+        assert_eq!(
+            change.added.iter().map(|c| c.display()).collect::<Vec<_>>(),
+            vec!["p/a", "p/c", "p/z"],
+        );
+        assert_eq!(
+            change
+                .removed
+                .iter()
+                .map(|c| c.display())
+                .collect::<Vec<_>>(),
+            vec!["p/b", "p/m", "p/y"],
+        );
+    }
+
+    #[cfg(feature = "pin-watch")]
+    #[tokio::test]
+    async fn watch_emits_approved_set_deltas() {
+        use std::time::Duration;
+        let (_dir, path) = store_path();
+        // Seed one approved pin before subscribing.
+        PinStore::mutate(path.clone(), |s| s.approve(&cap("a/x")))
+            .await
+            .unwrap();
+
+        let (snapshot, mut watcher) = PinStore::snapshot_and_watch(path.clone()).await.unwrap();
+        assert_eq!(snapshot, vec![cap("a/x")]);
+
+        // A cross-handle approval (as `net mcp pin approve` would) surfaces as an
+        // `added` delta, not a poll.
+        PinStore::mutate(path.clone(), |s| s.approve(&cap("a/y")))
+            .await
+            .unwrap();
+        let change = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("watcher fired within 5s")
+            .expect("watcher still live");
+        assert_eq!(change.added, vec![cap("a/y")]);
+        assert!(change.removed.is_empty(), "{change:?}");
+
+        // Removing one surfaces as a `removed` delta.
+        PinStore::mutate(path.clone(), |s| s.remove(&cap("a/x")))
+            .await
+            .unwrap();
+        let change = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("watcher fired within 5s")
+            .expect("watcher still live");
+        assert_eq!(change.removed, vec![cap("a/x")]);
+        assert!(change.added.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn default_path_is_the_shared_net_mesh_file() {
+        // On any dev/CI host a data-local or home dir resolves, so the default
+        // is present and ends with the one canonical machine-shared location
+        // the CLI, shim, and SDK clients all converge on.
+        let path = default_pin_store_path().expect("a data-local or home dir must resolve");
+        assert!(
+            path.ends_with(std::path::Path::new("net-mesh").join("mcp-pins.json")),
+            "unexpected default pin-store path: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]

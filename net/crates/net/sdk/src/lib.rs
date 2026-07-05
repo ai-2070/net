@@ -117,11 +117,24 @@ pub use redis_dedup::RedisStreamDedup;
 // dispatch and operate as a single unit at runtime.
 #[cfg(feature = "net")]
 pub mod capabilities;
+// Delegated agent identity — `root → machine → gateway → subagent`
+// delegation chains for capability-invocation attribution (Hermes plan
+// Phase 3). Rides `net` because it composes the identity / token-chain
+// surface; adds only the derivation + verification *convention* over the
+// core `TokenChain` / `RevocationRegistry` machinery.
+#[cfg(feature = "net")]
+pub mod delegation;
+// Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
+// 3): the provider side of revocation — a running `net wrap` honors an
+// operator's revocation of a delegated gateway without a restart. Mirrors the
+// pin store's file discipline; composes with a future mesh-published layer.
 /// Gang-claim resource-island scheduler value types (live ops on [`mesh::Mesh`]).
 #[cfg(feature = "net")]
 pub mod gang;
 #[cfg(feature = "net")]
 pub mod identity;
+#[cfg(feature = "net")]
+pub mod revocation;
 #[cfg(feature = "net")]
 pub mod subnets;
 
@@ -204,6 +217,14 @@ pub use crate::compute::{
 pub use crate::capabilities::{CapabilityFilter, CapabilitySet};
 #[cfg(feature = "net")]
 pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
+// Delegated-identity convenience re-exports (Phase 3): the chain type, the
+// shared revocation registry, and the child-seed KDF.
+#[cfg(feature = "net")]
+pub use crate::delegation::{
+    derive_child_seed, DelegationChain, RevocationRegistry, TokenChain, GATEWAY_DELEGATION_CHANNEL,
+};
+#[cfg(feature = "net")]
+pub use crate::revocation::{default_revocation_store_path, RevocationStore};
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
 

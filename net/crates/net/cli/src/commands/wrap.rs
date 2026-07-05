@@ -19,7 +19,12 @@ use std::path::PathBuf;
 
 use clap::Args;
 use net_mcp::spec::Implementation;
-use net_mcp::wrap::{CredentialOverride, ServerPublisher, Substitutability, WrapConfig};
+use net_mcp::wrap::{
+    CredentialOverride, DelegationAudit, DelegationGate, ServerPublisher, Substitutability,
+    WrapConfig,
+};
+use net_sdk::delegation::RevocationRegistry;
+use net_sdk::identity::EntityId;
 use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
@@ -54,6 +59,12 @@ enum WrapEvent<'a> {
         /// output states exactly who beyond same-root may invoke, rather than
         /// implying only same-root through the static `scope`.
         allowed_origins: &'a [u64],
+        /// The user-root entity id (`--owner-root`) a delegation gate is
+        /// anchored at, when enabled. Present iff delegated callers are admitted
+        /// — so the structured output reflects that admission path too, not just
+        /// the origin allowlist (`None`/omitted when no gate is configured).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delegation_root: Option<&'a str>,
     },
     /// The wrapped server changed its tool set; the mesh was reconciled.
     ToolsChanged {
@@ -94,6 +105,22 @@ pub struct WrapArgs {
     /// Owner-only by default; widen for specific peers.
     #[arg(long = "allow", value_name = "ORIGIN")]
     pub allow: Vec<String>,
+
+    /// Admit callers that present a valid delegation chain rooted at this user
+    /// **root** entity id (32-byte ed25519 pubkey, 64 hex chars, optional `0x`).
+    /// Unlike `--allow` (which trusts a spoofable origin), a delegated invoke is
+    /// admitted only if it carries a chain rooted here AND a per-invoke
+    /// signature by the chain's leaf — the admitted leaf (which gateway /
+    /// subagent) is logged. Owner-scope still applies to callers with no chain.
+    #[arg(long = "owner-root", value_name = "ENTITY_ID_HEX")]
+    pub owner_root: Option<String>,
+
+    /// Path to the machine-shared delegation-revocation store the gate honors
+    /// (default: the per-user shared file). A revocation written there — of a
+    /// delegated gateway's access — takes effect on this running provider
+    /// without a restart. Only meaningful with `--owner-root`.
+    #[arg(long = "revocation-store", value_name = "PATH")]
+    pub revocation_store: Option<PathBuf>,
 
     /// Operator identity file. Defaults to the profile's `identity`. Owner-only
     /// scoping keys on it, so a stable identity (not an ephemeral key) is
@@ -175,6 +202,44 @@ pub async fn run(
         config.scope.allow(origin);
     }
 
+    // Optional delegation gate (Phase 3): admit callers presenting a chain
+    // rooted at the given user root + a per-invoke leaf signature, and log the
+    // admitted leaf. A fresh revocation registry — cross-process revocation
+    // propagation to the provider is a follow-up (the gate structure supports
+    // it via `RevocationRegistry`).
+    if let Some(owner_root_hex) = &args.owner_root {
+        let owner_root = parse_owner_root(owner_root_hex)?;
+        let mut gate =
+            DelegationGate::new(owner_root, std::sync::Arc::new(RevocationRegistry::new()))
+                .with_audit(std::sync::Arc::new(|a: &DelegationAudit| {
+                    // Diagnostics on stderr, off the structured stdout stream.
+                    eprintln!(
+                        "net wrap: delegated invoke admitted — tool={} leaf={} root={}",
+                        a.tool,
+                        hex::encode(a.leaf.as_bytes()),
+                        hex::encode(a.root.as_bytes()),
+                    );
+                }));
+        // Honor a machine-shared revocation store so an operator can revoke a
+        // gateway's access without restarting this provider. Falls back to the
+        // per-user default path when the flag is omitted.
+        let rev_path = args
+            .revocation_store
+            .clone()
+            .or_else(net_sdk::revocation::default_revocation_store_path);
+        if let Some(p) = &rev_path {
+            gate = gate.with_revocation_store(p.clone());
+        }
+        config.delegation = Some(std::sync::Arc::new(gate));
+        eprintln!(
+            "net wrap: delegation gate enabled (owner root {owner_root_hex}); \
+             chain-rooted callers are verified + audited{}",
+            rev_path
+                .map(|p| format!("; revocations honored from {}", p.display()))
+                .unwrap_or_default()
+        );
+    }
+
     let publisher = ServerPublisher::new(std::sync::Arc::clone(&mesh));
     let mut publication = publisher
         .publish_server(program, prog_args, &envs, config)
@@ -193,6 +258,7 @@ pub async fn run(
             visibility: "owner_only",
             scope: "same_root_identity",
             allowed_origins: &allow,
+            delegation_root: args.owner_root.as_deref(),
         },
     )
     .map_err(|e| generic(format!("write output: {e}")))?;
@@ -283,6 +349,24 @@ fn parse_allow_origins(raw: &[String]) -> Result<Vec<u64>, CliError> {
         .collect()
 }
 
+/// Parse `--owner-root` — a 32-byte ed25519 entity id as 64 hex chars (optional
+/// `0x` prefix).
+fn parse_owner_root(raw: &str) -> Result<EntityId, CliError> {
+    let trimmed = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| invalid_args(format!("--owner-root: invalid hex: {e}")))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        invalid_args(format!(
+            "--owner-root must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(EntityId::from_bytes(arr))
+}
+
 /// Resolve the credential override from the two flags (upward beats detect;
 /// downward is validated later against `--force`).
 fn resolve_credential_override(credentialed: bool, no_credentials: bool) -> CredentialOverride {
@@ -307,6 +391,28 @@ mod tests {
             vec![("A".into(), "1".into()), ("B".into(), "x=y".into())]
         );
         assert!(parse_env_pairs(&["nope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn owner_root_parses_64_hex_and_rejects_bad_input() {
+        // A valid 32-byte id round-trips (with and without the 0x prefix).
+        let id = net_sdk::Identity::generate();
+        let hexed = hex::encode(id.entity_id().as_bytes());
+        assert_eq!(
+            parse_owner_root(&hexed).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert_eq!(
+            parse_owner_root(&format!("0x{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert_eq!(
+            parse_owner_root(&format!("0X{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        // Wrong length and non-hex are rejected.
+        assert!(parse_owner_root("deadbeef").is_err());
+        assert!(parse_owner_root(&"zz".repeat(32)).is_err());
     }
 
     #[test]
@@ -342,8 +448,30 @@ mod tests {
             visibility: "owner_only",
             scope: "same_root_identity",
             allowed_origins: allow,
+            delegation_root: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn wrapped_event_reports_the_delegation_root_when_a_gate_is_enabled() {
+        let tools = vec!["echo".to_string()];
+        let skipped: Vec<String> = Vec::new();
+        let root_hex = "aa".repeat(32);
+        let v = serde_json::to_value(WrapEvent::Wrapped {
+            name: "gh",
+            tools: &tools,
+            skipped: &skipped,
+            visibility: "owner_only",
+            scope: "same_root_identity",
+            allowed_origins: &[],
+            delegation_root: Some(&root_hex),
+        })
+        .unwrap();
+        // The delegation admission path is reported alongside the origin allowlist.
+        assert_eq!(v["delegation_root"], root_hex);
+        // With no gate, the field is omitted entirely (not serialized as null).
+        assert!(wrapped_event(&[]).get("delegation_root").is_none());
     }
 
     #[test]

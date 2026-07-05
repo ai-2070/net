@@ -778,11 +778,14 @@ else:
 try:
     from ._net import (
         AsyncPinStore,
+        AsyncPinWatcher,
         CapabilityId,
         ConsentPolicy,
+        PinChange,
         PinsError,
         PinStore,
         credential_requires_consent,
+        default_pin_store_path,
     )
 except ImportError:
     # `consent` feature not compiled in; symbols stay undefined.
@@ -791,11 +794,14 @@ else:
     __all__.extend(
         [
             "AsyncPinStore",
+            "AsyncPinWatcher",
             "CapabilityId",
             "ConsentPolicy",
+            "PinChange",
             "PinsError",
             "PinStore",
             "credential_requires_consent",
+            "default_pin_store_path",
         ]
     )
 
@@ -811,6 +817,46 @@ except ImportError:
     pass
 else:
     __all__.extend(["classify_mcp_server", "lower_mcp_tool"])
+
+# The native consent-gated capability gateway (search / describe / invoke over
+# an embedded NetMesh node), sync + awaitable duals. Present iff the module was
+# built with BOTH the `net` and `mcp` features (the default wheel is).
+try:
+    from ._net import AsyncCapabilityGateway, CapabilityGateway
+except ImportError:
+    # `net`+`mcp` not both compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(["AsyncCapabilityGateway", "CapabilityGateway"])
+
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): a
+# DelegationChain (`root -> machine -> gateway -> subagent`) for
+# capability-invocation attribution, a shared RevocationRegistry, and
+# stable child-`Identity` derivation. Present iff the module was built with
+# the `delegation` feature (default in the maturin-shipped wheel). H8-clean:
+# takes/returns opaque `Identity` handles and public entity-ids; private
+# seeds never cross into Python.
+try:
+    from ._net import (
+        GATEWAY_DELEGATION_CHANNEL,
+        DelegationChain,
+        RevocationRegistry,
+        default_revocation_store_path,
+        derive_child_identity,
+    )
+except ImportError:
+    # `delegation` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "GATEWAY_DELEGATION_CHANNEL",
+            "DelegationChain",
+            "RevocationRegistry",
+            "default_revocation_store_path",
+            "derive_child_identity",
+        ]
+    )
 
 
 __version__ = "0.31.0"

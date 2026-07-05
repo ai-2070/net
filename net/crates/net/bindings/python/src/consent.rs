@@ -33,7 +33,7 @@ use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use net_sdk::consent::{CapabilityId, ConsentPolicy as CoreConsentPolicy, CredentialStatus};
-use net_sdk::pins::{PinState, PinStore as CorePinStore, PinStoreError};
+use net_sdk::pins::{PinState, PinStore as CorePinStore, PinStoreError, PinWatcher};
 
 pyo3::create_exception!(
     _net,
@@ -143,6 +143,20 @@ impl PyCapabilityId {
 #[pyfunction]
 pub fn credential_requires_consent(status: &str) -> bool {
     CredentialStatus::from_wire(status).requires_consent()
+}
+
+/// The per-user default pin-store path — `<local data>/net-mesh/mcp-pins.json`,
+/// falling back to the home directory — or `None` if neither resolves.
+///
+/// This is the same file the `net mcp pin` CLI and a running `net mcp serve`
+/// shim use. Pass it to :class:`PinStore` / :class:`AsyncPinStore` (or a
+/// `CapabilityGateway`) so a Python client shares consent decisions with the
+/// rest of the machine — an approval made anywhere is honored everywhere —
+/// without hard-coding the path. The resolver lives once in the Rust SDK, so
+/// the CLI, the shim, and this binding cannot drift onto different files.
+#[pyfunction]
+pub fn default_pin_store_path() -> Option<String> {
+    net_sdk::pins::default_pin_store_path().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The consumer-side consent gate: a config allowlist plus a set of pinned
@@ -484,7 +498,94 @@ impl PyAsyncPinStore {
         })
     }
 
+    /// Snapshot the currently-approved capabilities AND subscribe to changes,
+    /// atomically. Returns ``(approved: list[str], AsyncPinWatcher)`` — promote
+    /// the snapshot, then ``async for change in watcher:`` to consume deltas.
+    /// The subscription is an OS file watcher, so a cross-process ``net mcp pin
+    /// approve`` (or another SDK client) arrives as an event, not a poll.
+    fn snapshot_and_watch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (snapshot, watcher) = CorePinStore::snapshot_and_watch(path)
+                .await
+                .map_err(pins_err)?;
+            let mut ids: Vec<String> = snapshot.iter().map(|id| id.display()).collect();
+            ids.sort();
+            Ok::<_, PyErr>((ids, PyAsyncPinWatcher::new(watcher)))
+        })
+    }
+
+    /// Subscribe to approved-pin changes, discarding the initial snapshot.
+    /// Returns an :class:`AsyncPinWatcher`.
+    fn watch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let watcher = CorePinStore::watch(path).await.map_err(pins_err)?;
+            Ok::<_, PyErr>(PyAsyncPinWatcher::new(watcher))
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!("AsyncPinStore(path='{}')", self.path.display())
+    }
+}
+
+/// A single approved-pin change: which capabilities became approved, and which
+/// are no longer approved, since the previous event. Yielded by
+/// :class:`AsyncPinWatcher`.
+#[pyclass(name = "PinChange", module = "net._net")]
+pub struct PyPinChange {
+    /// Capabilities newly `approved` (display ids).
+    #[pyo3(get)]
+    added: Vec<String>,
+    /// Capabilities no longer `approved` (display ids).
+    #[pyo3(get)]
+    removed: Vec<String>,
+}
+
+#[pymethods]
+impl PyPinChange {
+    fn __repr__(&self) -> String {
+        format!(
+            "PinChange(added={:?}, removed={:?})",
+            self.added, self.removed
+        )
+    }
+}
+
+/// An async iterator over approved-pin changes in the machine-shared store,
+/// backed by an OS file watcher (not polling). Consume it with
+/// ``async for change in watcher:``; each ``change`` is a :class:`PinChange`.
+#[pyclass(name = "AsyncPinWatcher", module = "net._net")]
+pub struct PyAsyncPinWatcher {
+    inner: std::sync::Arc<tokio::sync::Mutex<PinWatcher>>,
+}
+
+impl PyAsyncPinWatcher {
+    fn new(watcher: PinWatcher) -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(watcher)),
+        }
+    }
+}
+
+#[pymethods]
+impl PyAsyncPinWatcher {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut watcher = inner.lock().await;
+            match watcher.next().await {
+                Some(change) => Ok(PyPinChange {
+                    added: change.added.iter().map(|c| c.display()).collect(),
+                    removed: change.removed.iter().map(|c| c.display()).collect(),
+                }),
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
     }
 }

@@ -43,6 +43,7 @@ use parking_lot::Mutex;
 
 use super::catalog::{build_catalog, shared_catalog, CatalogPart, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
+use super::delegation::DelegationGate;
 use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
@@ -164,6 +165,12 @@ pub struct WrapConfig {
     pub client_info: Implementation,
     /// Who may invoke the wrapped tools (owner-only by default).
     pub scope: OwnerScope,
+    /// Optional delegation gate (Phase 3 Slice B). When set, an invoke that
+    /// carries a `net-delegation` chain header is admitted iff the chain + its
+    /// per-invoke leaf signature verify against the gate's owner root — a
+    /// spoof-proof "same-root delegation" path alongside `scope`. `None`
+    /// (default) keeps owner-scope-only behavior.
+    pub delegation: Option<Arc<DelegationGate>>,
     /// Credential-status override (`--credentialed` / `--no-credentials`).
     pub credential_override: CredentialOverride,
     /// Confirms a downward credential override (`--force`).
@@ -179,6 +186,7 @@ impl WrapConfig {
         Self {
             client_info,
             scope: OwnerScope::owner_only(owner_origin),
+            delegation: None,
             credential_override: CredentialOverride::Detect,
             force: false,
             substitutability: Substitutability::ProviderLocal,
@@ -410,7 +418,9 @@ impl ServerPublisher {
                 Arc::clone(&client),
                 lt.mcp_name.clone(),
                 config.scope.clone(),
-            );
+            )
+            .with_service(tool_id.clone())
+            .with_delegation(config.delegation.clone());
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -438,6 +448,7 @@ impl ServerPublisher {
             handles,
             ctx,
             scope: config.scope,
+            delegation: config.delegation,
             tools,
             skipped,
             registration: Registration {
@@ -487,6 +498,10 @@ pub struct PublicationHandle {
     ctx: LoweringContext,
     /// Owner scope reused when serving tools that appear on refresh.
     scope: OwnerScope,
+    /// Delegation gate reused when serving tools that appear on refresh, so a
+    /// promoted/refreshed tool enforces the same delegation policy as the
+    /// initial publish.
+    delegation: Option<Arc<DelegationGate>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// MCP tool names skipped because they have no usable id (an empty name).
@@ -571,7 +586,9 @@ impl PublicationHandle {
                     Arc::clone(&self.client),
                     lt.mcp_name.clone(),
                     self.scope.clone(),
-                );
+                )
+                .with_service(tool_id.clone())
+                .with_delegation(self.delegation.clone());
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);

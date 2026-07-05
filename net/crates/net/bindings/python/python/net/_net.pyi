@@ -959,6 +959,125 @@ def normalize_gpu_vendor(vendor: str) -> str:
     ...
 
 # =============================================================================
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3). Present iff
+# the module was built with the `delegation` feature (default in the wheel).
+# H8: takes/returns opaque `Identity` handles + public entity-ids; private
+# seeds never cross into Python.
+# =============================================================================
+
+GATEWAY_DELEGATION_CHANNEL: str
+"""The well-known channel every gateway delegation binds to (never actually
+published to). The deriver and the verifier both agree on it."""
+
+def derive_child_identity(parent: Identity, label: str) -> Identity:
+    """Derive a stable child ``Identity`` handle from ``parent`` under
+    ``label`` (deterministic blake3 KDF over the parent seed), so a
+    machine / gateway identity is reproducible across restarts from the
+    root alone. The returned handle owns its keypair; the private seed is
+    never exposed. ``label`` namespaces siblings, e.g. ``"machine:hostA"``
+    vs ``"gateway:hostA:hermes"``."""
+    ...
+
+def default_revocation_store_path() -> Optional[str]:
+    """The per-user default revocation-store path — the same file a
+    ``net wrap --owner-root`` provider honors and ``net identity revoke``
+    writes — or ``None`` if neither a data-local nor a home directory resolves.
+    Pass it (or the ``NET_MESH_REVOCATION_STORE`` override) to
+    :meth:`RevocationRegistry.load_from_store`."""
+    ...
+
+class RevocationRegistry:
+    """Shared per-issuer revocation floor. Bumping an issuer's floor
+    invalidates every outstanding delegation from that issuer — including
+    delegated children — the moment :meth:`DelegationChain.verify` next
+    runs. One registry is shared by a gateway and all its subagents."""
+
+    def __init__(self) -> None: ...
+    def revoke_below(self, issuer: bytes, generation: int) -> None:
+        """Set ``issuer``'s floor to ``generation``; tokens with a lower
+        ``issuer_generation`` are rejected next verify. Monotonic."""
+        ...
+    def revoke(self, issuer: bytes) -> None:
+        """Revoke every generation-0 delegation from ``issuer`` (floor ->
+        1). Revoking a *machine* identity kills its gateway chain and that
+        gateway's subagents, while another machine's chain is untouched."""
+        ...
+    def floor(self, issuer: bytes) -> int:
+        """Current revocation floor for ``issuer`` (0 if never revoked)."""
+        ...
+    def load_from_store(self, path: str) -> None:
+        """Reload the machine-shared revocation floors at ``path`` into this
+        registry (monotonic — floors only rise, so re-loading is idempotent). A
+        missing store file is a no-op; an unreadable/corrupt store raises. Lets a
+        caller's self-check observe an operator's ``net identity revoke`` (the
+        same file a ``net wrap --owner-root`` provider honors), so a revoked chain
+        fails :meth:`DelegationChain.verify` on the caller side too. Use
+        :func:`default_revocation_store_path` for ``path``."""
+        ...
+
+class DelegationChain:
+    """A ``root -> ... -> leaf`` delegation chain that attributes a
+    capability invocation to the terminal agent identity. Build with
+    :meth:`derive_gateway`, extend per-task with :meth:`extend_to_subagent`,
+    check with :meth:`verify`."""
+
+    @staticmethod
+    def derive_gateway(
+        root: Identity,
+        machine: Identity,
+        gateway: Identity,
+        ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+    ) -> "DelegationChain":
+        """Build a ``root -> machine -> gateway`` chain. ``root`` and
+        ``machine`` sign their delegations; only ``gateway``'s public
+        entity-id is used. ``ttl_seconds`` is the grant lifetime (the whole
+        chain expires together); ``max_depth`` (default 4) leaves room for
+        subagent hops."""
+        ...
+    def extend_to_subagent(
+        self, leaf_signer: Identity, subagent: bytes
+    ) -> "DelegationChain":
+        """Extend with a ``... -> subagent`` link signed by the current
+        leaf's owner (``leaf_signer``, whose entity-id must equal the
+        chain's current leaf subject). Returns a new chain; the original is
+        unchanged."""
+        ...
+    def verify(
+        self,
+        presenter: bytes,
+        root: bytes,
+        registry: RevocationRegistry,
+        skew_seconds: int = 0,
+    ) -> bool:
+        """``True`` if the chain still authorizes an invocation by
+        ``presenter``, anchored at ``root``, honoring ``registry``. Returns
+        ``False`` (never raises) when expired, revoked, rooted elsewhere, or
+        presented by the wrong identity."""
+        ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "DelegationChain":
+        """Parse a serialized chain. Raises ``TokenError`` on an empty
+        chain, too many links, or trailing garbage."""
+        ...
+    def to_bytes(self) -> bytes:
+        """Serialize to wire bytes (a ``TokenChain`` blob)."""
+        ...
+    def subjects(self) -> List[bytes]:
+        """The subject entity-id of each link, root-to-leaf."""
+        ...
+    @property
+    def leaf(self) -> bytes:
+        """The terminal (leaf) subject entity-id — the agent this chain
+        attributes to."""
+        ...
+    @property
+    def root(self) -> bytes:
+        """The root issuer entity-id the chain anchors at."""
+        ...
+    def __len__(self) -> int: ...
+
+# =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed
 # in detail here. Each class is declared without full method signatures so
 # `from net import X` resolves cleanly under mypy / pyright; method-level
@@ -1858,7 +1977,7 @@ class FoldQueryClient:
 # siblings' shapes.
 # =============================================================================
 
-from typing import AsyncIterator, Awaitable, Callable, Tuple, Union
+from typing import AsyncIterator, Awaitable, Callable, Tuple, Union, overload
 
 # ----- T1: net mesh + streams -----
 
@@ -2438,6 +2557,15 @@ def credential_requires_consent(status: str) -> bool:
     over-gate, never bypass consent."""
     ...
 
+def default_pin_store_path() -> Optional[str]:
+    """The per-user default pin-store path
+    (``<local data>/net-mesh/mcp-pins.json``, falling back to the home
+    directory), or ``None`` if neither resolves. The same file the
+    ``net mcp pin`` CLI and a running ``net mcp serve`` shim use — pass it to
+    :class:`PinStore` / :class:`AsyncPinStore` / ``CapabilityGateway`` to
+    share consent decisions machine-wide without hard-coding the path."""
+    ...
+
 class ConsentPolicy:
     """The consumer-side consent gate: config allowlist + pinned set.
     With no entries EVERY discovered capability requires approval. The
@@ -2495,7 +2623,39 @@ class AsyncPinStore:
     async def approved(self) -> list[str]: ...
     async def pending(self) -> list[str]: ...
     async def list(self) -> list[tuple[str, str]]: ...
+    async def snapshot_and_watch(self) -> tuple[list[str], "AsyncPinWatcher"]:
+        """Snapshot the currently-approved capabilities AND subscribe to
+        changes, atomically. Returns ``(approved, watcher)`` — promote the
+        snapshot, then ``async for change in watcher:`` for subsequent deltas.
+        The subscription is an OS file watcher, so a cross-process
+        ``net mcp pin approve`` (or another SDK client) arrives as an event,
+        not a poll."""
+        ...
+
+    async def watch(self) -> "AsyncPinWatcher":
+        """Subscribe to approved-pin changes, discarding the initial snapshot."""
+        ...
+
     def __repr__(self) -> str: ...
+
+class PinChange:
+    """One approved-pin change, yielded by :class:`AsyncPinWatcher`: the
+    capabilities newly approved and those no longer approved (display ids)
+    since the previous event."""
+
+    @property
+    def added(self) -> list[str]: ...
+    @property
+    def removed(self) -> list[str]: ...
+    def __repr__(self) -> str: ...
+
+class AsyncPinWatcher:
+    """An async iterator over approved-pin changes in the machine-shared store,
+    backed by an OS file watcher (not polling). ``async for change in
+    watcher:`` yields a :class:`PinChange` per approved-set delta."""
+
+    def __aiter__(self) -> "AsyncPinWatcher": ...
+    async def __anext__(self) -> PinChange: ...
 
 def classify_mcp_server(
     program: str,
@@ -2522,3 +2682,139 @@ def lower_mcp_tool(
     shape. Returns JSON: ``{"tool_id", "mcp_name", "descriptor",
     "bridge_metadata"}`` — classification labels only, never a secret."""
     ...
+
+class CapabilityGateway:
+    """The demand side of the bridge, natively — ``search`` / ``describe`` /
+    ``invoke`` over the mesh with the consent gate applied *inside*, no stdio
+    MCP shim in the middle. Built with the ``net`` + ``mcp`` features (the
+    default wheel has both).
+
+    Wraps a joined :class:`NetMesh` node and the machine-shared pin store (the
+    same file ``net mcp pin`` and ``net mcp serve`` use, so an approval made
+    anywhere is honored here). It applies the one Rust consent gate the shim
+    also uses — describe -> validate arguments -> consent/pins -> invoke — so
+    the native path and the MCP-compat path can never diverge.
+
+    Every method returns a JSON **string** with a ``status`` discriminant and
+    never raises for a gate outcome, so an embedding agent relays a pin
+    instruction or lets a model self-repair a bad argument:
+
+    - ``search(query)`` -> ``{"status":"ok","capabilities":[{cap_id, name,
+      description, compat_tier, credential_status, providers,
+      requires_approval}, ...]}``
+    - ``describe(cap_id)`` -> ``{"status":"ok", cap_id, name, description,
+      input_schema, output_schema, compat_tier, credential_status,
+      substitutability, version, requires_approval}``
+    - ``invoke(cap_id, arguments_json)`` -> ``{"status": "ok" |
+      "requires_approval" | "validation_error" | "denied" | "not_found" |
+      "transport_error" | "no_daemon" | "error", ...}``. On ``ok`` inspect
+      ``is_error`` for a tool-level failure; on ``requires_approval`` relay
+      ``approve_command``.
+
+    The methods release the GIL while the mesh call is in flight, so an
+    ``async`` caller can await them off the event loop without blocking it::
+
+        result = await asyncio.to_thread(gateway.invoke, cap_id, args_json)
+    """
+
+    # Both-or-neither is enforced at runtime (passing exactly one delegation
+    # arg raises ValueError), so express the two valid signatures as overloads
+    # — a partial call then fails static analysis instead of only at runtime.
+    @overload
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    @overload
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str],
+        delegation_leaf: "Identity",
+        delegation_chain: bytes,
+    ) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = None,
+        delegation_leaf: Optional["Identity"] = None,
+        delegation_chain: Optional[bytes] = None,
+    ) -> None:
+        """Build a gateway over a started ``mesh``. ``pin_store_path`` should
+        be the machine-shared pin store so approvals are honored both ways;
+        omit it to keep consent in-memory (every gated capability then always
+        requires approval).
+
+        Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
+        ``delegation_chain`` (a serialized ``DelegationChain``) together to have
+        every invoke carry a per-invoke signed delegation (Phase 3); a remote
+        provider running a delegation gate then admits by verified delegation
+        and audits this gateway's leaf. **Both or neither** — passing exactly
+        one raises ``ValueError``."""
+        ...
+
+    @property
+    def pin_store_path(self) -> Optional[str]:
+        """The machine-shared pin store path this gateway consults, if any."""
+        ...
+
+    def search(self, query: str) -> str:
+        """Search the mesh for capabilities matching ``query`` (substring over
+        id / name / description). Returns the JSON described above; an empty
+        index is ``ok`` with an empty list, never an error."""
+        ...
+
+    def describe(self, cap_id: str) -> str:
+        """Full detail for one capability, including its input schema and the
+        caller-side ``requires_approval`` flag. Returns the JSON described
+        above."""
+        ...
+
+    def invoke(self, cap_id: str, arguments_json: str = "{}") -> str:
+        """Invoke a capability through the consent gate. ``arguments_json`` is
+        the tool's own arguments as a JSON object string. Returns the
+        structured JSON described above; never raises for a gate outcome."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class AsyncCapabilityGateway:
+    """Awaitable dual of :class:`CapabilityGateway` — the same ``search`` /
+    ``describe`` / ``invoke`` as coroutines for ``asyncio`` code, resolving to
+    the same structured JSON strings. Each awaits the gateway op on the mesh's
+    own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
+    was built with the ``net`` + ``mcp`` features."""
+
+    @overload
+    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    @overload
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str],
+        delegation_leaf: "Identity",
+        delegation_chain: bytes,
+    ) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = None,
+        delegation_leaf: Optional["Identity"] = None,
+        delegation_chain: Optional[bytes] = None,
+    ) -> None:
+        """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
+        ``delegation_chain`` together (both or neither) to sign + attach a
+        delegation on every invoke (Phase 3)."""
+        ...
+    @property
+    def pin_store_path(self) -> Optional[str]: ...
+    async def search(self, query: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.search`."""
+        ...
+
+    async def describe(self, cap_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.describe`."""
+        ...
+
+    async def invoke(self, cap_id: str, arguments_json: str = "{}") -> str:
+        """Awaitable :meth:`CapabilityGateway.invoke`."""
+        ...
+
+    def __repr__(self) -> str: ...

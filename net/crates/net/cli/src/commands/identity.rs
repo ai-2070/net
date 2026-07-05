@@ -1,8 +1,8 @@
 //! `net identity (generate|show|fingerprint)` — operator-identity
 //! authoring + inspection.
 //!
-//! Identity files are TOML at `$XDG_CONFIG_HOME/net/identities/`
-//! by default. Format:
+//! Identity files are TOML at `$XDG_CONFIG_HOME/net-mesh/identities/`
+//! by default (see [`default_identity_path`]). Format:
 //!
 //! ```toml
 //! operator_id = "0x1234..."
@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
+use net_sdk::identity::EntityId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{generic, invalid_args, sdk, CliError};
@@ -37,6 +38,10 @@ pub enum IdentityCommand {
     /// Print a short SHA-256-derived identifier suitable for
     /// audit dashboards.
     Fingerprint(FingerprintArgs),
+    /// Revoke a delegated identity (Phase 3): raise an issuer's revocation
+    /// floor in the machine-shared store so a running `net wrap --owner-root`
+    /// provider stops admitting its delegations — without a restart.
+    Revoke(RevokeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -78,11 +83,32 @@ pub struct FingerprintArgs {
     pub insecure_permissions: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct RevokeArgs {
+    /// The issuer entity-id to revoke (32-byte ed25519 pubkey, 64 hex chars,
+    /// optional `0x`). To revoke a machine's gateway (and its subagents), pass
+    /// the *machine* identity's entity-id — the issuer of the machine→gateway
+    /// link, so the floor bump kills the whole subtree.
+    pub issuer: String,
+
+    /// Raise the floor to this generation (default 1 — revokes all current
+    /// generation-0 delegations). Monotonic: a value ≤ the current floor is a
+    /// no-op (never un-revokes).
+    #[arg(long, default_value_t = 1)]
+    pub generation: u32,
+
+    /// Revocation-store path (default: the per-user shared file a
+    /// `net wrap --owner-root` provider honors).
+    #[arg(long = "revocation-store", value_name = "PATH")]
+    pub revocation_store: Option<PathBuf>,
+}
+
 pub async fn run(cmd: IdentityCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
     match cmd {
         IdentityCommand::Generate(args) => run_generate(args, output).await,
         IdentityCommand::Show(args) => run_show(args, output).await,
         IdentityCommand::Fingerprint(args) => run_fingerprint(args, output).await,
+        IdentityCommand::Revoke(args) => run_revoke(args, output).await,
     }
 }
 
@@ -226,6 +252,51 @@ async fn run_fingerprint(
 }
 
 // =========================================================================
+// revoke
+// =========================================================================
+
+async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    let issuer = parse_entity_hex(&args.issuer)?;
+    let path = args
+        .revocation_store
+        .or_else(net_sdk::revocation::default_revocation_store_path)
+        .ok_or_else(|| {
+            invalid_args(
+                "no revocation-store path could be resolved; pass --revocation-store <PATH>",
+            )
+        })?;
+    let floor = net_sdk::revocation::RevocationStore::revoke_below(&path, &issuer, args.generation)
+        .map_err(|e| sdk(format!("revoke failed: {e}")))?;
+    let info = RevokeOutput {
+        issuer_hex: hex::encode(issuer.as_bytes()),
+        generation: args.generation,
+        floor,
+        store: path.display().to_string(),
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &info)
+        .map_err(|e| generic(format!("write revoke: {e}")))?;
+    Ok(())
+}
+
+/// Parse an issuer entity-id: 64 hex chars (optional `0x`) → 32-byte
+/// [`EntityId`].
+fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
+    let trimmed = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let bytes =
+        hex::decode(trimmed).map_err(|e| invalid_args(format!("issuer: invalid hex: {e}")))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        invalid_args(format!(
+            "issuer must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(EntityId::from_bytes(arr))
+}
+
+// =========================================================================
 // Disk shape
 // =========================================================================
 
@@ -253,6 +324,18 @@ struct IdentitySummary {
 struct FingerprintOutput {
     operator_id_hex: String,
     fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RevokeOutput {
+    /// The issuer whose delegations were revoked (hex entity-id).
+    issuer_hex: String,
+    /// The generation the revocation raised the floor toward.
+    generation: u32,
+    /// The floor now in effect for this issuer (≥ `generation`).
+    floor: u32,
+    /// The store the revocation was written to.
+    store: String,
 }
 
 async fn read_identity_file(
@@ -457,5 +540,43 @@ mod tests {
     fn iso8601_formats_known_timestamp() {
         // 2025-11-17T12:34:56Z = 1763382896
         assert_eq!(format_iso8601_utc(1763382896), "2025-11-17T12:34:56Z");
+    }
+
+    #[test]
+    fn parse_entity_hex_accepts_64_hex_and_rejects_bad() {
+        let id = net_sdk::Identity::generate();
+        let hexed = hex::encode(id.entity_id().as_bytes());
+        assert_eq!(
+            parse_entity_hex(&hexed).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert_eq!(
+            parse_entity_hex(&format!("0x{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert_eq!(
+            parse_entity_hex(&format!("0X{hexed}")).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
+        assert!(parse_entity_hex("deadbeef").is_err()); // wrong length
+        assert!(parse_entity_hex(&"zz".repeat(32)).is_err()); // non-hex
+    }
+
+    #[test]
+    fn revoke_writes_the_floor_to_the_store() {
+        // `net identity revoke` writes a floor a running provider then honors.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let issuer = net_sdk::Identity::generate();
+        let floor =
+            net_sdk::revocation::RevocationStore::revoke_below(&path, issuer.entity_id(), 1)
+                .unwrap();
+        assert_eq!(floor, 1);
+        assert_eq!(
+            net_sdk::revocation::RevocationStore::load(&path)
+                .unwrap()
+                .floor(issuer.entity_id()),
+            1
+        );
     }
 }

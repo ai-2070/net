@@ -285,4 +285,65 @@ __all__ += [
     "watch_tools",
 ]
 
+# Consent, pins, and the native consent-gated capability gateway — the bridge's
+# demand surface (`HERMES_INTEGRATION_PLAN.md` Phase 1). Re-exported from the
+# `net` wheel via `net_sdk.consent`; `CapabilityGateway` is present iff the
+# wheel was built with the `net` + `mcp` features (the default one is).
+from net_sdk.consent import (  # noqa: E402
+    AsyncPinStore,
+    AsyncPinWatcher,
+    CapabilityId,
+    ConsentPolicy,
+    PinChange,
+    PinsError,
+    PinStore,
+    credential_requires_consent,
+    default_pin_store_path,
+)
+
+__all__ += [
+    "AsyncPinStore",
+    "AsyncPinWatcher",
+    "CapabilityId",
+    "ConsentPolicy",
+    "PinChange",
+    "PinsError",
+    "PinStore",
+    "credential_requires_consent",
+    "default_pin_store_path",
+]
+
+try:
+    from net_sdk.consent import (  # noqa: E402
+        AsyncCapabilityGateway,
+        CapabilityGateway,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += ["AsyncCapabilityGateway", "CapabilityGateway"]
+
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
+# DelegationChain (`root -> machine -> gateway -> subagent`) + shared
+# RevocationRegistry + child-`Identity` derivation. Present iff the wheel was
+# built with the `delegation` feature (the default one is).
+try:
+    from net_sdk.delegation import (  # noqa: E402
+        GATEWAY_DELEGATION_CHANNEL,
+        DelegationChain,
+        RevocationRegistry,
+        default_revocation_store_path,
+        derive_child_identity,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "GATEWAY_DELEGATION_CHANNEL",
+        "DelegationChain",
+        "RevocationRegistry",
+        "default_revocation_store_path",
+        "derive_child_identity",
+    ]
+
 __version__ = "0.31.0"
