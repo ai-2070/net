@@ -15,8 +15,17 @@
 | `net-mesh-sdk` 0.30.0 on PyPI (Python binding over the Rust core) | PyPI | `plugins/net/` depends on it; no FFI work in Hermes. |
 | Schema sanitizer for third-party tool schemas | `tools/schema_sanitizer.py` | Run mesh descriptors through it before registry entry, same as MCP tools. |
 | Hermes's stdio MCP client delegates version acceptance to the installed `mcp` package (optional extra: `uv sync --extra mcp`); `mcp==1.26.0` accepts `2024-11-05 / 2025-03-26 / 2025-06-18 / 2025-11-25` and **raises** on anything else. (`tools/mcp_tool.py`'s own `LATEST_PROTOCOL_VERSION="2025-03-26"` is the HTTP-transport header, not the stdio accept-set.) | `mcp/client/session.py` (venv), `tools/mcp_tool.py` | The shim must echo a mutually-supported version in `initialize` — the L58 version adapter is **required**, not hypothetical. Verified live 2026-07-05: shim answered `2026-07-28` to a `2025-03-26` offer → stock Hermes's `ClientSession.initialize()` raises `Unsupported protocol version`. |
+| Plugin loading has four sources — bundled `plugins/`, user `~/.hermes/plugins/`, project `./.hermes/plugins/`, pip packages in the `hermes_agent.plugins` entry-point group — and later sources override earlier on name collision. `hermes plugins install <owner/repo[/subdir]>` shallow-clones (`--depth 1`, 60 s timeout), extracts the subdir (traversal-guarded), names the install dir from `plugin.yaml`'s `name:` (subdir basename is only the fallback), and surfaces `after-install.md`; `hermes plugins update` refreshes | `hermes_cli/plugins.py`, `hermes_cli/plugins_cmd.py` | **First-class plugin ≠ in-tree plugin.** `plugins/net/` can be developed in the Net monorepo and reach every existing Hermes install with one command — no Hermes fork, no upstream merge on the critical path. |
 
 **Workspace layout (decided 2026-07-05):** `hermes-agent/` is a gitignored sibling clone at the workspace root (same convention as `openclaw/`), never vendored into the monorepo — H6 requires an upstreamable clone of NousResearch/hermes-agent for `plugins/net/` PRs. CI pinning = record the tested Hermes SHA, not vendoring.
+
+**Plugin home & distribution (decided 2026-07-05):** the plugin is developed in the **Net monorepo** at `net/crates/net/adapters/hermes/` (beside `adapters/mcp`) — every plugin-side open risk in this plan is a `net-mesh-sdk` gap, and one repo makes SDK + plugin + tests a same-commit change. Existing Hermes installs get it with one command:
+
+```
+hermes plugins install ai-2070/net/net/crates/net/adapters/hermes
+```
+
+which lands at `~/.hermes/plugins/net/` (dir named from `plugin.yaml`'s `name: net`; the monorepo's full-history pack is ~46 MiB, comfortably inside the installer's 60 s shallow-clone timeout). Later channels, same source of truth: `hermes-plugin-net` on PyPI via the `hermes_agent.plugins` entry-point group, and — once stable — upstreaming to NousResearch as a bundled plugin. Upstreaming is a distribution *promotion*, not a move: user plugins deliberately override bundled ones on name collision, so the `net` identity survives all three channels. This refines H6's "official plugin": it means public plugin API + zero core patches — in-tree residence is not required.
 
 **Naming collision to avoid:** Hermes already has `tool_search`/`tool_describe`/`tool_call`. The Net plugin's mesh-index tools must be unambiguous to the model: `net_search_capabilities` ("searches the Net mesh across your machines — NOT local tools"), `net_describe_capability`, `net_invoke_capability`. Descriptions must state the local/mesh distinction explicitly or models will pick the wrong search.
 
@@ -85,18 +94,21 @@ mcp_servers:
 ## Phase 1 — `plugins/net/`: native client
 
 ```
-plugins/net/
-  plugin.yaml            # kind: standalone, provides_tools: [net_search_capabilities,
+net/crates/net/adapters/hermes/   # source of truth (Net monorepo); installs as ~/.hermes/plugins/net/
+  plugin.yaml            # name: net, kind: standalone, manifest_version: 1,
+                         #   provides_tools: [net_search_capabilities,
                          #   net_describe_capability, net_invoke_capability,
                          #   net_list_pinned_capabilities, net_request_pin]
-  __init__.py
+  __init__.py            # register(ctx) — the plugin loader's entry point
   daemon.py              # net-mesh-sdk client wrapper + liveness probe (feeds check_fn)
   tools.py               # the five ToolEntry definitions, toolset "net"
   pins.py                # pin-change subscription -> dynamic registration (Phase 2)
   folds.py               # stream fold consumers (Phase 6)
+  after-install.md       # shown by `hermes plugins install` — daemon + operator-identity setup
 ```
 
 - [ ] `plugin.yaml` + registration through the standard plugin loader; respects plugin override policy (Net tools never shadow built-ins)
+- [ ] Single-command install proven on a stock Hermes: `hermes plugins install ai-2070/net/net/crates/net/adapters/hermes` → `~/.hermes/plugins/net/`, `register(ctx)` runs, meta-tools appear; `hermes plugins update` picks up a new monorepo commit; `after-install.md` walks the daemon/identity prerequisites
 - [ ] The five tools registered as `ToolEntry`s, toolset `net`, `check_fn` = daemon liveness via SDK ping (TTL cache + grace absorbs mesh flaps — if daemon down past grace, Net tools cleanly vanish from the tools array instead of erroring mid-turn)
 - [ ] `net_invoke_capability` calls daemon `capability.invoke`; `validation_error` returned verbatim to the model (self-repair); `requires_approval` returns the pin instruction string
 - [ ] `net_request_pin` creates a pending request daemon-side and returns a **structured response** the model can relay: `{status: "pending_approval", request_id, approval_channels: ["cli","telegram",...], message: "Approve with: net mcp pin approve <id>"}` — never approves
@@ -230,5 +242,5 @@ Phase 0.5 config-to-first-invoke time; pinned-tool arg accuracy vs local baselin
 | Model confuses `tool_search` (local) with `net_search_capabilities` (mesh) | Explicit disambiguating descriptions; measure misroutes in Phase 1 |
 | Meta-tools always-load costs 5 tool defs in every prompt | Trivial vs the double-indirection failure mode; revisit only if measured context pressure demands it |
 | net-mesh-sdk Python API gaps (pin subscription, delegation context) | SDK gap = blocker filed against Net repo, not worked around with private hooks (H6) |
-| Hermes upstream churn (1.3M LOC, fast-moving) | Everything in `plugins/net/`; only stable surfaces used (registry, plugin API, approval hooks); pin tested Hermes versions in CI |
+| Hermes upstream churn (1.3M LOC, fast-moving) | Everything in `plugins/net/`; only stable surfaces used (registry, plugin API, approval hooks); pin tested Hermes versions in CI. Monorepo dev home + `hermes plugins install`/`update` decouple our release cadence from upstream merges entirely |
 | Pin approval UX drift between Hermes/CLI/shim | Single daemon store + the cross-client propagation test in Phase 2 |
