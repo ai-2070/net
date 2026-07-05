@@ -116,3 +116,12 @@ def test_request_pin_records_pending_and_list_reflects_it(plugin, node_ready):
 def test_request_pin_requires_cap_id(plugin, node_ready):
     tools = plugin.tools
     assert _run(tools.handle_net_request_pin({}))["status"] == "error"
+
+
+def test_bad_identity_seed_is_a_clear_error(plugin, monkeypatch):
+    # A malformed NET_MESH_IDENTITY_SEED fails early (before the mesh is built)
+    # with a message that names the env var — not a bare ValueError. `_build`
+    # doesn't touch the node singleton, so this is safe to call directly.
+    monkeypatch.setenv("NET_MESH_IDENTITY_SEED", "not-valid-hex-zz")
+    with pytest.raises(RuntimeError, match="NET_MESH_IDENTITY_SEED"):
+        plugin.node._build()

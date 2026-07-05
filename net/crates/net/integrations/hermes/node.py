@@ -72,7 +72,18 @@ def _build() -> Tuple[object, object, str, object]:
     from net_sdk import AsyncCapabilityGateway, default_pin_store_path
 
     cfg = _config()
-    seed = bytes.fromhex(cfg["identity_seed"]) if cfg["identity_seed"] else None
+    seed = None
+    if cfg["identity_seed"]:
+        try:
+            seed = bytes.fromhex(cfg["identity_seed"])
+        except ValueError as e:
+            # A malformed seed otherwise raises a bare `ValueError` that surfaces
+            # only as a generic "plugin unavailable" — name the env var + format
+            # so the misconfiguration is obvious (like the NET_MESH_PEERS guard).
+            raise RuntimeError(
+                "net plugin: NET_MESH_IDENTITY_SEED must be a 32-byte identity "
+                f"seed as 64 hex chars; got an unparseable value ({e})"
+            ) from e
 
     # Phase 3 (Slice A): derive the `root -> machine -> gateway` delegation
     # chain from the root seed *before* touching the mesh, so an acquisition
