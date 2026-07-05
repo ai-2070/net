@@ -49,6 +49,13 @@ schemars = { version = "1", optional = true }
 # Gated by the `macros` feature so users who don't want the
 # proc-macro2 / syn / quote dep tree don't pay for it.
 net-mesh-sdk-macros = { version = "0.31.0", path = "../sdk-macros", optional = true }
+# OS file-change events for the pin-store change subscription
+# (`PinStore::watch`) — a true push watcher (inotify / FSEvents /
+# ReadDirectoryChangesW), so a cross-process `net mcp pin approve`
+# surfaces as an event rather than being polled for. Gated by
+# `pin-watch` so consumers that only read/write the store don't pay
+# for the watcher backend.
+notify = { version = "6", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -193,6 +200,11 @@ tool = ["net/tool", "cortex", "dep:schemars"]
 # don't need. Always enabled alongside `tool` — the macro has no
 # runtime meaning without the SDK surface it expands into.
 macros = ["tool", "dep:net-mesh-sdk-macros"]
+# Pin-store change subscription (`PinStore::watch` / `snapshot_and_watch`) —
+# an OS file watcher over the machine-shared store, emitting approved-set
+# deltas. Pure local-state (no mesh); off by default, on for the language
+# bindings' `consent` surface.
+pin-watch = ["dep:notify"]
 # Testing — in-process multi-node `ClusterHarness` + bridge probes
 # (Mesh → MeshOsRuntime). Powers the deck demo and any integration
 # test that wants real UDP loopback + a real MeshOS snapshot fold
