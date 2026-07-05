@@ -118,6 +118,20 @@ def test_request_pin_requires_cap_id(plugin, node_ready):
     assert _run(tools.handle_net_request_pin({}))["status"] == "error"
 
 
+def test_malformed_peer_entries_do_not_crash_startup(plugin, monkeypatch, tmp_path):
+    # Non-dict peer entries must be skipped (logged), not crash the node build:
+    # without the isinstance guard the logging path re-raises on `p.get(...)`.
+    monkeypatch.setenv("NET_MESH_PEERS", '[42, "nope"]')
+    monkeypatch.setenv("NET_MESH_PIN_STORE", str(tmp_path / "pins.json"))
+    monkeypatch.delenv("NET_MESH_PSK", raising=False)
+    monkeypatch.delenv("NET_MESH_IDENTITY_SEED", raising=False)
+    mesh, _gateway, _pin_store, _delegation = plugin.node._build()
+    try:
+        assert mesh is not None  # built despite the malformed peers
+    finally:
+        mesh.shutdown()
+
+
 def test_bad_identity_seed_is_a_clear_error(plugin, monkeypatch):
     # A malformed NET_MESH_IDENTITY_SEED fails early (before the mesh is built)
     # with a message that names the env var — not a bare ValueError. `_build`

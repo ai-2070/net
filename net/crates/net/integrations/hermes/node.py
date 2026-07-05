@@ -115,7 +115,10 @@ def _build() -> Tuple[object, object, str, object]:
             try:
                 mesh.connect(str(p["addr"]), str(p["pubkey"]), int(p["node_id"]))
             except Exception as e:  # noqa: BLE001 — one bad peer must not sink the node
-                logger.warning("net plugin: connect to peer %s failed: %s", p.get("addr"), e)
+                # A non-dict entry (`p["addr"]` above raised) must not raise
+                # again in the logging path — `p.get` only exists on a mapping.
+                addr = p.get("addr") if isinstance(p, dict) else p
+                logger.warning("net plugin: connect to peer %s failed: %s", addr, e)
 
     # Start the receive loop / router so mesh RPC reaches connected peers. Cheap
     # and safe for an isolated node too.
