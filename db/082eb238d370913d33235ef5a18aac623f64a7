@@ -1,0 +1,38 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_1539b6b2705f81::t_508b14c5a5ee55 3128
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_1539b6b2705f81::t_d06c427d9a3d1d 2441-2449
+net/crates/net/sdk-py/src/net_sdk/consent.py
+  s_1539b6b2705f81::t_7b589e35efc1f1 1-51
+net/crates/net/sdk/Cargo.toml
+  s_1539b6b2705f81::t_2035e23e489126 33-35
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_1539b6b2705f81::t_c0e2453c62bd4d 288-318
+net/crates/net/bindings/python/python/net/__init__.py
+  s_1539b6b2705f81::t_1a4a78c23d520d 786,800
+net/crates/net/sdk/src/pins.rs
+  s_1539b6b2705f81::t_bb947817cfee82 38-54
+  s_1539b6b2705f81::t_78ccffe58f4ab1 401-413
+net/crates/net/cli/src/commands/mcp.rs
+  s_1539b6b2705f81::t_cc7eecfd4a6486 200-207
+net/crates/net/bindings/python/src/consent.rs
+  s_1539b6b2705f81::t_c99a8711446bd7 148-161
+net/crates/net/Cargo.lock
+  s_1539b6b2705f81::t_f3b0c2957538e9 2589
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "db082eb238d370913d33235ef5a18aac623f64a7",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
