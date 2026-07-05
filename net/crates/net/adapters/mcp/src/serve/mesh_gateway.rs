@@ -44,7 +44,9 @@ use crate::bridge::{
     BridgedToolInfo, DescribeRequest, DescribeResponse, BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE,
 };
 use crate::spec::CallToolResult;
-use crate::wrap::invoke::{ERR_BAD_REQUEST, ERR_OWNER_SCOPE, ERR_TOOL, ERR_UPSTREAM};
+use crate::wrap::invoke::{
+    ERR_BAD_REQUEST, ERR_DELEGATION, ERR_OWNER_SCOPE, ERR_TOOL, ERR_UPSTREAM,
+};
 use crate::wrap::DelegationSigner;
 
 /// How many times a bounded call is retried before giving up (covers the
@@ -359,29 +361,48 @@ impl MeshGateway {
             // Success: the wrap handler encoded the CallToolResult as the body.
             Ok(bytes) => serde_json::from_slice::<CallToolResult>(&bytes)
                 .map_err(|e| GatewayError::Other(format!("decode tool result: {e}"))),
-            // Owner-scope rejection at the provider — the confused-deputy defense.
-            Err(RpcError::ServerError { status, message }) if status == ERR_OWNER_SCOPE => {
-                Err(GatewayError::Denied(message))
+            // A provider application error — classify it (authorization verdict
+            // vs tool-level vs in-band) in one place so the demand side and the
+            // tests agree on the mapping.
+            Err(RpcError::ServerError { status, message }) => {
+                map_invoke_server_error(status, message)
             }
-            // The tool ran and reported a tool-level error: the wrap handler put
-            // the full CallToolResult JSON in the message. Recover it so the
-            // model sees the structured error rather than a transport failure.
-            Err(RpcError::ServerError { status, message }) if status == ERR_TOOL => {
-                Ok(serde_json::from_str::<CallToolResult>(&message)
-                    .unwrap_or_else(|_| CallToolResult::text_error(message)))
-            }
-            // The bridge couldn't reach the tool, or the request was malformed
-            // (should not happen — we pre-validate). Surface in-band.
-            Err(RpcError::ServerError { status, message })
-                if status == ERR_UPSTREAM || status == ERR_BAD_REQUEST =>
-            {
-                Ok(CallToolResult::text_error(message))
-            }
-            Err(RpcError::ServerError { status, message }) => Ok(CallToolResult::text_error(
-                format!("provider error {status:#06x}: {message}"),
-            )),
             Err(e) => Err(GatewayError::Transport(e.to_string())),
         }
+    }
+}
+
+/// Map a provider application error (nRPC `ServerError`) from an *invoke* to a
+/// gateway result.
+///
+/// **Authorization verdicts become `Denied`.** Both an owner-scope rejection
+/// ([`ERR_OWNER_SCOPE`], the confused-deputy defense) and a delegation-gate
+/// rejection ([`ERR_DELEGATION`] — a bad/replayed/stale signature, or the
+/// operator case of a chain the provider has since revoked) are authorization
+/// answers, not remote tool bugs. Surfacing `ERR_DELEGATION` as `Denied` (rather
+/// than the opaque `is_error` tool result the fall-through would produce) keeps
+/// it consistent with its owner-scope sibling, so the demand side reports
+/// `denied` and a model doesn't mistake a revoked chain for a tool failure and
+/// retry. Failover never applies to either — a peer rooted elsewhere refuses the
+/// same chain.
+///
+/// A tool-level error ([`ERR_TOOL`]) rides back as the structured
+/// `CallToolResult`; an upstream / malformed-request error surfaces in-band; any
+/// other status is a generic in-band error.
+fn map_invoke_server_error(status: u16, message: String) -> Result<CallToolResult, GatewayError> {
+    match status {
+        ERR_OWNER_SCOPE | ERR_DELEGATION => Err(GatewayError::Denied(message)),
+        // The wrap handler put the full CallToolResult JSON in the message;
+        // recover it so the model sees the structured error, falling back to a
+        // plain text error if it won't decode.
+        ERR_TOOL => Ok(serde_json::from_str::<CallToolResult>(&message)
+            .unwrap_or_else(|_| CallToolResult::text_error(message))),
+        // The bridge couldn't reach the tool, or the request was malformed
+        // (should not happen — we pre-validate). Surface in-band.
+        ERR_UPSTREAM | ERR_BAD_REQUEST => Ok(CallToolResult::text_error(message)),
+        _ => Ok(CallToolResult::text_error(format!(
+            "provider error {status:#06x}: {message}"
+        ))),
     }
 }
 
@@ -698,6 +719,53 @@ mod tests {
             ),
             GatewayError::Transport(_)
         ));
+    }
+
+    #[test]
+    fn invoke_maps_authorization_errors_to_denied() {
+        // Both the owner-scope gate and the delegation gate are authorization
+        // verdicts, so both must surface as `Denied` (the demand side reports
+        // `denied`) — NOT as an opaque `is_error` tool result a model could
+        // mistake for a tool failure and retry.
+        assert!(matches!(
+            map_invoke_server_error(ERR_OWNER_SCOPE, "no owner match".into()),
+            Err(GatewayError::Denied(_))
+        ));
+        assert!(
+            matches!(
+                map_invoke_server_error(ERR_DELEGATION, "chain revoked".into()),
+                Err(GatewayError::Denied(m)) if m == "chain revoked"
+            ),
+            "a delegation-gate rejection must be Denied, like its owner-scope sibling",
+        );
+    }
+
+    #[test]
+    fn invoke_maps_tool_and_upstream_errors_in_band() {
+        // A tool-level error rides back as the structured CallToolResult...
+        let structured = CallToolResult::text_error("boom");
+        let encoded = serde_json::to_string(&structured).unwrap();
+        match map_invoke_server_error(ERR_TOOL, encoded) {
+            Ok(r) => {
+                assert!(r.is_error);
+                assert_eq!(r.text(), "boom");
+            }
+            other => panic!("expected an in-band tool result, got {other:?}"),
+        }
+        // ...upstream / bad-request surface in-band as a text error...
+        assert!(matches!(
+            map_invoke_server_error(ERR_UPSTREAM, "unreachable".into()),
+            Ok(r) if r.is_error && r.text() == "unreachable"
+        ));
+        // ...and an unknown application status is a generic in-band error (never
+        // a Denied, so it can't be confused with an authorization verdict).
+        match map_invoke_server_error(0x8099, "weird".into()) {
+            Ok(r) => {
+                assert!(r.is_error);
+                assert!(r.text().contains("0x8099"), "{}", r.text());
+            }
+            other => panic!("expected a generic in-band error, got {other:?}"),
+        }
     }
 
     #[test]
