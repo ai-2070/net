@@ -102,6 +102,8 @@ plugins/net/
 
 **Acceptance:** the compressed milestone — machine B `net wrap`s GitHub; Hermes on machine A (plugin enabled, no MCP path involved) searches, describes, hits `requires_approval`, user approves, invokes. Plugin sees `ToolDescriptor`s only.
 
+> **Phase 1 status (2026-07-05).** The plugin is built and unit-tested in `net/crates/net/integrations/hermes/` (`plugin.yaml`, `__init__.py` `register(ctx)`, `node.py`, `tools.py`, 8 pytest cases). **Done:** the five `net_*` tools register (toolset `net`, `is_async`, shared `check_fn` = local node/SDK health); `net_invoke_capability` returns `validation_error` / `requires_approval` verbatim from the SDK gate; `net_request_pin` returns the structured pending response and shares the store with `net mcp pin` (proven by a plugin→pending→operator-approve→list test); descriptions disambiguate the mesh search from Hermes's local `tool_search`. **Deferred:** meta-tools-always-load (Hermes keys never-defer off a *name* in the core `_HERMES_CORE_TOOLS` list — needs a config mechanism / upstream public hook, not a core patch per H6); running mesh descriptors through `schema_sanitizer` (relevant once pin-promotion in Phase 2 registers descriptor schemas as real tools — the five meta-tool schemas are static and already sanitized by Hermes's normal assembly). **Not yet run here:** the live cross-machine acceptance + loading under the real Hermes loader — both need infra this dev box lacks (a CPython-3.13 `net-mesh` wheel to match Hermes's venv, a two-node mesh with a `net wrap` provider, and a running Hermes).
+
 ---
 
 ## Phase 2 — Pin promotion via dynamic registration
