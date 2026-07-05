@@ -49,6 +49,7 @@ use net_mcp::serve::{
     GatewayError, MeshGateway, PinStore,
 };
 use net_mcp::wrap::DelegationSigner;
+use net_sdk::delegation::DelegationChain;
 use net_sdk::mesh::Mesh as SdkMesh;
 use net_sdk::Identity as SdkIdentity;
 
@@ -62,6 +63,18 @@ fn build_delegation(
 ) -> PyResult<Option<(SdkIdentity, Vec<u8>)>> {
     match (delegation_leaf, delegation_chain) {
         (Some(leaf), Some(chain)) => {
+            // Validate upfront: a malformed chain, or one whose leaf isn't the
+            // supplied `delegation_leaf`, would otherwise be accepted silently
+            // and fail on EVERY invoke with an opaque provider-side denial. Fail
+            // here with a clear error instead.
+            let parsed = DelegationChain::from_bytes(&chain).map_err(|e| {
+                PyValueError::new_err(format!("delegation_chain is not a valid chain: {e:?}"))
+            })?;
+            if &parsed.leaf() != leaf.keypair.entity_id() {
+                return Err(PyValueError::new_err(
+                    "delegation_chain's leaf does not match delegation_leaf's entity id",
+                ));
+            }
             Ok(Some((SdkIdentity::from_seed(*leaf.keypair.secret_bytes()), chain)))
         }
         (None, None) => Ok(None),

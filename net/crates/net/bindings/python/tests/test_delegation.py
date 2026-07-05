@@ -183,3 +183,32 @@ def test_gateway_delegation_params_are_both_or_neither(tmp_path):
             AsyncCapabilityGateway(mesh, delegation_leaf=gateway)  # chain missing
     finally:
         mesh.shutdown()
+
+
+def test_gateway_rejects_a_mismatched_or_malformed_chain(tmp_path):
+    AsyncCapabilityGateway = getattr(net, "AsyncCapabilityGateway", None)
+    if AsyncCapabilityGateway is None:
+        pytest.skip("net+mcp features not built")
+
+    mesh = _mesh()
+    mesh.start()
+    try:
+        root = net.Identity.generate()
+        machine = net.derive_child_identity(root, "machine:h")
+        gateway = net.derive_child_identity(root, "gateway:h:hermes")
+        other = net.Identity.generate()
+        chain = net.DelegationChain.derive_gateway(root, machine, gateway, 3600)
+
+        # Leaf mismatch: the chain's leaf is `gateway`, not `other` — caught at
+        # construction, not as opaque per-invoke denials.
+        with pytest.raises(ValueError):
+            AsyncCapabilityGateway(
+                mesh, delegation_leaf=other, delegation_chain=chain.to_bytes()
+            )
+        # Malformed chain bytes.
+        with pytest.raises(ValueError):
+            AsyncCapabilityGateway(
+                mesh, delegation_leaf=gateway, delegation_chain=b"not-a-valid-chain"
+            )
+    finally:
+        mesh.shutdown()
