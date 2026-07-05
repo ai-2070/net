@@ -251,9 +251,16 @@ def test_async_pin_store_round_trip(tmp_path) -> None:
         store = AsyncPinStore(path)
         assert await store.request("b/echo") == "pending"
         assert not await store.is_approved("b/echo")
+        # Async read surface matches the sync one (parity with PinStore).
+        assert await store.state("b/echo") == "pending"
+        assert await store.pending() == ["b/echo"]
+        assert await store.approved() == []
         assert await store.approve("b/echo")
         assert await store.is_approved("b/echo")
+        assert await store.state("b/echo") == "approved"
+        assert await store.approved() == ["b/echo"]
         assert await store.reject("b/echo")
+        assert await store.state("b/echo") is None
         await store.approve("b/kept")
         return await store.list()
 

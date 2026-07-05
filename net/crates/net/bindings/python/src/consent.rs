@@ -428,6 +428,47 @@ impl PyAsyncPinStore {
         })
     }
 
+    /// Awaitable :meth:`PinStore.state`.
+    fn state<'py>(
+        &self,
+        py: Python<'py>,
+        cap_id: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let id = extract_cap_id(cap_id)?;
+        let path = self.path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<_, PyErr>(
+                CorePinStore::load(path)
+                    .await
+                    .map_err(pins_err)?
+                    .state(&id)
+                    .map(pin_state_str),
+            )
+        })
+    }
+
+    /// Awaitable :meth:`PinStore.approved`.
+    fn approved<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let store = CorePinStore::load(path).await.map_err(pins_err)?;
+            let mut ids: Vec<String> = store.approved().iter().map(|id| id.display()).collect();
+            ids.sort();
+            Ok::<_, PyErr>(ids)
+        })
+    }
+
+    /// Awaitable :meth:`PinStore.pending`.
+    fn pending<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let store = CorePinStore::load(path).await.map_err(pins_err)?;
+            let mut ids: Vec<String> = store.pending().iter().map(|id| id.display()).collect();
+            ids.sort();
+            Ok::<_, PyErr>(ids)
+        })
+    }
+
     /// Awaitable :meth:`PinStore.list`.
     fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let path = self.path.clone();
