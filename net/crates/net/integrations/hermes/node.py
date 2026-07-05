@@ -15,13 +15,21 @@ the plugin with only ``plugins.enabled: [net]`` and a few vars:
                                dev node (tools still load, search is empty).
 * ``NET_MESH_PEERS``         — JSON array of ``{addr, pubkey, node_id}`` peers to
                                connect to (the machines running ``net wrap``).
-* ``NET_MESH_IDENTITY_SEED`` — 32-byte seed as hex for a stable node identity.
+* ``NET_MESH_IDENTITY_SEED`` — 32-byte seed as hex. This is the **user root**
+                               identity; when set, the node derives a
+                               ``root -> machine -> gateway`` delegation chain
+                               from it (Phase 3, see ``delegation.py``). Unset ⇒
+                               an un-delegated dev node.
+* ``NET_MESH_MACHINE_ID``    — stable per-machine label for the delegation
+                               namespace (default: hostname). Set it where the
+                               hostname isn't stable (containers).
 * ``NET_MESH_PIN_STORE``     — pin-store path; defaults to the machine-shared
                                file (``net_sdk.default_pin_store_path()``), the
                                same one ``net mcp pin`` uses.
 
-The consent gate and the pin store live in the Rust SDK (bridge doctrine H2):
-this module only builds the node + gateway and hands them out.
+The consent gate, the pin store, and the delegation chain all live in the Rust
+SDK (bridge doctrine H2): this module only builds the node + gateway + chain
+and hands them out.
 """
 
 from __future__ import annotations
@@ -40,8 +48,10 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PSK = "00" * 32
 
 _lock = threading.Lock()
-# (mesh, gateway, pin_store_path) once built, else None.
-_state: Optional[Tuple[object, object, str]] = None
+# (mesh, gateway, pin_store_path, delegation_or_None) once built, else None.
+# `delegation` is a `delegation.GatewayDelegation` when a root seed is set and
+# the wheel has the `delegation` feature, else None (un-delegated dev node).
+_state: Optional[Tuple[object, object, str, object]] = None
 
 
 def _config() -> dict:
@@ -54,7 +64,7 @@ def _config() -> dict:
     }
 
 
-def _build() -> Tuple[object, object, str]:
+def _build() -> Tuple[object, object, str, object]:
     # Imports are deferred so this module imports even where the native wheel
     # is absent — check_fn() then reports the plugin unavailable rather than the
     # whole plugin failing to load and breaking the loader.
@@ -63,6 +73,25 @@ def _build() -> Tuple[object, object, str]:
 
     cfg = _config()
     seed = bytes.fromhex(cfg["identity_seed"]) if cfg["identity_seed"] else None
+
+    # Phase 3 (Slice A): derive the `root -> machine -> gateway` delegation
+    # chain from the root seed *before* touching the mesh, so an acquisition
+    # failure short-circuits cleanly. A wheel without the `delegation` feature
+    # degrades to an un-delegated node (logged, ImportError); with the feature,
+    # any other derivation failure (e.g. a malformed seed) propagates so
+    # check_fn reports unavailable — never silently degrade to machine identity
+    # (plan Phase 3). No root seed ⇒ un-delegated dev node, tools still load.
+    delegation = None
+    if seed is not None:
+        try:
+            from .delegation import GatewayDelegation
+
+            delegation = GatewayDelegation(seed)
+        except ImportError as e:
+            logger.info(
+                "net plugin: delegation surface unavailable (%s); running un-delegated", e
+            )
+
     mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed)
 
     if cfg["peers"]:
@@ -87,17 +116,24 @@ def _build() -> Tuple[object, object, str]:
             "net plugin: no pin-store path could be resolved; set NET_MESH_PIN_STORE"
         )
     gateway = AsyncCapabilityGateway(mesh, pin_store_path=pin_store)
+    if delegation is not None:
+        logger.info(
+            "net plugin: gateway delegation acquired (machine=%s, gateway=0x%s)",
+            delegation._machine_label,
+            delegation.gateway_id.hex()[:16],
+        )
     logger.info(
-        "net plugin: node up (id=%s, bind=%s, pin_store=%s)",
+        "net plugin: node up (id=%s, bind=%s, pin_store=%s, delegated=%s)",
         getattr(mesh, "node_id", "?"),
         cfg["bind_addr"],
         pin_store,
+        delegation is not None,
     )
-    return (mesh, gateway, pin_store)
+    return (mesh, gateway, pin_store, delegation)
 
 
-def get_state() -> Tuple[object, object, str]:
-    """The shared ``(mesh, gateway, pin_store_path)``, built once."""
+def get_state() -> Tuple[object, object, str, object]:
+    """The shared ``(mesh, gateway, pin_store_path, delegation)``, built once."""
     global _state
     if _state is not None:
         return _state
@@ -115,13 +151,31 @@ def check_net_available() -> bool:
     empty search results or a per-call mesh-unreachable error, not tool
     flicker. Only an SDK-import / node-construction failure past the registry's
     grace window removes the tools from the model-visible set.
+
+    Phase 3: when the node is delegated, the gateway chain must also still
+    verify — a revoked or expired delegation removes the tools rather than
+    letting the model invoke under an invalid chain (plan: delegation
+    acquisition/renewal failure ⇒ Net tools unavailable, never a silent
+    degrade to the machine/root identity).
     """
     try:
-        get_state()
-        return True
+        state = get_state()
     except Exception as e:  # noqa: BLE001 — any failure => unavailable this turn
         logger.debug("net plugin unavailable: %s", e)
         return False
+    delegation = state[3]
+    if delegation is not None:
+        try:
+            if not delegation.verify():
+                logger.info(
+                    "net plugin: gateway delegation invalid (revoked/expired); "
+                    "tools unavailable"
+                )
+                return False
+        except Exception as e:  # noqa: BLE001 — a verify error is unavailable, not a crash
+            logger.debug("net plugin: delegation verify error: %s", e)
+            return False
+    return True
 
 
 def gateway():
@@ -132,6 +186,13 @@ def gateway():
 def pin_store_path() -> str:
     """The machine-shared pin-store path the node consults."""
     return get_state()[2]
+
+
+def delegation():
+    """The session's :class:`delegation.GatewayDelegation`, or ``None`` when the
+    node is running un-delegated (no ``NET_MESH_IDENTITY_SEED``, or a wheel
+    without the ``delegation`` feature)."""
+    return get_state()[3]
 
 
 def shutdown() -> None:

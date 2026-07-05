@@ -22,8 +22,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from . import node, pins
+from . import delegation, node, pins
 from .tools import TOOLS
+
+# `delegation` is imported for package-attribute access (tests, and the
+# node's lazy `from .delegation import GatewayDelegation`); the node owns its
+# lifecycle.
+_ = delegation
 
 logger = logging.getLogger(__name__)
 

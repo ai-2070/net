@@ -70,8 +70,15 @@ here; CI syncs release-tagged builds one-way, re-pinning `net-mesh-sdk` in
   SDK-side canonical name allocation (names are deterministic client-side for
   now) and `dynamic_schema_overrides` wired to the live descriptor (schema is
   captured at promote time).
-- **Delegated identity (Phase 3)**, streaming/folds (Phase 6), etc. — see the
-  plan.
+- **Delegated identity (Phase 3) — Slice A done.** `delegation.py` derives the
+  `root -> machine -> gateway` chain at node init from `NET_MESH_IDENTITY_SEED`
+  (the user root) via the SDK (`net.DelegationChain` / `RevocationRegistry` /
+  `derive_child_identity`), and `check_fn` gates on it — a revoked or expired
+  gateway delegation removes the tools. No root seed ⇒ un-delegated dev node
+  (tools still load). Remaining (Slice B): carry the chain on the invoke so the
+  remote provider audits *which* gateway/subagent called — a cross-cutting
+  wrap-protocol change. See the plan's Phase 3 status.
+- **Streaming/folds (Phase 6)**, etc. — see the plan.
 
 ## Tests
 
