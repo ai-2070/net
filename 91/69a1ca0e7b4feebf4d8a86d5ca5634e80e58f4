@@ -1,0 +1,40 @@
+net/crates/net/bindings/node/Cargo.toml
+  s_cdbc9688784d9a::t_8fbfdbdc783021 45-46
+  s_cdbc9688784d9a::t_ecab2f0e97eff5 157-158
+  s_cdbc9688784d9a::t_7138b5400589b6 138-152
+net/crates/net/bindings/node/test/mcp_helpers.test.ts
+  s_cdbc9688784d9a::t_819efa32077e6f 1-93
+net/crates/net/bindings/node/src/mcp_helpers.rs
+  s_cdbc9688784d9a::t_87bc7cea72306c 143
+  s_cdbc9688784d9a::t_50d08edc8f6ed3 1-17,23-46,51-56,59-142,144-151
+  s_cdbc9688784d9a::t_3471e9db75f612 18-22
+  s_cdbc9688784d9a::t_703ac3b7ba22a6 47-50,57-58
+net/crates/net/bindings/node/src/consent.rs
+  s_cdbc9688784d9a::t_b5145e34db12e9 1-44,46-364
+  s_cdbc9688784d9a::t_c5d23e98c01da5 45
+net/crates/net/bindings/node/test/consent.test.ts
+  s_cdbc9688784d9a::t_d6f5c712559603 1-188
+net/crates/net/bindings/node/src/lib.rs
+  s_cdbc9688784d9a::t_b54de85ef5056f 55-58
+  s_cdbc9688784d9a::t_ab0232079dcc94 24-30
+.github/workflows/ci.yml
+  s_cdbc9688784d9a::t_5360e8f407afda 536
+net/crates/net/Cargo.lock
+  s_cdbc9688784d9a::t_ed974b7c91d3d1 2639
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9169a1ca0e7b4feebf4d8a86d5ca5634e80e58f4",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
