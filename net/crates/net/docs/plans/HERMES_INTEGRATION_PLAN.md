@@ -1,6 +1,6 @@
 # Implementation Plan: Hermes Native Integration (v2 — grounded in hermes-agent code)
 
-**Follow-up to:** `MCP_BRIDGE_PLAN.md`. Bridge plan ships the wedge; this plan makes Hermes (github.com/NousResearch/hermes-agent) the native-citizen showcase.
+**Follow-up to:** `net-mcp-bridge-implementation-plan.md`. Bridge plan ships the wedge; this plan makes Hermes (github.com/NousResearch/hermes-agent) the native-citizen showcase.
 
 **Repo ground truth this plan is built on** (verified against main, July 2026):
 
@@ -102,7 +102,7 @@ Mirror `tools/mcp_tool.py`'s server-tools pattern — it already solves this exa
 - [ ] **Pinned tool names are allocated by the daemon and stable** (persist across sessions, retired on unpin). Hermes never invents names. Daemon handles collisions deterministically (two GitHub accounts, same tool on multiple nodes → preferred alias from pin request, else provider-suffixed). One source of truth for what a tool is called across Hermes, the shim, and OpenClaw
 - [ ] Every pinned `ToolEntry` gets `check_fn` = daemon liveness, same TTL/grace as the meta-tools — daemon gone past grace means pinned tools cleanly vanish, no stale calls into a void
 - [ ] Structured results/logs carry **audit refs**: invocation id, provider node, capability id, delegation chain id — not necessarily user-visible, always log-present
-- [ ] `dynamic_schema_overrides` wired to the live descriptor: if the remote capability's announced type changes, the model sees the new schema at next `get_definitions()` — the "always up-to-date types" claim, demonstrated inside Hermes
+- [ ] `dynamic_schema_overrides` wired to the live descriptor: schema changes flow through live — the "always up-to-date types" claim, demonstrated inside Hermes. (Pin records carry descriptor_hash for deferred cross-ownership hardening; no v1 enforcement)
 - [ ] Pinned tools flow through Hermes's normal pipeline: `handle_function_call`, guardrails, hooks, truncation, and `tool_search` deferral if the pinned set grows large — zero special-casing
 - [ ] **Approval UX:** pin requests surface through Hermes's existing approval flow (interactive CLI prompt; gateway `permissions_list_open`/`permissions_respond` for Telegram/Discord approval). Resolution writes to the **daemon** pin store. Test: approve a pin from Telegram, verify `net mcp pin list` (CLI) and Claude Code (shim) both see it.
 
