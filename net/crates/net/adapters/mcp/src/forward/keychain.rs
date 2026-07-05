@@ -3,23 +3,28 @@
 //!
 //! A [`SecretBackend`](super::SecretBackend) backed by the platform credential
 //! store — macOS Keychain, Windows Credential Manager, or the Linux kernel
-//! `keyutils` — via the `keyring` crate. The OS handles storage and per-user
-//! access control, so nothing is ever written to a plaintext file by Net.
+//! `keyutils` — via `keyring-core` and the platform's native store crate. The
+//! OS handles storage and per-user access control, so nothing is ever written to
+//! a plaintext file by Net.
 //!
-//! The Linux backend is `keyutils` (pure Rust, no `libdbus`) rather than Secret
-//! Service, so the feature builds with no C system library. The trade-off is
-//! persistence: a keyutils keyring lives for the login session, not across
-//! reboots — see the `[dependencies]` note in `Cargo.toml` for how to swap in
-//! Secret Service where reboot-persistence matters.
+//! We link `keyring-core` + each native store crate directly rather than the
+//! `keyring` façade, and set the process default store ourselves
+//! ([`ensure_default_store`]): keyring 4's `v1` compat feature force-selects the
+//! Secret Service (zbus) store on Linux, which needs a running D-Bus session a
+//! headless host lacks. Picking `keyutils` directly keeps the Linux backend pure
+//! Rust, dbus-free, and headless-safe. The trade-off is persistence: a keyutils
+//! keyring lives for the login session, not across reboots — see the
+//! `[dependencies]` note in `Cargo.toml` for how to swap in Secret Service where
+//! reboot-persistence matters.
 //!
 //! Gated behind the non-default **`keychain`** cargo feature: it pulls the
-//! `keyring` dependency and needs a keychain-capable host to run, so the
-//! default build / CI / `cargo install net-mesh-mcp` never compile it.
+//! keyring-core stack and needs a keychain-capable host to run, so the default
+//! build / CI / `cargo install net-mesh-mcp` never compile it.
 //!
 //! Values enter through the operator ([`Self::set`], wired to `net secret set`),
 //! never the model, and every keychain call runs on a blocking thread so a
 //! syscall can't stall the async runtime. A value surfaces only as a
-//! [`ForwardedHeaderValue`]; `keyring` errors describe the *operation*, never
+//! [`ForwardedHeaderValue`]; keyring-core errors describe the *operation*, never
 //! the value, so mapping them to a string can't leak a secret.
 
 use async_trait::async_trait;
@@ -33,7 +38,7 @@ pub const DEFAULT_KEYCHAIN_SERVICE: &str = "net-mesh-forwarding";
 
 /// A [`SecretBackend`] backed by the OS keychain. Cheap to clone/construct — it
 /// holds only the service namespace; every operation opens a fresh
-/// `keyring::Entry`.
+/// `keyring_core::Entry`.
 #[derive(Debug, Clone)]
 pub struct KeychainSecretBackend {
     service: String,
@@ -84,7 +89,7 @@ impl KeychainSecretBackend {
         run_blocking(
             move || match entry(&service, &ref_name)?.delete_credential() {
                 Ok(()) => Ok(true),
-                Err(keyring::Error::NoEntry) => Ok(false),
+                Err(keyring_core::Error::NoEntry) => Ok(false),
                 Err(e) => Err(map_err(e)),
             },
         )
@@ -101,7 +106,7 @@ impl SecretBackend for KeychainSecretBackend {
         let (service, ref_name) = (self.service.clone(), ref_name.to_string());
         let bytes = run_blocking(move || match entry(&service, &ref_name)?.get_secret() {
             Ok(b) => Ok(Some(b)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(map_err(e)),
         })
         .await?;
@@ -114,30 +119,65 @@ impl SecretBackend for KeychainSecretBackend {
     async fn contains(&self, ref_name: &str) -> Result<bool, SecretBackendError> {
         let (service, ref_name) = (self.service.clone(), ref_name.to_string());
         run_blocking(move || match entry(&service, &ref_name)?.get_secret() {
-            // keyring has no existence probe that skips the value, so we read
-            // it — but we only want existence, so scrub the plaintext we had to
-            // materialize before it drops (matching the module's secret-handling
-            // guarantees).
+            // keyring-core has no existence probe that skips the value, so we
+            // read it — but we only want existence, so scrub the plaintext we had
+            // to materialize before it drops (matching the module's
+            // secret-handling guarantees).
             Ok(mut bytes) => {
                 zeroize_vec(&mut bytes);
                 Ok(true)
             }
-            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(e) => Err(map_err(e)),
         })
         .await
     }
 }
 
-/// Open a keychain entry for `(service, ref_name)`.
-fn entry(service: &str, ref_name: &str) -> Result<keyring::Entry, SecretBackendError> {
-    keyring::Entry::new(service, ref_name).map_err(map_err)
+/// Open a keychain entry for `(service, ref_name)`, ensuring the process's
+/// default credential store is our chosen native store first.
+fn entry(service: &str, ref_name: &str) -> Result<keyring_core::Entry, SecretBackendError> {
+    ensure_default_store()?;
+    keyring_core::Entry::new(service, ref_name).map_err(map_err)
 }
 
-/// Map a `keyring` error onto the backend error. The message describes the
+/// Map a `keyring-core` error onto the backend error. The message describes the
 /// operation / platform, never the value.
-fn map_err(e: keyring::Error) -> SecretBackendError {
+fn map_err(e: keyring_core::Error) -> SecretBackendError {
     SecretBackendError::Backend(e.to_string())
+}
+
+/// Install the platform's native credential store as `keyring-core`'s process
+/// default, exactly once. `keyring-core` resolves every [`keyring_core::Entry`]
+/// through a global default store, so we must set it before the first `Entry` —
+/// and we set it *ourselves*, per-OS, rather than via the `keyring` façade,
+/// specifically so Linux uses `keyutils` (headless-safe, no dbus) and never the
+/// Secret Service store keyring's `v1` compat would otherwise force.
+fn ensure_default_store() -> Result<(), SecretBackendError> {
+    use std::sync::OnceLock;
+    // The one-time init result, cached so a store-construction failure surfaces
+    // on every call (not just the first). `String` because `SecretBackendError`
+    // is not `Clone`.
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    match INIT.get_or_init(|| set_platform_store().map_err(|e| e.to_string())) {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(SecretBackendError::Backend(msg.clone())),
+    }
+}
+
+/// Construct the host platform's native store and register it as the default.
+/// Each store crate is target-gated in `Cargo.toml`, so only the matching arm
+/// compiles; an unsupported platform sets no store and every `Entry::new` then
+/// fails with a `keyring-core` "no default store" error (surfaced, not panicked).
+#[allow(clippy::unnecessary_wraps)]
+fn set_platform_store() -> Result<(), keyring_core::Error> {
+    #[cfg(target_os = "linux")]
+    keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
+    #[cfg(target_os = "windows")]
+    keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
+    Ok(())
 }
 
 /// Run a blocking keychain closure on the blocking pool so the syscall can't
