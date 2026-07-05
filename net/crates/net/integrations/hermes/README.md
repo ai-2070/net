@@ -62,10 +62,14 @@ here; CI syncs release-tagged builds one-way, re-pinning `net-mesh-sdk` in
   making them always-load needs a config mechanism or an upstream public hook
   (never a core patch, per H6). Until then they are ordinary deferrable plugin
   tools; five small defs is cheap.
-- **Pin promotion (Phase 2).** Approved pins should register as first-class
-  typed tools, diffed like `tools/mcp_tool.py`. The SDK has no pin-change
-  subscription yet, so this will poll `AsyncPinStore.approved()` on a TTL until
-  a watch API lands.
+- **Pin promotion (Phase 2) — done, subscription-based.** `pins.py` promotes an
+  approved pin to a first-class typed tool and retires it on unpin, diff-based
+  like `tools/mcp_tool.py`, driven by the SDK's pin-change **subscription**
+  (`AsyncPinStore.snapshot_and_watch` — an OS file watcher, not polling), so a
+  cross-process `net mcp pin approve` promotes within ~1s. Remaining refinements:
+  SDK-side canonical name allocation (names are deterministic client-side for
+  now) and `dynamic_schema_overrides` wired to the live descriptor (schema is
+  captured at promote time).
 - **Delegated identity (Phase 3)**, streaming/folds (Phase 6), etc. — see the
   plan.
 
