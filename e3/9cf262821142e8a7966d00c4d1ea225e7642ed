@@ -1,0 +1,37 @@
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_1539b6b2705f81::t_7eecdf90a6e7cd 28,35-38,40
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_1539b6b2705f81::t_3c92bb0dcffa30 1-474
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_1539b6b2705f81::t_0d0052414a7ba5 48-62
+  s_1539b6b2705f81::t_4ec9d9c4a41c19 142-145,150-151,157,161-167
+  s_1539b6b2705f81::t_bfbc5ee434d55b 24
+  s_1539b6b2705f81::t_792634658b3ecd 183-217
+  s_1539b6b2705f81::t_50d26cb188c5ea 168-169
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_1539b6b2705f81::t_9596f36b5745f7 421-422
+  s_1539b6b2705f81::t_0e46b26a7960ce 500-503
+  s_1539b6b2705f81::t_8e1b27ba7397f4 189
+  s_1539b6b2705f81::t_f9a4b2dae8ed84 450
+  s_1539b6b2705f81::t_a54c9bb110866d 588-589
+  s_1539b6b2705f81::t_7a134793fac14a 168-173
+  s_1539b6b2705f81::t_f84adaea16c327 47
+net/crates/net/src/adapter/net/identity/entity.rs
+  s_1539b6b2705f81::t_d4ca64961177e9 80-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e39cf262821142e8a7966d00c4d1ea225e7642ed",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
