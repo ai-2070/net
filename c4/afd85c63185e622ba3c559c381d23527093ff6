@@ -1,0 +1,21 @@
+net/crates/net/integrations/hermes/node.py
+  s_1539b6b2705f81::t_9509d47fbe05ac 118-121
+net/crates/net/integrations/hermes/tests/test_plugin.py
+  s_1539b6b2705f81::t_caf76d5deb7065 121-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c4afd85c63185e622ba3c559c381d23527093ff6",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
