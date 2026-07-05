@@ -78,36 +78,63 @@ impl LockGuard {
     async fn acquire(store_path: &Path) -> Result<Self, PinStoreError> {
         let lock_path = PathBuf::from(format!("{}.lock", store_path.display()));
         let display = lock_path.display().to_string();
-        // `lock_exclusive` blocks until acquired, so take it on a blocking
-        // thread; the returned `File` keeps the lock until it (and thus its fd)
-        // is dropped — safe to hold across the transaction's awaits.
+        // Open (creating) the lock file on a blocking thread — a bounded op
+        // that never waits on the lock itself. A lock file: created if absent,
+        // never written to or truncated — only its advisory lock matters.
+        // `truncate(false)` is explicit so we never clobber a sibling process's
+        // lock file content.
+        let open_path = lock_path.clone();
+        let open_display = display.clone();
         let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-            if let Some(parent) = lock_path.parent() {
+            if let Some(parent) = open_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            // A lock file: created if absent, never written to or truncated —
-            // only its advisory lock matters. `truncate(false)` is explicit so
-            // we never clobber a sibling process's lock file content.
-            let file = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(false)
-                .open(&lock_path)?;
-            file.lock_exclusive()?;
-            Ok(file)
+                .open(&open_path)
         })
         .await
         .map_err(|e| PinStoreError::Io {
-            path: display.clone(),
+            path: open_display.clone(),
             reason: format!("pin-store lock task panicked: {e}"),
         })?
         .map_err(|e| PinStoreError::Io {
-            path: display,
+            path: open_display,
             reason: e.to_string(),
         })?;
-        Ok(Self { _file: file })
+
+        // Acquire the cross-process exclusive lock by polling `try_lock_exclusive`
+        // with async backoff, NOT by blocking a thread on `lock_exclusive`. A
+        // blocking acquire parks a `spawn_blocking` pool thread for the whole
+        // wait; with enough contending mutators that starves the very pool the
+        // lock holder's own `tokio::fs` load/save needs, so the holder can never
+        // run its I/O to release the lock — a deadlock. An async sleep parks no
+        // thread, so waiters never compete with the holder's I/O. The `File`
+        // keeps the lock until it (and thus its fd) is dropped — safe to hold
+        // across the transaction's awaits. The store's advisory lock is still
+        // what serializes writers.
+        let contended = fs2::lock_contended_error().kind();
+        let mut backoff = std::time::Duration::from_millis(1);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e) if e.kind() == contended => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                Err(e) => {
+                    return Err(PinStoreError::Io {
+                        path: display,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -477,5 +504,49 @@ mod tests {
         let store = PinStore::load(&path).await.unwrap();
         assert!(store.is_approved(&cap("b/a")), "first approval survived");
         assert!(store.is_approved(&cap("b/b")), "second approval survived");
+    }
+
+    #[test]
+    fn contended_mutations_make_progress_under_a_tiny_blocking_pool() {
+        // Regression for the lock-acquire pool-exhaustion deadlock. When the
+        // lock was taken via a *blocking* `lock_exclusive` on the shared
+        // blocking pool, contending mutators could occupy every blocking
+        // thread waiting on the lock, starving the current holder's own
+        // load/save I/O (also on the blocking pool) so it could never run and
+        // release — a deadlock. Polling `try_lock_exclusive` with async
+        // backoff parks no thread while waiting, so even a 2-thread blocking
+        // pool drains many concurrent mutations. The timeout turns a
+        // regression (hang) into a failure instead of stalling the suite.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_dir, path) = store_path();
+            let n = 24usize;
+            let tasks: Vec<_> = (0..n)
+                .map(|i| {
+                    let path = path.clone();
+                    tokio::spawn(async move {
+                        PinStore::mutate(path, move |s| s.approve(&cap(&format!("b/cap{i}"))))
+                            .await
+                    })
+                })
+                .collect();
+            let drained = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                for t in tasks {
+                    t.await.unwrap().unwrap();
+                }
+            })
+            .await;
+            assert!(
+                drained.is_ok(),
+                "contended mutations deadlocked under a small blocking pool",
+            );
+            let store = PinStore::load(&path).await.unwrap();
+            assert_eq!(store.approved().len(), n, "every approval survived");
+        });
     }
 }
