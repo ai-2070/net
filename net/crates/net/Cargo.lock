@@ -2491,6 +2491,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-mcp-ffi"
+version = "0.31.0"
+dependencies = [
+ "net-mesh-mcp",
+ "net-mesh-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "net-mesh"
 version = "0.31.0"
 dependencies = [
