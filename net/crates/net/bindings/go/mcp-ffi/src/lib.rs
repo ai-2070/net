@@ -136,14 +136,18 @@ macro_rules! ffi_guard {
 
 /// Borrow a required C string as `&str`. On null / bad-UTF-8 it records the
 /// last-error and returns `None`.
-fn cstr<'a>(ptr: *const c_char, arg: &str) -> Option<&'a str> {
+///
+/// # Safety
+/// A non-null `ptr` must be a NUL-terminated C string valid for at least as
+/// long as the returned borrow is used. `unsafe fn` because the returned
+/// `&'a str` lifetime is caller-chosen and unconnected to the raw pointer — the
+/// caller must not hold it past the pointer's validity.
+unsafe fn cstr<'a>(ptr: *const c_char, arg: &str) -> Option<&'a str> {
     if ptr.is_null() {
         set_last_error(format!("{arg} must not be null"), "invalid_arg");
         return None;
     }
-    // SAFETY: `ptr` is non-null; the caller contract is a NUL-terminated
-    // C string valid for the duration of the call.
-    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+    match CStr::from_ptr(ptr).to_str() {
         Ok(s) => Some(s),
         Err(_) => {
             set_last_error(format!("{arg} is not valid UTF-8"), "invalid_arg");
@@ -157,12 +161,14 @@ fn cstr<'a>(ptr: *const c_char, arg: &str) -> Option<&'a str> {
 /// last-error and returns `Err(())` so the caller fails instead of silently
 /// coercing a malformed argument to the default (matching `cstr`, which
 /// already errors on bad UTF-8).
-fn opt_cstr<'a>(ptr: *const c_char, arg: &str) -> Result<Option<&'a str>, ()> {
+///
+/// # Safety
+/// As [`cstr`].
+unsafe fn opt_cstr<'a>(ptr: *const c_char, arg: &str) -> Result<Option<&'a str>, ()> {
     if ptr.is_null() {
         return Ok(None);
     }
-    // SAFETY: as `cstr`, but null was already handled.
-    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+    match CStr::from_ptr(ptr).to_str() {
         Ok(s) => Ok(Some(s)),
         Err(_) => {
             set_last_error(format!("{arg} is not valid UTF-8"), "invalid_arg");
