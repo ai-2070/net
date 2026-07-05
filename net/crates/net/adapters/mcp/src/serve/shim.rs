@@ -24,11 +24,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
+use super::backend::{CapabilityGateway, CapabilityId, GatewayError};
 use super::consent::ConsentPolicy;
+use super::gated::{gated_invoke, GatedOutcome};
 use super::pins::PinStore;
 use super::{
-    meta_tools, requires_approval_message, validation, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES,
+    meta_tools, requires_approval_message, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES,
 };
 use crate::spec::{
     method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
@@ -433,63 +434,26 @@ impl<G: CapabilityGateway> Shim<G> {
     /// → pre-flight validate → consent gate → route to the provider. Shared by
     /// the `net_invoke_capability` meta-tool and the first-class pinned-tool
     /// dispatch.
+    ///
+    /// The gate itself lives in [`gated_invoke`] (one implementation, shared
+    /// with the native SDK gateway); this method only reloads the pin store per
+    /// call — so an out-of-band `net mcp pin approve` takes effect immediately —
+    /// and flattens the structured [`GatedOutcome`] to the shim's product
+    /// failure strings.
     async fn invoke_capability(&self, id: &CapabilityId, tool_args: Value) -> CallToolResult {
-        // A no-argument invocation can arrive as JSON `null`: the host omitted
-        // `arguments` on a promoted pinned tool (which deserializes to
-        // `Value::Null`), or passed `"arguments": null` explicitly. MCP tool
-        // arguments are an object, so normalize `null` to `{}` here — the one
-        // place both the `net_invoke_capability` meta-tool and the first-class
-        // pinned-tool dispatch route through — rather than only in the meta-tool
-        // path. Otherwise a no-arg pinned tool fails pre-flight validation while
-        // the same capability invoked via `net_invoke_capability` succeeds.
-        let tool_args = if tool_args.is_null() {
-            json!({})
-        } else {
-            tool_args
-        };
-
-        // Describe first — the single source of truth for the schema (for
-        // pre-flight validation) and the credential status (for consent).
-        let detail = match self.gateway.describe(id).await {
-            Ok(d) => d,
-            Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
-        };
-
-        // [1] Pre-flight validation — never round-trip a bad arg to the
-        //     provider. Field-naming so the model can self-repair.
-        if let Err(v) = validation::validate_args(&tool_args, &detail.input_schema) {
-            return CallToolResult::text_error(format!(
-                "argument validation failed: {v}. See net_describe_capability for the schema.",
-            ));
-        }
-
-        // [2] Consent gate — credentialed / external / unknown need local
-        //     approval (an allowlist entry or an approved pin). Display never
-        //     implied invocation. The pin store is reloaded here so an
-        //     out-of-band `net mcp pin approve` takes effect immediately.
         let pins = self.load_pins().await;
-        if self.gated_after_pins(id, &detail.credential_status, &pins) {
-            return CallToolResult::text_error(requires_approval_message(&id.display()));
-        }
-
-        // [3] Route to the provider. A remote owner-scope rejection surfaces
-        //     as the wrapper-denied message; a tool-level error rides back
-        //     in the CallToolResult unchanged.
-        //
-        //     The retry policy is derived from the provider's declared status:
-        //     only an uncredentialed tool is duplicate-safe (may retry a
-        //     timeout); a credentialed one is at-most-once so a lost reply never
-        //     duplicates a real side effect. This is a resilience hint, NOT the
-        //     security gate above (which never trusts a wire status): a provider
-        //     mislabelling its own stateful tool only risks duplicating a call
-        //     to itself.
-        let safety = InvokeSafety::from_credential_status(&detail.credential_status);
-        match self.gateway.invoke(id, tool_args, safety).await {
-            Ok(result) => result,
-            Err(GatewayError::Denied(reason)) => {
+        match gated_invoke(&self.gateway, &self.consent, pins.as_ref(), id, tool_args).await {
+            GatedOutcome::Invoked(result) => result,
+            GatedOutcome::ValidationFailed(reason) => CallToolResult::text_error(format!(
+                "argument validation failed: {reason}. See net_describe_capability for the schema.",
+            )),
+            GatedOutcome::RequiresApproval => {
+                CallToolResult::text_error(requires_approval_message(&id.display()))
+            }
+            GatedOutcome::Failed(GatewayError::Denied(reason)) => {
                 CallToolResult::text_error(denied_message(&reason))
             }
-            Err(e) => CallToolResult::text_error(gateway_error_text(&e)),
+            GatedOutcome::Failed(e) => CallToolResult::text_error(gateway_error_text(&e)),
         }
     }
 
@@ -723,7 +687,7 @@ fn denied_message(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::backend::{CapabilityDetail, CapabilitySummary};
+    use crate::serve::backend::{CapabilityDetail, CapabilitySummary, InvokeSafety};
     use crate::serve::consent::ConsentPolicy;
     use crate::serve::pins::PinStore;
     use async_trait::async_trait;
