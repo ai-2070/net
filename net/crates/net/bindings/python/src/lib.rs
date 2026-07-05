@@ -34,6 +34,12 @@ mod groups;
 mod identity;
 #[cfg(feature = "mcp")]
 mod mcp_helpers;
+// Native consent-gated capability gateway (search / describe / invoke over an
+// embedded NetMesh node) — the `HERMES_INTEGRATION_PLAN.md` Phase 1 enabler.
+// Needs both a live node (`net`) and the bridge's gateway + shared gate
+// (`mcp`), so it is gated on both.
+#[cfg(all(feature = "net", feature = "mcp"))]
+mod capability_gateway;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3125,6 +3131,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_function(wrap_pyfunction!(mcp_helpers::classify_mcp_server, m)?)?;
         m.add_function(wrap_pyfunction!(mcp_helpers::lower_mcp_tool, m)?)?;
+    }
+    #[cfg(all(feature = "net", feature = "mcp"))]
+    {
+        m.add_class::<capability_gateway::PyCapabilityGateway>()?;
     }
     #[cfg(feature = "net")]
     {
