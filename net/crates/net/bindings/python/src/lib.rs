@@ -40,6 +40,12 @@ mod mcp_helpers;
 // (`mcp`), so it is gated on both.
 #[cfg(all(feature = "net", feature = "mcp"))]
 mod capability_gateway;
+// Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
+// DelegationChain (root → machine → gateway → subagent) + shared
+// RevocationRegistry + child-`Identity` derivation. Thin wrappers over
+// `net_sdk::delegation`; needs the SDK's `net` feature.
+#[cfg(feature = "delegation")]
+mod delegation;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3154,6 +3160,16 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m.py().get_type::<identity::IdentityError>(),
         )?;
         m.add("TokenError", m.py().get_type::<identity::TokenError>())?;
+    }
+    #[cfg(feature = "delegation")]
+    {
+        m.add_class::<delegation::PyDelegationChain>()?;
+        m.add_class::<delegation::PyRevocationRegistry>()?;
+        m.add_function(wrap_pyfunction!(delegation::derive_child_identity, m)?)?;
+        m.add(
+            "GATEWAY_DELEGATION_CHANNEL",
+            delegation::GATEWAY_DELEGATION_CHANNEL,
+        )?;
     }
     #[cfg(feature = "cortex")]
     {

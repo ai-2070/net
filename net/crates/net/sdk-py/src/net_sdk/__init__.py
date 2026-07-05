@@ -323,4 +323,25 @@ except ImportError:  # pragma: no cover - minimal build
 else:
     __all__ += ["AsyncCapabilityGateway", "CapabilityGateway"]
 
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
+# DelegationChain (`root -> machine -> gateway -> subagent`) + shared
+# RevocationRegistry + child-`Identity` derivation. Present iff the wheel was
+# built with the `delegation` feature (the default one is).
+try:
+    from net_sdk.delegation import (  # noqa: E402
+        GATEWAY_DELEGATION_CHANNEL,
+        DelegationChain,
+        RevocationRegistry,
+        derive_child_identity,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "GATEWAY_DELEGATION_CHANNEL",
+        "DelegationChain",
+        "RevocationRegistry",
+        "derive_child_identity",
+    ]
+
 __version__ = "0.31.0"

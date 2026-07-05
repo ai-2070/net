@@ -44,6 +44,7 @@ default = [
     "tool",
     "consent",
     "mcp",
+    "delegation",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -131,6 +132,14 @@ consent = ["dep:net-sdk", "net-sdk/pin-watch"]
 # only — publishing itself goes through the general SDK path; the
 # forwarding/keychain internals are never bound (bridge doctrine #3).
 mcp = ["consent", "dep:net-mcp"]
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3):
+# DelegationChain (root → machine → gateway → subagent), a shared
+# RevocationRegistry, and stable child-`Identity` derivation — thin
+# wrappers over `net_sdk::delegation`. Needs the SDK's `net` feature (the
+# identity + token-chain surface `delegation` composes), which `consent`
+# alone does not activate. H8-clean: takes/returns opaque `Identity`
+# handles + public entity-ids; private seeds never cross into Python.
+delegation = ["net", "dep:net-sdk", "net-sdk/net"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

@@ -829,5 +829,32 @@ except ImportError:
 else:
     __all__.extend(["AsyncCapabilityGateway", "CapabilityGateway"])
 
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): a
+# DelegationChain (`root -> machine -> gateway -> subagent`) for
+# capability-invocation attribution, a shared RevocationRegistry, and
+# stable child-`Identity` derivation. Present iff the module was built with
+# the `delegation` feature (default in the maturin-shipped wheel). H8-clean:
+# takes/returns opaque `Identity` handles and public entity-ids; private
+# seeds never cross into Python.
+try:
+    from ._net import (
+        GATEWAY_DELEGATION_CHANNEL,
+        DelegationChain,
+        RevocationRegistry,
+        derive_child_identity,
+    )
+except ImportError:
+    # `delegation` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "GATEWAY_DELEGATION_CHANNEL",
+            "DelegationChain",
+            "RevocationRegistry",
+            "derive_child_identity",
+        ]
+    )
+
 
 __version__ = "0.31.0"

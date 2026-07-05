@@ -959,6 +959,108 @@ def normalize_gpu_vendor(vendor: str) -> str:
     ...
 
 # =============================================================================
+# Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3). Present iff
+# the module was built with the `delegation` feature (default in the wheel).
+# H8: takes/returns opaque `Identity` handles + public entity-ids; private
+# seeds never cross into Python.
+# =============================================================================
+
+GATEWAY_DELEGATION_CHANNEL: str
+"""The well-known channel every gateway delegation binds to (never actually
+published to). The deriver and the verifier both agree on it."""
+
+def derive_child_identity(parent: Identity, label: str) -> Identity:
+    """Derive a stable child ``Identity`` handle from ``parent`` under
+    ``label`` (deterministic blake3 KDF over the parent seed), so a
+    machine / gateway identity is reproducible across restarts from the
+    root alone. The returned handle owns its keypair; the private seed is
+    never exposed. ``label`` namespaces siblings, e.g. ``"machine:hostA"``
+    vs ``"gateway:hostA:hermes"``."""
+    ...
+
+class RevocationRegistry:
+    """Shared per-issuer revocation floor. Bumping an issuer's floor
+    invalidates every outstanding delegation from that issuer — including
+    delegated children — the moment :meth:`DelegationChain.verify` next
+    runs. One registry is shared by a gateway and all its subagents."""
+
+    def __init__(self) -> None: ...
+    def revoke_below(self, issuer: bytes, generation: int) -> None:
+        """Set ``issuer``'s floor to ``generation``; tokens with a lower
+        ``issuer_generation`` are rejected next verify. Monotonic."""
+        ...
+    def revoke(self, issuer: bytes) -> None:
+        """Revoke every generation-0 delegation from ``issuer`` (floor ->
+        1). Revoking a *machine* identity kills its gateway chain and that
+        gateway's subagents, while another machine's chain is untouched."""
+        ...
+    def floor(self, issuer: bytes) -> int:
+        """Current revocation floor for ``issuer`` (0 if never revoked)."""
+        ...
+
+class DelegationChain:
+    """A ``root -> ... -> leaf`` delegation chain that attributes a
+    capability invocation to the terminal agent identity. Build with
+    :meth:`derive_gateway`, extend per-task with :meth:`extend_to_subagent`,
+    check with :meth:`verify`."""
+
+    @staticmethod
+    def derive_gateway(
+        root: Identity,
+        machine: Identity,
+        gateway: Identity,
+        ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+    ) -> "DelegationChain":
+        """Build a ``root -> machine -> gateway`` chain. ``root`` and
+        ``machine`` sign their delegations; only ``gateway``'s public
+        entity-id is used. ``ttl_seconds`` is the grant lifetime (the whole
+        chain expires together); ``max_depth`` (default 4) leaves room for
+        subagent hops."""
+        ...
+    def extend_to_subagent(
+        self, leaf_signer: Identity, subagent: bytes
+    ) -> "DelegationChain":
+        """Extend with a ``... -> subagent`` link signed by the current
+        leaf's owner (``leaf_signer``, whose entity-id must equal the
+        chain's current leaf subject). Returns a new chain; the original is
+        unchanged."""
+        ...
+    def verify(
+        self,
+        presenter: bytes,
+        root: bytes,
+        registry: RevocationRegistry,
+        skew_seconds: int = 0,
+    ) -> bool:
+        """``True`` if the chain still authorizes an invocation by
+        ``presenter``, anchored at ``root``, honoring ``registry``. Returns
+        ``False`` (never raises) when expired, revoked, rooted elsewhere, or
+        presented by the wrong identity."""
+        ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "DelegationChain":
+        """Parse a serialized chain. Raises ``TokenError`` on an empty
+        chain, too many links, or trailing garbage."""
+        ...
+    def to_bytes(self) -> bytes:
+        """Serialize to wire bytes (a ``TokenChain`` blob)."""
+        ...
+    def subjects(self) -> List[bytes]:
+        """The subject entity-id of each link, root-to-leaf."""
+        ...
+    @property
+    def leaf(self) -> bytes:
+        """The terminal (leaf) subject entity-id — the agent this chain
+        attributes to."""
+        ...
+    @property
+    def root(self) -> bytes:
+        """The root issuer entity-id the chain anchors at."""
+        ...
+    def __len__(self) -> int: ...
+
+# =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed
 # in detail here. Each class is declared without full method signatures so
 # `from net import X` resolves cleanly under mypy / pyright; method-level
