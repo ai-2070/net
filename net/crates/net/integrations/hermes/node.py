@@ -121,32 +121,43 @@ def _build() -> Tuple[object, object, str, object]:
                 logger.warning("net plugin: connect to peer %s failed: %s", addr, e)
 
     # Start the receive loop / router so mesh RPC reaches connected peers. Cheap
-    # and safe for an isolated node too.
+    # and safe for an isolated node too. From here on, roll the started mesh back
+    # on any failure so an init error leaves no live loop / socket behind — init
+    # stays cleanly retryable rather than leaking background state.
     mesh.start()
-
-    pin_store = cfg["pin_store"] or default_pin_store_path()
-    if not pin_store:
-        raise RuntimeError(
-            "net plugin: no pin-store path could be resolved; set NET_MESH_PIN_STORE"
-        )
-    # Phase 3 Slice B2: when delegated, the gateway signs + attaches the
-    # delegation chain on every invoke (from the gateway leaf key held in the
-    # chain), so a remote provider running a DelegationGate admits by verified
-    # delegation and audits this gateway. Un-delegated ⇒ plain gateway.
-    if delegation is not None:
-        gateway = AsyncCapabilityGateway(
-            mesh,
-            pin_store_path=pin_store,
-            delegation_leaf=delegation.gateway_identity,
-            delegation_chain=delegation.chain_bytes(),
-        )
-        logger.info(
-            "net plugin: gateway delegation acquired (machine=%s, gateway=0x%s)",
-            delegation._machine_label,
-            delegation.gateway_id.hex()[:16],
-        )
-    else:
-        gateway = AsyncCapabilityGateway(mesh, pin_store_path=pin_store)
+    try:
+        pin_store = cfg["pin_store"] or default_pin_store_path()
+        if not pin_store:
+            raise RuntimeError(
+                "net plugin: no pin-store path could be resolved; set NET_MESH_PIN_STORE"
+            )
+        # Phase 3 Slice B2: when delegated, the gateway signs + attaches the
+        # delegation chain on every invoke (from the gateway leaf key held in the
+        # chain), so a remote provider running a DelegationGate admits by verified
+        # delegation and audits this gateway. Un-delegated ⇒ plain gateway.
+        if delegation is not None:
+            gateway = AsyncCapabilityGateway(
+                mesh,
+                pin_store_path=pin_store,
+                delegation_leaf=delegation.gateway_identity,
+                delegation_chain=delegation.chain_bytes(),
+            )
+            logger.info(
+                "net plugin: gateway delegation acquired (machine=%s, gateway=0x%s)",
+                delegation._machine_label,
+                delegation.gateway_id.hex()[:16],
+            )
+        else:
+            gateway = AsyncCapabilityGateway(mesh, pin_store_path=pin_store)
+    except BaseException:
+        # Best-effort rollback; never mask the original error with a cleanup one.
+        try:
+            mesh.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "net plugin: mesh shutdown during init rollback failed", exc_info=True
+            )
+        raise
     logger.info(
         "net plugin: node up (id=%s, bind=%s, pin_store=%s, delegated=%s)",
         getattr(mesh, "node_id", "?"),

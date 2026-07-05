@@ -132,6 +132,47 @@ def test_malformed_peer_entries_do_not_crash_startup(plugin, monkeypatch, tmp_pa
         mesh.shutdown()
 
 
+def test_init_failure_after_start_rolls_back_the_mesh(plugin, monkeypatch):
+    # If setup fails AFTER mesh.start(), the started mesh must be shut down so
+    # init leaves no live loop / socket behind. Drive a post-start failure (no
+    # resolvable pin store) against a fake mesh and assert shutdown ran.
+    import net
+
+    class _FakeMesh:
+        def __init__(self, *a, **kw):
+            self.started = False
+            self.shut = 0
+
+        def start(self):
+            self.started = True
+
+        def connect(self, *a, **kw):
+            pass
+
+        def shutdown(self):
+            self.shut += 1
+
+    made = []
+
+    def factory(*a, **kw):
+        m = _FakeMesh()
+        made.append(m)
+        return m
+
+    monkeypatch.setattr(net, "NetMesh", factory)
+    monkeypatch.setattr("net_sdk.default_pin_store_path", lambda: None)
+    monkeypatch.delenv("NET_MESH_PIN_STORE", raising=False)
+    monkeypatch.delenv("NET_MESH_PSK", raising=False)
+    monkeypatch.delenv("NET_MESH_IDENTITY_SEED", raising=False)
+
+    with pytest.raises(RuntimeError, match="pin-store"):
+        plugin.node._build()
+
+    assert made, "the fake mesh should have been constructed"
+    assert made[0].started, "the mesh was started before the failure"
+    assert made[0].shut == 1, "the started mesh must be shut down on init failure"
+
+
 def test_bad_identity_seed_is_a_clear_error(plugin, monkeypatch):
     # A malformed NET_MESH_IDENTITY_SEED fails early (before the mesh is built)
     # with a message that names the env var — not a bare ValueError. `_build`
