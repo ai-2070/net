@@ -778,7 +778,7 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against SIX cdylibs via cgo:
+      # The Go bindings link against SEVEN cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
@@ -793,7 +793,9 @@ jobs:
       #     mesh_rpc.go / mesh_rpc_typed.go / tool.go. Added in the
       #     NET_GO_NRPC_PORT slices (G-1..G-5) — without it the
       #     typed/streaming/tool tests fail at link.
-      # All six end up in `net/crates/net/target/release/`.
+      #   - `-lnet_mcp` (libnet_mcp_ffi.so, the `net-mcp-ffi`
+      #     workspace member at bindings/go/mcp-ffi) from mcp.go
+      # All seven end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -805,7 +807,8 @@ jobs:
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
       #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
-      #     `net-rpc-ffi` have no extra features beyond their defaults.
+      #     `net-rpc-ffi`, `net-mcp-ffi` have no extra features beyond
+      #     their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
