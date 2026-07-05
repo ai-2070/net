@@ -152,13 +152,23 @@ fn cstr<'a>(ptr: *const c_char, arg: &str) -> Option<&'a str> {
     }
 }
 
-/// Borrow an optional C string (null → `None`, no error).
-fn opt_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
+/// Borrow an optional C string: null → `Ok(None)` (the absent/default case, no
+/// error). A non-null pointer must be valid UTF-8; bad UTF-8 records the
+/// last-error and returns `Err(())` so the caller fails instead of silently
+/// coercing a malformed argument to the default (matching `cstr`, which
+/// already errors on bad UTF-8).
+fn opt_cstr<'a>(ptr: *const c_char, arg: &str) -> Result<Option<&'a str>, ()> {
     if ptr.is_null() {
-        return None;
+        return Ok(None);
     }
     // SAFETY: as `cstr`, but null was already handled.
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+        Ok(s) => Ok(Some(s)),
+        Err(_) => {
+            set_last_error(format!("{arg} is not valid UTF-8"), "invalid_arg");
+            Err(())
+        }
+    }
 }
 
 /// Turn an owned `String` into a heap C string for return; NULL if it
@@ -255,18 +265,20 @@ pub unsafe extern "C" fn net_mcp_classify(
         let Some(program) = cstr(program, "program") else {
             return ptr::null_mut();
         };
-        let args: Vec<String> = match opt_cstr(args_json) {
-            Some(s) if !s.trim().is_empty() => match serde_json::from_str(s) {
+        let args: Vec<String> = match opt_cstr(args_json, "args_json") {
+            Err(()) => return ptr::null_mut(),
+            Ok(Some(s)) if !s.trim().is_empty() => match serde_json::from_str(s) {
                 Ok(v) => v,
                 Err(e) => {
                     set_last_error(format!("args_json: {e}"), "invalid_arg");
                     return ptr::null_mut();
                 }
             },
-            _ => Vec::new(),
+            Ok(_) => Vec::new(),
         };
-        let envs: Vec<(String, String)> = match opt_cstr(envs_json) {
-            Some(s) if !s.trim().is_empty() => {
+        let envs: Vec<(String, String)> = match opt_cstr(envs_json, "envs_json") {
+            Err(()) => return ptr::null_mut(),
+            Ok(Some(s)) if !s.trim().is_empty() => {
                 match serde_json::from_str::<std::collections::BTreeMap<String, String>>(s) {
                     Ok(m) => m.into_iter().collect(),
                     Err(e) => {
@@ -275,11 +287,12 @@ pub unsafe extern "C" fn net_mcp_classify(
                     }
                 }
             }
-            _ => Vec::new(),
+            Ok(_) => Vec::new(),
         };
-        let over = match opt_cstr(credential_override) {
-            None => CredentialOverride::Detect,
-            Some(label) => match CredentialOverride::from_wire(label) {
+        let over = match opt_cstr(credential_override, "credential_override") {
+            Err(()) => return ptr::null_mut(),
+            Ok(None) => CredentialOverride::Detect,
+            Ok(Some(label)) => match CredentialOverride::from_wire(label) {
                 Some(o) => o,
                 None => {
                     set_last_error(
@@ -366,9 +379,10 @@ pub unsafe extern "C" fn net_mcp_lower_tool(
             );
             return ptr::null_mut();
         };
-        let substitutability = match opt_cstr(substitutability) {
-            None => Substitutability::ProviderLocal,
-            Some(label) => match Substitutability::from_label(label) {
+        let substitutability = match opt_cstr(substitutability, "substitutability") {
+            Err(()) => return ptr::null_mut(),
+            Ok(None) => Substitutability::ProviderLocal,
+            Ok(Some(label)) => match Substitutability::from_label(label) {
                 Some(s) => s,
                 None => {
                     set_last_error(
@@ -428,7 +442,12 @@ pub unsafe extern "C" fn net_mcp_lower_tool(
 pub unsafe extern "C" fn net_mcp_credential_requires_consent(status: *const c_char) -> c_int {
     clear_last_error();
     ffi_guard!(1, {
-        let status = opt_cstr(status).unwrap_or("");
+        // A non-UTF-8 status can't be trusted — gate it (return 1) rather than
+        // coerce to "" and risk under-gating; opt_cstr records the detail.
+        let status = match opt_cstr(status, "status") {
+            Ok(s) => s.unwrap_or(""),
+            Err(()) => return 1,
+        };
         c_int::from(SdkCredentialStatus::from_wire(status).requires_consent())
     })
 }
