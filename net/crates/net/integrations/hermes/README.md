@@ -78,3 +78,10 @@ isolated node. Run from `net/crates/net/bindings/python` with the built wheel:
 ```sh
 .venv/Scripts/python -m pytest ../../integrations/hermes/tests -q
 ```
+
+`tests/real_hermes_loader_check.py` is a **manual** validation (not collected
+by pytest) that drives the plugin through Hermes's *real* `PluginContext` ->
+`tools.registry` -> `get_definitions` in a Hermes checkout — see its docstring
+for the recipe (needs an ABI-matched `net-mesh` wheel). Verified passing: the
+five tools register into the real registry and survive Hermes's model-facing
+assembly, and the embedded node builds + tears down in Hermes's interpreter.
