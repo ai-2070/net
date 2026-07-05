@@ -248,7 +248,11 @@ class PinPromotionService:
 
     def stop(self) -> None:
         loop, task = self._loop, self._task
-        if loop is not None and task is not None:
+        # Guard on `is_closed()`: after a prior successful stop the loop is closed,
+        # and `call_soon_threadsafe` on a closed loop raises RuntimeError — so an
+        # unguarded second stop() would blow up a teardown path documented as
+        # idempotent (`_on_session_end`).
+        if loop is not None and task is not None and not loop.is_closed():
             loop.call_soon_threadsafe(task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=2.0)
@@ -260,8 +264,14 @@ class PinPromotionService:
                     "net plugin: pin promotion thread did not stop within 2s; "
                     "keeping the handle so start() won't spawn a second loop"
                 )
-            else:
-                self._thread = None
+                # Leave _loop/_task intact so a later stop() retries the cancel.
+                return
+            self._thread = None
+        # The thread has stopped (or never started): drop the loop/task handles
+        # too, so a repeat stop() is a clean no-op rather than touching a closed
+        # loop, and a later start() begins from a clean slate.
+        self._loop = None
+        self._task = None
 
 
 def start_pin_promotion() -> PinPromotionService:

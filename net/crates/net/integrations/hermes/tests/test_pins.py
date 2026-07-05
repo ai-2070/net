@@ -112,6 +112,42 @@ def test_promote_survives_a_registration_error(plugin):
     assert any("ok" in n for n in reg.registered), reg.registered
 
 
+def test_pin_promotion_service_stop_is_idempotent(plugin, tmp_path):
+    # Regression: after a successful stop the promoter's event loop is closed;
+    # a second stop() must NOT call `call_soon_threadsafe` on that closed loop
+    # (RuntimeError) — `_on_session_end` documents teardown as idempotent.
+    import time
+
+    pins = plugin.pins
+
+    async def fake_describe(cap_id: str) -> dict:
+        return {
+            "status": "ok",
+            "name": cap_id,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+
+    promoter = pins.PinPromoter(
+        _FakeRegistrar(), fake_describe, lambda: True, str(tmp_path / "pins.json")
+    )
+    service = pins.PinPromotionService(promoter)
+    service.start()
+    try:
+        # Wait until the background loop/task are actually set, so stop()
+        # exercises the running-then-closed path (not the never-started one).
+        deadline = time.monotonic() + 5.0
+        while service._loop is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert service._loop is not None, "promotion loop never started"
+        service.stop()  # first stop: cancels + joins, loop closes
+        # A second stop must be a clean no-op, not a RuntimeError on the closed loop.
+        service.stop()
+        # A third, for good measure — still idempotent.
+        service.stop()
+    finally:
+        service.stop()
+
+
 def test_promoter_promotes_snapshot_then_applies_deltas(plugin, tmp_path):
     pins = plugin.pins
     from net_sdk import AsyncPinStore
