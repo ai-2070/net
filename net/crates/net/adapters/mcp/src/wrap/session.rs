@@ -103,9 +103,16 @@ impl RefreshDelta {
 /// One set for the whole node — capability announcements are whole-node-set
 /// replacements, so every publication's tags and metadata must ride together
 /// in a single announcement (the publisher passes the union here).
-pub fn build_capability_set(lowered: &[LoweredTool]) -> CapabilitySet {
+pub fn build_capability_set<'a>(
+    lowered: impl IntoIterator<Item = &'a LoweredTool>,
+) -> CapabilitySet {
     let mut caps = CapabilitySet::new();
-    if !lowered.is_empty() {
+    // The bridge-provider tag rides only when there is at least one tool, and
+    // ahead of the per-tool tags. `peekable` preserves that ordering without
+    // materializing the iterator, so the caller can stream tools borrowed
+    // straight from the live contributions instead of cloning them.
+    let mut lowered = lowered.into_iter().peekable();
+    if lowered.peek().is_some() {
         caps = caps.add_tag(BRIDGE_PROVIDER_TAG.to_string());
     }
     for lt in lowered {
@@ -191,11 +198,10 @@ impl PublisherShared {
     /// capability set to announce and the scoped describe-catalog parts.
     fn merged(&self) -> Result<(CapabilitySet, Vec<CatalogPart>), WrapError> {
         let contributions = self.contributions.lock();
-        let all: Vec<LoweredTool> = contributions
-            .values()
-            .flat_map(|c| c.lowered.iter().cloned())
-            .collect();
-        let caps = build_capability_set(&all);
+        // Announce the union of every publication's lowered tools, borrowing
+        // each contribution's tools directly rather than deep-cloning them all
+        // into a throwaway Vec on every publish / refresh / withdraw.
+        let caps = build_capability_set(contributions.values().flat_map(|c| c.lowered.iter()));
         let parts = contributions
             .values()
             .map(|c| {
