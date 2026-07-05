@@ -2504,7 +2504,39 @@ class AsyncPinStore:
     async def approved(self) -> list[str]: ...
     async def pending(self) -> list[str]: ...
     async def list(self) -> list[tuple[str, str]]: ...
+    async def snapshot_and_watch(self) -> tuple[list[str], "AsyncPinWatcher"]:
+        """Snapshot the currently-approved capabilities AND subscribe to
+        changes, atomically. Returns ``(approved, watcher)`` — promote the
+        snapshot, then ``async for change in watcher:`` for subsequent deltas.
+        The subscription is an OS file watcher, so a cross-process
+        ``net mcp pin approve`` (or another SDK client) arrives as an event,
+        not a poll."""
+        ...
+
+    async def watch(self) -> "AsyncPinWatcher":
+        """Subscribe to approved-pin changes, discarding the initial snapshot."""
+        ...
+
     def __repr__(self) -> str: ...
+
+class PinChange:
+    """One approved-pin change, yielded by :class:`AsyncPinWatcher`: the
+    capabilities newly approved and those no longer approved (display ids)
+    since the previous event."""
+
+    @property
+    def added(self) -> list[str]: ...
+    @property
+    def removed(self) -> list[str]: ...
+    def __repr__(self) -> str: ...
+
+class AsyncPinWatcher:
+    """An async iterator over approved-pin changes in the machine-shared store,
+    backed by an OS file watcher (not polling). ``async for change in
+    watcher:`` yields a :class:`PinChange` per approved-set delta."""
+
+    def __aiter__(self) -> "AsyncPinWatcher": ...
+    async def __anext__(self) -> PinChange: ...
 
 def classify_mcp_server(
     program: str,

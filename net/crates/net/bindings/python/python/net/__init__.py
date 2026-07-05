@@ -778,8 +778,10 @@ else:
 try:
     from ._net import (
         AsyncPinStore,
+        AsyncPinWatcher,
         CapabilityId,
         ConsentPolicy,
+        PinChange,
         PinsError,
         PinStore,
         credential_requires_consent,
@@ -792,8 +794,10 @@ else:
     __all__.extend(
         [
             "AsyncPinStore",
+            "AsyncPinWatcher",
             "CapabilityId",
             "ConsentPolicy",
+            "PinChange",
             "PinsError",
             "PinStore",
             "credential_requires_consent",

@@ -291,8 +291,10 @@ __all__ += [
 # wheel was built with the `net` + `mcp` features (the default one is).
 from net_sdk.consent import (  # noqa: E402
     AsyncPinStore,
+    AsyncPinWatcher,
     CapabilityId,
     ConsentPolicy,
+    PinChange,
     PinsError,
     PinStore,
     credential_requires_consent,
@@ -301,8 +303,10 @@ from net_sdk.consent import (  # noqa: E402
 
 __all__ += [
     "AsyncPinStore",
+    "AsyncPinWatcher",
     "CapabilityId",
     "ConsentPolicy",
+    "PinChange",
     "PinsError",
     "PinStore",
     "credential_requires_consent",

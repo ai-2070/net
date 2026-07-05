@@ -123,7 +123,7 @@ aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
 # local-state primitives with no mesh dependency). The one lock
 # implementation stays in Rust — the binding never opens the store
 # file directly.
-consent = ["dep:net-sdk"]
+consent = ["dep:net-sdk", "net-sdk/pin-watch"]
 # MCP bridge pure helpers (`MCP_BRIDGE_SDK_PLAN.md` P1): thin bindings
 # for `classify` (credential-risk scoring a native node may DISPLAY
 # before publishing an MCP-backed tool) and `lower_tool` (MCP

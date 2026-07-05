@@ -268,3 +268,39 @@ def test_async_pin_store_round_trip(tmp_path) -> None:
     assert rows == [("b/kept", "approved")]
     # The sync handle sees the async handle's writes — one store, one lock.
     assert PinStore(path).is_approved("b/kept")
+
+
+def test_async_pin_watch_emits_approved_deltas(tmp_path) -> None:
+    # The change subscription: an OS file watcher over the store, so a
+    # (cross-handle here, cross-process in production) approve/reject arrives as
+    # an event — no polling. snapshot_and_watch is atomic: the snapshot is the
+    # baseline, the watcher yields only subsequent approved-set deltas.
+    path = str(tmp_path / "pins.json")
+
+    async def _run() -> list:
+        from net import AsyncPinWatcher
+
+        store = AsyncPinStore(path)
+        assert await store.approve("a/x")  # seed one approved pin
+        snapshot, watcher = await store.snapshot_and_watch()
+        assert snapshot == ["a/x"], snapshot
+        assert isinstance(watcher, AsyncPinWatcher)
+
+        async def consume(n: int) -> list:
+            out = []
+            async for change in watcher:
+                out.append((list(change.added), list(change.removed)))
+                if len(out) >= n:
+                    break
+            return out
+
+        task = asyncio.create_task(consume(2))
+        await asyncio.sleep(0.2)
+        await store.approve("a/y")  # -> added delta
+        await asyncio.sleep(0.4)
+        await store.reject("a/x")  # -> removed delta
+        return await asyncio.wait_for(task, timeout=8)
+
+    changes = asyncio.run(_run())
+    assert (["a/y"], []) in changes, changes
+    assert ([], ["a/x"]) in changes, changes

@@ -22,8 +22,10 @@ doctrine #1: no logic in bindings); this module only re-exports them.
 
 from net import (
     AsyncPinStore,
+    AsyncPinWatcher,
     CapabilityId,
     ConsentPolicy,
+    PinChange,
     PinsError,
     PinStore,
     credential_requires_consent,
@@ -32,8 +34,10 @@ from net import (
 
 __all__ = [
     "AsyncPinStore",
+    "AsyncPinWatcher",
     "CapabilityId",
     "ConsentPolicy",
+    "PinChange",
     "PinsError",
     "PinStore",
     "credential_requires_consent",

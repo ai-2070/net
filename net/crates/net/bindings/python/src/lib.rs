@@ -3124,6 +3124,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<consent::PyConsentPolicy>()?;
         m.add_class::<consent::PyPinStore>()?;
         m.add_class::<consent::PyAsyncPinStore>()?;
+        m.add_class::<consent::PyAsyncPinWatcher>()?;
+        m.add_class::<consent::PyPinChange>()?;
         m.add_function(wrap_pyfunction!(consent::credential_requires_consent, m)?)?;
         m.add_function(wrap_pyfunction!(consent::default_pin_store_path, m)?)?;
         m.add("PinsError", m.py().get_type::<consent::PinsError>())?;
