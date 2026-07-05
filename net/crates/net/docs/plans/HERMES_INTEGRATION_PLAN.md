@@ -49,7 +49,7 @@ Phase 1 requires the consent/pin/validation engine exposed via `net-mesh-sdk` (g
 > - ❌ **pin-change subscription** — still poll-only everywhere (the reference shim itself polls at 1 s). **Not a Phase-1 blocker** (Phase 1 is search/describe/invoke/request_pin); Phase 2's dynamic (de)registration polls `AsyncPinStore.approved()` until a watch API lands.
 > - **audit events** — deferred (Phase 2/3; no per-invocation audit crosses to Python yet).
 >
-> Net: the Phase-1 native path is unblocked. Remaining: the async gateway dual (plugin uses `asyncio.to_thread` meanwhile) and the pin subscription (Phase 2).
+> Both a sync `CapabilityGateway` and an awaitable `AsyncCapabilityGateway` (spawns on the mesh runtime, bridges the JoinHandle) are exposed, so `is_async` plugin handlers `await` the gateway directly. Net: the Phase-1 native path is unblocked. Remaining: the pin-change subscription (Phase 2) and per-invocation audit.
 
 ---
 
