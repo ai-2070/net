@@ -1,0 +1,36 @@
+net/crates/net/integrations/hermes/__init__.py
+  s_1539b6b2705f81::t_9ff92e8a844635 1-55
+net/crates/net/integrations/hermes/tests/conftest.py
+  s_1539b6b2705f81::t_a1824cfabd4012 25-27
+  s_1539b6b2705f81::t_7a53898a18c5d0 1-24,28-103
+net/crates/net/integrations/hermes/plugin.yaml
+  s_1539b6b2705f81::t_3117cedd8322f8 1-13
+net/crates/net/integrations/hermes/node.py
+  s_1539b6b2705f81::t_59af48017fcf9d 1-148
+.gitignore
+  s_1539b6b2705f81::t_022a088b5174c6 62-65,69-70
+net/crates/net/integrations/hermes/tools.py
+  s_1539b6b2705f81::t_efca458afa1452 1-233
+net/crates/net/integrations/hermes/requirements.txt
+  s_1539b6b2705f81::t_6e340cc8c0e5c7 1-4
+net/crates/net/integrations/hermes/README.md
+  s_1539b6b2705f81::t_005606b9e5e7dd 1-80
+net/crates/net/integrations/hermes/tests/test_plugin.py
+  s_1539b6b2705f81::t_7acca45ea8a2e2 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "abb9b294e1e12542c2d880e3896c1ebfdaecec4e",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
