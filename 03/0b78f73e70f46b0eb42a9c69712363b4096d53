@@ -1,0 +1,22 @@
+net/crates/net/bindings/go/mcp-ffi/src/lib.rs
+  s_1539b6b2705f81::t_a394ab114d396a 382-385
+  s_1539b6b2705f81::t_96b7e2311b0976 155-160,162,165-171
+  s_1539b6b2705f81::t_07192141877eaf 268-270,277,279-281,290,292-295
+  s_1539b6b2705f81::t_dcb7c92402bb54 445-450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "030b78f73e70f46b0eb42a9c69712363b4096d53",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
