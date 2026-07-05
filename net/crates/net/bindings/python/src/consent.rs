@@ -140,9 +140,9 @@ impl PyCapabilityId {
 
 /// Does a wire-declared credential status require local consent before the
 /// capability may be invoked? Implements the core trust boundary: a wire
-/// `"none"` is NOT trusted (it gates like `"unknown"`), so this returns
-/// `False` for no wire value at all — a discovered capability can only
-/// ever over-gate, never bypass consent.
+/// `"none"` is NOT trusted (it gates like `"unknown"`), so even `"none"`
+/// (and any unrecognised value, or no wire value at all) returns `True` — a
+/// discovered capability can only ever over-gate, never bypass consent.
 #[pyfunction]
 pub fn credential_requires_consent(status: &str) -> bool {
     CredentialStatus::from_wire(status).requires_consent()
