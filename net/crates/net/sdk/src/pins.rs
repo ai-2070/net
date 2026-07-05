@@ -399,6 +399,16 @@ pub struct PinChange {
     pub removed: Vec<CapabilityId>,
 }
 
+/// Signal from the notify callback to [`PinWatcher::next`]: either a file event
+/// that may be a store change, or a backend error/shutdown that ends the
+/// subscription (so `next()` returns `None` rather than blocking forever if the
+/// backend stops delivering).
+#[cfg(feature = "pin-watch")]
+enum WatchSignal {
+    Dirty,
+    Backend,
+}
+
 /// A live subscription to approved-pin changes in the machine-shared store.
 ///
 /// Backed by an OS file watcher over the store's directory (**not** polling),
@@ -411,7 +421,7 @@ pub struct PinWatcher {
     path: PathBuf,
     // The watcher is kept alive here; dropping it stops the subscription.
     _watcher: notify::RecommendedWatcher,
-    dirty_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    dirty_rx: tokio::sync::mpsc::UnboundedReceiver<WatchSignal>,
     approved: std::collections::HashSet<CapabilityId>,
 }
 
@@ -425,11 +435,20 @@ impl PinWatcher {
     /// stops (e.g. the watched directory is removed) or this handle is dropped.
     pub async fn next(&mut self) -> Option<PinChange> {
         loop {
-            // Wait for a file event, then coalesce the save burst.
-            self.dirty_rx.recv().await?;
-            while self.dirty_rx.try_recv().is_ok() {}
+            // Wait for a file event; a backend error/shutdown ends the stream.
+            match self.dirty_rx.recv().await? {
+                WatchSignal::Backend => return None,
+                WatchSignal::Dirty => {}
+            }
+            // Coalesce the save burst, ending the stream if the backend died
+            // mid-burst.
+            if self.drain_burst() {
+                return None;
+            }
             tokio::time::sleep(Self::DEBOUNCE).await;
-            while self.dirty_rx.try_recv().is_ok() {}
+            if self.drain_burst() {
+                return None;
+            }
 
             // Reload and diff the approved set. A transient read / corrupt error
             // is not a verdict — wait for the next event rather than emit
@@ -446,6 +465,19 @@ impl PinWatcher {
                 return Some(change);
             }
         }
+    }
+
+    /// Drain buffered signals (coalescing the save burst). Returns `true` if a
+    /// backend error/shutdown signal was among them — the caller then ends the
+    /// stream (`next()` returns `None`).
+    fn drain_burst(&mut self) -> bool {
+        let mut backend_gone = false;
+        while let Ok(sig) = self.dirty_rx.try_recv() {
+            if matches!(sig, WatchSignal::Backend) {
+                backend_gone = true;
+            }
+        }
+        backend_gone
     }
 }
 
@@ -496,13 +528,21 @@ impl PinStore {
 
         let (tx, dirty_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                // Fire on any event that names the store file (or carries no
-                // path, which some backends emit for directory-level changes).
-                let touches = event.paths.is_empty()
-                    || event.paths.iter().any(|p| p.file_name() == want.as_deref());
-                if touches {
-                    let _ = tx.send(());
+            match res {
+                Ok(event) => {
+                    // Fire on any event that names the store file (or carries no
+                    // path, which some backends emit for directory-level changes).
+                    let touches = event.paths.is_empty()
+                        || event.paths.iter().any(|p| p.file_name() == want.as_deref());
+                    if touches {
+                        let _ = tx.send(WatchSignal::Dirty);
+                    }
+                }
+                // A backend error can mean the watch has stopped delivering events
+                // — signal termination so `next()` returns None instead of
+                // blocking forever on `recv()`.
+                Err(_) => {
+                    let _ = tx.send(WatchSignal::Backend);
                 }
             }
         })
