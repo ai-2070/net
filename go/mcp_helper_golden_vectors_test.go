@@ -75,7 +75,10 @@ func TestClassifyGoldenVectors(t *testing.T) {
 		}
 		got, err := Classify(c.Program, c.Args, c.Envs, override, c.Force)
 		if err != nil {
-			t.Fatalf("[%s] Classify error: %v", c.Name, err)
+			// Per-case failure: report and move on so one bad vector doesn't
+			// hide the rest (t.Fatalf is reserved for fixture-load failures).
+			t.Errorf("[%s] Classify error: %v", c.Name, err)
+			continue
 		}
 		if got != c.ExpectedStatus {
 			t.Errorf("[%s] classify = %q, want %q", c.Name, got, c.ExpectedStatus)
@@ -129,7 +132,9 @@ func TestLowerGoldenVectors(t *testing.T) {
 	for _, c := range loadMcpHelperFixture(t).Lower {
 		lowered, err := LowerTool(string(c.Tool), c.ServerVersion, c.CredentialStatus, c.Substitutability)
 		if err != nil {
-			t.Fatalf("[%s] LowerTool error: %v", c.Name, err)
+			// Per-case failure: report and move on (see TestClassifyGoldenVectors).
+			t.Errorf("[%s] LowerTool error: %v", c.Name, err)
+			continue
 		}
 		got := normalizeLowered(t, lowered)
 
