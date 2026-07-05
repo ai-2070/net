@@ -94,10 +94,23 @@ def node_ready(plugin, tmp_path_factory):
     pointed at a session temp pin store so tests never touch the real machine
     store."""
     store = tmp_path_factory.mktemp("net-plugin") / "pins.json"
+    # Save + restore the env we touch: this fixture is session-scoped, so
+    # `monkeypatch` (function-scoped) can't be used — without an explicit
+    # restore, popping the developer's own NET_MESH_PSK would leak for the
+    # whole session.
+    _keys = ("NET_MESH_PIN_STORE", "NET_MESH_PSK", "NET_MESH_PEERS")
+    _saved = {k: os.environ.get(k) for k in _keys}
     os.environ["NET_MESH_PIN_STORE"] = str(store)
     os.environ.pop("NET_MESH_PSK", None)
     os.environ.pop("NET_MESH_PEERS", None)
     node = plugin.node
-    assert node.check_net_available(), "isolated node should be healthy/available"
-    yield node
-    node.shutdown()
+    try:
+        assert node.check_net_available(), "isolated node should be healthy/available"
+        yield node
+    finally:
+        node.shutdown()
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
