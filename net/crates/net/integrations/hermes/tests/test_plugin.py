@@ -43,6 +43,7 @@ def test_register_wires_five_tools_and_hook(plugin, ctx):
         assert entry["schema"]["name"] == name
         assert entry["schema"]["parameters"]["type"] == "object"
         assert callable(entry["handler"])
+    assert "on_session_start" in ctx.hooks
     assert "on_session_end" in ctx.hooks
 
 

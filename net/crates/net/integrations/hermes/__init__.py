@@ -20,26 +20,52 @@ set ``NET_MESH_PSK`` (and ``NET_MESH_PEERS``) to join your mesh — see
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
-from . import node
+from . import node, pins
 from .tools import TOOLS
 
 logger = logging.getLogger(__name__)
 
+# The running pin-promotion subscription (Phase 2), if started. Held so the
+# session-end hook can stop it.
+_promotion: Optional["pins.PinPromotionService"] = None
+
+
+def _on_session_start(**_kwargs) -> None:
+    """Start the pin-promotion subscription (Phase 2) for this session. Promotes
+    approved pins to first-class tools, driven by the SDK's pin-change
+    subscription. Best-effort and idempotent — a failure here must never break a
+    session; the five meta-tools stand on their own."""
+    global _promotion
+    if _promotion is not None:
+        return
+    try:
+        if node.check_net_available():
+            _promotion = pins.start_pin_promotion()
+    except Exception as e:  # noqa: BLE001 — a session must not fail on this
+        logger.warning("net plugin: pin promotion not started: %s", e)
+
 
 def _on_session_end(**_kwargs) -> None:
-    """Best-effort node teardown when the session ends. Idempotent; swallows
-    errors so session end never fails on cleanup."""
+    """Best-effort teardown when the session ends. Idempotent; swallows errors
+    so session end never fails on cleanup."""
+    global _promotion
+    if _promotion is not None:
+        _promotion.stop()
+        _promotion = None
     node.shutdown()
 
 
 def register(ctx) -> None:
-    """Register the five ``net_*`` mesh tools + the shutdown hook.
+    """Register the five ``net_*`` mesh tools + the session lifecycle hooks.
 
     Called once by the plugin loader when ``net`` is in ``plugins.enabled``.
     Every tool shares ``check_fn`` = local node/SDK health (never "peers
     visible"), so a healthy-but-isolated node keeps its tools; only an
-    SDK/node failure removes them at the next tools-assembly boundary.
+    SDK/node failure removes them at the next tools-assembly boundary. The
+    pin-promotion subscription starts per-session (``on_session_start``), so
+    plugin load itself stays a pure, side-effect-free wiring step.
     """
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(
@@ -51,5 +77,6 @@ def register(ctx) -> None:
             is_async=True,
             emoji=emoji,
         )
+    ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     logger.info("net plugin: registered %d mesh tools (toolset 'net')", len(TOOLS))
