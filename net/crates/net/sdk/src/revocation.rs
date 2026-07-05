@@ -223,7 +223,24 @@ impl RevocationStore {
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             io(e)
-        })
+        })?;
+
+        // Durability (POSIX): `rename()` only updates the directory entry in
+        // memory; without fsyncing the parent directory a crash can revert to
+        // the old file, silently losing the just-persisted revocation (BUG #93,
+        // mirrors `redex/disk.rs`). Best-effort — a dir-fsync failure doesn't
+        // undo the completed rename, and Windows needs no directory fsync.
+        #[cfg(unix)]
+        {
+            let dir = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            if let Ok(dirf) = std::fs::File::open(dir) {
+                let _ = dirf.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 
