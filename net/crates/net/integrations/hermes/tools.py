@@ -212,6 +212,19 @@ async def handle_net_request_pin(args: Dict[str, Any], **_kw) -> str:
         state = await store.request(cap_id)
     except Exception as e:  # noqa: BLE001 — surface store failures as data
         return _json({"status": "error", "error": f"could not record pin request: {e}"})
+    # The message must match the actual state: `request` never downgrades an
+    # already-approved pin, so it can report `approved` — in which case telling
+    # the user approval is still required would be wrong.
+    if state == "pending":
+        message = (
+            f"Approval required for `{cap_id}` in Hermes or another trusted "
+            f"operator surface before it becomes usable. "
+            f"CLI fallback: net mcp pin approve {cap_id}"
+        )
+    elif state == "approved":
+        message = f"`{cap_id}` is already approved — it can be invoked now."
+    else:
+        message = f"`{cap_id}` is in state '{state}'."
     return _json(
         {
             "status": "pending_approval" if state == "pending" else state,
@@ -220,11 +233,7 @@ async def handle_net_request_pin(args: Dict[str, Any], **_kw) -> str:
             # a human approves in Hermes (or another trusted operator surface),
             # which writes to the same shared pin store.
             "approval_channels": ["telegram", "desktop", "cli_fallback"],
-            "message": (
-                f"Approval required for `{cap_id}` in Hermes or another trusted "
-                f"operator surface before it becomes usable. "
-                f"CLI fallback: net mcp pin approve {cap_id}"
-            ),
+            "message": message,
         }
     )
 

@@ -118,6 +118,21 @@ def test_request_pin_requires_cap_id(plugin, node_ready):
     assert _run(tools.handle_net_request_pin({}))["status"] == "error"
 
 
+def test_request_pin_on_an_already_approved_cap_says_so(plugin, node_ready):
+    # `request` never downgrades an approved pin, so the response must not claim
+    # approval is still required — the message reflects the real state.
+    from net_sdk import PinStore
+
+    tools = plugin.tools
+    cap = "42/already-approved-req-test"
+    PinStore(node_ready.pin_store_path()).approve(cap)
+
+    res = _run(tools.handle_net_request_pin({"cap_id": cap}))
+    assert res["status"] == "approved"
+    assert "already approved" in res["message"].lower()
+    assert "approval required" not in res["message"].lower()
+
+
 def test_malformed_peer_entries_do_not_crash_startup(plugin, monkeypatch, tmp_path):
     # Non-dict peer entries must be skipped (logged), not crash the node build:
     # without the isinstance guard the logging path re-raises on `p.get(...)`.
