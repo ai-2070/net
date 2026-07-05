@@ -206,7 +206,10 @@ mod tests {
             json!({}),
         )
         .await;
-        assert!(matches!(out, GatedOutcome::Failed(GatewayError::NotFound(_))), "{out:?}");
+        assert!(
+            matches!(out, GatedOutcome::Failed(GatewayError::NotFound(_))),
+            "{out:?}"
+        );
     }
 
     #[tokio::test]
@@ -278,6 +281,9 @@ mod tests {
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let out = gated_invoke(&gw, &consent, None, &echo_id(), json!({ "message": "hi" })).await;
-        assert!(matches!(out, GatedOutcome::Failed(GatewayError::Denied(_))), "{out:?}");
+        assert!(
+            matches!(out, GatedOutcome::Failed(GatewayError::Denied(_))),
+            "{out:?}"
+        );
     }
 }

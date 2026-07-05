@@ -236,7 +236,14 @@ impl MeshGateway {
                 .map_err(|e| GatewayError::Other(format!("encode describe request: {e}")))?,
         );
         match self
-            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT, is_retriable, false)
+            .call_retry(
+                node,
+                DESCRIBE_SERVICE,
+                body,
+                DESCRIBE_TIMEOUT,
+                is_retriable,
+                false,
+            )
             .await
         {
             Ok(bytes) => serde_json::from_slice(&bytes)

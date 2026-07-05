@@ -167,11 +167,7 @@ impl DelegationChain {
         leaf_signer: &Identity,
         subagent: &EntityId,
     ) -> Result<Self, TokenError> {
-        let parent = self
-            .chain
-            .tokens
-            .last()
-            .ok_or(TokenError::InvalidFormat)?;
+        let parent = self.chain.tokens.last().ok_or(TokenError::InvalidFormat)?;
         let child = parent.delegate(leaf_signer.keypair(), subagent.clone(), INVOKE_ACTION)?;
         let mut tokens = self.chain.tokens.clone();
         tokens.push(child);
@@ -208,7 +204,11 @@ impl DelegationChain {
     /// The subject entity ids of each link, root-to-leaf. `subjects()[0]`
     /// is the machine (root's grantee); the last is the terminal agent.
     pub fn subjects(&self) -> Vec<EntityId> {
-        self.chain.tokens.iter().map(|t| t.subject.clone()).collect()
+        self.chain
+            .tokens
+            .iter()
+            .map(|t| t.subject.clone())
+            .collect()
     }
 
     /// The terminal (leaf) subject — the agent this chain attributes to
@@ -286,9 +286,14 @@ mod tests {
     #[test]
     fn gateway_chain_derives_and_verifies() {
         let (root, machine, gateway) = root_machine_gateway();
-        let chain =
-            DelegationChain::derive_gateway(&root, &machine, gateway.entity_id(), Duration::from_secs(3600), DEFAULT_DELEGATION_DEPTH)
-                .unwrap();
+        let chain = DelegationChain::derive_gateway(
+            &root,
+            &machine,
+            gateway.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
         let reg = RevocationRegistry::new();
 
         assert_eq!(chain.len(), 2);
@@ -313,7 +318,9 @@ mod tests {
         .unwrap();
         let reg = RevocationRegistry::new();
         // The machine can't present the gateway's chain — leaf binding fails.
-        assert!(chain.verify(machine.entity_id(), root.entity_id(), &reg, 0).is_err());
+        assert!(chain
+            .verify(machine.entity_id(), root.entity_id(), &reg, 0)
+            .is_err());
     }
 
     #[test]
@@ -375,15 +382,31 @@ mod tests {
         let g2 = Identity::from_seed(derive_child_seed(&root_seed, "gateway:host2:hermes"));
 
         let ttl = Duration::from_secs(3600);
-        let c1 = DelegationChain::derive_gateway(&root, &m1, g1.entity_id(), ttl, DEFAULT_DELEGATION_DEPTH).unwrap();
-        let c2 = DelegationChain::derive_gateway(&root, &m2, g2.entity_id(), ttl, DEFAULT_DELEGATION_DEPTH).unwrap();
+        let c1 = DelegationChain::derive_gateway(
+            &root,
+            &m1,
+            g1.entity_id(),
+            ttl,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+        let c2 = DelegationChain::derive_gateway(
+            &root,
+            &m2,
+            g2.entity_id(),
+            ttl,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
         let sub1 = Identity::generate();
         let c1_sub = c1.extend_to_subagent(&g1, sub1.entity_id()).unwrap();
 
         let reg = RevocationRegistry::new();
         // All live before revocation.
         assert!(c1.verify(g1.entity_id(), root.entity_id(), &reg, 0).is_ok());
-        assert!(c1_sub.verify(sub1.entity_id(), root.entity_id(), &reg, 0).is_ok());
+        assert!(c1_sub
+            .verify(sub1.entity_id(), root.entity_id(), &reg, 0)
+            .is_ok());
         assert!(c2.verify(g2.entity_id(), root.entity_id(), &reg, 0).is_ok());
 
         // Revoke machine 1's gateway delegation: bump M1's floor above the
@@ -392,11 +415,14 @@ mod tests {
 
         // Machine 1's gateway chain — and its subagent — now fail…
         assert!(
-            c1.verify(g1.entity_id(), root.entity_id(), &reg, 0).is_err(),
+            c1.verify(g1.entity_id(), root.entity_id(), &reg, 0)
+                .is_err(),
             "revoked gateway chain must fail"
         );
         assert!(
-            c1_sub.verify(sub1.entity_id(), root.entity_id(), &reg, 0).is_err(),
+            c1_sub
+                .verify(sub1.entity_id(), root.entity_id(), &reg, 0)
+                .is_err(),
             "revoking the gateway must kill its subagents"
         );
         // …while machine 2's chain is untouched.
@@ -411,7 +437,10 @@ mod tests {
         let seed = [7u8; 32];
         assert_eq!(derive_child_seed(&seed, "a"), derive_child_seed(&seed, "a"));
         assert_ne!(derive_child_seed(&seed, "a"), derive_child_seed(&seed, "b"));
-        assert_ne!(derive_child_seed(&seed, "a"), derive_child_seed(&[8u8; 32], "a"));
+        assert_ne!(
+            derive_child_seed(&seed, "a"),
+            derive_child_seed(&[8u8; 32], "a")
+        );
     }
 
     #[test]

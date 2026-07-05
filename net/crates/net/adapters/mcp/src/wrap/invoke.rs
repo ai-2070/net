@@ -209,12 +209,14 @@ impl RpcHandler for WrapInvokeHandler {
             find_header(&ctx.payload.headers, HDR_DELEGATION),
         ) {
             (Some(gate), Some(chain_bytes)) => {
-                let sig = find_header(&ctx.payload.headers, HDR_DELEGATION_SIG).ok_or_else(|| {
-                    RpcHandlerError::Application {
-                        code: ERR_DELEGATION,
-                        message: "delegation chain present but signature header missing".to_string(),
-                    }
-                })?;
+                let sig =
+                    find_header(&ctx.payload.headers, HDR_DELEGATION_SIG).ok_or_else(|| {
+                        RpcHandlerError::Application {
+                            code: ERR_DELEGATION,
+                            message: "delegation chain present but signature header missing"
+                                .to_string(),
+                        }
+                    })?;
                 // Fail-closed: any verification error rejects the invoke; the
                 // gate audits the admitted leaf on success. Verify over the
                 // SERVICE name (tool_id) the caller signed, not the internal

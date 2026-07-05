@@ -28,9 +28,7 @@ use super::backend::{CapabilityGateway, CapabilityId, GatewayError};
 use super::consent::ConsentPolicy;
 use super::gated::{gated_invoke, GatedOutcome};
 use super::pins::PinStore;
-use super::{
-    meta_tools, requires_approval_message, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES,
-};
+use super::{meta_tools, requires_approval_message, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES};
 use crate::spec::{
     method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
     JsonRpcErrorResponse, JsonRpcNotification, JsonRpcSuccess, RequestId, INVALID_PARAMS,

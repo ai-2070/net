@@ -43,8 +43,8 @@ use parking_lot::Mutex;
 
 use super::catalog::{build_catalog, shared_catalog, CatalogPart, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
-use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 use super::delegation::DelegationGate;
+use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
 use super::McpError;

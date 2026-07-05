@@ -398,7 +398,10 @@ mod tests {
         // A valid 32-byte id round-trips (with and without the 0x prefix).
         let id = net_sdk::Identity::generate();
         let hexed = hex::encode(id.entity_id().as_bytes());
-        assert_eq!(parse_owner_root(&hexed).unwrap().as_bytes(), id.entity_id().as_bytes());
+        assert_eq!(
+            parse_owner_root(&hexed).unwrap().as_bytes(),
+            id.entity_id().as_bytes()
+        );
         assert_eq!(
             parse_owner_root(&format!("0x{hexed}")).unwrap().as_bytes(),
             id.entity_id().as_bytes()

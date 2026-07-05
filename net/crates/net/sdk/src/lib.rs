@@ -128,13 +128,13 @@ pub mod delegation;
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
 // pin store's file discipline; composes with a future mesh-published layer.
-#[cfg(feature = "net")]
-pub mod revocation;
 /// Gang-claim resource-island scheduler value types (live ops on [`mesh::Mesh`]).
 #[cfg(feature = "net")]
 pub mod gang;
 #[cfg(feature = "net")]
 pub mod identity;
+#[cfg(feature = "net")]
+pub mod revocation;
 #[cfg(feature = "net")]
 pub mod subnets;
 
@@ -221,8 +221,7 @@ pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
 // shared revocation registry, and the child-seed KDF.
 #[cfg(feature = "net")]
 pub use crate::delegation::{
-    derive_child_seed, DelegationChain, RevocationRegistry, TokenChain,
-    GATEWAY_DELEGATION_CHANNEL,
+    derive_child_seed, DelegationChain, RevocationRegistry, TokenChain, GATEWAY_DELEGATION_CHANNEL,
 };
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};

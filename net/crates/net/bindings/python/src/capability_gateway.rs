@@ -75,7 +75,10 @@ fn build_delegation(
                     "delegation_chain's leaf does not match delegation_leaf's entity id",
                 ));
             }
-            Ok(Some((SdkIdentity::from_seed(*leaf.keypair.secret_bytes()), chain)))
+            Ok(Some((
+                SdkIdentity::from_seed(*leaf.keypair.secret_bytes()),
+                chain,
+            )))
         }
         (None, None) => Ok(None),
         _ => Err(PyValueError::new_err(
@@ -374,9 +377,7 @@ impl PyCapabilityGateway {
         let h = self.state.handles();
         let runtime = self.state.runtime.clone();
         let query = query.to_string();
-        py.detach(move || {
-            runtime.block_on(do_search(&h.gateway, &h.consent, &h.pin_path, &query))
-        })
+        py.detach(move || runtime.block_on(do_search(&h.gateway, &h.consent, &h.pin_path, &query)))
     }
 
     /// Describe one capability by its `provider/capability` id. Returns a JSON
@@ -409,12 +410,17 @@ impl PyCapabilityGateway {
         let args: Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
-                return err_json("invalid_arguments", format!("arguments must be a JSON object: {e}"))
+                return err_json(
+                    "invalid_arguments",
+                    format!("arguments must be a JSON object: {e}"),
+                )
             }
         };
         let h = self.state.handles();
         let runtime = self.state.runtime.clone();
-        py.detach(move || runtime.block_on(do_invoke(&h.gateway, &h.consent, &h.pin_path, id, args)))
+        py.detach(move || {
+            runtime.block_on(do_invoke(&h.gateway, &h.consent, &h.pin_path, id, args))
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -464,9 +470,10 @@ impl PyAsyncCapabilityGateway {
     fn search<'py>(&self, py: Python<'py>, query: &str) -> PyResult<Bound<'py, PyAny>> {
         let h = self.state.handles();
         let query = query.to_string();
-        let join = self.state.runtime.spawn(async move {
-            do_search(&h.gateway, &h.consent, &h.pin_path, &query).await
-        });
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_search(&h.gateway, &h.consent, &h.pin_path, &query).await });
         spawn_bridge(py, join)
     }
 
@@ -501,7 +508,10 @@ impl PyAsyncCapabilityGateway {
             Err(e) => {
                 return immediate(
                     py,
-                    err_json("invalid_arguments", format!("arguments must be a JSON object: {e}")),
+                    err_json(
+                        "invalid_arguments",
+                        format!("arguments must be a JSON object: {e}"),
+                    ),
                 )
             }
         };

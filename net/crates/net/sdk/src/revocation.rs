@@ -321,10 +321,21 @@ mod tests {
         let path = dir.path().join("rev.json");
         let issuer = Identity::generate();
 
-        assert_eq!(RevocationStore::revoke_below(&path, issuer.entity_id(), 5).unwrap(), 5);
+        assert_eq!(
+            RevocationStore::revoke_below(&path, issuer.entity_id(), 5).unwrap(),
+            5
+        );
         // A lower generation is a no-op (never un-revokes).
-        assert_eq!(RevocationStore::revoke_below(&path, issuer.entity_id(), 2).unwrap(), 5);
-        assert_eq!(RevocationStore::load(&path).unwrap().floor(issuer.entity_id()), 5);
+        assert_eq!(
+            RevocationStore::revoke_below(&path, issuer.entity_id(), 2).unwrap(),
+            5
+        );
+        assert_eq!(
+            RevocationStore::load(&path)
+                .unwrap()
+                .floor(issuer.entity_id()),
+            5
+        );
     }
 
     #[test]

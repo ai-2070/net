@@ -559,8 +559,7 @@ impl PinStore {
 
         let store = PinStore::load(path.clone()).await?;
         let approved = store.approved();
-        let baseline: std::collections::HashSet<CapabilityId> =
-            approved.iter().cloned().collect();
+        let baseline: std::collections::HashSet<CapabilityId> = approved.iter().cloned().collect();
         Ok((
             approved,
             PinWatcher {
@@ -600,17 +599,19 @@ mod tests {
         use std::collections::HashSet;
         // Disjoint sets: `added` = all of `now`, `removed` = all of `old`, each
         // inserted out of order so a stable payload can only come from sorting.
-        let old: HashSet<CapabilityId> =
-            [cap("p/b"), cap("p/y"), cap("p/m")].into_iter().collect();
-        let now: HashSet<CapabilityId> =
-            [cap("p/c"), cap("p/a"), cap("p/z")].into_iter().collect();
+        let old: HashSet<CapabilityId> = [cap("p/b"), cap("p/y"), cap("p/m")].into_iter().collect();
+        let now: HashSet<CapabilityId> = [cap("p/c"), cap("p/a"), cap("p/z")].into_iter().collect();
         let change = diff_approved(&old, &now);
         assert_eq!(
             change.added.iter().map(|c| c.display()).collect::<Vec<_>>(),
             vec!["p/a", "p/c", "p/z"],
         );
         assert_eq!(
-            change.removed.iter().map(|c| c.display()).collect::<Vec<_>>(),
+            change
+                .removed
+                .iter()
+                .map(|c| c.display())
+                .collect::<Vec<_>>(),
             vec!["p/b", "p/m", "p/y"],
         );
     }

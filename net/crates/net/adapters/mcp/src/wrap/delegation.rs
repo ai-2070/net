@@ -80,10 +80,16 @@ impl std::fmt::Display for DelegationReject {
             Self::MalformedChain => write!(f, "malformed delegation chain"),
             Self::MalformedEnvelope => write!(f, "malformed delegation signature envelope"),
             Self::TimestampOutOfWindow => {
-                write!(f, "delegation signature timestamp outside the accepted window")
+                write!(
+                    f,
+                    "delegation signature timestamp outside the accepted window"
+                )
             }
             Self::BadSignature => {
-                write!(f, "delegation signature does not verify against the chain leaf")
+                write!(
+                    f,
+                    "delegation signature does not verify against the chain leaf"
+                )
             }
             Self::Replay => write!(f, "delegation nonce already seen (replay)"),
             Self::Chain(k) => write!(f, "delegation chain does not verify: {k}"),
@@ -203,8 +209,8 @@ impl DelegationGate {
         sig_env: &[u8],
     ) -> Result<EntityId, DelegationReject> {
         // [0] Parse both inputs before any crypto.
-        let chain =
-            DelegationChain::from_bytes(chain_bytes).map_err(|_| DelegationReject::MalformedChain)?;
+        let chain = DelegationChain::from_bytes(chain_bytes)
+            .map_err(|_| DelegationReject::MalformedChain)?;
         if sig_env.len() != ENVELOPE_LEN {
             return Err(DelegationReject::MalformedEnvelope);
         }
@@ -382,7 +388,10 @@ impl DelegationSigner {
         let sig = self.leaf.sign(&build_challenge(service, body, ts, nonce));
         vec![
             (HDR_DELEGATION.to_string(), self.chain_bytes.clone()),
-            (HDR_DELEGATION_SIG.to_string(), build_envelope(ts, nonce, &sig)),
+            (
+                HDR_DELEGATION_SIG.to_string(),
+                build_envelope(ts, nonce, &sig),
+            ),
         ]
     }
 }
@@ -443,7 +452,9 @@ mod tests {
         let chain = chain_for(&root, &machine, &gateway).to_bytes();
         let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
         let g = gate(&root, Arc::new(RevocationRegistry::new()));
-        let leaf = g.verify(TOOL, ARGS, &chain, &env).expect("valid invoke admits");
+        let leaf = g
+            .verify(TOOL, ARGS, &chain, &env)
+            .expect("valid invoke admits");
         assert_eq!(&leaf, gateway.entity_id());
     }
 
@@ -496,9 +507,15 @@ mod tests {
         let g = gate(&root, Arc::new(RevocationRegistry::new()));
         let ts = now_secs();
         let env = envelope(&gateway, TOOL, ARGS, ts, 7);
-        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok(), "first use admits");
         assert!(
-            matches!(g.verify(TOOL, ARGS, &chain, &env), Err(DelegationReject::Replay)),
+            g.verify(TOOL, ARGS, &chain, &env).is_ok(),
+            "first use admits"
+        );
+        assert!(
+            matches!(
+                g.verify(TOOL, ARGS, &chain, &env),
+                Err(DelegationReject::Replay)
+            ),
             "replaying the same (ts, nonce, sig) is rejected"
         );
     }
@@ -514,12 +531,20 @@ mod tests {
         let g1 = Identity::from_seed(derive_child_seed(&seed, "gateway:h:one"));
         let g2 = Identity::from_seed(derive_child_seed(&seed, "gateway:h:two"));
         let chain1 = DelegationChain::derive_gateway(
-            &root, &machine, g1.entity_id(), Duration::from_secs(3600), DEFAULT_DELEGATION_DEPTH,
+            &root,
+            &machine,
+            g1.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
         )
         .unwrap()
         .to_bytes();
         let chain2 = DelegationChain::derive_gateway(
-            &root, &machine, g2.entity_id(), Duration::from_secs(3600), DEFAULT_DELEGATION_DEPTH,
+            &root,
+            &machine,
+            g2.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
         )
         .unwrap()
         .to_bytes();
@@ -527,9 +552,13 @@ mod tests {
         let g = gate(&root, Arc::new(RevocationRegistry::new()));
         let ts = now_secs();
         let nonce = 42;
-        assert!(g.verify(TOOL, ARGS, &chain1, &envelope(&g1, TOOL, ARGS, ts, nonce)).is_ok());
+        assert!(g
+            .verify(TOOL, ARGS, &chain1, &envelope(&g1, TOOL, ARGS, ts, nonce))
+            .is_ok());
         // Same nonce, different leaf — NOT a replay of g1.
-        assert!(g.verify(TOOL, ARGS, &chain2, &envelope(&g2, TOOL, ARGS, ts, nonce)).is_ok());
+        assert!(g
+            .verify(TOOL, ARGS, &chain2, &envelope(&g2, TOOL, ARGS, ts, nonce))
+            .is_ok());
         // g1 replaying its own (leaf, nonce) is still rejected.
         assert!(matches!(
             g.verify(TOOL, ARGS, &chain1, &envelope(&g1, TOOL, ARGS, ts, nonce)),
@@ -598,7 +627,12 @@ mod tests {
         let g = gate(&root, Arc::new(RevocationRegistry::new()));
         // Garbage chain.
         assert!(matches!(
-            g.verify(TOOL, ARGS, b"not-a-chain", &envelope(&gateway, TOOL, ARGS, now_secs(), 1)),
+            g.verify(
+                TOOL,
+                ARGS,
+                b"not-a-chain",
+                &envelope(&gateway, TOOL, ARGS, now_secs(), 1)
+            ),
             Err(DelegationReject::MalformedChain)
         ));
         // Wrong-length envelope.
@@ -620,12 +654,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rev.json");
 
-        let g = DelegationGate::new(root.entity_id().clone(), Arc::new(RevocationRegistry::new()))
-            .with_revocation_store(&path);
+        let g = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
 
         // Admits before any revocation.
         let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
-        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok(), "admits before revocation");
+        assert!(
+            g.verify(TOOL, ARGS, &chain, &env).is_ok(),
+            "admits before revocation"
+        );
 
         // An operator revokes this machine's gateway delegation in the store.
         RevocationStore::revoke_below(&path, machine.entity_id(), 1).unwrap();
@@ -633,7 +673,10 @@ mod tests {
         // The next invoke reloads the store and is rejected.
         let env2 = envelope(&gateway, TOOL, ARGS, now_secs(), 2);
         assert!(
-            matches!(g.verify(TOOL, ARGS, &chain, &env2), Err(DelegationReject::Chain(_))),
+            matches!(
+                g.verify(TOOL, ARGS, &chain, &env2),
+                Err(DelegationReject::Chain(_))
+            ),
             "a store revocation must reject the next invoke",
         );
     }
@@ -682,10 +725,11 @@ mod tests {
         let chain = chain_for(&root, &machine, &gateway).to_bytes();
         let seen: Arc<StdMutex<Vec<DelegationAudit>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink_seen = seen.clone();
-        let g = gate(&root, Arc::new(RevocationRegistry::new()))
-            .with_audit(Arc::new(move |a: &DelegationAudit| {
+        let g = gate(&root, Arc::new(RevocationRegistry::new())).with_audit(Arc::new(
+            move |a: &DelegationAudit| {
                 sink_seen.lock().unwrap().push(a.clone());
-            }));
+            },
+        ));
         let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
         g.verify(TOOL, ARGS, &chain, &env).unwrap();
         let recorded = seen.lock().unwrap();
