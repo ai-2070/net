@@ -2655,6 +2655,7 @@ version = "0.31.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "bytes",
  "criterion",
  "dirs",
