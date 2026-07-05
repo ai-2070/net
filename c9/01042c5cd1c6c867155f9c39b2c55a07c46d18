@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/test/mcp_helper_golden_vectors.test.ts
+  s_1539b6b2705f81::t_ab6b8d8355560f 79-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c901042c5cd1c6c867155f9c39b2c55a07c46d18",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
