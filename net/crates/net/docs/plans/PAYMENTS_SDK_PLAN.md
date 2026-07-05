@@ -12,7 +12,7 @@
 
 ## Doctrine
 
-1. **x402 is the payment wire; networks are configuration.** No parallel payment vocabulary, ever. Net envelopes sign *around* x402 structures; x402 bytes are preserved verbatim, never re-serialized through Net types. Chain/network specifics live in x402 schemes and facilitator config — not in Net core, not in Net envelopes.
+1. **x402 is the payment wire; networks are configuration.** No parallel payment vocabulary, ever. Net envelopes sign *around* x402 structures; x402 bytes are preserved verbatim, never re-serialized through Net types. Chain/network specifics live in x402 schemes and facilitator config — not in Net core, not in Net envelopes. **Extension guardrail:** x402-native extensions (sessions/SIWx identity, discovery lists, prepaid patterns) are consumed for interop only — they never replace Net identity, consent, or billing semantics. Net identity remains the authority for who is being paid; x402 wallet identity is a payment credential, not a participant identity.
 2. **One payment policy engine, one implementation.** Rail/network config, wallet references, quotes, verification, spend limits, billing emission, audit — implemented once in the Rust SDK. State lives behind the SDK policy-store API: a locked per-user store shared across embedded nodes in v1 (same regime as pins/consent); the backend can migrate behind the same API if contention demands it. Enforcement is two-sided: the **caller's** node applies spend policy before anything leaves; the **provider's** node enforces its policy before its handler fires — and provider policy is broader than payment verification: caller allowlist, attestation requirements, network/asset allowlist, exposure caps, capability-level deny. Paid invocation lifecycle: caller policy → quote → payment payload → settle → provider verification → provider policy re-check → handler → billing event. **Provider policy also runs at quote issuance — never quote a caller you'd deny;** accepting a denied caller's payment creates refund obligations the protocol doesn't want.
 3. **The model never decides payment policy.** It requests invocation; the SDK policy engine enforces. Approval prompts render in agent UX; the decision lives in shared policy state.
 4. **Non-custodial default.** Identity keys ≠ settlement keys. Settlement keys live in the user's wallet/MPC/KMS/licensed provider; the SDK stores references and policy. The identity key signs an authorization attestation binding a settlement address to a node — Net cannot become custody by accident.
@@ -24,10 +24,14 @@
 ## Object model (envelopes around x402)
 
 ```
-net.pricing.terms@1        # in the capability announcement; embeds x402 accepts[] templates —
-                           # pricing is visible at discovery, no 402 round-trip on the mesh
+net.pricing.terms@1        # in the capability announcement; embeds x402 accepts[] TEMPLATES —
+                           # discovery/UX metadata, non-binding until instantiated in a quote;
+                           # billing and settlement bind to quote-instantiated requirements only.
+                           # Pricing visible at discovery, no 402 round-trip on the mesh
 net.payment.quote@1        # provider-identity-signed envelope over instantiated x402
-                           # PaymentRequirements + capability/invocation binding + registry ref
+                           # PaymentRequirements + quote_id + capability/invocation binding
+                           # + registry ref + authoritative expiry (x402 timeout is advisory;
+                           # the envelope's expiry governs)
 net.settlement.ref@1       # wraps the x402 settlement response + tx hash
 net.payment.verification@1 # Net-native: tiered, chained, immutable
 net.billing.event@1        # Net-native: the signed usage record; x402 has no equivalent
@@ -35,8 +39,8 @@ net.payment.dispute@1      # reserved: flag-only lifecycle extension, no dispute
 ```
 
 - **No intent object** — the client-signed x402 PaymentPayload travels in the invocation envelope.
-- **Dynamic pricing / RFQ** maps onto x402 v2's dynamic pricing and dynamic payTo rather than a parallel flow. The one-round rule stands: request → binding quote → accept or walk; **no counter-offer object exists, and that absence is the rule.** Input binding stands: the quote's `terms_hash` covers the input hash; quote-small-invoke-big fails verification. Quoting custom work discloses input and costs provider effort — descriptor/per-unit pricing preferred, full-input RFQ is intentional disclosure under policy, quote-spam is rate-limited by caller identity, declined/expired quotes emit audit (not billing) events.
-- **Canonicalization:** envelopes follow the core canonical-encoding regime (byte-identical across languages, golden-vectored, additive-within-version, unknown fields preserved). x402 payloads inside are **byte-preserved originals**; every binding round-trips a captured real x402 v2 fixture byte-identically in CI. `terms_hash` covers the version tag — no cross-version replay.
+- **Dynamic pricing / RFQ** maps onto x402 v2's dynamic pricing and dynamic payTo rather than a parallel flow — and inherits its maturity: if those v2 flows are too immature when RFQ is scheduled, **RFQ waits; we do not invent a parallel dynamic flow** (doctrine 1 applies). The one-round rule stands: request → binding quote → accept or walk; **no counter-offer object exists, and that absence is the rule.** Input binding stands: the quote's `terms_hash` covers the input hash; quote-small-invoke-big fails verification. Quoting custom work discloses input and costs provider effort — descriptor/per-unit pricing preferred, full-input RFQ is intentional disclosure under policy, quote-spam is rate-limited by caller identity, declined/expired quotes emit audit (not billing) events.
+- **Canonicalization:** envelopes follow the core canonical-encoding regime (byte-identical across languages, golden-vectored, additive-within-version, unknown fields preserved). x402 payloads inside are **byte-preserved originals**; every binding round-trips captured x402 fixtures byte-identically in CI — **fixtures are version-pinned per supported spec revision** (fixtures/x402/v2.0/...), never "latest"; new revisions add fixture sets, they don't replace them. `terms_hash` covers the version tag — no cross-version replay.
 - **Versioning:** breaking envelope changes mint `@2`; converters live in the SDK, lossless-or-explicit; endpoints reject unnegotiated versions with structured `unsupported_version`; relays forward opaquely.
 
 ## Identifiers, amounts, registry
@@ -48,7 +52,7 @@ net.payment.dispute@1      # reserved: flag-only lifecycle extension, no dispute
 
 ## Verification, confirmations, reorgs
 
-- **Verification confidence is a tier, not a boolean:** facilitator receipt → `observed`/`confirmed(n)`; independent on-chain check of the tx hash → `final`. Policy picks per capability — the facilitator never has to be in anyone's trust root. Each network's adapter config declares its own finality semantics; no armchair category claims.
+- **Verification confidence is a tier, not a boolean — and the tier vocabulary is a fixed protocol enum:** `observed | confirmed(n) | final`, canonical across all networks; adapters map their chain semantics *into* it (Solana commitment levels, EVM confirmations, XRPL validation) rather than exporting chain-specific states into policy. Facilitator receipt → `observed`/`confirmed(n)`; independent on-chain check of the tx hash → `final`. Policy picks per capability — the facilitator never has to be in anyone's trust root.
 - **Reorg handling is mandatory:** verification events chain per settlement ref; `invalidated {reason: reorg}` is a first-class outcome — engine freezes further serving against that quote, emits the event, applies provider policy. **Billing events are immutable:** later invalidation/adjustment/refund/dispute events *reference* them; nothing is rewritten. Event-sourced all the way down.
 - **Binding is x402-internal and that's the point:** payment payloads bind to payment requirements (EIP-3009/Permit2 on EVM, scheme-per-chain elsewhere); Net's quote binds to the requirements. The consumed-payload replay index is persistent; one payload satisfies exactly one quote.
 - **Idempotency is structural:** every stage has an id plus an `idempotency_key` scoped `{caller, provider, capability, quote}` — same-key retry never double-charges or double-serves. Agents retry on timeouts constantly; this is the difference between a hiccup and a duplicate charge.
@@ -77,14 +81,14 @@ Bindings are thin per the SDK matrix (Python dual sync/async, TS Promise-native,
 - **Mode C — channels/netting:** later; where sub-cent economics live; needs the succession rule and dispute flag first.
 - **Mode E — accounts & credit:**
   - *Identity-conditional pricing:* terms vary by caller identity class — free for same-org, priced for attested strangers, denied for anonymous. Pure descriptor metadata.
-  - *Postpaid tab:* `settlement_policy: postpaid{exposure_cap, netting_period}` — provider-local ledger keyed by delegation chain; billing events per call with settlement pending; `net.settlement.batch@1` nets the period (covered billing_event_ids, totals, settlement ref — **not an invoice, receipt, or statement of legal sufficiency**). Exposure caps keyed to identity + attestation tier + observed history; fresh identities get zero credit. **Credit inherits down the delegation chain: a subagent's draw ≤ parent's remaining.** Spending on credit is still spending — caller-side policy applies.
+  - *Postpaid tab:* `settlement_policy: postpaid{exposure_cap, netting_period}` — provider-local ledger keyed by delegation chain; billing events per call with settlement pending; `net.settlement.batch@1` nets the period (covered billing_event_ids, totals, settlement ref — **not an invoice, receipt, or statement of legal sufficiency**). Where possible the batch itself settles via x402 — one wire format for per-call and batch settlement. Exposure caps keyed to identity + attestation tier + observed history; fresh identities get zero credit. **Credit inherits down the delegation chain: a subagent's draw ≤ parent's remaining.** Spending on credit is still spending — caller-side policy applies.
   - *Prepaid:* `net.payment.account.event@1` (`kind: credit_granted | drawn | netted | deposit | balance_adjusted`; refund/expiry/reversal are later kinds). **Provider-held prepaid balances are the provider's business and regulatory posture; company-held credits only via licensed partners.** Accounts are bilateral, provider-scoped ledgers — Net maintains no global account, balance, wallet, or credit score. Vocabulary: provider account, credit line, tab, exposure cap, settlement batch. Never: Net credits, Net balance, wallet, stored value, deposit account.
   - *Credit is local policy:* underwriting, collections, dunning, scoring are participant obligations; Net emits events and enforces local policy. x402 v2's session/prepaid extensions are adjacent and compatible; Net's accounts stay provider-scoped regardless.
 
 ## Rollout
 
 **P0 — x402-native core + mock facilitator** (see the P0 implementation plan): envelopes, CAIP identifiers, policy engine, publish/gateway integration, billing stream — per-call pay-before-serve against the mock. *Acceptance: paid capability discovered, quoted, settled (mock), invoked, billing event streamed — SDK surfaces only.*
-**P1 — real networks (config, not code):** `x402/base` (USDC, first real-money target), `x402/solana` (SPL-USDC, live facilitators), `x402/xrpl` (committed pending facilitator verification at P1 start). Facilitator trust is a named dependency: established defaults, self-hosted supported, facilitator identity/endpoint recorded in every verification result. Two-way door: x402-speaking agents pay Net capabilities; Net agents pay external x402 APIs with the same objects — zero translation.
+**P1 — real networks (config, not code):** `x402/base` (USDC, first real-money target), `x402/solana` (SPL-USDC, live facilitators), `x402/xrpl` (committed pending facilitator verification at P1 start). Facilitator trust is a named dependency: established defaults, self-hosted supported, facilitator identity/endpoint recorded in every verification result. Two-way door: x402-speaking agents pay Net capabilities; Net agents pay external x402 APIs with the same objects — zero translation. **"Config, not code" is an acceptance criterion:** enabling a P1 network means adapter/facilitator config + registry entries + conformance runs — no new envelope types, no core changes, no per-network branches outside `src/x402/`. If a network needs code, that's a design failure that goes to review, not a quiet exception.
 **P2+ — more networks and settlement references, demand-driven:** additional CAIP networks via facilitator config; payment-intent / bank-payment *references* through licensed providers where applicable, for batch settlement of netted balances — never per-call. Direct-chain adapters (no facilitator) as a self-hosted shelf for facilitator-refusers.
 **P3 — accounts/postpaid:** identity-conditional pricing, tabs, `net.settlement.batch@1` in mock + one real network. (Tab + mock alone is the internal cost-attribution story with zero chain dependency — it can ship earlier for trusted meshes; P3 is when it meets real settlement.)
 **P4 — provider prepaid:** provider-held balances only, enterprise/private beta; no company custody.
@@ -114,7 +118,7 @@ Invoice generator, tax/VAT logic, ERP connectors, hosted marketplace checkout or
 1. Mock-paid fixture tool cross-machine, billing event streamed and exported — SDK only, no terminal beyond running the agents.
 2. Credential locality + payment: token never leaves the provider machine; caller pays to invoke; billing event links payment + invocation.
 3. OpenClaw paid-task consent screen via the A2A channel.
-4. Real USDC pay-before-serve on `x402/base`, tiered verification shown (facilitator receipt vs on-chain final).
+4. Real USDC pay-before-serve on `x402/base`, tiered verification shown — including `final` reached via independent on-chain check after the facilitator receipt was accepted at `observed`.
 5. Multi-network: provider accepts base + solana, caller policy picks, identical billing event shape.
 6. (P5) Per-subagent spend budgets in Hermes — delegation-chain cost attribution.
 
@@ -125,6 +129,7 @@ Invoice generator, tax/VAT logic, ERP connectors, hosted marketplace checkout or
 | x402 v2 spec/extension churn (young spec) | Pin spec revision; all parsing quarantined in `src/x402/`; Linux Foundation governance limits unilateral breaks; byte-preservation keeps envelope sigs valid under additive change |
 | Envelope drift | Byte-preservation rule + fixture round-trip vector per binding |
 | Facilitator trust in the money path | Tiered verification (`final` = independent chain check); self-hosted facilitators; facilitator identity recorded per verification |
+| Facilitator outage/degradation | Defined degraded behavior: verify/settle failures return structured retryable errors; policy chooses fail-closed (default), retry window, or fallback facilitator; paid capabilities never silently serve unverified |
 | Spend counters race across embedded nodes | Lock-held RMW on the shared store (fine at v1 rates); rolling budgets are the first legitimate case for a shared-daemon backend — behind the same SDK API, invisible to callers |
 | Scope drift beyond envelopes + facilitators + policy | The review invariant is the merge checklist |
 | Payment metadata correlation on public chains | Participants choose networks/wallet strategy; enterprises use separate settlement accounts; no payment metadata published beyond required refs |
