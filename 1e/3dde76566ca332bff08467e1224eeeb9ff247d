@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MCP_BRIDGE_SDK_PLAN.md
+  s_cdbc9688784d9a::t_eda24c64f2246f 46-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e3dde76566ca332bff08467e1224eeeb9ff247d",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
