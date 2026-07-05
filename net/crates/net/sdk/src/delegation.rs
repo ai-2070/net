@@ -22,7 +22,7 @@
 //!
 //! # Reused machinery, not new crypto
 //!
-//! The chain *is* a [`TokenChain`] of ed25519 [`PermissionToken`]s — the
+//! The chain *is* a [`TokenChain`] of ed25519 [`PermissionToken`](crate::PermissionToken)s — the
 //! exact type that already gates channel subscribe/publish. Verification
 //! ([`TokenChain::verify_authorizes`]) enforces root-anchoring, leaf
 //! binding, per-link validity + revocation, delegation continuity, and

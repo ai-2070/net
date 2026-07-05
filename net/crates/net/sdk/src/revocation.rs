@@ -2,7 +2,8 @@
 //! Phase 3).
 //!
 //! The **provider** side of delegation revocation: a running `net wrap`
-//! provider's [`crate::delegation::DelegationGate`] honors these floors, so an
+//! provider's `DelegationGate` (in the `net-mesh-mcp` adapter) honors these
+//! floors, so an
 //! operator can revoke a delegated gateway's (or machine's) access to their
 //! wrapped tools **without restarting the provider**. A floor entry is
 //! `issuer entity-id → generation`; any delegation link issued by that issuer
@@ -116,8 +117,8 @@ impl RevocationStore {
     }
 
     /// Apply every stored floor to `registry` (monotonic `revoke_below`), so the
-    /// registry a [`crate::delegation::DelegationGate`] verifies against reflects
-    /// the persisted revocations.
+    /// registry a `DelegationGate` (in the `net-mesh-mcp` adapter) verifies
+    /// against reflects the persisted revocations.
     pub fn apply_to(&self, registry: &RevocationRegistry) {
         for (bytes, gen) in &self.floors {
             registry.revoke_below(&EntityId::from_bytes(*bytes), *gen);

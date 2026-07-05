@@ -8,8 +8,7 @@
 //! request headers:
 //!
 //!   * [`HDR_DELEGATION`]     — a serialized [`DelegationChain`] (`root → … → leaf`)
-//!   * [`HDR_DELEGATION_SIG`] — a fresh per-invoke signed envelope by the
-//!                              **leaf's** private key
+//!   * [`HDR_DELEGATION_SIG`] — a fresh per-invoke signed envelope by the **leaf's** private key
 //!
 //! and this gate verifies, **fail-closed**: the chain roots at the owner root
 //! the provider trusts + is unrevoked + valid, **and** the envelope signature
@@ -21,8 +20,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use net_sdk::delegation::{DelegationChain, RevocationRegistry};
 use net_sdk::identity::EntityId;
@@ -207,8 +208,18 @@ impl DelegationGate {
         if sig_env.len() != ENVELOPE_LEN {
             return Err(DelegationReject::MalformedEnvelope);
         }
-        let ts = u64::from_le_bytes(sig_env[0..8].try_into().expect("8-byte slice"));
-        let nonce = u64::from_le_bytes(sig_env[8..16].try_into().expect("8-byte slice"));
+        // Length is already checked above, so these slices are exactly 8 bytes;
+        // still parse fallibly (no panic) to keep the gate strictly fail-closed.
+        let ts = u64::from_le_bytes(
+            sig_env[0..8]
+                .try_into()
+                .map_err(|_| DelegationReject::MalformedEnvelope)?,
+        );
+        let nonce = u64::from_le_bytes(
+            sig_env[8..16]
+                .try_into()
+                .map_err(|_| DelegationReject::MalformedEnvelope)?,
+        );
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&sig_env[16..80]);
 
@@ -281,7 +292,7 @@ impl DelegationGate {
         let mut leaf_key = [0u8; 32];
         leaf_key.copy_from_slice(leaf.as_bytes());
         let key = (leaf_key, nonce);
-        let mut cache = self.nonces.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cache = self.nonces.lock();
         // Prune expired first so the cap reflects live entries.
         cache.retain(|_, &mut exp| exp > now);
         if cache.contains_key(&key) {

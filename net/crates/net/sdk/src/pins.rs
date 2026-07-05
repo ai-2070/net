@@ -492,8 +492,8 @@ fn diff_approved(
 ) -> PinChange {
     let mut added: Vec<CapabilityId> = now.difference(old).cloned().collect();
     let mut removed: Vec<CapabilityId> = old.difference(now).cloned().collect();
-    added.sort_by(|a, b| a.display().cmp(&b.display()));
-    removed.sort_by(|a, b| a.display().cmp(&b.display()));
+    added.sort_by_key(|a| a.display());
+    removed.sort_by_key(|a| a.display());
     PinChange { added, removed }
 }
 
