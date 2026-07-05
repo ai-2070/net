@@ -1,0 +1,6 @@
+# Minimal single-machine daemon config for the Hermes Phase 0.5 gate
+# (HERMES_INTEGRATION_PLAN.md). Ephemeral port; fixed test PSK (same value
+# the aggregator-daemon's own print_bootstrap test uses — local gate only,
+# never a real deployment).
+listen = "127.0.0.1:0"
+psk_hex = "4242424242424242424242424242424242424242424242424242424242424242"
