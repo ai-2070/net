@@ -291,6 +291,11 @@ func (p *ConsentPolicy) Close() {
 
 func (p *ConsentPolicy) mutate(capID string, fn func(*C.ConsentPolicyHandle, *C.char) C.int) error {
 	defer pinThread()()
+	// Keep p reachable until the cgo call returns: p's finalizer frees the
+	// Rust handle, and without this the GC could run it (freeing p.ptr) while
+	// the C call is still dereferencing it — a use-after-free. Every method
+	// that passes p.ptr to cgo does the same.
+	defer runtime.KeepAlive(p)
 	cCap, free := cstr(capID)
 	defer free()
 	if fn(p.ptr, cCap) != 0 {
@@ -323,6 +328,7 @@ func (p *ConsentPolicy) Unpin(capID string) error {
 // IsPinned reports whether the capability is pinned.
 func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
 	defer pinThread()()
+	defer runtime.KeepAlive(p)
 	cCap, free := cstr(capID)
 	defer free()
 	rc := C.net_mcp_consent_policy_is_pinned(p.ptr, cCap)
@@ -336,6 +342,7 @@ func (p *ConsentPolicy) IsPinned(capID string) (bool, error) {
 // the given wire credential status (the SDK enum's stable string).
 func (p *ConsentPolicy) Decide(capID, credentialStatus string) (string, error) {
 	defer pinThread()()
+	defer runtime.KeepAlive(p)
 	cCap, freeCap := cstr(capID)
 	defer freeCap()
 	cStatus, freeStatus := cstr(credentialStatus)
@@ -369,6 +376,7 @@ func (p *ConsentPolicy) RequiresApproval(capID, credentialStatus string) (bool, 
 // Pinned returns the pinned capabilities' display ids, sorted.
 func (p *ConsentPolicy) Pinned() ([]string, error) {
 	defer pinThread()()
+	defer runtime.KeepAlive(p)
 	js, ok := takeString(C.net_mcp_consent_policy_pinned(p.ptr))
 	if !ok {
 		return nil, lastMcpError()
