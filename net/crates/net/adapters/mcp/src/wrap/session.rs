@@ -272,7 +272,12 @@ impl PublisherShared {
     /// Withdraw the describe service when no publication is left (dropping
     /// the handle reverses its `serve_rpc`).
     fn drop_describe_if_idle(&self) {
-        if self.contributions.lock().is_empty() {
+        // Hold the contributions lock across the describe teardown so the
+        // service can't be dropped between the emptiness check and the take —
+        // e.g. by a concurrent publish inserting a contribution. (Belt and
+        // suspenders: publish/withdraw already serialize through `sync`.)
+        let contributions = self.contributions.lock();
+        if contributions.is_empty() {
             self.describe.lock().take();
         }
     }
