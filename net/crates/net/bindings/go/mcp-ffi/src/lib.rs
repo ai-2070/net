@@ -476,8 +476,25 @@ pub unsafe extern "C" fn net_mcp_cap_id_canonicalize(display: *const c_char) -> 
 
 /// Opaque handle to a [`CoreConsentPolicy`]. Free with
 /// [`net_mcp_consent_policy_free`].
+///
+/// The C ABI is callable from any thread and the core policy takes `&mut` for
+/// its mutators, so the inner policy is behind a `Mutex`: concurrent
+/// `allow`/`pin`/`unpin`/`is_pinned`/`decide`/`pinned` calls on one handle are
+/// serialized here rather than racing. (Handle *lifetime* — free vs. a call in
+/// flight — is still the caller's responsibility; the Go binding guards it with
+/// its own mutex.)
 pub struct ConsentPolicyHandle {
-    inner: CoreConsentPolicy,
+    inner: std::sync::Mutex<CoreConsentPolicy>,
+}
+
+impl ConsentPolicyHandle {
+    /// Lock the inner policy, tolerating a poisoned mutex: the consent ops
+    /// leave no inconsistent state on a panic and every entry point is
+    /// `catch_unwind`-guarded, so a poisoned lock must not permanently wedge
+    /// the handle.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CoreConsentPolicy> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Allocate an empty consent policy. With no entries, EVERY discovered
@@ -486,7 +503,7 @@ pub struct ConsentPolicyHandle {
 pub extern "C" fn net_mcp_consent_policy_new() -> *mut ConsentPolicyHandle {
     ffi_guard!(ptr::null_mut(), {
         Box::into_raw(Box::new(ConsentPolicyHandle {
-            inner: CoreConsentPolicy::new(),
+            inner: std::sync::Mutex::new(CoreConsentPolicy::new()),
         }))
     })
 }
@@ -528,7 +545,7 @@ unsafe fn policy_mutate(
         let Some(id) = parse_cap(display) else {
             return -1;
         };
-        f(&mut (*policy).inner, id);
+        f(&mut (*policy).lock(), id);
         0
     })
 }
@@ -591,7 +608,7 @@ pub unsafe extern "C" fn net_mcp_consent_policy_is_pinned(
         let Some(id) = parse_cap(display) else {
             return -1;
         };
-        c_int::from((*policy).inner.is_pinned(&id))
+        c_int::from((*policy).lock().is_pinned(&id))
     })
 }
 
@@ -625,8 +642,8 @@ pub unsafe extern "C" fn net_mcp_consent_policy_decide(
             return ptr::null_mut();
         };
         // The SDK enum's stable string form — never re-derived here.
-        let decision = (*policy).inner.decide(&id, status).as_str();
-        into_cstr(decision.to_string())
+        let decision = (*policy).lock().decide(&id, status).as_str().to_string();
+        into_cstr(decision)
     })
 }
 
@@ -645,7 +662,7 @@ pub unsafe extern "C" fn net_mcp_consent_policy_pinned(
             set_last_error("policy must not be null", "invalid_arg");
             return ptr::null_mut();
         }
-        let mut ids: Vec<String> = (*policy).inner.pinned().map(|id| id.display()).collect();
+        let mut ids: Vec<String> = (*policy).lock().pinned().map(|id| id.display()).collect();
         ids.sort();
         match serde_json::to_string(&ids) {
             Ok(s) => into_cstr(s),
@@ -1080,6 +1097,57 @@ mod tests {
                 0
             );
 
+            net_mcp_consent_policy_free(p);
+        }
+    }
+
+    #[test]
+    fn consent_policy_handle_is_thread_safe() {
+        // The handle's inner policy is Mutex-guarded, so concurrent mutators
+        // and readers on ONE handle through the C ABI are serialized rather
+        // than racing on `&mut` (a data race here would be UB — this is the
+        // guard that makes the C ABI safe for multi-threaded callers). Handle
+        // lifetime stays the caller's job: we free only after every thread
+        // joins.
+        unsafe {
+            let p = net_mcp_consent_policy_new();
+            assert!(!p.is_null());
+            // Raw pointers aren't `Send`; carry the address across threads.
+            let addr = p as usize;
+            const N: usize = 32;
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    std::thread::spawn(move || {
+                        let p = addr as *mut ConsentPolicyHandle;
+                        let cap = c(&format!("b/cap{i}"));
+                        // SAFETY: `p` is live (freed only after join); the inner
+                        // Mutex serializes these concurrent calls.
+                        unsafe {
+                            net_mcp_consent_policy_allow(p, cap.as_ptr());
+                            net_mcp_consent_policy_pin(p, cap.as_ptr());
+                            net_mcp_consent_policy_is_pinned(p, cap.as_ptr());
+                            let _ = take(net_mcp_consent_policy_decide(
+                                p,
+                                cap.as_ptr(),
+                                c("credentialed").as_ptr(),
+                            ));
+                            let _ = take(net_mcp_consent_policy_pinned(p));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            // Every cap was allowlisted and pinned, so each decides "allowed".
+            for i in 0..N {
+                let d = take(net_mcp_consent_policy_decide(
+                    p,
+                    c(&format!("b/cap{i}")).as_ptr(),
+                    c("credentialed").as_ptr(),
+                ));
+                assert_eq!(d, "allowed");
+            }
             net_mcp_consent_policy_free(p);
         }
     }
