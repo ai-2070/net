@@ -1,0 +1,48 @@
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_928ee85c6ffc0a::t_860e95bb9baacc 1-42
+net/crates/net/src/adapter/net/cortex/tool.rs
+  s_928ee85c6ffc0a::t_78dd1f338d84e7 463-470
+.github/workflows/ci.yml
+  s_928ee85c6ffc0a::t_24a4b3e8a057e8 489-493,496
+net/crates/net/payments/src/policy/spend.rs
+  s_928ee85c6ffc0a::t_2c5786b9522a0b 373-380,402,407-440
+  s_928ee85c6ffc0a::t_c2defcf660edce 151
+  s_928ee85c6ffc0a::t_b9a99343bdf870 338-366
+  s_928ee85c6ffc0a::t_b41edd7e25e548 229-236,246-249,254-258
+  s_928ee85c6ffc0a::t_5c06d5418b9f8d 119-133
+  s_928ee85c6ffc0a::t_a3bb57b15c1287 441
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_928ee85c6ffc0a::t_515a34a16cf760 1-266
+net/crates/net/payments/Cargo.toml
+  s_928ee85c6ffc0a::t_88e16c0f1a3890 38-42
+  s_928ee85c6ffc0a::t_8eab092c36f647 67-73
+net/crates/net/payments/src/lib.rs
+  s_928ee85c6ffc0a::t_14144b8d64d44e 37-39
+  s_928ee85c6ffc0a::t_9c50e9c5e69618 52
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_610aff3c3a7796 1-31,33-268,301,311-376,390-456
+  s_928ee85c6ffc0a::t_39052fcac2ada9 269-300,302-310
+  s_928ee85c6ffc0a::t_1ec7176d234e38 32
+  s_928ee85c6ffc0a::t_ef1f85f836c978 377-389
+net/crates/net/payments/tests/flow_end_to_end.rs
+  s_928ee85c6ffc0a::t_0293fe713a41ce 173-175,177,179-187,189-195
+  s_928ee85c6ffc0a::t_c5089c78887300 1-172,176,178,188,196-372
+net/crates/net/Cargo.lock
+  s_928ee85c6ffc0a::t_fdfd083be4f3fa 2725
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f6f9939f5a770ce705f84649c42ce3b4d0637f1e",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
