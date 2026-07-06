@@ -728,6 +728,37 @@ class NetMesh:
         published. This node must be ``start()``ed + ``permissive_channels=True``.
         (Requires the ``publish`` feature.)"""
         ...
+    def serve_a2a(self, callback: Any) -> "A2aServeHandle":
+        """Serve the agent-to-agent (A2A) task lifecycle (V2 Phase 3), backed by
+        a Python **async** task executor ``callback``
+        ``async (task_id: str, prompt: str, context_refs: list[str],
+        tags: list[str]) -> str`` returning the result's artifact ref. Hold the
+        returned handle to keep accepting tasks. This node must be ``start()``ed.
+        (Requires the ``a2a`` feature.)"""
+        ...
+    def submit_task(
+        self,
+        target_node_id: int,
+        prompt: str,
+        context_refs: List[str] = ...,
+        tags: List[str] = ...,
+    ) -> str:
+        """Hand off a task to the executor at ``target_node_id``: ``prompt`` plus
+        optional Datafort ``context_refs`` (the executor doesn't share your
+        memory) and routing ``tags``. Returns the accepted task id; raises if the
+        executor rejected it. The node must already be connected to
+        ``target_node_id``. (Requires the ``a2a`` feature.)"""
+        ...
+    def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:
+        """The executor's status for ``task_id`` as a JSON string
+        (``{brief, state, updated_at}``), or ``None`` if unknown. (Requires the
+        ``a2a`` feature.)"""
+        ...
+    def cancel_task(self, target_node_id: int, task_id: str) -> bool:
+        """Cancel ``task_id`` on the executor; returns whether it was in flight.
+        The executor's coroutine is cancelled — the remote work stops. (Requires
+        the ``a2a`` feature.)"""
+        ...
 
     def push_to(self, peer_addr: str, json: str) -> bool:
         """Send a raw JSON payload to a direct peer address."""
@@ -1367,6 +1398,17 @@ class LocalPublicationHandle:
     def stop(self) -> None:
         """Stop serving (unregister on drop; does not re-announce). Idempotent."""
         ...
+
+class A2aServeHandle:
+    """Keeps the served agent-to-agent task services alive (returned by
+    ``NetMesh.serve_a2a``). Dropping it or calling :meth:`stop` unregisters
+    them."""
+
+    def stop(self) -> None:
+        """Stop accepting A2A tasks (unregister the services)."""
+        ...
+    @property
+    def serving(self) -> bool: ...
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed

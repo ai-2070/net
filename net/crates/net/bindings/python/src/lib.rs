@@ -58,6 +58,12 @@ mod enrollment;
 // (mcp + delegation + cortex).
 #[cfg(feature = "publish")]
 mod publish;
+// Agent-to-agent task handoff (Hermes V2 Phase 3): serve the A2A task lifecycle
+// backed by a Python async task-executor callback + submit/status/cancel by node
+// id. Thin wrappers over `net_sdk::{a2a,mesh_a2a}`; gated on `a2a`
+// (delegation + cortex).
+#[cfg(feature = "a2a")]
+mod a2a;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -1562,6 +1568,81 @@ mod mesh_bindings {
                 callback,
                 version,
                 owner_origin,
+            )
+        }
+
+        /// Serve the agent-to-agent (A2A) task lifecycle on this node (V2 Phase
+        /// 3), backed by a Python **async** task-executor `callback`
+        /// `async (task_id, prompt, context_refs, tags) -> str` returning the
+        /// result's artifact ref. A sibling in-root agent hands off a job with
+        /// `submit_task`. Hold the returned handle to keep accepting tasks. This
+        /// node must be `start()`ed. (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn serve_a2a(&self, callback: pyo3::Py<pyo3::PyAny>) -> PyResult<crate::a2a::PyA2aServeHandle> {
+            crate::a2a::mesh_serve_a2a(self.node_arc_clone()?, self.runtime.clone(), callback)
+        }
+
+        /// Hand off a task to the executor at `target_node_id`: `prompt` plus
+        /// optional Datafort `context_refs` (the executor doesn't share your
+        /// memory) and routing `tags`. Returns the accepted task id; raises if
+        /// the executor rejected it. The node must already be connected to
+        /// `target_node_id`. (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        #[pyo3(signature = (target_node_id, prompt, context_refs=Vec::new(), tags=Vec::new()))]
+        fn submit_task(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            prompt: String,
+            context_refs: Vec<String>,
+            tags: Vec<String>,
+        ) -> PyResult<String> {
+            crate::a2a::mesh_submit_task(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                prompt,
+                context_refs,
+                tags,
+            )
+        }
+
+        /// The executor's status for `task_id` as a JSON string
+        /// (`{brief, state, updated_at}`), or ``None`` if unknown. (Requires the
+        /// `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn task_status(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            task_id: String,
+        ) -> PyResult<Option<String>> {
+            crate::a2a::mesh_task_status(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                task_id,
+            )
+        }
+
+        /// Cancel `task_id` on the executor; returns whether it was in flight.
+        /// The executor's coroutine is cancelled — the remote work stops.
+        /// (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn cancel_task(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            task_id: String,
+        ) -> PyResult<bool> {
+            crate::a2a::mesh_cancel_task(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                task_id,
             )
         }
 
@@ -3313,6 +3394,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         // Local tool publication (V2 Phase 2, Slice B).
         m.add_class::<publish::PyLocalPublicationHandle>()?;
+    }
+    #[cfg(feature = "a2a")]
+    {
+        // Agent-to-agent task handoff (V2 Phase 3).
+        m.add_class::<a2a::PyA2aServeHandle>()?;
     }
     #[cfg(feature = "cortex")]
     {

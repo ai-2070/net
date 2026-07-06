@@ -901,5 +901,16 @@ except ImportError:
 else:
     __all__.append("LocalPublicationHandle")
 
+# Agent-to-agent task handoff (Hermes V2 Phase 3, the `a2a` feature): the
+# return-value type of `NetMesh.serve_a2a`. The submit/status/cancel client
+# surface lives on the `NetMesh` handle.
+try:
+    from ._net import A2aServeHandle
+except ImportError:
+    # `a2a` feature not compiled in; the symbol stays undefined.
+    pass
+else:
+    __all__.append("A2aServeHandle")
+
 
 __version__ = "0.31.0"
