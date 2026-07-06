@@ -82,6 +82,21 @@ def test_denied_dangerous_tool_never_dispatches(plugin):
     assert rec["dispatched"] == []  # fail-closed
 
 
+@pytest.mark.parametrize(
+    "decision",
+    [{"decision": "deny"}, "no", 1, [True], object()],
+    ids=["dict", "str", "int", "list", "object"],
+)
+def test_truthy_non_bool_decision_denies(plugin, decision):
+    # The approval contract is Optional[bool]: anything but an explicit True —
+    # including truthy non-bools from a loosely-typed surface — must deny.
+    prov, rec = _make(plugin, dangerous={"rm"}, approve=decision)
+    body, is_error = asyncio.run(prov._callback("rm", "{}"))
+    assert is_error is True
+    assert json.loads(body)["status"] == "denied"
+    assert rec["dispatched"] == []  # fail-closed
+
+
 def test_unreachable_approval_fails_closed(plugin):
     prov, rec = _make(plugin, dangerous={"rm"}, approve=None)
     body, is_error = asyncio.run(prov._callback("rm", "{}"))

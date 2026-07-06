@@ -137,7 +137,11 @@ class LocalToolProvider:
                     ),
                     True,
                 )
-            if not decision:
+            if decision is not True:
+                # The contract is Optional[bool]; anything but an explicit True
+                # denies. A truthy non-bool (a {'decision': 'deny'} dict, a
+                # 'no' string) from a loosely-typed approval surface must never
+                # run the tool.
                 return (
                     _deny_body(name, "denied", "the operator declined this invocation"),
                     True,
