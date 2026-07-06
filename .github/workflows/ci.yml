@@ -691,7 +691,12 @@ jobs:
       # `RevocationRegistry` for `test_delegation.py`. Default `redis` is
       # omitted because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation
+        # `publish` (V2 Phase 2 — NetMesh.publish_tools) and `a2a` (V2 Phase 3 —
+        # NetMesh.serve_a2a / submit_task / task_status / cancel_task) are shipped
+        # default features but this job builds `--no-default-features`, so they
+        # must be listed explicitly or `test_publish.py` / `test_a2a.py` fail with
+        # `AttributeError: 'NetMesh' object has no attribute ...`.
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
@@ -958,7 +963,10 @@ jobs:
             # earlier set even omitted `meshdb`, which `python-tests`
             # builds) — without them those pyo3 surfaces went unlinted.
             # `consent` / `mcp` are the P1 consent + bridge-helper modules.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp
+            # `delegation` / `publish` / `a2a` add the V2 enrollment, local-tool
+            # publication, and A2A binding modules so clippy lints them (they
+            # match the `python-tests` build set).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
