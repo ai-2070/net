@@ -69,14 +69,20 @@ impl CapabilityGateway for PaidToolGateway {
         payment: Option<PaymentProof>,
     ) -> Result<CallToolResult, GatewayError> {
         // Mirror WrapInvokeHandler's paid path: no proof or a failed
-        // redemption never reaches the handler.
+        // redemption never reaches the handler. The real flow signs the
+        // binding, so this composition also proves the signature the
+        // flow produced verifies against the paying identity.
         let Some(proof) = payment else {
             return Err(GatewayError::Denied(
                 "paid tool invoked without a payment quote".to_string(),
             ));
         };
+        assert!(
+            proof.binding_sig.is_some(),
+            "the flow's caller identity signs; bearer mode is for pre-binding callers"
+        );
         self.admission
-            .redeem(&id.capability, &proof.quote_id)
+            .redeem(&id.capability, &proof.quote_id, proof.binding_sig.as_deref())
             .await
             .map_err(GatewayError::Denied)?;
         self.handler_runs.fetch_add(1, Ordering::SeqCst);

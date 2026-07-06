@@ -216,9 +216,14 @@ impl ProviderChannel for InProcessProvider {
 #[derive(Debug, Clone)]
 pub enum CallerDecision {
     /// Payment cleared: `quote_id` is the redemption binding the
-    /// invocation must carry to the provider's gate; `proof` is the
-    /// full payment context (settlement refs, the signed billing event).
-    Paid { quote_id: String, proof: serde_json::Value },
+    /// invocation must carry to the provider's gate, `binding_sig` the
+    /// paying identity's possession proof over it, and `proof` the full
+    /// payment context (settlement refs, the signed billing event).
+    Paid {
+        quote_id: String,
+        binding_sig: Option<Vec<u8>>,
+        proof: serde_json::Value,
+    },
     RequiresPaymentApproval {
         quote_id: String,
         policy_reason: String,
@@ -417,8 +422,21 @@ impl CallerPaymentFlow {
                 if let Some(held_id) = redeeming_approval {
                     let _ = self.spend.clear_approval(&held_id).await;
                 }
+                // Sign the invocation binding: the provider's gate can
+                // then require that the invoker IS the payer. A public-
+                // only caller identity degrades to bearer mode.
+                let tool = capability.split_once('/').map(|(_, t)| t).unwrap_or(capability);
+                let binding_sig = self
+                    .caller
+                    .try_sign(&crate::engine::invocation_binding_transcript(
+                        &quote.quote_id,
+                        tool,
+                    ))
+                    .ok()
+                    .map(|sig| sig.to_bytes().to_vec());
                 CallerDecision::Paid {
                     quote_id: quote.quote_id.clone(),
+                    binding_sig,
                     proof: serde_json::json!({
                         "quote_id": quote.quote_id,
                         "transaction": transaction,

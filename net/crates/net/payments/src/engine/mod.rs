@@ -151,6 +151,21 @@ pub enum RedeemDecision {
     Denied { reason: String },
 }
 
+/// The invocation-binding transcript: what the paying identity signs to
+/// prove the invoker *is* the payer, not merely someone who saw the
+/// quote id. Domain-separated + length-prefixed (no boundary
+/// confusion); covers the quote and the tool being invoked.
+pub fn invocation_binding_transcript(quote_id: &str, tool_id: &str) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"net.payments.invocation_binding@1";
+    let mut out = Vec::with_capacity(DOMAIN.len() + 16 + quote_id.len() + tool_id.len());
+    out.extend_from_slice(DOMAIN);
+    for part in [quote_id.as_bytes(), tool_id.as_bytes()] {
+        out.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 /// Read-only snapshot of a quote's lifecycle state.
 #[derive(Debug, Clone)]
 pub struct QuoteStatus {
@@ -1022,11 +1037,20 @@ impl PaymentEngine {
     /// store lock. Deliberately at-most-once: a paid invoke whose reply
     /// was lost is not re-servable on the same quote, matching the
     /// at-most-once retry safety of credentialed tools.
+    ///
+    /// `binding`, when present, must be the paying identity's ed25519
+    /// signature over [`invocation_binding_transcript`] — possession
+    /// proof that the invoker is the payer. Present-but-invalid rejects;
+    /// absent falls back to bearer semantics (the quote id is
+    /// content-derived and unguessable), kept in P1 for pre-binding
+    /// callers.
     pub async fn redeem_for_invocation(
         &self,
         tool_id: &str,
         quote_id: &str,
+        binding: Option<&[u8]>,
     ) -> Result<RedeemDecision, EngineError> {
+        let binding = binding.map(<[u8]>::to_vec);
         let tool_id = tool_id.to_string();
         let quote_id = quote_id.to_string();
         let decision = mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
@@ -1035,6 +1059,30 @@ impl PaymentEngine {
                     reason: "unknown quote — no payment exists for this invocation".to_string(),
                 };
             };
+            if let Some(sig) = &binding {
+                let Ok(sig_bytes) = <&[u8; 64]>::try_from(sig.as_slice()) else {
+                    return RedeemDecision::Denied {
+                        reason: "invocation binding is not a 64-byte signature".to_string(),
+                    };
+                };
+                let payer = hex::decode(&rec.caller_hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .map(EntityId::from_bytes);
+                let Some(payer) = payer else {
+                    return RedeemDecision::Denied {
+                        reason: "payer identity corrupt in record".to_string(),
+                    };
+                };
+                let transcript = invocation_binding_transcript(&quote_id, &tool_id);
+                if payer.verify_bytes(&transcript, sig_bytes).is_err() {
+                    return RedeemDecision::Denied {
+                        reason: "invocation binding signature does not verify against the \
+                                 paying identity"
+                            .to_string(),
+                    };
+                }
+            }
             if let Some(reason) = &rec.frozen {
                 return RedeemDecision::Denied {
                     reason: format!("quote is frozen ({reason}) — nothing serves against it"),

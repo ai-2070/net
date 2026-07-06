@@ -215,7 +215,7 @@ async fn a_reverted_settlement_invalidates_and_freezes() {
     // Frozen means frozen: the redemption gate refuses too.
     let redemption = w
         .engine
-        .redeem_for_invocation("fixture-tool", &w.quote_id)
+        .redeem_for_invocation("fixture-tool", &w.quote_id, None)
         .await
         .unwrap();
     assert!(matches!(

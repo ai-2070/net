@@ -553,10 +553,17 @@ impl CapabilityGateway for MeshGateway {
         // over, which is the right money-path behavior.
         let payment_headers: Vec<(String, Vec<u8>)> = payment
             .map(|p| {
-                vec![(
+                let mut headers = vec![(
                     crate::serve::payment::HDR_PAYMENT_QUOTE.to_string(),
                     p.quote_id.into_bytes(),
-                )]
+                )];
+                if let Some(sig) = p.binding_sig {
+                    headers.push((
+                        crate::serve::payment::HDR_PAYMENT_BINDING.to_string(),
+                        sig,
+                    ));
+                }
+                headers
             })
             .unwrap_or_default();
         // A duplicate-safe call retries any transient error; an at-most-once

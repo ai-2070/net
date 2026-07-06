@@ -148,12 +148,13 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
             )));
         };
         match flow.pay(id, terms, &tool_args).await {
-            PaymentFlowDecision::Paid { quote_id, proof: _proof } => {
-                // Cleared. The quote id rides with the invocation so the
+            PaymentFlowDecision::Paid { quote_id, binding_sig, proof: _proof } => {
+                // Cleared. The quote id (plus the paying identity's
+                // signed binding) rides with the invocation so the
                 // provider's own gate can redeem the payment before its
                 // handler runs — the caller-side clearance alone is never
                 // the provider's proof.
-                payment_proof = Some(PaymentProof { quote_id });
+                payment_proof = Some(PaymentProof { quote_id, binding_sig });
             }
             PaymentFlowDecision::RequiresPaymentApproval {
                 quote_id,
@@ -403,6 +404,7 @@ mod tests {
         consent.allow(echo_id());
         let flow = ScriptedFlow::new(PaymentFlowDecision::Paid {
             quote_id: "q-1".to_string(),
+            binding_sig: Some(vec![7u8; 64]),
             proof: json!({"quote": "q-1"}),
         });
         let out = gated_invoke(
@@ -420,7 +422,10 @@ mod tests {
         // provider's own gate redeems before its handler runs.
         assert_eq!(
             *gw.last_payment.lock(),
-            Some(Some(PaymentProof { quote_id: "q-1".to_string() }))
+            Some(Some(PaymentProof {
+                quote_id: "q-1".to_string(),
+                binding_sig: Some(vec![7u8; 64]),
+            }))
         );
     }
 
@@ -484,6 +489,7 @@ mod tests {
         let consent = ConsentPolicy::new();
         let flow = ScriptedFlow::new(PaymentFlowDecision::Paid {
             quote_id: "q-unused".to_string(),
+            binding_sig: None,
             proof: json!({}),
         });
         let out = gated_invoke(

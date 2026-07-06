@@ -168,7 +168,7 @@ async fn the_full_exact_scheme_lifecycle_runs_on_an_enabled_network() {
     .with_signer("eip155", signer.clone());
 
     let decision = flow.run(CAPABILITY, &terms_json).await;
-    let CallerDecision::Paid { quote_id: _, proof } = decision else {
+    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = decision else {
         panic!("expected Paid on the enabled network, got {decision:?}");
     };
     assert_eq!(proof["transaction"], "0xbase5ep011a7e57");

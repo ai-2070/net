@@ -294,7 +294,9 @@ impl RpcHandler for WrapInvokeHandler {
                 code: ERR_PAYMENT,
                 message: "paid tool invoked without a payment quote header".to_string(),
             })?;
-            gate.redeem(&self.service, quote_id)
+            let binding =
+                find_header(&ctx.payload.headers, crate::serve::payment::HDR_PAYMENT_BINDING);
+            gate.redeem(&self.service, quote_id, binding)
                 .await
                 .map_err(|reason| RpcHandlerError::Application {
                     code: ERR_PAYMENT,

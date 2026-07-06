@@ -50,7 +50,8 @@ pub use backend::{
 pub use consent::{ConsentDecision, ConsentPolicy};
 pub use gated::{gated_invoke, GatedOutcome};
 pub use payment::{
-    PaymentAdmission, PaymentFlow, PaymentFlowDecision, PaymentProof, HDR_PAYMENT_QUOTE,
+    PaymentAdmission, PaymentFlow, PaymentFlowDecision, PaymentProof, HDR_PAYMENT_BINDING,
+    HDR_PAYMENT_QUOTE,
 };
 pub use mesh_gateway::MeshGateway;
 pub use pins::{PinState, PinStore, PinStoreError};

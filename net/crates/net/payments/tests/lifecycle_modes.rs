@@ -15,8 +15,8 @@ use net_payments::core::verification::{
     check_chain, ExceptionKind, InvalidationReason, VerificationStatus, VerificationTier,
 };
 use net_payments::engine::{
-    AdmitAll, PaymentDecision, PaymentEngine, ProviderAdmissionPolicy, RedeemDecision,
-    RejectReason,
+    invocation_binding_transcript, AdmitAll, PaymentDecision, PaymentEngine,
+    ProviderAdmissionPolicy, RedeemDecision, RejectReason,
 };
 use net_payments::facilitator::mock::{MockFacilitator, MockMode, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::facilitator::{
@@ -644,7 +644,7 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     // Unpaid: nothing to redeem.
     let unpaid = h
         .engine
-        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
         .await
         .unwrap();
     assert!(matches!(unpaid, RedeemDecision::Denied { .. }), "got {unpaid:?}");
@@ -661,7 +661,7 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     // A quote pays for ITS capability's tool, nothing else.
     let wrong_tool = h
         .engine
-        .redeem_for_invocation("other-tool", &quote.quote_id)
+        .redeem_for_invocation("other-tool", &quote.quote_id, None)
         .await
         .unwrap();
     match wrong_tool {
@@ -672,7 +672,7 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     // The one paid invocation.
     assert_eq!(
         h.engine
-            .redeem_for_invocation("fixture-tool", &quote.quote_id)
+            .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
             .await
             .unwrap(),
         RedeemDecision::Admitted
@@ -681,7 +681,7 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     // One payment, one serve — the second redemption bounces.
     let again = h
         .engine
-        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
         .await
         .unwrap();
     match again {
@@ -690,6 +690,63 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
         }
         other => panic!("expected Denied, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_signed_binding_must_verify_against_the_paying_identity() {
+    let h = harness();
+    let quote = h.quote("2500");
+    let payload = payload_for(&quote, "payer-1");
+    let served = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(matches!(served, PaymentDecision::Served { .. }));
+
+    let transcript = invocation_binding_transcript(&quote.quote_id, "fixture-tool");
+
+    // A present-but-wrong binding never falls back to bearer.
+    let impostor = EntityKeypair::generate();
+    let forged = impostor.try_sign(&transcript).unwrap().to_bytes();
+    let denied = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&forged))
+        .await
+        .unwrap();
+    match denied {
+        RedeemDecision::Denied { reason } => assert!(reason.contains("does not verify"), "{reason}"),
+        other => panic!("expected Denied, got {other:?}"),
+    }
+
+    // Garbage-length bindings are rejected outright.
+    let denied = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&[1, 2, 3]))
+        .await
+        .unwrap();
+    assert!(matches!(denied, RedeemDecision::Denied { .. }));
+
+    // A binding signed over the WRONG tool doesn't transfer.
+    let wrong_tool_transcript = invocation_binding_transcript(&quote.quote_id, "other-tool");
+    let misdirected = h.caller.try_sign(&wrong_tool_transcript).unwrap().to_bytes();
+    let denied = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&misdirected))
+        .await
+        .unwrap();
+    assert!(matches!(denied, RedeemDecision::Denied { .. }));
+
+    // The paying identity's signature over the right transcript admits —
+    // and the failed attempts above consumed nothing.
+    let good = h.caller.try_sign(&transcript).unwrap().to_bytes();
+    assert_eq!(
+        h.engine
+            .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&good))
+            .await
+            .unwrap(),
+        RedeemDecision::Admitted
+    );
 }
 
 #[tokio::test]
@@ -718,7 +775,7 @@ async fn redemption_denies_frozen_quotes() {
 
     let redemption = h
         .engine
-        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
         .await
         .unwrap();
     match redemption {

@@ -113,7 +113,7 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     let w = world(SpendProfile::DevTest);
 
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, proof } = decision else {
+    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = decision else {
         panic!("expected Paid, got {decision:?}");
     };
 
@@ -135,7 +135,7 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     // by the engine's lifecycle tests). Here we pin the flow-level fact:
     // a second full run is a second charge with a distinct billing id.
     let second = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, proof: proof2 } = second else {
+    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof: proof2 } = second else {
         panic!("expected Paid, got {second:?}");
     };
     assert_ne!(
@@ -177,7 +177,7 @@ async fn over_cap_surfaces_structured_approval_and_approval_unblocks() {
     assert!(approver.approve(&quote_id).await.expect("approve"));
 
     let retry = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, proof } = retry else {
+    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = retry else {
         panic!("approval must unblock the paid invoke, got {retry:?}");
     };
     assert_eq!(

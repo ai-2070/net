@@ -23,19 +23,27 @@ use super::backend::CapabilityId;
 
 /// Request header carrying the paid invocation's quote id — the binding
 /// between the payment (settled out-of-band via the payment services)
-/// and this invocation. Same convention as `net-delegation`. The quote
-/// id is a bearer redemption token in P0: it is content-derived
-/// (32-byte blake3 hex, unguessable without the quote) and the
-/// provider's engine redeems it **at most once** — a signed invocation
-/// binding is the P1 hardening.
+/// and this invocation. Same convention as `net-delegation`.
 pub const HDR_PAYMENT_QUOTE: &str = "net-payment-quote";
 
+/// Request header carrying the caller's ed25519 signature over the
+/// invocation-binding transcript (quote id + tool id) — proof that the
+/// invoker *is* the identity the quote was paid by, not merely someone
+/// who saw the quote id. Replay of the header is harmless: redemption
+/// is at-most-once regardless. Optional in P1 (bearer fallback for
+/// pre-binding callers); providers may require it by policy.
+pub const HDR_PAYMENT_BINDING: &str = "net-payment-quote-sig";
+
 /// The caller-side proof that an invocation was paid: the quote id the
-/// provider's engine can redeem. Attached to the invoke as
-/// [`HDR_PAYMENT_QUOTE`].
+/// provider's engine can redeem, plus the optional signed binding.
+/// Attached to the invoke as [`HDR_PAYMENT_QUOTE`] /
+/// [`HDR_PAYMENT_BINDING`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentProof {
     pub quote_id: String,
+    /// 64-byte ed25519 signature by the paying identity over the
+    /// binding transcript. `None` = bearer mode.
+    pub binding_sig: Option<Vec<u8>>,
 }
 
 /// The structured outcome of the caller-side paid lifecycle.
@@ -43,10 +51,16 @@ pub struct PaymentProof {
 pub enum PaymentFlowDecision {
     /// Payment cleared under policy (quote accepted, payload authored,
     /// settlement path run per the mode). `quote_id` binds the upcoming
-    /// invocation to the settled payment; `proof` is the opaque payment
-    /// context (settlement refs, the signed billing event) the gate
-    /// passes through without reading.
-    Paid { quote_id: String, proof: Value },
+    /// invocation to the settled payment; `binding_sig` is the paying
+    /// identity's signature over the binding transcript (possession
+    /// proof); `proof` is the opaque payment context (settlement refs,
+    /// the signed billing event) the gate passes through without
+    /// reading.
+    Paid {
+        quote_id: String,
+        binding_sig: Option<Vec<u8>>,
+        proof: Value,
+    },
     /// Spend policy wants a human. Mirrors the consent shape; the
     /// decision resolves through the SDK consent API and the shared
     /// policy store — never through the model.
@@ -92,6 +106,14 @@ pub trait PaymentFlow: Send + Sync {
 #[async_trait]
 pub trait PaymentAdmission: Send + Sync {
     /// `Err(reason)` rejects the invocation; the reason travels to the
-    /// caller as the payment-rejection application error.
-    async fn redeem(&self, tool_id: &str, quote_id: &str) -> Result<(), String>;
+    /// caller as the payment-rejection application error. `binding` is
+    /// the caller's signature over the binding transcript when the
+    /// invoke carried one — a present-but-invalid binding must reject
+    /// (never fall back to bearer).
+    async fn redeem(
+        &self,
+        tool_id: &str,
+        quote_id: &str,
+        binding: Option<&[u8]>,
+    ) -> Result<(), String>;
 }

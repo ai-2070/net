@@ -173,7 +173,7 @@ async fn a_replayed_settlement_transaction_never_serves_a_second_quote() {
 
     // And the frozen quote's invocation is refused at the gate.
     let redemption =
-        w.engine.redeem_for_invocation("fixture-tool", &second_id).await.unwrap();
+        w.engine.redeem_for_invocation("fixture-tool", &second_id, None).await.unwrap();
     assert!(matches!(
         redemption,
         net_payments::engine::RedeemDecision::Denied { .. }
