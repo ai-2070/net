@@ -1323,8 +1323,30 @@ jobs:
           LD_PRELOAD: "/tmp/libnapi_stub.so"
         run: cargo test --lib ${{ matrix.crate.features }}
 
+      # pyo3's `extension-module` feature (hardcoded — maturin builds the
+      # importable cdylib from this crate) deliberately does not link
+      # libpython: the host interpreter supplies the C-API symbols at
+      # import time. A standalone `cargo test --lib` executable therefore
+      # cannot resolve them at link time — the same problem class as
+      # node's napi symbols above. It only *surfaces* when a unit test
+      # statically reaches pyo3 runtime machinery (e.g. holding a
+      # `Py<PyAny>` whose drop glue references the GIL entry points);
+      # `--gc-sections` hid it while every unit test was pure-JSON. The
+      # unit tests never CALL the interpreter (interpreter-dependent
+      # coverage lives in the `python-tests` pytest job, where the real
+      # extension module is imported by a live Python), so unresolved
+      # symbols are ignored rather than stubbed. If a future unit test
+      # needs a live interpreter, it belongs in pytest — or the crate
+      # moves to pyo3's optional-extension-module pattern.
+      - name: Run tests (python — libpython unlinked by design)
+        if: matrix.crate.name == 'python'
+        working-directory: ${{ matrix.crate.path }}
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
+        run: cargo test --lib ${{ matrix.crate.features }}
+
       - name: Run tests
-        if: matrix.crate.name != 'node'
+        if: matrix.crate.name != 'node' && matrix.crate.name != 'python'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --lib ${{ matrix.crate.features }}
 
