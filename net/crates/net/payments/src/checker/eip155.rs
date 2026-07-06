@@ -183,9 +183,21 @@ impl ChainChecker for Eip155Checker {
                         .flatten()
                         .filter_map(Value::as_str)
                         .collect();
+                    // Bind the transfer to (token, from-payer, to-recipient).
+                    // topics[1] is the indexed `from`, topics[2] the indexed
+                    // `to`. Without the `from` bind, a facilitator could point
+                    // at *any* qualifying transfer to the merchant (e.g. a
+                    // different customer's) and pass the delivered-amount
+                    // check. When `q.from` is set, only transfers authorized by
+                    // this quote's payer count.
+                    let from_ok = match q.from.as_deref() {
+                        Some(from) => topics.get(1).is_some_and(|t| topic_is_address(t, from)),
+                        None => true,
+                    };
                     if emitter.eq_ignore_ascii_case(&q.token)
                         && topics.len() >= 3
                         && topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC)
+                        && from_ok
                         && topic_is_address(topics[2], &q.to)
                     {
                         let value =

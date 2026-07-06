@@ -43,15 +43,23 @@ impl CheckerError {
     }
 }
 
-/// What to cross-check delivery against: the token contract and the
-/// quoted recipient.
+/// What to cross-check delivery against: the token contract, the quoted
+/// recipient, and — critically — the authorized payer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferQuery {
     /// The asset locator as the requirements carried it (token contract
     /// on eip155).
     pub token: String,
-    /// The quoted `payTo` recipient.
+    /// The quoted `payTo` recipient (the indexed `to` topic).
     pub to: String,
+    /// The authorized payer — the EIP-3009 `from` (the indexed `from`
+    /// topic). When set, a `Transfer` only counts toward delivery if its
+    /// `from` equals this payer. This binds delivery to *this quote's*
+    /// authorization rather than to any qualifying transfer to the same
+    /// merchant, so a facilitator cannot satisfy a quote by pointing at a
+    /// different customer's payment. `None` leaves delivery bound only to
+    /// (token, recipient) — for schemes/paths with no on-chain payer.
+    pub from: Option<String>,
 }
 
 /// The chain's answer, in protocol vocabulary.

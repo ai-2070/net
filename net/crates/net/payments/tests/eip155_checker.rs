@@ -114,12 +114,18 @@ fn topic_for(address: &str) -> String {
     )
 }
 
+const PAYER: &str = "0x857b06519E91e3A54538791bDbb0E22373e36b66";
+
 fn transfer_log(token: &str, to: &str, amount_hex: &str) -> Value {
+    transfer_log_from(token, PAYER, to, amount_hex)
+}
+
+fn transfer_log_from(token: &str, from: &str, to: &str, amount_hex: &str) -> Value {
     json!({
         "address": token,
         "topics": [
             TRANSFER_TOPIC,
-            topic_for("0x857b06519E91e3A54538791bDbb0E22373e36b66"),
+            topic_for(from),
             topic_for(to),
         ],
         "data": amount_hex,
@@ -130,6 +136,15 @@ fn query() -> TransferQuery {
     TransferQuery {
         token: TOKEN.to_string(),
         to: RECIPIENT.to_string(),
+        from: None,
+    }
+}
+
+fn query_from(payer: &str) -> TransferQuery {
+    TransferQuery {
+        token: TOKEN.to_string(),
+        to: RECIPIENT.to_string(),
+        from: Some(payer.to_string()),
     }
 }
 
@@ -233,4 +248,48 @@ async fn delivered_amount_comes_from_the_right_transfer_logs_only() {
         panic!("expected Included, got {verdict:?}");
     };
     assert_eq!(delivered.as_deref(), Some("0"));
+}
+
+/// H3 regression: when the query carries the authorized payer, a
+/// qualifying transfer to the same merchant from a *different* payer does
+/// not count. This is the leg that stops a facilitator satisfying a quote
+/// with some other customer's payment to the same `payTo`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_amount_binds_to_the_authorized_payer() {
+    let rpc = RpcFixture::start().await;
+    let checker = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
+    rpc.set_head(100);
+
+    let other_payer = "0x00000000000000000000000000000000deadbeef";
+    // Right token, right recipient, right amount — but a different payer.
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [ transfer_log_from(TOKEN, other_payer, RECIPIENT, "0x2710") ],
+    }));
+
+    // Bound to the real payer: the stranger's transfer contributes nothing.
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(
+        delivered.as_deref(),
+        Some("0"),
+        "a transfer from a different payer must not count as delivery"
+    );
+
+    // Bound to the stranger who actually sent it: now it counts. Proves
+    // the filter is the `from` bind, not an accident of the fixture.
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query_from(other_payer)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
 }

@@ -983,9 +983,26 @@ impl PaymentEngine {
         let network = requirements.view().network.clone();
         let required_amount = AtomicAmount::parse(&requirements.view().amount)
             .map_err(|e| EngineError::State(e.to_string()))?;
+        // The authorized payer, so the checker binds delivery to *this*
+        // quote's authorization and not merely to (token, recipient). For
+        // exact-EVM this is `payload.authorization.from`; schemes/paths
+        // without an on-chain payer leave it `None`.
+        let payload: X402Carry<PaymentPayload> = X402Carry::from_bytes(
+            BASE64
+                .decode(&rec.payload_b64)
+                .map_err(|e| EngineError::State(e.to_string()))?,
+        )?;
+        let payer_from = payload
+            .view()
+            .payload
+            .get("authorization")
+            .and_then(|a| a.get("from"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let query = TransferQuery {
             token: requirements.view().asset.clone(),
             to: requirements.view().pay_to.clone(),
+            from: payer_from,
         };
 
         let verdict = match checker.check(&network, &transaction, Some(&query)).await {
