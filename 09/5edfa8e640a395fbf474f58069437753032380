@@ -1,0 +1,37 @@
+net/crates/net/integrations/hermes/tools.py
+  s_a772df20f47a78::t_7ff54f0b9dfc4e 19
+  s_a772df20f47a78::t_d155982ee42e1e 421-582
+  s_a772df20f47a78::t_27c8b003983701 593-595
+net/crates/net/integrations/hermes/tests/test_a2a_plugin.py
+  s_a772df20f47a78::t_66e15c1b110ff5 1-225
+net/crates/net/integrations/hermes/tests/test_plugin.py
+  s_a772df20f47a78::t_31795fe32caa97 31-34
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_45cfe626757bd3 116-118
+net/crates/net/integrations/hermes/plugin.yaml
+  s_a772df20f47a78::t_5f574669bccc45 15-17
+net/crates/net/integrations/hermes/a2a.py
+  s_a772df20f47a78::t_d74d921a785b7d 1-116
+net/crates/net/integrations/hermes/__init__.py
+  s_a772df20f47a78::t_e0e2914fdddc76 116-124,130-133
+  s_a772df20f47a78::t_320a30eb6ec5db 26,29,36
+  s_a772df20f47a78::t_282614e43f0d84 54-58
+  s_a772df20f47a78::t_c9817ecbf61e55 90
+  s_a772df20f47a78::t_8e1b008aa1c1b7 78-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "095edfa8e640a395fbf474f58069437753032380",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
