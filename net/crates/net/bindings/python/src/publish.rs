@@ -97,8 +97,11 @@ fn mesh_over(node: Arc<MeshNode>) -> Mesh {
 /// `ServerPublisher::publish_tools`; releases the GIL for the async work.
 ///
 /// `owner_origin` scopes who may invoke: `Some(origin)` admits only that
-/// caller (an `origin_hash`), `None` admits any caller (`OwnerScope::any` —
-/// in-root / testing; the plugin wires the delegation gate in a follow-up).
+/// caller (an `origin_hash`); `None` admits only **this node itself**
+/// (fail-closed — the published tools are backed by an arbitrary local
+/// callback, so nothing is exposed mesh-wide by omission). Admitting every
+/// mesh peer requires the explicit `allow_any_caller` opt-in, which overrides
+/// `owner_origin`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mesh_publish_tools(
     py: Python<'_>,
@@ -108,6 +111,7 @@ pub(crate) fn mesh_publish_tools(
     callback: Py<PyAny>,
     version: String,
     owner_origin: Option<u64>,
+    allow_any_caller: bool,
 ) -> PyResult<PyLocalPublicationHandle> {
     let mut sdk_tools = Vec::with_capacity(tools.len());
     for (name, description, schema_json) in &tools {
@@ -140,12 +144,17 @@ pub(crate) fn mesh_publish_tools(
         name: "net-publish".to_string(),
         version: "0".to_string(),
     };
-    let mut config = WrapConfig::owner_only(client_info, owner_origin.unwrap_or(0));
-    if owner_origin.is_none() {
+    let mesh = Arc::new(mesh_over(node));
+    // Fail closed by default: no owner_origin → only this node's own origin
+    // may invoke. `OwnerScope::any()` is reachable only through the explicit
+    // `allow_any_caller` opt-in.
+    let owner = owner_origin.unwrap_or_else(|| mesh.origin_hash());
+    let mut config = WrapConfig::owner_only(client_info, owner);
+    if allow_any_caller {
         config.scope = OwnerScope::any();
     }
 
-    let publisher = ServerPublisher::new(Arc::new(mesh_over(node)));
+    let publisher = ServerPublisher::new(mesh);
     let invoker: Arc<dyn ToolInvoker> = Arc::new(PyToolInvoker { callback });
 
     let rt = Arc::clone(&runtime);

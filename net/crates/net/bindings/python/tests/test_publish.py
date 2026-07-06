@@ -88,8 +88,10 @@ def test_publish_tools_is_invoked_over_the_wire():
         provider.start()
         consumer.start()
 
+        # Cross-node invocation needs the explicit opt-in — the default scope
+        # admits only the publishing node itself.
         handle = provider.publish_tools(
-            [("echo", "echo it back", ECHO_SCHEMA)], echo_handler
+            [("echo", "echo it back", ECHO_SCHEMA)], echo_handler, allow_any_caller=True
         )
         assert "echo" in handle.tools
         assert handle.serving is True
@@ -107,6 +109,45 @@ def test_publish_tools_is_invoked_over_the_wire():
         assert text == "hi over the wire"
         # The proof: the Python callback ran on a remote invoke.
         assert calls, "the Python async callback was invoked"
+    finally:
+        if handle is not None:
+            handle.stop()
+        for m in (consumer, provider):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def test_publish_tools_default_scope_denies_remote_callers():
+    """Fail-closed by default: without ``allow_any_caller`` (or an explicit
+    ``owner_origin``), a *remote* node's invoke is rejected by the owner scope
+    and the Python callback never runs."""
+    provider = net.NetMesh("127.0.0.1:0", PSK, permissive_channels=True)
+    consumer = net.NetMesh("127.0.0.1:0", PSK, permissive_channels=True)
+
+    calls = []
+    handle = None
+
+    async def echo_handler(name, args_json):
+        calls.append(name)
+        return "should never run"
+
+    try:
+        _handshake(consumer, provider)
+        provider.start()
+        consumer.start()
+
+        handle = provider.publish_tools(
+            [("echo", "echo it back", ECHO_SCHEMA)], echo_handler
+        )
+        assert "echo" in handle.tools
+
+        rpc = net.MeshRpc(consumer)
+        body = json.dumps({"message": "sneaky"}).encode("utf-8")
+        with pytest.raises(Exception):
+            _call_retry(rpc, provider.node_id, "echo", body, attempts=3)
+        assert calls == [], "the callback must not run for a denied caller"
     finally:
         if handle is not None:
             handle.stop()

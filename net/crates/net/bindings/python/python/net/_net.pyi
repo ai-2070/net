@@ -713,6 +713,7 @@ class NetMesh:
         callback: Any,
         version: str = ...,
         owner_origin: Optional[int] = ...,
+        allow_any_caller: bool = ...,
     ) -> "LocalPublicationHandle":
         """Publish this node's OWN local tools as mesh capabilities (V2 Phase 2)
         — the inverse of ``net wrap``. ``tools`` is a list of
@@ -723,8 +724,11 @@ class NetMesh:
         ``(text, is_error)`` tuple flags a tool-level error). A consumer
         discovers + invokes these through the ordinary
         :class:`AsyncCapabilityGateway`. ``owner_origin`` scopes admission (an
-        ``origin_hash`` admits only that caller; ``None`` admits any caller —
-        in-root / testing). Hold the returned handle to keep the tools
+        ``origin_hash`` admits only that caller; ``None`` admits only **this
+        node itself** — the fail-closed default). Pass
+        ``allow_any_caller=True`` to explicitly admit every mesh peer
+        (overrides ``owner_origin``; gate invocations yourself, e.g. with an
+        approval callback). Hold the returned handle to keep the tools
         published. This node must be ``start()``ed + ``permissive_channels=True``.
         (Requires the ``publish`` feature.)"""
         ...

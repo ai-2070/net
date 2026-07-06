@@ -80,7 +80,11 @@ class LocalToolProvider:
         if not specs:
             logger.info("net plugin: no local tools to publish to the mesh")
             return []
-        self._handle = self._mesh.publish_tools(specs, self._callback)
+        # Explicit opt-in: these tools exist to be invoked by sibling in-root
+        # machines (the binding's default admits only the publishing node
+        # itself). Authority stays with this provider — every dangerous invoke
+        # still runs the operator-approval gate in `_callback`.
+        self._handle = self._mesh.publish_tools(specs, self._callback, allow_any_caller=True)
         logger.info(
             "net plugin: published %d local tools to the mesh (%s)",
             len(self.published),

@@ -1546,12 +1546,16 @@ mod mesh_bindings {
         /// (a `(text, is_error)` tuple flags a tool-level error). A consumer
         /// discovers + invokes these through the ordinary
         /// `AsyncCapabilityGateway`. `owner_origin` scopes admission: an
-        /// `origin_hash` admits only that caller; `None` admits any caller
-        /// (in-root / testing). Returns a handle that must be held to keep the
-        /// tools published. This node must be `start()`ed and built with
-        /// `permissive_channels=True`. (Requires the `publish` feature.)
+        /// `origin_hash` admits only that caller; `None` admits only **this
+        /// node itself** (fail-closed default — the tools are backed by an
+        /// arbitrary local callback). Pass `allow_any_caller=True` to
+        /// explicitly admit every mesh peer (overrides `owner_origin`; gate
+        /// invocations yourself, e.g. with an approval callback). Returns a
+        /// handle that must be held to keep the tools published. This node
+        /// must be `start()`ed and built with `permissive_channels=True`.
+        /// (Requires the `publish` feature.)
         #[cfg(feature = "publish")]
-        #[pyo3(signature = (tools, callback, version=String::new(), owner_origin=None))]
+        #[pyo3(signature = (tools, callback, version=String::new(), owner_origin=None, allow_any_caller=false))]
         fn publish_tools(
             &self,
             py: Python<'_>,
@@ -1559,6 +1563,7 @@ mod mesh_bindings {
             callback: pyo3::Py<pyo3::PyAny>,
             version: String,
             owner_origin: Option<u64>,
+            allow_any_caller: bool,
         ) -> PyResult<crate::publish::PyLocalPublicationHandle> {
             crate::publish::mesh_publish_tools(
                 py,
@@ -1568,6 +1573,7 @@ mod mesh_bindings {
                 callback,
                 version,
                 owner_origin,
+                allow_any_caller,
             )
         }
 

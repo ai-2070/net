@@ -193,7 +193,9 @@ def test_discovers_and_federates_a_remote_tool_over_the_wire(plugin):
         _handshake(consumer, provider_mesh)
         provider_mesh.start()
         consumer.start()
-        handle = provider_mesh.publish_tools([("echo", "echo it", schema_json)], _cb)
+        handle = provider_mesh.publish_tools(
+            [("echo", "echo it", schema_json)], _cb, allow_any_caller=True
+        )
 
         # The consumer's real gateway discovers the remote echo through the fold.
         gw = net.CapabilityGateway(consumer)
