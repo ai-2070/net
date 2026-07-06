@@ -32,7 +32,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
 
 use super::traits::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
 use crate::core::verification::{VerificationTier, VerifierRef};
@@ -83,25 +82,9 @@ impl AuthProvider for BearerAuth {
     }
 }
 
-/// One `(scheme, network)` pair a facilitator supports (`GET
-/// /supported` → `kinds[]`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct SupportedKind {
-    #[serde(rename = "x402Version")]
-    pub x402_version: u64,
-    pub scheme: String,
-    pub network: String,
-}
-
-/// The `GET /supported` response shape (spec-pinned).
-#[derive(Debug, Clone, Deserialize)]
-pub struct SupportedResponse {
-    pub kinds: Vec<SupportedKind>,
-    #[serde(default)]
-    pub extensions: Vec<String>,
-    #[serde(default)]
-    pub signers: std::collections::BTreeMap<String, Vec<String>>,
-}
+// The spec-pinned `/supported` shapes live with the config object so
+// offline validation compiles without this feature.
+pub use super::config::{SupportedKind, SupportedResponse};
 
 /// The HTTP facilitator client.
 pub struct HttpFacilitator {
@@ -154,6 +137,23 @@ impl HttpFacilitator {
         }
         serde_json::from_slice(&body)
             .map_err(|e| FacilitatorError::protocol(format!("/supported decode: {e}")))
+    }
+
+    /// Build from a [`FacilitatorConfig`], fetching `GET /supported`
+    /// and validating every enabled pair — the load-time gate the
+    /// config object promises ("fails loudly at load, not at first
+    /// payment"). The caller resolves `config.auth`'s secret ref into
+    /// `auth` through its own secret handling.
+    pub async fn from_config(
+        config: &super::config::FacilitatorConfig,
+        auth: std::sync::Arc<dyn AuthProvider>,
+    ) -> Result<Self, FacilitatorError> {
+        let client = Self::new(&config.endpoint, auth)?;
+        let supported = client.supported().await?;
+        config
+            .validate_against(&supported)
+            .map_err(|e| FacilitatorError::rejected(e.to_string()))?;
+        Ok(client)
     }
 
     /// Assert every configured `(scheme, network)` pair is offered.

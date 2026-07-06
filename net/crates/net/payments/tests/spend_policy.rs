@@ -166,6 +166,102 @@ async fn production_profile_requires_approval_and_the_operator_verb_unblocks() {
 }
 
 #[tokio::test]
+async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
+    // The P1 posture: explicit allowed_networks listing enables a real
+    // network; caps and approvals then work exactly as on mock.
+    let provider = EntityKeypair::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = default_mock_registry(provider.entity_id().clone());
+    registry.assets.push(AssetEntry {
+        id: AssetId::parse("eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+            .unwrap(),
+        x402_asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(),
+        decimals: 6,
+        symbol: "USDC".into(),
+        display_name: None,
+        equivalence_class: None,
+    });
+    let engine = SpendPolicyEngine::new(dir.path().join("policy.json"), SpendProfile::Production);
+    engine
+        .configure(|defaults, _| {
+            defaults.allowed_networks = vec!["eip155:8453".to_string()];
+            defaults.max_per_call = Some(AtomicAmount::from_u128(50_000));
+        })
+        .await
+        .unwrap();
+
+    let requirements = |amount: &str| {
+        X402Carry::author(&PaymentRequirements {
+            scheme: "exact".into(),
+            network: "eip155:8453".into(),
+            amount: amount.into(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(),
+            pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .unwrap()
+    };
+    let caller = EntityKeypair::generate();
+    let quote = |reqs, issued: u64| {
+        PaymentQuote::new(
+            provider.entity_id().clone(),
+            caller.entity_id().clone(),
+            CAPABILITY,
+            None,
+            reqs,
+            registry.reference().unwrap(),
+            issued,
+            issued + 60_000_000_000,
+        )
+    };
+
+    // Under the cap: allowed silently, even in production profile — the
+    // explicit network listing IS the operator's production consent.
+    let under = quote(requirements("10000"), NOW);
+    assert_eq!(
+        engine.check_and_reserve(&under, &registry, NOW).await.unwrap(),
+        SpendDecision::Allowed
+    );
+
+    // Over the cap: the structured approval hold, same as mock.
+    let over = quote(requirements("100000"), NOW + 1);
+    assert!(matches!(
+        engine.check_and_reserve(&over, &registry, NOW).await.unwrap(),
+        SpendDecision::RequiresPaymentApproval { .. }
+    ));
+
+    // A different real network stays denied: enablement is per network.
+    let mut registry_with_polygon = registry.clone();
+    registry_with_polygon.assets.push(AssetEntry {
+        id: AssetId::parse("eip155:137/erc20:0xusdcpolygon").unwrap(),
+        x402_asset: "0xusdcpolygon".into(),
+        decimals: 6,
+        symbol: "USDC".into(),
+        display_name: None,
+        equivalence_class: None,
+    });
+    let polygon = quote(
+        X402Carry::author(&PaymentRequirements {
+            scheme: "exact".into(),
+            network: "eip155:137".into(),
+            amount: "10000".into(),
+            asset: "0xusdcpolygon".into(),
+            pay_to: "0xpayee".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .unwrap(),
+        NOW + 2,
+    );
+    let decision = engine.check_and_reserve(&polygon, &registry_with_polygon, NOW).await.unwrap();
+    let SpendDecision::Denied { policy_reason } = decision else {
+        panic!("expected Denied for the unlisted network, got {decision:?}");
+    };
+    assert!(policy_reason.contains("not enabled"), "{policy_reason}");
+}
+
+#[tokio::test]
 async fn the_unsafe_flag_auto_allows_mock_in_production() {
     let provider = EntityKeypair::generate();
     let dir = tempfile::tempdir().unwrap();

@@ -158,6 +158,52 @@ pub struct RegistryRef {
     pub hash: String,
 }
 
+/// The P1 default registry: the mock asset plus the survey-verified real
+/// networks — Base Sepolia (the conformance target), Base (the first
+/// real-money target), and Solana SPL-USDC. Network enablement is
+/// registry entries + facilitator config, never code; participants pin
+/// or override this default.
+pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
+    let mut registry = default_mock_registry(signer);
+    registry.version = "net-default-1".to_string();
+    registry.assets.extend([
+        AssetEntry {
+            id: AssetId::parse(
+                "eip155:84532/erc20:0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            )
+            .unwrap_or_else(|_| unreachable!("static base-sepolia USDC id is valid CAIP-19")),
+            x402_asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string(),
+            decimals: 6,
+            symbol: "USDC".to_string(),
+            display_name: Some("USDC (Base Sepolia testnet)".to_string()),
+            equivalence_class: None,
+        },
+        AssetEntry {
+            id: AssetId::parse(
+                "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            )
+            .unwrap_or_else(|_| unreachable!("static base USDC id is valid CAIP-19")),
+            x402_asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(),
+            decimals: 6,
+            symbol: "USDC".to_string(),
+            display_name: Some("USDC (Base)".to_string()),
+            equivalence_class: None,
+        },
+        AssetEntry {
+            id: AssetId::parse(
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            )
+            .unwrap_or_else(|_| unreachable!("static solana USDC id is valid CAIP-19")),
+            x402_asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
+            symbol: "USDC".to_string(),
+            display_name: Some("USDC (Solana SPL)".to_string()),
+            equivalence_class: None,
+        },
+    ]);
+    registry
+}
+
 /// The P0 default registry: the mock network's asset only. Real networks
 /// enter in P1 as registry entries + facilitator config — config, not code.
 pub fn default_mock_registry(signer: EntityId) -> AssetRegistry {

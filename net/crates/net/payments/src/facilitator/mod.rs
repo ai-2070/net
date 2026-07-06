@@ -8,6 +8,7 @@
 //! - [`client`] — the real-facilitator HTTP client (P1; config, not code).
 
 pub mod client;
+pub mod config;
 pub mod mock;
 pub mod traits;
 

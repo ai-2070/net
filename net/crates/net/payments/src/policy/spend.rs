@@ -6,8 +6,11 @@
 //! agent UX and the decision lives in the shared locked store.
 //!
 //! Defaults are doctrine:
-//! - **Real networks deny.** The gate exists even though P0 is mock-only;
-//!   no configuration in P0 unlocks a non-mock network.
+//! - **Real networks are config-enabled, never ambient** (the P1
+//!   replacement of P0's hard deny): a real network spends only when
+//!   explicitly listed in the effective `allowed_networks` — an empty
+//!   allowlist enables nothing real, and neither profiles, unsafe
+//!   flags, nor approvals bypass network enablement. Default: deny.
 //! - **Mock auto-allows only under a dev/test profile or an explicit
 //!   unsafe flag** — demos must not train the policy path wrong. In
 //!   production profile, every mock spend needs an approval.
@@ -62,8 +65,9 @@ pub struct SpendLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_day: Option<AtomicAmount>,
     /// CAIP-2 networks spending is allowed on. For the mock network an
-    /// empty list defers to the profile gate; for real networks the P0
-    /// hard-deny precedes this list entirely.
+    /// empty list defers to the profile gate; a **real** network spends
+    /// only when explicitly listed here — network enablement has no
+    /// approval path around it.
     #[serde(default)]
     pub allowed_networks: Vec<String>,
     /// CAIP-19 asset ids spending is allowed in. Empty defers to the
@@ -208,17 +212,6 @@ impl SpendPolicyEngine {
             }
         };
         let is_mock = network.starts_with("mock:");
-        // P0 hard line: real networks deny, no approval path, regardless
-        // of profile, flags, or allowlists. P1 replaces this with network
-        // config — config, not code, but *this* line is the code that
-        // must be consciously replaced.
-        if !is_mock {
-            return Ok(SpendDecision::Denied {
-                policy_reason: format!(
-                    "network `{network}` is a real network; real-network spending is P1 — denied in P0"
-                ),
-            });
-        }
         let profile_admits_mock =
             matches!(self.profile, SpendProfile::DevTest) || self.unsafe_mock_auto_allow;
 
@@ -263,19 +256,40 @@ impl SpendPolicyEngine {
                 }
             };
 
+            // Real networks are config-enabled, never ambient — the
+            // network must be EXPLICITLY listed in the effective limits'
+            // allowed_networks (an empty allowlist enables nothing real),
+            // and neither profiles, unsafe flags, nor approvals bypass
+            // network enablement itself. This replaced P0's hard deny:
+            // config, not code — but default remains deny-all.
+            if !is_mock && !limits.allowed_networks.contains(&network) {
+                return SpendDecision::Denied {
+                    policy_reason: format!(
+                        "real network `{network}` is not enabled for `{capability}` — add it \
+                         to allowed_networks (plus a signer + facilitator config) to enable; \
+                         the default is deny"
+                    ),
+                };
+            }
+
             if !approved {
-                if !profile_admits_mock {
-                    return require(
-                        s,
-                        "mock-network auto-allow requires a dev/test profile or the explicit \
-                         unsafe flag; production profile requires approval per spend"
-                            .to_string(),
-                    );
-                }
-                if !limits.allowed_networks.is_empty()
-                    && !limits.allowed_networks.contains(&network)
-                {
-                    return require(s, format!("network `{network}` is not in allowed_networks"));
+                if is_mock {
+                    if !profile_admits_mock {
+                        return require(
+                            s,
+                            "mock-network auto-allow requires a dev/test profile or the explicit \
+                             unsafe flag; production profile requires approval per spend"
+                                .to_string(),
+                        );
+                    }
+                    if !limits.allowed_networks.is_empty()
+                        && !limits.allowed_networks.contains(&network)
+                    {
+                        return require(
+                            s,
+                            format!("network `{network}` is not in allowed_networks"),
+                        );
+                    }
                 }
                 if !limits.allowed_assets.is_empty() && !limits.allowed_assets.contains(&asset_caip)
                 {
