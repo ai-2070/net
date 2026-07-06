@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_SDK_PLAN.md
+  s_928ee85c6ffc0a::t_a635e5aee50e66 106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "06e515ea5ab409609b9aff4dcbdb416a30c39125",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
