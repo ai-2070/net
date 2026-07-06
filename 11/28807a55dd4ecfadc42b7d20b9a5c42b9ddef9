@@ -1,0 +1,23 @@
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_2ce1bbf7d954a5::t_3fe42bebc243f1 225
+  s_2ce1bbf7d954a5::t_ed0fdf634d74b6 257,263
+  s_2ce1bbf7d954a5::t_e46cc18e3b14e5 193-203
+  s_2ce1bbf7d954a5::t_41195af389b0e1 497-521
+  s_2ce1bbf7d954a5::t_35b9d5a2301ce9 234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1128807a55dd4ecfadc42b7d20b9a5c42b9ddef9",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
