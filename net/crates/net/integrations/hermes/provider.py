@@ -25,6 +25,8 @@ import logging
 import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .federate import FEDERATED_TOOLSET
+
 logger = logging.getLogger(__name__)
 
 # A local tool descriptor: (name, description|None, input_schema as a dict or a
@@ -168,8 +170,11 @@ def _deny_body(name: str, status: str, message: str) -> str:
 # ---------------------------------------------------------------------------
 
 #: Toolsets this plugin publishes onto the mesh itself — never republish them
-#: (a mesh capability re-announced as a local tool would loop).
-_OWN_TOOLSETS = frozenset({"net", "net-pinned"})
+#: (a mesh capability re-announced as a local tool would loop). Includes the
+#: federated toolset: a federated proxy tool re-published as this node's OWN
+#: capability would be re-federated by peers under this node's identity
+#: (net_mesh__a__net_mesh__b__…) — exactly the loop this set exists to prevent.
+_OWN_TOOLSETS = frozenset({"net", "net-pinned", FEDERATED_TOOLSET})
 
 #: Name-substring heuristic for "dangerous" tools when Hermes exposes no
 #: explicit per-tool approval flag. Fail-safe: an *unclassified* tool is treated

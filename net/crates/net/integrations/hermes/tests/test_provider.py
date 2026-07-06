@@ -126,6 +126,40 @@ def test_name_heuristic_classifier(plugin):
     assert d("frobnicate") is True  # unknown → gated (fail-safe)
 
 
+def test_list_tools_skips_own_and_federated_toolsets(plugin, monkeypatch):
+    """The production list_tools seam must skip every toolset this plugin puts
+    on the mesh itself — including the federated proxies. Republishing a
+    federated tool as this node's OWN capability would let peers re-federate it
+    under this node's identity (net_mesh__a__net_mesh__b__…): a loop."""
+    import sys
+    import types
+
+    class Entry:
+        def __init__(self, toolset):
+            self.toolset = toolset
+            self.schema = {"parameters": {"type": "object"}}
+            self.description = "d"
+
+    reg = types.SimpleNamespace(
+        tools={
+            "local_tool": Entry("workspace"),
+            "net_join": Entry("net"),
+            "pinned_x": Entry("net-pinned"),
+            "net_mesh__b__terminal_run": Entry(plugin.federate.FEDERATED_TOOLSET),
+        }
+    )
+    tools_mod = types.ModuleType("tools")
+    registry_mod = types.ModuleType("tools.registry")
+    registry_mod.registry = reg
+    tools_mod.registry = registry_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
+
+    list_tools, _dispatch, _approve, _dangerous = plugin.provider._hermes_adapters()
+    names = [name for name, _desc, _schema in list_tools()]
+    assert names == ["local_tool"]
+
+
 # ---------------------------------------------------------------------------
 # Publish orchestration (real isolated node, no peer).
 # ---------------------------------------------------------------------------
