@@ -866,6 +866,7 @@ else:
 # `Identity` handles; private seeds never cross into Python.
 try:
     from ._net import (
+        DeviceEnrollment,
         DeviceRecord,
         InviteToken,
         JoinOutcome,
@@ -879,6 +880,7 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "DeviceEnrollment",
             "DeviceRecord",
             "InviteToken",
             "JoinOutcome",

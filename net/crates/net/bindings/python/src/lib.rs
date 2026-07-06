@@ -3245,6 +3245,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<enrollment::PyDeviceRecord>()?;
         m.add_class::<enrollment::PyOperatorEnrollment>()?;
         m.add_class::<enrollment::PyEnrollmentServeHandle>()?;
+        m.add_class::<enrollment::PyDeviceEnrollment>()?;
         m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
     }
     #[cfg(feature = "cortex")]

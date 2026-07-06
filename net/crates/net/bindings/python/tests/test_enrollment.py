@@ -158,6 +158,47 @@ def test_fingerprint_is_stable_and_grouped(tmp_path):
     assert len(fa) == 19 and fa.count("-") == 3
 
 
+def test_device_enrollment_persists_and_reloads_without_re_pairing(tmp_path):
+    op, root = _operator(tmp_path)
+    invite = op.invite("relay://rv", 300)
+    device = net.Identity.generate()
+    chain = op.approve(net.JoinRequest.create(device, "pc", [], invite), 3600)
+
+    de = net.DeviceEnrollment(device, chain, 1_700_000_000)
+    path = str(tmp_path / "device-enrollment.json")
+    de.save(path)
+
+    # "Restart": reload from disk — no re-pairing.
+    loaded = net.DeviceEnrollment.load(path)
+    assert loaded is not None
+    assert loaded.device.entity_id == device.entity_id
+    assert loaded.root == root.entity_id
+    reg = net.RevocationRegistry()
+    assert loaded.is_valid(reg) is True
+    # The reloaded device still holds its key: extend to a gateway + verify.
+    gateway = net.Identity.generate()
+    gw = loaded.chain.extend_to_subagent(loaded.device, gateway.entity_id)
+    assert gw.verify(gateway.entity_id, loaded.root, reg) is True
+
+
+def test_device_enrollment_expiry_and_renewal(tmp_path):
+    import time
+
+    op, _root = _operator(tmp_path)
+    invite = op.invite("relay://rv", 300)
+    device = net.Identity.generate()
+    chain = op.approve(net.JoinRequest.create(device, "pc", [], invite), 3600)
+    now = int(time.time())
+    de = net.DeviceEnrollment(device, chain, now)
+    assert de.expires_at > now
+    assert de.needs_renewal(2 * 3600, now) is True
+    assert de.needs_renewal(60, now) is False
+
+
+def test_device_enrollment_load_missing_is_none(tmp_path):
+    assert net.DeviceEnrollment.load(str(tmp_path / "nope.json")) is None
+
+
 def test_live_enrollment_over_the_mesh(tmp_path):
     # End-to-end over real UDP loopback: an operator node serves enrollment; a
     # fresh device node joins over the wire and gets its root -> device chain.

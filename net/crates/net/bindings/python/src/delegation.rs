@@ -168,6 +168,12 @@ impl PyDelegationChain {
     pub(crate) fn from_inner(inner: DelegationChain) -> Self {
         Self { inner }
     }
+
+    /// A clone of the underlying SDK chain — used by `DeviceEnrollment` to
+    /// bundle a chain handed in from Python.
+    pub(crate) fn inner_chain(&self) -> DelegationChain {
+        self.inner.clone()
+    }
 }
 
 #[pymethods]

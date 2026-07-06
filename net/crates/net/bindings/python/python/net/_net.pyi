@@ -1207,6 +1207,43 @@ class DeviceRecord:
     @property
     def is_revoked(self) -> bool: ...
 
+class DeviceEnrollment:
+    """A device's persisted enrollment — its own key + the ``root -> device``
+    grant it received — so it survives restarts without re-pairing. The device
+    seed stays in Rust (H8); :attr:`device` hands back an opaque ``Identity``."""
+
+    def __init__(
+        self, device: Identity, chain: DelegationChain, enrolled_at: int
+    ) -> None: ...
+    @staticmethod
+    def load(path: str) -> Optional["DeviceEnrollment"]:
+        """Load a persisted enrollment. ``None`` if none is saved yet; raises on
+        a corrupt file."""
+        ...
+    def save(self, path: str) -> None:
+        """Persist to ``path`` (0600, atomic). Overwrites — e.g. after renewal."""
+        ...
+    def is_valid(self, revocation: RevocationRegistry, skew_seconds: int = 0) -> bool:
+        """Whether the grant still verifies + is unexpired. An empty registry is
+        fine device-side (the provider enforces revocation on invoke)."""
+        ...
+    def needs_renewal(self, window_seconds: int, now: int) -> bool:
+        """Whether the grant is within ``window_seconds`` of expiry at ``now``."""
+        ...
+    @property
+    def device(self) -> Identity:
+        """The device's opaque ``Identity`` handle — extend the grant to a
+        gateway with it."""
+        ...
+    @property
+    def chain(self) -> DelegationChain: ...
+    @property
+    def root(self) -> bytes: ...
+    @property
+    def enrolled_at(self) -> int: ...
+    @property
+    def expires_at(self) -> int: ...
+
 class OperatorEnrollment:
     """The operator side: mint invites, approve join requests into
     ``root -> device`` delegations, and manage the device inventory."""

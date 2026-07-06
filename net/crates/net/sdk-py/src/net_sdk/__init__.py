@@ -351,6 +351,7 @@ else:
 # the wheel was built with the `delegation` feature (the default one is).
 try:
     from net_sdk.enrollment import (  # noqa: E402
+        DeviceEnrollment,
         DeviceRecord,
         InviteToken,
         JoinOutcome,
@@ -362,6 +363,7 @@ except ImportError:  # pragma: no cover - minimal build
     pass
 else:
     __all__ += [
+        "DeviceEnrollment",
         "DeviceRecord",
         "InviteToken",
         "JoinOutcome",

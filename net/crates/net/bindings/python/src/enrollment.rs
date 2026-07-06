@@ -29,17 +29,29 @@ use pyo3::types::PyBytes;
 use tokio::runtime::Runtime;
 
 use net::adapter::net::channel::ChannelConfigRegistry;
+use net::adapter::net::identity::TokenCache;
 use net::adapter::net::MeshNode;
 use net_sdk::delegation::DEFAULT_DELEGATION_DEPTH;
 use net_sdk::devices::DeviceRecord;
-use net_sdk::enrollment::{fingerprint as sdk_fingerprint, InviteToken, JoinOutcome, JoinRequest};
+use net_sdk::enrollment::{
+    fingerprint as sdk_fingerprint, DeviceEnrollment, InviteToken, JoinOutcome, JoinRequest,
+};
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::operator::OperatorEnrollment;
 use net_sdk::Identity as SdkIdentity;
 
-use crate::delegation::{entity_id_from_bytes, to_sdk, PyDelegationChain};
+use crate::delegation::{entity_id_from_bytes, to_sdk, PyDelegationChain, PyRevocationRegistry};
 use crate::identity::Identity;
+
+/// Rebuild a Python `Identity` handle from an SDK identity — the keypair `Arc`
+/// is shared; a fresh token cache is attached. The private seed stays in Rust.
+fn to_py_identity(sdk: &SdkIdentity) -> Identity {
+    Identity {
+        keypair: sdk.keypair().clone(),
+        cache: Arc::new(TokenCache::new()),
+    }
+}
 
 fn enroll_err(msg: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(msg.to_string())
@@ -451,6 +463,96 @@ impl PyOperatorEnrollment {
             .into_iter()
             .map(|inner| PyInviteToken { inner })
             .collect()
+    }
+}
+
+/// A device's **persisted** enrollment — its own key + the `root → device`
+/// grant it received — so it survives restarts without re-pairing. The device
+/// seed stays in Rust (H8); [`Self::device`] hands back an opaque `Identity`.
+#[pyclass(name = "DeviceEnrollment", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyDeviceEnrollment {
+    inner: DeviceEnrollment,
+}
+
+#[pymethods]
+impl PyDeviceEnrollment {
+    /// Bundle a device `Identity` handle with the `root → device` chain it
+    /// received from `join`, plus the unix-seconds it enrolled.
+    #[new]
+    fn new(device: &Identity, chain: &PyDelegationChain, enrolled_at: u64) -> Self {
+        Self {
+            inner: DeviceEnrollment::new(to_sdk(device), chain.inner_chain(), enrolled_at),
+        }
+    }
+
+    /// Load a persisted enrollment from `path`. `None` if none is saved yet;
+    /// raises on a corrupt file.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: &str) -> PyResult<Option<Self>> {
+        let owned = path.to_string();
+        let loaded = py
+            .detach(|| DeviceEnrollment::load(&owned))
+            .map_err(enroll_err)?;
+        Ok(loaded.map(|inner| Self { inner }))
+    }
+
+    /// Persist to `path` (`0600`, atomic). Overwrites — e.g. after a renewal.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let owned = path.to_string();
+        py.detach(|| self.inner.save(&owned)).map_err(enroll_err)
+    }
+
+    /// The device's opaque `Identity` handle (its private seed stays in Rust) —
+    /// use it to extend the grant to a gateway.
+    #[getter]
+    fn device(&self) -> Identity {
+        to_py_identity(self.inner.device())
+    }
+
+    /// The `root → device` delegation chain.
+    #[getter]
+    fn chain(&self) -> PyDelegationChain {
+        PyDelegationChain::from_inner(self.inner.chain().clone())
+    }
+
+    /// The mesh root the grant anchors at (32 bytes).
+    #[getter]
+    fn root<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.inner.root().as_bytes())
+    }
+
+    #[getter]
+    fn enrolled_at(&self) -> u64 {
+        self.inner.enrolled_at()
+    }
+
+    /// Unix-seconds the grant expires.
+    #[getter]
+    fn expires_at(&self) -> u64 {
+        self.inner.expires_at()
+    }
+
+    /// Whether the grant still verifies + is unexpired. Pass a
+    /// `RevocationRegistry` (an empty one is fine device-side — the provider
+    /// enforces revocation on invoke).
+    #[pyo3(signature = (revocation, skew_seconds=0))]
+    fn is_valid(&self, revocation: &PyRevocationRegistry, skew_seconds: u64) -> bool {
+        self.inner.is_valid(&revocation.inner, skew_seconds)
+    }
+
+    /// Whether the grant is within `window_seconds` of expiry at `now` (unix
+    /// secs) — the trigger for silent renewal.
+    fn needs_renewal(&self, window_seconds: u64, now: u64) -> bool {
+        self.inner.needs_renewal(window_seconds, now)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DeviceEnrollment(device=0x{}, expires_at={})",
+            hex::encode(self.inner.device().entity_id().as_bytes()),
+            self.inner.expires_at()
+        )
     }
 }
 

@@ -32,6 +32,7 @@ one is).
 """
 
 from net import (
+    DeviceEnrollment,
     DeviceRecord,
     InviteToken,
     JoinOutcome,
@@ -41,6 +42,7 @@ from net import (
 )
 
 __all__ = [
+    "DeviceEnrollment",
     "DeviceRecord",
     "InviteToken",
     "JoinOutcome",
