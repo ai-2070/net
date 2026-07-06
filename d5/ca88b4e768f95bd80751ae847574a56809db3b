@@ -1,0 +1,22 @@
+net/crates/net/sdk/src/a2a.rs
+  s_ecf38b21f410fb::t_1703314209c253 321
+  s_ecf38b21f410fb::t_b6a69b89d87698 295-305
+  s_ecf38b21f410fb::t_655bb74e657f96 589-616
+  s_ecf38b21f410fb::t_67e1363b5dd5e3 387-415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d5ca88b4e768f95bd80751ae847574a56809db3b",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
