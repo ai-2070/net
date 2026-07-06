@@ -20,16 +20,23 @@
 //! a follow-up on the SDK `Mesh` handle.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use tokio::runtime::Runtime;
 
+use net::adapter::net::channel::ChannelConfigRegistry;
+use net::adapter::net::MeshNode;
 use net_sdk::delegation::DEFAULT_DELEGATION_DEPTH;
 use net_sdk::devices::DeviceRecord;
 use net_sdk::enrollment::{fingerprint as sdk_fingerprint, InviteToken, JoinOutcome, JoinRequest};
+use net_sdk::mesh::Mesh;
+use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::operator::OperatorEnrollment;
+use net_sdk::Identity as SdkIdentity;
 
 use crate::delegation::{entity_id_from_bytes, to_sdk, PyDelegationChain};
 use crate::identity::Identity;
@@ -313,7 +320,16 @@ impl PyDeviceRecord {
 /// authority + device registry + revocation store for one mesh root.
 #[pyclass(name = "OperatorEnrollment", skip_from_py_object)]
 pub struct PyOperatorEnrollment {
-    inner: OperatorEnrollment,
+    inner: Arc<OperatorEnrollment>,
+}
+
+impl PyOperatorEnrollment {
+    /// Shared handle to the underlying facade — used by the live
+    /// `NetMesh.serve_enrollment_auto` bridge to hand the coordinator to the
+    /// nRPC handler.
+    pub(crate) fn arc(&self) -> Arc<OperatorEnrollment> {
+        self.inner.clone()
+    }
 }
 
 #[pymethods]
@@ -323,11 +339,11 @@ impl PyOperatorEnrollment {
     #[new]
     fn new(root: &Identity, registry_path: &str, revocation_path: &str) -> Self {
         Self {
-            inner: OperatorEnrollment::new(
+            inner: Arc::new(OperatorEnrollment::new(
                 to_sdk(root),
                 PathBuf::from(registry_path),
                 PathBuf::from(revocation_path),
-            ),
+            )),
         }
     }
 
@@ -337,7 +353,9 @@ impl PyOperatorEnrollment {
     #[staticmethod]
     fn with_default_paths(root: &Identity) -> PyResult<Self> {
         OperatorEnrollment::with_default_paths(to_sdk(root))
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner: Arc::new(inner),
+            })
             .ok_or_else(|| enroll_err("no default store paths could be resolved"))
     }
 
@@ -433,5 +451,91 @@ impl PyOperatorEnrollment {
             .into_iter()
             .map(|inner| PyInviteToken { inner })
             .collect()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Live mesh bridge — the pieces the `NetMesh` PyO3 methods call to drive the
+// SDK `Mesh` over the raw `MeshNode` the Python binding holds. The wire
+// orchestration lives once in the SDK (`net_sdk::mesh_enroll`); this just wraps
+// the node in a `Mesh` and forwards (bridge doctrine H2).
+// -----------------------------------------------------------------------------
+
+/// Wrap a raw node in an SDK `Mesh` sharing the same live node. A fresh channel
+/// registry is fine — nRPC dispatch lives on the node; the registry is
+/// auxiliary bookkeeping the served handle keeps alive.
+fn mesh_over(node: Arc<MeshNode>, identity: Option<SdkIdentity>) -> Mesh {
+    Mesh::from_node_arc(node, Arc::new(ChannelConfigRegistry::new()), identity)
+}
+
+/// The invite `rendezvous` locator for `node` (addr + Noise pubkey + node id).
+pub(crate) fn mesh_rendezvous_string(node: Arc<MeshNode>) -> String {
+    mesh_over(node, None).rendezvous_string()
+}
+
+/// Device-side: enroll `device`'s key into the mesh named by `invite` over the
+/// live `node`, returning the verified `root -> device` chain. Releases the GIL
+/// for the network round-trip.
+pub(crate) fn mesh_join(
+    py: Python<'_>,
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    device: &Identity,
+    invite: String,
+    name: String,
+    tags: Vec<String>,
+) -> PyResult<PyDelegationChain> {
+    let mesh = mesh_over(node, Some(to_sdk(device)));
+    let chain = py
+        .detach(move || runtime.block_on(mesh.join(&invite, name, tags)))
+        .map_err(enroll_err)?;
+    Ok(PyDelegationChain::from_inner(chain))
+}
+
+/// Operator-side: serve enrollment on the live `node` (auto — the invite is the
+/// authorization). Returns a handle that must be held to keep the service open.
+pub(crate) fn mesh_serve_enrollment_auto(
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    operator: Arc<OperatorEnrollment>,
+    grant_ttl: Duration,
+    max_depth: u8,
+) -> PyResult<PyEnrollmentServeHandle> {
+    let mesh = mesh_over(node, None);
+    // `serve_rpc` spawns a bridge task, so it needs a runtime context.
+    let _guard = runtime.enter();
+    let handle = mesh
+        .serve_enrollment_auto(operator, grant_ttl, max_depth)
+        .map_err(enroll_err)?;
+    Ok(PyEnrollmentServeHandle {
+        inner: Some((mesh, handle)),
+    })
+}
+
+/// Keeps a served enrollment service alive. Dropping it (or calling
+/// [`Self::stop`]) unregisters the service.
+#[pyclass(name = "EnrollmentServeHandle", skip_from_py_object)]
+pub struct PyEnrollmentServeHandle {
+    // The `Mesh` holds the channel registry the service registered against and
+    // the `ServeHandle` holds the dispatcher registration — both must outlive
+    // the service.
+    inner: Option<(Mesh, ServeHandle)>,
+}
+
+#[pymethods]
+impl PyEnrollmentServeHandle {
+    /// Stop serving enrollment (unregister the service).
+    fn stop(&mut self) {
+        self.inner = None;
+    }
+
+    /// Whether the service is still registered.
+    #[getter]
+    fn serving(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("EnrollmentServeHandle(serving={})", self.inner.is_some())
     }
 }

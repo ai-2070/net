@@ -673,6 +673,29 @@ class NetMesh:
         """Start the receive loop, heartbeats, and router."""
         ...
 
+    def rendezvous_string(self) -> str:
+        """The invite ``rendezvous`` locator for this node (address + Noise
+        static key + node id), to pass to ``OperatorEnrollment.invite``.
+        (Requires the ``delegation`` feature.)"""
+        ...
+    def join(
+        self, device: Identity, invite: str, name: str, tags: List[str]
+    ) -> DelegationChain:
+        """Device-side enrollment: enroll ``device``'s key into the mesh named
+        by the ``invite`` string, returning the verified ``root -> device``
+        chain. This node must be ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def serve_enrollment_auto(
+        self,
+        operator: "OperatorEnrollment",
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+    ) -> "EnrollmentServeHandle":
+        """Operator-side: serve enrollment on this node (auto — the invite is
+        the authorization). Hold the returned handle to keep the service open.
+        This node must be ``start()``ed. (Requires ``delegation``.)"""
+        ...
+
     def push_to(self, peer_addr: str, json: str) -> bool:
         """Send a raw JSON payload to a direct peer address."""
         ...
@@ -1231,6 +1254,17 @@ class OperatorEnrollment:
     @property
     def root_id(self) -> bytes: ...
     def root_fingerprint(self) -> str: ...
+
+class EnrollmentServeHandle:
+    """Keeps a served enrollment service alive (returned by
+    ``NetMesh.serve_enrollment_auto``). Dropping it or calling :meth:`stop`
+    unregisters the service."""
+
+    def stop(self) -> None:
+        """Stop serving enrollment (unregister the service)."""
+        ...
+    @property
+    def serving(self) -> bool: ...
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed

@@ -140,7 +140,11 @@ mcp = ["consent", "dep:net-mcp"]
 # identity + token-chain surface `delegation` composes), which `consent`
 # alone does not activate. H8-clean: takes/returns opaque `Identity`
 # handles + public entity-ids; private seeds never cross into Python.
-delegation = ["net", "dep:net-sdk", "net-sdk/net"]
+# `net-sdk/cortex` brings the SDK's nRPC surface (`net_sdk::mesh_rpc` /
+# `mesh_enroll`) so the live enrollment bridge (`NetMesh.join` /
+# `serve_enrollment_auto`) compiles; the default wheel already enables the
+# same core `netdb` / `redex-disk` features, so this is marginal there.
+delegation = ["net", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

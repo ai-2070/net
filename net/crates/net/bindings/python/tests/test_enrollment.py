@@ -156,3 +156,46 @@ def test_fingerprint_is_stable_and_grouped(tmp_path):
     assert fa == net.fingerprint(a.entity_id)
     assert fa != net.fingerprint(b.entity_id)
     assert len(fa) == 19 and fa.count("-") == 3
+
+
+def test_live_enrollment_over_the_mesh(tmp_path):
+    # End-to-end over real UDP loopback: an operator node serves enrollment; a
+    # fresh device node joins over the wire and gets its root -> device chain.
+    pytest.importorskip("net._net")
+
+    psk = "37" * 32  # 32-byte PSK as hex
+
+    # nRPC reply channels are dynamic per-caller-origin, so enrollment needs
+    # permissive_channels (the Rust default; the Python default is strict).
+    root = net.Identity.generate()
+    op_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    op_mesh.start()
+    op = net.OperatorEnrollment(
+        root, str(tmp_path / "d.json"), str(tmp_path / "r.json")
+    )
+    handle = op_mesh.serve_enrollment_auto(op, 3600)
+    assert handle.serving is True
+
+    invite = op.invite(op_mesh.rendezvous_string(), 300)
+
+    device = net.Identity.generate()
+    dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    dev_mesh.start()
+    try:
+        chain = dev_mesh.join(device, invite.encode(), "pc", ["region:office"])
+        assert chain.leaf == device.entity_id
+        assert chain.root == root.entity_id
+
+        devs = op.devices()
+        assert len(devs) == 1
+        assert devs[0].name == "pc"
+        assert devs[0].device == device.entity_id
+
+        handle.stop()
+        assert handle.serving is False
+    finally:
+        for m in (dev_mesh, op_mesh):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass

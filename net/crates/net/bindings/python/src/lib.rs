@@ -1446,6 +1446,64 @@ mod mesh_bindings {
             Ok(())
         }
 
+        /// The invite `rendezvous` locator for this node (address + Noise
+        /// static key + node id), to pass to `OperatorEnrollment.invite`.
+        /// Devices dial it via `join`. (Hermes V2 Phase 1.)
+        #[cfg(feature = "delegation")]
+        fn rendezvous_string(&self) -> PyResult<String> {
+            Ok(crate::enrollment::mesh_rendezvous_string(
+                self.node_arc_clone()?,
+            ))
+        }
+
+        /// Device-side enrollment: enroll `device`'s key into the mesh named by
+        /// the `invite` string, under `name` + `tags`, returning the verified
+        /// `root -> device` `DelegationChain`. This node must be `start()`ed and
+        /// built with `permissive_channels=True` (the enrollment nRPC uses
+        /// dynamic per-caller reply channels the strict registry rejects).
+        #[cfg(feature = "delegation")]
+        fn join(
+            &self,
+            py: Python<'_>,
+            device: &crate::identity::Identity,
+            invite: &str,
+            name: &str,
+            tags: Vec<String>,
+        ) -> PyResult<crate::delegation::PyDelegationChain> {
+            crate::enrollment::mesh_join(
+                py,
+                self.node_arc_clone()?,
+                &self.runtime,
+                device,
+                invite.to_string(),
+                name.to_string(),
+                tags,
+            )
+        }
+
+        /// Operator-side: serve enrollment on this node (auto — the invite is
+        /// the authorization). Hold the returned handle for as long as
+        /// enrollment should stay open. This node must be `start()`ed and built
+        /// with `permissive_channels=True` (the enrollment nRPC uses dynamic
+        /// per-caller reply channels the strict registry rejects).
+        #[cfg(feature = "delegation")]
+        #[pyo3(signature = (operator, grant_ttl_seconds, max_depth=None))]
+        fn serve_enrollment_auto(
+            &self,
+            operator: &crate::enrollment::PyOperatorEnrollment,
+            grant_ttl_seconds: u64,
+            max_depth: Option<u8>,
+        ) -> PyResult<crate::enrollment::PyEnrollmentServeHandle> {
+            let depth = max_depth.unwrap_or(net_sdk::delegation::DEFAULT_DELEGATION_DEPTH);
+            crate::enrollment::mesh_serve_enrollment_auto(
+                self.node_arc_clone()?,
+                &self.runtime,
+                operator.arc(),
+                std::time::Duration::from_secs(grant_ttl_seconds),
+                depth,
+            )
+        }
+
         /// Send raw JSON to a direct peer.
         fn push_to(&self, peer_addr: &str, json: &str) -> PyResult<bool> {
             let node = self.get_node()?;
@@ -3186,6 +3244,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<enrollment::PyJoinOutcome>()?;
         m.add_class::<enrollment::PyDeviceRecord>()?;
         m.add_class::<enrollment::PyOperatorEnrollment>()?;
+        m.add_class::<enrollment::PyEnrollmentServeHandle>()?;
         m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
     }
     #[cfg(feature = "cortex")]
