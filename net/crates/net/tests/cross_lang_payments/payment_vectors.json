@@ -63,6 +63,14 @@
     [
       "mock:net/token:musd",
       "mock:net/token:musd/1"
+    ],
+    [
+      "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "eip155:84532/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    ],
+    [
+      "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     ]
   ],
   "caip_vectors": [
@@ -72,7 +80,17 @@
       "valid": true
     },
     {
+      "input": "eip155:84532",
+      "kind": "chain",
+      "valid": true
+    },
+    {
       "input": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
       "kind": "chain",
       "valid": true
     },

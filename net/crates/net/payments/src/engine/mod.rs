@@ -198,6 +198,12 @@ struct EngineState {
     /// payload content hash → the one quote it satisfies.
     #[serde(default)]
     consumed: BTreeMap<String, String>,
+    /// `network|transaction` → the one quote that settlement satisfies.
+    /// The facilitator-receipt-replay guard: a facilitator (or a replayed
+    /// response) presenting the same transaction for a second quote is
+    /// invalidated — one on-chain settlement never serves twice.
+    #[serde(default)]
+    consumed_transactions: BTreeMap<String, String>,
     /// quote_id → lifecycle record.
     #[serde(default)]
     quotes: BTreeMap<String, QuoteRecord>,
@@ -466,6 +472,8 @@ impl PaymentEngine {
             None => required.clone(),
         };
         let transaction = settle.response.view().transaction.clone();
+        let settle_network = settle.response.view().network.clone();
+        let quoted_network = quote.requirements.view().network.clone();
         let tier = settle.tier;
 
         let quote_id = quote.quote_id.clone();
@@ -473,6 +481,72 @@ impl PaymentEngine {
         let (decision, fresh_billing) = mutate_json::<EngineState, Completion, _>(
             &self.state_path,
             |s| {
+            // Facilitator-answer sanity, before any amount reasoning:
+            // [a] the settlement must be on the QUOTED network — a
+            //     receipt from some other chain is worth nothing here;
+            // [b] the transaction must not already satisfy another quote
+            //     (receipt replay: one on-chain settlement, one serve).
+            // Both are misbehavior-of-the-money-machinery: invalidate
+            // and freeze, never a retryable shrug.
+            if settle_network != quoted_network {
+                let rec = s
+                    .quotes
+                    .get_mut(&quote_id)
+                    .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
+                rec.in_flight = false;
+                let ev = self.build_event(
+                    rec,
+                    &quote_id,
+                    Some(transaction.clone()),
+                    tier,
+                    VerificationStatus::Invalidated { reason: InvalidationReason::Rejected },
+                    now_ns,
+                    &[(
+                        "network_mismatch".to_string(),
+                        serde_json::Value::String(settle_network.clone()),
+                    )],
+                )?;
+                rec.chain.push(ev);
+                rec.frozen = Some(format!(
+                    "settlement reported on `{settle_network}`, quote is on `{quoted_network}`"
+                ));
+                return Ok((
+                    PaymentDecision::Invalidated { reason: InvalidationReason::Rejected },
+                    None,
+                ));
+            }
+            let tx_key = format!("{quoted_network}|{transaction}");
+            match s.consumed_transactions.get(&tx_key) {
+                Some(owner) if *owner != quote_id => {
+                    let rec = s
+                        .quotes
+                        .get_mut(&quote_id)
+                        .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
+                    rec.in_flight = false;
+                    let ev = self.build_event(
+                        rec,
+                        &quote_id,
+                        Some(transaction.clone()),
+                        tier,
+                        VerificationStatus::Invalidated { reason: InvalidationReason::Replay },
+                        now_ns,
+                        &[(
+                            "transaction_already_satisfies".to_string(),
+                            serde_json::Value::String(owner.clone()),
+                        )],
+                    )?;
+                    rec.chain.push(ev);
+                    rec.frozen = Some("settlement transaction replayed across quotes".to_string());
+                    return Ok((
+                        PaymentDecision::Invalidated { reason: InvalidationReason::Replay },
+                        None,
+                    ));
+                }
+                _ => {
+                    s.consumed_transactions.insert(tx_key, quote_id.clone());
+                }
+            }
+
             let rec = s
                 .quotes
                 .get_mut(&quote_id)

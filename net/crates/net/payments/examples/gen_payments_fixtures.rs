@@ -289,7 +289,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
         "caip_vectors": [
             {"input": "eip155:8453", "kind": "chain", "valid": true},
+            {"input": "eip155:84532", "kind": "chain", "valid": true},
             {"input": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "kind": "chain", "valid": true},
+            {"input": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "kind": "chain", "valid": true},
             {"input": "mock:net", "kind": "chain", "valid": true},
             {"input": "EIP155:8453", "kind": "chain", "valid": false},
             {"input": "eip155", "kind": "chain", "valid": false},
@@ -307,6 +309,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             ["eip155:8453/erc20:0xabc", "eip155:8453/erc20:0xABC"],
             ["eip155:1/erc20:0xabc", "eip155:8453/erc20:0xabc"],
             ["mock:net/token:musd", "mock:net/token:musd/1"],
+            // The P1 mainnet/testnet trap: the same contract address on
+            // Base vs Base Sepolia is two different assets.
+            [
+                "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "eip155:84532/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            ],
+            // Solana mainnet vs devnet genesis references.
+            [
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            ],
         ],
         "atomic_amount_vectors": [
             {"input": "0", "valid": true},
