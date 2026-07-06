@@ -18,6 +18,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use net::adapter::net::identity::EntityKeypair;
 use net_payments::core::billing_event::BillingEvent;
+use net_payments::core::canonical::SignedEnvelope;
 use net_payments::core::canonical::{canonical_bytes, signed_payload_bytes};
 use net_payments::core::quote::PaymentQuote;
 use net_payments::core::registry::{default_mock_registry, AssetRegistry};
@@ -25,7 +26,6 @@ use net_payments::core::settlement_ref::SettlementRef;
 use net_payments::core::terms::PricingTerms;
 use net_payments::core::units::AtomicAmount;
 use net_payments::core::verification::{check_chain, VerificationEvent};
-use net_payments::core::canonical::SignedEnvelope;
 use net_payments::x402::caip::{AssetId, ChainId};
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
@@ -40,8 +40,8 @@ fn fixture_dir() -> PathBuf {
 
 fn vectors() -> Value {
     let path = fixture_dir().join("payment_vectors.json");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("fixture parses")
 }
 
@@ -164,11 +164,14 @@ fn verification_chain_links() {
 #[test]
 fn x402_fixtures_are_byte_preserved() {
     let v = vectors();
-    for entry in v["x402_byte_preservation"].as_array().expect("preservation array") {
+    for entry in v["x402_byte_preservation"]
+        .as_array()
+        .expect("preservation array")
+    {
         let name = entry["name"].as_str().expect("name");
         let file = fixture_dir().join(entry["file"].as_str().expect("file"));
-        let file_bytes = std::fs::read(&file)
-            .unwrap_or_else(|e| panic!("{name}: read {}: {e}", file.display()));
+        let file_bytes =
+            std::fs::read(&file).unwrap_or_else(|e| panic!("{name}: read {}: {e}", file.display()));
         let b64 = entry["base64"].as_str().expect("base64");
         assert_eq!(
             BASE64.decode(b64).expect("decodes"),
@@ -181,11 +184,14 @@ fn x402_fixtures_are_byte_preserved() {
             "payment_requirements_v2" => {
                 let carry: X402Carry<PaymentRequirements> =
                     X402Carry::from_bytes(file_bytes.clone()).expect("carry parses");
-                assert_eq!(carry.bytes(), &file_bytes[..], "{name}: carry mutated bytes");
-                let through_serde: X402Carry<PaymentRequirements> = serde_json::from_str(
-                    &serde_json::to_string(&carry).expect("carry serializes"),
-                )
-                .expect("carry round-trips");
+                assert_eq!(
+                    carry.bytes(),
+                    &file_bytes[..],
+                    "{name}: carry mutated bytes"
+                );
+                let through_serde: X402Carry<PaymentRequirements> =
+                    serde_json::from_str(&serde_json::to_string(&carry).expect("carry serializes"))
+                        .expect("carry round-trips");
                 assert_eq!(through_serde.bytes(), &file_bytes[..]);
             }
             "payment_payload_v2" => {
@@ -205,7 +211,9 @@ fn x402_fixtures_are_byte_preserved() {
         if let Some(embedded_in) = entry["embedded_in"].as_str() {
             let field = entry["envelope_field"].as_str().expect("envelope_field");
             let env: Value = serde_json::from_str(
-                envelope(&v, embedded_in)["canonical"].as_str().expect("canonical"),
+                envelope(&v, embedded_in)["canonical"]
+                    .as_str()
+                    .expect("canonical"),
             )
             .expect("envelope parses");
             assert_eq!(
@@ -263,7 +271,9 @@ fn atomic_amount_vectors_hold() {
 fn decimals_vectors_hold() {
     let v = vectors();
     let seed: [u8; 32] = hex::decode(
-        v["identities"]["registry_signer_seed_hex"].as_str().expect("seed"),
+        v["identities"]["registry_signer_seed_hex"]
+            .as_str()
+            .expect("seed"),
     )
     .expect("hex")
     .try_into()
@@ -299,7 +309,10 @@ fn unknown_fields_are_covered() {
         .as_str()
         .expect("canonical");
     let quote = PaymentQuote::from_json_bytes(canonical.as_bytes()).expect("decodes + verifies");
-    assert!(!quote.extra.is_empty(), "unknown fields must survive decode");
+    assert!(
+        !quote.extra.is_empty(),
+        "unknown fields must survive decode"
+    );
 
     // Stripping them breaks the signature: they are covered, not cosmetic.
     let mut stripped = quote.clone();

@@ -164,7 +164,11 @@ pub struct SpendPolicyEngine {
 
 impl SpendPolicyEngine {
     pub fn new(path: impl Into<PathBuf>, profile: SpendProfile) -> Self {
-        Self { path: path.into(), profile, unsafe_mock_auto_allow: false }
+        Self {
+            path: path.into(),
+            profile,
+            unsafe_mock_auto_allow: false,
+        }
     }
 
     /// The explicit unsafe flag: auto-allow mock spends even in a
@@ -208,7 +212,9 @@ impl SpendPolicyEngine {
         let asset_caip = match registry.check_requirements(requirements) {
             Ok(entry) => entry.id.as_str().to_string(),
             Err(e) => {
-                return Ok(SpendDecision::Denied { policy_reason: e.to_string() });
+                return Ok(SpendDecision::Denied {
+                    policy_reason: e.to_string(),
+                });
             }
         };
         let is_mock = network.starts_with("mock:");
@@ -240,15 +246,21 @@ impl SpendPolicyEngine {
                 .approvals
                 .get(&quote_id)
                 .is_some_and(|r| r.state == ApprovalState::Approved);
-            let limits = s.per_capability.get(&capability).unwrap_or(&s.defaults).clone();
+            let limits = s
+                .per_capability
+                .get(&capability)
+                .unwrap_or(&s.defaults)
+                .clone();
 
             let require = |s: &mut SpendPolicyFile, policy_reason: String| {
                 // The model-reachable side writes pending only.
-                s.approvals.entry(quote_id.clone()).or_insert(ApprovalRecord {
-                    state: ApprovalState::Pending,
-                    capability: capability.clone(),
-                    quote_b64: quote_b64.clone(),
-                });
+                s.approvals
+                    .entry(quote_id.clone())
+                    .or_insert(ApprovalRecord {
+                        state: ApprovalState::Pending,
+                        capability: capability.clone(),
+                        quote_b64: quote_b64.clone(),
+                    });
                 SpendDecision::RequiresPaymentApproval {
                     quote_id: quote_id.clone(),
                     policy_reason,
@@ -342,7 +354,8 @@ impl SpendPolicyEngine {
                 }
             }
             // Approved spend is still spending: it lands in the counter.
-            s.counters.insert(counter_key.clone(), new_total.to_canonical_string());
+            s.counters
+                .insert(counter_key.clone(), new_total.to_canonical_string());
             SpendDecision::Allowed
         })
         .await?;
@@ -362,15 +375,20 @@ impl SpendPolicyEngine {
         let requirements = quote.requirements.view();
         let amount = AtomicAmount::parse(&requirements.amount)
             .map_err(|e| SpendError::Malformed(e.to_string()))?;
-        let key =
-            format!("{}|{}|{}", now_ns / NS_PER_DAY, requirements.network, requirements.asset);
+        let key = format!(
+            "{}|{}|{}",
+            now_ns / NS_PER_DAY,
+            requirements.network,
+            requirements.asset
+        );
         mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
             if let Some(raw) = s.counters.get(&key) {
                 if let Ok(current) = AtomicAmount::parse(raw) {
                     let reduced = current
                         .checked_sub(&amount)
                         .unwrap_or_else(|_| AtomicAmount::from_u128(0));
-                    s.counters.insert(key.clone(), reduced.to_canonical_string());
+                    s.counters
+                        .insert(key.clone(), reduced.to_canonical_string());
                 }
             }
         })

@@ -192,8 +192,14 @@ mod tests {
         let bytes = serde_json::to_vec(&config()).unwrap();
         let back = FacilitatorConfig::from_json_bytes(&bytes).unwrap();
         assert_eq!(back, config());
-        assert_eq!(back.required_tier("eip155:84532"), VerificationTier::Confirmed(1));
-        assert_eq!(back.required_tier("eip155:8453"), VerificationTier::Observed);
+        assert_eq!(
+            back.required_tier("eip155:84532"),
+            VerificationTier::Confirmed(1)
+        );
+        assert_eq!(
+            back.required_tier("eip155:8453"),
+            VerificationTier::Observed
+        );
 
         let mut wrong_tag = config();
         wrong_tag.object = "net.payment.quote@1".to_string();
@@ -209,7 +215,8 @@ mod tests {
     #[test]
     fn validation_requires_every_pair_offered_at_v2() {
         let c = config();
-        c.validate_against(&supported(&[("exact", "eip155:84532")])).unwrap();
+        c.validate_against(&supported(&[("exact", "eip155:84532")]))
+            .unwrap();
 
         let err = c
             .validate_against(&supported(&[("exact", "eip155:8453")]))
@@ -225,7 +232,9 @@ mod tests {
     #[test]
     fn auth_carries_refs_never_values() {
         let c = FacilitatorConfig {
-            auth: AuthConfig::Bearer { secret_ref: "cdp-api-key".to_string() },
+            auth: AuthConfig::Bearer {
+                secret_ref: "cdp-api-key".to_string(),
+            },
             ..config()
         };
         let json = serde_json::to_string(&c).unwrap();

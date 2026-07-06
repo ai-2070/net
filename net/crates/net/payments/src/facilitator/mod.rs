@@ -15,4 +15,6 @@ pub mod mock;
 pub mod packs;
 pub mod traits;
 
-pub use traits::{Facilitator, FacilitatorError, FacilitatorErrorKind, SettleOutcome, VerifyOutcome};
+pub use traits::{
+    Facilitator, FacilitatorError, FacilitatorErrorKind, SettleOutcome, VerifyOutcome,
+};

@@ -20,12 +20,12 @@ use net_mcp::serve::{
 use net_mcp::spec::CallToolResult;
 use net_payments::core::registry::default_mock_registry;
 use net_payments::core::terms::PricingTerms;
+use net_payments::core::units::AtomicAmount;
 use net_payments::engine::{AdmitAll, PaymentEngine};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::flow::mcp_gate::EnginePaymentAdmission;
 use net_payments::flow::{CallerPaymentFlow, Clock, InProcessProvider};
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
-use net_payments::core::units::AtomicAmount;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 use serde_json::{json, Value};
@@ -82,7 +82,11 @@ impl CapabilityGateway for PaidToolGateway {
             "the flow's caller identity signs; bearer mode is for pre-binding callers"
         );
         self.admission
-            .redeem(&id.capability, &proof.quote_id, proof.binding_sig.as_deref())
+            .redeem(
+                &id.capability,
+                &proof.quote_id,
+                proof.binding_sig.as_deref(),
+            )
             .await
             .map_err(GatewayError::Denied)?;
         self.handler_runs.fetch_add(1, Ordering::SeqCst);
@@ -100,8 +104,9 @@ struct World {
 
 fn world(profile: SpendProfile) -> World {
     let dir = tempfile::tempdir().expect("tempdir");
-    let clock: Arc<dyn Clock> =
-        Arc::new(TestClock(std::sync::atomic::AtomicU64::new(1_000_000_000_000_000)));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
+        1_000_000_000_000_000,
+    )));
 
     // Provider side.
     let provider_keys = Arc::new(EntityKeypair::generate());
@@ -177,7 +182,13 @@ fn world(profile: SpendProfile) -> World {
         clock,
     );
 
-    World { gateway, consent, flow, spend_path, _dir: dir }
+    World {
+        gateway,
+        consent,
+        flow,
+        spend_path,
+        _dir: dir,
+    }
 }
 
 fn cap() -> CapabilityId {
@@ -223,7 +234,12 @@ async fn over_cap_holds_structured_and_approval_unblocks_the_retry() {
         json!({ "message": "hi" }),
     )
     .await;
-    let GatedOutcome::RequiresPaymentApproval { quote_id, policy_reason, .. } = out else {
+    let GatedOutcome::RequiresPaymentApproval {
+        quote_id,
+        policy_reason,
+        ..
+    } = out
+    else {
         panic!("expected RequiresPaymentApproval");
     };
     assert!(policy_reason.contains("max_per_call"), "{policy_reason}");

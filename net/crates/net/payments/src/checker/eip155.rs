@@ -45,7 +45,12 @@ impl Eip155Checker {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| CheckerError::terminal(format!("http client: {e}")))?;
-        Ok(Self { rpc_endpoint: rpc_endpoint.into(), network, final_depth: 12, http })
+        Ok(Self {
+            rpc_endpoint: rpc_endpoint.into(),
+            network,
+            final_depth: 12,
+            http,
+        })
     }
 
     /// Depth at which `Confirmed(n)` becomes `Final` (default 12; pick
@@ -72,7 +77,10 @@ impl Eip155Checker {
                 }
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| CheckerError::retryable(e.to_string()))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CheckerError::retryable(e.to_string()))?;
         if !status.is_success() {
             return Err(if status.is_server_error() {
                 CheckerError::retryable(format!("{method} -> {status}"))
@@ -83,7 +91,9 @@ impl Eip155Checker {
         let envelope: Value = serde_json::from_slice(&bytes)
             .map_err(|e| CheckerError::terminal(format!("{method} decode: {e}")))?;
         if let Some(error) = envelope.get("error") {
-            return Err(CheckerError::terminal(format!("{method} rpc error: {error}")));
+            return Err(CheckerError::terminal(format!(
+                "{method} rpc error: {error}"
+            )));
         }
         Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -149,7 +159,10 @@ impl ChainChecker for Eip155Checker {
             return Ok(ChainVerdict::Reverted);
         }
         let block = parse_hex_u64(&receipt["blockNumber"], "receipt.blockNumber")?;
-        let head = parse_hex_u64(&self.rpc("eth_blockNumber", json!([])).await?, "blockNumber")?;
+        let head = parse_hex_u64(
+            &self.rpc("eth_blockNumber", json!([])).await?,
+            "blockNumber",
+        )?;
         let confirmations = head.saturating_sub(block).saturating_add(1);
         let tier = if confirmations >= self.final_depth {
             VerificationTier::Final

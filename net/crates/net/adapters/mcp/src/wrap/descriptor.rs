@@ -318,7 +318,10 @@ mod tests {
         );
         // A tool absent from the pricing map is free.
         let free = lower_tool(
-            &Tool { name: "other".to_string(), ..echo_tool() },
+            &Tool {
+                name: "other".to_string(),
+                ..echo_tool()
+            },
             &c,
         );
         assert_eq!(free.descriptor.pricing_terms, None);

@@ -45,16 +45,32 @@ pub struct FacilitatorError {
 
 impl FacilitatorError {
     pub fn timeout(message: impl Into<String>) -> Self {
-        Self { kind: FacilitatorErrorKind::Timeout, retryable: true, message: message.into() }
+        Self {
+            kind: FacilitatorErrorKind::Timeout,
+            retryable: true,
+            message: message.into(),
+        }
     }
     pub fn unavailable(message: impl Into<String>) -> Self {
-        Self { kind: FacilitatorErrorKind::Unavailable, retryable: true, message: message.into() }
+        Self {
+            kind: FacilitatorErrorKind::Unavailable,
+            retryable: true,
+            message: message.into(),
+        }
     }
     pub fn protocol(message: impl Into<String>) -> Self {
-        Self { kind: FacilitatorErrorKind::Protocol, retryable: false, message: message.into() }
+        Self {
+            kind: FacilitatorErrorKind::Protocol,
+            retryable: false,
+            message: message.into(),
+        }
     }
     pub fn rejected(message: impl Into<String>) -> Self {
-        Self { kind: FacilitatorErrorKind::Rejected, retryable: false, message: message.into() }
+        Self {
+            kind: FacilitatorErrorKind::Rejected,
+            retryable: false,
+            message: message.into(),
+        }
     }
 }
 

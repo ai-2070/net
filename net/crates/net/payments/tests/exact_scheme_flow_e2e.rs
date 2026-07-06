@@ -23,9 +23,7 @@ use net_payments::core::terms::PricingTerms;
 use net_payments::core::units::AtomicAmount;
 use net_payments::core::verification::{VerificationTier, VerifierRef};
 use net_payments::engine::{AdmitAll, PaymentEngine};
-use net_payments::facilitator::{
-    Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome,
-};
+use net_payments::facilitator::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
 use net_payments::flow::signer::dev::DevLocalSigner;
 use net_payments::flow::signer::SchemeSigner;
 use net_payments::flow::{CallerDecision, CallerPaymentFlow, Clock, InProcessProvider};
@@ -55,7 +53,10 @@ struct ExactSchemeFacilitator {
 #[async_trait]
 impl Facilitator for ExactSchemeFacilitator {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: "test-exact-evm".into() }
+        VerifierRef {
+            identity: None,
+            endpoint: "test-exact-evm".into(),
+        }
     }
 
     async fn verify(
@@ -168,7 +169,12 @@ async fn the_full_exact_scheme_lifecycle_runs_on_an_enabled_network() {
     .with_signer("eip155", signer.clone());
 
     let decision = flow.run(CAPABILITY, &terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = decision else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof,
+    } = decision
+    else {
         panic!("expected Paid on the enabled network, got {decision:?}");
     };
     assert_eq!(proof["transaction"], "0xbase5ep011a7e57");
@@ -185,11 +191,16 @@ async fn the_full_exact_scheme_lifecycle_runs_on_an_enabled_network() {
             authorization["from"].as_str().map(str::to_lowercase),
             Some(signer.address().to_lowercase())
         );
-        assert_eq!(authorization["to"], "0x209693Bc6afc0C5328bA36FaF03C514EF312287C");
+        assert_eq!(
+            authorization["to"],
+            "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+        );
         assert_eq!(authorization["value"], "10000");
         let signature = sent.payload["signature"].as_str().expect("signature");
         assert_eq!(
-            hex::decode(signature.strip_prefix("0x").expect("0x")).expect("hex").len(),
+            hex::decode(signature.strip_prefix("0x").expect("0x"))
+                .expect("hex")
+                .len(),
             65
         );
     }

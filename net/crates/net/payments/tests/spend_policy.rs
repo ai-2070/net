@@ -7,13 +7,9 @@ use std::sync::Arc;
 
 use net::adapter::net::identity::EntityKeypair;
 use net_payments::core::quote::PaymentQuote;
-use net_payments::core::registry::{
-    default_mock_registry, AssetEntry, AssetRegistry, RegistryRef,
-};
+use net_payments::core::registry::{default_mock_registry, AssetEntry, AssetRegistry, RegistryRef};
 use net_payments::core::units::AtomicAmount;
-use net_payments::policy::spend::{
-    SpendDecision, SpendLimits, SpendPolicyEngine, SpendProfile,
-};
+use net_payments::policy::spend::{SpendDecision, SpendLimits, SpendPolicyEngine, SpendProfile};
 use net_payments::x402::caip::AssetId;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
@@ -75,13 +71,20 @@ impl Setup {
 async fn dev_profile_auto_allows_silently_and_counts_the_spend() {
     let s = setup(SpendProfile::DevTest);
     let quote = s.quote(mock_requirements("2500"), NOW);
-    let decision = s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap();
+    let decision = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
     assert_eq!(decision, SpendDecision::Allowed);
     assert_eq!(
         s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
         AtomicAmount::from_u128(2500)
     );
-    assert!(s.engine.pending().await.unwrap().is_empty(), "silent means no approval records");
+    assert!(
+        s.engine.pending().await.unwrap().is_empty(),
+        "silent means no approval records"
+    );
 }
 
 #[tokio::test]
@@ -92,8 +95,7 @@ async fn real_networks_deny_with_no_approval_path_even_with_the_unsafe_flag() {
     // the P0 real-network line, not from registry absence.
     let mut registry = default_mock_registry(provider.entity_id().clone());
     registry.assets.push(AssetEntry {
-        id: AssetId::parse("eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
-            .unwrap(),
+        id: AssetId::parse("eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap(),
         x402_asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(),
         decimals: 6,
         symbol: "USDC".into(),
@@ -125,10 +127,16 @@ async fn real_networks_deny_with_no_approval_path_even_with_the_unsafe_flag() {
         NOW + 60_000_000_000,
     );
 
-    let decision = engine.check_and_reserve(&quote, &registry, NOW).await.unwrap();
+    let decision = engine
+        .check_and_reserve(&quote, &registry, NOW)
+        .await
+        .unwrap();
     match decision {
         SpendDecision::Denied { policy_reason } => {
-            assert!(policy_reason.contains("real network"), "got: {policy_reason}")
+            assert!(
+                policy_reason.contains("real network"),
+                "got: {policy_reason}"
+            )
         }
         other => panic!("expected Denied, got {other:?}"),
     }
@@ -139,8 +147,16 @@ async fn production_profile_requires_approval_and_the_operator_verb_unblocks() {
     let s = setup(SpendProfile::Production);
     let quote = s.quote(mock_requirements("2500"), NOW);
 
-    let first = s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap();
-    let SpendDecision::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } = first
+    let first = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
+    let SpendDecision::RequiresPaymentApproval {
+        quote_id,
+        policy_reason,
+        approve_hint,
+    } = first
     else {
         panic!("production mock spend must require approval");
     };
@@ -148,7 +164,10 @@ async fn production_profile_requires_approval_and_the_operator_verb_unblocks() {
     assert!(policy_reason.contains("dev/test profile"));
     assert!(approve_hint.contains(&quote.quote_id));
     // The request left a pending record for consent UX; nothing reserved.
-    assert_eq!(s.engine.pending().await.unwrap(), vec![quote.quote_id.clone()]);
+    assert_eq!(
+        s.engine.pending().await.unwrap(),
+        vec![quote.quote_id.clone()]
+    );
     assert_eq!(
         s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
         AtomicAmount::from_u128(0)
@@ -157,7 +176,11 @@ async fn production_profile_requires_approval_and_the_operator_verb_unblocks() {
     // Operator approves through the consent surface → retry allows and
     // the spend lands in the counter (approved spend is still spending).
     assert!(s.engine.approve(&quote.quote_id).await.unwrap());
-    let retry = s.engine.check_and_reserve(&quote, &s.registry, NOW + 1).await.unwrap();
+    let retry = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW + 1)
+        .await
+        .unwrap();
     assert_eq!(retry, SpendDecision::Allowed);
     assert_eq!(
         s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
@@ -173,8 +196,7 @@ async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = default_mock_registry(provider.entity_id().clone());
     registry.assets.push(AssetEntry {
-        id: AssetId::parse("eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
-            .unwrap(),
+        id: AssetId::parse("eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap(),
         x402_asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(),
         decimals: 6,
         symbol: "USDC".into(),
@@ -220,14 +242,20 @@ async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
     // explicit network listing IS the operator's production consent.
     let under = quote(requirements("10000"), NOW);
     assert_eq!(
-        engine.check_and_reserve(&under, &registry, NOW).await.unwrap(),
+        engine
+            .check_and_reserve(&under, &registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::Allowed
     );
 
     // Over the cap: the structured approval hold, same as mock.
     let over = quote(requirements("100000"), NOW + 1);
     assert!(matches!(
-        engine.check_and_reserve(&over, &registry, NOW).await.unwrap(),
+        engine
+            .check_and_reserve(&over, &registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::RequiresPaymentApproval { .. }
     ));
 
@@ -254,7 +282,10 @@ async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
         .unwrap(),
         NOW + 2,
     );
-    let decision = engine.check_and_reserve(&polygon, &registry_with_polygon, NOW).await.unwrap();
+    let decision = engine
+        .check_and_reserve(&polygon, &registry_with_polygon, NOW)
+        .await
+        .unwrap();
     let SpendDecision::Denied { policy_reason } = decision else {
         panic!("expected Denied for the unlisted network, got {decision:?}");
     };
@@ -279,7 +310,10 @@ async fn the_unsafe_flag_auto_allows_mock_in_production() {
         NOW,
         NOW + 60_000_000_000,
     );
-    let decision = engine.check_and_reserve(&quote, &registry, NOW).await.unwrap();
+    let decision = engine
+        .check_and_reserve(&quote, &registry, NOW)
+        .await
+        .unwrap();
     assert_eq!(decision, SpendDecision::Allowed);
 }
 
@@ -293,15 +327,26 @@ async fn over_cap_per_call_returns_the_structured_error() {
         .await
         .unwrap();
     let quote = s.quote(mock_requirements("2500"), NOW);
-    let decision = s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap();
+    let decision = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
     let SpendDecision::RequiresPaymentApproval { policy_reason, .. } = decision else {
         panic!("expected RequiresPaymentApproval");
     };
-    assert!(policy_reason.contains("max_per_call"), "got: {policy_reason}");
+    assert!(
+        policy_reason.contains("max_per_call"),
+        "got: {policy_reason}"
+    );
 
     // Approval overrides the cap for exactly this quote.
     s.engine.approve(&quote.quote_id).await.unwrap();
-    let retry = s.engine.check_and_reserve(&quote, &s.registry, NOW + 1).await.unwrap();
+    let retry = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW + 1)
+        .await
+        .unwrap();
     assert_eq!(retry, SpendDecision::Allowed);
 }
 
@@ -318,23 +363,36 @@ async fn per_day_cap_accumulates_and_rolls_over_at_the_day_boundary() {
     for i in 0..2 {
         let quote = s.quote(mock_requirements("2500"), NOW + i);
         assert_eq!(
-            s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap(),
+            s.engine
+                .check_and_reserve(&quote, &s.registry, NOW)
+                .await
+                .unwrap(),
             SpendDecision::Allowed,
             "spend {i} fits the cap"
         );
     }
     let third = s.quote(mock_requirements("2500"), NOW + 2);
-    let decision = s.engine.check_and_reserve(&third, &s.registry, NOW).await.unwrap();
+    let decision = s
+        .engine
+        .check_and_reserve(&third, &s.registry, NOW)
+        .await
+        .unwrap();
     let SpendDecision::RequiresPaymentApproval { policy_reason, .. } = decision else {
         panic!("expected RequiresPaymentApproval on the third spend");
     };
-    assert!(policy_reason.contains("max_per_day"), "got: {policy_reason}");
+    assert!(
+        policy_reason.contains("max_per_day"),
+        "got: {policy_reason}"
+    );
 
     // Next day the counter is fresh.
     let tomorrow = NOW + NS_PER_DAY;
     let fourth = s.quote(mock_requirements("2500"), tomorrow);
     assert_eq!(
-        s.engine.check_and_reserve(&fourth, &s.registry, tomorrow).await.unwrap(),
+        s.engine
+            .check_and_reserve(&fourth, &s.registry, tomorrow)
+            .await
+            .unwrap(),
         SpendDecision::Allowed
     );
 }
@@ -359,7 +417,10 @@ async fn per_capability_overrides_replace_the_defaults() {
     // The overridden capability clears its generous cap...
     let quote = s.quote(mock_requirements("2500"), NOW);
     assert_eq!(
-        s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap(),
+        s.engine
+            .check_and_reserve(&quote, &s.registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::Allowed
     );
 
@@ -376,7 +437,10 @@ async fn per_capability_overrides_replace_the_defaults() {
         NOW + 60_000_000_000,
     );
     assert!(matches!(
-        s.engine.check_and_reserve(&other, &s.registry, NOW).await.unwrap(),
+        s.engine
+            .check_and_reserve(&other, &s.registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::RequiresPaymentApproval { .. }
     ));
 }
@@ -391,7 +455,11 @@ async fn allowlists_gate_even_in_dev_when_configured() {
         .await
         .unwrap();
     let quote = s.quote(mock_requirements("2500"), NOW);
-    let decision = s.engine.check_and_reserve(&quote, &s.registry, NOW).await.unwrap();
+    let decision = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
     let SpendDecision::RequiresPaymentApproval { policy_reason, .. } = decision else {
         panic!("expected RequiresPaymentApproval");
     };
@@ -442,7 +510,11 @@ async fn concurrent_processes_hammering_max_per_day_never_overspend() {
                     NOW + engine_idx * 1_000 + i,
                     NOW + 60_000_000_000,
                 );
-                match engine.check_and_reserve(&quote, &registry, NOW).await.unwrap() {
+                match engine
+                    .check_and_reserve(&quote, &registry, NOW)
+                    .await
+                    .unwrap()
+                {
                     SpendDecision::Allowed => allowed += 1,
                     SpendDecision::RequiresPaymentApproval { .. } => {}
                     SpendDecision::Denied { policy_reason } => {

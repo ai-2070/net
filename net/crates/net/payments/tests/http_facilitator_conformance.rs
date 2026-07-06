@@ -53,7 +53,9 @@ impl Fixture {
         let bodies_task = bodies.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let mode = mode_task.clone();
                 let bodies = bodies_task.clone();
                 tokio::spawn(async move {
@@ -204,7 +206,9 @@ async fn request_bodies_embed_the_carry_bytes_verbatim() {
     // The preserved bytes appear inside the request body EXACTLY —
     // whitespace quirks and all. Re-serialization would have normalized
     // them and broken this.
-    let body = fixture.last_body_for("POST /verify").expect("captured body");
+    let body = fixture
+        .last_body_for("POST /verify")
+        .expect("captured body");
     let body_str = String::from_utf8(body).expect("utf8");
     assert!(
         body_str.contains(reqs.as_json_str()),
@@ -226,7 +230,10 @@ async fn spec_vocabulary_rides_inside_responses_not_as_transport_errors() {
     let pay = payload_for(&reqs);
 
     // isValid: false is the facilitator's ANSWER — Ok(...), engine judges.
-    let verify = client.verify(&pay, &reqs).await.expect("verify transport ok");
+    let verify = client
+        .verify(&pay, &reqs)
+        .await
+        .expect("verify transport ok");
     assert!(!verify.response.view().is_valid);
     assert_eq!(
         verify.response.view().invalid_reason.as_deref(),
@@ -234,9 +241,15 @@ async fn spec_vocabulary_rides_inside_responses_not_as_transport_errors() {
         "the spec's verbatim reason is preserved"
     );
 
-    let settle = client.settle(&pay, &reqs).await.expect("settle transport ok");
+    let settle = client
+        .settle(&pay, &reqs)
+        .await
+        .expect("settle transport ok");
     assert!(!settle.response.view().success);
-    assert_eq!(settle.response.view().error_reason.as_deref(), Some("insufficient_funds"));
+    assert_eq!(
+        settle.response.view().error_reason.as_deref(),
+        Some("insufficient_funds")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -248,13 +261,19 @@ async fn transport_failures_map_to_structured_retryability() {
 
     // 5xx: the facilitator is degraded — retryable, policy decides.
     fixture.set_mode(FixtureMode::ServerError);
-    let err = client.verify(&pay, &reqs).await.expect_err("5xx is an error");
+    let err = client
+        .verify(&pay, &reqs)
+        .await
+        .expect_err("5xx is an error");
     assert_eq!(err.kind, FacilitatorErrorKind::Unavailable);
     assert!(err.retryable);
 
     // 4xx: a terminal answer about this request — never retried.
     fixture.set_mode(FixtureMode::Forbidden);
-    let err = client.settle(&pay, &reqs).await.expect_err("4xx is an error");
+    let err = client
+        .settle(&pay, &reqs)
+        .await
+        .expect_err("4xx is an error");
     assert_eq!(err.kind, FacilitatorErrorKind::Rejected);
     assert!(!err.retryable);
 
@@ -270,7 +289,10 @@ async fn supported_validation_passes_offered_pairs_and_refuses_others() {
     let client = HttpFacilitator::new(&fixture.addr, Arc::new(NoAuth)).expect("client");
 
     let supported = client
-        .validate_pairs(&[("mock".into(), "mock:net".into()), ("exact".into(), "eip155:84532".into())])
+        .validate_pairs(&[
+            ("mock".into(), "mock:net".into()),
+            ("exact".into(), "eip155:84532".into()),
+        ])
         .await
         .expect("offered pairs validate");
     assert_eq!(supported.kinds.len(), 2);
@@ -313,13 +335,22 @@ async fn the_unchanged_engine_settles_through_the_http_client() {
     let payload = payload_for(&quote.requirements);
 
     let decision = engine
-        .accept_payment(&quote, &payload, VerificationTier::Observed, 1_000_000_000_000_001)
+        .accept_payment(
+            &quote,
+            &payload,
+            VerificationTier::Observed,
+            1_000_000_000_000_001,
+        )
         .await
         .expect("accept");
     let PaymentDecision::Served { billing, tier } = decision else {
         panic!("expected Served through HTTP, got {decision:?}");
     };
-    assert_eq!(tier, VerificationTier::Observed, "a receipt is observed, never more");
+    assert_eq!(
+        tier,
+        VerificationTier::Observed,
+        "a receipt is observed, never more"
+    );
     assert_eq!(billing.transaction.as_deref(), Some("0xfeedbead"));
     assert_eq!(billing.amount.to_canonical_string(), "2500");
 
@@ -344,11 +375,18 @@ async fn the_unchanged_engine_settles_through_the_http_client() {
     })
     .expect("payload2");
     let rejected = engine
-        .accept_payment(&quote2, &payload2, VerificationTier::Observed, 1_000_000_000_000_101)
+        .accept_payment(
+            &quote2,
+            &payload2,
+            VerificationTier::Observed,
+            1_000_000_000_000_101,
+        )
         .await
         .expect("accept2");
     match rejected {
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(r) } => {
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(r),
+        } => {
             assert_eq!(r, "insufficient_funds")
         }
         other => panic!("expected VerifyRejected(insufficient_funds), got {other:?}"),

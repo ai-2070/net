@@ -113,7 +113,18 @@ mod tests {
     #[test]
     fn rejects_every_ambiguous_spelling() {
         for bad in [
-            "", "01", "007", "-1", "+1", "1.0", "1e6", " 1", "1 ", "1_000", "0x10", "١٢٣",
+            "",
+            "01",
+            "007",
+            "-1",
+            "+1",
+            "1.0",
+            "1e6",
+            " 1",
+            "1 ",
+            "1_000",
+            "0x10",
+            "١٢٣",
             "340282366920938463463374607431768211456", // u128::MAX + 1
         ] {
             assert!(AtomicAmount::parse(bad).is_err(), "should reject {bad:?}");
@@ -126,10 +137,7 @@ mod tests {
         let one = AtomicAmount::from_u128(1);
         assert_eq!(max.checked_add(&one), Err(AmountError::Overflow));
         assert_eq!(one.checked_sub(&max), Err(AmountError::Overflow));
-        assert_eq!(
-            one.checked_add(&one).unwrap(),
-            AtomicAmount::from_u128(2)
-        );
+        assert_eq!(one.checked_add(&one).unwrap(), AtomicAmount::from_u128(2));
     }
 
     #[test]

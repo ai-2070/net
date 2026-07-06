@@ -67,13 +67,15 @@ fn endpoint() -> String {
 }
 
 fn rpc_endpoint() -> String {
-    std::env::var("NET_PAYMENTS_LIVE_RPC")
-        .unwrap_or_else(|_| packs::RPC_BASE_SEPOLIA.to_string())
+    std::env::var("NET_PAYMENTS_LIVE_RPC").unwrap_or_else(|_| packs::RPC_BASE_SEPOLIA.to_string())
 }
 
 fn amount() -> u128 {
     std::env::var("NET_PAYMENTS_LIVE_AMOUNT")
-        .map(|v| v.parse().expect("NET_PAYMENTS_LIVE_AMOUNT must be a decimal integer"))
+        .map(|v| {
+            v.parse()
+                .expect("NET_PAYMENTS_LIVE_AMOUNT must be a decimal integer")
+        })
         .unwrap_or(1000)
 }
 
@@ -117,9 +119,16 @@ async fn supported_offers_the_conformance_pair_live() {
         .await
         .expect("the survey-pinned pair must be offered live — if this fails, the pin is stale");
 
-    println!("facilitator {} offers {} kinds:", endpoint(), supported.kinds.len());
+    println!(
+        "facilitator {} offers {} kinds:",
+        endpoint(),
+        supported.kinds.len()
+    );
     for kind in &supported.kinds {
-        println!("  v{} ({}, {})", kind.x402_version, kind.scheme, kind.network);
+        println!(
+            "  v{} ({}, {})",
+            kind.x402_version, kind.scheme, kind.network
+        );
     }
     if !supported.extensions.is_empty() {
         println!("extensions: {:?}", supported.extensions);
@@ -140,7 +149,11 @@ async fn the_shipped_pack_loads_against_the_live_facilitator() {
     let client = HttpFacilitator::from_config(&pack, Arc::new(NoAuth))
         .await
         .expect("the shipped pack must load against the live facilitator");
-    println!("pack loaded: {:?} via {}", pack.pairs, client.reference().endpoint);
+    println!(
+        "pack loaded: {:?} via {}",
+        pack.pairs,
+        client.reference().endpoint
+    );
 }
 
 /// Rung 1c — a really-signed EIP-3009 payload gets a *structural*
@@ -153,8 +166,7 @@ async fn the_shipped_pack_loads_against_the_live_facilitator() {
 #[ignore = "live network — run deliberately with --ignored (see module docs)"]
 async fn a_signed_verify_answers_structurally_live() {
     let signer = payer_signer();
-    let pay_to =
-        std::env::var("NET_PAYMENTS_LIVE_PAY_TO").unwrap_or_else(|_| signer.address());
+    let pay_to = std::env::var("NET_PAYMENTS_LIVE_PAY_TO").unwrap_or_else(|_| signer.address());
     let requirements = requirements(&pay_to);
 
     // Author the authorization directly (no engine on this rung): a
@@ -192,7 +204,11 @@ async fn a_signed_verify_answers_structurally_live() {
         .await
         .expect("live /verify must answer structurally, never fail at the transport");
 
-    assert_eq!(outcome.tier, VerificationTier::Observed, "receipts cap at observed");
+    assert_eq!(
+        outcome.tier,
+        VerificationTier::Observed,
+        "receipts cap at observed"
+    );
     let view = outcome.response.view();
     if view.is_valid {
         println!("live /verify: VALID (payer {} is funded)", signer.address());
@@ -252,8 +268,7 @@ async fn the_unchanged_engine_settles_on_base_sepolia_live() {
         .expect("configure");
 
     // ── provider: the unchanged engine over the LIVE facilitator ──
-    let facilitator =
-        Arc::new(HttpFacilitator::new(endpoint(), Arc::new(NoAuth)).expect("client"));
+    let facilitator = Arc::new(HttpFacilitator::new(endpoint(), Arc::new(NoAuth)).expect("client"));
     let engine = Arc::new(
         PaymentEngine::new(
             provider_keys.clone(),
@@ -265,8 +280,7 @@ async fn the_unchanged_engine_settles_on_base_sepolia_live() {
         .expect("engine"),
     );
     let provider = Arc::new(
-        InProcessProvider::new(engine.clone(), clock.clone())
-            .with_quote_ttl_ns(300_000_000_000),
+        InProcessProvider::new(engine.clone(), clock.clone()).with_quote_ttl_ns(300_000_000_000),
     );
 
     let template = requirements(&pay_to);
@@ -290,15 +304,20 @@ async fn the_unchanged_engine_settles_on_base_sepolia_live() {
     .with_signer("eip155", signer);
 
     let decision = flow.run(CAPABILITY, &terms_json).await;
-    let CallerDecision::Paid { quote_id, proof, .. } = decision else {
+    let CallerDecision::Paid {
+        quote_id, proof, ..
+    } = decision
+    else {
         panic!("expected Paid on live Base Sepolia, got {decision:?}");
     };
-    let transaction = proof["transaction"].as_str().expect("settlement transaction").to_string();
+    let transaction = proof["transaction"]
+        .as_str()
+        .expect("settlement transaction")
+        .to_string();
     println!("SETTLED live: {transaction} (quote {quote_id})");
 
     // ── past receipt trust: the pack's checker upgrades the chain ──
-    let checker =
-        Eip155Checker::new(packs::NETWORK_BASE_SEPOLIA, rpc_endpoint()).expect("checker");
+    let checker = Eip155Checker::new(packs::NETWORK_BASE_SEPOLIA, rpc_endpoint()).expect("checker");
     let required = pack.required_tier(packs::NETWORK_BASE_SEPOLIA);
     let mut upgraded = None;
     for attempt in 0..24 {
@@ -322,7 +341,11 @@ async fn the_unchanged_engine_settles_on_base_sepolia_live() {
 
     // The signed chain records both verifiers: the live facilitator's
     // observed receipt, then the independent chain check.
-    let status = engine.status(&quote_id).await.expect("status").expect("known quote");
+    let status = engine
+        .status(&quote_id)
+        .await
+        .expect("status")
+        .expect("known quote");
     assert!(status.billing_event_id.is_some(), "served means billed");
     assert!(status.chain.len() >= 2);
     assert_eq!(status.chain[0].verifier.endpoint, endpoint());

@@ -186,7 +186,10 @@ async fn same_key_retry_is_one_settle_one_billing_event() {
     else {
         panic!("both attempts must serve");
     };
-    assert_eq!(b1.billing_event_id, b2.billing_event_id, "one billing event id");
+    assert_eq!(
+        b1.billing_event_id, b2.billing_event_id,
+        "one billing event id"
+    );
     // One settle: the mock rejects a second settle of the same payment, so
     // reaching Served twice proves the engine never re-settled.
     assert_eq!(
@@ -225,7 +228,12 @@ async fn replayed_payload_never_satisfies_a_second_quote() {
         .await
         .unwrap();
     assert!(
-        matches!(replay, PaymentDecision::Rejected { reason: RejectReason::Replay }),
+        matches!(
+            replay,
+            PaymentDecision::Rejected {
+                reason: RejectReason::Replay
+            }
+        ),
         "got {replay:?}"
     );
     // The second quote never even reached the facilitator: no record.
@@ -236,7 +244,8 @@ async fn replayed_payload_never_satisfies_a_second_quote() {
 async fn facilitator_reported_replay_rejects_and_consumes_nothing() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::Replay);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::Replay);
     let payload = payload_for(&quote, "payer-1");
 
     let decision = h
@@ -245,12 +254,17 @@ async fn facilitator_reported_replay_rejects_and_consumes_nothing() {
         .await
         .unwrap();
     match decision {
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(r) } => {
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(r),
+        } => {
             assert_eq!(r, "payload_replayed")
         }
         other => panic!("expected VerifyRejected, got {other:?}"),
     }
-    assert!(h.engine.status(&quote.quote_id).await.unwrap().is_none(), "claim released");
+    assert!(
+        h.engine.status(&quote.quote_id).await.unwrap().is_none(),
+        "claim released"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -261,7 +275,8 @@ async fn facilitator_reported_replay_rejects_and_consumes_nothing() {
 async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::WrongAmount);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::WrongAmount);
     let payload = payload_for(&quote, "payer-1");
 
     let decision = h
@@ -270,7 +285,9 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
         .await
         .unwrap();
     match decision {
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(r) } => {
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(r),
+        } => {
             assert_eq!(r, "wrong_amount")
         }
         other => panic!("expected VerifyRejected(wrong_amount), got {other:?}"),
@@ -278,13 +295,17 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
     // No chain, no billing, and the payload is free to satisfy a healthy
     // quote afterwards (nothing was consumed).
     assert!(h.engine.status(&quote.quote_id).await.unwrap().is_none());
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::Success);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::Success);
     let retry = h
         .engine
         .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
         .await
         .unwrap();
-    assert!(matches!(retry, PaymentDecision::Served { .. }), "got {retry:?}");
+    assert!(
+        matches!(retry, PaymentDecision::Served { .. }),
+        "got {retry:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -295,12 +316,17 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
 async fn late_finality_withholds_serving_until_the_tier_is_reached() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::LateFinality);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::LateFinality);
     let payload = payload_for(&quote, "payer-1");
     let required = VerificationTier::Confirmed(1);
 
     // Settles, but the receipt is only `observed`.
-    let first = h.engine.accept_payment(&quote, &payload, required, NOW + 1).await.unwrap();
+    let first = h
+        .engine
+        .accept_payment(&quote, &payload, required, NOW + 1)
+        .await
+        .unwrap();
     assert!(
         matches!(
             first,
@@ -313,11 +339,22 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
     );
 
     // Second verify: still observed (mock reaches confirmed on call 3).
-    let second = h.engine.re_verify(&quote.quote_id, required, NOW + 2).await.unwrap();
-    assert!(matches!(second, PaymentDecision::PendingTier { .. }), "got {second:?}");
+    let second = h
+        .engine
+        .re_verify(&quote.quote_id, required, NOW + 2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(second, PaymentDecision::PendingTier { .. }),
+        "got {second:?}"
+    );
 
     // Third verify: confirmed(1) → served, billing emitted now.
-    let third = h.engine.re_verify(&quote.quote_id, required, NOW + 3).await.unwrap();
+    let third = h
+        .engine
+        .re_verify(&quote.quote_id, required, NOW + 3)
+        .await
+        .unwrap();
     let PaymentDecision::Served { billing, tier } = third else {
         panic!("expected Served");
     };
@@ -336,8 +373,16 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
 
     // An accept retry on the settled quote is a re-verify, never a second
     // settle — and returns the same billing event.
-    let retry = h.engine.accept_payment(&quote, &payload, required, NOW + 4).await.unwrap();
-    let PaymentDecision::Served { billing: retry_billing, .. } = retry else {
+    let retry = h
+        .engine
+        .accept_payment(&quote, &payload, required, NOW + 4)
+        .await
+        .unwrap();
+    let PaymentDecision::Served {
+        billing: retry_billing,
+        ..
+    } = retry
+    else {
         panic!("expected Served on retry");
     };
     assert_eq!(retry_billing.billing_event_id, billing.billing_event_id);
@@ -351,7 +396,8 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
 async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::ReorgInvalidate);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::ReorgInvalidate);
     let payload = payload_for(&quote, "payer-1");
 
     // First pass verifies and serves (receipt issued).
@@ -371,7 +417,12 @@ async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
         .await
         .unwrap();
     assert!(
-        matches!(reorg, PaymentDecision::Invalidated { reason: InvalidationReason::Reorg }),
+        matches!(
+            reorg,
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::Reorg
+            }
+        ),
         "got {reorg:?}"
     );
 
@@ -381,7 +432,9 @@ async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
         vec![
             (VerificationStatus::Verified, VerificationTier::Observed),
             (
-                VerificationStatus::Invalidated { reason: InvalidationReason::Reorg },
+                VerificationStatus::Invalidated {
+                    reason: InvalidationReason::Reorg
+                },
                 VerificationTier::Observed
             ),
         ]
@@ -396,7 +449,9 @@ async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
     assert!(
         matches!(
             after,
-            PaymentDecision::Rejected { reason: RejectReason::QuoteFrozen(_) }
+            PaymentDecision::Rejected {
+                reason: RejectReason::QuoteFrozen(_)
+            }
         ),
         "got {after:?}"
     );
@@ -407,13 +462,18 @@ async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
         .unwrap();
     assert!(matches!(
         reverify,
-        PaymentDecision::Rejected { reason: RejectReason::QuoteFrozen(_) }
+        PaymentDecision::Rejected {
+            reason: RejectReason::QuoteFrozen(_)
+        }
     ));
 
     // The billing event is immutable: still present, same id, and the
     // invalidation event references the same quote for the audit trail.
     let status = h.engine.status(&quote.quote_id).await.unwrap().unwrap();
-    assert_eq!(status.billing_event_id.as_deref(), Some(billing.billing_event_id.as_str()));
+    assert_eq!(
+        status.billing_event_id.as_deref(),
+        Some(billing.billing_event_id.as_str())
+    );
     assert_eq!(status.frozen.as_deref(), Some("reorged_out"));
 }
 
@@ -425,7 +485,10 @@ async fn reorg_after_serve_freezes_the_quote_and_keeps_billing_immutable() {
 async fn expired_requirements_mode_rejects() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::ExpiredRequirements);
+    h.facilitator.arm(
+        quote.requirements.content_hash(),
+        MockMode::ExpiredRequirements,
+    );
     let payload = payload_for(&quote, "payer-1");
     let decision = h
         .engine
@@ -433,7 +496,9 @@ async fn expired_requirements_mode_rejects() {
         .await
         .unwrap();
     match decision {
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(r) } => {
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(r),
+        } => {
             assert_eq!(r, "expired_requirements")
         }
         other => panic!("expected VerifyRejected, got {other:?}"),
@@ -446,17 +511,26 @@ async fn expired_quotes_are_rejected_before_the_facilitator_is_consulted() {
     let quote = h.quote("2500");
     // Arm a timeout: if the engine consulted the facilitator, the decision
     // would be FacilitatorFailure, not QuoteExpired.
-    h.facilitator
-        .arm(quote.requirements.content_hash(), MockMode::VerificationTimeout);
+    h.facilitator.arm(
+        quote.requirements.content_hash(),
+        MockMode::VerificationTimeout,
+    );
     let payload = payload_for(&quote, "payer-1");
     let decision = h
         .engine
-        .accept_payment(&quote, &payload, VerificationTier::Observed, quote.expires_at_ns)
+        .accept_payment(
+            &quote,
+            &payload,
+            VerificationTier::Observed,
+            quote.expires_at_ns,
+        )
         .await
         .unwrap();
     assert!(matches!(
         decision,
-        PaymentDecision::Rejected { reason: RejectReason::QuoteExpired }
+        PaymentDecision::Rejected {
+            reason: RejectReason::QuoteExpired
+        }
     ));
 }
 
@@ -468,8 +542,10 @@ async fn expired_quotes_are_rejected_before_the_facilitator_is_consulted() {
 async fn verification_timeout_fails_closed_and_a_retry_charges_exactly_once() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator
-        .arm(quote.requirements.content_hash(), MockMode::VerificationTimeout);
+    h.facilitator.arm(
+        quote.requirements.content_hash(),
+        MockMode::VerificationTimeout,
+    );
     let payload = payload_for(&quote, "payer-1");
 
     let decision = h
@@ -478,7 +554,9 @@ async fn verification_timeout_fails_closed_and_a_retry_charges_exactly_once() {
         .await
         .unwrap();
     match decision {
-        PaymentDecision::FacilitatorFailure { kind, retryable, .. } => {
+        PaymentDecision::FacilitatorFailure {
+            kind, retryable, ..
+        } => {
             assert_eq!(kind, FacilitatorErrorKind::Timeout);
             assert!(retryable, "timeout is a retryable failure for policy");
         }
@@ -488,7 +566,8 @@ async fn verification_timeout_fails_closed_and_a_retry_charges_exactly_once() {
     assert!(h.engine.status(&quote.quote_id).await.unwrap().is_none());
 
     // Facilitator heals → the same payload settles exactly once.
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::Success);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::Success);
     let retry = h
         .engine
         .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
@@ -566,7 +645,13 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
     .unwrap();
 
     let quote = engine
-        .issue_quote(caller.entity_id().clone(), CAPABILITY, requirements("2500"), NOW, TTL)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
         .unwrap();
     let payload = payload_for(&quote, "payer-1");
     let decision = engine
@@ -574,16 +659,26 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
         .await
         .unwrap();
     assert!(
-        matches!(decision, PaymentDecision::Exception { kind: ExceptionKind::Overpayment }),
+        matches!(
+            decision,
+            PaymentDecision::Exception {
+                kind: ExceptionKind::Overpayment
+            }
+        ),
         "got {decision:?}"
     );
     let status = engine.status(&quote.quote_id).await.unwrap().unwrap();
-    assert!(!status.served, "the verifier never auto-satisfies on overpayment");
+    assert!(
+        !status.served,
+        "the verifier never auto-satisfies on overpayment"
+    );
     assert!(status.billing_event_id.is_none());
     assert_eq!(status.chain.len(), 1);
     assert!(matches!(
         status.chain[0].status,
-        VerificationStatus::Exception { kind: ExceptionKind::Overpayment }
+        VerificationStatus::Exception {
+            kind: ExceptionKind::Overpayment
+        }
     ));
 }
 
@@ -603,7 +698,13 @@ async fn a_denied_caller_is_never_quoted() {
     let h = harness_with_policy(Arc::new(DenyEveryone));
     let err = h
         .engine
-        .issue_quote(h.caller.entity_id().clone(), CAPABILITY, requirements("2500"), NOW, TTL)
+        .issue_quote(
+            h.caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
         .unwrap_err();
     assert!(err.to_string().contains("admission denied"));
 }
@@ -647,7 +748,10 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
         .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
         .await
         .unwrap();
-    assert!(matches!(unpaid, RedeemDecision::Denied { .. }), "got {unpaid:?}");
+    assert!(
+        matches!(unpaid, RedeemDecision::Denied { .. }),
+        "got {unpaid:?}"
+    );
 
     // Pay + serve.
     let payload = payload_for(&quote, "payer-1");
@@ -715,7 +819,9 @@ async fn a_signed_binding_must_verify_against_the_paying_identity() {
         .await
         .unwrap();
     match denied {
-        RedeemDecision::Denied { reason } => assert!(reason.contains("does not verify"), "{reason}"),
+        RedeemDecision::Denied { reason } => {
+            assert!(reason.contains("does not verify"), "{reason}")
+        }
         other => panic!("expected Denied, got {other:?}"),
     }
 
@@ -729,7 +835,11 @@ async fn a_signed_binding_must_verify_against_the_paying_identity() {
 
     // A binding signed over the WRONG tool doesn't transfer.
     let wrong_tool_transcript = invocation_binding_transcript(&quote.quote_id, "other-tool");
-    let misdirected = h.caller.try_sign(&wrong_tool_transcript).unwrap().to_bytes();
+    let misdirected = h
+        .caller
+        .try_sign(&wrong_tool_transcript)
+        .unwrap()
+        .to_bytes();
     let denied = h
         .engine
         .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&misdirected))
@@ -753,7 +863,8 @@ async fn a_signed_binding_must_verify_against_the_paying_identity() {
 async fn redemption_denies_frozen_quotes() {
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator.arm(quote.requirements.content_hash(), MockMode::ReorgInvalidate);
+    h.facilitator
+        .arm(quote.requirements.content_hash(), MockMode::ReorgInvalidate);
     let payload = payload_for(&quote, "payer-1");
 
     let served = h
@@ -804,7 +915,12 @@ async fn a_second_payload_for_a_satisfied_quote_is_rejected() {
         .await
         .unwrap();
     assert!(
-        matches!(dup, PaymentDecision::Rejected { reason: RejectReason::QuoteAlreadyPaid }),
+        matches!(
+            dup,
+            PaymentDecision::Rejected {
+                reason: RejectReason::QuoteAlreadyPaid
+            }
+        ),
         "got {dup:?}"
     );
 }

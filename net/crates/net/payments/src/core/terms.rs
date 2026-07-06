@@ -96,7 +96,10 @@ mod tests {
             EntityKeypair::generate().entity_id().clone(),
             "prov/fixture-tool",
             vec![template()],
-            RegistryRef { version: "net-default-0".into(), hash: "00".into() },
+            RegistryRef {
+                version: "net-default-0".into(),
+                hash: "00".into(),
+            },
         )
     }
 

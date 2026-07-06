@@ -149,7 +149,10 @@ impl Default for MockFacilitator {
 #[async_trait]
 impl Facilitator for MockFacilitator {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: "mock".to_string() }
+        VerifierRef {
+            identity: None,
+            endpoint: "mock".to_string(),
+        }
     }
 
     async fn verify(
@@ -173,16 +176,23 @@ impl Facilitator for MockFacilitator {
         let bound = payload.view().accepted == *requirements.view();
 
         let (view, tier) = match mode {
-            _ if !bound => (Self::invalid("payload_requirements_mismatch"), VerificationTier::Observed),
+            _ if !bound => (
+                Self::invalid("payload_requirements_mismatch"),
+                VerificationTier::Observed,
+            ),
             MockMode::VerificationTimeout => {
                 return Err(FacilitatorError::timeout(
                     "mock facilitator armed with verification_timeout",
                 ))
             }
-            MockMode::ExpiredRequirements => {
-                (Self::invalid("expired_requirements"), VerificationTier::Observed)
-            }
-            MockMode::Replay => (Self::invalid("payload_replayed"), VerificationTier::Observed),
+            MockMode::ExpiredRequirements => (
+                Self::invalid("expired_requirements"),
+                VerificationTier::Observed,
+            ),
+            MockMode::Replay => (
+                Self::invalid("payload_replayed"),
+                VerificationTier::Observed,
+            ),
             MockMode::WrongAmount => (Self::invalid("wrong_amount"), VerificationTier::Observed),
             MockMode::ReorgInvalidate if calls > 1 => {
                 (Self::invalid("reorged_out"), VerificationTier::Observed)
@@ -194,16 +204,29 @@ impl Facilitator for MockFacilitator {
                     VerificationTier::Observed
                 };
                 (
-                    VerifyResponse { is_valid: true, invalid_reason: None, payer: None, extra: None },
+                    VerifyResponse {
+                        is_valid: true,
+                        invalid_reason: None,
+                        payer: None,
+                        extra: None,
+                    },
                     tier,
                 )
             }
             MockMode::Success | MockMode::ReorgInvalidate => (
-                VerifyResponse { is_valid: true, invalid_reason: None, payer: None, extra: None },
+                VerifyResponse {
+                    is_valid: true,
+                    invalid_reason: None,
+                    payer: None,
+                    extra: None,
+                },
                 VerificationTier::Observed,
             ),
         };
-        Ok(VerifyOutcome { response: Self::author_verify(&view)?, tier })
+        Ok(VerifyOutcome {
+            response: Self::author_verify(&view)?,
+            tier,
+        })
     }
 
     async fn settle(
@@ -335,7 +358,10 @@ mod tests {
         let pay = payload_for(&reqs);
         f.settle(&pay, &reqs).await.unwrap();
         let err = f.settle(&pay, &reqs).await.unwrap_err();
-        assert_eq!(err.kind, super::super::traits::FacilitatorErrorKind::Rejected);
+        assert_eq!(
+            err.kind,
+            super::super::traits::FacilitatorErrorKind::Rejected
+        );
         assert!(!err.retryable);
     }
 
@@ -349,7 +375,10 @@ mod tests {
         let first = f.verify(&pay, &reqs).await.unwrap();
         assert!(first.response.view().is_valid, "receipt issued first");
         let second = f.verify(&pay, &reqs).await.unwrap();
-        assert_eq!(second.response.view().invalid_reason.as_deref(), Some("reorged_out"));
+        assert_eq!(
+            second.response.view().invalid_reason.as_deref(),
+            Some("reorged_out")
+        );
 
         // A different quote (different requirements bytes) is unaffected.
         let other = X402Carry::author(&PaymentRequirements {
@@ -358,7 +387,14 @@ mod tests {
         })
         .unwrap();
         let other_pay = payload_for(&other);
-        assert!(f.verify(&other_pay, &other).await.unwrap().response.view().is_valid);
+        assert!(
+            f.verify(&other_pay, &other)
+                .await
+                .unwrap()
+                .response
+                .view()
+                .is_valid
+        );
     }
 
     #[tokio::test]
@@ -376,7 +412,10 @@ mod tests {
         let reqs = requirements();
         let pay = payload_for(&reqs);
         let err = f.verify(&pay, &reqs).await.unwrap_err();
-        assert_eq!(err.kind, super::super::traits::FacilitatorErrorKind::Timeout);
+        assert_eq!(
+            err.kind,
+            super::super::traits::FacilitatorErrorKind::Timeout
+        );
         assert!(err.retryable);
     }
 

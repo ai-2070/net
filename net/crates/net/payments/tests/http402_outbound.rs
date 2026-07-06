@@ -54,14 +54,18 @@ impl PaidServer {
         let received_task = received.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let mode = mode_task.clone();
                 let received = received_task.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 4096];
                     let header_end = loop {
-                        let Ok(n) = stream.read(&mut tmp).await else { return };
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
                         if n == 0 {
                             return;
                         }
@@ -79,9 +83,7 @@ impl PaidServer {
 
                     let current = *mode.lock();
                     let response = match (current, payment_signature) {
-                        (ServerMode::Free, _) => {
-                            http_response("200 OK", &[], b"free lunch")
-                        }
+                        (ServerMode::Free, _) => http_response("200 OK", &[], b"free lunch"),
                         (_, None) => {
                             // Demand payment: mock-network requirements so
                             // the test settles without a chain.
@@ -133,7 +135,11 @@ impl PaidServer {
                 });
             }
         });
-        Self { url, mode, received_payloads: received }
+        Self {
+            url,
+            mode,
+            received_payloads: received,
+        }
     }
 
     fn set_mode(&self, mode: ServerMode) {
@@ -142,7 +148,10 @@ impl PaidServer {
 }
 
 fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
-    let mut out = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
+    let mut out = format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        body.len()
+    );
     for (name, value) in headers {
         out.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -168,7 +177,9 @@ async fn free_resources_pass_through_untouched() {
     let server = PaidServer::start().await;
     server.set_mode(ServerMode::Free);
     let dir = tempfile::tempdir().expect("tempdir");
-    let outcome = flow(SpendProfile::DevTest, &dir).fetch_paid(&server.url).await;
+    let outcome = flow(SpendProfile::DevTest, &dir)
+        .fetch_paid(&server.url)
+        .await;
     let X402HttpOutcome::Ok { status, body } = outcome else {
         panic!("expected Ok passthrough, got {outcome:?}");
     };
@@ -183,7 +194,12 @@ async fn the_paid_fetch_settles_under_policy_and_lands_the_settlement_header() {
     let f = flow(SpendProfile::DevTest, &dir);
 
     let outcome = f.fetch_paid(&server.url).await;
-    let X402HttpOutcome::Paid { status, body, settlement } = outcome else {
+    let X402HttpOutcome::Paid {
+        status,
+        body,
+        settlement,
+    } = outcome
+    else {
         panic!("expected Paid, got {outcome:?}");
     };
     assert_eq!(status, 200);
@@ -220,11 +236,19 @@ async fn policy_holds_before_anything_is_signed_or_sent() {
     let f = flow(SpendProfile::Production, &dir);
 
     let outcome = f.fetch_paid(&server.url).await;
-    let X402HttpOutcome::RequiresPaymentApproval { quote_id, policy_reason, .. } = outcome else {
+    let X402HttpOutcome::RequiresPaymentApproval {
+        quote_id,
+        policy_reason,
+        ..
+    } = outcome
+    else {
         panic!("expected the approval hold, got {outcome:?}");
     };
     assert!(!quote_id.is_empty());
-    assert!(policy_reason.contains("dev/test profile"), "{policy_reason}");
+    assert!(
+        policy_reason.contains("dev/test profile"),
+        "{policy_reason}"
+    );
     assert!(
         server.received_payloads.lock().is_empty(),
         "no payment left the machine while policy holds"

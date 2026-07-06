@@ -154,9 +154,15 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(intent.mint, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-        assert_eq!(intent.pay_to, "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
+        assert_eq!(
+            intent.pay_to,
+            "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+        );
         assert_eq!(intent.amount, "10000");
-        assert_eq!(intent.fee_payer, "FaciLitator111111111111111111111111111111111");
+        assert_eq!(
+            intent.fee_payer,
+            "FaciLitator111111111111111111111111111111111"
+        );
         assert_eq!(intent.memo, None);
 
         // The spec requires the fee sponsor: absent extra, absent field,
@@ -168,16 +174,12 @@ mod tests {
 
     #[test]
     fn memo_passes_through_within_the_spec_bound() {
-        let with_memo = requirements(Some(
-            json!({ "feePayer": "F1", "memo": "order #42" }),
-        ));
+        let with_memo = requirements(Some(json!({ "feePayer": "F1", "memo": "order #42" })));
         assert_eq!(
             transfer_intent(&with_memo).unwrap().memo.as_deref(),
             Some("order #42")
         );
-        let oversized = requirements(Some(
-            json!({ "feePayer": "F1", "memo": "x".repeat(257) }),
-        ));
+        let oversized = requirements(Some(json!({ "feePayer": "F1", "memo": "x".repeat(257) })));
         assert!(transfer_intent(&oversized).is_err());
         let wrong_type = requirements(Some(json!({ "feePayer": "F1", "memo": 42 })));
         assert!(transfer_intent(&wrong_type).is_err());

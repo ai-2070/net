@@ -71,14 +71,19 @@ pub struct BearerAuth {
 
 impl BearerAuth {
     pub fn new(token: impl Into<String>) -> Self {
-        Self { token: token.into() }
+        Self {
+            token: token.into(),
+        }
     }
 }
 
 #[async_trait]
 impl AuthProvider for BearerAuth {
     async fn headers(&self) -> Result<Vec<(String, String)>, FacilitatorError> {
-        Ok(vec![("authorization".to_string(), format!("Bearer {}", self.token))])
+        Ok(vec![(
+            "authorization".to_string(),
+            format!("Bearer {}", self.token),
+        )])
     }
 }
 
@@ -107,7 +112,11 @@ impl HttpFacilitator {
             .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
         let endpoint = endpoint.into();
         let endpoint = endpoint.trim_end_matches('/').to_string();
-        Ok(Self { endpoint, http, auth })
+        Ok(Self {
+            endpoint,
+            http,
+            auth,
+        })
     }
 
     /// Override request timeouts (per call).
@@ -187,9 +196,8 @@ impl HttpFacilitator {
     ) -> Result<Vec<u8>, FacilitatorError> {
         // Compose around the preserved bytes: the payload/requirements
         // enter the request exactly as they were signed/quoted.
-        let payload_raw: &serde_json::value::RawValue =
-            serde_json::from_str(payload.as_json_str())
-                .map_err(|e| FacilitatorError::protocol(format!("payload carry: {e}")))?;
+        let payload_raw: &serde_json::value::RawValue = serde_json::from_str(payload.as_json_str())
+            .map_err(|e| FacilitatorError::protocol(format!("payload carry: {e}")))?;
         let requirements_raw: &serde_json::value::RawValue =
             serde_json::from_str(requirements.as_json_str())
                 .map_err(|e| FacilitatorError::protocol(format!("requirements carry: {e}")))?;
@@ -258,7 +266,10 @@ fn http_status_error(path: &str, status: reqwest::StatusCode, body: &[u8]) -> Fa
 #[async_trait]
 impl Facilitator for HttpFacilitator {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: self.endpoint.clone() }
+        VerifierRef {
+            identity: None,
+            endpoint: self.endpoint.clone(),
+        }
     }
 
     async fn verify(
@@ -266,10 +277,15 @@ impl Facilitator for HttpFacilitator {
         payload: &X402Carry<PaymentPayload>,
         requirements: &X402Carry<PaymentRequirements>,
     ) -> Result<VerifyOutcome, FacilitatorError> {
-        let body = self.post_payment_op("/verify", payload, requirements).await?;
+        let body = self
+            .post_payment_op("/verify", payload, requirements)
+            .await?;
         let response: X402Carry<VerifyResponse> = X402Carry::from_bytes(body)
             .map_err(|e| FacilitatorError::protocol(format!("/verify response: {e}")))?;
-        Ok(VerifyOutcome { response, tier: VerificationTier::Observed })
+        Ok(VerifyOutcome {
+            response,
+            tier: VerificationTier::Observed,
+        })
     }
 
     async fn settle(
@@ -277,11 +293,16 @@ impl Facilitator for HttpFacilitator {
         payload: &X402Carry<PaymentPayload>,
         requirements: &X402Carry<PaymentRequirements>,
     ) -> Result<SettleOutcome, FacilitatorError> {
-        let body = self.post_payment_op("/settle", payload, requirements).await?;
+        let body = self
+            .post_payment_op("/settle", payload, requirements)
+            .await?;
         let response: X402Carry<SettlementResponse> = X402Carry::from_bytes(body)
             .map_err(|e| FacilitatorError::protocol(format!("/settle response: {e}")))?;
         // A receipt is a receipt: `observed`, never more (the spec
         // reports no finality; the chain checker owns everything above).
-        Ok(SettleOutcome { response, tier: VerificationTier::Observed })
+        Ok(SettleOutcome {
+            response,
+            tier: VerificationTier::Observed,
+        })
     }
 }

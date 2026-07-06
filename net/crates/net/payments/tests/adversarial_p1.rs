@@ -9,14 +9,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use net::adapter::net::identity::EntityKeypair;
 use net_payments::core::registry::default_mock_registry;
-use net_payments::core::verification::{
-    InvalidationReason, VerificationTier, VerifierRef,
-};
+use net_payments::core::verification::{InvalidationReason, VerificationTier, VerifierRef};
 use net_payments::engine::{AdmitAll, PaymentDecision, PaymentEngine};
 use net_payments::facilitator::mock::{MOCK_NETWORK, MOCK_SCHEME};
-use net_payments::facilitator::{
-    Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome,
-};
+use net_payments::facilitator::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
 use net_payments::x402::payload::PaymentPayload;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::settlement::{SettlementResponse, VerifyResponse};
@@ -35,7 +31,10 @@ struct ScriptedSettler {
 #[async_trait]
 impl Facilitator for ScriptedSettler {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: "adversarial-fixture".into() }
+        VerifierRef {
+            identity: None,
+            endpoint: "adversarial-fixture".into(),
+        }
     }
 
     async fn verify(
@@ -93,7 +92,11 @@ fn world(facilitator: Arc<dyn Facilitator>) -> World {
         dir.path().join("engine.json"),
     )
     .expect("engine");
-    World { engine, caller: EntityKeypair::generate(), _dir: dir }
+    World {
+        engine,
+        caller: EntityKeypair::generate(),
+        _dir: dir,
+    }
 }
 
 fn requirements() -> X402Carry<PaymentRequirements> {
@@ -153,7 +156,12 @@ async fn a_replayed_settlement_transaction_never_serves_a_second_quote() {
 
     let (second_id, second) = w.pay("payer-2", NOW + 1_000).await;
     assert!(
-        matches!(second, PaymentDecision::Invalidated { reason: InvalidationReason::Replay }),
+        matches!(
+            second,
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::Replay
+            }
+        ),
         "one on-chain settlement, one serve — got {second:?}"
     );
 
@@ -172,8 +180,11 @@ async fn a_replayed_settlement_transaction_never_serves_a_second_quote() {
     assert!(first_status.billing_event_id.is_some());
 
     // And the frozen quote's invocation is refused at the gate.
-    let redemption =
-        w.engine.redeem_for_invocation("fixture-tool", &second_id, None).await.unwrap();
+    let redemption = w
+        .engine
+        .redeem_for_invocation("fixture-tool", &second_id, None)
+        .await
+        .unwrap();
     assert!(matches!(
         redemption,
         net_payments::engine::RedeemDecision::Denied { .. }
@@ -191,14 +202,26 @@ async fn a_settlement_on_the_wrong_network_is_worth_nothing() {
 
     let (quote_id, decision) = w.pay("payer-1", NOW).await;
     assert!(
-        matches!(decision, PaymentDecision::Invalidated { reason: InvalidationReason::Rejected }),
+        matches!(
+            decision,
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::Rejected
+            }
+        ),
         "got {decision:?}"
     );
     let status = w.engine.status(&quote_id).await.unwrap().unwrap();
-    assert!(status.frozen.as_deref().unwrap_or_default().contains("eip155:8453"));
+    assert!(status
+        .frozen
+        .as_deref()
+        .unwrap_or_default()
+        .contains("eip155:8453"));
     assert!(status.billing_event_id.is_none());
     let last = status.chain.last().unwrap();
-    assert_eq!(last.extra.get("network_mismatch"), Some(&serde_json::json!("eip155:8453")));
+    assert_eq!(
+        last.extra.get("network_mismatch"),
+        Some(&serde_json::json!("eip155:8453"))
+    );
 }
 
 #[tokio::test]

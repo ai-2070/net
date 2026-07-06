@@ -106,7 +106,8 @@ mod tests {
     use net::adapter::net::identity::EntityKeypair;
 
     fn settle_carry() -> X402Carry<SettlementResponse> {
-        let json = r#"{"success":true,"transaction":"0xfeed","network":"mock:net","amount":"2500"}"#;
+        let json =
+            r#"{"success":true,"transaction":"0xfeed","network":"mock:net","amount":"2500"}"#;
         X402Carry::from_bytes(json.as_bytes().to_vec()).unwrap()
     }
 
@@ -116,7 +117,10 @@ mod tests {
         let mut sref = SettlementRef::new(
             "q1",
             settle_carry(),
-            VerifierRef { identity: None, endpoint: "mock".into() },
+            VerifierRef {
+                identity: None,
+                endpoint: "mock".into(),
+            },
             7,
             kp.entity_id().clone(),
         );

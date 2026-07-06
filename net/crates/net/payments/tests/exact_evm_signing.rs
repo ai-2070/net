@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use net::adapter::net::identity::EntityKeypair;
+use net_payments::core::canonical::SignedEnvelope as _;
 use net_payments::core::quote::PaymentQuote;
 use net_payments::core::registry::RegistryRef;
-use net_payments::core::canonical::SignedEnvelope as _;
 use net_payments::flow::exact_evm_authorization_for_quote;
 use net_payments::flow::signer::dev::DevLocalSigner;
 use net_payments::flow::signer::{ExternalSigner, SchemeSigner};
@@ -44,7 +44,10 @@ fn quote_for(requirements: X402Carry<PaymentRequirements>) -> PaymentQuote {
         "42/paid-tool",
         None,
         requirements,
-        RegistryRef { version: "net-default-0".into(), hash: "aa".into() },
+        RegistryRef {
+            version: "net-default-0".into(),
+            hash: "aa".into(),
+        },
         1_740_672_000_000_000_000,
         1_740_672_060_000_000_000,
     );
@@ -67,16 +70,18 @@ async fn the_dev_signer_signs_recoverably_and_deterministically() {
 
     // RFC 6979: same document, same signature — retries re-present the
     // identical authorization.
-    assert_eq!(signer.sign_typed_data(&typed).await.expect("sign again"), sig_hex);
+    assert_eq!(
+        signer.sign_typed_data(&typed).await.expect("sign again"),
+        sig_hex
+    );
 
     // The signature recovers to the signer's address over the EIP-712
     // digest — what the token contract will check on-chain.
     let digest = DevLocalSigner::eip712_digest(&typed).expect("digest");
     let signature = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).expect("sig");
     let recovery = k256::ecdsa::RecoveryId::from_byte(v - 27).expect("recid");
-    let recovered =
-        k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
-            .expect("recover");
+    let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
+        .expect("recover");
     let pubkey = recovered.to_encoded_point(false);
     let hash = {
         use sha3::{Digest, Keccak256};

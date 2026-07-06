@@ -139,8 +139,14 @@ mod tests {
     #[test]
     fn same_idempotency_key_same_event_id() {
         let kp = EntityKeypair::generate();
-        assert_eq!(event(&kp, "k1").billing_event_id, event(&kp, "k1").billing_event_id);
-        assert_ne!(event(&kp, "k1").billing_event_id, event(&kp, "k2").billing_event_id);
+        assert_eq!(
+            event(&kp, "k1").billing_event_id,
+            event(&kp, "k1").billing_event_id
+        );
+        assert_ne!(
+            event(&kp, "k1").billing_event_id,
+            event(&kp, "k2").billing_event_id
+        );
     }
 
     #[test]

@@ -31,9 +31,8 @@ pub use net::adapter::net::behavior::fold::capability_aggregation::{TagMatcher, 
 #[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
     description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
-    tags_metadata_key, ToolDescriptor, ToolEvent,
-    ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
-    TOOL_METADATA_FETCH_SERVICE,
+    tags_metadata_key, ToolDescriptor, ToolEvent, ToolListChange, ToolListWatch,
+    ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
 };
 
 #[cfg(feature = "cortex")]

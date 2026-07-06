@@ -81,16 +81,15 @@ pub fn cdp_base_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     FacilitatorConfig {
         object: TAG_FACILITATOR_CONFIG.to_string(),
         endpoint: CDP_FACILITATOR.to_string(),
-        auth: AuthConfig::Bearer { secret_ref: secret_ref.into() },
+        auth: AuthConfig::Bearer {
+            secret_ref: secret_ref.into(),
+        },
         pairs: vec![SchemePair {
             scheme: "exact".to_string(),
             network: NETWORK_BASE.to_string(),
         }],
         rpc_endpoints: BTreeMap::from([(NETWORK_BASE.to_string(), RPC_BASE.to_string())]),
-        required_tier: BTreeMap::from([(
-            NETWORK_BASE.to_string(),
-            VerificationTier::Confirmed(1),
-        )]),
+        required_tier: BTreeMap::from([(NETWORK_BASE.to_string(), VerificationTier::Confirmed(1))]),
     }
 }
 
@@ -107,7 +106,9 @@ pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     FacilitatorConfig {
         object: TAG_FACILITATOR_CONFIG.to_string(),
         endpoint: CDP_FACILITATOR.to_string(),
-        auth: AuthConfig::Bearer { secret_ref: secret_ref.into() },
+        auth: AuthConfig::Bearer {
+            secret_ref: secret_ref.into(),
+        },
         pairs: vec![SchemePair {
             scheme: "exact".to_string(),
             network: NETWORK_SOLANA.to_string(),
@@ -200,11 +201,17 @@ mod tests {
         assert!(sepolia.rpc_endpoints.contains_key(NETWORK_BASE_SEPOLIA));
 
         let base = cdp_base_mainnet("k");
-        assert_eq!(base.required_tier(NETWORK_BASE), VerificationTier::Confirmed(1));
+        assert_eq!(
+            base.required_tier(NETWORK_BASE),
+            VerificationTier::Confirmed(1)
+        );
         assert!(base.rpc_endpoints.contains_key(NETWORK_BASE));
 
         let solana = cdp_solana_mainnet("k");
-        assert_eq!(solana.required_tier(NETWORK_SOLANA), VerificationTier::Observed);
+        assert_eq!(
+            solana.required_tier(NETWORK_SOLANA),
+            VerificationTier::Observed
+        );
         assert!(solana.rpc_endpoints.is_empty());
     }
 }

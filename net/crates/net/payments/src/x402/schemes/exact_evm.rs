@@ -52,9 +52,9 @@ pub fn chain_id(network: &str) -> Result<u64, X402Error> {
             "exact-EVM authoring needs an eip155 network, got `{network}`"
         )));
     }
-    reference
-        .parse()
-        .map_err(|_| X402Error::Invalid(format!("eip155 reference `{reference}` is not a chain id")))
+    reference.parse().map_err(|_| {
+        X402Error::Invalid(format!("eip155 reference `{reference}` is not a chain id"))
+    })
 }
 
 /// Build the `eth_signTypedData_v4` document for this authorization
@@ -81,11 +81,14 @@ pub fn typed_data(
     let name = extra.get("name").and_then(Value::as_str).ok_or_else(|| {
         X402Error::Invalid("requirements.extra.name (EIP-712 domain name) missing".to_string())
     })?;
-    let version = extra.get("version").and_then(Value::as_str).ok_or_else(|| {
-        X402Error::Invalid(
-            "requirements.extra.version (EIP-712 domain version) missing".to_string(),
-        )
-    })?;
+    let version = extra
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            X402Error::Invalid(
+                "requirements.extra.version (EIP-712 domain version) missing".to_string(),
+            )
+        })?;
     if auth.to != requirements.pay_to {
         return Err(X402Error::Invalid(
             "authorization recipient differs from requirements.payTo".to_string(),
@@ -182,9 +185,15 @@ mod tests {
         assert_eq!(doc["domain"]["name"], "USDC");
         assert_eq!(doc["domain"]["version"], "2");
         assert_eq!(doc["domain"]["chainId"], 84532);
-        assert_eq!(doc["domain"]["verifyingContract"], "0x036CbD53842c5426634e7929541eC2318f3dCF7e");
+        assert_eq!(
+            doc["domain"]["verifyingContract"],
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        );
         assert_eq!(doc["message"]["value"], "10000");
-        assert_eq!(doc["types"]["TransferWithAuthorization"][5]["type"], "bytes32");
+        assert_eq!(
+            doc["types"]["TransferWithAuthorization"][5]["type"],
+            "bytes32"
+        );
     }
 
     #[test]
@@ -211,6 +220,9 @@ mod tests {
         let p = payload_object(&auth(), "0xsig");
         assert_eq!(p["signature"], "0xsig");
         assert_eq!(p["authorization"]["validBefore"], "1740672154");
-        assert_eq!(p["authorization"]["nonce"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(
+            p["authorization"]["nonce"],
+            format!("0x{}", "11".repeat(32))
+        );
     }
 }

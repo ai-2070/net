@@ -558,10 +558,7 @@ impl CapabilityGateway for MeshGateway {
                     p.quote_id.into_bytes(),
                 )];
                 if let Some(sig) = p.binding_sig {
-                    headers.push((
-                        crate::serve::payment::HDR_PAYMENT_BINDING.to_string(),
-                        sig,
-                    ));
+                    headers.push((crate::serve::payment::HDR_PAYMENT_BINDING.to_string(), sig));
                 }
                 headers
             })
@@ -574,7 +571,13 @@ impl CapabilityGateway for MeshGateway {
             retriable_send_safe
         };
         match self
-            .invoke_on(primary, &id.capability, body.clone(), retriable, &payment_headers)
+            .invoke_on(
+                primary,
+                &id.capability,
+                body.clone(),
+                retriable,
+                &payment_headers,
+            )
             .await
         {
             // Primary unreachable — fail over to an equivalent provider (see the
@@ -585,7 +588,13 @@ impl CapabilityGateway for MeshGateway {
             Err(GatewayError::Transport(primary_reason)) => {
                 for (node, _) in self.equivalent_providers(id, primary).await {
                     match self
-                        .invoke_on(node, &id.capability, body.clone(), retriable, &payment_headers)
+                        .invoke_on(
+                            node,
+                            &id.capability,
+                            body.clone(),
+                            retriable,
+                            &payment_headers,
+                        )
                         .await
                     {
                         Err(GatewayError::Transport(_)) => continue, // this one is down too

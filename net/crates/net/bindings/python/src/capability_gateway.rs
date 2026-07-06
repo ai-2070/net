@@ -180,7 +180,11 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
         // untouched (doctrine #1: the decision came from the Rust spend
         // engine; this arm only names the fields). Approval resolves
         // through the SDK consent API; the shared store holds the decision.
-        GatedOutcome::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } => json!({
+        GatedOutcome::RequiresPaymentApproval {
+            quote_id,
+            policy_reason,
+            approve_hint,
+        } => json!({
             "status": "requires_payment_approval",
             "cap_id": id.display(),
             "quote_id": quote_id,
@@ -393,7 +397,9 @@ fn build_payment_flow(
     use net_payments::flow::{CallerPaymentFlow, SystemClock};
     use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 
-    let Some(config) = config else { return Ok(None) };
+    let Some(config) = config else {
+        return Ok(None);
+    };
     let profile = match config.profile.as_str() {
         "production" => SpendProfile::Production,
         "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
@@ -409,8 +415,7 @@ fn build_payment_flow(
     // the operator lists them in the spend policy's `allowed_networks`
     // AND configures a signer — the registry is the asset allowlist,
     // never the enablement switch.
-    let registry =
-        net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
+    let registry = net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
     let mut flow = CallerPaymentFlow::new(
@@ -753,7 +758,15 @@ impl PyAsyncCapabilityGateway {
         };
         let h = self.state.handles();
         let join = self.state.runtime.spawn(async move {
-            do_invoke(&h.gateway, &h.consent, &h.pin_path, h.payment.as_deref(), id, args).await
+            do_invoke(
+                &h.gateway,
+                &h.consent,
+                &h.pin_path,
+                h.payment.as_deref(),
+                id,
+                args,
+            )
+            .await
         });
         spawn_bridge(py, join)
     }

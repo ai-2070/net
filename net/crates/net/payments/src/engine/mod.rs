@@ -107,10 +107,16 @@ pub enum RejectReason {
 pub enum PaymentDecision {
     /// Payment verified at (or above) the required tier — the handler may
     /// run. Same-key retries return this same billing event.
-    Served { billing: Box<BillingEvent>, tier: VerificationTier },
+    Served {
+        billing: Box<BillingEvent>,
+        tier: VerificationTier,
+    },
     /// Settled, but confidence hasn't reached the required tier yet.
     /// Re-verify later; the handler does not run.
-    PendingTier { reached: VerificationTier, required: VerificationTier },
+    PendingTier {
+        reached: VerificationTier,
+        required: VerificationTier,
+    },
     /// A verification exception (e.g. overpayment) for provider policy to
     /// handle manually. The verifier never auto-satisfies.
     Exception { kind: ExceptionKind },
@@ -123,7 +129,11 @@ pub enum PaymentDecision {
     Rejected { reason: RejectReason },
     /// The facilitator could not answer. Fail-closed default; policy
     /// chooses retry / fallback. Nothing was consumed.
-    FacilitatorFailure { kind: FacilitatorErrorKind, retryable: bool, message: String },
+    FacilitatorFailure {
+        kind: FacilitatorErrorKind,
+        retryable: bool,
+        message: String,
+    },
 }
 
 /// Provider-side admission: never quote a caller you'd deny.
@@ -339,10 +349,14 @@ impl PaymentEngine {
             return Ok(PaymentDecision::Rejected { reason: e });
         }
         if now_ns >= quote.expires_at_ns.saturating_add(self.expiry_tolerance_ns) {
-            return Ok(PaymentDecision::Rejected { reason: RejectReason::QuoteExpired });
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::QuoteExpired,
+            });
         }
         if payload.view().accepted != *quote.requirements.view() {
-            return Ok(PaymentDecision::Rejected { reason: RejectReason::PayloadMismatch });
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::PayloadMismatch,
+            });
         }
 
         let payload_hash = payload.content_hash();
@@ -409,13 +423,19 @@ impl PaymentEngine {
 
         match claim {
             Claim::Frozen(reason) => {
-                return Ok(PaymentDecision::Rejected { reason: RejectReason::QuoteFrozen(reason) })
+                return Ok(PaymentDecision::Rejected {
+                    reason: RejectReason::QuoteFrozen(reason),
+                })
             }
             Claim::QuoteAlreadyPaid => {
-                return Ok(PaymentDecision::Rejected { reason: RejectReason::QuoteAlreadyPaid })
+                return Ok(PaymentDecision::Rejected {
+                    reason: RejectReason::QuoteAlreadyPaid,
+                })
             }
             Claim::ReplayOtherQuote => {
-                return Ok(PaymentDecision::Rejected { reason: RejectReason::Replay })
+                return Ok(PaymentDecision::Rejected {
+                    reason: RejectReason::Replay,
+                })
             }
             Claim::InProgress => return Ok(PaymentDecision::InProgress),
             Claim::AlreadyServed(billing, tier) => {
@@ -453,7 +473,9 @@ impl PaymentEngine {
                 .clone()
                 .unwrap_or_else(|| "unspecified".to_string());
             self.release_claim(&quote.quote_id, &payload_hash).await?;
-            return Ok(PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(reason) });
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::VerifyRejected(reason),
+            });
         }
 
         // -- settle (facilitator I/O, no lock held).
@@ -476,7 +498,9 @@ impl PaymentEngine {
                 .clone()
                 .unwrap_or_else(|| "unspecified".to_string());
             self.release_claim(&quote.quote_id, &payload_hash).await?;
-            return Ok(PaymentDecision::Rejected { reason: RejectReason::SettleFailed(reason) });
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::SettleFailed(reason),
+            });
         }
 
         // -- completion: amount policy + chain event + billing, one lock.
@@ -493,46 +517,16 @@ impl PaymentEngine {
 
         let quote_id = quote.quote_id.clone();
         type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
-        let (decision, fresh_billing) = mutate_json::<EngineState, Completion, _>(
-            &self.state_path,
-            |s| {
-            // Facilitator-answer sanity, before any amount reasoning:
-            // [a] the settlement must be on the QUOTED network — a
-            //     receipt from some other chain is worth nothing here;
-            // [b] the transaction must not already satisfy another quote
-            //     (receipt replay: one on-chain settlement, one serve).
-            // Both are misbehavior-of-the-money-machinery: invalidate
-            // and freeze, never a retryable shrug.
-            if settle_network != quoted_network {
-                let rec = s
-                    .quotes
-                    .get_mut(&quote_id)
-                    .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
-                rec.in_flight = false;
-                let ev = self.build_event(
-                    rec,
-                    &quote_id,
-                    Some(transaction.clone()),
-                    tier,
-                    VerificationStatus::Invalidated { reason: InvalidationReason::Rejected },
-                    now_ns,
-                    &[(
-                        "network_mismatch".to_string(),
-                        serde_json::Value::String(settle_network.clone()),
-                    )],
-                )?;
-                rec.chain.push(ev);
-                rec.frozen = Some(format!(
-                    "settlement reported on `{settle_network}`, quote is on `{quoted_network}`"
-                ));
-                return Ok((
-                    PaymentDecision::Invalidated { reason: InvalidationReason::Rejected },
-                    None,
-                ));
-            }
-            let tx_key = format!("{quoted_network}|{transaction}");
-            match s.consumed_transactions.get(&tx_key) {
-                Some(owner) if *owner != quote_id => {
+        let (decision, fresh_billing) =
+            mutate_json::<EngineState, Completion, _>(&self.state_path, |s| {
+                // Facilitator-answer sanity, before any amount reasoning:
+                // [a] the settlement must be on the QUOTED network — a
+                //     receipt from some other chain is worth nothing here;
+                // [b] the transaction must not already satisfy another quote
+                //     (receipt replay: one on-chain settlement, one serve).
+                // Both are misbehavior-of-the-money-machinery: invalidate
+                // and freeze, never a retryable shrug.
+                if settle_network != quoted_network {
                     let rec = s
                         .quotes
                         .get_mut(&quote_id)
@@ -543,105 +537,162 @@ impl PaymentEngine {
                         &quote_id,
                         Some(transaction.clone()),
                         tier,
-                        VerificationStatus::Invalidated { reason: InvalidationReason::Replay },
-                        now_ns,
-                        &[(
-                            "transaction_already_satisfies".to_string(),
-                            serde_json::Value::String(owner.clone()),
-                        )],
-                    )?;
-                    rec.chain.push(ev);
-                    rec.frozen = Some("settlement transaction replayed across quotes".to_string());
-                    return Ok((
-                        PaymentDecision::Invalidated { reason: InvalidationReason::Replay },
-                        None,
-                    ));
-                }
-                _ => {
-                    s.consumed_transactions.insert(tx_key, quote_id.clone());
-                }
-            }
-
-            let rec = s
-                .quotes
-                .get_mut(&quote_id)
-                .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
-            rec.in_flight = false;
-
-            use std::cmp::Ordering;
-            match delivered.cmp(&required) {
-                Ordering::Less => {
-                    // Money moved but short: the payment is invalid and the
-                    // quote freezes — value was consumed, nothing serves.
-                    let ev = self.build_event(
-                        rec,
-                        &quote_id,
-                        Some(transaction.clone()),
-                        tier,
                         VerificationStatus::Invalidated {
-                            reason: InvalidationReason::AmountMismatch,
+                            reason: InvalidationReason::Rejected,
                         },
                         now_ns,
                         &[(
-                            "delivered".to_string(),
-                            serde_json::Value::String(delivered.to_canonical_string()),
+                            "network_mismatch".to_string(),
+                            serde_json::Value::String(settle_network.clone()),
                         )],
                     )?;
                     rec.chain.push(ev);
-                    rec.frozen = Some("amount_mismatch".to_string());
-                    Ok((
-                        PaymentDecision::Invalidated { reason: InvalidationReason::AmountMismatch },
+                    rec.frozen = Some(format!(
+                        "settlement reported on `{settle_network}`, quote is on `{quoted_network}`"
+                    ));
+                    return Ok((
+                        PaymentDecision::Invalidated {
+                            reason: InvalidationReason::Rejected,
+                        },
                         None,
-                    ))
+                    ));
                 }
-                Ordering::Greater => {
-                    // Overpayment: verification exception for provider
-                    // policy, never auto-satisfied. Not frozen; no billing.
-                    let ev = self.build_event(
-                        rec,
-                        &quote_id,
-                        Some(transaction.clone()),
-                        tier,
-                        VerificationStatus::Exception { kind: ExceptionKind::Overpayment },
-                        now_ns,
-                        &[(
-                            "delivered".to_string(),
-                            serde_json::Value::String(delivered.to_canonical_string()),
-                        )],
-                    )?;
-                    rec.chain.push(ev);
-                    Ok((PaymentDecision::Exception { kind: ExceptionKind::Overpayment }, None))
+                let tx_key = format!("{quoted_network}|{transaction}");
+                match s.consumed_transactions.get(&tx_key) {
+                    Some(owner) if *owner != quote_id => {
+                        let rec = s.quotes.get_mut(&quote_id).ok_or_else(|| {
+                            EngineError::State("record vanished mid-settle".into())
+                        })?;
+                        rec.in_flight = false;
+                        let ev = self.build_event(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            tier,
+                            VerificationStatus::Invalidated {
+                                reason: InvalidationReason::Replay,
+                            },
+                            now_ns,
+                            &[(
+                                "transaction_already_satisfies".to_string(),
+                                serde_json::Value::String(owner.clone()),
+                            )],
+                        )?;
+                        rec.chain.push(ev);
+                        rec.frozen =
+                            Some("settlement transaction replayed across quotes".to_string());
+                        return Ok((
+                            PaymentDecision::Invalidated {
+                                reason: InvalidationReason::Replay,
+                            },
+                            None,
+                        ));
+                    }
+                    _ => {
+                        s.consumed_transactions.insert(tx_key, quote_id.clone());
+                    }
                 }
-                Ordering::Equal => {
-                    let ev = self.build_event(
-                        rec,
-                        &quote_id,
-                        Some(transaction.clone()),
-                        tier,
-                        VerificationStatus::Verified,
-                        now_ns,
-                        &[],
-                    )?;
-                    rec.chain.push(ev);
-                    if tier.satisfies(&required_tier) {
-                        let billing = self.build_billing(rec, &quote_id, &transaction, delivered.clone(), now_ns)?;
-                        rec.billing = Some(billing.clone());
-                        rec.served = true;
+
+                let rec = s
+                    .quotes
+                    .get_mut(&quote_id)
+                    .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
+                rec.in_flight = false;
+
+                use std::cmp::Ordering;
+                match delivered.cmp(&required) {
+                    Ordering::Less => {
+                        // Money moved but short: the payment is invalid and the
+                        // quote freezes — value was consumed, nothing serves.
+                        let ev = self.build_event(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            tier,
+                            VerificationStatus::Invalidated {
+                                reason: InvalidationReason::AmountMismatch,
+                            },
+                            now_ns,
+                            &[(
+                                "delivered".to_string(),
+                                serde_json::Value::String(delivered.to_canonical_string()),
+                            )],
+                        )?;
+                        rec.chain.push(ev);
+                        rec.frozen = Some("amount_mismatch".to_string());
                         Ok((
-                            PaymentDecision::Served { billing: Box::new(billing.clone()), tier },
-                            Some(billing),
-                        ))
-                    } else {
-                        Ok((
-                            PaymentDecision::PendingTier { reached: tier, required: required_tier },
+                            PaymentDecision::Invalidated {
+                                reason: InvalidationReason::AmountMismatch,
+                            },
                             None,
                         ))
                     }
+                    Ordering::Greater => {
+                        // Overpayment: verification exception for provider
+                        // policy, never auto-satisfied. Not frozen; no billing.
+                        let ev = self.build_event(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            tier,
+                            VerificationStatus::Exception {
+                                kind: ExceptionKind::Overpayment,
+                            },
+                            now_ns,
+                            &[(
+                                "delivered".to_string(),
+                                serde_json::Value::String(delivered.to_canonical_string()),
+                            )],
+                        )?;
+                        rec.chain.push(ev);
+                        Ok((
+                            PaymentDecision::Exception {
+                                kind: ExceptionKind::Overpayment,
+                            },
+                            None,
+                        ))
+                    }
+                    Ordering::Equal => {
+                        let ev = self.build_event(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            tier,
+                            VerificationStatus::Verified,
+                            now_ns,
+                            &[],
+                        )?;
+                        rec.chain.push(ev);
+                        if tier.satisfies(&required_tier) {
+                            let billing = self.build_billing(
+                                rec,
+                                &quote_id,
+                                &transaction,
+                                delivered.clone(),
+                                now_ns,
+                            )?;
+                            rec.billing = Some(billing.clone());
+                            rec.served = true;
+                            Ok((
+                                PaymentDecision::Served {
+                                    billing: Box::new(billing.clone()),
+                                    tier,
+                                },
+                                Some(billing),
+                            ))
+                        } else {
+                            Ok((
+                                PaymentDecision::PendingTier {
+                                    reached: tier,
+                                    required: required_tier,
+                                },
+                                None,
+                            ))
+                        }
+                    }
                 }
-            }
-        },
-        )
-        .await??;
+            })
+            .await??;
         self.publish_billing(fresh_billing).await?;
         Ok(decision)
     }
@@ -701,92 +752,101 @@ impl PaymentEngine {
 
         let quote_id = quote_id.to_string();
         type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
-        let (decision, fresh_billing) = mutate_json::<EngineState, Completion, _>(
-            &self.state_path,
-            |s| {
-            let rec = s
-                .quotes
-                .get_mut(&quote_id)
-                .ok_or_else(|| EngineError::State("record vanished mid-verify".into()))?;
-            if let Some(reason) = &rec.frozen {
-                return Ok((
-                    PaymentDecision::Rejected { reason: RejectReason::QuoteFrozen(reason.clone()) },
-                    None,
-                ));
-            }
-            let transaction = rec.chain.last().and_then(|e| e.transaction.clone());
+        let (decision, fresh_billing) =
+            mutate_json::<EngineState, Completion, _>(&self.state_path, |s| {
+                let rec = s
+                    .quotes
+                    .get_mut(&quote_id)
+                    .ok_or_else(|| EngineError::State("record vanished mid-verify".into()))?;
+                if let Some(reason) = &rec.frozen {
+                    return Ok((
+                        PaymentDecision::Rejected {
+                            reason: RejectReason::QuoteFrozen(reason.clone()),
+                        },
+                        None,
+                    ));
+                }
+                let transaction = rec.chain.last().and_then(|e| e.transaction.clone());
 
-            if !is_valid {
-                let reason_str =
-                    facilitator_reason.unwrap_or_else(|| "unspecified".to_string());
-                let reason = InvalidationReason::from_facilitator_reason(&reason_str);
+                if !is_valid {
+                    let reason_str =
+                        facilitator_reason.unwrap_or_else(|| "unspecified".to_string());
+                    let reason = InvalidationReason::from_facilitator_reason(&reason_str);
+                    let ev = self.build_event(
+                        rec,
+                        &quote_id,
+                        transaction,
+                        tier,
+                        VerificationStatus::Invalidated { reason },
+                        now_ns,
+                        &[(
+                            "facilitator_reason".to_string(),
+                            serde_json::Value::String(reason_str.clone()),
+                        )],
+                    )?;
+                    rec.chain.push(ev);
+                    // Freeze: nothing further serves against this quote. The
+                    // billing event (if emitted) stands immutable — this event
+                    // references the same quote/chain for the audit trail.
+                    rec.frozen = Some(reason_str);
+                    return Ok((PaymentDecision::Invalidated { reason }, None));
+                }
+
                 let ev = self.build_event(
                     rec,
                     &quote_id,
-                    transaction,
+                    transaction.clone(),
                     tier,
-                    VerificationStatus::Invalidated { reason },
+                    VerificationStatus::Verified,
                     now_ns,
-                    &[(
-                        "facilitator_reason".to_string(),
-                        serde_json::Value::String(reason_str.clone()),
-                    )],
+                    &[],
                 )?;
                 rec.chain.push(ev);
-                // Freeze: nothing further serves against this quote. The
-                // billing event (if emitted) stands immutable — this event
-                // references the same quote/chain for the audit trail.
-                rec.frozen = Some(reason_str);
-                return Ok((PaymentDecision::Invalidated { reason }, None));
-            }
 
-            let ev = self.build_event(
-                rec,
-                &quote_id,
-                transaction.clone(),
-                tier,
-                VerificationStatus::Verified,
-                now_ns,
-                &[],
-            )?;
-            rec.chain.push(ev);
-
-            if let Some(billing) = &rec.billing {
-                return Ok((
-                    PaymentDecision::Served { billing: Box::new(billing.clone()), tier },
-                    None,
-                ));
-            }
-            if tier.satisfies(&required_tier) {
-                let tx = transaction.unwrap_or_default();
-                let delivered = rec
-                    .chain
-                    .first()
-                    .and_then(|e| e.extra.get("delivered"))
-                    .and_then(|v| v.as_str())
-                    .map(AtomicAmount::parse)
-                    .transpose()
-                    .map_err(|e| EngineError::State(e.to_string()))?;
-                let amount = match delivered {
-                    Some(a) => a,
-                    None => self.required_amount_from(rec)?,
-                };
-                let billing = self.build_billing(rec, &quote_id, &tx, amount, now_ns)?;
-                rec.billing = Some(billing.clone());
-                rec.served = true;
-                Ok((
-                    PaymentDecision::Served { billing: Box::new(billing.clone()), tier },
-                    Some(billing),
-                ))
-            } else {
-                Ok((
-                    PaymentDecision::PendingTier { reached: tier, required: required_tier },
-                    None,
-                ))
-            }
-        },
-        )
-        .await??;
+                if let Some(billing) = &rec.billing {
+                    return Ok((
+                        PaymentDecision::Served {
+                            billing: Box::new(billing.clone()),
+                            tier,
+                        },
+                        None,
+                    ));
+                }
+                if tier.satisfies(&required_tier) {
+                    let tx = transaction.unwrap_or_default();
+                    let delivered = rec
+                        .chain
+                        .first()
+                        .and_then(|e| e.extra.get("delivered"))
+                        .and_then(|v| v.as_str())
+                        .map(AtomicAmount::parse)
+                        .transpose()
+                        .map_err(|e| EngineError::State(e.to_string()))?;
+                    let amount = match delivered {
+                        Some(a) => a,
+                        None => self.required_amount_from(rec)?,
+                    };
+                    let billing = self.build_billing(rec, &quote_id, &tx, amount, now_ns)?;
+                    rec.billing = Some(billing.clone());
+                    rec.served = true;
+                    Ok((
+                        PaymentDecision::Served {
+                            billing: Box::new(billing.clone()),
+                            tier,
+                        },
+                        Some(billing),
+                    ))
+                } else {
+                    Ok((
+                        PaymentDecision::PendingTier {
+                            reached: tier,
+                            required: required_tier,
+                        },
+                        None,
+                    ))
+                }
+            })
+            .await??;
         self.publish_billing(fresh_billing).await?;
         Ok(decision)
     }
@@ -864,9 +924,8 @@ impl PaymentEngine {
 
         let quote_id = quote_id.to_string();
         type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
-        let (decision, fresh_billing) = mutate_json::<EngineState, Completion, _>(
-            &self.state_path,
-            |s| {
+        let (decision, fresh_billing) =
+            mutate_json::<EngineState, Completion, _>(&self.state_path, |s| {
                 let rec = s
                     .quotes
                     .get_mut(&quote_id)
@@ -888,7 +947,10 @@ impl PaymentEngine {
                         let reached =
                             last_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
                         Ok((
-                            PaymentDecision::PendingTier { reached, required: required_tier },
+                            PaymentDecision::PendingTier {
+                                reached,
+                                required: required_tier,
+                            },
                             None,
                         ))
                     }
@@ -911,11 +973,16 @@ impl PaymentEngine {
                         rec.chain.push(ev);
                         rec.frozen = Some("settlement reverted on-chain".to_string());
                         Ok((
-                            PaymentDecision::Invalidated { reason: InvalidationReason::Rejected },
+                            PaymentDecision::Invalidated {
+                                reason: InvalidationReason::Rejected,
+                            },
                             None,
                         ))
                     }
-                    ChainVerdict::Included { tier, ref delivered } => {
+                    ChainVerdict::Included {
+                        tier,
+                        ref delivered,
+                    } => {
                         // Delivered-amount cross-check, straight from the
                         // chain: the exact-amount policy's independent leg.
                         if let Some(delivered) = delivered {
@@ -1012,20 +1079,25 @@ impl PaymentEngine {
                             rec.billing = Some(billing.clone());
                             rec.served = true;
                             Ok((
-                                PaymentDecision::Served { billing: Box::new(billing.clone()), tier },
+                                PaymentDecision::Served {
+                                    billing: Box::new(billing.clone()),
+                                    tier,
+                                },
                                 Some(billing),
                             ))
                         } else {
                             Ok((
-                                PaymentDecision::PendingTier { reached: tier, required: required_tier },
+                                PaymentDecision::PendingTier {
+                                    reached: tier,
+                                    required: required_tier,
+                                },
                                 None,
                             ))
                         }
                     }
                 }
-            },
-        )
-        .await??;
+            })
+            .await??;
         self.publish_billing(fresh_billing).await?;
         Ok(decision)
     }
@@ -1090,8 +1162,7 @@ impl PaymentEngine {
             }
             if rec.billing.is_none() {
                 return RedeemDecision::Denied {
-                    reason: "quote is not settled/billed — the payment never completed"
-                        .to_string(),
+                    reason: "quote is not settled/billed — the payment never completed".to_string(),
                 };
             }
             // The capability binds `provider/tool`; the tool segment is
@@ -1144,7 +1215,9 @@ impl PaymentEngine {
             .verify_signature()
             .map_err(|e| RejectReason::BadQuote(e.to_string()))?;
         if quote.provider != *self.provider.entity_id() {
-            return Err(RejectReason::BadQuote("quote issued by another provider".into()));
+            return Err(RejectReason::BadQuote(
+                "quote issued by another provider".into(),
+            ));
         }
         if quote.asset_registry != self.registry_ref {
             return Err(RejectReason::BadQuote(

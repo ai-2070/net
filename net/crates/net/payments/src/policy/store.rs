@@ -41,7 +41,10 @@ pub enum StoreError {
 
 impl StoreError {
     fn io(path: &Path, e: impl std::fmt::Display) -> Self {
-        Self::Io { path: path.display().to_string(), reason: e.to_string() }
+        Self::Io {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }
     }
 }
 
@@ -158,13 +161,17 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         }
         let mut file = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
         use tokio::io::AsyncWriteExt as _;
-        file.write_all(&bytes).await.map_err(|e| StoreError::io(&tmp, e))?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|e| StoreError::io(&tmp, e))?;
         file.flush().await.map_err(|e| StoreError::io(&tmp, e))?;
         // fsync before the rename so a crash right after the rename can
         // never surface a truncated store.
         file.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
         drop(file);
-        tokio::fs::rename(&tmp, path).await.map_err(|e| StoreError::io(path, e))
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(|e| StoreError::io(path, e))
     }
     .await;
 
@@ -290,9 +297,7 @@ mod tests {
         assert_eq!(loaded.counts.len(), 24);
     }
 
-    async fn futures_join_all(
-        tasks: Vec<tokio::task::JoinHandle<Result<(), StoreError>>>,
-    ) {
+    async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<Result<(), StoreError>>>) {
         for t in tasks {
             t.await.expect("join").expect("mutate");
         }

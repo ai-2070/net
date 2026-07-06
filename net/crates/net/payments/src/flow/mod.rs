@@ -78,17 +78,31 @@ pub enum PayResponse {
         billing_event: String,
         transaction: Option<String>,
     },
-    PendingTier { reached: String, required: String },
-    Rejected { reason: String },
-    Invalidated { reason: String },
-    Exception { kind: String },
+    PendingTier {
+        reached: String,
+        required: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    Invalidated {
+        reason: String,
+    },
+    Exception {
+        kind: String,
+    },
     InProgress,
-    Failure { retryable: bool, message: String },
+    Failure {
+        retryable: bool,
+        message: String,
+    },
 }
 
 impl PayResponse {
     /// Project an engine decision onto the wire vocabulary.
-    pub fn from_decision(decision: &PaymentDecision) -> Result<Self, crate::core::canonical::EnvelopeError> {
+    pub fn from_decision(
+        decision: &PaymentDecision,
+    ) -> Result<Self, crate::core::canonical::EnvelopeError> {
         Ok(match decision {
             PaymentDecision::Served { billing, .. } => PayResponse::Served {
                 billing_event: String::from_utf8(crate::core::canonical::canonical_bytes(
@@ -101,19 +115,22 @@ impl PayResponse {
                 reached: format!("{reached:?}"),
                 required: format!("{required:?}"),
             },
-            PaymentDecision::Rejected { reason } => {
-                PayResponse::Rejected { reason: reason.to_string() }
-            }
-            PaymentDecision::Invalidated { reason } => {
-                PayResponse::Invalidated { reason: format!("{reason:?}") }
-            }
-            PaymentDecision::Exception { kind } => {
-                PayResponse::Exception { kind: format!("{kind:?}") }
-            }
+            PaymentDecision::Rejected { reason } => PayResponse::Rejected {
+                reason: reason.to_string(),
+            },
+            PaymentDecision::Invalidated { reason } => PayResponse::Invalidated {
+                reason: format!("{reason:?}"),
+            },
+            PaymentDecision::Exception { kind } => PayResponse::Exception {
+                kind: format!("{kind:?}"),
+            },
             PaymentDecision::InProgress => PayResponse::InProgress,
-            PaymentDecision::FacilitatorFailure { retryable, message, .. } => {
-                PayResponse::Failure { retryable: *retryable, message: message.clone() }
-            }
+            PaymentDecision::FacilitatorFailure {
+                retryable, message, ..
+            } => PayResponse::Failure {
+                retryable: *retryable,
+                message: message.clone(),
+            },
         })
     }
 }
@@ -189,9 +206,14 @@ impl ProviderChannel for InProcessProvider {
                 self.clock.now_ns(),
                 self.ttl_ns,
             )
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })?;
-        crate::core::canonical::canonical_bytes(&quote)
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })
+            .map_err(|e| ChannelError {
+                message: e.to_string(),
+                retryable: false,
+            })?;
+        crate::core::canonical::canonical_bytes(&quote).map_err(|e| ChannelError {
+            message: e.to_string(),
+            retryable: false,
+        })
     }
 
     async fn pay(
@@ -199,15 +221,22 @@ impl ProviderChannel for InProcessProvider {
         quote_bytes: &[u8],
         payload: &X402Carry<PaymentPayload>,
     ) -> Result<PayResponse, ChannelError> {
-        let quote = PaymentQuote::from_json_bytes(quote_bytes)
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })?;
+        let quote = PaymentQuote::from_json_bytes(quote_bytes).map_err(|e| ChannelError {
+            message: e.to_string(),
+            retryable: false,
+        })?;
         let decision = self
             .engine
             .accept_payment(&quote, payload, self.required_tier, self.clock.now_ns())
             .await
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })?;
-        PayResponse::from_decision(&decision)
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })
+            .map_err(|e| ChannelError {
+                message: e.to_string(),
+                retryable: false,
+            })?;
+        PayResponse::from_decision(&decision).map_err(|e| ChannelError {
+            message: e.to_string(),
+            retryable: false,
+        })
     }
 }
 
@@ -229,8 +258,13 @@ pub enum CallerDecision {
         policy_reason: String,
         approve_hint: String,
     },
-    Denied { policy_reason: String },
-    Failed { message: String, retryable: bool },
+    Denied {
+        policy_reason: String,
+    },
+    Failed {
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// The caller-side payment flow: one per caller identity + policy store.
@@ -342,14 +376,26 @@ impl CallerPaymentFlow {
                 }
             }
             Ok(None) => {
-                match self.provider.quote(self.caller.entity_id(), capability, template).await {
+                match self
+                    .provider
+                    .quote(self.caller.entity_id(), capability, template)
+                    .await
+                {
                     Ok(b) => b,
                     Err(e) => {
-                        return CallerDecision::Failed { message: e.message, retryable: e.retryable }
+                        return CallerDecision::Failed {
+                            message: e.message,
+                            retryable: e.retryable,
+                        }
                     }
                 }
             }
-            Err(e) => return CallerDecision::Failed { message: e.to_string(), retryable: false },
+            Err(e) => {
+                return CallerDecision::Failed {
+                    message: e.to_string(),
+                    retryable: false,
+                }
+            }
         };
         let quote = match PaymentQuote::from_json_bytes(&quote_bytes) {
             Ok(q) => q,
@@ -385,9 +431,17 @@ impl CallerPaymentFlow {
         }
 
         // -- [3] caller spend policy: check + reserve, one locked RMW.
-        match self.spend.check_and_reserve(&quote, &self.registry, now_ns).await {
+        match self
+            .spend
+            .check_and_reserve(&quote, &self.registry, now_ns)
+            .await
+        {
             Ok(SpendDecision::Allowed) => {}
-            Ok(SpendDecision::RequiresPaymentApproval { quote_id, policy_reason, approve_hint }) => {
+            Ok(SpendDecision::RequiresPaymentApproval {
+                quote_id,
+                policy_reason,
+                approve_hint,
+            }) => {
                 return CallerDecision::RequiresPaymentApproval {
                     quote_id,
                     policy_reason,
@@ -398,7 +452,10 @@ impl CallerPaymentFlow {
                 return CallerDecision::Denied { policy_reason }
             }
             Err(e) => {
-                return CallerDecision::Failed { message: e.to_string(), retryable: false }
+                return CallerDecision::Failed {
+                    message: e.to_string(),
+                    retryable: false,
+                }
             }
         }
 
@@ -410,7 +467,10 @@ impl CallerPaymentFlow {
             Ok(p) => p,
             Err(message) => {
                 self.release(&quote, now_ns).await;
-                return CallerDecision::Failed { message, retryable: false };
+                return CallerDecision::Failed {
+                    message,
+                    retryable: false,
+                };
             }
         };
 
@@ -515,9 +575,7 @@ impl CallerPaymentFlow {
                 "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
                 "nonce": nonce,
             })
-        } else if self.can_settle(requirements)
-            && requirements.network.starts_with("eip155:")
-        {
+        } else if self.can_settle(requirements) && requirements.network.starts_with("eip155:") {
             // exact / eip155: EIP-3009 typed data through the signer.
             let signer = self
                 .signers
@@ -526,12 +584,12 @@ impl CallerPaymentFlow {
             let auth = exact_evm_authorization_for_quote(quote, &signer.address());
             let typed = crate::x402::schemes::exact_evm::typed_data(requirements, &auth)
                 .map_err(|e| e.to_string())?;
-            let signature =
-                signer.sign_typed_data(&typed).await.map_err(|e| e.to_string())?;
+            let signature = signer
+                .sign_typed_data(&typed)
+                .await
+                .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
-        } else if self.can_settle(requirements)
-            && requirements.network.starts_with("solana:")
-        {
+        } else if self.can_settle(requirements) && requirements.network.starts_with("solana:") {
             // exact / solana: the wallet authors a partially-signed SPL
             // transfer for the intent derived from the quoted
             // requirements. Retry honesty: the wallet may bind a fresh
@@ -545,8 +603,10 @@ impl CallerPaymentFlow {
                 .ok_or_else(|| "no solana signer configured".to_string())?;
             let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
                 .map_err(|e| e.to_string())?;
-            let transaction =
-                signer.sign_svm_transfer(&intent).await.map_err(|e| e.to_string())?;
+            let transaction = signer
+                .sign_svm_transfer(&intent)
+                .await
+                .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_svm::payload_object(&transaction)
                 .map_err(|e| e.to_string())?
         } else {

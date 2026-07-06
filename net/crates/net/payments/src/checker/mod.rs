@@ -30,10 +30,16 @@ pub struct CheckerError {
 
 impl CheckerError {
     pub fn retryable(message: impl Into<String>) -> Self {
-        Self { message: message.into(), retryable: true }
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
     }
     pub fn terminal(message: impl Into<String>) -> Self {
-        Self { message: message.into(), retryable: false }
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
     }
 }
 

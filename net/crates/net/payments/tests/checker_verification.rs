@@ -41,7 +41,10 @@ impl ScriptedChecker {
 #[async_trait]
 impl ChainChecker for ScriptedChecker {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: "independent-chain-check:scripted".into() }
+        VerifierRef {
+            identity: None,
+            endpoint: "independent-chain-check:scripted".into(),
+        }
     }
 
     async fn check(
@@ -92,7 +95,13 @@ async fn settled_world(required_tier: VerificationTier) -> (World, PaymentDecisi
     })
     .expect("author");
     let quote = engine
-        .issue_quote(caller.entity_id().clone(), CAPABILITY, requirements, NOW, 60_000_000_000)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements,
+            NOW,
+            60_000_000_000,
+        )
         .expect("quote");
     let payload = X402Carry::author(&PaymentPayload {
         x402_version: 2,
@@ -106,14 +115,24 @@ async fn settled_world(required_tier: VerificationTier) -> (World, PaymentDecisi
         .accept_payment(&quote, &payload, required_tier, NOW + 1)
         .await
         .expect("accept");
-    (World { engine, quote_id: quote.quote_id.clone(), _dir: dir }, decision)
+    (
+        World {
+            engine,
+            quote_id: quote.quote_id.clone(),
+            _dir: dir,
+        },
+        decision,
+    )
 }
 
 #[tokio::test]
 async fn the_checker_upgrades_the_tier_and_bills_at_the_required_depth() {
     // Provider requires confirmed(1): the receipt alone (observed) holds.
     let (w, first) = settled_world(VerificationTier::Confirmed(1)).await;
-    assert!(matches!(first, PaymentDecision::PendingTier { .. }), "{first:?}");
+    assert!(
+        matches!(first, PaymentDecision::PendingTier { .. }),
+        "{first:?}"
+    );
 
     let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
         tier: VerificationTier::Confirmed(3),
@@ -121,7 +140,12 @@ async fn the_checker_upgrades_the_tier_and_bills_at_the_required_depth() {
     }]);
     let decision = w
         .engine
-        .re_verify_with_checker(&w.quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .re_verify_with_checker(
+            &w.quote_id,
+            &checker,
+            VerificationTier::Confirmed(1),
+            NOW + 2,
+        )
         .await
         .expect("engine");
     let PaymentDecision::Served { billing, tier } = decision else {
@@ -136,14 +160,20 @@ async fn the_checker_upgrades_the_tier_and_bills_at_the_required_depth() {
     check_chain(&status.chain).expect("link-valid");
     assert_eq!(status.chain.len(), 2);
     assert_eq!(status.chain[0].verifier.endpoint, "mock");
-    assert_eq!(status.chain[1].verifier.endpoint, "independent-chain-check:scripted");
+    assert_eq!(
+        status.chain[1].verifier.endpoint,
+        "independent-chain-check:scripted"
+    );
     assert_eq!(status.chain[1].tier, VerificationTier::Confirmed(3));
 
     // The checker was asked about the right transfer.
     let queries = checker.queries.lock();
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].0, MOCK_NETWORK);
-    assert_eq!(queries[0].2.as_ref().map(|q| q.to.as_str()), Some("mock-provider-settle-addr"));
+    assert_eq!(
+        queries[0].2.as_ref().map(|q| q.to.as_str()),
+        Some("mock-provider-settle-addr")
+    );
 }
 
 #[tokio::test]
@@ -171,23 +201,48 @@ async fn final_is_reachable_only_through_the_checker() {
 #[tokio::test]
 async fn pending_claims_nothing_and_appends_nothing() {
     let (w, _) = settled_world(VerificationTier::Confirmed(1)).await;
-    let before = w.engine.status(&w.quote_id).await.unwrap().unwrap().chain.len();
+    let before = w
+        .engine
+        .status(&w.quote_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .chain
+        .len();
 
     let checker = ScriptedChecker::new(vec![ChainVerdict::Pending]);
     let decision = w
         .engine
-        .re_verify_with_checker(&w.quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .re_verify_with_checker(
+            &w.quote_id,
+            &checker,
+            VerificationTier::Confirmed(1),
+            NOW + 2,
+        )
         .await
         .expect("engine");
     assert!(
         matches!(
             decision,
-            PaymentDecision::PendingTier { reached: VerificationTier::Observed, .. }
+            PaymentDecision::PendingTier {
+                reached: VerificationTier::Observed,
+                ..
+            }
         ),
         "{decision:?}"
     );
-    let after = w.engine.status(&w.quote_id).await.unwrap().unwrap().chain.len();
-    assert_eq!(before, after, "pending is the absence of a fact, never an event");
+    let after = w
+        .engine
+        .status(&w.quote_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .chain
+        .len();
+    assert_eq!(
+        before, after,
+        "pending is the absence of a fact, never an event"
+    );
 }
 
 #[tokio::test]
@@ -202,14 +257,21 @@ async fn a_reverted_settlement_invalidates_and_freezes() {
         .await
         .expect("engine");
     assert!(
-        matches!(decision, PaymentDecision::Invalidated { reason: InvalidationReason::Rejected }),
+        matches!(
+            decision,
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::Rejected
+            }
+        ),
         "{decision:?}"
     );
     let status = w.engine.status(&w.quote_id).await.unwrap().unwrap();
     assert!(status.frozen.is_some());
     assert!(matches!(
         status.chain.last().unwrap().status,
-        VerificationStatus::Invalidated { reason: InvalidationReason::Rejected }
+        VerificationStatus::Invalidated {
+            reason: InvalidationReason::Rejected
+        }
     ));
 
     // Frozen means frozen: the redemption gate refuses too.
@@ -234,19 +296,29 @@ async fn an_on_chain_delivered_mismatch_invalidates() {
     }]);
     let decision = w
         .engine
-        .re_verify_with_checker(&w.quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .re_verify_with_checker(
+            &w.quote_id,
+            &checker,
+            VerificationTier::Confirmed(1),
+            NOW + 2,
+        )
         .await
         .expect("engine");
     assert!(
         matches!(
             decision,
-            PaymentDecision::Invalidated { reason: InvalidationReason::AmountMismatch }
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::AmountMismatch
+            }
         ),
         "{decision:?}"
     );
     let status = w.engine.status(&w.quote_id).await.unwrap().unwrap();
     assert!(status.frozen.is_some());
-    assert!(status.billing_event_id.is_none(), "an underdelivered settlement never bills");
+    assert!(
+        status.billing_event_id.is_none(),
+        "an underdelivered settlement never bills"
+    );
 }
 
 #[tokio::test]
@@ -256,11 +328,22 @@ async fn checker_failure_is_structured_and_frozen_quotes_stay_refused() {
     let exhausted = ScriptedChecker::new(vec![]);
     let decision = w
         .engine
-        .re_verify_with_checker(&w.quote_id, &exhausted, VerificationTier::Confirmed(1), NOW + 2)
+        .re_verify_with_checker(
+            &w.quote_id,
+            &exhausted,
+            VerificationTier::Confirmed(1),
+            NOW + 2,
+        )
         .await
         .expect("engine");
     assert!(
-        matches!(decision, PaymentDecision::FacilitatorFailure { retryable: true, .. }),
+        matches!(
+            decision,
+            PaymentDecision::FacilitatorFailure {
+                retryable: true,
+                ..
+            }
+        ),
         "{decision:?}"
     );
 
@@ -268,7 +351,12 @@ async fn checker_failure_is_structured_and_frozen_quotes_stay_refused() {
     let reverter = ScriptedChecker::new(vec![ChainVerdict::Reverted]);
     let _ = w
         .engine
-        .re_verify_with_checker(&w.quote_id, &reverter, VerificationTier::Confirmed(1), NOW + 3)
+        .re_verify_with_checker(
+            &w.quote_id,
+            &reverter,
+            VerificationTier::Confirmed(1),
+            NOW + 3,
+        )
         .await
         .expect("engine");
     let after = ScriptedChecker::new(vec![ChainVerdict::Pending]);
@@ -279,6 +367,8 @@ async fn checker_failure_is_structured_and_frozen_quotes_stay_refused() {
         .expect("engine");
     assert!(matches!(
         decision,
-        PaymentDecision::Rejected { reason: RejectReason::QuoteFrozen(_) }
+        PaymentDecision::Rejected {
+            reason: RejectReason::QuoteFrozen(_)
+        }
     ));
 }

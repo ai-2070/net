@@ -16,8 +16,7 @@ use tokio::net::TcpListener;
 const TX: &str = "0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f";
 const TOKEN: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const RECIPIENT: &str = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C";
-const TRANSFER_TOPIC: &str =
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /// Scripted RPC node: `(receipt result, head block)`.
 struct RpcFixture {
@@ -36,14 +35,18 @@ impl RpcFixture {
         let head_task = head.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let receipt = receipt_task.clone();
                 let head = head_task.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 2048];
                     let header_end = loop {
-                        let Ok(n) = stream.read(&mut tmp).await else { return };
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
                         if n == 0 {
                             return;
                         }
@@ -61,7 +64,9 @@ impl RpcFixture {
                         .unwrap_or(0);
                     let mut body = buf[header_end..].to_vec();
                     while body.len() < content_length {
-                        let Ok(n) = stream.read(&mut tmp).await else { return };
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
                         if n == 0 {
                             break;
                         }
@@ -86,7 +91,11 @@ impl RpcFixture {
                 });
             }
         });
-        Self { endpoint, receipt, head }
+        Self {
+            endpoint,
+            receipt,
+            head,
+        }
     }
 
     fn set_receipt(&self, receipt: Value) {
@@ -98,7 +107,11 @@ impl RpcFixture {
 }
 
 fn topic_for(address: &str) -> String {
-    format!("0x{}{}", "0".repeat(24), address.trim_start_matches("0x").to_lowercase())
+    format!(
+        "0x{}{}",
+        "0".repeat(24),
+        address.trim_start_matches("0x").to_lowercase()
+    )
 }
 
 fn transfer_log(token: &str, to: &str, amount_hex: &str) -> Value {
@@ -114,7 +127,10 @@ fn transfer_log(token: &str, to: &str, amount_hex: &str) -> Value {
 }
 
 fn query() -> TransferQuery {
-    TransferQuery { token: TOKEN.to_string(), to: RECIPIENT.to_string() }
+    TransferQuery {
+        token: TOKEN.to_string(),
+        to: RECIPIENT.to_string(),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -127,14 +143,20 @@ async fn pending_reverted_confirmed_and_final_map_into_the_tier_vocabulary() {
     // No receipt yet: pending.
     rpc.set_receipt(Value::Null);
     assert_eq!(
-        checker.check("eip155:84532", TX, None).await.expect("check"),
+        checker
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
         ChainVerdict::Pending
     );
 
     // Reverted.
     rpc.set_receipt(json!({ "status": "0x0", "blockNumber": "0x5f", "logs": [] }));
     assert_eq!(
-        checker.check("eip155:84532", TX, None).await.expect("check"),
+        checker
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
         ChainVerdict::Reverted
     );
 
@@ -142,19 +164,34 @@ async fn pending_reverted_confirmed_and_final_map_into_the_tier_vocabulary() {
     rpc.set_receipt(json!({ "status": "0x1", "blockNumber": "0x5f", "logs": [] }));
     rpc.set_head(100);
     assert_eq!(
-        checker.check("eip155:84532", TX, None).await.expect("check"),
-        ChainVerdict::Included { tier: VerificationTier::Confirmed(6), delivered: None }
+        checker
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
+        ChainVerdict::Included {
+            tier: VerificationTier::Confirmed(6),
+            delivered: None
+        }
     );
 
     // Depth crosses final_depth: final.
     rpc.set_head(200);
     assert_eq!(
-        checker.check("eip155:84532", TX, None).await.expect("check"),
-        ChainVerdict::Included { tier: VerificationTier::Final, delivered: None }
+        checker
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
+        ChainVerdict::Included {
+            tier: VerificationTier::Final,
+            delivered: None
+        }
     );
 
     // Wrong network is a configuration error, terminal.
-    let err = checker.check("eip155:8453", TX, None).await.expect_err("wrong network");
+    let err = checker
+        .check("eip155:8453", TX, None)
+        .await
+        .expect_err("wrong network");
     assert!(!err.retryable);
 }
 
@@ -176,7 +213,10 @@ async fn delivered_amount_comes_from_the_right_transfer_logs_only() {
         ],
     }));
 
-    let verdict = checker.check("eip155:84532", TX, Some(&query())).await.expect("check");
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query()))
+        .await
+        .expect("check");
     let ChainVerdict::Included { delivered, .. } = verdict else {
         panic!("expected Included, got {verdict:?}");
     };
@@ -185,7 +225,10 @@ async fn delivered_amount_comes_from_the_right_transfer_logs_only() {
     // No matching logs at all: delivered = 0 — an honest zero the
     // engine turns into an amount-mismatch invalidation.
     rpc.set_receipt(json!({ "status": "0x1", "blockNumber": "0x5f", "logs": [] }));
-    let verdict = checker.check("eip155:84532", TX, Some(&query())).await.expect("check");
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query()))
+        .await
+        .expect("check");
     let ChainVerdict::Included { delivered, .. } = verdict else {
         panic!("expected Included, got {verdict:?}");
     };

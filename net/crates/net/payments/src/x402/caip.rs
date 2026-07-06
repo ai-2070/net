@@ -225,7 +225,11 @@ mod tests {
 
     #[test]
     fn parses_real_and_mock_chain_ids() {
-        for ok in ["eip155:8453", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "mock:net"] {
+        for ok in [
+            "eip155:8453",
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "mock:net",
+        ] {
             let c = ChainId::parse(ok).unwrap();
             assert_eq!(c.as_str(), ok);
         }
@@ -238,12 +242,12 @@ mod tests {
     fn rejects_malformed_chain_ids() {
         for bad in [
             "",
-            "eip155",         // no colon
-            "EIP155:1",       // uppercase namespace
-            "ei:1",           // namespace too short
-            "verylongns:1",   // namespace too long
-            "eip155:",        // empty reference
-            "eip155:a b",     // space in reference
+            "eip155",                // no colon
+            "EIP155:1",              // uppercase namespace
+            "ei:1",                  // namespace too short
+            "verylongns:1",          // namespace too long
+            "eip155:",               // empty reference
+            "eip155:a b",            // space in reference
             "eip155:8453/erc20:0x0", // that's a CAIP-19
         ] {
             assert!(ChainId::parse(bad).is_err(), "should reject {bad:?}");
@@ -270,11 +274,11 @@ mod tests {
     fn rejects_malformed_asset_ids() {
         for bad in [
             "",
-            "eip155:8453",                 // chain only
-            "eip155:8453/erc20",           // no asset reference
-            "eip155:8453/ERC20:0x0",       // uppercase asset namespace
-            "notachain/erc20:0x0",         // bad chain segment
-            "eip155:8453/erc20:0x 0",      // space
+            "eip155:8453",            // chain only
+            "eip155:8453/erc20",      // no asset reference
+            "eip155:8453/ERC20:0x0",  // uppercase asset namespace
+            "notachain/erc20:0x0",    // bad chain segment
+            "eip155:8453/erc20:0x 0", // space
         ] {
             assert!(AssetId::parse(bad).is_err(), "should reject {bad:?}");
         }
@@ -284,7 +288,10 @@ mod tests {
     fn comparison_is_case_sensitive() {
         let lower = AssetId::parse("eip155:8453/erc20:0xabc").unwrap();
         let upper = AssetId::parse("eip155:8453/erc20:0xABC").unwrap();
-        assert_ne!(lower, upper, "CAIP ids compare exact; equivalence is registry policy");
+        assert_ne!(
+            lower, upper,
+            "CAIP ids compare exact; equivalence is registry policy"
+        );
     }
 
     #[test]

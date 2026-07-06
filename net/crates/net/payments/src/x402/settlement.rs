@@ -128,8 +128,7 @@ mod tests {
 
     #[test]
     fn failed_settle_may_omit_transaction() {
-        let json =
-            r#"{"success":false,"errorReason":"insufficient_funds","transaction":"","network":"eip155:84532"}"#;
+        let json = r#"{"success":false,"errorReason":"insufficient_funds","transaction":"","network":"eip155:84532"}"#;
         let carry: X402Carry<SettlementResponse> =
             X402Carry::from_bytes(json.as_bytes().to_vec()).unwrap();
         assert!(!carry.view().success);

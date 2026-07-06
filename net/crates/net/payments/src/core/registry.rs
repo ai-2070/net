@@ -107,7 +107,11 @@ impl AssetRegistry {
 
     /// Look up the entry for an x402 `(network, asset)` pair. Exact match;
     /// absence is a policy denial, not a lookup miss.
-    pub fn lookup(&self, network: &ChainId, x402_asset: &str) -> Result<&AssetEntry, RegistryError> {
+    pub fn lookup(
+        &self,
+        network: &ChainId,
+        x402_asset: &str,
+    ) -> Result<&AssetEntry, RegistryError> {
         self.assets
             .iter()
             .find(|e| e.id.chain() == network && e.x402_asset == x402_asset)
@@ -253,7 +257,9 @@ mod tests {
     #[test]
     fn known_asset_passes_unknown_hard_rejects() {
         let reg = registry();
-        assert!(reg.check_requirements(&mock_requirements("musd", None)).is_ok());
+        assert!(reg
+            .check_requirements(&mock_requirements("musd", None))
+            .is_ok());
         let err = reg
             .check_requirements(&mock_requirements("evil-musd", None))
             .unwrap_err();
@@ -268,7 +274,11 @@ mod tests {
         let bad = mock_requirements("musd", Some(serde_json::json!({"decimals": 18})));
         assert!(matches!(
             reg.check_requirements(&bad).unwrap_err(),
-            RegistryError::DecimalsMismatch { declared: 18, expected: 6, .. }
+            RegistryError::DecimalsMismatch {
+                declared: 18,
+                expected: 6,
+                ..
+            }
         ));
     }
 

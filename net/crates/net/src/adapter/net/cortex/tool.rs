@@ -743,10 +743,7 @@ mod tests {
         let terms = "{\"object\":\"net.pricing.terms@1\"}";
         let capability = cap("paid_tool");
         let mut metadata = BTreeMap::new();
-        metadata.insert(
-            pricing_terms_metadata_key("paid_tool"),
-            terms.to_string(),
-        );
+        metadata.insert(pricing_terms_metadata_key("paid_tool"), terms.to_string());
         let paid = ToolDescriptor::from_capability(&capability, &metadata);
         assert_eq!(paid.pricing_terms.as_deref(), Some(terms));
 

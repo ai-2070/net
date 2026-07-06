@@ -64,15 +64,21 @@ impl X402View for PaymentRequirements {
 
     fn validate(&self) -> Result<(), X402Error> {
         if self.scheme.is_empty() {
-            return Err(X402Error::Invalid("PaymentRequirements.scheme is empty".into()));
+            return Err(X402Error::Invalid(
+                "PaymentRequirements.scheme is empty".into(),
+            ));
         }
         self.chain()?;
         validate_atomic_str(&self.amount, "PaymentRequirements.amount")?;
         if self.asset.is_empty() {
-            return Err(X402Error::Invalid("PaymentRequirements.asset is empty".into()));
+            return Err(X402Error::Invalid(
+                "PaymentRequirements.asset is empty".into(),
+            ));
         }
         if self.pay_to.is_empty() {
-            return Err(X402Error::Invalid("PaymentRequirements.payTo is empty".into()));
+            return Err(X402Error::Invalid(
+                "PaymentRequirements.payTo is empty".into(),
+            ));
         }
         if self.max_timeout_seconds == 0 {
             return Err(X402Error::Invalid(
@@ -112,13 +118,34 @@ mod tests {
     #[test]
     fn rejects_bad_network_amount_and_empty_fields() {
         let cases = [
-            (r#"{"scheme":"exact","network":"EIP155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#, "uppercase network"),
-            (r#"{"scheme":"exact","network":"eip155:1","amount":"01","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#, "leading-zero amount"),
-            (r#"{"scheme":"exact","network":"eip155:1","amount":"1.5","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#, "decimal amount"),
-            (r#"{"scheme":"exact","network":"eip155:1","amount":"-1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#, "negative amount"),
-            (r#"{"scheme":"","network":"eip155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#, "empty scheme"),
-            (r#"{"scheme":"exact","network":"eip155:1","amount":"1","asset":"a","payTo":"","maxTimeoutSeconds":60}"#, "empty payTo"),
-            (r#"{"scheme":"exact","network":"eip155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":0}"#, "zero timeout"),
+            (
+                r#"{"scheme":"exact","network":"EIP155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#,
+                "uppercase network",
+            ),
+            (
+                r#"{"scheme":"exact","network":"eip155:1","amount":"01","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#,
+                "leading-zero amount",
+            ),
+            (
+                r#"{"scheme":"exact","network":"eip155:1","amount":"1.5","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#,
+                "decimal amount",
+            ),
+            (
+                r#"{"scheme":"exact","network":"eip155:1","amount":"-1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#,
+                "negative amount",
+            ),
+            (
+                r#"{"scheme":"","network":"eip155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":60}"#,
+                "empty scheme",
+            ),
+            (
+                r#"{"scheme":"exact","network":"eip155:1","amount":"1","asset":"a","payTo":"","maxTimeoutSeconds":60}"#,
+                "empty payTo",
+            ),
+            (
+                r#"{"scheme":"exact","network":"eip155:1","amount":"1","asset":"a","payTo":"b","maxTimeoutSeconds":0}"#,
+                "zero timeout",
+            ),
         ];
         for (json, why) in cases {
             assert!(

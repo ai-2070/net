@@ -103,7 +103,10 @@ mod tests {
         let err = X402Carry::<PaymentPayload>::from_bytes(v1.into_bytes()).unwrap_err();
         assert_eq!(
             err,
-            X402Error::UnsupportedX402Version { got: 1, expected: 2 }
+            X402Error::UnsupportedX402Version {
+                got: 1,
+                expected: 2
+            }
         );
     }
 

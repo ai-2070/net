@@ -33,7 +33,9 @@ pub struct SignerError {
 
 impl SignerError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -87,7 +89,10 @@ impl ExternalSigner {
         address: impl Into<String>,
         sign: impl Fn(Value) -> SignFuture + Send + Sync + 'static,
     ) -> Self {
-        Self { address: address.into(), sign: Box::new(sign) }
+        Self {
+            address: address.into(),
+            sign: Box::new(sign),
+        }
     }
 }
 
@@ -111,9 +116,8 @@ impl SchemeSigner for ExternalSigner {
 /// structured refusal by construction.
 pub struct ExternalSvmSigner {
     address: String,
-    sign: Box<
-        dyn Fn(crate::x402::schemes::exact_svm::SvmTransferIntent) -> SignFuture + Send + Sync,
-    >,
+    sign:
+        Box<dyn Fn(crate::x402::schemes::exact_svm::SvmTransferIntent) -> SignFuture + Send + Sync>,
 }
 
 impl ExternalSvmSigner {
@@ -124,7 +128,10 @@ impl ExternalSvmSigner {
             + Sync
             + 'static,
     ) -> Self {
-        Self { address: address.into(), sign: Box::new(sign) }
+        Self {
+            address: address.into(),
+            sign: Box::new(sign),
+        }
     }
 }
 
@@ -191,8 +198,9 @@ pub mod dev {
     }
 
     fn word_u128_str(s: &str) -> Result<[u8; 32], SignerError> {
-        let v: u128 =
-            s.parse().map_err(|e| SignerError::new(format!("uint256 `{s}`: {e}")))?;
+        let v: u128 = s
+            .parse()
+            .map_err(|e| SignerError::new(format!("uint256 `{s}`: {e}")))?;
         let mut word = [0u8; 32];
         word[16..].copy_from_slice(&v.to_be_bytes());
         Ok(word)

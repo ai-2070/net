@@ -52,7 +52,12 @@ fn setup() -> Setup {
     )
     .expect("engine")
     .with_billing_log(log.clone());
-    Setup { engine, log, caller: EntityKeypair::generate(), _dir: dir }
+    Setup {
+        engine,
+        log,
+        caller: EntityKeypair::generate(),
+        _dir: dir,
+    }
 }
 
 async fn pay_once(s: &Setup, nonce: &str, issued_ns: u64) -> PaymentDecision {
@@ -93,7 +98,9 @@ async fn subscribers_receive_what_the_log_records() {
     // The stream delivered the same signed fact...
     let streamed = rx.try_recv().expect("subscriber got the event");
     assert_eq!(streamed.billing_event_id, billing.billing_event_id);
-    streamed.verify_signature().expect("streamed event verifies");
+    streamed
+        .verify_signature()
+        .expect("streamed event verifies");
 
     // ...and the log holds it durably, verified on read.
     let recorded = s.log.read_all().await.unwrap();
@@ -106,7 +113,13 @@ async fn idempotent_retries_do_not_duplicate_log_records() {
     let s = setup();
     let quote = s
         .engine
-        .issue_quote(s.caller.entity_id().clone(), CAPABILITY, requirements(), NOW, 60_000_000_000)
+        .issue_quote(
+            s.caller.entity_id().clone(),
+            CAPABILITY,
+            requirements(),
+            NOW,
+            60_000_000_000,
+        )
         .unwrap();
     let payload = X402Carry::author(&PaymentPayload {
         x402_version: 2,
@@ -168,5 +181,8 @@ async fn a_tampered_log_line_fails_loudly_on_read() {
     tokio::fs::write(&path, tampered).await.unwrap();
 
     let err = s.log.read_all().await.unwrap_err();
-    assert!(matches!(err, BillingError::BadRecord { line: 1, .. }), "got {err:?}");
+    assert!(
+        matches!(err, BillingError::BadRecord { line: 1, .. }),
+        "got {err:?}"
+    );
 }

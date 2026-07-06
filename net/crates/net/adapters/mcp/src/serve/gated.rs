@@ -148,13 +148,20 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
             )));
         };
         match flow.pay(id, terms, &tool_args).await {
-            PaymentFlowDecision::Paid { quote_id, binding_sig, proof: _proof } => {
+            PaymentFlowDecision::Paid {
+                quote_id,
+                binding_sig,
+                proof: _proof,
+            } => {
                 // Cleared. The quote id (plus the paying identity's
                 // signed binding) rides with the invocation so the
                 // provider's own gate can redeem the payment before its
                 // handler runs — the caller-side clearance alone is never
                 // the provider's proof.
-                payment_proof = Some(PaymentProof { quote_id, binding_sig });
+                payment_proof = Some(PaymentProof {
+                    quote_id,
+                    binding_sig,
+                });
             }
             PaymentFlowDecision::RequiresPaymentApproval {
                 quote_id,
@@ -209,7 +216,11 @@ mod tests {
 
     impl StubGateway {
         fn new(detail: CapabilityDetail, deny: bool) -> Self {
-            Self { detail, deny, last_payment: parking_lot::Mutex::new(None) }
+            Self {
+                detail,
+                deny,
+                last_payment: parking_lot::Mutex::new(None),
+            }
         }
     }
 
@@ -306,7 +317,15 @@ mod tests {
         // gated until an allowlist entry or approved pin admits it.
         let gw = StubGateway::new(detail("none"), false);
         let consent = ConsentPolicy::new();
-        let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
         assert!(matches!(out, GatedOutcome::RequiresApproval), "{out:?}");
     }
 
@@ -315,7 +334,15 @@ mod tests {
         let gw = StubGateway::new(detail("credentialed"), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
-        let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
         match out {
             GatedOutcome::Invoked(result) => {
                 assert!(!result.is_error);
@@ -333,7 +360,15 @@ mod tests {
         let gw = StubGateway::new(detail("external_api"), false);
         let mut consent = ConsentPolicy::new();
         consent.pin(echo_id());
-        let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
         assert!(matches!(out, GatedOutcome::Invoked(_)), "{out:?}");
     }
 
@@ -342,7 +377,15 @@ mod tests {
         let gw = StubGateway::new(detail("none"), true);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
-        let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
         assert!(
             matches!(out, GatedOutcome::Failed(GatewayError::Denied(_))),
             "{out:?}"
@@ -360,7 +403,10 @@ mod tests {
     }
     impl ScriptedFlow {
         fn new(decision: PaymentFlowDecision) -> Self {
-            Self { decision, calls: AtomicU32::new(0) }
+            Self {
+                decision,
+                calls: AtomicU32::new(0),
+            }
         }
     }
     #[async_trait]
@@ -388,7 +434,15 @@ mod tests {
         let gw = StubGateway::new(paid_detail(), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
-        let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
         match out {
             GatedOutcome::Failed(GatewayError::Denied(reason)) => {
                 assert!(reason.contains("no payment flow"), "{reason}");
@@ -449,7 +503,11 @@ mod tests {
         )
         .await;
         match out {
-            GatedOutcome::RequiresPaymentApproval { quote_id, policy_reason, .. } => {
+            GatedOutcome::RequiresPaymentApproval {
+                quote_id,
+                policy_reason,
+                ..
+            } => {
                 assert_eq!(quote_id, "q-77");
                 assert!(policy_reason.contains("max_per_call"));
             }
@@ -475,7 +533,11 @@ mod tests {
         )
         .await;
         assert!(matches!(out, GatedOutcome::Invoked(_)), "{out:?}");
-        assert_eq!(flow.calls.load(Ordering::SeqCst), 0, "free tools skip the payment gate");
+        assert_eq!(
+            flow.calls.load(Ordering::SeqCst),
+            0,
+            "free tools skip the payment gate"
+        );
         // And a free invoke carries no payment binding.
         assert_eq!(*gw.last_payment.lock(), Some(None));
     }

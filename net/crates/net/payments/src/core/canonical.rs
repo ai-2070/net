@@ -213,8 +213,16 @@ mod tests {
     #[test]
     fn canonical_bytes_sort_all_keys_and_stay_compact() {
         let mut extra = ExtraFields::new();
-        extra.insert("zz_unknown".into(), serde_json::json!({"y": 1, "x": [true, null]}));
-        let s = Sample { b: 2, a: "hé\"llo", extra, signature: None };
+        extra.insert(
+            "zz_unknown".into(),
+            serde_json::json!({"y": 1, "x": [true, null]}),
+        );
+        let s = Sample {
+            b: 2,
+            a: "hé\"llo",
+            extra,
+            signature: None,
+        };
         let bytes = canonical_bytes(&s).unwrap();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
@@ -224,7 +232,12 @@ mod tests {
 
     #[test]
     fn signed_payload_excludes_the_signature_key() {
-        let s = Sample { b: 1, a: "x", extra: ExtraFields::new(), signature: Some(SignatureHex([7u8; 64])) };
+        let s = Sample {
+            b: 1,
+            a: "x",
+            extra: ExtraFields::new(),
+            signature: Some(SignatureHex([7u8; 64])),
+        };
         let payload = signed_payload_bytes(&s).unwrap();
         assert_eq!(String::from_utf8(payload).unwrap(), r#"{"a":"x","b":1}"#);
     }
@@ -233,7 +246,10 @@ mod tests {
     fn floats_are_rejected_not_encoded() {
         let v = serde_json::json!({"price": 1.5});
         let mut out = Vec::new();
-        assert!(matches!(write_canonical(&v, &mut out), Err(EnvelopeError::Float(_))));
+        assert!(matches!(
+            write_canonical(&v, &mut out),
+            Err(EnvelopeError::Float(_))
+        ));
     }
 
     #[test]
@@ -283,6 +299,9 @@ mod tests {
             note: "hello".into(),
             signature: None,
         };
-        assert!(matches!(env2.sign_with(&other), Err(EnvelopeError::Signing(_))));
+        assert!(matches!(
+            env2.sign_with(&other),
+            Err(EnvelopeError::Signing(_))
+        ));
     }
 }

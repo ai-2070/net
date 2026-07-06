@@ -37,7 +37,10 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
     let caller_id = caller.inner().node_id();
     let (accept, connect) = tokio::join!(server.inner().accept(caller_id), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        caller.inner().connect(server_addr, &server_pub, server_id).await
+        caller
+            .inner()
+            .connect(server_addr, &server_pub, server_id)
+            .await
     });
     accept.expect("accept");
     connect.expect("connect");
@@ -49,8 +52,9 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
 async fn the_paid_lifecycle_crosses_the_wire() {
     let psk = [0x42u8; 32];
     let dir = tempfile::tempdir().expect("tempdir");
-    let clock: Arc<dyn Clock> =
-        Arc::new(TestClock(std::sync::atomic::AtomicU64::new(1_000_000_000_000_000)));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
+        1_000_000_000_000_000,
+    )));
 
     // ── machine B: the provider ────────────────────────────────────
     let provider_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
@@ -119,7 +123,12 @@ async fn the_paid_lifecycle_crosses_the_wire() {
     // Auto-allow: quote, payload, and settlement all cross the wire;
     // the proof carries the provider-signed billing event back.
     let decision = flow.run(&capability, &terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = decision else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof,
+    } = decision
+    else {
         panic!("expected Paid over the wire, got {decision:?}");
     };
     let billing_json = proof["billing_event"].as_str().expect("billing event");
@@ -148,13 +157,26 @@ async fn the_paid_lifecycle_crosses_the_wire() {
     let CallerDecision::RequiresPaymentApproval { quote_id, .. } = held else {
         panic!("expected RequiresPaymentApproval, got {held:?}");
     };
-    assert_eq!(provider_log.read_all().await.unwrap().len(), 1, "no charge while held");
+    assert_eq!(
+        provider_log.read_all().await.unwrap().len(),
+        1,
+        "no charge while held"
+    );
 
     configurer.approve(&quote_id).await.expect("approve");
     let redeemed = flow.run(&capability, &terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = redeemed else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof,
+    } = redeemed
+    else {
         panic!("approval must unblock over the wire, got {redeemed:?}");
     };
     assert_eq!(proof["quote_id"].as_str(), Some(quote_id.as_str()));
-    assert_eq!(provider_log.read_all().await.unwrap().len(), 2, "exactly one new charge");
+    assert_eq!(
+        provider_log.read_all().await.unwrap().len(),
+        2,
+        "exactly one new charge"
+    );
 }

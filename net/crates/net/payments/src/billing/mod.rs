@@ -37,12 +37,19 @@ pub enum BillingError {
     #[error("billing log I/O error at {path}: {reason}")]
     Io { path: String, reason: String },
     #[error("billing log at {path} holds an invalid record (line {line}): {reason}")]
-    BadRecord { path: String, line: usize, reason: String },
+    BadRecord {
+        path: String,
+        line: usize,
+        reason: String,
+    },
 }
 
 impl BillingError {
     fn io(path: &Path, e: impl std::fmt::Display) -> Self {
-        Self::Io { path: path.display().to_string(), reason: e.to_string() }
+        Self::Io {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }
     }
 }
 
@@ -59,7 +66,10 @@ impl BillingLog {
         // gets `RecvError::Lagged` and recovers by re-reading the log —
         // the file is the truth, the stream is a projection of it.
         let (tx, _) = broadcast::channel(1024);
-        Self { path: path.into(), tx }
+        Self {
+            path: path.into(),
+            tx,
+        }
     }
 
     /// Where the JSONL log lives.
@@ -106,8 +116,12 @@ impl BillingLog {
             .open(&self.path)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;
-        file.write_all(&line).await.map_err(|e| BillingError::io(&self.path, e))?;
-        file.sync_all().await.map_err(|e| BillingError::io(&self.path, e))?;
+        file.write_all(&line)
+            .await
+            .map_err(|e| BillingError::io(&self.path, e))?;
+        file.sync_all()
+            .await
+            .map_err(|e| BillingError::io(&self.path, e))?;
         drop(file);
 
         // Publish after the durable write; a send error only means no
@@ -129,13 +143,12 @@ impl BillingLog {
             if line.is_empty() {
                 continue;
             }
-            let event = BillingEvent::from_json_bytes(line).map_err(|e| {
-                BillingError::BadRecord {
+            let event =
+                BillingEvent::from_json_bytes(line).map_err(|e| BillingError::BadRecord {
                     path: self.path.display().to_string(),
                     line: i + 1,
                     reason: e.to_string(),
-                }
-            })?;
+                })?;
             events.push(event);
         }
         Ok(events)
@@ -156,7 +169,9 @@ impl BillingLog {
             out.extend_from_slice(&bytes);
             out.push(b'\n');
         }
-        tokio::fs::write(dest, out).await.map_err(|e| BillingError::io(dest, e))?;
+        tokio::fs::write(dest, out)
+            .await
+            .map_err(|e| BillingError::io(dest, e))?;
         Ok(events.len())
     }
 }

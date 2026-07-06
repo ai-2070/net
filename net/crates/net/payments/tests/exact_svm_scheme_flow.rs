@@ -56,7 +56,10 @@ struct SvmFacilitator {
 #[async_trait]
 impl Facilitator for SvmFacilitator {
     fn reference(&self) -> VerifierRef {
-        VerifierRef { identity: None, endpoint: "test-exact-svm".into() }
+        VerifierRef {
+            identity: None,
+            endpoint: "test-exact-svm".into(),
+        }
     }
 
     async fn verify(
@@ -100,7 +103,10 @@ impl Facilitator for SvmFacilitator {
     }
 }
 
-fn solana_terms(provider: &EntityKeypair, registry_ref: net_payments::core::registry::RegistryRef) -> String {
+fn solana_terms(
+    provider: &EntityKeypair,
+    registry_ref: net_payments::core::registry::RegistryRef,
+) -> String {
     let template = X402Carry::author(&PaymentRequirements {
         scheme: "exact".into(),
         network: SOLANA_MAINNET.into(),
@@ -144,7 +150,9 @@ async fn world(with_signer: bool) -> World {
         .await
         .expect("configure");
 
-    let facilitator = Arc::new(SvmFacilitator { payloads: parking_lot::Mutex::new(Vec::new()) });
+    let facilitator = Arc::new(SvmFacilitator {
+        payloads: parking_lot::Mutex::new(Vec::new()),
+    });
     let billing = Arc::new(BillingLog::new(dir.path().join("billing.jsonl")));
     let engine = Arc::new(
         PaymentEngine::new(
@@ -184,7 +192,13 @@ async fn world(with_signer: bool) -> World {
             })),
         );
     }
-    World { flow, facilitator, billing, terms_json, _dir: dir }
+    World {
+        flow,
+        facilitator,
+        billing,
+        terms_json,
+        _dir: dir,
+    }
 }
 
 #[tokio::test]
@@ -194,7 +208,10 @@ async fn the_full_exact_svm_lifecycle_runs_on_an_enabled_network() {
     let CallerDecision::Paid { proof, .. } = decision else {
         panic!("expected Paid on the enabled solana network, got {decision:?}");
     };
-    assert_eq!(proof["transaction"], "5VERYrealSVMsignature1111111111111111111111");
+    assert_eq!(
+        proof["transaction"],
+        "5VERYrealSVMsignature1111111111111111111111"
+    );
 
     // What crossed the facilitator boundary: the spec-pinned payload
     // shape around the wallet's blob, byte-preserved.
@@ -203,7 +220,10 @@ async fn the_full_exact_svm_lifecycle_runs_on_an_enabled_network() {
         assert_eq!(payloads.len(), 1);
         let sent = payloads[0].view();
         assert_eq!(sent.accepted.network, SOLANA_MAINNET);
-        assert_eq!(sent.payload, serde_json::json!({ "transaction": SIGNED_BLOB }));
+        assert_eq!(
+            sent.payload,
+            serde_json::json!({ "transaction": SIGNED_BLOB })
+        );
     }
 
     // Billed exactly once, in the real asset on the real network.
@@ -222,6 +242,9 @@ async fn without_a_solana_signer_the_terms_are_refused_at_selection() {
         panic!("expected a structured denial, got {decision:?}");
     };
     assert!(policy_reason.contains("no settleable"), "{policy_reason}");
-    assert!(w.facilitator.payloads.lock().is_empty(), "nothing was authored or sent");
+    assert!(
+        w.facilitator.payloads.lock().is_empty(),
+        "nothing was authored or sent"
+    );
     assert!(w.billing.read_all().await.expect("read").is_empty());
 }

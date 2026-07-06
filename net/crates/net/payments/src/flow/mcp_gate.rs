@@ -27,16 +27,24 @@ impl PaymentFlow for CallerPaymentFlow {
         // P0 static pricing ignores the arguments (no input-bound quotes
         // until RFQ maps onto x402 v2 dynamic pricing).
         match self.run(&id.display(), pricing_terms).await {
-            CallerDecision::Paid { quote_id, binding_sig, proof } => {
-                PaymentFlowDecision::Paid { quote_id, binding_sig, proof }
-            }
-            CallerDecision::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } => {
-                PaymentFlowDecision::RequiresPaymentApproval {
-                    quote_id,
-                    policy_reason,
-                    approve_hint,
-                }
-            }
+            CallerDecision::Paid {
+                quote_id,
+                binding_sig,
+                proof,
+            } => PaymentFlowDecision::Paid {
+                quote_id,
+                binding_sig,
+                proof,
+            },
+            CallerDecision::RequiresPaymentApproval {
+                quote_id,
+                policy_reason,
+                approve_hint,
+            } => PaymentFlowDecision::RequiresPaymentApproval {
+                quote_id,
+                policy_reason,
+                approve_hint,
+            },
             CallerDecision::Denied { policy_reason } => {
                 PaymentFlowDecision::Denied { policy_reason }
             }
@@ -68,7 +76,11 @@ impl PaymentAdmission for EnginePaymentAdmission {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), String> {
-        match self.engine.redeem_for_invocation(tool_id, quote_id, binding).await {
+        match self
+            .engine
+            .redeem_for_invocation(tool_id, quote_id, binding)
+            .await
+        {
             Ok(RedeemDecision::Admitted) => Ok(()),
             Ok(RedeemDecision::Denied { reason }) => Err(reason),
             // Engine/store failure is fail-closed: never serve on an

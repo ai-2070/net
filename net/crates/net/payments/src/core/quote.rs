@@ -189,8 +189,12 @@ impl PaymentQuote {
                 self.terms_hash, expected_terms
             )));
         }
-        let expected_id =
-            Self::derive_id(&self.provider, &self.caller, &self.terms_hash, self.issued_at_ns);
+        let expected_id = Self::derive_id(
+            &self.provider,
+            &self.caller,
+            &self.terms_hash,
+            self.issued_at_ns,
+        );
         if expected_id != self.quote_id {
             return Err(EnvelopeError::Field(format!(
                 "quote_id mismatch: envelope says {}, content derives {}",
@@ -246,7 +250,10 @@ mod tests {
             "prov/fixture-tool",
             None,
             requirements(),
-            RegistryRef { version: "net-default-0".into(), hash: "aa".into() },
+            RegistryRef {
+                version: "net-default-0".into(),
+                hash: "aa".into(),
+            },
             1_000,
             2_000,
         );
@@ -289,7 +296,10 @@ mod tests {
         let mut extended = q.clone();
         extended.expires_at_ns = u64::MAX;
         assert!(extended.check_integrity().is_ok());
-        assert_eq!(extended.verify_signature(), Err(EnvelopeError::BadSignature));
+        assert_eq!(
+            extended.verify_signature(),
+            Err(EnvelopeError::BadSignature)
+        );
     }
 
     #[test]
@@ -316,7 +326,10 @@ mod tests {
             "prov/fixture-tool",
             None,
             requirements(),
-            RegistryRef { version: "net-default-0".into(), hash: "aa".into() },
+            RegistryRef {
+                version: "net-default-0".into(),
+                hash: "aa".into(),
+            },
             2_000,
             1_000,
         );
@@ -329,17 +342,24 @@ mod tests {
         let provider = EntityKeypair::generate();
         let caller = EntityKeypair::generate().entity_id().clone();
         let mut q = signed_quote(&provider, caller);
-        q.extra.insert("future_field".into(), serde_json::json!("v1.1 data"));
+        q.extra
+            .insert("future_field".into(), serde_json::json!("v1.1 data"));
         q.sign_with(&provider).unwrap();
 
         let bytes = canonical_bytes(&q).unwrap();
         let back = PaymentQuote::from_json_bytes(&bytes).unwrap();
-        assert_eq!(back.extra.get("future_field"), Some(&serde_json::json!("v1.1 data")));
+        assert_eq!(
+            back.extra.get("future_field"),
+            Some(&serde_json::json!("v1.1 data"))
+        );
 
         // Stripping the unknown field breaks the signature — unknown
         // fields are covered, not decorative.
         let mut stripped = back.clone();
         stripped.extra.clear();
-        assert_eq!(stripped.verify_signature(), Err(EnvelopeError::BadSignature));
+        assert_eq!(
+            stripped.verify_signature(),
+            Err(EnvelopeError::BadSignature)
+        );
     }
 }

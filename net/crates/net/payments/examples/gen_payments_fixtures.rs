@@ -62,7 +62,10 @@ fn envelope_entry<T: SignedEnvelope>(
     entry.insert("object".into(), json!(T::OBJECT_TAG));
     entry.insert("canonical".into(), json!(canonical));
     entry.insert("signed_payload".into(), json!(signed_payload));
-    entry.insert("signer_hex".into(), json!(hex::encode(envelope.signer().as_bytes())));
+    entry.insert(
+        "signer_hex".into(),
+        json!(hex::encode(envelope.signer().as_bytes())),
+    );
     entry.insert(
         "signature_hex".into(),
         match envelope.signature() {
@@ -78,7 +81,10 @@ fn envelope_entry<T: SignedEnvelope>(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out_dir = manifest_dir.join("..").join("tests").join("cross_lang_payments");
+    let out_dir = manifest_dir
+        .join("..")
+        .join("tests")
+        .join("cross_lang_payments");
     let fixtures_v2 = out_dir.join("fixtures").join("x402").join("v2.0");
 
     let read = |p: &Path| -> Result<Vec<u8>, Box<dyn Error>> {
@@ -108,7 +114,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         max_timeout_seconds: 60,
         extra: None,
     })?;
-    let req_eip155: X402Carry<PaymentRequirements> = X402Carry::from_bytes(req_eip155_bytes.clone())?;
+    let req_eip155: X402Carry<PaymentRequirements> =
+        X402Carry::from_bytes(req_eip155_bytes.clone())?;
     // Parsed for validation only — the payload fixture is a pure
     // byte-preservation vector (it travels in the invocation envelope,
     // which is out of this crate's object model).
@@ -152,14 +159,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut quote_unknowns = quote_mock.clone();
     quote_unknowns.extra = BTreeMap::from([
         ("aa_sorts_first".to_string(), json!("esc\"ape\\é")),
-        ("zz_future_field".to_string(), json!({"nested": [1, true, null]})),
+        (
+            "zz_future_field".to_string(),
+            json!({"nested": [1, true, null]}),
+        ),
     ]);
     quote_unknowns.sign_with(&provider)?;
 
     let mut settlement_ref = SettlementRef::new(
         quote_eip155.quote_id.clone(),
         settle_eip155.clone(),
-        VerifierRef { identity: None, endpoint: "mock".into() },
+        VerifierRef {
+            identity: None,
+            endpoint: "mock".into(),
+        },
         SETTLED_NS,
         provider.entity_id().clone(),
     );
@@ -171,7 +184,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         transaction: Some(settle_eip155.view().transaction.clone()),
         tier: VerificationTier::Observed,
         status: VerificationStatus::Verified,
-        verifier: VerifierRef { identity: None, endpoint: "mock".into() },
+        verifier: VerifierRef {
+            identity: None,
+            endpoint: "mock".into(),
+        },
         prev: None,
         checked_at_ns: CHECKED_1_NS,
         signer: provider.entity_id().clone(),

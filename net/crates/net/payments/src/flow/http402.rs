@@ -146,7 +146,11 @@ impl X402HttpFlow {
         };
         if response.status().as_u16() != 402 {
             let status = response.status().as_u16();
-            let body = response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+            let body = response
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
             return X402HttpOutcome::Ok { status, body };
         }
 
@@ -196,11 +200,17 @@ impl X402HttpFlow {
         let requirements = match X402Carry::author(entry) {
             Ok(c) => c,
             Err(e) => {
-                return X402HttpOutcome::Failed { message: e.to_string(), retryable: false }
+                return X402HttpOutcome::Failed {
+                    message: e.to_string(),
+                    retryable: false,
+                }
             }
         };
         let now_ns = self.clock.now_ns();
-        let ttl_ns = entry.max_timeout_seconds.max(1).saturating_mul(1_000_000_000);
+        let ttl_ns = entry
+            .max_timeout_seconds
+            .max(1)
+            .saturating_mul(1_000_000_000);
         let quote = PaymentQuote::new(
             self.caller.entity_id().clone(),
             self.caller.entity_id().clone(),
@@ -210,16 +220,27 @@ impl X402HttpFlow {
             match self.registry.reference() {
                 Ok(r) => r,
                 Err(e) => {
-                    return X402HttpOutcome::Failed { message: e.to_string(), retryable: false }
+                    return X402HttpOutcome::Failed {
+                        message: e.to_string(),
+                        retryable: false,
+                    }
                 }
             },
             now_ns,
             now_ns.saturating_add(ttl_ns),
         );
 
-        match self.spend.check_and_reserve(&quote, &self.registry, now_ns).await {
+        match self
+            .spend
+            .check_and_reserve(&quote, &self.registry, now_ns)
+            .await
+        {
             Ok(SpendDecision::Allowed) => {}
-            Ok(SpendDecision::RequiresPaymentApproval { quote_id, policy_reason, approve_hint }) => {
+            Ok(SpendDecision::RequiresPaymentApproval {
+                quote_id,
+                policy_reason,
+                approve_hint,
+            }) => {
                 return X402HttpOutcome::RequiresPaymentApproval {
                     quote_id,
                     policy_reason,
@@ -230,7 +251,10 @@ impl X402HttpFlow {
                 return X402HttpOutcome::Denied { policy_reason }
             }
             Err(e) => {
-                return X402HttpOutcome::Failed { message: e.to_string(), retryable: false }
+                return X402HttpOutcome::Failed {
+                    message: e.to_string(),
+                    retryable: false,
+                }
             }
         }
 
@@ -240,7 +264,10 @@ impl X402HttpFlow {
             Ok(p) => p,
             Err(message) => {
                 self.release(&quote, now_ns).await;
-                return X402HttpOutcome::Failed { message, retryable: false };
+                return X402HttpOutcome::Failed {
+                    message,
+                    retryable: false,
+                };
             }
         };
         let paid_response = match self
@@ -268,10 +295,18 @@ impl X402HttpFlow {
             .and_then(|v| v.to_str().ok())
             .and_then(|b64| BASE64.decode(b64.as_bytes()).ok())
             .and_then(|bytes| X402Carry::<SettlementResponse>::from_bytes(bytes).ok());
-        let body = paid_response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        let body = paid_response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
 
         if (200..300).contains(&status) {
-            X402HttpOutcome::Paid { status, body, settlement }
+            X402HttpOutcome::Paid {
+                status,
+                body,
+                settlement,
+            }
         } else {
             // Per the transport, a non-2xx answer to a paid request means
             // verification/settlement failed — nothing settled, release.
@@ -283,7 +318,10 @@ impl X402HttpFlow {
         }
     }
 
-    async fn author_payload(&self, quote: &PaymentQuote) -> Result<X402Carry<PaymentPayload>, String> {
+    async fn author_payload(
+        &self,
+        quote: &PaymentQuote,
+    ) -> Result<X402Carry<PaymentPayload>, String> {
         let requirements = quote.requirements.view();
         let payload_object = if requirements.network.starts_with("mock:") {
             serde_json::json!({
@@ -298,7 +336,10 @@ impl X402HttpFlow {
             let auth = exact_evm_authorization_for_quote(quote, &signer.address());
             let typed = crate::x402::schemes::exact_evm::typed_data(requirements, &auth)
                 .map_err(|e| e.to_string())?;
-            let signature = signer.sign_typed_data(&typed).await.map_err(|e| e.to_string())?;
+            let signature = signer
+                .sign_typed_data(&typed)
+                .await
+                .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
         } else {
             return Err(format!(

@@ -237,7 +237,10 @@ mod tests {
             serde_json::to_string(&VerificationTier::Confirmed(6)).unwrap(),
             "{\"confirmed\":6}"
         );
-        assert_eq!(serde_json::to_string(&VerificationTier::Final).unwrap(), "\"final\"");
+        assert_eq!(
+            serde_json::to_string(&VerificationTier::Final).unwrap(),
+            "\"final\""
+        );
     }
 
     fn event(
@@ -251,7 +254,10 @@ mod tests {
             transaction: Some("0xabc".into()),
             tier: VerificationTier::Observed,
             status,
-            verifier: VerifierRef { identity: None, endpoint: "mock".into() },
+            verifier: VerifierRef {
+                identity: None,
+                endpoint: "mock".into(),
+            },
             prev,
             checked_at_ns: 1,
             signer: kp.entity_id().clone(),
@@ -266,7 +272,11 @@ mod tests {
     fn chains_link_and_freeze_after_invalidation() {
         let kp = EntityKeypair::generate();
         let e1 = event(&kp, None, VerificationStatus::Verified);
-        let e2 = event(&kp, Some(e1.chain_hash().unwrap()), VerificationStatus::Verified);
+        let e2 = event(
+            &kp,
+            Some(e1.chain_hash().unwrap()),
+            VerificationStatus::Verified,
+        );
         check_chain(&[e1.clone(), e2.clone()]).unwrap();
 
         // Broken link.
@@ -277,7 +287,9 @@ mod tests {
         let invalidated = event(
             &kp,
             Some(e2.chain_hash().unwrap()),
-            VerificationStatus::Invalidated { reason: InvalidationReason::Reorg },
+            VerificationStatus::Invalidated {
+                reason: InvalidationReason::Reorg,
+            },
         );
         let after = event(
             &kp,
@@ -291,9 +303,13 @@ mod tests {
     #[test]
     fn events_round_trip_signed() {
         let kp = EntityKeypair::generate();
-        let ev = event(&kp, None, VerificationStatus::Exception {
-            kind: ExceptionKind::Overpayment,
-        });
+        let ev = event(
+            &kp,
+            None,
+            VerificationStatus::Exception {
+                kind: ExceptionKind::Overpayment,
+            },
+        );
         let bytes = canonical_bytes(&ev).unwrap();
         let back = VerificationEvent::from_json_bytes(&bytes).unwrap();
         assert_eq!(back.status, ev.status);

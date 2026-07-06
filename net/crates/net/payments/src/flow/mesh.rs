@@ -68,10 +68,8 @@ pub fn serve_payments(
     provider: Arc<InProcessProvider>,
 ) -> Result<PaymentServeHandle, ServeError> {
     let quote_provider = provider.clone();
-    let quote = mesh.serve_rpc_typed(
-        QUOTE_SERVICE,
-        Codec::Json,
-        move |req: QuoteWireRequest| {
+    let quote =
+        mesh.serve_rpc_typed(QUOTE_SERVICE, Codec::Json, move |req: QuoteWireRequest| {
             let provider = quote_provider.clone();
             async move {
                 let caller = decode_entity(&req.caller_hex)?;
@@ -84,10 +82,11 @@ pub fn serve_payments(
                     .quote(&caller, &req.capability, &template)
                     .await
                     .map_err(|e| e.message)?;
-                Ok(QuoteWireResponse { quote_b64: BASE64.encode(quote_bytes) })
+                Ok(QuoteWireResponse {
+                    quote_b64: BASE64.encode(quote_bytes),
+                })
             }
-        },
-    )?;
+        })?;
 
     let pay = mesh.serve_rpc_typed(PAY_SERVICE, Codec::Json, move |req: PayWireRequest| {
         let provider = provider.clone();
@@ -100,13 +99,18 @@ pub fn serve_payments(
                 .map_err(|e| format!("payload is not base64: {e}"))?;
             let payload: X402Carry<PaymentPayload> =
                 X402Carry::from_bytes(payload_bytes).map_err(|e| e.to_string())?;
-            let response: PayResponse =
-                provider.pay(&quote_bytes, &payload).await.map_err(|e| e.message)?;
+            let response: PayResponse = provider
+                .pay(&quote_bytes, &payload)
+                .await
+                .map_err(|e| e.message)?;
             Ok::<PayResponse, String>(response)
         }
     })?;
 
-    Ok(PaymentServeHandle { _quote: quote, _pay: pay })
+    Ok(PaymentServeHandle {
+        _quote: quote,
+        _pay: pay,
+    })
 }
 
 fn decode_entity(hex_str: &str) -> Result<EntityId, String> {
@@ -152,7 +156,10 @@ impl MeshPaymentChannel {
 
     fn map_rpc_error(e: RpcError) -> ChannelError {
         let retryable = matches!(e, RpcError::Timeout { .. } | RpcError::NoRoute { .. });
-        ChannelError { message: e.to_string(), retryable }
+        ChannelError {
+            message: e.to_string(),
+            retryable,
+        }
     }
 }
 
@@ -181,7 +188,10 @@ impl ProviderChannel for MeshPaymentChannel {
             .map_err(Self::map_rpc_error)?;
         BASE64
             .decode(&response.quote_b64)
-            .map_err(|e| ChannelError { message: format!("quote is not base64: {e}"), retryable: false })
+            .map_err(|e| ChannelError {
+                message: format!("quote is not base64: {e}"),
+                retryable: false,
+            })
     }
 
     async fn pay(
@@ -191,8 +201,13 @@ impl ProviderChannel for MeshPaymentChannel {
     ) -> Result<PayResponse, ChannelError> {
         // The quote carries its provider identity, but routing needs the
         // node id — recover it from the quote's capability binding.
-        let quote = crate::core::quote::PaymentQuote::from_json_bytes(quote_bytes)
-            .map_err(|e| ChannelError { message: e.to_string(), retryable: false })?;
+        let quote =
+            crate::core::quote::PaymentQuote::from_json_bytes(quote_bytes).map_err(|e| {
+                ChannelError {
+                    message: e.to_string(),
+                    retryable: false,
+                }
+            })?;
         let node = Self::provider_node(&quote.capability)?;
         self.mesh
             .call_typed(

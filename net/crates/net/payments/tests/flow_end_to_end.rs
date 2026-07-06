@@ -15,13 +15,13 @@ use net_payments::core::billing_event::BillingEvent;
 use net_payments::core::canonical::SignedEnvelope as _;
 use net_payments::core::registry::{default_mock_registry, AssetRegistry};
 use net_payments::core::terms::PricingTerms;
+use net_payments::core::units::AtomicAmount;
 use net_payments::engine::{AdmitAll, PaymentEngine, ProviderAdmissionPolicy};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::flow::{
     CallerDecision, CallerPaymentFlow, Clock, InProcessProvider, ProviderChannel,
 };
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
-use net_payments::core::units::AtomicAmount;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 
@@ -105,7 +105,13 @@ fn world_with(profile: SpendProfile, admission: Arc<dyn ProviderAdmissionPolicy>
         channel,
         clock,
     );
-    World { flow, spend_path, terms_json, provider_log, _dir: dir }
+    World {
+        flow,
+        spend_path,
+        terms_json,
+        provider_log,
+        _dir: dir,
+    }
 }
 
 #[tokio::test]
@@ -113,13 +119,20 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     let w = world(SpendProfile::DevTest);
 
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = decision else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof,
+    } = decision
+    else {
         panic!("expected Paid, got {decision:?}");
     };
 
     // The proof carries the signed billing event — the caller can verify
     // and persist its own copy ("billing events persisted both sides").
-    let billing_json = proof["billing_event"].as_str().expect("billing event in proof");
+    let billing_json = proof["billing_event"]
+        .as_str()
+        .expect("billing event in proof");
     let billing = BillingEvent::from_json_bytes(billing_json.as_bytes()).expect("verifies");
     assert_eq!(billing.amount, AtomicAmount::from_u128(2500));
     assert_eq!(billing.capability, CAPABILITY);
@@ -135,7 +148,12 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     // by the engine's lifecycle tests). Here we pin the flow-level fact:
     // a second full run is a second charge with a distinct billing id.
     let second = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof: proof2 } = second else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof: proof2,
+    } = second
+    else {
         panic!("expected Paid, got {second:?}");
     };
     assert_ne!(
@@ -158,8 +176,11 @@ async fn over_cap_surfaces_structured_approval_and_approval_unblocks() {
         .expect("configure");
 
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } =
-        decision
+    let CallerDecision::RequiresPaymentApproval {
+        quote_id,
+        policy_reason,
+        approve_hint,
+    } = decision
     else {
         panic!("expected RequiresPaymentApproval, got {decision:?}");
     };
@@ -177,7 +198,12 @@ async fn over_cap_surfaces_structured_approval_and_approval_unblocks() {
     assert!(approver.approve(&quote_id).await.expect("approve"));
 
     let retry = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { quote_id: _, binding_sig: _, proof } = retry else {
+    let CallerDecision::Paid {
+        quote_id: _,
+        binding_sig: _,
+        proof,
+    } = retry
+    else {
         panic!("approval must unblock the paid invoke, got {retry:?}");
     };
     assert_eq!(
@@ -185,7 +211,11 @@ async fn over_cap_surfaces_structured_approval_and_approval_unblocks() {
         Some(quote_id.as_str()),
         "the redeemed quote is the approved one"
     );
-    assert_eq!(w.provider_log.read_all().await.unwrap().len(), 1, "exactly one charge");
+    assert_eq!(
+        w.provider_log.read_all().await.unwrap().len(),
+        1,
+        "exactly one charge"
+    );
 
     // The approval was consumed: a third run holds again on a new quote.
     let third = w.flow.run(CAPABILITY, &w.terms_json).await;
@@ -202,7 +232,10 @@ async fn production_profile_holds_every_mock_spend_for_approval() {
     let CallerDecision::RequiresPaymentApproval { policy_reason, .. } = decision else {
         panic!("expected RequiresPaymentApproval, got {decision:?}");
     };
-    assert!(policy_reason.contains("dev/test profile"), "{policy_reason}");
+    assert!(
+        policy_reason.contains("dev/test profile"),
+        "{policy_reason}"
+    );
 }
 
 #[tokio::test]
@@ -226,7 +259,10 @@ async fn a_denied_caller_is_refused_at_quote_time_and_nothing_reserves() {
     // Never quoted → nothing reserved, nothing billed.
     let spend = SpendPolicyEngine::new(&w.spend_path, SpendProfile::DevTest);
     assert_eq!(
-        spend.spent_today(MOCK_NETWORK, "musd", 1_000_000_000_000_000).await.unwrap(),
+        spend
+            .spent_today(MOCK_NETWORK, "musd", 1_000_000_000_000_000)
+            .await
+            .unwrap(),
         AtomicAmount::from_u128(0)
     );
     assert!(w.provider_log.read_all().await.unwrap().is_empty());
@@ -274,14 +310,16 @@ async fn real_network_only_terms_are_denied_at_both_layers() {
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
     let provider_keys = Arc::new(EntityKeypair::generate());
     let mut registry = default_mock_registry(provider_keys.entity_id().clone());
-    registry.assets.push(net_payments::core::registry::AssetEntry {
-        id: net_payments::x402::caip::AssetId::parse("eip155:8453/erc20:0xusdc").expect("caip"),
-        x402_asset: "0xusdc".into(),
-        decimals: 6,
-        symbol: "USDC".into(),
-        display_name: None,
-        equivalence_class: None,
-    });
+    registry
+        .assets
+        .push(net_payments::core::registry::AssetEntry {
+            id: net_payments::x402::caip::AssetId::parse("eip155:8453/erc20:0xusdc").expect("caip"),
+            x402_asset: "0xusdc".into(),
+            decimals: 6,
+            symbol: "USDC".into(),
+            display_name: None,
+            equivalence_class: None,
+        });
     let engine = Arc::new(
         PaymentEngine::new(
             provider_keys.clone(),
@@ -313,11 +351,7 @@ async fn real_network_only_terms_are_denied_at_both_layers() {
     .expect("utf8");
     let never_signs = net_payments::flow::signer::ExternalSigner::new(
         "0x857b06519E91e3A54538791bDbb0E22373e36b66",
-        |_typed| {
-            Box::pin(async {
-                panic!("policy must deny before any signature is requested")
-            })
-        },
+        |_typed| Box::pin(async { panic!("policy must deny before any signature is requested") }),
     );
     let flow = CallerPaymentFlow::new(
         Arc::new(EntityKeypair::generate()),
@@ -367,13 +401,22 @@ impl ProviderChannel for GreedyProvider {
         })?;
         let quote = self
             .engine
-            .issue_quote(caller.clone(), capability, inflated, self.clock.now_ns(), 60_000_000_000)
+            .issue_quote(
+                caller.clone(),
+                capability,
+                inflated,
+                self.clock.now_ns(),
+                60_000_000_000,
+            )
             .map_err(|e| net_payments::flow::ChannelError {
                 message: e.to_string(),
                 retryable: false,
             })?;
         net_payments::core::canonical::canonical_bytes(&quote).map_err(|e| {
-            net_payments::flow::ChannelError { message: e.to_string(), retryable: false }
+            net_payments::flow::ChannelError {
+                message: e.to_string(),
+                retryable: false,
+            }
         })
     }
 
@@ -403,7 +446,11 @@ async fn a_quote_that_deviates_from_announced_terms_is_refused() {
         .unwrap(),
     );
     let honest = Arc::new(InProcessProvider::new(engine.clone(), clock.clone()));
-    let greedy = Arc::new(GreedyProvider { inner: honest, engine, clock: clock.clone() });
+    let greedy = Arc::new(GreedyProvider {
+        inner: honest,
+        engine,
+        clock: clock.clone(),
+    });
 
     let template = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
@@ -422,8 +469,7 @@ async fn a_quote_that_deviates_from_announced_terms_is_refused() {
         registry.reference().unwrap(),
     );
     let terms_json =
-        String::from_utf8(net_payments::core::canonical::canonical_bytes(&terms).unwrap())
-            .unwrap();
+        String::from_utf8(net_payments::core::canonical::canonical_bytes(&terms).unwrap()).unwrap();
 
     let caller = Arc::new(EntityKeypair::generate());
     let flow = CallerPaymentFlow::new(
@@ -437,5 +483,8 @@ async fn a_quote_that_deviates_from_announced_terms_is_refused() {
     let CallerDecision::Denied { policy_reason } = decision else {
         panic!("expected Denied, got {decision:?}");
     };
-    assert!(policy_reason.contains("deviates from the announced terms"), "{policy_reason}");
+    assert!(
+        policy_reason.contains("deviates from the announced terms"),
+        "{policy_reason}"
+    );
 }

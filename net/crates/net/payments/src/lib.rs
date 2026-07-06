@@ -55,10 +55,10 @@ pub mod policy;
 pub mod x402;
 
 pub use crate::core::billing_event::BillingEvent;
-pub use crate::engine::{PaymentDecision, PaymentEngine};
 pub use crate::core::quote::PaymentQuote;
 pub use crate::core::terms::PricingTerms;
 pub use crate::core::units::AtomicAmount;
 pub use crate::core::verification::{VerificationEvent, VerificationTier};
+pub use crate::engine::{PaymentDecision, PaymentEngine};
 pub use crate::x402::caip::{AssetId, ChainId};
 pub use crate::x402::X402Carry;
