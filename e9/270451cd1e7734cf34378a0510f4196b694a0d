@@ -1,0 +1,28 @@
+net/crates/net/adapters/mcp/src/forward/secret.rs
+  s_759aaad81078ca::t_c235b02e3eafc7 217
+  s_759aaad81078ca::t_00643776f5c31e 277
+  s_759aaad81078ca::t_576487f8531103 227
+  s_759aaad81078ca::t_e1b970326202c4 203
+  s_759aaad81078ca::t_33abe1e9b154b0 1-65,71-72,74-81,89-90,93-95,98-101,103-106,108-113,115-123,126-130,132-202,204-216,218-226,228-276,278-283
+  s_759aaad81078ca::t_6fffa8a426ee8c 66-70,73,82-88,91-92,96-97,102,107,114,124-125,131
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_d3543760f0629b 79-81
+  s_759aaad81078ca::t_2d2862651b9b54 66
+  s_759aaad81078ca::t_968f40e6859299 39-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e9270451cd1e7734cf34378a0510f4196b694a0d",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

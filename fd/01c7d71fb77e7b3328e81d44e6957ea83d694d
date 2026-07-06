@@ -1,0 +1,23 @@
+net/crates/net/adapters/mcp/src/spec/mod.rs
+  s_4b449b0a181874::t_87690ae338f583 23-35
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_4b449b0a181874::t_7c545f46ee3748 234-248,250
+  s_4b449b0a181874::t_36a6c36bf10b03 972-1011
+  s_4b449b0a181874::t_7218d698cf0d0d 35-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fd01c7d71fb77e7b3328e81d44e6957ea83d694d",
+  "prompts": {},
+  "sessions": {
+    "s_4b449b0a181874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f19c588e-03dd-49aa-bfa8-acdee181ed34",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md
+  s_759aaad81078ca::t_24c0ca8a54f920 118-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5318eaa6f06fdb2989795419eb2d879d6c7a9ba9",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

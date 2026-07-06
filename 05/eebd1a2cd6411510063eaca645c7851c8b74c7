@@ -1,0 +1,23 @@
+net/crates/net/integrations/hermes/README.md
+  s_1539b6b2705f81::t_b2b72f87221fc8 81-87
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN.md
+  s_1539b6b2705f81::t_57a8d8d50d3c68 105
+net/crates/net/integrations/hermes/tests/real_hermes_loader_check.py
+  s_1539b6b2705f81::t_107cf022ca7161 1-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "05eebd1a2cd6411510063eaca645c7851c8b74c7",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

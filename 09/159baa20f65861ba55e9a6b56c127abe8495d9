@@ -1,0 +1,26 @@
+net/crates/net/adapters/mcp/src/forward/header.rs
+  s_cdbc9688784d9a::t_228e3ba7d89c2a 360-374
+  s_cdbc9688784d9a::t_4209956d9ed465 189-198,208
+  s_cdbc9688784d9a::t_66079ea6487cc8 359
+net/crates/net/adapters/mcp/src/forward/keychain.rs
+  s_cdbc9688784d9a::t_f2a6561738f622 185-189,191-200
+  s_cdbc9688784d9a::t_1e943745f5b3a2 60-64
+  s_cdbc9688784d9a::t_263e955be3d090 190
+  s_cdbc9688784d9a::t_adf9c2b168ba53 184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "09159baa20f65861ba55e9a6b56c127abe8495d9",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

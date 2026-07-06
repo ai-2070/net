@@ -1,0 +1,28 @@
+net/crates/net/integrations/hermes/renewal.py
+  s_a772df20f47a78::t_31b65ba86c0762 1-139
+net/crates/net/integrations/hermes/__init__.py
+  s_a772df20f47a78::t_eeabf895fbd2e5 25,28-29,31
+net/crates/net/integrations/hermes/tests/test_renewal.py
+  s_a772df20f47a78::t_d0c64c553b3e9e 1-107
+net/crates/net/integrations/hermes/node.py
+  s_a772df20f47a78::t_73e43186590250 187-194
+  s_a772df20f47a78::t_8b4ca1589f7dfd 290-351
+  s_a772df20f47a78::t_8aa4b54ac6e1fa 60-63
+  s_a772df20f47a78::t_4895d5c15b1b0b 422,426-428,430-434,440-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "28d108d67eeeac51eeaada4201781882c4511f65",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

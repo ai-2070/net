@@ -1,0 +1,40 @@
+net/crates/net/bindings/python/python/net/__init__.py
+  s_cdbc9688784d9a::t_d371d0336251e1 803-815
+net/crates/net/bindings/python/tests/test_mcp_helpers.py
+  s_cdbc9688784d9a::t_caea05bda88836 1-103
+net/crates/net/sdk/src/consent.rs
+  s_cdbc9688784d9a::t_dc865ce92ddab2 180-197
+  s_cdbc9688784d9a::t_4a690c6351d934 380-397
+.github/workflows/ci.yml
+  s_cdbc9688784d9a::t_6529c52e387c0d 692
+net/crates/net/bindings/python/Cargo.toml
+  s_cdbc9688784d9a::t_1efbb161325550 46
+  s_cdbc9688784d9a::t_7012bd4cb836a5 138-139
+  s_cdbc9688784d9a::t_82eb97ab36f609 127-133
+net/crates/net/bindings/python/src/lib.rs
+  s_cdbc9688784d9a::t_cc29f10bb1b6bf 31-32
+  s_cdbc9688784d9a::t_5b1a37cc0f7a64 3124-3128
+  s_cdbc9688784d9a::t_e041b71a75953b 35-36
+net/crates/net/bindings/python/src/mcp_helpers.rs
+  s_cdbc9688784d9a::t_2f7300b7b0bff3 1-121
+net/crates/net/Cargo.lock
+  s_cdbc9688784d9a::t_f1c008c5766b3c 2658
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_cdbc9688784d9a::t_1a902848fbaee7 2496-2521
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f18ae6f321ee4e57f5c964d7d4829ab81784cd75",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

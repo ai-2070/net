@@ -1,0 +1,23 @@
+go/mcp.go
+  s_1539b6b2705f81::t_66b99724405c57 379
+  s_1539b6b2705f81::t_97948887513c1d 298
+  s_1539b6b2705f81::t_878583efc3aade 331
+  s_1539b6b2705f81::t_5b16fe9f3a92e7 294-297
+  s_1539b6b2705f81::t_77f70ae592d88b 345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a5e5a3ae18ba34c31faeae67274b8671f3adca30",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

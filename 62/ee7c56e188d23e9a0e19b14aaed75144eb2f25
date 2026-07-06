@@ -1,0 +1,32 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_04_MCP_FORWARDING.md
+  s_cdbc9688784d9a::t_5251c782a78b2d 156
+  s_cdbc9688784d9a::t_3e49a7b0c6c861 261
+  s_cdbc9688784d9a::t_3b9183ea138cbd 308-310,315-317
+  s_cdbc9688784d9a::t_8fa78144196088 283
+  s_cdbc9688784d9a::t_c452b240be2293 198
+  s_cdbc9688784d9a::t_fc865d7aac2309 133
+  s_cdbc9688784d9a::t_23c68a39c90bec 174
+  s_cdbc9688784d9a::t_64d5346f001a5d 1
+  s_cdbc9688784d9a::t_ef32c8d0511d0b 212
+  s_cdbc9688784d9a::t_dddc7361884d9a 237
+  s_cdbc9688784d9a::t_a3015fcd33a105 272
+  s_cdbc9688784d9a::t_12bdc449fb0c32 291
+  s_cdbc9688784d9a::t_20eb65c371525e 101
+  s_cdbc9688784d9a::t_e49a4b9185c9da 97-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "62ee7c56e188d23e9a0e19b14aaed75144eb2f25",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_1539b6b2705f81::t_548d5788db72d8 855-883
+  s_1539b6b2705f81::t_b0a94538f1d3e2 78-105
+  s_1539b6b2705f81::t_47325a0fa9a995 555
+  s_1539b6b2705f81::t_27c97f1d144e03 585,588-589
+  s_1539b6b2705f81::t_9c6db5ba28b3f3 422,425-429
+  s_1539b6b2705f81::t_0bbeffed1723be 397
+  s_1539b6b2705f81::t_534e493697ae3a 854
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "facb75e85503c112b78eaf89925b2611f88a3f7f",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

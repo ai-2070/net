@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_1539b6b2705f81::t_384d9a9c0dbaf6 66-77
+  s_1539b6b2705f81::t_d2a77ab933d356 52
+net/crates/net/bindings/python/tests/test_delegation.py
+  s_1539b6b2705f81::t_9958063f06f27c 186-214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "70e243f306f49ef63ba512a25020380f92bdafaa",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

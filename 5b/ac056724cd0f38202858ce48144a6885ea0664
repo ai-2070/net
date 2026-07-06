@@ -1,0 +1,38 @@
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_1539b6b2705f81::t_14d145e3a98bbf 19
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_1539b6b2705f81::t_913dec834cb088 2600-2623
+net/crates/net/bindings/python/src/lib.rs
+  s_1539b6b2705f81::t_3fe68c41d404e7 3139
+net/crates/net/bindings/python/python/net/__init__.py
+  s_1539b6b2705f81::t_5255cbe3b7bd09 818-819,821,823,826
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_1539b6b2705f81::t_c44ba2e14c3265 297-298,300-301,313-315,335,338-340
+  s_1539b6b2705f81::t_9f849544283698 382,384,396-400,425-429
+  s_1539b6b2705f81::t_b1c2e133346220 4-10,15-16,18-24,30-36,41,45,53-55,135-220,228,234-280,285-286,293-296,308,311,323-325,327,330,341-381,383,385,387-395,401-422,424,430,434-455,457-458
+  s_1539b6b2705f81::t_89650a6796f6ce 423
+net/crates/net/sdk-py/src/net_sdk/consent.py
+  s_1539b6b2705f81::t_f5d7a900e42a85 43-45,47,51
+net/crates/net/bindings/python/tests/test_capability_gateway.py
+  s_1539b6b2705f81::t_ed00b2a9b55e77 116-136,141-175
+  s_1539b6b2705f81::t_272925754bfbd6 137-140
+  s_1539b6b2705f81::t_f526d686db5060 21,32-34
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_1539b6b2705f81::t_7ff13844d96ef4 313-316,320
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5bac056724cd0f38202858ce48144a6885ea0664",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

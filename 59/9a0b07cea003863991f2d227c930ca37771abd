@@ -1,0 +1,22 @@
+net/crates/net/sdk/src/pins.rs
+  s_1539b6b2705f81::t_d7d85180cfcc00 443,445-446,452-465
+  s_1539b6b2705f81::t_cc4797c8d28ee3 558-577
+  s_1539b6b2705f81::t_e9e021a68b1519 466-467
+  s_1539b6b2705f81::t_e42803e8bb17c7 557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "599a0b07cea003863991f2d227c930ca37771abd",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

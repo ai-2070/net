@@ -1,0 +1,21 @@
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_928ee85c6ffc0a::t_8d78a05a7efd4f 217
+  s_928ee85c6ffc0a::t_52ef6fbd3a18a3 141-142,148
+  s_928ee85c6ffc0a::t_c312a3488438c9 460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21330400ce5438ba1e000cf72ee4cb6fb39bf873",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

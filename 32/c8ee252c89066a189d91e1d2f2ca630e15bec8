@@ -1,0 +1,29 @@
+net/crates/net/docs/plans/PAYMENTS_P1_IMPLEMENTATION_PLAN.md
+  s_928ee85c6ffc0a::t_5023c81865689e 81-82
+  s_928ee85c6ffc0a::t_05cd38888daaf5 88-89
+  s_928ee85c6ffc0a::t_e2b905143e3e7f 29-35
+  s_928ee85c6ffc0a::t_ad242c2179eada 64-67
+  s_928ee85c6ffc0a::t_4ed0ef263ffde7 54-58
+  s_928ee85c6ffc0a::t_a7fdfb89ff50ab 73-77
+  s_928ee85c6ffc0a::t_134ff7fd088d80 92
+  s_928ee85c6ffc0a::t_37a9336253f505 43-46
+net/crates/net/docs/plans/PAYMENTS_SDK_PLAN.md
+  s_928ee85c6ffc0a::t_6b5832c64b9730 91
+  s_928ee85c6ffc0a::t_38d25bbc13d73a 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "32c8ee252c89066a189d91e1d2f2ca630e15bec8",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

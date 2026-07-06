@@ -1,0 +1,22 @@
+net/crates/net/cli/src/commands/forwarding.rs
+  s_cdbc9688784d9a::t_b1a11dd2e71f31 132-134,144-153,155-157,159-165,167-169
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_cdbc9688784d9a::t_53fab35fd52847 140-155
+  s_cdbc9688784d9a::t_8f966be3d84dfb 112-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "250f1b682567e3908edb824fe2a1edb4f5f798c0",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

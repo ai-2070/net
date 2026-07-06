@@ -1,0 +1,23 @@
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_1539b6b2705f81::t_bcdfb8464bb167 244-247
+  s_1539b6b2705f81::t_1b7b0f0c2bcdeb 274-279,281-283,287,295
+  s_1539b6b2705f81::t_44b719813e6155 120-124
+  s_1539b6b2705f81::t_23c72345ef5e89 496-528
+  s_1539b6b2705f81::t_da02f910afca76 495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "987d82980c218cb72e40cb05f163d0cdf89e731f",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

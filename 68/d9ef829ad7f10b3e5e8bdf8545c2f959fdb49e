@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_1539b6b2705f81::t_bfb39285fb289d 3127-3128
+net/crates/net/bindings/python/Cargo.toml
+  s_1539b6b2705f81::t_6f3eab78a287dc 126
+net/crates/net/bindings/python/python/net/__init__.py
+  s_1539b6b2705f81::t_bf5e630ef608cc 781,784,797,800
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_1539b6b2705f81::t_aad60c1a2a3a96 294,297,306,309
+net/crates/net/bindings/python/src/consent.rs
+  s_1539b6b2705f81::t_77d2a0d139580b 501-527,532-591
+  s_1539b6b2705f81::t_793dbeb02b079b 36
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_1539b6b2705f81::t_6d28066ff18e55 2507-2519,2522-2539
+  s_1539b6b2705f81::t_ebb38e8e867399 2540
+net/crates/net/sdk-py/src/net_sdk/consent.py
+  s_1539b6b2705f81::t_79fbe0b5a6da1d 25,28,37,40
+net/crates/net/bindings/python/tests/test_consent_pins.py
+  s_1539b6b2705f81::t_c77c6360c9662e 271-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "68d9ef829ad7f10b3e5e8bdf8545c2f959fdb49e",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

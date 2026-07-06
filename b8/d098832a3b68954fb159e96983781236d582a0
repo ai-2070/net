@@ -1,0 +1,26 @@
+net/crates/net/bindings/go/mcp-ffi/src/lib.rs
+  s_1539b6b2705f81::t_3681926adaf402 48
+  s_1539b6b2705f81::t_588af5533707e7 1133-1144
+  s_1539b6b2705f81::t_84baec23c22007 515
+  s_1539b6b2705f81::t_e8c093cee4d9c7 495,499-504
+net/crates/net/bindings/go/mcp-ffi/Cargo.toml
+  s_1539b6b2705f81::t_d59ac1df514d46 45-47
+net/crates/net/Cargo.lock
+  s_1539b6b2705f81::t_8ae10dc655eff7 2499
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8d098832a3b68954fb159e96983781236d582a0",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

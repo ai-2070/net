@@ -1,0 +1,20 @@
+net/crates/net/adapters/mcp/src/forward/store.rs
+  s_759aaad81078ca::t_605243f562e137 198-201,203-226
+  s_759aaad81078ca::t_9d5cd12e1c75b7 716-789
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "00ab3b1a13598b730a13e9fbd38e36e251b17a8c",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

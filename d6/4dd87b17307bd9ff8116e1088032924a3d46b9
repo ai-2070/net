@@ -1,0 +1,29 @@
+net/crates/net/integrations/hermes/delegation.py
+  s_1539b6b2705f81::t_75f9519e3380f4 41-102,104,106-113,118-129
+net/crates/net/integrations/hermes/tests/test_delegation.py
+  s_1539b6b2705f81::t_c4ed322166f0ef 126
+  s_1539b6b2705f81::t_670dc3c36524d2 96-118
+  s_1539b6b2705f81::t_daea7d34240690 119-125,127-139
+net/crates/net/integrations/hermes/tools.py
+  s_1539b6b2705f81::t_f0233beb0bc367 180-190
+net/crates/net/integrations/hermes/node.py
+  s_1539b6b2705f81::t_55ce3bcb7e257d 234-255
+net/crates/net/integrations/hermes/pins.py
+  s_1539b6b2705f81::t_55ff76cc9779e5 84-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d64dd87b17307bd9ff8116e1088032924a3d46b9",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

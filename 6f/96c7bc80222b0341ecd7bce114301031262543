@@ -1,0 +1,26 @@
+net/crates/net/cli/Cargo.toml
+  s_759aaad81078ca::t_acdde1fff754fe 14-22
+net/crates/net/cli/src/commands/forwarding.rs
+  s_759aaad81078ca::t_a054d6ba3a8a44 43-46
+  s_759aaad81078ca::t_f07da5ebbc6b50 104-110
+  s_759aaad81078ca::t_c9c12dc253a7d4 123,127-176
+  s_759aaad81078ca::t_51b321a399eb9f 177
+net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md
+  s_759aaad81078ca::t_6a457911a4f032 120-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6f96c7bc80222b0341ecd7bce114301031262543",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

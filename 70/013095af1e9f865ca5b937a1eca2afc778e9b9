@@ -1,0 +1,55 @@
+net/crates/net/adapters/mcp/src/wrap/policy.rs
+  s_a772df20f47a78::t_cd4e3987dec4fe 1-109
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_a772df20f47a78::t_5a4f96788ff3bc 197-201
+  s_a772df20f47a78::t_8b63496f2ffdaa 25
+  s_a772df20f47a78::t_fcf3b58b4658eb 240-249
+  s_a772df20f47a78::t_538ebf488da656 217
+  s_a772df20f47a78::t_19e54677b40466 270,292,302-324
+  s_a772df20f47a78::t_df91cc52d441f6 55-60
+net/crates/net/adapters/mcp/tests/publish_tools_end_to_end.rs
+  s_a772df20f47a78::t_f6fd297ebd7de6 107-129,302-303
+  s_a772df20f47a78::t_9d4c26e74ff639 24,26-27
+  s_a772df20f47a78::t_dd3d1a4f00bd3e 306-362
+  s_a772df20f47a78::t_fc8e7652ec9723 304-305
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_a772df20f47a78::t_d648967bb289cc 397
+  s_a772df20f47a78::t_c2c09e2c179e0c 48
+  s_a772df20f47a78::t_57b7762ec67a87 378-379,381-385
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_b84daaf68326e5 95-96
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_a772df20f47a78::t_44ec17c1249e44 31
+  s_a772df20f47a78::t_63d496b296a149 43-44
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_a772df20f47a78::t_a7cd7b1a60457d 834-836
+  s_a772df20f47a78::t_25f60adf0c0aad 479
+  s_a772df20f47a78::t_7071278fac2a3f 192-204
+  s_a772df20f47a78::t_fbe772c0db3a96 449-450
+  s_a772df20f47a78::t_654e541701e1c5 554-555
+  s_a772df20f47a78::t_c1e8502ca5aecb 184-189
+  s_a772df20f47a78::t_45ea43b096ac61 218
+  s_a772df20f47a78::t_b9b02574fe37fa 654-656
+  s_a772df20f47a78::t_0ead89b982b25e 743-744
+  s_a772df20f47a78::t_79e962ed24db60 49
+  s_a772df20f47a78::t_5588297631bd3e 163-166
+  s_a772df20f47a78::t_ec58650d1eba8d 902-903
+  s_a772df20f47a78::t_7e3523e1396713 584
+  s_a772df20f47a78::t_90c8fe92b3a16f 190-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "70013095af1e9f865ca5b937a1eca2afc778e9b9",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

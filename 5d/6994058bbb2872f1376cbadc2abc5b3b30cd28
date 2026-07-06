@@ -1,0 +1,43 @@
+net/crates/net/bindings/go/mcp-ffi/src/lib.rs
+  s_1539b6b2705f81::t_24d5dd3baf49d4 608-609
+  s_1539b6b2705f81::t_0bd4498c560e0f 370-383
+  s_1539b6b2705f81::t_0aae94cd5863b8 281-294
+  s_1539b6b2705f81::t_b5ba720ed358b9 203,205
+net/crates/net/bindings/node/src/mcp_helpers.rs
+  s_1539b6b2705f81::t_aa6bf51d7f9a62 81-87
+  s_1539b6b2705f81::t_fb2b49442d4b73 125-131
+net/crates/net/bindings/node/src/consent.rs
+  s_1539b6b2705f81::t_dd1a09d23a7d8e 66,68
+  s_1539b6b2705f81::t_411f9bd3d34fed 210-212
+net/crates/net/bindings/python/src/mcp_helpers.rs
+  s_1539b6b2705f81::t_aeb034bdffdc5b 46-52
+  s_1539b6b2705f81::t_972a4696a80ac1 95-100
+net/crates/net/sdk/src/pins.rs
+  s_1539b6b2705f81::t_5172697c5addcf 49-61
+net/crates/net/sdk/src/consent.rs
+  s_1539b6b2705f81::t_ab7749eda848a4 217-227
+net/crates/net/bindings/python/src/consent.rs
+  s_1539b6b2705f81::t_16ef1b87e609b0 203-204
+  s_1539b6b2705f81::t_1c5c967531f559 74,76
+net/crates/net/adapters/mcp/src/wrap/credentials.rs
+  s_1539b6b2705f81::t_c9f606f6fdab57 36-63
+net/crates/net/adapters/mcp/src/wrap/descriptor.rs
+  s_1539b6b2705f81::t_ceefc4ba2e1c2b 42-45,53-61
+  s_1539b6b2705f81::t_8f3043bed035ec 62-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5d6994058bbb2872f1376cbadc2abc5b3b30cd28",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+net/crates/net/adapters/mcp/src/forward/keychain.rs
+  s_759aaad81078ca::t_fb30363b9fe221 100-107
+  s_759aaad81078ca::t_962eca97bfc8e9 23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a469ba9e0fd25e98876c66689a2311a0843fe3d9",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

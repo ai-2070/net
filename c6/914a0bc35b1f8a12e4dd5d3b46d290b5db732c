@@ -1,0 +1,24 @@
+net/crates/net/cli/src/commands/forwarding.rs
+  s_759aaad81078ca::t_6d0f1cb8d76ba4 1-248
+net/crates/net/cli/src/main.rs
+  s_759aaad81078ca::t_32d9a21fb11762 156-158
+  s_759aaad81078ca::t_e6c173286ca737 253-255
+net/crates/net/cli/src/commands/mod.rs
+  s_759aaad81078ca::t_8af5862ef626e5 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c6914a0bc35b1f8a12e4dd5d3b46d290b5db732c",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

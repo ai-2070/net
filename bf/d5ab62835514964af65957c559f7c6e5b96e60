@@ -1,0 +1,39 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_cdbc9688784d9a::t_5982573e917a80 3111-3119
+  s_cdbc9688784d9a::t_4d7c7b2d3ee370 22-28
+net/crates/net/bindings/python/src/async_bridge.rs
+  s_cdbc9688784d9a::t_b6d0ccef3e2287 17-19,24
+  s_cdbc9688784d9a::t_aa1594d5bb9771 25
+net/crates/net/bindings/python/src/consent.rs
+  s_cdbc9688784d9a::t_562194a51540de 88
+  s_cdbc9688784d9a::t_2d0d134ccea502 1-87,89-452
+  s_cdbc9688784d9a::t_3e4b190380d3a9 453-455
+  s_cdbc9688784d9a::t_fb0595c17c09b1 456-461
+net/crates/net/bindings/python/Cargo.toml
+  s_cdbc9688784d9a::t_75b75ba2b1c37b 118-125
+  s_cdbc9688784d9a::t_ce7725c2646b7f 45
+net/crates/net/bindings/python/tests/test_consent_pins.py
+  s_cdbc9688784d9a::t_4fb59afbc83ab5 1-263
+net/crates/net/bindings/python/python/net/__init__.py
+  s_cdbc9688784d9a::t_4ab4456e79a223 771-802
+.github/workflows/ci.yml
+  s_cdbc9688784d9a::t_778b9b3b418db8 692
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_cdbc9688784d9a::t_a13a0621d91401 2408-2495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bfd5ab62835514964af65957c559f7c6e5b96e60",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

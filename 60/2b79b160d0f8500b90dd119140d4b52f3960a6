@@ -1,0 +1,23 @@
+net/crates/net/adapters/mcp/src/forward/secret.rs
+  s_759aaad81078ca::t_bc9c6e59d01843 29,32-43
+  s_759aaad81078ca::t_6bd01ae42d44c7 86
+  s_759aaad81078ca::t_ffffaee5f16691 105-106
+  s_759aaad81078ca::t_6eeeff786c0404 139
+  s_759aaad81078ca::t_e0ae4d716e1136 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "602b79b160d0f8500b90dd119140d4b52f3960a6",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

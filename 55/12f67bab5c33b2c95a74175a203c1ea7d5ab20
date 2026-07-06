@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/src/delegation.rs
+  s_a772df20f47a78::t_a31044b24d3e8f 171-176
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_a772df20f47a78::t_11f445d9797879 354,366
+net/crates/net/sdk-py/src/net_sdk/enrollment.py
+  s_a772df20f47a78::t_89691d5d68068f 35,45
+net/crates/net/bindings/python/tests/test_enrollment.py
+  s_a772df20f47a78::t_95575524eca10b 161-201
+net/crates/net/bindings/python/src/lib.rs
+  s_a772df20f47a78::t_8fa292e3e13701 3248
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a772df20f47a78::t_073e2ab783686a 1210-1246
+net/crates/net/bindings/python/python/net/__init__.py
+  s_a772df20f47a78::t_7f45d7ae21d002 869,883
+net/crates/net/bindings/python/src/enrollment.rs
+  s_a772df20f47a78::t_efb3700512cf97 32,36-38,44,47-54
+  s_a772df20f47a78::t_fce286ee289698 469-558
+  s_a772df20f47a78::t_754fb7fd21b61c 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5512f67bab5c33b2c95a74175a203c1ea7d5ab20",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

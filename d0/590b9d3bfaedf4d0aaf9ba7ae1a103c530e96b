@@ -1,0 +1,56 @@
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_cdbc9688784d9a::t_82a0d9d881aae3 364
+  s_cdbc9688784d9a::t_388c6f3215c0ae 272-273
+  s_cdbc9688784d9a::t_b7005d191d412b 145-149
+  s_cdbc9688784d9a::t_9f48fdd4d0cb5d 285-296
+  s_cdbc9688784d9a::t_5ffadd24cc1775 23-25
+  s_cdbc9688784d9a::t_c0a7a85e843da5 78,82-83,85-87,89-90
+  s_cdbc9688784d9a::t_bc9cfd5c624ad7 156,164-166,168
+  s_cdbc9688784d9a::t_70160596c019d0 217-221,365
+  s_cdbc9688784d9a::t_6160baa2dcec0e 297-299
+  s_cdbc9688784d9a::t_90272cf28732cd 366-368
+  s_cdbc9688784d9a::t_bc1f7ab1e108e1 300-306,370-374
+net/crates/net/adapters/mcp/src/wrap/catalog.rs
+  s_cdbc9688784d9a::t_9143f65c0b1632 131-132,138-141,148-149,151-158,180,191-204
+  s_cdbc9688784d9a::t_c99e497563b029 14-19,37-45,49
+  s_cdbc9688784d9a::t_abd7b2a1cff3f5 78-80
+  s_cdbc9688784d9a::t_dbb6d79deb69e3 164-168
+  s_cdbc9688784d9a::t_5cd8ceda949371 255-260,268,283,295,300-327
+  s_cdbc9688784d9a::t_e22c269eeaca09 328
+net/crates/net/adapters/mcp/tests/wrap_end_to_end.rs
+  s_cdbc9688784d9a::t_863c3fd5f77190 310,317,327,331,338-342
+  s_cdbc9688784d9a::t_afc6a7c900df32 160-168,170-173
+  s_cdbc9688784d9a::t_a8a5c1115d82d9 226-230
+  s_cdbc9688784d9a::t_d6aaec547193b1 124,132-134,136-137
+  s_cdbc9688784d9a::t_27a31a064526c9 236,243-247,249
+  s_cdbc9688784d9a::t_9bc914f5832fbd 1-2,4-8,15,20
+  s_cdbc9688784d9a::t_ef64908b499e7c 287,289,293-295,297-298
+  s_cdbc9688784d9a::t_d5e507548a029c 278-282
+  s_cdbc9688784d9a::t_dc23818557b7cc 182,187-189,191,194,196,199
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_cdbc9688784d9a::t_e9e2abd2bd5817 1-6,10-17,20-24,37
+net/crates/net/cli/src/commands/wrap.rs
+  s_cdbc9688784d9a::t_bb13fe6ce68671 178-180,191-192,201-206,208,210,214,230,233-252
+  s_cdbc9688784d9a::t_fe914a0d482a8d 6-10
+  s_cdbc9688784d9a::t_f16dff79871078 22
+  s_cdbc9688784d9a::t_866cc6a553541a 144-146
+  s_cdbc9688784d9a::t_53cf9323901d6c 147
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_cdbc9688784d9a::t_15bb558e05b1b8 1-3,5-23,30-32,34-36,43,52,79,95-429,431,437-438,448-449,452-453,470-472,475,482-495,510-517,547-563,568-569,616-635,685-737
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d0590b9d3bfaedf4d0aaf9ba7ae1a103c530e96b",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

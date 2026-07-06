@@ -1,0 +1,41 @@
+net/crates/net/adapters/mcp/src/forward/aead.rs
+  s_759aaad81078ca::t_6aaba7b655187a 145-146,177-179,340-343,365-368
+net/crates/net/adapters/mcp/src/forward/context.rs
+  s_759aaad81078ca::t_4a5793e72a1043 354-357,391-394,417-420,441,445,453,467,475-476
+net/crates/net/adapters/mcp/src/forward/header.rs
+  s_759aaad81078ca::t_495efe5e363749 144-158,223-227,296-299,315-320,354-357,371-375
+net/crates/net/adapters/mcp/src/forward/keychain.rs
+  s_759aaad81078ca::t_7fd1c32d5f19b8 69-75
+net/crates/net/adapters/mcp/src/forward/keys.rs
+  s_759aaad81078ca::t_89b47fb1a42742 81-82
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_640018d811b6cd 84-85,91-93
+net/crates/net/adapters/mcp/src/forward/policy.rs
+  s_759aaad81078ca::t_3b0694306ab78a 621-623,718-721,764-767,823-826
+net/crates/net/adapters/mcp/src/forward/seal.rs
+  s_759aaad81078ca::t_f404f599f10883 302-305
+net/crates/net/adapters/mcp/src/forward/secret.rs
+  s_759aaad81078ca::t_b76f5ca8551cd7 106-107,234-241,248-249,279-282
+net/crates/net/adapters/mcp/src/forward/store.rs
+  s_759aaad81078ca::t_766bf5d5dced53 96-98,277,655-662,673-679,784-785
+net/crates/net/adapters/mcp/src/forward/target.rs
+  s_759aaad81078ca::t_65c918dd23c36d 105-108,124-125
+net/crates/net/cli/src/commands/forwarding.rs
+  s_759aaad81078ca::t_b4b581d2f806ec 261-267,285-288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "854a5ab3c036cf1be5fe46bb50417e0af3504368",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+net/crates/net/integrations/hermes/tests/test_plugin.py
+  s_a772df20f47a78::t_5c6cd34064e525 41
+  s_a772df20f47a78::t_805825f21a48d7 21,27-30
+net/crates/net/integrations/hermes/tools.py
+  s_a772df20f47a78::t_bee65d16db990f 359-389
+  s_a772df20f47a78::t_89d0d8eae9df15 257-358,390-419,427-429
+  s_a772df20f47a78::t_a21cb0c030427c 1
+  s_a772df20f47a78::t_6d12823d3cc107 20,25-28
+  s_a772df20f47a78::t_d52ed254134d68 29
+net/crates/net/sdk/src/operator.rs
+  s_a772df20f47a78::t_cc54dd3dbf4432 384
+net/crates/net/bindings/python/tests/test_enrollment.py
+  s_a772df20f47a78::t_cc54dd3dbf4432 25,107,174
+net/crates/net/integrations/hermes/node.py
+  s_a772df20f47a78::t_acec45824fc426 278-283,285-286,293-316,318-330,340-341,343-345,348,350-351,354,356-360,362
+  s_a772df20f47a78::t_9198a67ccdf047 60-70
+  s_a772df20f47a78::t_d9e8b5df87c40b 284,287-292,317,331-339,342
+  s_a772df20f47a78::t_f5ac0eb7eae12f 56-59,71
+  s_a772df20f47a78::t_75b061d550d65f 122-128
+net/crates/net/integrations/hermes/pins.py
+  s_a772df20f47a78::t_a21cb0c030427c 33
+net/crates/net/sdk/src/mesh_enroll.rs
+  s_a772df20f47a78::t_cc54dd3dbf4432 272,338
+net/crates/net/integrations/hermes/plugin.yaml
+  s_a772df20f47a78::t_91bd18516cc721 3,12-14
+net/crates/net/integrations/hermes/tests/test_mesh_admin.py
+  s_a772df20f47a78::t_a08cdebbf320d6 1-60,62-103,108-115,142-160,162-176
+  s_a772df20f47a78::t_0ace1f94acddf2 104-107
+  s_a772df20f47a78::t_cc54dd3dbf4432 61,161
+  s_a772df20f47a78::t_24ebbf0f2239ae 116-141
+net/crates/net/integrations/hermes/__init__.py
+  s_a772df20f47a78::t_a21cb0c030427c 6,44,66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e4ed5ad1434b0cff2de2c60c1cb24af22e5f3af",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

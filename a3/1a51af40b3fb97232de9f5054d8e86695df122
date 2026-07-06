@@ -1,0 +1,27 @@
+net/crates/net/adapters/mcp/tests/helper_golden_vectors.rs
+  s_cdbc9688784d9a::t_68392020546a7c 1-165
+net/crates/net/bindings/python/tests/test_mcp_helper_golden_vectors.py
+  s_cdbc9688784d9a::t_e5c60e1e53ebc4 1-77
+net/crates/net/bindings/node/test/mcp_helper_golden_vectors.test.ts
+  s_cdbc9688784d9a::t_9ab4f001f6d0d9 1-105
+net/crates/net/tests/cross_lang_mcp/helper_vectors.json
+  s_cdbc9688784d9a::t_7c5b37d707942f 1-144
+go/mcp_helper_golden_vectors_test.go
+  s_cdbc9688784d9a::t_6d2b7fbfb78c1c 1-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a31a51af40b3fb97232de9f5054d8e86695df122",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+go/mcp.go
+  s_1539b6b2705f81::t_fc4aeb421716db 344-345
+  s_1539b6b2705f81::t_b35f25e261cf6e 360-361
+  s_1539b6b2705f81::t_037f4f25567e49 267-272,274
+  s_1539b6b2705f81::t_056458678f22ad 396-397
+  s_1539b6b2705f81::t_bb8d25c989c088 68
+  s_1539b6b2705f81::t_e7acd005e480f0 291-293,295-296
+  s_1539b6b2705f81::t_f8cea5e41280b3 305-306
+go/mcp_test.go
+  s_1539b6b2705f81::t_c8656c0913ee08 235-277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c5759f7b4acde28e2ffe9f74cc0d55192059f5ac",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

@@ -1,0 +1,50 @@
+.claude/skills/net-payments/gotchas.md
+  s_21112e90de5ad5::t_56902ab4bfe03a 1-135
+.claude/skills/net-payments/billing.md
+  s_21112e90de5ad5::t_eae7f76edc112c 1-104
+.claude/skills/net-payments/SKILL.md
+  s_21112e90de5ad5::t_47b951b3377b51 1-136
+.claude/skills/net-payments/testing.md
+  s_21112e90de5ad5::t_9f1bcd6aeb224f 1-138
+.claude/skills/net-payments/networks.md
+  s_21112e90de5ad5::t_dc3b7022812570 1-120
+.claude/skills/net-payments/bindings.md
+  s_21112e90de5ad5::t_a1e1bb102168b8 1-108
+.claude/skills/net-payments/signer.md
+  s_21112e90de5ad5::t_9c0270f9353ba7 1-110
+.claude/skills/net-payments/http402.md
+  s_21112e90de5ad5::t_4c1c5e9899edde 25-27
+  s_21112e90de5ad5::t_ce5fb7be371a0d 1-24,28-73
+.claude/skills/net-payments/caller.md
+  s_21112e90de5ad5::t_02d2ad9922dee3 1-142
+.claude/skills/net-payments/object-model.md
+  s_21112e90de5ad5::t_28465eee5402e0 1-262
+.claude/skills/net-payments/concepts.md
+  s_21112e90de5ad5::t_f9652561530730 1-217
+.claude/skills/net-payments/facilitator.md
+  s_21112e90de5ad5::t_7b6fcca20db1a6 1-153
+.claude/skills/net-payments/verification.md
+  s_21112e90de5ad5::t_d6d474b8118957 1-142
+.claude/skills/net-payments/x402.md
+  s_21112e90de5ad5::t_348e6b9691e4f0 1-185
+.claude/skills/net-payments/provider.md
+  s_21112e90de5ad5::t_2254749a1306bc 1-197
+.claude/skills/net-payments/spend-policy.md
+  s_21112e90de5ad5::t_fab462965ebb5a 1-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "55f3bde03c486dc4e01de206da4d1d4a3ac3d7b9",
+  "prompts": {},
+  "sessions": {
+    "s_21112e90de5ad5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc0dc5c7-8947-4b58-8406-5adf37d71584",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

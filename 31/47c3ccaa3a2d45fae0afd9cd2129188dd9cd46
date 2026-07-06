@@ -1,0 +1,23 @@
+.github/workflows/release-net-cli.yml
+  s_759aaad81078ca::t_2d093c80852a4e 50-54
+.github/workflows/release-crates.yml
+  s_759aaad81078ca::t_c00a6fc1daecd0 3-4,6-11
+  s_759aaad81078ca::t_f35538e9331152 31
+  s_759aaad81078ca::t_1de5a5827722b6 95-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3147c3ccaa3a2d45fae0afd9cd2129188dd9cd46",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

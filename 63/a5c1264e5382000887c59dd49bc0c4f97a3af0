@@ -1,0 +1,95 @@
+net/crates/net/payments/tests/flow_end_to_end.rs
+  s_928ee85c6ffc0a::t_3cc8ca36d115c4 23
+  s_928ee85c6ffc0a::t_d9f8d2234dfc30 116,138,180
+net/crates/net/adapters/mcp/src/serve/payment.rs
+  s_928ee85c6ffc0a::t_3e2e4783340665 24-40,45-49
+  s_928ee85c6ffc0a::t_8943f2c24a4418 80-97
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_928ee85c6ffc0a::t_1db0df9bb18412 1-3,5-10,13,17,30-32,49-71,73-74
+  s_928ee85c6ffc0a::t_28cb9d8263d7d2 72
+net/crates/net/adapters/mcp/src/serve/mod.rs
+  s_928ee85c6ffc0a::t_8e27fb65eb5629 52-54
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_db9c12dc8814c5 215-218
+  s_928ee85c6ffc0a::t_540aa32195169a 388
+net/crates/net/payments/tests/lifecycle_modes.rs
+  s_928ee85c6ffc0a::t_07c5e49d652b56 635-729
+  s_928ee85c6ffc0a::t_bd8a2e445ff8a4 18-19
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_928ee85c6ffc0a::t_89f888ccddf1d8 239
+  s_928ee85c6ffc0a::t_217b69a76da724 201-202,207-210,212
+  s_928ee85c6ffc0a::t_367a8bb7d43712 400,404-407,419-424
+  s_928ee85c6ffc0a::t_3439a2c71f712c 332
+  s_928ee85c6ffc0a::t_c49507b252dea5 457
+  s_928ee85c6ffc0a::t_e645eefd8eeac8 474-475
+  s_928ee85c6ffc0a::t_ff3eb5b4f7737a 314
+  s_928ee85c6ffc0a::t_90523c450e1b9b 341
+  s_928ee85c6ffc0a::t_f680342e414818 26
+  s_928ee85c6ffc0a::t_a41cf6a2806aca 141,151-156,186
+  s_928ee85c6ffc0a::t_eb6938aab8d0b4 387,401,429,483,504
+  s_928ee85c6ffc0a::t_3333dd3aa2c5d8 274,294,306
+  s_928ee85c6ffc0a::t_ea0ffe363e8ef2 234
+  s_928ee85c6ffc0a::t_411b6bb63f2cba 206,211
+  s_928ee85c6ffc0a::t_c2c257e89d3386 485-488
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_928ee85c6ffc0a::t_efca5085d43a19 773
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_928ee85c6ffc0a::t_0523b5ad538672 165-170,176
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_928ee85c6ffc0a::t_1fa7a353d255ae 325
+  s_928ee85c6ffc0a::t_c46be88188361b 53-58
+  s_928ee85c6ffc0a::t_250964cfb7ae86 157-164
+  s_928ee85c6ffc0a::t_a48b771c42cd33 203-217
+  s_928ee85c6ffc0a::t_570a6cf3da5dc4 312
+  s_928ee85c6ffc0a::t_07757e9cd2b670 179-180
+  s_928ee85c6ffc0a::t_3f78c6230cbdd7 272-305
+net/crates/net/payments/src/engine/mod.rs
+  s_928ee85c6ffc0a::t_3ffffc1f4945c2 143-152
+  s_928ee85c6ffc0a::t_a0bb06fdf9944d 181-186
+  s_928ee85c6ffc0a::t_4a86faf3caa123 714-772
+  s_928ee85c6ffc0a::t_b2fc792ae9208b 349
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_928ee85c6ffc0a::t_0ba25791526df1 18,25
+  s_928ee85c6ffc0a::t_fc821254fe1d76 43-45,49,66,69,71-81
+  s_928ee85c6ffc0a::t_14fb7963bbefb6 156
+  s_928ee85c6ffc0a::t_69872fa5ff40e1 113
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_928ee85c6ffc0a::t_5e6c321b3d14dd 565-567
+  s_928ee85c6ffc0a::t_05798acde1cae2 173-175
+  s_928ee85c6ffc0a::t_7542424b759eaa 478-482
+  s_928ee85c6ffc0a::t_89c243b544a40f 405-412
+  s_928ee85c6ffc0a::t_8825fa8fa354cc 213
+  s_928ee85c6ffc0a::t_aba9eff89753d8 654-658
+  s_928ee85c6ffc0a::t_f9d77ac41f910e 238
+  s_928ee85c6ffc0a::t_9c1c98a39e2c1e 511
+  s_928ee85c6ffc0a::t_4774eed79e2010 79-89
+  s_928ee85c6ffc0a::t_5f87a494fab892 200-205
+  s_928ee85c6ffc0a::t_d611a20504e327 208-212,214-223
+  s_928ee85c6ffc0a::t_c41ce766649f83 206-207
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_928ee85c6ffc0a::t_e6591cd1018687 258
+  s_928ee85c6ffc0a::t_12c82fa1684999 190-195
+  s_928ee85c6ffc0a::t_98f1714b16e435 48
+  s_928ee85c6ffc0a::t_746280c2e3d6ae 204,211-214,222
+  s_928ee85c6ffc0a::t_ea753ae65edfcc 367,370-378
+  s_928ee85c6ffc0a::t_763c8ff1dd29f8 414-417
+  s_928ee85c6ffc0a::t_97a7cba3fd6ab0 541,548-561,570,581
+net/crates/net/payments/tests/mesh_payments_e2e.rs
+  s_928ee85c6ffc0a::t_2d988495d3027b 122,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "63a5c1264e5382000887c59dd49bc0c4f97a3af0",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

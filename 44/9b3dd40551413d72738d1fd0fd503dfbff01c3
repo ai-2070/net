@@ -1,0 +1,29 @@
+net/crates/net/payments/src/x402/payment_required.rs
+  s_928ee85c6ffc0a::t_1214e0a7086234 1-100
+net/crates/net/payments/src/x402/mod.rs
+  s_928ee85c6ffc0a::t_bbe22feab070e9 17
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_bcbe0f64e06651 38-39
+net/crates/net/payments/tests/http402_outbound.rs
+  s_928ee85c6ffc0a::t_e4776a3868ba40 195-204
+  s_928ee85c6ffc0a::t_559d7f1ca82dfd 1-194,205-253
+net/crates/net/payments/src/flow/http402.rs
+  s_928ee85c6ffc0a::t_83742a8a2e7918 1-202,204-335
+  s_928ee85c6ffc0a::t_d51d652601385e 203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "449b3dd40551413d72738d1fd0fd503dfbff01c3",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

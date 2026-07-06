@@ -1,0 +1,33 @@
+net/crates/net/adapters/mcp/src/forward/policy.rs
+  s_759aaad81078ca::t_a1d982253956e6 689-775
+  s_759aaad81078ca::t_4000d5b45b844e 340-345,353-354,356
+  s_759aaad81078ca::t_fc9631f5759f89 59-68,79-167
+  s_759aaad81078ca::t_b61bbe98e56c88 168
+  s_759aaad81078ca::t_54e3c81d01dbc6 355
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_d1cfb1986eb233 91
+net/crates/net/cli/src/commands/forwarding.rs
+  s_759aaad81078ca::t_9f936f93409373 204
+net/crates/net/adapters/mcp/src/forward/store.rs
+  s_759aaad81078ca::t_efda280758b967 95-100,115-132
+  s_759aaad81078ca::t_9ea338a73b69d4 33-35
+  s_759aaad81078ca::t_c2a28c570ef33c 320-333,347-349,352
+  s_759aaad81078ca::t_0bf856182961c3 133-135
+  s_759aaad81078ca::t_911e11c428bd7e 136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "08164b0dbcf6a099f417edc34e1a0d6dde017cb7",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

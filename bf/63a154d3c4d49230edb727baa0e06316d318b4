@@ -1,0 +1,30 @@
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_4c4a3e9bc66137 66-67
+  s_759aaad81078ca::t_0f3cdbccc47c06 42-44
+  s_759aaad81078ca::t_a9df15a3227f44 85-86
+net/crates/net/adapters/mcp/src/forward/keychain.rs
+  s_759aaad81078ca::t_b0f6ac37c412c9 1-184
+.github/workflows/ci.yml
+  s_759aaad81078ca::t_cc7577c0093c21 1449-1459
+net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md
+  s_759aaad81078ca::t_f0463c64f8f950 119-120
+net/crates/net/adapters/mcp/Cargo.toml
+  s_759aaad81078ca::t_90b92753b3934f 59-68
+  s_759aaad81078ca::t_e9b576a1ca536c 22-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bf63a154d3c4d49230edb727baa0e06316d318b4",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

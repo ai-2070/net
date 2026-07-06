@@ -1,0 +1,26 @@
+net/crates/net/tools/hermes-gate/README.md
+  s_4b449b0a181874::t_d1a9ec96961c76 1-36
+net/crates/net/tools/hermes-gate/daemon.toml
+  s_4b449b0a181874::t_ac85b495a48c62 1-6
+net/crates/net/tools/hermes-gate/probe_client.py
+  s_4b449b0a181874::t_3d0161f598c23e 1-66
+net/crates/net/tools/hermes-gate/probe_hermes_register.py
+  s_4b449b0a181874::t_f067ae987c75b0 1-64,67-68,71,75-91
+  s_4b449b0a181874::t_479ce96e582272 65-66,69-70,72-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6617e878dfd2722050df0ffaff68cc2af0a43a69",
+  "prompts": {},
+  "sessions": {
+    "s_4b449b0a181874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f19c588e-03dd-49aa-bfa8-acdee181ed34",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

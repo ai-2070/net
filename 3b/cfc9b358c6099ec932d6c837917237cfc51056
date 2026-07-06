@@ -1,0 +1,28 @@
+net/crates/net/sdk/src/delegation.rs
+  s_1539b6b2705f81::t_5d7b6b65b0eb09 1-47,49-53,57-432
+  s_1539b6b2705f81::t_922f59c54216e2 48,54-56
+net/crates/net/sdk/Cargo.toml
+  s_1539b6b2705f81::t_6720bc1ecf0a07 59-64
+  s_1539b6b2705f81::t_ec843f65a10a88 118
+net/crates/net/sdk/src/lib.rs
+  s_1539b6b2705f81::t_80f16332cf22ba 120-126
+  s_1539b6b2705f81::t_7a526480db0062 214-220
+net/crates/net/Cargo.lock
+  s_1539b6b2705f81::t_f611f16174e453 2658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3bcfc9b358c6099ec932d6c837917237cfc51056",
+  "prompts": {},
+  "sessions": {
+    "s_1539b6b2705f81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b477ef12-3bfb-49f4-aa9f-561b7ee1f4a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
