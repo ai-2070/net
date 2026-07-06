@@ -64,6 +64,27 @@ pub enum InvalidationReason {
     Expired,
     /// The payload was already consumed against another quote.
     Replay,
+    /// The delivered amount no longer matches the quoted amount.
+    AmountMismatch,
+    /// The facilitator withdrew validity for a reason outside the named
+    /// vocabulary (the reason string travels in the event's `extra`).
+    Rejected,
+}
+
+impl InvalidationReason {
+    /// Map an x402 facilitator `invalidReason` string into the fixed
+    /// vocabulary. Unknown reasons collapse to [`Self::Rejected`] — the
+    /// enum stays a closed protocol vocabulary; the verbatim string is
+    /// preserved separately by the caller.
+    pub fn from_facilitator_reason(reason: &str) -> Self {
+        match reason {
+            r if r.contains("reorg") => Self::Reorg,
+            "expired_requirements" => Self::Expired,
+            "payload_replayed" => Self::Replay,
+            "wrong_amount" => Self::AmountMismatch,
+            _ => Self::Rejected,
+        }
+    }
 }
 
 /// Verification exceptions: outcomes that are neither pass nor fail and

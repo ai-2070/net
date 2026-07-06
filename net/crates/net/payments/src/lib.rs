@@ -30,19 +30,27 @@
 //!   registry, idempotency, canonicalization, versioning.
 //! - [`facilitator`] — the verify/settle client interface, the mock
 //!   facilitator (P0), and the real-facilitator client (P1).
-//! - [`policy`] — the payment policy store (pins pattern) + spend engine.
+//! - [`engine`] — the provider-side lifecycle engine: quote issuance
+//!   under provider policy, verify/settle orchestration, the consumed-
+//!   payload replay index, idempotent completion, signed verification
+//!   chains with reorg freeze, billing emission.
+//! - [`policy`] — the locked payment state store (pins pattern) + spend
+//!   policy engine.
 //!
 //! Pinned x402 revision for P0 fixtures: `specs/x402-specification-v2.md`
 //! at x402-foundation/x402 commit `087922a5eecc06ea773636b75df205814ba295b5`
 //! (2026-05-29). Fixtures are version-pinned per supported spec revision
 //! (`tests/cross_lang_payments/fixtures/x402/v2.0/...`), never "latest".
 
+pub mod billing;
 pub mod core;
+pub mod engine;
 pub mod facilitator;
 pub mod policy;
 pub mod x402;
 
 pub use crate::core::billing_event::BillingEvent;
+pub use crate::engine::{PaymentDecision, PaymentEngine};
 pub use crate::core::quote::PaymentQuote;
 pub use crate::core::terms::PricingTerms;
 pub use crate::core::units::AtomicAmount;

@@ -32,6 +32,12 @@ pub struct BillingEvent {
     pub idempotency_key: String,
     /// Capability id in display form.
     pub capability: String,
+    /// The invocation this charge paid for, when the integration layer
+    /// binds one (WS4's payment gate does; engine-level tests may not).
+    /// Additive: omitted when absent, so pre-existing signatures and
+    /// golden vectors are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     /// The quote this charge satisfies.
     pub quote_id: String,
     /// Settlement transaction id.
@@ -113,6 +119,7 @@ mod tests {
             billing_event_id: BillingEvent::derive_id(idem_key),
             idempotency_key: idem_key.to_string(),
             capability: "prov/fixture-tool".into(),
+            invocation_id: None,
             quote_id: "q1".into(),
             transaction: Some("0xabc".into()),
             verification_ref: None,

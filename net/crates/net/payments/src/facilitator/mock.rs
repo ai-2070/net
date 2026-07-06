@@ -56,7 +56,6 @@ pub enum MockMode {
 #[derive(Default)]
 struct QuoteState {
     verify_calls: u32,
-    settled: bool,
 }
 
 /// The mock facilitator. Cheap to construct per test; `Send + Sync`.
@@ -64,6 +63,10 @@ pub struct MockFacilitator {
     default_mode: MockMode,
     modes: Mutex<HashMap<String, MockMode>>,
     state: Mutex<HashMap<String, QuoteState>>,
+    /// Settled payments, keyed by **payload** content hash — the payment
+    /// is the payload, not the requirements: two quotes for the same
+    /// static-priced tool legitimately share requirements bytes.
+    settled: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MockFacilitator {
@@ -72,6 +75,7 @@ impl MockFacilitator {
             default_mode: MockMode::Success,
             modes: Mutex::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
+            settled: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -212,14 +216,12 @@ impl Facilitator for MockFacilitator {
         let mode = self.mode_for(&key);
 
         {
-            let mut state = self.state.lock();
-            let entry = state.entry(key.clone()).or_default();
-            if entry.settled && mode != MockMode::Replay {
+            let mut settled = self.settled.lock();
+            if !settled.insert(payload.content_hash()) && mode != MockMode::Replay {
                 // A facilitator-side second settle of the same payment is
                 // the replay class regardless of the armed mode.
                 return Err(FacilitatorError::rejected("payment already settled"));
             }
-            entry.settled = true;
         }
 
         let amount = &requirements.view().amount;

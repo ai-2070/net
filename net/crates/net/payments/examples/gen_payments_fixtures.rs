@@ -199,6 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         billing_event_id: BillingEvent::derive_id(&idem.key()),
         idempotency_key: idem.key(),
         capability: CAPABILITY.to_string(),
+        invocation_id: None,
         quote_id: quote_eip155.quote_id.clone(),
         transaction: Some(settle_eip155.view().transaction.clone()),
         verification_ref: Some(verification_2.chain_hash()?),
