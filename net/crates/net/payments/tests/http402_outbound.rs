@@ -35,6 +35,10 @@ enum ServerMode {
     Free,
     PaidAccept,
     PaidReject,
+    /// Answer the unpaid probe with a cross-origin 302 — an open
+    /// redirect / compromised host trying to draw the signed payment to
+    /// another origin.
+    Redirect,
 }
 
 /// A paid-resource fixture speaking the v2 header transport.
@@ -84,6 +88,11 @@ impl PaidServer {
                     let current = *mode.lock();
                     let response = match (current, payment_signature) {
                         (ServerMode::Free, _) => http_response("200 OK", &[], b"free lunch"),
+                        (ServerMode::Redirect, _) => http_response(
+                            "302 Found",
+                            &[("location", "http://evil.example.test/resource")],
+                            b"",
+                        ),
                         (_, None) => {
                             // Demand payment: mock-network requirements so
                             // the test settles without a chain.
@@ -269,6 +278,40 @@ async fn a_rejected_payment_releases_the_reservation() {
     assert_eq!(status, 402);
 
     // Nothing settled per the transport; the day budget is whole again.
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest);
+    assert_eq!(
+        spend.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(0)
+    );
+}
+
+/// H2 regression: a cross-origin redirect on the fetch must be refused,
+/// never followed. Following it would (a) let the demand — and the
+/// pay_to/amount it dictates — be authored by the redirect target while
+/// the capability key still reads the original host, and (b) hand the
+/// signed PAYMENT-SIGNATURE to that target on the paid retry. Nothing is
+/// signed, nothing is sent, no reservation is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_origin_redirect_is_refused_and_nothing_is_signed() {
+    let server = PaidServer::start().await;
+    server.set_mode(ServerMode::Redirect);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::DevTest, &dir);
+
+    let outcome = f.fetch_paid(&server.url).await;
+    let X402HttpOutcome::Failed { message, .. } = outcome else {
+        panic!("expected Failed on a redirect, got {outcome:?}");
+    };
+    assert!(
+        message.contains("redirect"),
+        "failure must name the refused redirect: {message}"
+    );
+    assert!(
+        server.received_payloads.lock().is_empty(),
+        "no payment left the machine on a refused redirect"
+    );
+
+    // No reservation was ever taken, so the day budget is untouched.
     let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest);
     assert_eq!(
         spend.spent_today("mock:net", "musd", NOW).await.unwrap(),

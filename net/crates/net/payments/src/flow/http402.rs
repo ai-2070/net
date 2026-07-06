@@ -99,6 +99,11 @@ impl X402HttpFlow {
     ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // Never follow redirects: both the unpaid probe and the paid
+            // retry carry (or are about to carry) a signed EIP-3009
+            // authorization — a bearer instrument. Following a 3xx would
+            // hand it to an origin we never scoped spend policy against.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         Ok(Self {
@@ -144,14 +149,52 @@ impl X402HttpFlow {
                 }
             }
         };
-        if response.status().as_u16() != 402 {
-            let status = response.status().as_u16();
+        let status = response.status().as_u16();
+        // A redirect is refused, not followed: the client is built with
+        // `Policy::none()`, so a 3xx lands here as a real response. Treat
+        // it as a hard failure — a moved paid resource must be re-fetched
+        // explicitly at its true origin, never chased while a payment is
+        // in flight to a host we scoped policy against.
+        if (300..400).contains(&status) {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>");
+            return X402HttpOutcome::Failed {
+                message: format!(
+                    "refusing to follow a {status} redirect to `{location}` on a paid fetch"
+                ),
+                retryable: false,
+            };
+        }
+        if status != 402 {
             let body = response
                 .bytes()
                 .await
                 .map(|b| b.to_vec())
                 .unwrap_or_default();
             return X402HttpOutcome::Ok { status, body };
+        }
+
+        // The 402 demand must originate from the host we intend to pay.
+        // With redirects disabled this holds by construction, but re-check
+        // so the capability key (`x402-http/<host>`) and the signed retry
+        // can never be scoped to one origin while the demand — and the
+        // pay_to/amount it dictates — was authored by another.
+        let intended_host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned));
+        let demand_host = response.url().host_str().map(str::to_owned);
+        if intended_host.is_some() && intended_host != demand_host {
+            return X402HttpOutcome::Failed {
+                message: format!(
+                    "402 demand origin `{}` does not match the intended host `{}`",
+                    demand_host.as_deref().unwrap_or("<none>"),
+                    intended_host.as_deref().unwrap_or("<none>"),
+                ),
+                retryable: false,
+            };
         }
 
         // -- [2] the demand, from the PAYMENT-REQUIRED header.
