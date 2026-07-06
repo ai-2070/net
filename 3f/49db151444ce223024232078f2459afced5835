@@ -1,0 +1,27 @@
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_1bad7aafbbe7ba 116-119
+net/crates/net/sdk/src/a2a.rs
+  s_a772df20f47a78::t_3facbb784a698f 295-304,306-307
+  s_a772df20f47a78::t_316d9d08a8652c 1-207,213-294,305,308-354,356-536
+  s_a772df20f47a78::t_7931fd4b9c0405 208-212
+  s_a772df20f47a78::t_5125629f25aa55 355
+net/crates/net/sdk/src/lib.rs
+  s_a772df20f47a78::t_f25bd62ab9b910 161-166
+  s_a772df20f47a78::t_5c4b566b61855a 273-277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3f49db151444ce223024232078f2459afced5835",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
