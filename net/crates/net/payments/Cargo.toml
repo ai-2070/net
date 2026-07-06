@@ -62,6 +62,10 @@ async-trait = "0.1"
 # Workspace lock discipline (clippy disallowed-methods bans
 # std::sync::Mutex::lock — poisoning is unhandled everywhere here).
 parking_lot = "0.12"
+# HTTP client for the real-facilitator boundary (`http-facilitator`).
+# rustls, no default features: no openssl, no cookies, no proxies from
+# env — the money path gets exactly the transport it needs.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
 tracing = "0.1"
 
 [features]
@@ -76,6 +80,11 @@ mcp-gate = ["dep:net-mcp"]
 # machines). Off by default — pulls the SDK's mesh transport + typed
 # nRPC surface.
 mesh = ["net-sdk/net", "net-sdk/cortex"]
+# The real-facilitator HTTP client (P1): `HttpFacilitator` speaking
+# `POST /verify`, `POST /settle`, `GET /supported` per the pinned x402
+# v2 spec. The first (and only) HTTP dependency in the money path —
+# rustls only, feature-gated so mock-only consumers never build it.
+http-facilitator = ["dep:reqwest"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
