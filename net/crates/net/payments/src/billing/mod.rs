@@ -187,21 +187,30 @@ impl BillingLog {
 mod tests {
     use super::*;
     use crate::core::canonical::{ExtraFields, SignedEnvelope as _};
+    use crate::core::idempotency::IdempotencyScope;
     use crate::core::units::AtomicAmount;
     use crate::core::versioning::TAG_BILLING_EVENT;
     use net::adapter::net::identity::EntityKeypair;
 
-    fn signed_event(kp: &EntityKeypair, idem: &str) -> BillingEvent {
+    fn signed_event(kp: &EntityKeypair, quote_id: &str) -> BillingEvent {
+        let payer = EntityKeypair::from_bytes([9u8; 32]).entity_id().clone();
+        let scope = IdempotencyScope {
+            caller: payer.clone(),
+            provider: kp.entity_id().clone(),
+            capability: "prov/tool".into(),
+            quote_id: quote_id.to_string(),
+        };
+        let idem = scope.key();
         let mut ev = BillingEvent {
             object: TAG_BILLING_EVENT.to_string(),
-            billing_event_id: BillingEvent::derive_id(idem),
-            idempotency_key: idem.to_string(),
+            billing_event_id: BillingEvent::derive_id(&idem),
+            idempotency_key: idem,
             capability: "prov/tool".into(),
             invocation_id: None,
-            quote_id: "q1".into(),
+            quote_id: quote_id.to_string(),
             transaction: Some("0xabc".into()),
             verification_ref: None,
-            payer: EntityKeypair::generate().entity_id().clone(),
+            payer,
             payee: kp.entity_id().clone(),
             network: "mock:net".into(),
             asset: "musd".into(),
@@ -221,7 +230,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = BillingLog::new(dir.path().join("b.jsonl"));
         let kp = EntityKeypair::generate();
-        let ev = signed_event(&kp, "k1");
+        let ev = signed_event(&kp, "q1");
 
         log.append(&ev).await.unwrap();
         log.append(&ev).await.unwrap();

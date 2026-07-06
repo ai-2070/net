@@ -15,6 +15,7 @@ use net::adapter::net::identity::EntityId;
 use serde::{Deserialize, Serialize};
 
 use super::canonical::{EnvelopeError, ExtraFields, SignatureHex, SignedEnvelope};
+use super::idempotency::IdempotencyScope;
 use super::units::AtomicAmount;
 use super::versioning::{ensure_tag, TAG_BILLING_EVENT};
 
@@ -89,6 +90,26 @@ impl BillingEvent {
                 "billing_event_id does not derive from the idempotency key".into(),
             ));
         }
+        // Bind the idempotency key to the event's OWN scope. Without this,
+        // billing_event_id == derive_id(idempotency_key) is pure
+        // self-consistency: a signed event for one quote could carry the
+        // idempotency key of a different {caller, provider, capability,
+        // quote} scope and a store that dedups on billing_event_id would
+        // silently collide two distinct charges. Recompute the scope key
+        // from the event's own coordinates and require a match.
+        let scope = IdempotencyScope {
+            caller: ev.payer.clone(),
+            provider: ev.payee.clone(),
+            capability: ev.capability.clone(),
+            quote_id: ev.quote_id.clone(),
+        };
+        if ev.idempotency_key != scope.key() {
+            return Err(EnvelopeError::Field(
+                "idempotency_key does not derive from the event's own \
+                 {payer, payee, capability, quote} scope"
+                    .into(),
+            ));
+        }
         ev.verify_signature()?;
         Ok(ev)
     }
@@ -113,17 +134,29 @@ mod tests {
     use crate::core::canonical::canonical_bytes;
     use net::adapter::net::identity::EntityKeypair;
 
-    fn event(kp: &EntityKeypair, idem_key: &str) -> BillingEvent {
+    /// A signed event whose idempotency key derives from its own
+    /// {payer, payee, capability, quote} scope — the shape the engine
+    /// actually emits, so `from_json_bytes` accepts it.
+    fn event(kp: &EntityKeypair, quote_id: &str) -> BillingEvent {
+        // Deterministic payer so the same quote yields a stable key.
+        let payer = EntityKeypair::from_bytes([9u8; 32]).entity_id().clone();
+        let scope = IdempotencyScope {
+            caller: payer.clone(),
+            provider: kp.entity_id().clone(),
+            capability: "prov/fixture-tool".into(),
+            quote_id: quote_id.to_string(),
+        };
+        let idem = scope.key();
         let mut ev = BillingEvent {
             object: TAG_BILLING_EVENT.to_string(),
-            billing_event_id: BillingEvent::derive_id(idem_key),
-            idempotency_key: idem_key.to_string(),
+            billing_event_id: BillingEvent::derive_id(&idem),
+            idempotency_key: idem,
             capability: "prov/fixture-tool".into(),
             invocation_id: None,
-            quote_id: "q1".into(),
+            quote_id: quote_id.to_string(),
             transaction: Some("0xabc".into()),
             verification_ref: None,
-            payer: EntityKeypair::generate().entity_id().clone(),
+            payer,
             payee: kp.entity_id().clone(),
             network: "mock:net".into(),
             asset: "musd".into(),
@@ -137,22 +170,22 @@ mod tests {
     }
 
     #[test]
-    fn same_idempotency_key_same_event_id() {
+    fn same_scope_same_event_id() {
         let kp = EntityKeypair::generate();
         assert_eq!(
-            event(&kp, "k1").billing_event_id,
-            event(&kp, "k1").billing_event_id
+            event(&kp, "q1").billing_event_id,
+            event(&kp, "q1").billing_event_id
         );
         assert_ne!(
-            event(&kp, "k1").billing_event_id,
-            event(&kp, "k2").billing_event_id
+            event(&kp, "q1").billing_event_id,
+            event(&kp, "q2").billing_event_id
         );
     }
 
     #[test]
     fn round_trips_and_rejects_forged_ids() {
         let kp = EntityKeypair::generate();
-        let ev = event(&kp, "k1");
+        let ev = event(&kp, "q1");
         let bytes = canonical_bytes(&ev).unwrap();
         let back = BillingEvent::from_json_bytes(&bytes).unwrap();
         assert_eq!(back.amount, ev.amount);
@@ -162,5 +195,33 @@ mod tests {
         forged.sign_with(&kp).unwrap();
         let bytes = canonical_bytes(&forged).unwrap();
         assert!(BillingEvent::from_json_bytes(&bytes).is_err());
+    }
+
+    /// M8: an event whose idempotency key (and matching event id) belong
+    /// to a *different* scope is self-consistent but foreign-scoped, and
+    /// must be rejected on decode — otherwise a store deduping on
+    /// billing_event_id could silently collide two distinct charges.
+    #[test]
+    fn an_idempotency_key_from_a_foreign_scope_is_rejected() {
+        let kp = EntityKeypair::generate();
+        let mut ev = event(&kp, "q1");
+        // Borrow quote q2's key while the event is still for q1.
+        let foreign = IdempotencyScope {
+            caller: ev.payer.clone(),
+            provider: ev.payee.clone(),
+            capability: ev.capability.clone(),
+            quote_id: "q2".into(),
+        };
+        ev.idempotency_key = foreign.key();
+        ev.billing_event_id = BillingEvent::derive_id(&ev.idempotency_key);
+        ev.sign_with(&kp).unwrap();
+        let bytes = canonical_bytes(&ev).unwrap();
+
+        // Passes tag + id-derivation, but the scope binding catches it.
+        let err = BillingEvent::from_json_bytes(&bytes).unwrap_err();
+        assert!(
+            format!("{err}").contains("scope"),
+            "error should name the scope mismatch: {err}"
+        );
     }
 }
