@@ -147,6 +147,12 @@ pub mod operator;
 // transport-independent and rides `net` alone).
 #[cfg(all(feature = "net", feature = "cortex"))]
 pub mod mesh_enroll;
+// Live agent-to-agent task handoff over the mesh (Hermes V2 Phase 3 Slice B) —
+// `mesh.serve_a2a` (executor) + `mesh.submit_task`/`task_status`/`cancel_task`
+// (requester) via direct-addressed nRPC. Needs `cortex` for the nRPC surface,
+// like `mesh_enroll`; the `a2a` task core above is transport-independent (`net`).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub mod mesh_a2a;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -266,6 +272,11 @@ pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegis
 // Operator-surface convenience re-exports (V2 Phase 1).
 #[cfg(all(feature = "net", feature = "cortex"))]
 pub use crate::mesh_enroll::{JoinFlowError, ENROLLMENT_SERVICE};
+// Live A2A task-handoff convenience re-exports (V2 Phase 3 Slice B).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub use crate::mesh_a2a::{
+    A2aFlowError, A2A_CANCEL_SERVICE, A2A_STATUS_SERVICE, A2A_TASK_SERVICE,
+};
 #[cfg(feature = "net")]
 pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]
