@@ -87,6 +87,19 @@ pub enum WrapError {
         /// How many tools the config prices.
         count: usize,
     },
+    /// One or more `pricing` keys did not match any discovered tool name.
+    /// Rejected before anything serves — an unmatched key (a typo, a
+    /// since-renamed tool, or the sanitized channel id used instead of the
+    /// tool's own name) means the tool it was meant to price would publish
+    /// for free, silently.
+    #[error(
+        "pricing keys matched no discovered tool: {keys:?} — price a tool by its \
+         wrapped name (not its sanitized channel id), and check for typos/renames"
+    )]
+    PricingKeyUnmatched {
+        /// The pricing keys that matched no discovered tool.
+        keys: Vec<String>,
+    },
     /// A publish/refresh step failed AND the rollback re-announce that would
     /// restore a consistent mesh state also failed — the node may be left
     /// advertising tools with no live handler. Both errors are surfaced so the
@@ -432,6 +445,27 @@ impl ServerPublisher {
             pricing: config.pricing.clone(),
         };
         let (lowered, skipped) = discover_and_lower(&client, &ctx).await?;
+
+        // Every pricing key must have matched a discovered+lowered tool.
+        // `lower_tool` looks pricing up by the tool's wrapped name and the
+        // publish-time guard only checks "pricing non-empty => a gate
+        // exists" — nothing catches a key that matched no tool. Left
+        // unchecked, such a key is silently ignored and the tool it was
+        // meant to price lowers free (`pricing_terms=None`) and serves to
+        // every caller. Fail closed before anything announces or serves.
+        if !config.pricing.is_empty() {
+            let priced: std::collections::BTreeSet<&str> =
+                lowered.iter().map(|lt| lt.mcp_name.as_str()).collect();
+            let unmatched: Vec<String> = config
+                .pricing
+                .keys()
+                .filter(|k| !priced.contains(k.as_str()))
+                .cloned()
+                .collect();
+            if !unmatched.is_empty() {
+                return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
+            }
+        }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
