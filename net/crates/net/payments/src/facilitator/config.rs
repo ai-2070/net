@@ -77,6 +77,14 @@ pub struct FacilitatorConfig {
     /// Absent = `observed` (receipt-trust; pick deliberately).
     #[serde(default)]
     pub required_tier: BTreeMap<String, VerificationTier>,
+    /// Confirmation depth at which the chain checker reports `final`, per
+    /// CAIP-2 network. Absent = the checker's default. **Pick per network
+    /// posture**: on an OP-stack L2 (Base) a dozen L2 blocks is not
+    /// L1-backed finality — L2 blocks stay reversible until their batch
+    /// finalizes on L1 — so an L2 network wants an L1-finalization-scale
+    /// depth here, not the L1 default.
+    #[serde(default)]
+    pub final_depth: BTreeMap<String, u64>,
 }
 
 impl FacilitatorConfig {
@@ -121,6 +129,12 @@ impl FacilitatorConfig {
             .get(network)
             .copied()
             .unwrap_or(VerificationTier::Observed)
+    }
+
+    /// The configured `final` confirmation depth for a network, if any.
+    /// `None` leaves the checker's default in place.
+    pub fn final_depth(&self, network: &str) -> Option<u64> {
+        self.final_depth.get(network).copied()
     }
 
     /// The CAIP-2 networks this config enables.
@@ -169,6 +183,7 @@ mod tests {
                 "eip155:84532".to_string(),
                 VerificationTier::Confirmed(1),
             )]),
+            final_depth: BTreeMap::new(),
         }
     }
 

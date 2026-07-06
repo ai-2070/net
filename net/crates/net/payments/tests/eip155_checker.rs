@@ -337,3 +337,35 @@ async fn a_chain_id_mismatch_is_a_terminal_error() {
         ChainVerdict::Included { .. }
     ));
 }
+
+/// M10 regression: the checker's `final` depth comes from the config pack
+/// per network, not a hardcoded 12. Built via `from_config` with a
+/// configured final_depth of 100, a settlement 50 blocks deep is
+/// `Confirmed(50)` — where the old hardcoded 12 would have wrongly called
+/// it `Final`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_depth_comes_from_the_config_pack() {
+    let rpc = RpcFixture::start().await;
+    // 50 confirmations: block 95 (0x5f), head 144.
+    rpc.set_receipt(json!({ "status": "0x1", "blockNumber": "0x5f", "logs": [] }));
+    rpc.set_head(144);
+
+    let mut config = net_payments::facilitator::packs::x402_org_base_sepolia();
+    config
+        .rpc_endpoints
+        .insert("eip155:84532".to_string(), rpc.endpoint.clone());
+    config
+        .final_depth
+        .insert("eip155:84532".to_string(), 100);
+
+    let checker =
+        Eip155Checker::from_config(&config, "eip155:84532").expect("checker from config");
+    assert_eq!(
+        checker.check("eip155:84532", TX, None).await.expect("check"),
+        ChainVerdict::Included {
+            tier: VerificationTier::Confirmed(50),
+            delivered: None
+        },
+        "50 < configured final_depth 100 → Confirmed, not Final"
+    );
+}

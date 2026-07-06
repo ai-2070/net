@@ -46,6 +46,13 @@ pub const RPC_BASE_SEPOLIA: &str = "https://sepolia.base.org";
 /// Public Base mainnet JSON-RPC, for the independent chain checker.
 pub const RPC_BASE: &str = "https://mainnet.base.org";
 
+/// `final`-tier confirmation depth for Base (an OP-stack L2). A dozen L2
+/// blocks (~24s) is *not* L1-backed finality — L2 blocks stay reversible
+/// until their batch finalizes on L1 (minutes). ~1800 L2 blocks (≈1h at
+/// 2s/block) is a conservative L1-finalization posture; operators tune it
+/// per deployment. Chosen deliberately over the checker's L1-scale default.
+pub const FINAL_DEPTH_BASE: u64 = 1800;
+
 /// Rung 1 — Base Sepolia via the x402.org facilitator: open auth, test
 /// USDC, and the full production *posture* (serve at `confirmed(1)`, so
 /// a conformance run exercises the checker path, not just receipt
@@ -67,6 +74,7 @@ pub fn x402_org_base_sepolia() -> FacilitatorConfig {
             NETWORK_BASE_SEPOLIA.to_string(),
             VerificationTier::Confirmed(1),
         )]),
+        final_depth: BTreeMap::from([(NETWORK_BASE_SEPOLIA.to_string(), FINAL_DEPTH_BASE)]),
     }
 }
 
@@ -90,6 +98,7 @@ pub fn cdp_base_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
         }],
         rpc_endpoints: BTreeMap::from([(NETWORK_BASE.to_string(), RPC_BASE.to_string())]),
         required_tier: BTreeMap::from([(NETWORK_BASE.to_string(), VerificationTier::Confirmed(1))]),
+        final_depth: BTreeMap::from([(NETWORK_BASE.to_string(), FINAL_DEPTH_BASE)]),
     }
 }
 
@@ -115,6 +124,7 @@ pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
         }],
         rpc_endpoints: BTreeMap::new(),
         required_tier: BTreeMap::new(),
+        final_depth: BTreeMap::new(),
     }
 }
 
@@ -200,12 +210,19 @@ mod tests {
         );
         assert!(sepolia.rpc_endpoints.contains_key(NETWORK_BASE_SEPOLIA));
 
+        // L2 packs carry a per-network final_depth well above the L1 default.
+        assert_eq!(
+            sepolia.final_depth(NETWORK_BASE_SEPOLIA),
+            Some(FINAL_DEPTH_BASE)
+        );
+
         let base = cdp_base_mainnet("k");
         assert_eq!(
             base.required_tier(NETWORK_BASE),
             VerificationTier::Confirmed(1)
         );
         assert!(base.rpc_endpoints.contains_key(NETWORK_BASE));
+        assert_eq!(base.final_depth(NETWORK_BASE), Some(FINAL_DEPTH_BASE));
 
         let solana = cdp_solana_mainnet("k");
         assert_eq!(

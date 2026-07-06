@@ -71,6 +71,27 @@ impl Eip155Checker {
         self
     }
 
+    /// Build a checker for `network` straight from a facilitator config
+    /// pack: RPC endpoint and (crucially) the network's configured
+    /// `final_depth`, so an L2's L1-finalization posture actually reaches
+    /// the checker instead of the L1-scale default. Errors if the pack
+    /// enables no RPC endpoint for `network`.
+    pub fn from_config(
+        config: &crate::facilitator::config::FacilitatorConfig,
+        network: &str,
+    ) -> Result<Self, CheckerError> {
+        let rpc = config.rpc_endpoints.get(network).ok_or_else(|| {
+            CheckerError::terminal(format!(
+                "facilitator config has no rpc endpoint for `{network}` — cannot check it"
+            ))
+        })?;
+        let mut checker = Self::new(network, rpc)?;
+        if let Some(depth) = config.final_depth(network) {
+            checker = checker.with_final_depth(depth);
+        }
+        Ok(checker)
+    }
+
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, CheckerError> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let response = self
