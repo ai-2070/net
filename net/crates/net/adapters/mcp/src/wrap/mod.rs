@@ -37,9 +37,10 @@ pub use delegation::{
     DelegationSigner, HDR_DELEGATION, HDR_DELEGATION_SIG,
 };
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
-pub use invoke::{OwnerScope, WrapInvokeHandler, ERR_DELEGATION};
+pub use invoke::{OwnerScope, ToolInvoker, WrapInvokeHandler, ERR_DELEGATION};
 pub use session::{
-    build_capability_set, PublicationHandle, RefreshDelta, ServerPublisher, WrapConfig, WrapError,
+    build_capability_set, LocalPublicationHandle, PublicationHandle, RefreshDelta, ServerPublisher,
+    WrapConfig, WrapError,
 };
 pub use stdio::StdioMcpClient;
 

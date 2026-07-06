@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use super::delegation::{DelegationGate, HDR_DELEGATION, HDR_DELEGATION_SIG};
 use super::stdio::StdioMcpClient;
+use super::McpError;
 use crate::spec::CallToolResult;
 
 /// Application error code (nRPC `RpcStatus::Application`) for a caller that
@@ -133,11 +134,49 @@ pub fn encode_result(result: &CallToolResult) -> Result<Vec<u8>, String> {
     serde_json::to_vec(result).map_err(|e| format!("encode tool result: {e}"))
 }
 
-/// Serves one wrapped MCP tool over nRPC. Install with
-/// `Mesh::serve_rpc(tool_id, Arc::new(handler))`.
+/// The invoke seam a served tool actually calls when a mesh request arrives.
+///
+/// [`WrapInvokeHandler`] is generic over this so the *same*
+/// announce/describe/owner-scope/delegation path backs two producers that
+/// differ in exactly one step:
+///
+/// - `net wrap` — a wrapped stdio MCP server ([`StdioMcpClient`], the blanket
+///   impl below): the mesh call becomes a `tools/call` on the child process.
+/// - a native node publishing its **own** in-process toolset
+///   ([`ServerPublisher::publish_tools`](super::session::ServerPublisher::publish_tools)):
+///   the mesh call is dispatched to a local (e.g. callback-backed) invoker.
+///
+/// `name` is the tool's original name ([`super::descriptor::LoweredTool::mcp_name`])
+/// and `arguments` the caller's decoded JSON object. The result contract
+/// mirrors [`StdioMcpClient::call_tool`]: an `Ok` [`CallToolResult`] with
+/// `is_error == true` is a **tool-level** failure the tool reported in-band
+/// (surfaced as `ERR_TOOL`), while an `Err(McpError)` is a transport/protocol
+/// failure (`ERR_UPSTREAM`) — the two are kept apart so a caller can tell
+/// "the tool refused" from "the tool was unreachable".
+#[async_trait::async_trait]
+pub trait ToolInvoker: Send + Sync {
+    /// Invoke `name` with `arguments`, returning the tool's structured result.
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult, McpError>;
+}
+
+/// `net wrap`'s invoker: dispatch to the wrapped stdio MCP server's
+/// `tools/call`. The behavior `publish_server` has always used, now expressed
+/// through the shared seam so `publish_tools` can substitute a different one.
+#[async_trait::async_trait]
+impl ToolInvoker for StdioMcpClient {
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult, McpError> {
+        // Fully-qualified to call the inherent method (no trait recursion).
+        StdioMcpClient::call_tool(self, name, arguments).await
+    }
+}
+
+/// Serves one bridged tool over nRPC. Install with
+/// `Mesh::serve_rpc(tool_id, Arc::new(handler))`. Backed by any
+/// [`ToolInvoker`] — a wrapped MCP server or a node's own local tools.
 pub struct WrapInvokeHandler {
-    client: Arc<StdioMcpClient>,
-    /// The wrapped tool's MCP name — what `tools/call` is issued against.
+    invoker: Arc<dyn ToolInvoker>,
+    /// The tool's original name — what [`ToolInvoker::call_tool`] is issued
+    /// against.
     tool: String,
     /// The nRPC service name this handler is served under (the channel-safe
     /// `tool_id`) — what the caller invokes and signs the delegation challenge
@@ -151,13 +190,14 @@ pub struct WrapInvokeHandler {
 }
 
 impl WrapInvokeHandler {
-    /// Build a handler that invokes `tool` on `client`, admitting only
+    /// Build a handler that invokes `tool` on `invoker`, admitting only
     /// callers in `scope`. No delegation gate — use [`Self::with_delegation`]
-    /// to add one.
-    pub fn new(client: Arc<StdioMcpClient>, tool: impl Into<String>, scope: OwnerScope) -> Self {
+    /// to add one. `invoker` is any [`ToolInvoker`]; an `Arc<StdioMcpClient>`
+    /// coerces here directly (the `net wrap` path).
+    pub fn new(invoker: Arc<dyn ToolInvoker>, tool: impl Into<String>, scope: OwnerScope) -> Self {
         let tool = tool.into();
         Self {
-            client,
+            invoker,
             service: tool.clone(),
             tool,
             scope,
@@ -250,7 +290,7 @@ impl RpcHandler for WrapInvokeHandler {
         //     result is ERR_TOOL — kept distinct so the caller can tell
         //     "unreachable" from "the tool refused".
         let result = self
-            .client
+            .invoker
             .call_tool(&self.tool, arguments)
             .await
             .map_err(|e| RpcHandlerError::Application {
