@@ -1,0 +1,29 @@
+net/crates/net/integrations/hermes/__init__.py
+  s_a772df20f47a78::t_a8dd37fabf1ebc 48-56,62-69
+  s_a772df20f47a78::t_85572c365bdad1 26,29-31,35
+  s_a772df20f47a78::t_76d75699553311 94-102,108-111
+net/crates/net/integrations/hermes/federate.py
+  s_a772df20f47a78::t_7599ec01afa27b 51-56
+  s_a772df20f47a78::t_dcb4508d0669d5 1-50,57-313
+net/crates/net/integrations/hermes/tests/test_federate.py
+  s_a772df20f47a78::t_937c89041eee8c 1-227
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_ea8fb9fbc7348f 95-96
+  s_a772df20f47a78::t_02fa74dff26a61 88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dc87e7d474dda69056db100f453f242150fa2317",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

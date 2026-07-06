@@ -1,0 +1,41 @@
+net/crates/net/bindings/python/src/publish.rs
+  s_a772df20f47a78::t_535013b90569b9 1-222
+net/crates/net/bindings/python/Cargo.toml
+  s_a772df20f47a78::t_d9559e3883d89f 48
+  s_a772df20f47a78::t_348514947cc2c9 149-156
+net/crates/net/bindings/python/python/net/__init__.py
+  s_a772df20f47a78::t_457722cf529989 893-903
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a772df20f47a78::t_f68b2a0f4cfdfb 658-662
+  s_a772df20f47a78::t_6368b4f335445e 710-730
+  s_a772df20f47a78::t_b8726b75234f62 1347-1370
+  s_a772df20f47a78::t_c0341e3f469849 247
+net/crates/net/bindings/python/tests/test_publish.py
+  s_a772df20f47a78::t_a8f5a933a8c88e 72-76,87-93
+  s_a772df20f47a78::t_dec849f1cfaa31 111-112
+  s_a772df20f47a78::t_6e6493491173d8 1-71,77-78,80-86,94-110,113-148
+  s_a772df20f47a78::t_95b270cf0a261e 79
+net/crates/net/bindings/python/src/lib.rs
+  s_a772df20f47a78::t_b8245219fbc373 3312-3316
+  s_a772df20f47a78::t_d5f9273ff65567 55-60
+  s_a772df20f47a78::t_1c8055421ef932 1534-1567
+  s_a772df20f47a78::t_222a33e378bbc4 1382-1389
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_d0995fc180b14a 95-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6ba7ed3ce6908313c4fbe3618d2aa06283168457",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
