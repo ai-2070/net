@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/tests/test_a2a.py
+  s_a772df20f47a78::t_1dd8496b5a2bb7 1-156
+net/crates/net/bindings/python/Cargo.toml
+  s_a772df20f47a78::t_e6dd40b16a351e 158-164
+  s_a772df20f47a78::t_7428618f1d12aa 49
+net/crates/net/bindings/python/python/net/__init__.py
+  s_a772df20f47a78::t_7528df3e341ca9 904-914
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a772df20f47a78::t_1c80c6274ae0d7 731-761
+  s_a772df20f47a78::t_1c4c5e1b8dc25d 1402-1412
+net/crates/net/bindings/python/src/lib.rs
+  s_a772df20f47a78::t_b49a3b434e24f7 61-66
+  s_a772df20f47a78::t_1eefde68ef9b32 3398-3402
+  s_a772df20f47a78::t_d03d89b4e23258 1574-1648
+net/crates/net/bindings/python/src/a2a.rs
+  s_a772df20f47a78::t_878a7fccb408d1 1-186
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_8f4185fb1f426a 118-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ec5580edd3942a1de9b68c96759ce978578cdd4d",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
