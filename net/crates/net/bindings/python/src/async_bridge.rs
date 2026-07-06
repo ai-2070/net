@@ -222,10 +222,19 @@ pub fn dispatch_handler_coro(
     // when the returned future is dropped or completes.
     let cf_future_owned: Py<PyAny> = cf_future.clone().unbind();
 
+    // Arm the guard NOW, not inside the async block: the coroutine is already
+    // running (run_coroutine_threadsafe submitted it above), but an async
+    // block's body — and a guard constructed there — only exists once the
+    // future is first polled. A caller that drops the returned future without
+    // ever polling it (e.g. a `select!` whose cancel branch wins first) must
+    // still cancel the dispatched coroutine, or it runs to completion as a
+    // zombie. Moving the armed guard into the block ties its Drop to the
+    // future object itself, polled or not.
+    let mut guard = CoroCancelGuard {
+        cf_future: Some(cf_future_owned),
+    };
+
     Ok(async move {
-        let mut guard = CoroCancelGuard {
-            cf_future: Some(cf_future_owned),
-        };
         let result = rx.await.map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "async handler dispatcher channel closed before result",

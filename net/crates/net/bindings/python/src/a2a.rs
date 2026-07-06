@@ -49,11 +49,15 @@ impl TaskExecutor for PyTaskExecutor {
         })
         .map_err(|e| format!("a2a executor: calling the task handler failed: {e}"))?;
 
-        // Cancellation: if the token trips, this branch wins and `fut` drops —
-        // dispatch_handler_coro's guard cancels the Python coroutine. The
-        // registry records `Cancelled` regardless of what we return here.
+        // Cancellation: if the token trips, the cancel branch wins and `fut`
+        // drops — dispatch_handler_coro's guard is armed at dispatch (not at
+        // first poll), so dropping `fut` cancels the Python coroutine even if
+        // the token was already tripped before this select ever polled it.
+        // `biased` polls `fut` first so a result that's already in beats a
+        // simultaneous cancel. The registry records `Cancelled` regardless of
+        // what we return here.
         tokio::select! {
-            _ = cancel.cancelled() => Err("cancelled".to_string()),
+            biased;
             r = fut => match r {
                 Ok(obj) => Python::attach(|py| {
                     obj.bind(py)
@@ -62,6 +66,7 @@ impl TaskExecutor for PyTaskExecutor {
                 }),
                 Err(e) => Err(format!("a2a task handler raised: {e}")),
             },
+            _ = cancel.cancelled() => Err("cancelled".to_string()),
         }
     }
 }

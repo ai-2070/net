@@ -122,6 +122,49 @@ def test_a2a_submit_run_and_cancel_over_the_wire():
                 pass
 
 
+def test_a2a_immediate_cancel_leaves_no_zombie_coroutine():
+    """Cancel racing the dispatch itself (the guard-armed-at-dispatch window):
+    a cancel accepted right after submit must actually stop the handler — the
+    coroutine either never runs or is cancelled, never runs to completion as a
+    zombie behind a reported ``cancelled`` state."""
+    executor = _mesh_unstarted()
+    requester = _mesh_unstarted()
+
+    completed = []
+
+    async def run_task(task_id, prompt, context_refs, tags):
+        await asyncio.sleep(1.0)
+        completed.append(task_id)  # a zombie would reach this after the cancel
+        return "blob://zombie"
+
+    handle = None
+    try:
+        _handshake(requester, executor)
+        executor.start()
+        requester.start()
+        handle = executor.serve_a2a(run_task)
+        exec_id = executor.node_id
+
+        task_id = _submit_retry(requester, exec_id, "job to kill instantly", [])
+        # No wait for "running": cancel as close to the dispatch as the wire
+        # allows, so the token can trip before the executor's select ever polls.
+        assert requester.cancel_task(exec_id, task_id) is True
+        _wait_state(requester, exec_id, task_id, "cancelled")
+
+        # Past the handler's natural completion point: a zombie would have
+        # appended by now.
+        time.sleep(1.5)
+        assert completed == [], "cancelled task's coroutine ran to completion"
+    finally:
+        if handle is not None:
+            handle.stop()
+        for m in (requester, executor):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def test_a2a_task_completes_with_an_artifact_ref():
     executor = _mesh_unstarted()
     requester = _mesh_unstarted()
