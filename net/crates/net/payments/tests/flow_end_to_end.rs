@@ -488,3 +488,44 @@ async fn a_quote_that_deviates_from_announced_terms_is_refused() {
         "{policy_reason}"
     );
 }
+
+/// LOW (caller-side provenance): terms announced under one provider but
+/// answered by a quote from a different provider must be refused — the
+/// quote's provider must match the announced terms provider.
+#[tokio::test]
+async fn a_quote_whose_provider_differs_from_the_announced_terms_is_denied() {
+    // Announce settleable mock terms, but under a stranger's identity —
+    // not the world engine's provider that will actually issue the quote.
+    let stranger = EntityKeypair::generate();
+    let registry = default_mock_registry(stranger.entity_id().clone());
+    let template = X402Carry::author(&PaymentRequirements {
+        scheme: MOCK_SCHEME.into(),
+        network: MOCK_NETWORK.into(),
+        amount: "2500".into(),
+        asset: "musd".into(),
+        pay_to: "mock-provider-settle-addr".into(),
+        max_timeout_seconds: 60,
+        extra: None,
+    })
+    .expect("author template");
+    let terms = PricingTerms::new(
+        stranger.entity_id().clone(),
+        CAPABILITY,
+        vec![template],
+        registry.reference().expect("registry ref"),
+    );
+    let terms_json = String::from_utf8(
+        net_payments::core::canonical::canonical_bytes(&terms).expect("terms canonicalize"),
+    )
+    .expect("utf8");
+
+    let w = world(SpendProfile::DevTest);
+    let decision = w.flow.run(CAPABILITY, &terms_json).await;
+    let CallerDecision::Denied { policy_reason } = decision else {
+        panic!("expected Denied on a provider mismatch, got {decision:?}");
+    };
+    assert!(
+        policy_reason.contains("provider"),
+        "denial should name the provider mismatch: {policy_reason}"
+    );
+}

@@ -197,6 +197,17 @@ impl X402HttpFlow {
             };
         }
 
+        // The paid retry carries the signed PAYMENT-SIGNATURE (a bearer
+        // instrument): refuse to author payment for a cleartext http URL to
+        // a remote host. http to loopback stays allowed for local testing.
+        if !is_payment_safe_url(url) {
+            return X402HttpOutcome::Denied {
+                policy_reason: format!(
+                    "refusing to send a signed payment over cleartext to `{url}` — use https"
+                ),
+            };
+        }
+
         // -- [2] the demand, from the PAYMENT-REQUIRED header.
         let Some(required_b64) = response
             .headers()
@@ -414,6 +425,26 @@ impl X402HttpFlow {
     }
 }
 
+/// Whether a signed payment may be sent to `url`: https anywhere, or http
+/// only to a loopback host (local/self-hosted testing). Anything else
+/// would put the PAYMENT-SIGNATURE bearer instrument on the wire in the
+/// clear.
+fn is_payment_safe_url(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) if u.scheme() == "https" => true,
+        Ok(u) if u.scheme() == "http" => {
+            let host = u.host_str().unwrap_or_default();
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost"
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// The host segment of a URL, for the per-host capability key.
 fn host_of(url: &str) -> String {
     url.split("://")
@@ -423,4 +454,20 @@ fn host_of(url: &str) -> String {
         .next()
         .unwrap_or("unknown-host")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_payment_safe_url;
+
+    #[test]
+    fn payment_requires_https_except_loopback() {
+        assert!(is_payment_safe_url("https://api.example.com/x"));
+        assert!(is_payment_safe_url("http://127.0.0.1:8080/x"));
+        assert!(is_payment_safe_url("http://[::1]/x"));
+        assert!(is_payment_safe_url("http://localhost/x"));
+        // Cleartext to a remote host, or a non-web scheme: refused.
+        assert!(!is_payment_safe_url("http://api.example.com/x"));
+        assert!(!is_payment_safe_url("ftp://api.example.com/x"));
+    }
 }

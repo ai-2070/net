@@ -25,6 +25,7 @@ use std::sync::Arc;
 use net::adapter::net::identity::{EntityId, EntityKeypair};
 use serde::{Deserialize, Serialize};
 
+use crate::core::billing_event::BillingEvent;
 use crate::core::quote::PaymentQuote;
 use crate::core::registry::AssetRegistry;
 use crate::core::terms::PricingTerms;
@@ -415,6 +416,12 @@ impl CallerPaymentFlow {
                 policy_reason: "quote binds a different capability".to_string(),
             };
         }
+        if quote.provider != terms.provider {
+            return CallerDecision::Denied {
+                policy_reason: "quote provider does not match the announced terms provider"
+                    .to_string(),
+            };
+        }
         if quote.requirements.bytes() != template.bytes() {
             return CallerDecision::Denied {
                 policy_reason: "quote deviates from the announced terms — never pay more \
@@ -482,6 +489,38 @@ impl CallerPaymentFlow {
                 if let Some(held_id) = redeeming_approval {
                     let _ = self.spend.clear_approval(&held_id).await;
                 }
+                // Verify the provider-supplied billing event before recording
+                // it as dispute/audit evidence: from_json_bytes checks tag +
+                // id-derivation + scope + signature, and we additionally
+                // require it to bind THIS quote, caller, and provider. The
+                // payment already served (money moved), so a bad evidence blob
+                // is not a fund loss — but it must not be recorded as
+                // trustworthy: drop it from the proof and warn.
+                let verified_billing = match BillingEvent::from_json_bytes(billing_event.as_bytes())
+                {
+                    Ok(ev)
+                        if ev.quote_id == quote.quote_id
+                            && ev.payer == *self.caller.entity_id()
+                            && ev.payee == quote.provider =>
+                    {
+                        serde_json::Value::String(billing_event)
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            quote = %quote.quote_id,
+                            "provider billing event does not bind this quote/caller/provider — dropped from proof"
+                        );
+                        serde_json::Value::Null
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            quote = %quote.quote_id,
+                            error = %e,
+                            "provider billing event failed verification — dropped from proof"
+                        );
+                        serde_json::Value::Null
+                    }
+                };
                 // Sign the invocation binding: the provider's gate can
                 // then require that the invoker IS the payer. A public-
                 // only caller identity degrades to bearer mode.
@@ -500,7 +539,7 @@ impl CallerPaymentFlow {
                     proof: serde_json::json!({
                         "quote_id": quote.quote_id,
                         "transaction": transaction,
-                        "billing_event": billing_event,
+                        "billing_event": verified_billing,
                     }),
                 }
             }
@@ -681,12 +720,22 @@ pub fn exact_evm_authorization_for_quote(
         format!("0x{}", hex::encode(hasher.finalize().as_bytes()))
     };
     let requirements = quote.requirements.view();
+    let valid_after = (quote.issued_at_ns / 1_000_000_000).saturating_sub(60);
+    // `validBefore` derives from the provider/server-controlled quote
+    // expiry. Clamp the authorization lifetime so an abusively long expiry
+    // cannot mint a long-lived single-use bearer authorization. A normal
+    // quote (seconds to minutes) is well under the cap and unaffected; the
+    // deterministic nonce already makes the authorization single-use
+    // on-chain, so this is defense in depth on the time dimension.
+    const MAX_AUTH_LIFETIME_SECS: u64 = 3600;
+    let valid_before = (quote.expires_at_ns / 1_000_000_000)
+        .min(valid_after.saturating_add(MAX_AUTH_LIFETIME_SECS));
     crate::x402::schemes::exact_evm::ExactEvmAuthorization {
         from: from.to_string(),
         to: requirements.pay_to.clone(),
         value: requirements.amount.clone(),
-        valid_after: (quote.issued_at_ns / 1_000_000_000).saturating_sub(60),
-        valid_before: quote.expires_at_ns / 1_000_000_000,
+        valid_after,
+        valid_before,
         nonce,
     }
 }
