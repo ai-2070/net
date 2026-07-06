@@ -925,6 +925,9 @@ impl EnrollmentAuthority {
 pub struct DeviceEnrollment {
     device: Identity,
     chain: DelegationChain,
+    /// The operator's rendezvous locator (from the original invite), persisted
+    /// so the device can dial back to **renew** after a restart.
+    rendezvous: String,
     enrolled_at: u64,
 }
 
@@ -956,16 +959,27 @@ struct DeviceEnrollmentFile {
     device_seed: String,
     /// The `root → device` chain bytes, lowercase hex.
     chain: String,
+    /// The operator's rendezvous locator (for renewal). Defaulted for
+    /// forward-compat with enrollments written before renewal existed.
+    #[serde(default)]
+    rendezvous: String,
     enrolled_at: u64,
 }
 
 impl DeviceEnrollment {
     /// Bundle a freshly-joined `device` (whose key it holds) with the
-    /// `root → device` `chain` it received. `enrolled_at` is unix-seconds.
-    pub fn new(device: Identity, chain: DelegationChain, enrolled_at: u64) -> Self {
+    /// `root → device` `chain` it received and the operator's `rendezvous`
+    /// locator (from the invite, for renewal). `enrolled_at` is unix-seconds.
+    pub fn new(
+        device: Identity,
+        chain: DelegationChain,
+        rendezvous: impl Into<String>,
+        enrolled_at: u64,
+    ) -> Self {
         Self {
             device,
             chain,
+            rendezvous: rendezvous.into(),
             enrolled_at,
         }
     }
@@ -978,6 +992,11 @@ impl DeviceEnrollment {
     /// The `root → device` delegation chain.
     pub fn chain(&self) -> &DelegationChain {
         &self.chain
+    }
+
+    /// The operator's rendezvous locator — where the device dials to renew.
+    pub fn rendezvous(&self) -> &str {
+        &self.rendezvous
     }
 
     /// The mesh root the grant anchors at.
@@ -1028,6 +1047,7 @@ impl DeviceEnrollment {
         let file = DeviceEnrollmentFile {
             device_seed: hex_lower(&self.device.to_bytes()),
             chain: hex_lower(&self.chain.to_bytes()),
+            rendezvous: self.rendezvous.clone(),
             enrolled_at: self.enrolled_at,
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| DeviceEnrollmentError::Io {
@@ -1087,6 +1107,7 @@ impl DeviceEnrollment {
         Ok(Some(Self {
             device,
             chain,
+            rendezvous: file.rendezvous,
             enrolled_at: file.enrolled_at,
         }))
     }
@@ -1524,7 +1545,7 @@ mod tests {
         let enrollment = auth
             .approve(&req, &invite, T0, grant_ttl, DEFAULT_DELEGATION_DEPTH)
             .unwrap();
-        let de = DeviceEnrollment::new(device.clone(), enrollment.chain, now_unix());
+        let de = DeviceEnrollment::new(device.clone(), enrollment.chain, "relay://rv", now_unix());
         (auth, device, de)
     }
 
@@ -1541,6 +1562,7 @@ mod tests {
             .expect("enrollment present");
         assert_eq!(loaded.device().entity_id(), device.entity_id());
         assert_eq!(&loaded.root(), auth.root_id());
+        assert_eq!(loaded.rendezvous(), "relay://rv");
         let reg = RevocationRegistry::new();
         assert!(
             loaded.is_valid(&reg, 0),

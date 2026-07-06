@@ -27,13 +27,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::delegation::DelegationChain;
-use crate::enrollment::{EnrollmentError, InviteToken, JoinError, JoinOutcome, JoinRequest};
+use crate::enrollment::{
+    EnrollmentError, InviteToken, JoinError, JoinOutcome, JoinRequest, RenewalRequest,
+};
 use crate::mesh::Mesh;
 use crate::mesh_rpc::{CallOptionsTyped, Codec, ServeError, ServeHandle};
 use crate::operator::OperatorEnrollment;
 
-/// The nRPC service name the operator serves and the device calls.
+/// The nRPC service name the operator serves and a joining device calls.
 pub const ENROLLMENT_SERVICE: &str = "net.mesh.enroll";
+
+/// The nRPC service name the operator serves and an enrolled device calls to
+/// **renew** its grant before it expires (silent auto-renewal).
+pub const RENEWAL_SERVICE: &str = "net.mesh.renew";
 
 /// How a joining device reaches the operator's node — the transport
 /// coordinates encoded into an invite's `rendezvous` field.
@@ -200,6 +206,64 @@ impl Mesh {
                 Ok::<Vec<u8>, String>(operator.handle_join_request(&req, grant_ttl, max_depth))
             }
         })
+    }
+
+    /// **Operator side.** Serve the renewal service so enrolled devices can
+    /// refresh their grant before it expires (silent auto-renewal). Pair it
+    /// with [`Self::serve_enrollment_auto`] to serve the full device lifecycle;
+    /// hold the returned [`ServeHandle`]. This node must be `start()`ed.
+    pub fn serve_renewal_auto(
+        &self,
+        operator: Arc<OperatorEnrollment>,
+        grant_ttl: Duration,
+        max_depth: u8,
+    ) -> Result<ServeHandle, ServeError> {
+        self.serve_rpc_typed(RENEWAL_SERVICE, Codec::Json, move |req: Vec<u8>| {
+            let operator = operator.clone();
+            async move {
+                Ok::<Vec<u8>, String>(operator.handle_renewal_request(&req, grant_ttl, max_depth))
+            }
+        })
+    }
+
+    /// **Device side.** Renew this node's grant: dial the operator at
+    /// `rendezvous`, present `current_chain` (the device's existing
+    /// `root → device` grant) with a fresh signature, and return the verified
+    /// **fresh** grant. This node must be `start()`ed and its identity must be
+    /// the leaf of `current_chain` (the enrolled device key). A revoked or
+    /// lapsed grant is refused (the returned `JoinOutcome` is a `Rejected`).
+    pub async fn renew(
+        &self,
+        rendezvous: &str,
+        current_chain: &DelegationChain,
+    ) -> Result<DelegationChain, JoinFlowError> {
+        let device = self.identity().cloned().ok_or(JoinFlowError::NoIdentity)?;
+        let rv = Rendezvous::decode(rendezvous)
+            .ok_or_else(|| JoinFlowError::Transport("malformed rendezvous locator".into()))?;
+        // Best-effort attach: a fresh device (renewing after a restart) needs
+        // the handshake, but a device renewing right after joining is already
+        // connected — its `connect_via` would fail as "already connected", which
+        // is fine since `call` routes by node id. A genuine unreachability
+        // surfaces as the `call` error below.
+        let _ = self
+            .connect_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
+            .await;
+        let request = RenewalRequest::create(&device, current_chain);
+        let response: Vec<u8> = self
+            .call_typed(
+                rv.node_id,
+                RENEWAL_SERVICE,
+                &request.to_bytes(),
+                CallOptionsTyped::default(),
+            )
+            .await
+            .map_err(|e| JoinFlowError::Transport(format!("call: {e}")))?;
+        // The renewed grant must anchor at the same root and bind to this
+        // device — the same rogue-operator defense as `join`.
+        let root = current_chain.root();
+        JoinOutcome::from_bytes(&response)
+            .and_then(|outcome| outcome.into_chain(device.entity_id(), &root))
+            .map_err(JoinFlowError::Outcome)
     }
 
     /// **Device side.** Enroll this node into the mesh named by `invite`,
@@ -371,5 +435,71 @@ mod tests {
         // pending for the real device.
         assert!(op.devices().unwrap().is_empty());
         assert_eq!(op.pending_invites(0).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_renews_its_grant_and_a_revoked_one_cannot() {
+        let psk = [0x58u8; 32];
+        let root = Identity::generate();
+        let operator_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .unwrap()
+            .identity(root.clone())
+            .build()
+            .await
+            .unwrap();
+        operator_mesh.start();
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = Arc::new(OperatorEnrollment::new(
+            root.clone(),
+            dir.path().join("devices.json"),
+            dir.path().join("revocations.json"),
+        ));
+        // Serve the full device lifecycle: join + renew.
+        let _enroll = operator_mesh
+            .serve_enrollment_auto(
+                op.clone(),
+                Duration::from_secs(3600),
+                DEFAULT_DELEGATION_DEPTH,
+            )
+            .expect("serve enrollment");
+        let _renew = operator_mesh
+            .serve_renewal_auto(
+                op.clone(),
+                Duration::from_secs(7200),
+                DEFAULT_DELEGATION_DEPTH,
+            )
+            .expect("serve renewal");
+
+        let rendezvous = operator_mesh.rendezvous_string();
+        let invite = op.invite(rendezvous.clone(), Duration::from_secs(300));
+
+        let device = Identity::generate();
+        let device_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .unwrap()
+            .identity(device.clone())
+            .build()
+            .await
+            .unwrap();
+        device_mesh.start();
+
+        // Join, then renew over the wire → a fresh grant, still anchored + bound.
+        let chain = device_mesh
+            .join(&invite.encode(), "pc", vec![])
+            .await
+            .expect("join");
+        let renewed = device_mesh
+            .renew(&rendezvous, &chain)
+            .await
+            .expect("renew a healthy grant");
+        assert_eq!(&renewed.leaf(), device.entity_id());
+        assert_eq!(&renewed.root(), root.entity_id());
+
+        // Revoke the device → renewal is refused (the operator's floor check).
+        op.revoke(device.entity_id()).unwrap();
+        assert!(
+            device_mesh.renew(&rendezvous, &renewed).await.is_err(),
+            "a revoked device must not be able to renew"
+        );
     }
 }
