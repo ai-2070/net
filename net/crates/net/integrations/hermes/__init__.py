@@ -23,14 +23,16 @@ import logging
 import os
 from typing import Optional
 
-from . import delegation, node, pins, provider, renewal
+from . import delegation, federate, node, pins, provider, renewal
 from .tools import TOOLS
 
-# `delegation` / `renewal` / `provider` are imported for package-attribute
-# access (tests, and the node's lazy imports); the node owns their lifecycle.
+# `delegation` / `renewal` / `provider` / `federate` are imported for
+# package-attribute access (tests, and the node's lazy imports); the node owns
+# their lifecycle.
 _ = delegation
 _ = renewal
 _ = provider
+_ = federate
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +45,28 @@ _promotion: Optional["pins.PinPromotionService"] = None
 # hook can withdraw it.
 _provider: Optional["provider.LocalToolProvider"] = None
 
+# The running tool-federation service (V2 Phase 2, consumer side), if started —
+# surfaces discovered mesh capabilities as machine-namespaced first-class tools.
+# Opt-in; held so the session-end hook can stop it.
+_federation: Optional["federate.FederationService"] = None
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _publish_local_tools_enabled() -> bool:
     """Whether to announce this Hermes's OWN local tools to the mesh. Opt-in —
     exposing a machine's toolset to the operator mesh must be deliberate, so it
     is off unless ``NET_MESH_PUBLISH_LOCAL_TOOLS`` is truthy."""
-    return (os.environ.get("NET_MESH_PUBLISH_LOCAL_TOOLS") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return _env_flag("NET_MESH_PUBLISH_LOCAL_TOOLS")
+
+
+def _federate_tools_enabled() -> bool:
+    """Whether to auto-surface discovered mesh capabilities as first-class tools.
+    Opt-in via ``NET_MESH_FEDERATE_TOOLS`` — a federation-heavy mesh can add many
+    tools, so a deployment turns it on deliberately."""
+    return _env_flag("NET_MESH_FEDERATE_TOOLS")
 
 
 def _on_session_start(**_kwargs) -> None:
@@ -78,12 +91,24 @@ def _on_session_start(**_kwargs) -> None:
                 _provider = provider.start_local_tool_provider(node.mesh())
         except Exception as e:  # noqa: BLE001 — a session must not fail on this
             logger.warning("net plugin: local-tool publishing not started: %s", e)
+    # Consumer side (opt-in): auto-surface discovered mesh capabilities as
+    # machine-namespaced first-class tools. Best-effort — a discovery failure
+    # must never break a session; the meta-tools still reach the mesh.
+    if _federation is None and _federate_tools_enabled():
+        try:
+            if node.check_net_available():
+                _federation = federate.start_federation()
+        except Exception as e:  # noqa: BLE001 — a session must not fail on this
+            logger.warning("net plugin: tool federation not started: %s", e)
 
 
 def _on_session_end(**_kwargs) -> None:
     """Best-effort teardown when the session ends. Idempotent; swallows errors
     so session end never fails on cleanup."""
-    global _promotion, _provider
+    global _promotion, _provider, _federation
+    if _federation is not None:
+        _federation.stop()
+        _federation = None
     if _provider is not None:
         _provider.stop()
         _provider = None
