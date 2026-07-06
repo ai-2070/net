@@ -28,7 +28,7 @@ use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayl
 use tokio::sync::RwLock;
 
 use super::descriptor::{
-    compat_tier_key, credential_status_key, invocation_scope_key, schema_hash_key,
+    compat_tier_key, credential_status_key, invocation_scope_key, schema_hash,
     substitutability_key, visibility_key, LoweredTool,
 };
 use super::invoke::{OwnerScope, ERR_BAD_REQUEST, ERR_OWNER_SCOPE, OWNER_SCOPE_REJECTION};
@@ -111,6 +111,10 @@ fn to_bridged_tool_info(lt: &LoweredTool) -> Result<BridgedToolInfo, CatalogErro
         })?),
         None => None,
     };
+    // Computed from the parsed input schema (not read from bridge_metadata,
+    // which no longer carries it — `lower_tool` stays golden-vector-stable).
+    // Before the struct literal moves `input_schema`.
+    let schema_hash_hex = schema_hash(&input_schema);
 
     Ok(BridgedToolInfo {
         tool_id: id.clone(),
@@ -124,7 +128,7 @@ fn to_bridged_tool_info(lt: &LoweredTool) -> Result<BridgedToolInfo, CatalogErro
         substitutability: meta(substitutability_key(id)),
         visibility: meta(visibility_key(id)),
         invocation_scope: meta(invocation_scope_key(id)),
-        schema_hash: meta(schema_hash_key(id)),
+        schema_hash: schema_hash_hex,
     })
 }
 

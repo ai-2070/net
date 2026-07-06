@@ -288,10 +288,13 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
         invocation_scope_key(&tool_id),
         INVOCATION_SCOPE_SAME_ROOT.to_string(),
     );
-    bridge_metadata.insert(
-        schema_hash_key(&tool_id),
-        schema_hash(&tool.input_schema),
-    );
+    // NOTE: `schema_hash` is deliberately NOT added here. `lower_tool` is the
+    // pure cross-binding helper whose DTO is pinned by
+    // `tests/cross_lang_mcp/helper_vectors.json` (matched by the Python / Node /
+    // Go lowerers) — adding a Rust-only field would break that parity. The
+    // schema hash is a provider-side announce/describe derived value, computed
+    // in `build_capability_set` (announce) and `to_bridged_tool_info`
+    // (describe) instead.
 
     LoweredTool {
         descriptor,
@@ -433,18 +436,18 @@ mod tests {
     }
 
     #[test]
-    fn lower_tool_carries_the_schema_hash_in_bridge_metadata() {
-        let tool = echo_tool();
+    fn lower_tool_does_not_emit_schema_hash_for_cross_binding_parity() {
+        // `lower_tool`'s DTO is pinned by the cross-language golden vectors, so
+        // the provider-side `schema_hash` must NOT ride in its bridge_metadata
+        // (it's computed in the announce / describe paths). This guards the
+        // parity fixture from regressing.
         let lowered = lower_tool(
-            &tool,
+            &echo_tool(),
             &ctx(CredentialStatus::Unknown, Substitutability::ProviderLocal),
         );
-        let stored = lowered
+        assert!(!lowered
             .bridge_metadata
-            .get(&schema_hash_key("echo"))
-            .expect("schema_hash present");
-        assert_eq!(*stored, schema_hash(&tool.input_schema));
-        assert!(!stored.is_empty());
+            .contains_key(&schema_hash_key("echo")));
     }
 
     #[test]

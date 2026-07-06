@@ -44,7 +44,9 @@ use parking_lot::Mutex;
 use super::catalog::{build_catalog, shared_catalog, CatalogPart, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
 use super::delegation::DelegationGate;
-use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
+use super::descriptor::{
+    lower_tool, schema_hash, schema_hash_key, LoweredTool, LoweringContext, Substitutability,
+};
 use super::invoke::{OwnerScope, ToolInvoker, WrapInvokeHandler};
 use super::policy::InvokePolicy;
 use super::stdio::StdioMcpClient;
@@ -153,6 +155,15 @@ pub fn build_capability_set<'a>(
         }
         if let Some(description) = &d.description {
             caps = caps.with_metadata(description_metadata_key(&d.tool_id), description.clone());
+        }
+        // Provider-side schema hash in the announce baseline, so a discovering
+        // node reads it straight off the fold (fetch-once / cache / invalidate).
+        // Computed here from the tool's input schema rather than in `lower_tool`
+        // — its DTO is pinned by the cross-binding golden vectors.
+        if let Some(schema_str) = &d.input_schema {
+            if let Ok(schema) = serde_json::from_str::<serde_json::Value>(schema_str) {
+                caps = caps.with_metadata(schema_hash_key(&d.tool_id), schema_hash(&schema));
+            }
         }
     }
     caps
