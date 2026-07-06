@@ -1,0 +1,23 @@
+net/crates/net/sdk/src/enrollment.rs
+  s_ecf38b21f410fb::t_2097dbd624d22d 1045-1049
+  s_ecf38b21f410fb::t_13b9775bc26c79 1086-1095
+  s_ecf38b21f410fb::t_5ccd426b7717be 1152-1153,1164
+  s_ecf38b21f410fb::t_e6d5c472102b95 1140-1151,1154-1163,1165-1172
+  s_ecf38b21f410fb::t_7225a6ce6b0d6f 928-929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "407e53e0992dd72c8152677912a3507c96d372d2",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
