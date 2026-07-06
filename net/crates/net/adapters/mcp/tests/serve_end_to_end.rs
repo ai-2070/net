@@ -138,12 +138,14 @@ async fn gateway_searches_describes_and_invokes_across_two_nodes() {
     assert_eq!(detail.input_schema["type"], "object");
     assert_eq!(detail.id.display(), format!("{host_id}/echo"));
 
-    // invoke — the wrapped tool round-trips the argument.
+    // invoke — the wrapped tool round-trips the argument. A free tool
+    // carries no payment proof.
     let result = gateway
         .invoke(
             &id,
             json!({ "message": "hi gateway" }),
             InvokeSafety::DuplicateSafe,
+            None,
         )
         .await
         .expect("invoke echo");
@@ -212,6 +214,7 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
             &id,
             json!({ "message": "nope" }),
             InvokeSafety::DuplicateSafe,
+            None,
         )
         .await;
     assert!(
@@ -454,6 +457,7 @@ async fn invoke_retry(gateway: &MeshGateway, id: &CapabilityId, message: &str) -
                 id,
                 json!({ "message": message }),
                 InvokeSafety::DuplicateSafe,
+                None,
             )
             .await
         {
