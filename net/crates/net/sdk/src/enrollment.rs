@@ -866,6 +866,16 @@ impl EnrollmentAuthority {
         }
         let chain = DelegationChain::from_bytes(&request.chain)
             .map_err(|_| EnrollmentError::MalformedRequest("chain"))?;
+        // Only a *bare* `root → device` grant is renewable. Anything longer
+        // (`root → device → gateway → …`) would let a deep leaf — e.g. a
+        // non-delegable, depth-exhausted subagent — present its full chain and
+        // be re-minted as a direct root grantee with fresh `DELEGATE` and depth,
+        // escaping its parent's revocation subtree. Extended links are derived
+        // locally by the device from its renewed bare grant, never re-anchored
+        // here.
+        if chain.len() != 1 {
+            return Err(EnrollmentError::Unrenewable);
+        }
         // The presented grant must still verify — roots at this mesh, its leaf
         // is the requesting device, and it's unexpired. A lapsed grant must
         // re-enroll, not renew.
@@ -1671,6 +1681,54 @@ mod tests {
             ),
             Err(EnrollmentError::WrongMesh)
         ));
+    }
+
+    #[test]
+    fn renew_refuses_an_extended_chain_no_leaf_promotion() {
+        // A deep leaf must not be able to "renew" itself into a direct
+        // `root → leaf` grant: that would hand a non-delegable, depth-exhausted
+        // subagent fresh DELEGATE + depth and re-anchor it outside its parent's
+        // revocation subtree. Only the bare `root → device` grant renews.
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let jreq = JoinRequest::create(&device, "pc", vec![], &invite);
+        let device_chain = auth
+            .approve(&jreq, &invite, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+
+        let gateway = Identity::generate();
+        let gw_chain = device_chain
+            .extend_delegate(&device, gateway.entity_id())
+            .unwrap();
+        let subagent = Identity::generate();
+        let sub_chain = gw_chain
+            .extend_to_subagent(&gateway, subagent.entity_id())
+            .unwrap();
+        let reg = RevocationRegistry::new();
+        // The subagent's chain is genuinely valid — it verifies as the subagent.
+        sub_chain
+            .verify(subagent.entity_id(), auth.root_id(), &reg, 0)
+            .unwrap();
+
+        // Renewal presenting the full chain (leaf = subagent) is refused —
+        // for the gateway's chain too, not just the subagent's.
+        let req = RenewalRequest::create(&subagent, &sub_chain);
+        assert!(matches!(
+            auth.renew(&req, &reg, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(EnrollmentError::Unrenewable)
+        ));
+        let req = RenewalRequest::create(&gateway, &gw_chain);
+        assert!(matches!(
+            auth.renew(&req, &reg, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(EnrollmentError::Unrenewable)
+        ));
+
+        // The bare grant itself still renews.
+        let req = RenewalRequest::create(&device, &device_chain);
+        auth.renew(&req, &reg, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .expect("bare root → device grant still renews");
     }
 
     #[test]
