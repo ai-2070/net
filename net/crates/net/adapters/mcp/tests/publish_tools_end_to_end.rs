@@ -21,10 +21,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use net_mcp::bridge::{DescribeResponse, DESCRIBE_SERVICE};
-use net_mcp::spec::{CallToolResult, Tool};
+use net_mcp::spec::{CallToolResult, Implementation, Tool};
 use net_mcp::wrap::{
-    CredentialStatus, LoweringContext, McpError, OwnerScope, ServerPublisher, Substitutability,
-    ToolInvoker, WrapConfig,
+    CredentialStatus, InvokePolicy, LoweringContext, McpError, OwnerScope, PolicyContext,
+    PolicyDecision, ServerPublisher, Substitutability, ToolInvoker, WrapConfig,
 };
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::{Mesh, MeshBuilder};
@@ -101,6 +101,29 @@ fn ctx() -> LoweringContext {
         server_version: "hermes-1.0".to_string(),
         credential_status: CredentialStatus::None,
         substitutability: Substitutability::ProviderLocal,
+    }
+}
+
+fn hermes_impl() -> Implementation {
+    Implementation {
+        name: "hermes".to_string(),
+        version: "1.0".to_string(),
+    }
+}
+
+/// An invoke policy that denies `echo` (with a distinctive reason) but allows
+/// everything else — proves flipping the preset from allow-all to a deny is a
+/// config change, and that a deny surfaces as `denied`, not a tool result.
+struct DenyEcho;
+
+#[async_trait]
+impl InvokePolicy for DenyEcho {
+    async fn check(&self, ctx: &PolicyContext) -> PolicyDecision {
+        if ctx.tool_id == "echo" {
+            PolicyDecision::deny("blocked by test policy")
+        } else {
+            PolicyDecision::Allow
+        }
     }
 }
 
@@ -273,6 +296,67 @@ async fn local_tools_are_discovered_described_and_invoked_across_two_nodes() {
     );
 
     caller.shutdown().await.ok();
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invoke_policy_denies_an_admitted_call() {
+    // The invoke-path enforcement hook: an admitted (in-scope) caller is still
+    // subject to the provider's policy. `DenyEcho` allows `add` but blocks
+    // `echo` — flipping the allow-all preset to a deny is a config change, not
+    // new plumbing.
+    let caller = build_mesh(&[0x53u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x53u8; 32]).await);
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+
+    let mut config = WrapConfig::owner_only(hermes_impl(), caller.origin_hash());
+    config.policy = Some(Arc::new(DenyEcho)); // flip the preset
+    let invoker = Arc::new(LocalTools::default());
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let _publication = publisher
+        .publish_tools(&local_tools(), invoker as Arc<dyn ToolInvoker>, ctx(), config)
+        .await
+        .expect("publish local tools");
+
+    let filter = CapabilityFilter::new().require_tag("echo");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "discovery is unaffected by the invoke policy",
+    );
+
+    // `add` is allowed by the policy → it still invokes and runs.
+    let add_reply = call_retry(&caller, b_id, "add", || {
+        Bytes::from(serde_json::to_vec(&json!({ "a": 2, "b": 3 })).unwrap())
+    })
+    .await
+    .expect("add is allowed by the policy");
+    let add_result: CallToolResult =
+        serde_json::from_slice(add_reply.body.as_ref()).expect("decode add result");
+    assert_eq!(add_result.text(), "5");
+
+    // `echo` is denied by the policy. Warm up the per-caller reply channel (a
+    // fast rejection can outrace the first subscription), then the structured
+    // ERR_POLICY denial lands — the caller never gets a tool result.
+    let echo_body = || Bytes::from(serde_json::to_vec(&json!({ "message": "hi" })).unwrap());
+    let _ = call_bounded(&caller, b_id, "echo", echo_body()).await;
+    let err = call_bounded(&caller, b_id, "echo", echo_body())
+        .await
+        .expect_err("the policy denies echo");
+    assert!(
+        err.contains("blocked by test policy"),
+        "expected the policy reason in the denial, got: {err}",
+    );
+
+    caller.shutdown().await.ok();
+    drop(_publication);
     drop(publisher);
     if let Ok(host) = Arc::try_unwrap(host) {
         host.shutdown().await.ok();

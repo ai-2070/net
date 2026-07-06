@@ -22,6 +22,7 @@ use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayl
 use serde_json::Value;
 
 use super::delegation::{DelegationGate, HDR_DELEGATION, HDR_DELEGATION_SIG};
+use super::policy::{InvokePolicy, PolicyContext, PolicyDecision};
 use super::stdio::StdioMcpClient;
 use super::McpError;
 use crate::spec::CallToolResult;
@@ -51,6 +52,12 @@ pub const ERR_TOOL: u16 = 0x8004;
 /// that doesn't root at the provider's owner. Distinct from
 /// [`ERR_OWNER_SCOPE`] (the no-chain origin-allowlist path).
 pub const ERR_DELEGATION: u16 = 0x8005;
+/// The invoke was admitted but the provider's [`InvokePolicy`] refused it
+/// (V2 Phase 2's in-root toll booth — an allowlist deny, or a dangerous-tool
+/// approval that was declined / could not reach the operator). An
+/// authorization verdict, so the demand side maps it to `denied` like
+/// [`ERR_OWNER_SCOPE`] / [`ERR_DELEGATION`], never a tool-level `is_error`.
+pub const ERR_POLICY: u16 = 0x8006;
 
 /// Find the first request header named `name` in `ctx.payload.headers`
 /// (`Vec<(String, Vec<u8>)>` — the substrate's `RpcHeader` alias). First match
@@ -187,6 +194,11 @@ pub struct WrapInvokeHandler {
     /// carries a [`HDR_DELEGATION`] chain is admitted iff the chain + its
     /// per-invoke signature verify; a no-chain invoke still uses `scope`.
     delegation: Option<Arc<DelegationGate>>,
+    /// Optional invoke-path policy (V2 Phase 2). When set, an *admitted* invoke
+    /// is additionally run past it before the tool executes — the in-root toll
+    /// booth. `None` is the allow-all preset (the check is skipped): the mesh
+    /// adds reach, not authority.
+    policy: Option<Arc<dyn InvokePolicy>>,
 }
 
 impl WrapInvokeHandler {
@@ -202,6 +214,7 @@ impl WrapInvokeHandler {
             tool,
             scope,
             delegation: None,
+            policy: None,
         }
     }
 
@@ -221,6 +234,16 @@ impl WrapInvokeHandler {
     #[must_use]
     pub fn with_delegation(mut self, delegation: Option<Arc<DelegationGate>>) -> Self {
         self.delegation = delegation;
+        self
+    }
+
+    /// Attach an invoke-path policy (V2 Phase 2), or `None` for the allow-all
+    /// preset (the check is skipped). Builder-style so
+    /// `WrapInvokeHandler::new(...).with_policy(p)` reads cleanly at the serve
+    /// site, alongside `with_delegation`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Option<Arc<dyn InvokePolicy>>) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -244,7 +267,7 @@ impl RpcHandler for WrapInvokeHandler {
         //     (`identity/origin.rs`), because the *signature* proves leaf-key
         //     possession. A caller with no chain falls back to the owner-scope
         //     origin allowlist (the AEAD-verified `caller_origin`), unchanged.
-        match (
+        let delegated = match (
             &self.delegation,
             find_header(&ctx.payload.headers, HDR_DELEGATION),
         ) {
@@ -266,6 +289,7 @@ impl RpcHandler for WrapInvokeHandler {
                         code: ERR_DELEGATION,
                         message: e.to_string(),
                     })?;
+                true
             }
             _ => {
                 // No chain (or no gate configured): owner-scope path.
@@ -275,6 +299,29 @@ impl RpcHandler for WrapInvokeHandler {
                         message: OWNER_SCOPE_REJECTION.to_string(),
                     });
                 }
+                false
+            }
+        };
+
+        // [1b] Policy hook (V2 Phase 2, the in-root toll booth). The call is
+        //      admitted; now the provider's policy — an allowlist, or a
+        //      dangerous-tool approval that routes to the operator — gets the
+        //      final say before the tool runs. `None` is the allow-all preset
+        //      (skipped): the mesh adds reach, not authority. A deny becomes an
+        //      ERR_POLICY the demand side reports as `denied`.
+        if let Some(policy) = &self.policy {
+            if let PolicyDecision::Deny { reason } = policy
+                .check(&PolicyContext {
+                    tool_id: self.service.clone(),
+                    caller_origin: ctx.caller_origin,
+                    delegated,
+                })
+                .await
+            {
+                return Err(RpcHandlerError::Application {
+                    code: ERR_POLICY,
+                    message: reason,
+                });
             }
         }
 

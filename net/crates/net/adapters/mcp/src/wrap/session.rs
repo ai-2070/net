@@ -46,6 +46,7 @@ use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
 use super::delegation::DelegationGate;
 use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 use super::invoke::{OwnerScope, ToolInvoker, WrapInvokeHandler};
+use super::policy::InvokePolicy;
 use super::stdio::StdioMcpClient;
 use super::McpError;
 use crate::bridge::{BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE};
@@ -159,7 +160,10 @@ pub fn build_capability_set<'a>(
 
 /// Configuration for a publication: the credential-classification overrides
 /// and the substitutability the operator declared, plus who may invoke.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (not derived) so [`InvokePolicy`] impls need not be
+/// `Debug` — a policy may wrap genuinely opaque state (e.g. a host callback).
+#[derive(Clone)]
 pub struct WrapConfig {
     /// How this server identifies itself to the wrapped MCP server.
     pub client_info: Implementation,
@@ -177,6 +181,27 @@ pub struct WrapConfig {
     pub force: bool,
     /// Whether the tools are declared interchangeable across providers.
     pub substitutability: Substitutability,
+    /// Optional invoke-path policy (V2 Phase 2 — the in-root toll booth). When
+    /// set, every admitted invoke of this publication's tools is run past it
+    /// before the tool executes. `None` (default) is the allow-all preset: the
+    /// mesh adds reach, not authority. Flipping to an allowlist or a
+    /// dangerous-tool approval policy is setting this field, not new plumbing.
+    pub policy: Option<Arc<dyn InvokePolicy>>,
+}
+
+impl std::fmt::Debug for WrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrapConfig")
+            .field("client_info", &self.client_info)
+            .field("scope", &self.scope)
+            .field("delegation", &self.delegation)
+            .field("credential_override", &self.credential_override)
+            .field("force", &self.force)
+            .field("substitutability", &self.substitutability)
+            // The policy is opaque (not `Debug`); show only its presence.
+            .field("policy", &self.policy.as_ref().map(|_| "<policy>"))
+            .finish()
+    }
 }
 
 impl WrapConfig {
@@ -190,6 +215,7 @@ impl WrapConfig {
             credential_override: CredentialOverride::Detect,
             force: false,
             substitutability: Substitutability::ProviderLocal,
+            policy: None,
         }
     }
 }
@@ -420,7 +446,8 @@ impl ServerPublisher {
                 config.scope.clone(),
             )
             .with_service(tool_id.clone())
-            .with_delegation(config.delegation.clone());
+            .with_delegation(config.delegation.clone())
+            .with_policy(config.policy.clone());
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -449,6 +476,7 @@ impl ServerPublisher {
             ctx,
             scope: config.scope,
             delegation: config.delegation,
+            policy: config.policy,
             tools,
             skipped,
             registration: Registration {
@@ -523,7 +551,8 @@ impl ServerPublisher {
                 config.scope.clone(),
             )
             .with_service(tool_id.clone())
-            .with_delegation(config.delegation.clone());
+            .with_delegation(config.delegation.clone())
+            .with_policy(config.policy.clone());
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -552,6 +581,7 @@ impl ServerPublisher {
             ctx,
             scope: config.scope,
             delegation: config.delegation,
+            policy: config.policy,
             tools: served,
             skipped,
             registration: Registration {
@@ -621,6 +651,9 @@ pub struct PublicationHandle {
     /// promoted/refreshed tool enforces the same delegation policy as the
     /// initial publish.
     delegation: Option<Arc<DelegationGate>>,
+    /// Invoke-path policy reused when serving tools that appear on refresh, so
+    /// a refreshed tool enforces the same policy as the initial publish.
+    policy: Option<Arc<dyn InvokePolicy>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// MCP tool names skipped because they have no usable id (an empty name).
@@ -707,7 +740,8 @@ impl PublicationHandle {
                     self.scope.clone(),
                 )
                 .with_service(tool_id.clone())
-                .with_delegation(self.delegation.clone());
+                .with_delegation(self.delegation.clone())
+                .with_policy(self.policy.clone());
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);
@@ -797,6 +831,9 @@ pub struct LocalPublicationHandle {
     /// refreshed tool enforces the same delegation policy as the initial
     /// publish.
     delegation: Option<Arc<DelegationGate>>,
+    /// Invoke-path policy reused when serving tools that appear on refresh, so
+    /// a refreshed tool enforces the same policy as the initial publish.
+    policy: Option<Arc<dyn InvokePolicy>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// Tool names skipped because they have no usable id (an empty name).
@@ -862,7 +899,8 @@ impl LocalPublicationHandle {
                     self.scope.clone(),
                 )
                 .with_service(tool_id.clone())
-                .with_delegation(self.delegation.clone());
+                .with_delegation(self.delegation.clone())
+                .with_policy(self.policy.clone());
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);
