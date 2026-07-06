@@ -169,7 +169,7 @@ impl OperatorEnrollment {
         let enrollment = self
             .authority
             .approve(request, &invite, now, grant_ttl, max_depth)?;
-        DeviceRegistry::record(
+        if let Err(e) = DeviceRegistry::record(
             &self.registry_path,
             DeviceRecord::new(
                 enrollment.device.clone(),
@@ -177,7 +177,13 @@ impl OperatorEnrollment {
                 enrollment.tags.clone(),
                 now,
             ),
-        )?;
+        ) {
+            // The admission didn't commit — un-spend the nonce so the device's
+            // retry (once the store recovers) isn't permanently rejected as a
+            // replay while `pending` still advertises the invite.
+            self.authority.unspend_nonce(&invite.nonce);
+            return Err(e.into());
+        }
         // Single-use: retire the invite only after a successful admission.
         self.pending.lock().remove(&request.invite_nonce);
         Ok(enrollment)
@@ -228,7 +234,7 @@ impl OperatorEnrollment {
         let enrollment =
             self.authority
                 .approve(request, &invite, now_unix(), grant_ttl, max_depth)?;
-        DeviceRegistry::record(
+        if let Err(e) = DeviceRegistry::record(
             &self.registry_path,
             DeviceRecord::new(
                 enrollment.device.clone(),
@@ -236,7 +242,12 @@ impl OperatorEnrollment {
                 enrollment.tags.clone(),
                 now_unix(),
             ),
-        )?;
+        ) {
+            // Mirror `approve_at`: a failed commit un-spends the nonce so the
+            // invite stays redeemable for the device's retry.
+            self.authority.unspend_nonce(&invite.nonce);
+            return Err(e.into());
+        }
         self.pending.lock().remove(&request.invite_nonce);
         Ok(enrollment)
     }
@@ -482,6 +493,32 @@ mod tests {
             op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH),
             Err(OperatorError::UnknownInvite)
         ));
+    }
+
+    #[test]
+    fn a_failed_record_rolls_back_the_invite_spend() {
+        let (op, _root, dir) = operator();
+        // Sabotage the registry: a directory where the store file should be,
+        // so the post-approve record write fails.
+        std::fs::create_dir(dir.path().join("devices.json")).unwrap();
+
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        assert!(matches!(
+            op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(OperatorError::Registry(_))
+        ));
+
+        // The admission didn't commit: the invite is still advertised AND still
+        // redeemable — once the store recovers, the same request approves
+        // (previously the nonce stayed spent → Replay forever).
+        assert_eq!(op.pending_invites(T0).len(), 1);
+        std::fs::remove_dir(dir.path().join("devices.json")).unwrap();
+        op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .expect("retry after the store recovers succeeds");
+        assert_eq!(op.devices().unwrap().len(), 1);
+        assert!(op.pending_invites(T0).is_empty());
     }
 
     #[test]

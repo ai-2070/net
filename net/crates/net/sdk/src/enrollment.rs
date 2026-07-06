@@ -910,6 +910,16 @@ impl EnrollmentAuthority {
         self.approve(request, invite, now_unix(), grant_ttl, max_depth)
     }
 
+    /// Roll back a nonce spent by [`Self::approve`] whose admission could
+    /// **not** be committed (e.g. the device-registry write failed after the
+    /// grant was minted). Without the rollback the invite is permanently
+    /// bricked: the ledger says spent (`Replay` on every retry) while the
+    /// operator's pending set still advertises it. Only the coordinator that
+    /// owns the commit sequence calls this — never on a successful admission.
+    pub(crate) fn unspend_nonce(&self, nonce: &[u8; 16]) {
+        self.seen.lock().remove(nonce);
+    }
+
     /// Burn `nonce` for single-use. Prunes expired entries first, rejects a
     /// replay, and fails closed if the ledger is saturated.
     fn spend_nonce(&self, nonce: [u8; 16], expiry: u64, now: u64) -> Result<(), EnrollmentError> {
