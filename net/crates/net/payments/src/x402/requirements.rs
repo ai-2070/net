@@ -37,7 +37,13 @@ pub struct PaymentRequirements {
     pub scheme: String,
     /// CAIP-2 network identifier.
     pub network: String,
-    /// Required amount in atomic token units, as a string.
+    /// Required amount in atomic token units, as a string. The pinned
+    /// spec names this `amount`; the widely-deployed x402 servers name it
+    /// `maxAmountRequired`. Accept both on input (the carry preserves the
+    /// original bytes for signing regardless) so an outbound payment to a
+    /// real server whose requirements use `maxAmountRequired` parses
+    /// rather than failing with "missing field `amount`".
+    #[serde(alias = "maxAmountRequired")]
     pub amount: String,
     /// Scheme-scoped asset locator (token contract address / currency code).
     pub asset: String,
@@ -113,6 +119,27 @@ mod tests {
         assert_eq!(carry.view().amount, "10000");
         assert_eq!(carry.bytes(), FIXTURE.as_bytes());
         assert_eq!(carry.view().chain().unwrap().namespace(), "eip155");
+    }
+
+    /// M9: a real x402 server whose requirements name the amount
+    /// `maxAmountRequired` (no `amount` key) must still parse — and its
+    /// original bytes are preserved untouched for signing.
+    #[test]
+    fn accepts_max_amount_required_alias() {
+        const DEPLOYED: &str = r#"{
+  "scheme": "exact",
+  "network": "eip155:8453",
+  "maxAmountRequired": "10000",
+  "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+  "maxTimeoutSeconds": 60
+}"#;
+        let carry: X402Carry<PaymentRequirements> =
+            X402Carry::from_bytes(DEPLOYED.as_bytes().to_vec())
+                .expect("maxAmountRequired must parse");
+        assert_eq!(carry.view().amount, "10000");
+        // Byte preservation: the original key survives for signing.
+        assert_eq!(carry.bytes(), DEPLOYED.as_bytes());
     }
 
     #[test]
