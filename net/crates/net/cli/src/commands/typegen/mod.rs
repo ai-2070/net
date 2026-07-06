@@ -680,6 +680,7 @@ mod tests {
             stateless: true,
             streaming: false,
             tags: vec![],
+            pricing_terms: None,
             node_count: 1,
         }
     }

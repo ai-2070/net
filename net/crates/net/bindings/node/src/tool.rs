@@ -132,6 +132,7 @@ fn descriptor_to_camel_json(d: ToolDescriptor) -> serde_json::Value {
         stateless,
         streaming,
         tags,
+        pricing_terms,
         node_count,
     } = d;
     serde_json::json!({
@@ -146,6 +147,7 @@ fn descriptor_to_camel_json(d: ToolDescriptor) -> serde_json::Value {
         "stateless": stateless,
         "streaming": streaming,
         "tags": tags,
+        "pricingTerms": pricing_terms,
         "nodeCount": node_count,
     })
 }
@@ -253,6 +255,7 @@ mod tests {
             stateless: false,
             streaming: true,
             tags: vec!["search".into()],
+            pricing_terms: Some("{\"object\":\"net.pricing.terms@1\"}".into()),
             node_count: 7,
         }
     }
@@ -277,6 +280,7 @@ mod tests {
                 "name",
                 "nodeCount",
                 "outputSchema",
+                "pricingTerms",
                 "requires",
                 "stateless",
                 "streaming",
@@ -291,6 +295,7 @@ mod tests {
         assert_eq!(obj["nodeCount"], 7);
         assert_eq!(obj["streaming"], true);
         assert_eq!(obj["inputSchema"], "{\"type\":\"object\"}");
+        assert_eq!(obj["pricingTerms"], "{\"object\":\"net.pricing.terms@1\"}");
     }
 
     #[test]

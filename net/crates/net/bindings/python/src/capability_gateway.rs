@@ -131,6 +131,7 @@ fn detail_to_json(d: &CapabilityDetail, requires_approval: bool) -> String {
         "substitutability": d.substitutability,
         "version": d.version,
         "requires_approval": requires_approval,
+        "pricing_terms": d.pricing_terms,
     })
     .to_string()
 }
@@ -160,6 +161,17 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
                 id.display(),
                 id.display(),
             ),
+        }),
+        // The payment-gate mirror of `requires_approval` — passed through
+        // untouched (doctrine #1: the decision came from the Rust spend
+        // engine; this arm only names the fields). Approval resolves
+        // through the SDK consent API; the shared store holds the decision.
+        GatedOutcome::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } => json!({
+            "status": "requires_payment_approval",
+            "cap_id": id.display(),
+            "quote_id": quote_id,
+            "policy_reason": policy_reason,
+            "approve_hint": approve_hint,
         }),
         GatedOutcome::Failed(e) => json!({
             "status": gateway_status(&e),
@@ -229,7 +241,10 @@ async fn do_invoke(
     args: Value,
 ) -> String {
     let pins = load_pins(pin_path).await;
-    let outcome = gated_invoke(gateway, consent, pins.as_ref(), &id, args).await;
+    // No payment flow is wired yet: a paid capability fails closed with a
+    // structured `denied` (never a silent unpaid serve). The net-payments
+    // flow lands here as an optional gateway field next.
+    let outcome = gated_invoke(gateway, consent, pins.as_ref(), None, &id, args).await;
     outcome_to_json(&id, outcome)
 }
 

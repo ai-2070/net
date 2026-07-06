@@ -162,6 +162,13 @@ pub struct LoweringContext {
     pub credential_status: CredentialStatus,
     /// Substitutability for every tool from this server.
     pub substitutability: Substitutability,
+    /// Pricing terms per wrapped tool, keyed by the MCP tool **name**
+    /// (pre-sanitization — the operator prices the tool they see in the
+    /// wrapped server, not the derived channel id). Values are
+    /// `net.pricing.terms@1` canonical JSON, carried opaquely: the
+    /// bridge never parses payment objects. Tools absent from the map
+    /// are free.
+    pub pricing: BTreeMap<String, String>,
 }
 
 /// The result of lowering one MCP tool: the SDK discovery descriptor plus
@@ -194,6 +201,7 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
         ctx.server_version.clone()
     };
 
+    let pricing_terms = ctx.pricing.get(&tool.name).cloned();
     let descriptor = ToolDescriptor {
         tool_id: tool_id.clone(),
         // Prefer the human title; fall back to the machine name.
@@ -209,6 +217,7 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
         stateless: false,
         streaming: false,
         tags: Vec::new(),
+        pricing_terms: pricing_terms.clone(),
         node_count: 0,
     };
 
@@ -230,6 +239,12 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
         invocation_scope_key(&tool_id),
         INVOCATION_SCOPE_SAME_ROOT.to_string(),
     );
+    // Pricing rides the SAME metadata key native tools use
+    // (`tool::<id>::pricing_terms`) so demand-side consumers read one
+    // key regardless of which publish path announced the tool.
+    if let Some(terms) = pricing_terms {
+        bridge_metadata.insert(net_sdk::tool::pricing_terms_metadata_key(&tool_id), terms);
+    }
 
     LoweredTool {
         descriptor,
@@ -261,6 +276,7 @@ mod tests {
             server_version: "1.2.3".to_string(),
             credential_status: status,
             substitutability: sub,
+            pricing: BTreeMap::new(),
         }
     }
 
@@ -276,10 +292,36 @@ mod tests {
         assert_eq!(d.version, "1.2.3");
         assert_eq!(d.description.as_deref(), Some("Return the message."));
         assert!(!d.streaming, "compat tier is request/response only");
+        assert_eq!(d.pricing_terms, None, "unpriced tools stay free");
         // The input schema round-trips as a JSON string.
         let schema: serde_json::Value =
             serde_json::from_str(d.input_schema.as_deref().unwrap()).unwrap();
         assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn pricing_rides_the_descriptor_and_the_shared_metadata_key() {
+        let terms = "{\"object\":\"net.pricing.terms@1\"}";
+        let mut c = ctx(CredentialStatus::Unknown, Substitutability::ProviderLocal);
+        // Keyed by the MCP tool *name* the operator sees, pre-sanitization.
+        c.pricing.insert("echo".to_string(), terms.to_string());
+        let lowered = lower_tool(&echo_tool(), &c);
+        assert_eq!(lowered.descriptor.pricing_terms.as_deref(), Some(terms));
+        // Announced under the SAME key the native serve_tool path uses, so
+        // demand-side consumers read one key regardless of publish path.
+        assert_eq!(
+            lowered
+                .bridge_metadata
+                .get(&net_sdk::tool::pricing_terms_metadata_key("echo"))
+                .map(String::as_str),
+            Some(terms)
+        );
+        // A tool absent from the pricing map is free.
+        let free = lower_tool(
+            &Tool { name: "other".to_string(), ..echo_tool() },
+            &c,
+        );
+        assert_eq!(free.descriptor.pricing_terms, None);
     }
 
     #[test]
@@ -343,6 +385,7 @@ mod tests {
                 server_version: String::new(),
                 credential_status: CredentialStatus::Unknown,
                 substitutability: Substitutability::ProviderLocal,
+                pricing: BTreeMap::new(),
             },
         );
         assert_eq!(lowered.descriptor.name, "raw");

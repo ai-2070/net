@@ -105,6 +105,9 @@ pub fn lower_mcp_tool(
             server_version: server_version.to_string(),
             credential_status,
             substitutability,
+            // Pricing attaches through `publish_server` opts (the wrap
+            // session), not this per-tool lowering helper.
+            pricing: std::collections::BTreeMap::new(),
         },
     );
     serde_json::to_string(&serde_json::json!({

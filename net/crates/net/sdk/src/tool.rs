@@ -30,7 +30,8 @@
 pub use net::adapter::net::behavior::fold::capability_aggregation::{TagMatcher, TagMatcherError};
 #[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
-    description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor, ToolEvent,
+    description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+    tags_metadata_key, ToolDescriptor, ToolEvent,
     ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
     TOOL_METADATA_FETCH_SERVICE,
 };
@@ -141,6 +142,18 @@ impl ToolMetadataBuilder {
         self
     }
 
+    /// Attach pricing: a `net.pricing.terms@1` envelope as canonical
+    /// JSON (author it with `net-payments`; the SDK carries the string
+    /// opaquely — the substrate never parses payment objects). Announced
+    /// under the tool's `pricing_terms` metadata key, so the price is
+    /// visible at discovery time. A paid capability is metadata +
+    /// invocation policy, not a different kind of tool — and displaying
+    /// a price never implies authorization to spend it.
+    pub fn pricing_terms(mut self, terms_json: impl Into<String>) -> Self {
+        self.descriptor.pricing_terms = Some(terms_json.into());
+        self
+    }
+
     /// Consume the builder and return the finished [`ToolDescriptor`].
     /// Pass this into the future `serve_tool` / `serve_tool_streaming`
     /// methods (A-2 / A-3).
@@ -188,6 +201,7 @@ where
             stateless: true,
             streaming: false,
             tags: Vec::new(),
+            pricing_terms: None,
             node_count: 0,
         },
     }
@@ -1270,6 +1284,7 @@ mod tests {
             stateless: true,
             streaming: false,
             tags: Vec::new(),
+            pricing_terms: None,
             node_count: 0,
         };
         // Empty-object fallback prevents provider validators from

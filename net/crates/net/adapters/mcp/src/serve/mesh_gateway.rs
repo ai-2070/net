@@ -609,6 +609,7 @@ fn detail_from(id: &CapabilityId, info: BridgedToolInfo) -> CapabilityDetail {
         credential_status: info.credential_status,
         substitutability: info.substitutability,
         version: info.version,
+        pricing_terms: info.pricing_terms,
     }
 }
 
@@ -776,6 +777,7 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
             output_schema: None,
+            pricing_terms: None,
             version: "1".into(),
             compat_tier: "mcp_bridge".into(),
             credential_status: "none".into(),

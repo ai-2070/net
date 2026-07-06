@@ -77,6 +77,18 @@ pub fn tags_metadata_key(tool_id: &str) -> String {
     format!("tool::{tool_id}::tags")
 }
 
+/// Metadata key holding the tool's `net.pricing.terms@1` envelope as
+/// canonical JSON — pricing visible at discovery time, no 402
+/// round-trip on the mesh. The value is discovery/UX metadata and
+/// non-binding: billing and settlement bind only to quote-instantiated
+/// requirements (the quote is provider-signed; announced terms are
+/// covered by the announcement signature like every other key here).
+/// The substrate carries the string opaquely — parsing and every
+/// payment semantic live in `net-payments`, never in core.
+pub fn pricing_terms_metadata_key(tool_id: &str) -> String {
+    format!("tool::{tool_id}::pricing_terms")
+}
+
 // ============================================================================
 // ToolDescriptor — SDK-facing discovery shape
 // ============================================================================
@@ -129,6 +141,14 @@ pub struct ToolDescriptor {
     pub streaming: bool,
     /// Free-form tags the host attached at register time.
     pub tags: Vec<String>,
+    /// `net.pricing.terms@1` envelope as canonical JSON, when the host
+    /// published this tool as paid ([`pricing_terms_metadata_key`]).
+    /// Opaque to the substrate; interpreted only by `net-payments`.
+    /// Additive: absent for free tools and on legacy announcements, and
+    /// omitted from serialization when `None` so pre-payments consumers
+    /// and pinned fixtures see the exact prior shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_terms: Option<String>,
     /// How many nodes currently advertise this `(tool_id, version)`
     /// pair across the scope queried. Filled by the aggregator;
     /// stays at `0` on a freshly-constructed descriptor.
@@ -164,6 +184,9 @@ impl ToolDescriptor {
                     .collect()
             })
             .unwrap_or_default();
+        let pricing_terms = metadata
+            .get(&pricing_terms_metadata_key(&cap.tool_id))
+            .cloned();
         Self {
             tool_id: cap.tool_id.clone(),
             name: cap.name.clone(),
@@ -176,6 +199,7 @@ impl ToolDescriptor {
             stateless: cap.stateless,
             streaming,
             tags,
+            pricing_terms,
             node_count: 0,
         }
     }
@@ -702,6 +726,29 @@ mod tests {
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"progress"}"#
         );
+    }
+
+    // ── pricing terms (payments discovery hook) ─────────────────
+
+    #[test]
+    fn from_capability_reads_pricing_terms_and_stays_free_without_the_key() {
+        let terms = "{\"object\":\"net.pricing.terms@1\"}";
+        let capability = cap("paid_tool");
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            pricing_terms_metadata_key("paid_tool"),
+            terms.to_string(),
+        );
+        let paid = ToolDescriptor::from_capability(&capability, &metadata);
+        assert_eq!(paid.pricing_terms.as_deref(), Some(terms));
+
+        let free = ToolDescriptor::from_capability(&capability, &BTreeMap::new());
+        assert_eq!(free.pricing_terms, None);
+
+        // Absent pricing serializes to nothing — pre-payments consumers
+        // and pinned fixtures see the exact prior descriptor shape.
+        let json = serde_json::to_string(&free).unwrap();
+        assert!(!json.contains("pricing_terms"), "{json}");
     }
 
     // ── tool.metadata.fetch ─────────────────────────────────────

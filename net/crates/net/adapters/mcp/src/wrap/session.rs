@@ -177,6 +177,13 @@ pub struct WrapConfig {
     pub force: bool,
     /// Whether the tools are declared interchangeable across providers.
     pub substitutability: Substitutability,
+    /// Pricing terms per wrapped tool, keyed by MCP tool name. Values
+    /// are `net.pricing.terms@1` canonical JSON (author with
+    /// `net-payments`; the bridge carries them opaquely). Same publish
+    /// option the native `serve_tool` path exposes — a paid capability
+    /// is metadata + invocation policy, not a different kind of tool.
+    /// Empty (the default) publishes every tool as free.
+    pub pricing: std::collections::BTreeMap<String, String>,
 }
 
 impl WrapConfig {
@@ -190,6 +197,7 @@ impl WrapConfig {
             credential_override: CredentialOverride::Detect,
             force: false,
             substitutability: Substitutability::ProviderLocal,
+            pricing: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -375,6 +383,7 @@ impl ServerPublisher {
             server_version: init.server_info.version,
             credential_status,
             substitutability: config.substitutability,
+            pricing: config.pricing.clone(),
         };
         let (lowered, skipped) = discover_and_lower(&client, &ctx).await?;
 
@@ -695,6 +704,7 @@ mod tests {
             server_version: "1.0.0".to_string(),
             credential_status: super::super::CredentialStatus::Unknown,
             substitutability: Substitutability::ProviderLocal,
+            pricing: std::collections::BTreeMap::new(),
         };
         names
             .iter()
@@ -908,6 +918,7 @@ mod tests {
             server_version: "1.0.0".to_string(),
             credential_status: super::super::CredentialStatus::Credentialed,
             substitutability: Substitutability::ProviderLocal,
+            pricing: std::collections::BTreeMap::new(),
         };
         let caps = build_capability_set(&[lower_tool(&tool("secretive", "uses a token"), &ctx)]);
         // The credential_status value is a fixed classification label.

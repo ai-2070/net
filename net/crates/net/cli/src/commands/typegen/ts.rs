@@ -426,6 +426,7 @@ mod tests {
             stateless: true,
             streaming: false,
             tags: vec!["search".into(), "io".into()],
+            pricing_terms: None,
             node_count: 0,
         }
     }

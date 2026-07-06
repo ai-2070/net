@@ -590,13 +590,13 @@ async fn gated_invoke_stable(
     id: &CapabilityId,
     args: &serde_json::Value,
 ) -> GatedOutcome {
-    let mut out = gated_invoke(gateway, consent, pins, id, args.clone()).await;
+    let mut out = gated_invoke(gateway, consent, pins, None, id, args.clone()).await;
     for _ in 0..6 {
         if !matches!(out, GatedOutcome::Failed(GatewayError::Transport(_))) {
             return out;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
-        out = gated_invoke(gateway, consent, pins, id, args.clone()).await;
+        out = gated_invoke(gateway, consent, pins, None, id, args.clone()).await;
     }
     out
 }

@@ -211,6 +211,7 @@ mod tests {
             description: None,
             input_schema: schema,
             output_schema: None,
+            pricing_terms: None,
             version: "1".to_string(),
             compat_tier: "mcp_bridge".to_string(),
             credential_status: cred.to_string(),

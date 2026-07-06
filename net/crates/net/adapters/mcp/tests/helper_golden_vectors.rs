@@ -151,6 +151,7 @@ fn lower_parity() {
                 server_version: case["server_version"].as_str().unwrap().to_string(),
                 credential_status,
                 substitutability,
+                pricing: std::collections::BTreeMap::new(),
             },
         );
 

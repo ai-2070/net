@@ -71,6 +71,10 @@ fn descriptor_from_fixture(input: &Value) -> ToolDescriptor {
             .as_array()
             .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
             .unwrap_or_default(),
+        pricing_terms: input
+            .get("pricing_terms")
+            .filter(|v| !v.is_null())
+            .map(|v| v.as_str().unwrap().to_string()),
         node_count: input["node_count"].as_u64().unwrap() as u32,
     }
 }

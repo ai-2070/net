@@ -10046,7 +10046,8 @@ impl MeshNode {
         } else {
             use crate::adapter::net::behavior::ToolCapability;
             use crate::adapter::net::cortex::tool::{
-                description_metadata_key, streaming_metadata_key, tags_metadata_key,
+                description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+                tags_metadata_key,
             };
             let snapshot = self.tool_registry.snapshot();
             // Reconstruct ToolCapability values from each descriptor's
@@ -10095,6 +10096,16 @@ impl MeshNode {
                     merged = merged.with_metadata(
                         tags_metadata_key(&descriptor.tool_id),
                         descriptor.tags.join(","),
+                    );
+                }
+                // Pricing terms (net.pricing.terms@1 canonical JSON) ride
+                // the same hook — paid capability = metadata + invocation
+                // policy, not a different kind of tool. The substrate
+                // never parses the value.
+                if let Some(ref terms) = descriptor.pricing_terms {
+                    merged = merged.with_metadata(
+                        pricing_terms_metadata_key(&descriptor.tool_id),
+                        terms.clone(),
                     );
                 }
             }
