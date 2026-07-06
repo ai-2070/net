@@ -3,7 +3,7 @@ Phase 1).
 
 A first-party, standalone plugin that lets a Hermes agent reach capabilities
 running on the user's *other* machines — the ones published there with
-``net wrap`` — as five ``net_*`` tools, with local consent + pin approval. It
+``net wrap`` — as ``net_*`` tools, with local consent + pin approval. It
 embeds a first-class Net node in-process via ``net-mesh-sdk`` (no daemon, no MCP
 shim); the node joins the mesh, and the tools drive the SDK's consent-gated
 ``AsyncCapabilityGateway`` and the machine-shared pin store.
@@ -41,7 +41,7 @@ def _on_session_start(**_kwargs) -> None:
     """Start the pin-promotion subscription (Phase 2) for this session. Promotes
     approved pins to first-class tools, driven by the SDK's pin-change
     subscription. Best-effort and idempotent — a failure here must never break a
-    session; the five meta-tools stand on their own."""
+    session; the meta-tools stand on their own."""
     global _promotion
     if _promotion is not None:
         return
@@ -63,7 +63,7 @@ def _on_session_end(**_kwargs) -> None:
 
 
 def register(ctx) -> None:
-    """Register the five ``net_*`` mesh tools + the session lifecycle hooks.
+    """Register the ``net_*`` mesh tools + the session lifecycle hooks.
 
     Called once by the plugin loader when ``net`` is in ``plugins.enabled``.
     Every tool shares ``check_fn`` = local node/SDK health (never "peers

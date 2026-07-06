@@ -53,6 +53,22 @@ _lock = threading.Lock()
 # the wheel has the `delegation` feature, else None (un-delegated dev node).
 _state: Optional[Tuple[object, object, str, object]] = None
 
+# The operator device-enrollment coordinator + its live serve handle, built
+# lazily on first mesh-admin tool use (needs a root seed). `(operator, handle)`.
+_operator: Optional[Tuple[object, object]] = None
+
+# The `root -> device` grant lifetime an enrolled device receives: **1 year**
+# (the token ceiling). The lifecycle model:
+#   * long grant so an enrolled device survives restarts without re-pairing;
+#   * **silent, automatic renewal** while the device is healthy and root policy
+#     permits (re-issued before expiry, re-recording the device so its expiry
+#     stays fresh) — a follow-on to this slice;
+#   * **manual revocation is always immediate** — bumping the device's floor
+#     denies its next invocation regardless of the grant's remaining lifetime;
+#   * an **expiry warning** surfaces (via `net_mesh_devices`) before the annual
+#     grant lapses, so a device that renewal couldn't reach gets attention.
+_GRANT_TTL_SECONDS = 365 * 24 * 60 * 60
+
 
 def _config() -> dict:
     return {
@@ -103,7 +119,13 @@ def _build() -> Tuple[object, object, str, object]:
                 "net plugin: delegation surface unavailable (%s); running un-delegated", e
             )
 
-    mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed)
+    # `permissive_channels=True` matches the Rust default (no strict
+    # ChannelConfigRegistry on the node). Required for the mesh nRPC surface —
+    # capability invoke *and* enrollment serving use reply channels whose names
+    # are dynamic per-caller-origin and can't be pre-registered. Capability
+    # security is unaffected (owner-scope / consent / delegation gate at the
+    # capability layer, not the channel layer).
+    mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed, permissive_channels=True)
 
     if cfg["peers"]:
         try:
@@ -253,15 +275,90 @@ def delegation_valid_for_invoke() -> bool:
         return False
 
 
+def mesh():
+    """The embedded :class:`net.NetMesh` — the raw node handle (for enrollment
+    rendezvous / serving)."""
+    return get_state()[0]
+
+
+def _build_operator(mesh_handle) -> Tuple[object, object]:
+    """Build the operator device-enrollment coordinator from the root seed and
+    start serving enrollment (auto — the invite is the authorization) on the
+    already-built `mesh_handle`, so minted invites are dialable. Returns
+    ``(operator, serve_handle)``.
+
+    Takes the mesh explicitly rather than calling ``mesh()`` because the caller
+    already holds ``_lock`` — and ``mesh()`` → ``get_state()`` re-acquires it
+    (``threading.Lock`` is not reentrant, so that would deadlock).
+    """
+    from net import Identity, OperatorEnrollment
+
+    cfg = _config()
+    if not cfg["identity_seed"]:
+        raise RuntimeError(
+            "net plugin: mesh device enrollment needs the user root identity; "
+            "set NET_MESH_IDENTITY_SEED"
+        )
+    root = Identity.from_seed(bytes.fromhex(cfg["identity_seed"]))
+
+    # Store paths: the machine-shared defaults (the same files `net wrap` /
+    # `net identity revoke` use) unless overridden — tests point these at a
+    # temp dir so they never touch the real inventory.
+    dev = (os.environ.get("NET_MESH_DEVICE_STORE") or "").strip() or None
+    rev = (os.environ.get("NET_MESH_REVOCATION_STORE") or "").strip() or None
+    if dev and rev:
+        operator = OperatorEnrollment(root, dev, rev)
+    else:
+        operator = OperatorEnrollment.with_default_paths(root)
+
+    # Serve enrollment on the node so an operator's invite can actually be
+    # redeemed. Auto-admit (invite-as-authorization) is the v1 model; an
+    # operator-approval-gated serve is the follow-up.
+    handle = mesh_handle.serve_enrollment_auto(operator, _GRANT_TTL_SECONDS)
+    return (operator, handle)
+
+
+def operator():
+    """The :class:`net.OperatorEnrollment` for this node's root, serving
+    enrollment on the node. Built once (needs ``NET_MESH_IDENTITY_SEED``).
+
+    Raises :class:`RuntimeError` when no root seed is set — device enrollment
+    is an operator action that requires the user root to sign delegations.
+    """
+    global _operator
+    if _operator is not None:
+        return _operator[0]
+    # Fail fast (and cheaply — no node build) when there's no root to sign as.
+    if not _config()["identity_seed"]:
+        raise RuntimeError(
+            "net plugin: mesh device enrollment needs the user root identity; "
+            "set NET_MESH_IDENTITY_SEED"
+        )
+    # Build the node BEFORE taking our lock: `mesh()` → `get_state()` acquires
+    # `_lock` itself, and `threading.Lock` is not reentrant.
+    mesh_handle = mesh()
+    with _lock:
+        if _operator is None:
+            _operator = _build_operator(mesh_handle)
+        return _operator[0]
+
+
 def shutdown() -> None:
     """Tear the node down (best-effort, idempotent). Called at session end."""
-    global _state
+    global _state, _operator
     with _lock:
+        op_handle = _operator[1] if _operator is not None else None
+        _operator = None
         if _state is None:
             return
-        mesh = _state[0]
+        mesh_handle = _state[0]
         _state = None
+    if op_handle is not None:
+        try:
+            op_handle.stop()
+        except Exception:  # noqa: BLE001 — cleanup must not fail session end
+            logger.debug("net plugin: enrollment serve-handle stop failed", exc_info=True)
     try:
-        mesh.shutdown()
+        mesh_handle.shutdown()
     except Exception as e:  # noqa: BLE001 — session end must not fail on cleanup
         logger.debug("net plugin: shutdown error: %s", e)

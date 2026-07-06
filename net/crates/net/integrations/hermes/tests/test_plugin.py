@@ -18,11 +18,16 @@ pytest.importorskip("net")
 pytest.importorskip("net_sdk")
 
 TOOL_NAMES = {
+    # Capability meta-tools.
     "net_search_capabilities",
     "net_describe_capability",
     "net_invoke_capability",
     "net_list_pinned_capabilities",
     "net_request_pin",
+    # Device-enrollment (mesh admin) tools (V2 Phase 1).
+    "net_mesh_invite",
+    "net_mesh_devices",
+    "net_mesh_revoke",
 }
 
 
@@ -33,7 +38,7 @@ def _run(coro):
 # --- registration ----------------------------------------------------------
 
 
-def test_register_wires_five_tools_and_hook(plugin, ctx):
+def test_register_wires_all_tools_and_hook(plugin, ctx):
     plugin.register(ctx)
     assert set(ctx.tools) == TOOL_NAMES
     for name, entry in ctx.tools.items():

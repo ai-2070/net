@@ -381,7 +381,7 @@ mod tests {
         let op = OperatorEnrollment::new(
             root.clone(),
             dir.path().join("devices.json"),
-            dir.path().join("rev.json"),
+            dir.path().join("revocations.json"),
         );
         (op, root, dir)
     }

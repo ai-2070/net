@@ -22,7 +22,7 @@ def _operator(tmp_path, root=None):
     op = net.OperatorEnrollment(
         root,
         str(tmp_path / "devices.json"),
-        str(tmp_path / "rev.json"),
+        str(tmp_path / "revocations.json"),
     )
     return op, root
 
@@ -104,7 +104,7 @@ def test_handle_join_request_rejects_are_coded(tmp_path):
     # A request against an invite this operator never minted.
     stray_root = net.Identity.generate()
     stray_op = net.OperatorEnrollment(
-        stray_root, str(tmp_path / "d2.json"), str(tmp_path / "r2.json")
+        stray_root, str(tmp_path / "devices2.json"), str(tmp_path / "revocations2.json")
     )
     stray_invite = stray_op.invite("relay://rv", 300)
     device = net.Identity.generate()
@@ -171,7 +171,7 @@ def test_live_enrollment_over_the_mesh(tmp_path):
     op_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
     op_mesh.start()
     op = net.OperatorEnrollment(
-        root, str(tmp_path / "d.json"), str(tmp_path / "r.json")
+        root, str(tmp_path / "devices.json"), str(tmp_path / "revocations.json")
     )
     handle = op_mesh.serve_enrollment_auto(op, 3600)
     assert handle.serving is True

@@ -269,7 +269,7 @@ mod tests {
         let op = Arc::new(OperatorEnrollment::new(
             root.clone(),
             dir.path().join("devices.json"),
-            dir.path().join("rev.json"),
+            dir.path().join("revocations.json"),
         ));
         let _handle = operator_mesh
             .serve_enrollment(
@@ -335,7 +335,7 @@ mod tests {
         let op = Arc::new(OperatorEnrollment::new(
             root.clone(),
             dir.path().join("devices.json"),
-            dir.path().join("rev.json"),
+            dir.path().join("revocations.json"),
         ));
         // The operator denies this request.
         let _handle = operator_mesh
