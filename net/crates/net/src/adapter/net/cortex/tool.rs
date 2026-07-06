@@ -460,6 +460,14 @@ pub struct ToolMetadataRequest {
 /// failed."
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one transient response per tool.metadata.fetch RPC, decoded and \
+              immediately consumed — boxing the descriptor would add an \
+              allocation + wire-invisible indirection to every Found for a \
+              stack-size win nothing is sensitive to (ToolDescriptor crossed \
+              the 200-byte lint threshold when pricing_terms landed)"
+)]
 pub enum ToolMetadataResponse {
     /// Host has a `serve_tool` registration for `name`; descriptor
     /// has every field the registry holds. `node_count` is left at

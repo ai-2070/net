@@ -486,11 +486,14 @@ jobs:
       # `tests/cross_lang_payments/` (the Node / Python / Go verifiers run
       # in their own jobs off the same fixture; see the fixture README).
       # Rides this job to share the sdk cargo cache — the crate depends on
-      # net-mesh + net-mesh-sdk, both already built here.
-      - name: Run net-payments tests (includes payments_golden_vectors)
+      # net-mesh + net-mesh-sdk, both already built here. `--all-features`
+      # turns on `mcp-gate`, whose composition tests drive the real
+      # `gated_invoke` payment gate end to end — without it they compile
+      # to an empty test binary and the WS4 contract goes unverified.
+      - name: Run net-payments tests (includes payments_golden_vectors + mcp_gate_composition)
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
-        run: cargo test
+        run: cargo test --all-features
 
   node-tests:
     name: Node bindings tests (vitest)

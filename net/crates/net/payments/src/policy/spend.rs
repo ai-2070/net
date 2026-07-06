@@ -116,6 +116,21 @@ pub enum ApprovalState {
     Approved,
 }
 
+/// One held quote awaiting (or granted) approval. The record carries the
+/// quote's canonical bytes so a retry after approval redeems **the same
+/// provider-signed quote** the human saw — approval of quote X never
+/// authorizes some later quote Y.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub state: ApprovalState,
+    /// Capability the quote binds (display form), for redemption lookup.
+    #[serde(default)]
+    pub capability: String,
+    /// The quote envelope's canonical bytes, base64.
+    #[serde(default)]
+    pub quote_b64: String,
+}
+
 /// On-disk shape. Struct wrapper (not a bare map) for schema headroom,
 /// per the store convention.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -133,7 +148,7 @@ pub struct SpendPolicyFile {
     counters: BTreeMap<String, String>,
     /// Approval records keyed by quote id.
     #[serde(default)]
-    approvals: BTreeMap<String, ApprovalState>,
+    approvals: BTreeMap<String, ApprovalRecord>,
 }
 
 /// The caller-side spend gate over one shared policy file.
@@ -211,6 +226,14 @@ impl SpendPolicyEngine {
         let capability = quote.capability.clone();
         let day = now_ns / NS_PER_DAY;
         let counter_key = format!("{day}|{network}|{}", requirements.asset);
+        // Held with the pending record so a post-approval retry redeems
+        // this exact provider-signed quote.
+        let quote_b64 = crate::core::canonical::canonical_bytes(quote)
+            .map(|b| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(b)
+            })
+            .map_err(|e| SpendError::Malformed(e.to_string()))?;
 
         let approve_hint =
             format!("approve quote {quote_id} via the payments consent API (operator surface)");
@@ -220,12 +243,19 @@ impl SpendPolicyEngine {
             s.counters
                 .retain(|k, _| counter_day(k).is_some_and(|d| d + COUNTER_RETAIN_DAYS >= day));
 
-            let approved = s.approvals.get(&quote_id) == Some(&ApprovalState::Approved);
+            let approved = s
+                .approvals
+                .get(&quote_id)
+                .is_some_and(|r| r.state == ApprovalState::Approved);
             let limits = s.per_capability.get(&capability).unwrap_or(&s.defaults).clone();
 
             let require = |s: &mut SpendPolicyFile, policy_reason: String| {
                 // The model-reachable side writes pending only.
-                s.approvals.entry(quote_id.clone()).or_insert(ApprovalState::Pending);
+                s.approvals.entry(quote_id.clone()).or_insert(ApprovalRecord {
+                    state: ApprovalState::Pending,
+                    capability: capability.clone(),
+                    quote_b64: quote_b64.clone(),
+                });
                 SpendDecision::RequiresPaymentApproval {
                     quote_id: quote_id.clone(),
                     policy_reason,
@@ -305,13 +335,49 @@ impl SpendPolicyEngine {
         Ok(decision)
     }
 
+    /// Release a reservation made by [`Self::check_and_reserve`] after a
+    /// terminal failure where value verifiably did not move (provider
+    /// rejected pre-settle, facilitator refused). Saturating at zero;
+    /// callers treat failure as over-counting (the fail-closed
+    /// direction), never as blocked spending.
+    pub async fn release_reservation(
+        &self,
+        quote: &PaymentQuote,
+        now_ns: u64,
+    ) -> Result<(), SpendError> {
+        let requirements = quote.requirements.view();
+        let amount = AtomicAmount::parse(&requirements.amount)
+            .map_err(|e| SpendError::Malformed(e.to_string()))?;
+        let key =
+            format!("{}|{}|{}", now_ns / NS_PER_DAY, requirements.network, requirements.asset);
+        mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            if let Some(raw) = s.counters.get(&key) {
+                if let Ok(current) = AtomicAmount::parse(raw) {
+                    let reduced = current
+                        .checked_sub(&amount)
+                        .unwrap_or_else(|_| AtomicAmount::from_u128(0));
+                    s.counters.insert(key.clone(), reduced.to_canonical_string());
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Operator-only verb: approve a specific quote. Resolves through the
     /// SDK consent API (Hermes/OpenClaw render the prompt); the shared
     /// store holds the decision. Returns whether state changed.
     pub async fn approve(&self, quote_id: &str) -> Result<bool, SpendError> {
         let quote_id = quote_id.to_string();
         let changed = mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
-            s.approvals.insert(quote_id, ApprovalState::Approved) != Some(ApprovalState::Approved)
+            let record = s.approvals.entry(quote_id).or_insert(ApprovalRecord {
+                state: ApprovalState::Pending,
+                capability: String::new(),
+                quote_b64: String::new(),
+            });
+            let changed = record.state != ApprovalState::Approved;
+            record.state = ApprovalState::Approved;
+            changed
         })
         .await?;
         Ok(changed)
@@ -333,9 +399,44 @@ impl SpendPolicyEngine {
         Ok(state
             .approvals
             .iter()
-            .filter(|(_, v)| **v == ApprovalState::Pending)
+            .filter(|(_, v)| v.state == ApprovalState::Pending)
             .map(|(k, _)| k.clone())
             .collect())
+    }
+
+    /// An approved-but-unredeemed held quote for `capability`, if any:
+    /// `(quote_id, canonical quote bytes)`. The flow redeems this before
+    /// requesting a fresh quote, so the human's approval applies to the
+    /// exact quote they saw.
+    pub async fn approved_quote(
+        &self,
+        capability: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
+        use base64::Engine as _;
+        let state: SpendPolicyFile = load_json(&self.path).await?;
+        for (quote_id, record) in &state.approvals {
+            if record.state == ApprovalState::Approved
+                && record.capability == capability
+                && !record.quote_b64.is_empty()
+            {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&record.quote_b64)
+                    .map_err(|e| SpendError::Malformed(e.to_string()))?;
+                return Ok(Some((quote_id.clone(), bytes)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drop an approval record (redeemed after a successful pay, or a
+    /// stale hold for an expired quote).
+    pub async fn clear_approval(&self, quote_id: &str) -> Result<(), SpendError> {
+        let quote_id = quote_id.to_string();
+        mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            s.approvals.remove(&quote_id);
+        })
+        .await?;
+        Ok(())
     }
 
     /// Today's reserved total for a `(network, x402 asset)` pair.

@@ -35,6 +35,11 @@ net = { package = "net-mesh", version = "0.31.0", path = "..", default-features 
 # store mirrors (`CapabilityId`, the locked-store pattern) and is the
 # surface WS4 composes against (gateway / publish options).
 net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../sdk", default-features = false }
+# The MCP demand-side gate seam (`net_mcp::serve::PaymentFlow`).
+# Optional, behind `mcp-gate`: only payment-aware gateway hosts (the
+# Python binding, agent runtimes) pull the adapter; the payments core
+# stays adapter-free. The adapter never depends back on this crate.
+net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../adapters/mcp", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -58,6 +63,13 @@ async-trait = "0.1"
 # std::sync::Mutex::lock — poisoning is unhandled everywhere here).
 parking_lot = "0.12"
 tracing = "0.1"
+
+[features]
+# Implements `net_mcp::serve::PaymentFlow` for the caller flow, so the
+# gated-invoke composition can clear paid capabilities through this
+# crate's spend engine + lifecycle. Off by default — payments users who
+# never touch the MCP gateway don't pay the adapter's build cost.
+mcp-gate = ["dep:net-mcp"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }

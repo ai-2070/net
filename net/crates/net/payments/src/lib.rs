@@ -34,6 +34,9 @@
 //!   under provider policy, verify/settle orchestration, the consumed-
 //!   payload replay index, idempotent completion, signed verification
 //!   chains with reorg freeze, billing emission.
+//! - [`flow`] — the caller-side flow: terms → quote → spend policy →
+//!   payload → pay, over a [`flow::ProviderChannel`]. The `mcp-gate`
+//!   feature plugs it into `gated_invoke` as the payment gate.
 //! - [`policy`] — the locked payment state store (pins pattern) + spend
 //!   policy engine.
 //!
@@ -46,6 +49,7 @@ pub mod billing;
 pub mod core;
 pub mod engine;
 pub mod facilitator;
+pub mod flow;
 pub mod policy;
 pub mod x402;
 
