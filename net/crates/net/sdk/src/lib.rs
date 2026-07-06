@@ -141,6 +141,12 @@ pub mod devices;
 // authority + device registry + revocation store into one coordinator.
 #[cfg(feature = "net")]
 pub mod operator;
+// Live enrollment over the mesh (Hermes V2 Phase 1 Slice B2b) — `mesh.join` /
+// `mesh.serve_enrollment` via direct-addressed nRPC. Needs `cortex` for the
+// nRPC surface, so gated net+cortex (the `operator` facade above is
+// transport-independent and rides `net` alone).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub mod mesh_enroll;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -252,6 +258,8 @@ pub use crate::enrollment::{
 #[cfg(feature = "net")]
 pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegistry};
 // Operator-surface convenience re-exports (V2 Phase 1).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub use crate::mesh_enroll::{JoinFlowError, ENROLLMENT_SERVICE};
 #[cfg(feature = "net")]
 pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]
