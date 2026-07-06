@@ -136,6 +136,11 @@ pub mod enrollment;
 // discipline. Rides `net` (records `EntityId`s).
 #[cfg(feature = "net")]
 pub mod devices;
+// Operator-side mesh management (Hermes V2 Phase 1) — the transport-independent
+// `mesh.invite/approve/revoke/devices` surface, composing the enrollment
+// authority + device registry + revocation store into one coordinator.
+#[cfg(feature = "net")]
+pub mod operator;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -245,6 +250,9 @@ pub use crate::enrollment::{
 // `mesh.devices()`.
 #[cfg(feature = "net")]
 pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegistry};
+// Operator-surface convenience re-exports (V2 Phase 1).
+#[cfg(feature = "net")]
+pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};
 #[cfg(feature = "net")]

@@ -158,7 +158,9 @@ fn nibble_hex(n: u8) -> char {
         .to_ascii_uppercase()
 }
 
-fn now_unix() -> u64 {
+/// Current unix-seconds, or 0 if the clock is before the epoch. Shared with the
+/// operator facade so both read time the same way.
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
