@@ -481,14 +481,16 @@ impl CallerPaymentFlow {
         }
     }
 
-    /// Can this caller author a payment for these requirements?
+    /// Can this caller author a payment for these requirements? The
+    /// mock network always; a real network's `exact` entry when its
+    /// CAIP-2 namespace (`eip155`, `solana`) has a registered signer.
     fn can_settle(&self, requirements: &PaymentRequirements) -> bool {
         if requirements.network.starts_with("mock:") {
             return true;
         }
         let namespace = requirements.network.split(':').next().unwrap_or_default();
         requirements.scheme == "exact"
-            && namespace == "eip155"
+            && matches!(namespace, "eip155" | "solana")
             && self.signers.contains_key(namespace)
     }
 
@@ -513,7 +515,9 @@ impl CallerPaymentFlow {
                 "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
                 "nonce": nonce,
             })
-        } else if self.can_settle(requirements) {
+        } else if self.can_settle(requirements)
+            && requirements.network.starts_with("eip155:")
+        {
             // exact / eip155: EIP-3009 typed data through the signer.
             let signer = self
                 .signers
@@ -525,6 +529,26 @@ impl CallerPaymentFlow {
             let signature =
                 signer.sign_typed_data(&typed).await.map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
+        } else if self.can_settle(requirements)
+            && requirements.network.starts_with("solana:")
+        {
+            // exact / solana: the wallet authors a partially-signed SPL
+            // transfer for the intent derived from the quoted
+            // requirements. Retry honesty: the wallet may bind a fresh
+            // blockhash, so same-quote retries can produce *different*
+            // payload bytes — idempotency holds at the quote (a served
+            // quote returns its original billing event), not at
+            // payload byte-identity as on eip155.
+            let signer = self
+                .signers
+                .get("solana")
+                .ok_or_else(|| "no solana signer configured".to_string())?;
+            let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
+                .map_err(|e| e.to_string())?;
+            let transaction =
+                signer.sign_svm_transfer(&intent).await.map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_svm::payload_object(&transaction)
+                .map_err(|e| e.to_string())?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}` (fail-closed)",

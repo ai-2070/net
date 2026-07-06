@@ -3031,6 +3031,16 @@ impl MeshNode {
         self.identity.entity_id()
     }
 
+    /// This node's ed25519 identity keypair — the one handed to
+    /// `MeshNode::new`. In-process surfaces that must sign *as the
+    /// node* (e.g. the payments caller flow binding quotes and
+    /// invocation proofs to the node identity) borrow it here; it
+    /// never crosses a language boundary. Same exposure precedent as
+    /// `compute::host` and `behavior::deck`.
+    pub fn entity_keypair(&self) -> &EntityKeypair {
+        &self.identity
+    }
+
     /// Look up a peer's pinned `entity_id`, if the TOFU binding
     /// has been established. Returns `None` before we've received
     /// a signature-verified `CapabilityAnnouncement` from the peer.

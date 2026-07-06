@@ -229,3 +229,75 @@ def test_async_gateway_accepts_payment_kwargs(mesh, tmp_path):
         return json.loads(await gw.search(""))
 
     assert asyncio.run(roundtrip())["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# The settlement signer *reference* surface (P1 WS2): the payer address plus
+# a callable that signs EIP-712 typed data. The contract pinned here: the
+# pair is both-or-neither, needs the policy store, must be callable — and
+# there is NO kwarg that accepts key material (the negative test is that
+# these four are the entire payment surface).
+# ---------------------------------------------------------------------------
+
+
+def test_payment_signer_reference_constructs_a_gateway(mesh, tmp_path):
+    def signer(typed_data_json: str) -> str:
+        raise AssertionError("never invoked at construction")
+
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_address="0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            payment_signer=signer,
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    # Construction wires the signer but never calls it; free tools unchanged.
+    assert json.loads(gw.search(""))["status"] == "ok"
+
+
+def test_payment_signer_pair_is_both_or_neither(mesh, tmp_path):
+    policy = str(tmp_path / "payment-policy.json")
+    with pytest.raises(ValueError):
+        CapabilityGateway(
+            mesh, payment_policy_path=policy, payment_signer_address="0xpayer"
+        )
+    with pytest.raises(ValueError):
+        CapabilityGateway(
+            mesh, payment_policy_path=policy, payment_signer=lambda t: "0x"
+        )
+
+
+def test_payment_signer_requires_the_policy_path(mesh):
+    with pytest.raises(ValueError):
+        CapabilityGateway(
+            mesh,
+            payment_signer_address="0xpayer",
+            payment_signer=lambda t: "0x",
+        )
+
+
+def test_payment_signer_must_be_callable(mesh, tmp_path):
+    with pytest.raises(ValueError):
+        CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_address="0xpayer",
+            payment_signer="not-a-callable",
+        )
+
+
+def test_no_payment_kwarg_accepts_key_material(mesh, tmp_path):
+    """The key-invariant negative test, binding-level: a private key is
+    unrepresentable on this surface. Any kwarg smelling of key bytes is
+    rejected as an unexpected argument — the signer *reference* (address +
+    callable) is the only way in, and the callable only ever sees typed
+    data."""
+    for kwarg in ("payment_private_key", "payment_secret", "payment_key_bytes"):
+        with pytest.raises(TypeError):
+            CapabilityGateway(
+                mesh,
+                payment_policy_path=str(tmp_path / "payment-policy.json"),
+                **{kwarg: b"\x11" * 32},
+            )

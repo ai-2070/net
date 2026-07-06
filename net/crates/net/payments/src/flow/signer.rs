@@ -40,12 +40,34 @@ impl SignerError {
 /// The settlement signer for scheme payload authoring.
 #[async_trait]
 pub trait SchemeSigner: Send + Sync {
-    /// The payer address this signer controls (`0x…` for eip155).
+    /// The payer address this signer controls (`0x…` for eip155,
+    /// base58 for solana).
     fn address(&self) -> String;
 
     /// Sign an EIP-712 typed-data document (`eth_signTypedData_v4`
     /// shape). Returns the 65-byte `r‖s‖v` signature as `0x…` hex.
     async fn sign_typed_data(&self, typed_data: &Value) -> Result<String, SignerError>;
+
+    /// Author a **partially-signed** SVM transaction for a typed
+    /// transfer intent (exact-SVM: SPL `TransferChecked`, fee payer =
+    /// `intent.fee_payer`, recent blockhash fetched by the wallet).
+    /// Returns the base64-serialized versioned transaction. The intent
+    /// is the whole document — same doctrine as typed data: a
+    /// policy-bearing wallet inspects the amount, mint, and recipient
+    /// it is authorizing; there is no raw-bytes path.
+    ///
+    /// Defaulted to a structured refusal: an EVM signer registered
+    /// under the wrong namespace fails closed instead of authoring
+    /// something it does not understand.
+    async fn sign_svm_transfer(
+        &self,
+        intent: &crate::x402::schemes::exact_svm::SvmTransferIntent,
+    ) -> Result<String, SignerError> {
+        let _ = intent;
+        Err(SignerError::new(
+            "this signer does not author solana transactions",
+        ))
+    }
 }
 
 type SignFuture = Pin<Box<dyn Future<Output = Result<String, SignerError>> + Send>>;
@@ -77,6 +99,52 @@ impl SchemeSigner for ExternalSigner {
 
     async fn sign_typed_data(&self, typed_data: &Value) -> Result<String, SignerError> {
         (self.sign)(typed_data.clone()).await
+    }
+}
+
+/// The externally-held SVM wallet: the host's callback receives the
+/// structured [`SvmTransferIntent`](crate::x402::schemes::exact_svm::SvmTransferIntent)
+/// and returns the base64 partially-signed versioned transaction. The
+/// wallet owns the key, the SPL transaction machinery, and the RPC
+/// connection for the recent blockhash — none of which enter Net.
+/// Registered under the `solana` namespace; its EVM method is a
+/// structured refusal by construction.
+pub struct ExternalSvmSigner {
+    address: String,
+    sign: Box<
+        dyn Fn(crate::x402::schemes::exact_svm::SvmTransferIntent) -> SignFuture + Send + Sync,
+    >,
+}
+
+impl ExternalSvmSigner {
+    pub fn new(
+        address: impl Into<String>,
+        sign: impl Fn(crate::x402::schemes::exact_svm::SvmTransferIntent) -> SignFuture
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self { address: address.into(), sign: Box::new(sign) }
+    }
+}
+
+#[async_trait]
+impl SchemeSigner for ExternalSvmSigner {
+    fn address(&self) -> String {
+        self.address.clone()
+    }
+
+    async fn sign_typed_data(&self, _typed_data: &Value) -> Result<String, SignerError> {
+        Err(SignerError::new(
+            "this signer authors solana transactions, not EIP-712 documents",
+        ))
+    }
+
+    async fn sign_svm_transfer(
+        &self,
+        intent: &crate::x402::schemes::exact_svm::SvmTransferIntent,
+    ) -> Result<String, SignerError> {
+        (self.sign)(intent.clone()).await
     }
 }
 

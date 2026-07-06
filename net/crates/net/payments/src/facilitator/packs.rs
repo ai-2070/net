@@ -94,14 +94,15 @@ pub fn cdp_base_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     }
 }
 
-/// Rung 3 — Solana mainnet via the CDP facilitator: **config-complete,
-/// not yet settleable.** The caller flow has no SVM settlement signer
-/// (the `SchemeSigner` seam is EVM-typed-data-shaped; the SVM extension
-/// is demand-scheduled per P1 WS2) and no SVM chain checker exists, so
-/// `required_tier` is deliberately absent (= `observed`): promising
-/// `confirmed(n)` with no checker to deliver it would make every
-/// settlement unservable. Until the signer lands, accepts[] entries on
-/// this network are honestly refused at selection (`can_settle`).
+/// Rung 3 — Solana mainnet via the CDP facilitator. Settleable through
+/// the exact-SVM seam (`SchemeSigner::sign_svm_transfer` /
+/// [`ExternalSvmSigner`](crate::flow::signer::ExternalSvmSigner) — the
+/// wallet builds and partially signs; without one, accepts[] entries on
+/// this network are honestly refused at selection). **No SVM chain
+/// checker exists yet**, so `required_tier` is deliberately absent
+/// (= `observed`, receipt trust) and no `rpc_endpoints` entry ships:
+/// promising `confirmed(n)` with no checker to deliver it would make
+/// every settlement unservable.
 pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     FacilitatorConfig {
         object: TAG_FACILITATOR_CONFIG.to_string(),

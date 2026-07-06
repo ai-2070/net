@@ -86,26 +86,32 @@ transaction hash and the printed verification chain here.
 
 - [ ] Enabled: date `____` · first settlement `____`
 
-## Rung 3 — Solana mainnet (CDP facilitator) · **config-complete, not settleable — deliberate**
+## Rung 3 — Solana mainnet (CDP facilitator) · **seam landed, enablement blocked on checker + conformance**
 
 - Pack: `packs::cdp_solana_mainnet(secret_ref)` — `(exact,
   solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp)`; registry `net-default-1`
   already carries SPL-USDC.
-- Two honest gaps block enablement, both demand-scheduled per P1 WS2/WS3:
-  1. **No SVM settlement signer.** The `SchemeSigner` seam is
-     EVM-typed-data-shaped; SPL presign is a trait extension, not a config
-     change. Until it lands, `can_settle` refuses solana accepts[] entries
-     at selection — the flow's structured `Denied`, never a fallback.
-  2. **No SVM chain checker.** The pack therefore deliberately omits
-     `required_tier` (= `observed`, receipt trust) and ships no
-     `rpc_endpoints` entry — promising `confirmed(n)` with no checker would
-     make every settlement unservable, and *claiming* one that doesn't
-     exist would be worse.
-- Enablement = SVM signer seam + SVM checker + this suite's shape run
-  against a solana pair. Config stays as shipped; the work is the two
-  seams.
+- **The SVM settlement seam is landed** (2026-07-06):
+  `SchemeSigner::sign_svm_transfer` (defaulted structured refusal) +
+  `ExternalSvmSigner` — intent-in/blob-out. Net derives the typed
+  `SvmTransferIntent` from the quoted requirements (spec-required
+  `extra.feePayer`, memo ≤ 256 bytes) and the **wallet** builds and
+  partially signs the versioned transaction: it owns the key, the SPL
+  machinery, and the blockhash RPC — none of which enter Net. Payload is
+  the spec-pinned `{"transaction": "<base64>"}`. e2e:
+  `tests/exact_svm_scheme_flow.rs` (paid lifecycle on the enabled
+  network; structured refusal without a wallet). Retry honesty: a
+  same-quote retry may re-author against a fresh blockhash, so
+  idempotency holds at the quote, not at payload byte-identity.
+- One honest gap still blocks serving above receipt trust: **no SVM
+  chain checker.** The pack therefore deliberately omits `required_tier`
+  (= `observed`) and ships no `rpc_endpoints` entry — promising
+  `confirmed(n)` with no checker would make every settlement
+  unservable, and *claiming* one that doesn't exist would be worse.
+- Enablement = SVM checker + this suite's shape run against a solana
+  pair (CDP credentials). Config stays as shipped.
 
-- [ ] SVM signer seam landed: `____` · checker: `____` · conformance: `____`
+- [x] SVM signer seam landed: `2026-07-06` · [ ] checker: `____` · [ ] conformance: `____`
 
 ## Rung 4 — xrpl: go/no-go record
 
@@ -121,9 +127,14 @@ Basis:
   `/verify`/`/settle`, settling XRP and RLUSD (+ USDC IOU) via presigned
   `Payment` blobs. The original blocker — no facilitator — no longer holds.
 - What enablement still requires, in dependency order:
-  1. an xrpl `SchemeSigner`-seam extension (presigned Payment blobs are a
-     different authoring shape from EIP-712 typed data — same trait
-     doctrine: typed operations in, signature out, no raw-bytes API);
+  1. an xrpl `SchemeSigner`-seam extension (presigned Payment blobs —
+     the SVM seam's intent-in/blob-out pattern instantiates directly).
+     **Blocked on a pinnable shape:** the pinned spec commit carries
+     `scheme_exact_*.md` for twelve chains but none for xrpl (verified
+     2026-07-06), so the payload object's shape is t54-vendor-defined
+     today; building against it would couple the money path to an
+     unversioned vendor format. The seam lands when the shape is pinned
+     (an upstream spec PR or versioned t54 documentation);
   2. registry entries for XRP and RLUSD (**deliberately not shipped** —
      the registry is an allowlist and absence is a hard reject; entries
      land with the conformance run, not before);
@@ -138,10 +149,15 @@ Basis:
 
 - [ ] xrpl seam: `____` · registry entries: `____` · t54 conformance: `____`
 
-## Carried alongside the ladder (unchanged from the P1 plan)
+## Carried alongside the ladder
 
 - Record the two-machine P0 demo (mock pack; `mesh_payments_e2e` is its
   shape).
-- Node-identity-bound payment caller in the Python gateway (needs an SDK
-  entity-keypair accessor).
-- Python/TS surfaces for signer references + the outbound HTTP-402 client.
+- ~~Node-identity-bound payment caller in the Python gateway~~ —
+  **landed 2026-07-06** (`MeshNode::entity_keypair()` /
+  `Mesh::entity_keypair()`; the gateway signs as the node).
+- ~~Python signer-reference surface~~ — **landed 2026-07-06**
+  (`payment_signer_address` + `payment_signer` kwargs; key material
+  unrepresentable, negative tests pinned). Still pending: a Python
+  surface for the outbound HTTP-402 client, and TS parity once the node
+  binding grows a payment flow (it has none today).

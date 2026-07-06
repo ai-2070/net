@@ -5,3 +5,4 @@
 //! feature-gated.
 
 pub mod exact_evm;
+pub mod exact_svm;
