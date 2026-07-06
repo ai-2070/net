@@ -234,6 +234,9 @@ async fn local_tools_are_discovered_described_and_invoked_across_two_nodes() {
     assert_eq!(echo.input_schema["properties"]["message"]["type"], "string");
     assert_eq!(echo.credential_status, "none");
     assert_eq!(echo.substitutability, "provider_local");
+    // The schema content hash rides over the wire so a consumer can cache by it.
+    assert_eq!(echo.schema_hash, net_mcp::wrap::schema_hash(&echo.input_schema));
+    assert!(!echo.schema_hash.is_empty());
 
     // Invoke: the mesh call reaches the callback invoker and the result
     // round-trips, structured content included.

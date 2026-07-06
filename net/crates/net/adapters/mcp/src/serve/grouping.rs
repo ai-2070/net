@@ -205,6 +205,7 @@ mod tests {
         cred: &str,
         schema: serde_json::Value,
     ) -> BridgedToolInfo {
+        let schema_hash = crate::wrap::schema_hash(&schema);
         BridgedToolInfo {
             tool_id: tool.to_string(),
             name: tool.to_string(),
@@ -221,6 +222,7 @@ mod tests {
             },
             visibility: "owner_only".to_string(),
             invocation_scope: "same_root_identity".to_string(),
+            schema_hash,
         }
     }
 

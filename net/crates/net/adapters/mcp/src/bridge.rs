@@ -76,6 +76,12 @@ pub struct BridgedToolInfo {
     pub visibility: String,
     /// Invocation scope (`same_root_identity` by default).
     pub invocation_scope: String,
+    /// Content hash of the input schema (`wrap::schema_hash`) so a consumer can
+    /// fetch-once / cache / invalidate-on-change without re-reading the whole
+    /// schema. Empty from a provider that predates schema hashing
+    /// (`#[serde(default)]` for forward-compat).
+    #[serde(default)]
+    pub schema_hash: String,
 }
 
 /// The describe service response: the wrap node's current bridged tools.
@@ -103,6 +109,7 @@ mod tests {
             substitutability: "provider_local".to_string(),
             visibility: "owner_only".to_string(),
             invocation_scope: "same_root_identity".to_string(),
+            schema_hash: "0123456789abcdef0123456789abcdef".to_string(),
         }
     }
 
@@ -136,5 +143,16 @@ mod tests {
     #[test]
     fn empty_response_is_the_default() {
         assert_eq!(DescribeResponse::default().tools.len(), 0);
+    }
+
+    #[test]
+    fn schema_hash_absent_defaults_to_empty_for_forward_compat() {
+        // A provider that predates schema hashing omits the field entirely; a
+        // newer consumer must still decode it (empty hash = "no cache key yet",
+        // never a decode failure).
+        let mut obj = serde_json::to_value(sample()).unwrap();
+        obj.as_object_mut().unwrap().remove("schema_hash");
+        let back: BridgedToolInfo = serde_json::from_value(obj).unwrap();
+        assert_eq!(back.schema_hash, "");
     }
 }

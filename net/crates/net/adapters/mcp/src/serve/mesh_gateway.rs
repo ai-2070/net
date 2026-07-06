@@ -782,6 +782,7 @@ mod tests {
             substitutability: "provider_equivalent".into(),
             visibility: "owner_only".into(),
             invocation_scope: "same_root_identity".into(),
+            schema_hash: String::new(),
         };
         // Build the group through the real path so the primary/provider list
         // come from grouping, not a hand-rolled struct. Collapse enabled: this

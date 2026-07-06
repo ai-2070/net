@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use blake2::{Blake2s256, Digest};
 use net_sdk::tool::ToolDescriptor;
 
 use super::credentials::CredentialStatus;
@@ -84,6 +85,63 @@ pub fn visibility_key(tool_id: &str) -> String {
 /// Metadata key holding a tool's invocation scope.
 pub fn invocation_scope_key(tool_id: &str) -> String {
     format!("tool::{tool_id}::invocation_scope")
+}
+/// Metadata key holding a tool's input-schema content hash.
+pub fn schema_hash_key(tool_id: &str) -> String {
+    format!("tool::{tool_id}::schema_hash")
+}
+
+/// A stable content hash of a tool's input JSON Schema, hex-encoded.
+///
+/// Computed over a **canonicalized** form (object keys sorted recursively) so
+/// it is invariant to key ordering: a forwarder that re-serializes the schema
+/// with a different key order — the classic drift bug — computes the *same*
+/// hash. A demand-side consumer keys a fetch-once / cache / invalidate-on-change
+/// entry by this value, so gossip + describe cost is O(unique schemas), not
+/// O(tools × nodes). 128 bits of BLAKE2s — ample collision resistance for a
+/// cache key, small enough to ride in the announce metadata.
+pub fn schema_hash(input_schema: &serde_json::Value) -> String {
+    // Canonical bytes: sort object keys recursively, then serialize — using an
+    // explicitly re-sorted map so the output is independent of serde_json's map
+    // ordering (BTreeMap vs. the `preserve_order` IndexMap). `to_vec` on a
+    // Value is infallible in practice; fall back to `{}` on the impossible
+    // error so this helper never fails a caller.
+    let canonical = canonicalize_json(input_schema);
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|_| b"{}".to_vec());
+    let mut hasher = Blake2s256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    hex_lower(&digest[..16])
+}
+
+/// Recursively sort object keys so equal schemas serialize identically
+/// regardless of the source key order.
+fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let sorted: serde_json::Map<String, serde_json::Value> = entries
+                .into_iter()
+                .map(|(k, val)| (k.clone(), canonicalize_json(val)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Lowercase hex of a byte slice (this crate carries no `hex` dependency).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Max length of a tool id, leaving headroom under the substrate's 255-char
@@ -230,6 +288,10 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
         invocation_scope_key(&tool_id),
         INVOCATION_SCOPE_SAME_ROOT.to_string(),
     );
+    bridge_metadata.insert(
+        schema_hash_key(&tool_id),
+        schema_hash(&tool.input_schema),
+    );
 
     LoweredTool {
         descriptor,
@@ -347,6 +409,42 @@ mod tests {
         );
         assert_eq!(lowered.descriptor.name, "raw");
         assert_eq!(lowered.descriptor.version, "0");
+    }
+
+    #[test]
+    fn schema_hash_is_canonical_stable_and_discriminating() {
+        // Same schema, different key order -> same hash (the forwarder /
+        // re-serialization drift the hash exists to defeat).
+        let a = json!({
+            "type": "object",
+            "properties": { "b": { "type": "string" }, "a": { "type": "integer" } }
+        });
+        let b = json!({
+            "properties": { "a": { "type": "integer" }, "b": { "type": "string" } },
+            "type": "object"
+        });
+        assert_eq!(schema_hash(&a), schema_hash(&b), "key order must not matter");
+        // A different schema -> a different hash.
+        let c = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
+        assert_ne!(schema_hash(&a), schema_hash(&c));
+        // Hex, 16 bytes = 32 chars.
+        assert_eq!(schema_hash(&a).len(), 32);
+        assert!(schema_hash(&a).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn lower_tool_carries_the_schema_hash_in_bridge_metadata() {
+        let tool = echo_tool();
+        let lowered = lower_tool(
+            &tool,
+            &ctx(CredentialStatus::Unknown, Substitutability::ProviderLocal),
+        );
+        let stored = lowered
+            .bridge_metadata
+            .get(&schema_hash_key("echo"))
+            .expect("schema_hash present");
+        assert_eq!(*stored, schema_hash(&tool.input_schema));
+        assert!(!stored.is_empty());
     }
 
     #[test]
