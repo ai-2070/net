@@ -1,0 +1,27 @@
+net/crates/net/payments/src/facilitator/mod.rs
+  s_928ee85c6ffc0a::t_2728a3b595ff5e 9-10,15
+net/crates/net/payments/tests/live_testnet_conformance.rs
+  s_928ee85c6ffc0a::t_187b1eb5c8e608 310
+  s_928ee85c6ffc0a::t_e2a1300f02c8b3 300-301
+  s_928ee85c6ffc0a::t_769a7934bc4858 1-299,302-309,311-344
+net/crates/net/payments/src/facilitator/packs.rs
+  s_928ee85c6ffc0a::t_71a1b2e4de3918 1-209
+net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md
+  s_928ee85c6ffc0a::t_d79f24252c33c7 1-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "51dc45faaee92ac6400ad30584b87b87f6ad94af",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
