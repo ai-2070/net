@@ -1,0 +1,26 @@
+net/crates/net/sdk/src/delegation.rs
+  s_a772df20f47a78::t_0bd4138aa179f2 296-307
+net/crates/net/sdk/src/lib.rs
+  s_a772df20f47a78::t_a4c7b59958bf9a 253-254
+net/crates/net/sdk/src/enrollment.rs
+  s_a772df20f47a78::t_9ae63f63a8f9e6 1349-1416
+  s_a772df20f47a78::t_b5996734de7864 948
+  s_a772df20f47a78::t_e4b395da80c257 55,60
+  s_a772df20f47a78::t_4c7e4e2ca1aa24 756-947,949-962
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7cc2d1a7766db38086bc244466dda70dd1dad988",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
