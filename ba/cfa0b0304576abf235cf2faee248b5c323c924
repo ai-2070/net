@@ -1,0 +1,32 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_a772df20f47a78::t_cf17f2107ed5b1 1507-1519
+net/crates/net/bindings/python/tests/test_enrollment.py
+  s_a772df20f47a78::t_f8a80cf0658a5f 244-281
+  s_a772df20f47a78::t_6df102a4c39631 167,176
+  s_a772df20f47a78::t_131bd1d2634bae 193
+net/crates/net/bindings/python/src/enrollment.rs
+  s_a772df20f47a78::t_b498b79598b789 651-652,655-658
+  s_a772df20f47a78::t_74383897fdd5af 481-482,484,486-491
+  s_a772df20f47a78::t_bc332b49b61084 525-530
+  s_a772df20f47a78::t_ff606ff09479b8 609-629,640-644,647
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a772df20f47a78::t_37b69e983e6512 1223-1227
+  s_a772df20f47a78::t_7f63cb69da20a8 694-703
+  s_a772df20f47a78::t_90ad0df0f98bc8 1252-1255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bacfa0b0304576abf235cf2faee248b5c323c924",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
