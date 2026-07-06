@@ -1,0 +1,56 @@
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_928ee85c6ffc0a::t_1a17baf7a10f46 829-832,835-850,854
+  s_928ee85c6ffc0a::t_7e090daa34c258 298-304,312-313,315-324,330,332-335,337-338
+  s_928ee85c6ffc0a::t_c86a2509f47009 382-386,406-411,413,416,423-425,429-467
+  s_928ee85c6ffc0a::t_ed4865a8c5fae8 670,680-681,688-689
+  s_928ee85c6ffc0a::t_7fbc3da7f493ea 552,562-563,570-571
+  s_928ee85c6ffc0a::t_30b7be98d4eb88 90-103,468
+  s_928ee85c6ffc0a::t_33978094c59a69 288-293
+  s_928ee85c6ffc0a::t_fb58c8fb927866 469
+net/crates/net/payments/src/flow/signer.rs
+  s_928ee85c6ffc0a::t_d5148ad026882c 105-150
+  s_928ee85c6ffc0a::t_53db38ac2f122d 43-44,50-70
+net/crates/net/payments/tests/exact_svm_scheme_flow.rs
+  s_928ee85c6ffc0a::t_fcc9ab9d604d33 1-227
+net/crates/net/docs/plans/PAYMENTS_P1_IMPLEMENTATION_PLAN.md
+  s_928ee85c6ffc0a::t_9bfb84ee5053c6 47-49
+  s_928ee85c6ffc0a::t_f2e4074dc8ed35 94
+net/crates/net/src/adapter/net/mesh.rs
+  s_928ee85c6ffc0a::t_6ddf1e5b005cdd 3034-3043
+net/crates/net/payments/src/x402/schemes/mod.rs
+  s_928ee85c6ffc0a::t_a1e5885136d581 8
+net/crates/net/payments/src/facilitator/packs.rs
+  s_928ee85c6ffc0a::t_7d2524d185e0dd 97-105
+net/crates/net/payments/src/x402/schemes/exact_svm.rs
+  s_928ee85c6ffc0a::t_69c3b27d058339 1-203
+net/crates/net/sdk/src/mesh.rs
+  s_928ee85c6ffc0a::t_ea1a58478d89a6 1115-1124
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_928ee85c6ffc0a::t_64733fff5d9627 2846-2847,2853-2857
+  s_928ee85c6ffc0a::t_4fb45fdefef812 2750-2751,2776-2792
+net/crates/net/bindings/python/tests/test_capability_gateway.py
+  s_928ee85c6ffc0a::t_f60839129b5923 232-303
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_9cbc06e569804d 518-520,532-551
+  s_928ee85c6ffc0a::t_7bf1b01775baec 484-486,493
+net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md
+  s_928ee85c6ffc0a::t_841f429480a1a4 89,94-114
+  s_928ee85c6ffc0a::t_0cb314a1f84f92 130-137
+  s_928ee85c6ffc0a::t_fe40b3cc1714ad 152,156-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0d12fc79910f982b04ea8b68c2fb588aad162a91",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
