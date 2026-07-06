@@ -46,6 +46,7 @@
 //! (`tests/cross_lang_payments/fixtures/x402/v2.0/...`), never "latest".
 
 pub mod billing;
+pub mod checker;
 pub mod core;
 pub mod engine;
 pub mod facilitator;

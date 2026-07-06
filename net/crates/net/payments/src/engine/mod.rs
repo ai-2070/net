@@ -39,6 +39,7 @@ use net::adapter::net::identity::{EntityId, EntityKeypair};
 use serde::{Deserialize, Serialize};
 
 use crate::billing::{BillingError, BillingLog};
+use crate::checker::{ChainChecker, ChainVerdict, TransferQuery};
 use crate::core::billing_event::BillingEvent;
 use crate::core::canonical::{EnvelopeError, ExtraFields, SignedEnvelope};
 use crate::core::idempotency::IdempotencyScope;
@@ -711,6 +712,235 @@ impl PaymentEngine {
         Ok(())
     }
 
+    /// Re-verify through the **independent chain checker** — the only
+    /// path to `confirmed(n)`/`final` (a facilitator receipt caps at
+    /// `observed`; the facilitator is never in the trust root above
+    /// that). The checker's verdicts land as first-class chain events:
+    /// inclusion upgrades the tier (and bills once the required tier is
+    /// reached), a reverted settlement invalidates and freezes, and a
+    /// delivered-amount mismatch — checked straight from the chain —
+    /// invalidates likewise. `Pending` claims nothing either way.
+    pub async fn re_verify_with_checker(
+        &self,
+        quote_id: &str,
+        checker: &dyn ChainChecker,
+        required_tier: VerificationTier,
+        now_ns: u64,
+    ) -> Result<PaymentDecision, EngineError> {
+        // Snapshot without holding the lock across checker I/O.
+        let state: EngineState = load_json(&self.state_path).await?;
+        let Some(rec) = state.quotes.get(quote_id) else {
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::BadQuote("unknown quote".into()),
+            });
+        };
+        if let Some(reason) = &rec.frozen {
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::QuoteFrozen(reason.clone()),
+            });
+        }
+        let Some(transaction) = rec.chain.last().and_then(|e| e.transaction.clone()) else {
+            return Ok(PaymentDecision::Rejected {
+                reason: RejectReason::BadQuote("quote has no settlement to check".into()),
+            });
+        };
+        let requirements: X402Carry<PaymentRequirements> = X402Carry::from_bytes(
+            BASE64
+                .decode(&rec.requirements_b64)
+                .map_err(|e| EngineError::State(e.to_string()))?,
+        )?;
+        let network = requirements.view().network.clone();
+        let required_amount = AtomicAmount::parse(&requirements.view().amount)
+            .map_err(|e| EngineError::State(e.to_string()))?;
+        let query = TransferQuery {
+            token: requirements.view().asset.clone(),
+            to: requirements.view().pay_to.clone(),
+        };
+
+        let verdict = match checker.check(&network, &transaction, Some(&query)).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(PaymentDecision::FacilitatorFailure {
+                    kind: if e.retryable {
+                        FacilitatorErrorKind::Unavailable
+                    } else {
+                        FacilitatorErrorKind::Protocol
+                    },
+                    retryable: e.retryable,
+                    message: format!("chain checker: {}", e.message),
+                })
+            }
+        };
+        let verifier = checker.reference();
+
+        let quote_id = quote_id.to_string();
+        type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
+        let (decision, fresh_billing) = mutate_json::<EngineState, Completion, _>(
+            &self.state_path,
+            |s| {
+                let rec = s
+                    .quotes
+                    .get_mut(&quote_id)
+                    .ok_or_else(|| EngineError::State("record vanished mid-check".into()))?;
+                if let Some(reason) = &rec.frozen {
+                    return Ok((
+                        PaymentDecision::Rejected {
+                            reason: RejectReason::QuoteFrozen(reason.clone()),
+                        },
+                        None,
+                    ));
+                }
+
+                match verdict {
+                    ChainVerdict::Pending => {
+                        // No event: pending is the absence of an answer,
+                        // and the chain stays an append-only record of
+                        // *facts*.
+                        let reached =
+                            last_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
+                        Ok((
+                            PaymentDecision::PendingTier { reached, required: required_tier },
+                            None,
+                        ))
+                    }
+                    ChainVerdict::Reverted => {
+                        let ev = self.build_event_with_verifier(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            VerificationTier::Observed,
+                            VerificationStatus::Invalidated {
+                                reason: InvalidationReason::Rejected,
+                            },
+                            verifier.clone(),
+                            now_ns,
+                            &[(
+                                "chain_status".to_string(),
+                                serde_json::Value::String("reverted".to_string()),
+                            )],
+                        )?;
+                        rec.chain.push(ev);
+                        rec.frozen = Some("settlement reverted on-chain".to_string());
+                        Ok((
+                            PaymentDecision::Invalidated { reason: InvalidationReason::Rejected },
+                            None,
+                        ))
+                    }
+                    ChainVerdict::Included { tier, ref delivered } => {
+                        // Delivered-amount cross-check, straight from the
+                        // chain: the exact-amount policy's independent leg.
+                        if let Some(delivered) = delivered {
+                            let delivered = AtomicAmount::parse(delivered)
+                                .map_err(|e| EngineError::State(e.to_string()))?;
+                            use std::cmp::Ordering;
+                            match delivered.cmp(&required_amount) {
+                                Ordering::Less => {
+                                    let ev = self.build_event_with_verifier(
+                                        rec,
+                                        &quote_id,
+                                        Some(transaction.clone()),
+                                        tier,
+                                        VerificationStatus::Invalidated {
+                                            reason: InvalidationReason::AmountMismatch,
+                                        },
+                                        verifier.clone(),
+                                        now_ns,
+                                        &[(
+                                            "delivered".to_string(),
+                                            serde_json::Value::String(
+                                                delivered.to_canonical_string(),
+                                            ),
+                                        )],
+                                    )?;
+                                    rec.chain.push(ev);
+                                    rec.frozen = Some("amount_mismatch".to_string());
+                                    return Ok((
+                                        PaymentDecision::Invalidated {
+                                            reason: InvalidationReason::AmountMismatch,
+                                        },
+                                        None,
+                                    ));
+                                }
+                                Ordering::Greater => {
+                                    let ev = self.build_event_with_verifier(
+                                        rec,
+                                        &quote_id,
+                                        Some(transaction.clone()),
+                                        tier,
+                                        VerificationStatus::Exception {
+                                            kind: ExceptionKind::Overpayment,
+                                        },
+                                        verifier.clone(),
+                                        now_ns,
+                                        &[(
+                                            "delivered".to_string(),
+                                            serde_json::Value::String(
+                                                delivered.to_canonical_string(),
+                                            ),
+                                        )],
+                                    )?;
+                                    rec.chain.push(ev);
+                                    return Ok((
+                                        PaymentDecision::Exception {
+                                            kind: ExceptionKind::Overpayment,
+                                        },
+                                        None,
+                                    ));
+                                }
+                                Ordering::Equal => {}
+                            }
+                        }
+
+                        let ev = self.build_event_with_verifier(
+                            rec,
+                            &quote_id,
+                            Some(transaction.clone()),
+                            tier,
+                            VerificationStatus::Verified,
+                            verifier.clone(),
+                            now_ns,
+                            &[],
+                        )?;
+                        rec.chain.push(ev);
+
+                        if let Some(billing) = &rec.billing {
+                            return Ok((
+                                PaymentDecision::Served {
+                                    billing: Box::new(billing.clone()),
+                                    tier,
+                                },
+                                None,
+                            ));
+                        }
+                        if tier.satisfies(&required_tier) {
+                            let billing = self.build_billing(
+                                rec,
+                                &quote_id,
+                                &transaction,
+                                required_amount.clone(),
+                                now_ns,
+                            )?;
+                            rec.billing = Some(billing.clone());
+                            rec.served = true;
+                            Ok((
+                                PaymentDecision::Served { billing: Box::new(billing.clone()), tier },
+                                Some(billing),
+                            ))
+                        } else {
+                            Ok((
+                                PaymentDecision::PendingTier { reached: tier, required: required_tier },
+                                None,
+                            ))
+                        }
+                    }
+                }
+            },
+        )
+        .await??;
+        self.publish_billing(fresh_billing).await?;
+        Ok(decision)
+    }
+
     /// The provider-side invocation gate: redeem a paid quote for its one
     /// invocation. Admits iff the quote is settled and billed, unfrozen,
     /// bound to `tool_id` (the capability's tool segment), and never
@@ -835,6 +1065,33 @@ impl PaymentEngine {
         now_ns: u64,
         extra: &[(String, serde_json::Value)],
     ) -> Result<VerificationEvent, EngineError> {
+        self.build_event_with_verifier(
+            rec,
+            quote_id,
+            transaction,
+            tier,
+            status,
+            self.facilitator.reference(),
+            now_ns,
+            extra,
+        )
+    }
+
+    /// Build + sign one chain event, recording *who* verified — the
+    /// facilitator for receipt-driven events, the independent chain
+    /// checker for everything above `observed`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_event_with_verifier(
+        &self,
+        rec: &QuoteRecord,
+        quote_id: &str,
+        transaction: Option<String>,
+        tier: VerificationTier,
+        status: VerificationStatus,
+        verifier: crate::core::verification::VerifierRef,
+        now_ns: u64,
+        extra: &[(String, serde_json::Value)],
+    ) -> Result<VerificationEvent, EngineError> {
         let prev = match rec.chain.last() {
             Some(last) => Some(last.chain_hash()?),
             None => None,
@@ -845,7 +1102,7 @@ impl PaymentEngine {
             transaction,
             tier,
             status,
-            verifier: self.facilitator.reference(),
+            verifier,
             prev,
             checked_at_ns: now_ns,
             signer: self.provider.entity_id().clone(),
