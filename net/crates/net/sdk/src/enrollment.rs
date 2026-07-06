@@ -492,6 +492,10 @@ pub mod reject {
     pub const REPLAY: u16 = 5;
     /// The operator side hit an internal error (store I/O, token minting).
     pub const INTERNAL: u16 = 6;
+    /// The operator (a human, or a policy) explicitly denied the request —
+    /// distinct from a failed check: the invite/signature were valid, the
+    /// operator said no.
+    pub const DENIED: u16 = 7;
 }
 
 /// The operator's response to a join request — the payload the enrollment RPC
@@ -682,6 +686,31 @@ impl EnrollmentAuthority {
         grant_ttl: Duration,
         max_depth: u8,
     ) -> Result<Enrollment, EnrollmentError> {
+        self.verify_request(request, invite, now)?;
+        self.spend_nonce(invite.nonce, invite.expires_at, now)?;
+        let chain =
+            DelegationChain::derive_device(&self.root, &request.device, grant_ttl, max_depth)?;
+        Ok(Enrollment {
+            chain,
+            device: request.device.clone(),
+            name: request.name.clone(),
+            tags: request.tags.clone(),
+        })
+    }
+
+    /// Validate a request against its invite **without** consuming the invite
+    /// or signing anything: names this mesh (1), unexpired (2), correct nonce
+    /// (3), holds its key (4). This is the check to run *before* asking a human
+    /// to approve — it lets an operator surface show a legitimate request
+    /// (device id / name / tags) and defer the single-use spend to the moment
+    /// of actual admission ([`Self::approve`]), so a request a human ultimately
+    /// denies never burns a still-good invite.
+    pub fn verify_request(
+        &self,
+        request: &JoinRequest,
+        invite: &InviteToken,
+        now: u64,
+    ) -> Result<(), EnrollmentError> {
         let root_id = self.root.entity_id();
         if &invite.root != root_id || &request.root != root_id {
             return Err(EnrollmentError::WrongMesh);
@@ -692,16 +721,7 @@ impl EnrollmentAuthority {
         if request.invite_nonce != invite.nonce {
             return Err(EnrollmentError::NonceMismatch);
         }
-        request.verify_self_signature()?;
-        self.spend_nonce(invite.nonce, invite.expires_at, now)?;
-        let chain =
-            DelegationChain::derive_device(&self.root, &request.device, grant_ttl, max_depth)?;
-        Ok(Enrollment {
-            chain,
-            device: request.device.clone(),
-            name: request.name.clone(),
-            tags: request.tags.clone(),
-        })
+        request.verify_self_signature()
     }
 
     /// [`Self::approve`] reading the system clock for `now`.

@@ -22,6 +22,7 @@
 //! identity is the key being enrolled, so the returned chain's leaf is exactly
 //! `mesh.identity()`.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,15 +139,56 @@ impl Mesh {
         .encode()
     }
 
-    /// **Operator side.** Register the enrollment service so devices can join
-    /// this mesh. `operator` mints/approves against the mesh root; `grant_ttl`
-    /// and `max_depth` parameterize the `root → device` delegation each
-    /// admitted device receives.
+    /// **Operator side.** Register the enrollment service, gating every valid
+    /// request through `approver` before it's admitted — the V2 threat model
+    /// ("a leaked invite lets someone *ask*, never admits them").
+    ///
+    /// `approver` is handed the (already-validated) [`JoinRequest`] so it can
+    /// surface the asker's device id / name / tags to the operator (a
+    /// Telegram/desktop prompt, a policy check, …) and returns `true` to admit.
+    /// A denial answers the device a coded `Rejected` and **doesn't** burn the
+    /// single-use invite, so the real device can still use it. `operator`
+    /// mints/signs against the mesh root; `grant_ttl` / `max_depth` shape each
+    /// `root → device` grant.
     ///
     /// Hold the returned [`ServeHandle`] for as long as enrollment should stay
     /// open — dropping it unregisters the service. The node must be `start()`ed
-    /// for its dispatch loop to answer.
-    pub fn serve_enrollment(
+    /// for its dispatch loop to answer. For headless auto-admission (invite is
+    /// the authorization), use [`Self::serve_enrollment_auto`].
+    pub fn serve_enrollment<F, Fut>(
+        &self,
+        operator: Arc<OperatorEnrollment>,
+        grant_ttl: Duration,
+        max_depth: u8,
+        approver: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        F: Fn(JoinRequest) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.serve_rpc_typed(ENROLLMENT_SERVICE, Codec::Json, move |req: Vec<u8>| {
+            let operator = operator.clone();
+            let approver = approver.clone();
+            async move {
+                // Never fails out of band: a malformed request, a denial, or a
+                // rejected check is a coded `JoinOutcome::Rejected` the device
+                // reads, so always `Ok(bytes)`.
+                Ok::<Vec<u8>, String>(
+                    operator
+                        .handle_join_request_approved(&req, grant_ttl, max_depth, approver)
+                        .await,
+                )
+            }
+        })
+    }
+
+    /// **Operator side, headless.** Register the enrollment service that
+    /// **auto-admits any valid single-use invite** — the invite *is* the
+    /// authorization. Weaker than [`Self::serve_enrollment`]: a leaked, still
+    /// valid invite gets its holder *admitted*, not just able to ask. Use only
+    /// where no operator surface exists (a scripted fleet enroll) and the
+    /// invite's short TTL + single-use are the whole gate.
+    pub fn serve_enrollment_auto(
         &self,
         operator: Arc<OperatorEnrollment>,
         grant_ttl: Duration,
@@ -155,9 +197,6 @@ impl Mesh {
         self.serve_rpc_typed(ENROLLMENT_SERVICE, Codec::Json, move |req: Vec<u8>| {
             let operator = operator.clone();
             async move {
-                // The handler never fails out of band: a malformed request or a
-                // rejected approval is a coded `JoinOutcome::Rejected` the
-                // device reads, so always `Ok(bytes)`.
                 Ok::<Vec<u8>, String>(operator.handle_join_request(&req, grant_ttl, max_depth))
             }
         })
@@ -237,6 +276,8 @@ mod tests {
                 op.clone(),
                 Duration::from_secs(3600),
                 DEFAULT_DELEGATION_DEPTH,
+                // Approve every request in this happy-path test.
+                |_req| async { true },
             )
             .expect("serve enrollment");
 
@@ -274,5 +315,61 @@ mod tests {
         // The invite was single-use — a replay of the same string now fails.
         let replay = device_mesh.join(&invite_str, "pc", vec![]).await;
         assert!(replay.is_err(), "single-use invite must not enroll twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_join_is_rejected_and_leaves_the_invite_usable() {
+        use crate::enrollment::{reject, JoinError};
+
+        let psk = [0x37u8; 32];
+        let root = Identity::generate();
+        let operator_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .unwrap()
+            .identity(root.clone())
+            .build()
+            .await
+            .unwrap();
+        operator_mesh.start();
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = Arc::new(OperatorEnrollment::new(
+            root.clone(),
+            dir.path().join("devices.json"),
+            dir.path().join("rev.json"),
+        ));
+        // The operator denies this request.
+        let _handle = operator_mesh
+            .serve_enrollment(
+                op.clone(),
+                Duration::from_secs(3600),
+                DEFAULT_DELEGATION_DEPTH,
+                |_req| async { false },
+            )
+            .expect("serve enrollment");
+
+        let invite = op.invite(operator_mesh.rendezvous_string(), Duration::from_secs(300));
+        let invite_str = invite.encode();
+
+        let device_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .unwrap()
+            .identity(Identity::generate())
+            .build()
+            .await
+            .unwrap();
+        device_mesh.start();
+
+        let err = device_mesh
+            .join(&invite_str, "pc", vec![])
+            .await
+            .expect_err("a denied join must fail");
+        assert!(matches!(
+            err,
+            JoinFlowError::Outcome(JoinError::Rejected { code, .. }) if code == reject::DENIED
+        ));
+
+        // Denial admitted nobody and did NOT burn the invite — it's still
+        // pending for the real device.
+        assert!(op.devices().unwrap().is_empty());
+        assert_eq!(op.pending_invites(0).len(), 1);
     }
 }

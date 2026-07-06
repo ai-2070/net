@@ -27,6 +27,7 @@
 //! the [`Enrollment`] whose `chain` it sends back.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -54,6 +55,11 @@ pub enum OperatorError {
     /// already redeemed (single-use), or expired and pruned.
     #[error("no outstanding invite matches this request")]
     UnknownInvite,
+    /// The operator (a human or a policy) explicitly denied an otherwise-valid
+    /// request. Distinct from a failed check — nothing about the invite or the
+    /// signature was wrong; admission was refused.
+    #[error("enrollment denied by the operator")]
+    Denied,
     /// The enrollment handshake rejected the request.
     #[error(transparent)]
     Enrollment(#[from] EnrollmentError),
@@ -176,6 +182,64 @@ impl OperatorEnrollment {
         Ok(enrollment)
     }
 
+    /// Approve an arriving request **only if the operator says so** — the model
+    /// the V2 threat model wants ("a leaked invite lets someone *ask*, never
+    /// admits them").
+    ///
+    /// Flow: find + validate the referenced invite for display
+    /// ([`EnrollmentAuthority::verify_request`], **no** single-use spend); await
+    /// `approver` (the operator's decision — e.g. a Telegram/desktop prompt);
+    /// only on approval commit the admission ([`Self::approve`], which spends
+    /// the invite against a *fresh* clock, so an invite that expired while the
+    /// human deliberated is correctly rejected) and record the device. A denied
+    /// request never burns the invite, so the real device can still use it.
+    pub async fn approve_with<F, Fut>(
+        &self,
+        request: &JoinRequest,
+        grant_ttl: Duration,
+        max_depth: u8,
+        approver: F,
+    ) -> Result<Enrollment, OperatorError>
+    where
+        F: FnOnce(JoinRequest) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        // Look up the invite (leave it in `pending`) and validate for display.
+        let invite = {
+            let now = now_unix();
+            let mut pending = self.pending.lock();
+            pending.retain(|_, inv| !inv.is_expired(now));
+            pending
+                .get(&request.invite_nonce)
+                .cloned()
+                .ok_or(OperatorError::UnknownInvite)?
+        };
+        self.authority
+            .verify_request(request, &invite, now_unix())?;
+
+        // The operator's decision — may take a while (a human on their phone).
+        if !approver(request.clone()).await {
+            return Err(OperatorError::Denied);
+        }
+
+        // Commit against a fresh clock: spends the invite + signs, re-running
+        // every check so a race or an expiry-during-approval is caught.
+        let enrollment =
+            self.authority
+                .approve(request, &invite, now_unix(), grant_ttl, max_depth)?;
+        DeviceRegistry::record(
+            &self.registry_path,
+            DeviceRecord::new(
+                enrollment.device.clone(),
+                enrollment.name.clone(),
+                enrollment.tags.clone(),
+                now_unix(),
+            ),
+        )?;
+        self.pending.lock().remove(&request.invite_nonce);
+        Ok(enrollment)
+    }
+
     /// Revoke a device, reading the system clock: raise its floor to generation
     /// 1 (kills all current delegations, matching `net identity revoke`) and
     /// stamp the inventory. (`mesh.revoke`.)
@@ -245,12 +309,49 @@ impl OperatorEnrollment {
         };
         outcome.to_bytes()
     }
+
+    /// The approval-gated server side: like [`Self::handle_join_request`], but
+    /// routes a valid request through `approver` before admitting it (see
+    /// [`Self::approve_with`]). A denial answers a coded `Rejected`, never an
+    /// out-of-band error.
+    pub async fn handle_join_request_approved<F, Fut>(
+        &self,
+        request_bytes: &[u8],
+        grant_ttl: Duration,
+        max_depth: u8,
+        approver: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(JoinRequest) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let outcome = match JoinRequest::from_bytes(request_bytes) {
+            Err(e) => JoinOutcome::Rejected {
+                code: reject::MALFORMED,
+                message: e.to_string(),
+            },
+            Ok(request) => match self
+                .approve_with(&request, grant_ttl, max_depth, approver)
+                .await
+            {
+                Ok(enrollment) => JoinOutcome::Admitted {
+                    chain: enrollment.chain.to_bytes(),
+                },
+                Err(e) => JoinOutcome::Rejected {
+                    code: reject_code(&e),
+                    message: e.to_string(),
+                },
+            },
+        };
+        outcome.to_bytes()
+    }
 }
 
 /// Map an [`OperatorError`] to a stable [`reject`] code for a [`JoinOutcome`].
 fn reject_code(err: &OperatorError) -> u16 {
     match err {
         OperatorError::UnknownInvite => reject::UNKNOWN_INVITE,
+        OperatorError::Denied => reject::DENIED,
         OperatorError::Enrollment(e) => match e {
             EnrollmentError::MalformedInvite(_) | EnrollmentError::MalformedRequest(_) => {
                 reject::MALFORMED
