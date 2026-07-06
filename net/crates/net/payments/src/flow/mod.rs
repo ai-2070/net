@@ -515,7 +515,16 @@ impl CallerPaymentFlow {
                 retryable: true,
             },
             Ok(PayResponse::Rejected { reason }) => {
-                self.release(&quote, now_ns).await;
+                // A provider holding a self-contained bearer authorization
+                // (exact/EIP-3009, exact/SPL) can claim "rejected" while
+                // still settling it — its claim is not proof the money
+                // stayed put. Keep the reservation for such schemes
+                // (fail-closed accounting, as on transport ambiguity);
+                // releasing it would reset the per-day counter every cycle
+                // and defeat `max_per_day` as a loss bound.
+                if reject_releases_reservation(&quote) {
+                    self.release(&quote, now_ns).await;
+                }
                 CallerDecision::Denied {
                     policy_reason: format!("provider rejected the payment: {reason}"),
                 }
@@ -529,7 +538,12 @@ impl CallerPaymentFlow {
                 retryable: false,
             },
             Ok(PayResponse::Failure { retryable, message }) => {
-                self.release(&quote, now_ns).await;
+                // Same bearer-authorization reasoning as `Rejected`: a
+                // claimed failure from a provider that holds the signed
+                // pull authorization is not proof of non-settlement.
+                if reject_releases_reservation(&quote) {
+                    self.release(&quote, now_ns).await;
+                }
                 CallerDecision::Failed { message, retryable }
             }
             Err(e) => {
@@ -633,6 +647,19 @@ impl CallerPaymentFlow {
             tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
         }
     }
+}
+
+/// Whether a provider's *claimed* rejection/failure is trustworthy enough
+/// to release the caller's spend reservation. Only the chainless mock
+/// test scheme qualifies. Every real scheme here authors a self-contained
+/// bearer pull authorization (exact/EIP-3009, exact/SPL) the counterparty
+/// could settle on-chain regardless of what it reports back, so a claimed
+/// non-settlement is not proof — the reservation must stand (fail-closed),
+/// exactly as on transport ambiguity. Releasing it would let a lying
+/// provider settle while resetting the per-day counter, defeating
+/// `max_per_day` as the wallet's loss bound.
+pub(crate) fn reject_releases_reservation(quote: &PaymentQuote) -> bool {
+    quote.requirements.view().network.starts_with("mock:")
 }
 
 /// The EIP-3009 authorization a quote implies for payer `from`: recipient

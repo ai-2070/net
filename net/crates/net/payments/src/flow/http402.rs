@@ -351,9 +351,16 @@ impl X402HttpFlow {
                 settlement,
             }
         } else {
-            // Per the transport, a non-2xx answer to a paid request means
-            // verification/settlement failed — nothing settled, release.
-            self.release(&quote, now_ns).await;
+            // The v2 transport says a non-2xx answer to a paid request
+            // means it did not settle — but the server already holds our
+            // signed EIP-3009 authorization, a bearer instrument it could
+            // submit on-chain regardless of the status it returns. Release
+            // the reservation only for the chainless mock scheme; for a
+            // real bearer authorization the reservation must stand
+            // (fail-closed accounting), mirroring the mesh flow (M1).
+            if super::reject_releases_reservation(&quote) {
+                self.release(&quote, now_ns).await;
+            }
             X402HttpOutcome::PaymentRejected {
                 status,
                 message: String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned(),
