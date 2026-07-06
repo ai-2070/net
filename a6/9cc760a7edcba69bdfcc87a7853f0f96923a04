@@ -1,0 +1,35 @@
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_a772df20f47a78::t_8fa6218f615921 42-43
+  s_a772df20f47a78::t_ec0ba6d3e0da3f 40
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_a772df20f47a78::t_844c491d8cef9d 26
+  s_a772df20f47a78::t_fc8529c1aeb23a 137-175,177-179
+  s_a772df20f47a78::t_d7d63ce900ee76 193,195-197,200
+  s_a772df20f47a78::t_58ef9f4c404fbf 293
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN_V2.md
+  s_a772df20f47a78::t_ce1a9470477b4c 88-96
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_a772df20f47a78::t_5bd6d771686fce 418
+  s_a772df20f47a78::t_2106360a4a7c1e 461-579
+  s_a772df20f47a78::t_db3a768b8fbe53 48,52
+  s_a772df20f47a78::t_cd5256db82b4bf 775-924
+  s_a772df20f47a78::t_2c853dab5a944c 705
+net/crates/net/adapters/mcp/tests/publish_tools_end_to_end.rs
+  s_a772df20f47a78::t_0ac2eeb0f2fe36 1-334
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a69cc760a7edcba69bdfcc87a7853f0f96923a04",
+  "prompts": {},
+  "sessions": {
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
