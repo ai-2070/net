@@ -925,7 +925,8 @@ impl EnrollmentAuthority {
 /// `root → device` delegation it received from [`EnrollmentAuthority::approve`],
 /// so the device survives restarts **without re-pairing**.
 ///
-/// The device seed is secret material: [`Self::save`] writes it `0600` and the
+/// The device seed is secret material: [`Self::save`] restricts the file to
+/// the current user (`0600` on Unix, an owner-only ACL on Windows) and the
 /// seed never leaves Rust ([`Self::device`] hands back an opaque [`Identity`]
 /// handle — H8). Revocation is enforced at the **provider** on invoke, so the
 /// device-side [`Self::is_valid`] checks the grant is well-formed and unexpired
@@ -1041,8 +1042,11 @@ impl DeviceEnrollment {
         now.saturating_add(window_secs) >= self.expires_at()
     }
 
-    /// Persist to `path` (`0600` on Unix, atomic temp+rename). Overwrites any
-    /// existing enrollment (e.g. after a renewal).
+    /// Persist to `path` (atomic temp+rename), restricting the file to the
+    /// current user — `0600` on Unix, an owner-only ACL (inheritance stripped)
+    /// on Windows. On Windows a failure to apply the ACL aborts the save
+    /// (fail-closed) rather than leaving the seed readable to other local
+    /// users. Overwrites any existing enrollment (e.g. after a renewal).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DeviceEnrollmentError> {
         let path = path.as_ref();
         let io = |e: std::io::Error| DeviceEnrollmentError::Io {
@@ -1079,6 +1083,16 @@ impl DeviceEnrollment {
             f.flush().map_err(io)?;
             f.sync_all().map_err(io)?;
         }
+        // Windows has no `mode(0o600)`: the temp file is created with the
+        // directory's inherited ACL, which on a shared box can be readable by
+        // other local users. Restrict it to the current user *before* the
+        // rename so the seed is never world-readable at rest; a failure aborts
+        // the save (fail-closed) instead of publishing the seed.
+        #[cfg(windows)]
+        restrict_to_owner(&tmp).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io(e)
+        })?;
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             io(e)
@@ -1121,6 +1135,39 @@ impl DeviceEnrollment {
             enrolled_at: file.enrolled_at,
         }))
     }
+}
+
+/// Windows analogue of the Unix `0600` mode: strip inherited ACEs and leave a
+/// single full-control grant for the current user
+/// (`icacls <path> /inheritance:r /grant:r <user>:F`). Used on the enrollment
+/// temp file before it is renamed into place, so the device seed is never
+/// readable by other local users. Errors (no `USERNAME`, `icacls` missing or
+/// failing) must abort the save — the caller fails closed.
+#[cfg(windows)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !domain.is_empty() => format!("{domain}\\{user}"),
+        (_, Ok(user)) if !user.is_empty() => user,
+        _ => {
+            return Err(std::io::Error::other(
+                "USERNAME is not set; cannot restrict the enrollment file ACL",
+            ))
+        }
+    };
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "icacls could not restrict {} to {user}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
