@@ -1,0 +1,22 @@
+net/crates/net/integrations/hermes/tests/test_provider.py
+  s_ecf38b21f410fb::t_751bcdb6ca9e82 129-162
+net/crates/net/integrations/hermes/provider.py
+  s_ecf38b21f410fb::t_f05c553517f696 28-29
+  s_ecf38b21f410fb::t_4c819f64ecfb3d 173-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "14beb3ef9450890097e80a071b7dd54d414201ec",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
