@@ -73,11 +73,20 @@ network is "live."
 |---|---|---|---|
 | 1 | Base Sepolia (`eip155:84532`) | `packs::x402_org_base_sepolia()` | **Suite shipped, live run pending.** Open-auth x402.org facilitator, `(exact, eip155:84532)`, checker RPC `https://sepolia.base.org`, serve `Confirmed(1)`. Conformance in `tests/live_testnet_conformance.rs` (`#[ignore]`d; env-gated). |
 | 2 | Base mainnet (`eip155:8453`) | `packs::cdp_base_mainnet(secret_ref)` | **Pack shipped, blocked on rung 1 + CDP credentials.** First real-money target. CDP facilitator (API-key auth via secret ref), serve `Confirmed(1)`. |
-| 3 | Solana mainnet | `packs::cdp_solana_mainnet(secret_ref)` | **Config-complete, deliberately NOT settleable.** Two honest gaps: no SVM settlement signer (the `SchemeSigner` seam is EVM-shaped; SPL presign is a trait extension), and no SVM chain checker (so the pack omits `required_tier` = `observed`, ships no RPC). `can_settle` refuses solana entries until the two seams land. |
-| 4 | xrpl | (not shipped) | **Conditional GO / enablement NO-GO.** t54.ai runs a live XRPL facilitator (`xrpl-x402.t54.ai`); the "pending verification" gate resolves. Enablement needs: an xrpl `SchemeSigner` extension (presigned Payment blobs), registry entries for XRP/RLUSD (deliberately absent — absence is a hard reject), an xrpl pack validated against live `/supported`, a conformance run incl. adversarial rows, and an independent XRPL checker before serving above `observed`. |
+| 3 | Solana mainnet | `packs::cdp_solana_mainnet(secret_ref)` | **SVM seam landed (2026-07-06); enablement blocked on checker + conformance.** Settleable through the exact-SVM seam (`sign_svm_transfer` / `ExternalSvmSigner`; `can_settle` now accepts `solana`). One honest gap remains: **no SVM chain checker**, so the pack deliberately omits `required_tier` (= `observed`, receipt trust) and ships no RPC — serving above `observed` waits on the checker. Enablement = SVM checker + a conformance run against a solana pair + CDP credentials. |
+| 4 | xrpl | (not shipped) | **Conditional GO / enablement NO-GO — blocked on a pinnable shape.** t54.ai runs a live XRPL facilitator (`xrpl-x402.t54.ai`); the facilitator gate resolves. But the pinned x402 spec commit carries `scheme_exact_*.md` for **twelve chains and none for xrpl** — its payload shape is t54-vendor-defined, and the money path won't couple to an unversioned vendor format. The intent-in/blob-out SVM pattern instantiates directly once a shape is pinned (an upstream spec PR or versioned t54 docs). Still also needs: registry entries for XRP/RLUSD (deliberately absent — absence is a hard reject), a validated pack, a conformance run incl. adversarial rows, and an XRPL checker before serving above `observed`. |
 
 The invariant every rung obeys: **enabling a network is config, not code.** A
 rung that needs core code is a design failure that goes to review.
+
+One nuance the ladder makes concrete: a *new payment scheme* (EVM `exact`, SVM
+`exact`, an eventual xrpl shape) is authoring code — but it lives **quarantined
+in `src/x402/schemes/`** plus the `SchemeSigner` trait, exactly where x402's
+own scheme-per-chain reality is allowed to live. That's why the Solana seam
+needed `x402/schemes/exact_svm.rs` and a `sign_svm_transfer` trait method
+without violating doctrine 1: no new *envelope* types, no core changes, no
+per-network branch outside `src/x402/`. Adding the *network* on top of an
+existing scheme is still pure config + registry.
 
 ## Live testnet runbook (rung 1)
 

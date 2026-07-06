@@ -76,8 +76,9 @@ they go red (`testing.md`).
 - **Facilitator trust:** don't put a facilitator in the trust root for
   anything above `observed`. If policy needs `confirmed(n)`/`final`, wire a
   `ChainChecker` — otherwise the tier is unreachable and every settlement is
-  unservable. (Solana ships config-complete but *not settleable* precisely
-  because it has no checker yet — that's honest, not a bug.)
+  unservable. (Solana is settleable at `observed` via the exact-SVM seam, but
+  its pack deliberately omits `required_tier` because **no SVM checker exists
+  yet** — it can't serve above receipt trust. That's honest, not a bug.)
 - **Promising a tier with no checker** is worse than serving at `observed` —
   the Solana pack deliberately omits `required_tier` rather than claim a tier
   it can't deliver.
@@ -101,8 +102,11 @@ they go red (`testing.md`).
   payments (not even a verifier). Don't send a user to `@net-mesh/payments`
   (it doesn't exist) or a Go payments test (it doesn't exist). See
   `bindings.md`.
-- Python's `.pyi` stub lags the impl on the signer kwargs — the kwargs work;
-  the stub just doesn't list them.
+- Python's payment identity is the **node's mesh identity** and it accepts
+  `payment_signer_address` + `payment_signer` (both-or-neither, require the
+  policy store). But it wires the signer under `eip155` **only** — solana
+  settlement from Python isn't wired yet, even though the Rust crate has the
+  SVM seam. See `bindings.md`.
 
 ## Dependency direction (don't invert it)
 

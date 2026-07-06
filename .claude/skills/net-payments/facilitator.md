@@ -145,7 +145,7 @@ Well-known packs are **data-only constructors** — the "config, not code" proof
 ```rust
 packs::x402_org_base_sepolia()               // testnet, open auth, (exact, eip155:84532), serve Confirmed(1)
 packs::cdp_base_mainnet(secret_ref)          // Base mainnet, CDP endpoint, (exact, eip155:8453)
-packs::cdp_solana_mainnet(secret_ref)        // config-complete but NOT settleable yet (no SVM signer/checker) — tier observed
+packs::cdp_solana_mainnet(secret_ref)        // settleable via the exact-SVM seam; serves at `observed` only (no SVM checker yet)
 ```
 
 Endpoint/network/RPC constants live in `packs` (`X402_ORG_FACILITATOR`,

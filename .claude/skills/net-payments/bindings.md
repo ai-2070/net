@@ -63,23 +63,33 @@ gw.invoke(cap_id, arguments_json="{}")  # JSON string; status discriminant
 - **The signer never sees a key.** `payment_signer` is a Python callable
   `(typed_data_json) -> signature_hex`, bridged into `ExternalSigner` under
   scheme `eip155`. Only the typed `eth_signTypedData_v4` doc and the resulting
-  signature cross the boundary — doctrine 7/8 holds at the language edge.
+  signature cross the boundary — doctrine 7/8 holds at the language edge. The
+  two signer kwargs are **both-or-neither** and **require `payment_policy_path`**
+  (the shared spend-policy store); the callable is validated as callable at
+  construction, not on first invoke. It runs on a **blocking worker thread**
+  (`spawn_blocking` + `Python::attach`) so the GIL never stalls the mesh
+  reactor.
 - **Fail-closed when payments is compiled out:** if the `payments` feature is
   off, passing any payment kwarg **raises `ValueError`** — never a silent free
   serve.
 
 Caveats to remember (state them if the user hits them):
 
-- The type stub `bindings/python/python/net/_net.pyi` documents only
-  `payment_policy_path` / `payment_profile` / `payment_unsafe_mock_auto_allow`;
-  it **lags** the Rust impl (which also accepts `payment_signer_address` /
-  `payment_signer`). The kwargs work; the stub just doesn't list them yet.
+- **The gateway wires the signer under `eip155` only.** Even though the Rust
+  crate now has an SVM signer seam (`ExternalSvmSigner`, `signer.md`), the
+  Python gateway registers only the EVM signer — **solana settlement from
+  Python is not yet wired** (needs an SVM-signer bridge in the binding).
 - The Python **tool/publish** surface (`net/tool.py`, re-exported by
   `net_sdk.tool`) has **no pricing field.** Python sees pricing only through
   `CapabilityGateway.describe()`, never on the publish side. `sdk-py` has no
   payments module.
-- A carried follow-up: a node-identity-bound payment caller (vs the current
-  in-process borrow) needs an SDK entity-keypair accessor — partly landed.
+- Still pending for Python: a surface for the **outbound HTTP-402 client**
+  (`X402HttpFlow` exists in Rust; no Python wrapper yet).
+
+(Both landed 2026-07-06 and are now current in this skill: the payment identity
+is the **node's mesh identity** via `Mesh::entity_keypair()`, and the
+`_net.pyi` stub documents the `payment_signer_address` / `payment_signer`
+kwargs — the stub no longer lags the impl.)
 
 ## Node / TS — pricing passthrough on read only
 

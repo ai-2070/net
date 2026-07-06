@@ -89,6 +89,9 @@ The design's acceptance test: **the mock and the HTTP client pass the
   upgrade (`observed` → `confirmed(n)` → `final`) and delivered-amount
   cross-check.
 - `exact_evm_signing.rs` — EIP-3009 typed-data authoring + dev-signer digest.
+- `exact_svm_scheme_flow.rs` — the exact-SVM seam: the paid lifecycle on an
+  enabled solana network (wallet authors the base64 blob), and the structured
+  refusal when no SVM wallet is registered.
 - `adversarial_p1.rs` — facilitator-receipt replay, payload/requirements
   mismatch, CAIP network/asset confusion, amount/decimals per network.
 - `http402_outbound.rs` — the outbound HTTP 402 two-way door.
@@ -113,9 +116,13 @@ cargo test -p net-payments --features mcp-gate                  # gate compositi
 Doctrine 8 demands a testable invariant: **no binding can accept, return,
 serialize, log, or request raw signing of arbitrary bytes.** Each binding
 carries a negative test proving key material is unrepresentable in its API —
-`SchemeSigner` has no raw-bytes method, and the Python bridge only ever passes
-a typed `eth_signTypedData_v4` doc + gets a signature back. When you touch a
-binding's signer surface, that negative test must still hold.
+`SchemeSigner` has no raw-bytes method (the SVM `sign_svm_transfer` also takes
+a typed intent, never bytes), and the Python bridge only ever passes a typed
+`eth_signTypedData_v4` doc + gets a signature back. The Python negative test
+lives in `bindings/python/tests/test_capability_gateway.py` — it pins that no
+gateway kwarg accepts key material, and that the signer kwargs are both-or-
+neither and require the policy store. When you touch a binding's signer
+surface, that negative test must still hold.
 
 ## Live testnet (env-gated, never in CI)
 

@@ -67,9 +67,11 @@ let decision: CallerDecision = flow.run("prov/fixture-tool", pricing_terms_json)
 5. `spend.check_and_reserve(&quote, &registry, now_ns)` → `SpendDecision`
    (one locked read-modify-write: check limits *and* reserve the per-day
    counter atomically).
-6. Author the x402 payload — mock JSON on the mock network, or for `exact`
-   EVM: `exact_evm::typed_data` → `signer.sign_typed_data` →
-   `exact_evm::payload_object`.
+6. Author the x402 payload by namespace: mock JSON on the mock network;
+   `exact` on **eip155** → `exact_evm::typed_data` → `signer.sign_typed_data`
+   → `exact_evm::payload_object`; `exact` on **solana** →
+   `exact_svm::transfer_intent` → `signer.sign_svm_transfer` (the wallet
+   builds + partially signs) → `exact_svm::payload_object`. See `signer.md`.
 7. `provider.pay(quote_bytes, &payload)` → `PayResponse`.
 8. On success, sign the invocation binding
    (`invocation_binding_transcript(quote_id, tool_id)`) and return it in the
