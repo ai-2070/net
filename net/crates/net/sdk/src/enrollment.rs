@@ -71,6 +71,10 @@ const INVITE_MAGIC: [u8; 4] = *b"NMI1";
 /// 4-byte magic + version for the [`JoinRequest`] wire form (Net-Mesh Join v1).
 const JOIN_MAGIC: [u8; 4] = *b"NMJ1";
 
+/// 4-byte magic + version for the [`JoinOutcome`] wire form (Net-Mesh Outcome
+/// v1).
+const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
+
 /// Domain-separation prefix for the device's self-signature, so a join-request
 /// signature can never be confused with any other signature the device key
 /// produces (tokens, announcements, delegation-invoke envelopes).
@@ -472,6 +476,147 @@ pub struct Enrollment {
     pub tags: Vec<String>,
 }
 
+/// [`JoinOutcome::Rejected`] codes — stable across versions so a device can
+/// branch on *why* it was turned away (e.g. `EXPIRED` → fetch a fresh invite).
+pub mod reject {
+    /// The join-request bytes were malformed.
+    pub const MALFORMED: u16 = 1;
+    /// No outstanding invite matched (never minted here, already used, or
+    /// expired and pruned).
+    pub const UNKNOWN_INVITE: u16 = 2;
+    /// The invite's TTL had elapsed.
+    pub const EXPIRED: u16 = 3;
+    /// A binding check failed (wrong nonce, wrong mesh, or bad self-signature).
+    pub const BAD_REQUEST: u16 = 4;
+    /// The invite was already redeemed (single-use).
+    pub const REPLAY: u16 = 5;
+    /// The operator side hit an internal error (store I/O, token minting).
+    pub const INTERNAL: u16 = 6;
+}
+
+/// The operator's response to a join request — the payload the enrollment RPC
+/// returns to the device.
+///
+/// On [`Self::Admitted`] the device parses + verifies the carried chain
+/// ([`Self::into_chain`]); on [`Self::Rejected`] it learns a stable
+/// [`reject`] code and a human message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JoinOutcome {
+    /// The device was admitted; carries the serialized `root → device`
+    /// [`DelegationChain`].
+    Admitted {
+        /// The delegation chain bytes ([`DelegationChain::to_bytes`]).
+        chain: Vec<u8>,
+    },
+    /// The request was rejected; carries a stable [`reject`] code and a message.
+    Rejected {
+        /// A stable [`reject`] code.
+        code: u16,
+        /// A human-readable reason.
+        message: String,
+    },
+}
+
+impl JoinOutcome {
+    /// Canonical wire form (versioned, length-prefixed).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&OUTCOME_MAGIC);
+        match self {
+            JoinOutcome::Admitted { chain } => {
+                buf.push(0);
+                push_lp(&mut buf, chain);
+            }
+            JoinOutcome::Rejected { code, message } => {
+                buf.push(1);
+                buf.extend_from_slice(&code.to_le_bytes());
+                push_lp(&mut buf, message.as_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Parse the canonical wire form. Rejects a bad magic/version, truncation,
+    /// an unknown tag, or trailing bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, JoinError> {
+        let mut r = Reader::new(bytes);
+        let magic = r.take_arr::<4>().ok_or(JoinError::Malformed("truncated"))?;
+        if magic != OUTCOME_MAGIC {
+            return Err(JoinError::Malformed("bad magic or version"));
+        }
+        let tag = r
+            .take_arr::<1>()
+            .ok_or(JoinError::Malformed("truncated tag"))?[0];
+        let outcome = match tag {
+            0 => JoinOutcome::Admitted {
+                chain: r
+                    .take_lp()
+                    .ok_or(JoinError::Malformed("bad chain"))?
+                    .to_vec(),
+            },
+            1 => {
+                let code = r.take_u16().ok_or(JoinError::Malformed("truncated code"))?;
+                let message = r
+                    .take_lp_string()
+                    .ok_or(JoinError::Malformed("bad message"))?;
+                JoinOutcome::Rejected { code, message }
+            }
+            _ => return Err(JoinError::Malformed("unknown outcome tag")),
+        };
+        if !r.done() {
+            return Err(JoinError::Malformed("trailing bytes"));
+        }
+        Ok(outcome)
+    }
+
+    /// Interpret the outcome the device received. On [`Self::Admitted`], parse
+    /// the chain and **verify it anchors at the invited mesh root and binds to
+    /// this device** — defending the joiner against a rogue operator returning
+    /// a chain for a different mesh or a different key. On [`Self::Rejected`],
+    /// surface the reason.
+    pub fn into_chain(
+        self,
+        device: &EntityId,
+        invite_root: &EntityId,
+    ) -> Result<DelegationChain, JoinError> {
+        match self {
+            JoinOutcome::Admitted { chain } => {
+                let chain =
+                    DelegationChain::from_bytes(&chain).map_err(JoinError::MalformedGrant)?;
+                let reg = RevocationRegistry::new();
+                chain
+                    .verify(device, invite_root, &reg, 0)
+                    .map_err(|_| JoinError::UntrustedGrant)?;
+                Ok(chain)
+            }
+            JoinOutcome::Rejected { code, message } => Err(JoinError::Rejected { code, message }),
+        }
+    }
+}
+
+/// Device-side errors interpreting a [`JoinOutcome`].
+#[derive(Debug, thiserror::Error)]
+pub enum JoinError {
+    /// The operator rejected the request. Carries a stable [`reject`] code.
+    #[error("enrollment rejected (code {code}): {message}")]
+    Rejected {
+        /// A stable [`reject`] code.
+        code: u16,
+        /// The operator's reason.
+        message: String,
+    },
+    /// The admitted delegation bytes didn't parse.
+    #[error("the admitted delegation is malformed: {0}")]
+    MalformedGrant(TokenError),
+    /// The admitted delegation doesn't anchor at the invited mesh root or bind
+    /// to this device — a rogue or confused operator.
+    #[error("the admitted delegation does not anchor at the invited mesh root / this device")]
+    UntrustedGrant,
+    /// The outcome bytes themselves were malformed.
+    #[error("malformed join outcome: {0}")]
+    Malformed(&'static str),
+}
+
 /// The operator side: holds the mesh **root** identity and the single-use
 /// ledger, mints invites, and approves join requests into `root → device`
 /// delegations.
@@ -642,6 +787,10 @@ impl<'a> Reader<'a> {
         let mut a = [0u8; N];
         a.copy_from_slice(s);
         Some(a)
+    }
+
+    fn take_u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take_arr::<2>()?))
     }
 
     fn take_u32(&mut self) -> Option<u32> {
@@ -897,6 +1046,75 @@ mod tests {
         assert!(InviteToken::decode("deadbeef").is_err());
         assert!(InviteToken::decode("net-invite:!!!not-base64!!!").is_err());
         assert!(InviteToken::decode("net-invite:AAAA").is_err());
+    }
+
+    #[test]
+    fn join_outcome_round_trips_both_variants() {
+        let admitted = JoinOutcome::Admitted {
+            chain: vec![1, 2, 3, 4],
+        };
+        assert_eq!(
+            JoinOutcome::from_bytes(&admitted.to_bytes()).unwrap(),
+            admitted
+        );
+        let rejected = JoinOutcome::Rejected {
+            code: reject::EXPIRED,
+            message: "invite has expired".into(),
+        };
+        assert_eq!(
+            JoinOutcome::from_bytes(&rejected.to_bytes()).unwrap(),
+            rejected
+        );
+        // Malformed / truncated / cross-typed bytes are rejected.
+        assert!(JoinOutcome::from_bytes(b"nope").is_err());
+        let bytes = admitted.to_bytes();
+        assert!(JoinOutcome::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        assert!(JoinOutcome::from_bytes(&invite.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn into_chain_accepts_a_valid_grant_and_rejects_impostors() {
+        // A real admitted grant from an approve.
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "d", vec![], &invite);
+        let enrollment = auth
+            .approve(&req, &invite, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        let admitted = JoinOutcome::Admitted {
+            chain: enrollment.chain.to_bytes(),
+        };
+        // The device accepts it: anchors at the invited root, binds to itself.
+        let chain = admitted
+            .clone()
+            .into_chain(device.entity_id(), &invite.root)
+            .expect("valid grant accepted");
+        assert_eq!(&chain.leaf(), device.entity_id());
+
+        // A grant that anchors at a *different* root (rogue operator) is refused.
+        assert!(matches!(
+            admitted
+                .clone()
+                .into_chain(device.entity_id(), Identity::generate().entity_id()),
+            Err(JoinError::UntrustedGrant)
+        ));
+        // A grant bound to a *different* device is refused.
+        assert!(matches!(
+            admitted.into_chain(Identity::generate().entity_id(), &invite.root),
+            Err(JoinError::UntrustedGrant)
+        ));
+        // A rejection surfaces its code.
+        let rejected = JoinOutcome::Rejected {
+            code: reject::REPLAY,
+            message: "used".into(),
+        };
+        assert!(matches!(
+            rejected.into_chain(device.entity_id(), &invite.root),
+            Err(JoinError::Rejected { code, .. }) if code == reject::REPLAY
+        ));
     }
 
     #[test]

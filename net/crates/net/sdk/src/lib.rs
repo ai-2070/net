@@ -244,7 +244,8 @@ pub use crate::delegation::{
 // types + the displayed root fingerprint.
 #[cfg(feature = "net")]
 pub use crate::enrollment::{
-    fingerprint, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinRequest,
+    fingerprint, reject, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinError,
+    JoinOutcome, JoinRequest,
 };
 // Device-inventory convenience re-exports (V2 Phase 1): the registry backing
 // `mesh.devices()`.

@@ -36,7 +36,8 @@ use crate::devices::{
     default_device_registry_path, DeviceRecord, DeviceRegistry, DeviceRegistryError,
 };
 use crate::enrollment::{
-    now_unix, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinRequest,
+    now_unix, reject, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinOutcome,
+    JoinRequest,
 };
 use crate::identity::{EntityId, Identity};
 use crate::revocation::{default_revocation_store_path, RevocationStore, RevocationStoreError};
@@ -213,6 +214,56 @@ impl OperatorEnrollment {
     pub fn forget(&self, device: &EntityId) -> Result<bool, OperatorError> {
         Ok(DeviceRegistry::remove(&self.registry_path, device)?)
     }
+
+    /// The **server side** of the enrollment RPC: turn serialized
+    /// [`JoinRequest`] bytes into serialized [`JoinOutcome`] bytes. The
+    /// transport (Slice B2b) just moves these — parse the request, run
+    /// [`Self::approve`], and answer `Admitted { chain }` or a coded
+    /// `Rejected`. Never returns an error itself: a malformed request or a
+    /// rejected approval is a `Rejected` outcome the device can read, not a
+    /// transport failure.
+    pub fn handle_join_request(
+        &self,
+        request_bytes: &[u8],
+        grant_ttl: Duration,
+        max_depth: u8,
+    ) -> Vec<u8> {
+        let outcome = match JoinRequest::from_bytes(request_bytes) {
+            Err(e) => JoinOutcome::Rejected {
+                code: reject::MALFORMED,
+                message: e.to_string(),
+            },
+            Ok(request) => match self.approve(&request, grant_ttl, max_depth) {
+                Ok(enrollment) => JoinOutcome::Admitted {
+                    chain: enrollment.chain.to_bytes(),
+                },
+                Err(e) => JoinOutcome::Rejected {
+                    code: reject_code(&e),
+                    message: e.to_string(),
+                },
+            },
+        };
+        outcome.to_bytes()
+    }
+}
+
+/// Map an [`OperatorError`] to a stable [`reject`] code for a [`JoinOutcome`].
+fn reject_code(err: &OperatorError) -> u16 {
+    match err {
+        OperatorError::UnknownInvite => reject::UNKNOWN_INVITE,
+        OperatorError::Enrollment(e) => match e {
+            EnrollmentError::MalformedInvite(_) | EnrollmentError::MalformedRequest(_) => {
+                reject::MALFORMED
+            }
+            EnrollmentError::Expired => reject::EXPIRED,
+            EnrollmentError::NonceMismatch
+            | EnrollmentError::WrongMesh
+            | EnrollmentError::BadSignature => reject::BAD_REQUEST,
+            EnrollmentError::Replay => reject::REPLAY,
+            EnrollmentError::LedgerSaturated | EnrollmentError::Token(_) => reject::INTERNAL,
+        },
+        OperatorError::Registry(_) | OperatorError::Revocation(_) => reject::INTERNAL,
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +415,83 @@ mod tests {
         assert_eq!(op.pending_invites(T0).len(), 2);
         // After expiry they prune out.
         assert!(op.pending_invites(T0 + 3600).is_empty());
+    }
+
+    // The RPC-handler tests use the clock-reading `invite` (not `invite_at`)
+    // because `handle_join_request` approves against the real clock.
+
+    #[test]
+    fn handle_join_request_admits_and_the_device_verifies() {
+        let (op, root, _dir) = operator();
+        let invite = op.invite("relay://rv", HOUR);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+
+        // Server: request bytes → outcome bytes.
+        let outcome_bytes = op.handle_join_request(&req.to_bytes(), HOUR, DEFAULT_DELEGATION_DEPTH);
+        // Device: parse + verify the grant anchors at the invited root + binds
+        // to this device.
+        let chain = JoinOutcome::from_bytes(&outcome_bytes)
+            .unwrap()
+            .into_chain(device.entity_id(), &invite.root)
+            .expect("device accepts its grant");
+        assert_eq!(&chain.leaf(), device.entity_id());
+        assert_eq!(&chain.root(), root.entity_id());
+        assert_eq!(op.devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn handle_join_request_rejects_malformed_bytes() {
+        let (op, _root, _dir) = operator();
+        let outcome = JoinOutcome::from_bytes(&op.handle_join_request(
+            b"garbage",
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(matches!(outcome, JoinOutcome::Rejected { code, .. } if code == reject::MALFORMED));
+    }
+
+    #[test]
+    fn handle_join_request_rejects_an_unminted_invite() {
+        let (op, _root, _dir) = operator();
+        // A request against an invite this operator never minted.
+        let stray = InviteToken::mint(op.root_id(), "relay://rv", HOUR);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &stray);
+        let outcome = JoinOutcome::from_bytes(&op.handle_join_request(
+            &req.to_bytes(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(
+            matches!(outcome, JoinOutcome::Rejected { code, .. } if code == reject::UNKNOWN_INVITE)
+        );
+    }
+
+    #[test]
+    fn handle_join_request_is_single_use() {
+        let (op, _root, _dir) = operator();
+        let invite = op.invite("relay://rv", HOUR);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        let first = JoinOutcome::from_bytes(&op.handle_join_request(
+            &req.to_bytes(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(matches!(first, JoinOutcome::Admitted { .. }));
+        // Replay: the invite was retired, so the second attempt finds no invite.
+        let second = JoinOutcome::from_bytes(&op.handle_join_request(
+            &req.to_bytes(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(
+            matches!(second, JoinOutcome::Rejected { code, .. } if code == reject::UNKNOWN_INVITE)
+        );
     }
 }
