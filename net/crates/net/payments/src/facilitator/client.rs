@@ -105,13 +105,16 @@ impl HttpFacilitator {
         endpoint: impl Into<String>,
         auth: std::sync::Arc<dyn AuthProvider>,
     ) -> Result<Self, FacilitatorError> {
+        let endpoint = endpoint.into();
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        // The bearer secret (CDP key) must never ride cleartext http to a
+        // remote host. Enforce https except to loopback (local/self-hosted).
+        require_secure_endpoint(&endpoint)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
-        let endpoint = endpoint.into();
-        let endpoint = endpoint.trim_end_matches('/').to_string();
         Ok(Self {
             endpoint,
             http,
@@ -140,7 +143,7 @@ impl HttpFacilitator {
         }
         let response = req.send().await.map_err(map_send_error)?;
         let status = response.status();
-        let body = response.bytes().await.map_err(map_send_error)?;
+        let body = read_bounded(response, MAX_FACILITATOR_BODY).await?;
         if !status.is_success() {
             return Err(http_status_error("/supported", status, &body));
         }
@@ -229,12 +232,78 @@ impl HttpFacilitator {
         }
         let response = req.send().await.map_err(map_send_error)?;
         let status = response.status();
-        let body = response.bytes().await.map_err(map_send_error)?;
+        let body = read_bounded(response, MAX_FACILITATOR_BODY).await?;
         if !status.is_success() {
             return Err(http_status_error(path, status, &body));
         }
-        Ok(body.to_vec())
+        Ok(body)
     }
+}
+
+/// Facilitator responses are small JSON. Cap the body so a malicious or
+/// compromised facilitator cannot stream a multi-GB body within the
+/// timeout and exhaust memory.
+const MAX_FACILITATOR_BODY: usize = 4 * 1024 * 1024;
+
+/// Reject a config-supplied endpoint that would send credentials in
+/// cleartext: https is required, except to a loopback host for local and
+/// self-hosted testing.
+fn require_secure_endpoint(endpoint: &str) -> Result<(), FacilitatorError> {
+    let url = reqwest::Url::parse(endpoint).map_err(|e| {
+        FacilitatorError::protocol(format!("facilitator endpoint `{endpoint}`: {e}"))
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = url.host_str().unwrap_or_default();
+            // `host_str` keeps IPv6 brackets (`[::1]`); strip them to parse.
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            let is_loopback = host == "localhost"
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if is_loopback {
+                Ok(())
+            } else {
+                Err(FacilitatorError::protocol(format!(
+                    "facilitator endpoint `{endpoint}` is plaintext http to a non-loopback host \
+                     — refusing to send credentials in cleartext; use https"
+                )))
+            }
+        }
+        other => Err(FacilitatorError::protocol(format!(
+            "facilitator endpoint `{endpoint}` uses unsupported scheme `{other}` (want https)"
+        ))),
+    }
+}
+
+/// Read a response body, capped at `max` bytes. A declared over-cap
+/// `content-length` is rejected up front; a body that streams past the
+/// cap (no/underdeclared length) is rejected mid-stream. Bounds memory
+/// against a hostile endpoint.
+async fn read_bounded(
+    response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, FacilitatorError> {
+    if let Some(len) = response.content_length() {
+        if len as usize > max {
+            return Err(FacilitatorError::protocol(format!(
+                "facilitator response declared {len} bytes, over the {max}-byte cap"
+            )));
+        }
+    }
+    let mut response = response;
+    let mut out = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_send_error)? {
+        if out.len().saturating_add(chunk.len()) > max {
+            return Err(FacilitatorError::protocol(format!(
+                "facilitator response exceeded the {max}-byte cap"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Transport-level error mapping. Timeouts and connect failures are the
@@ -304,5 +373,36 @@ impl Facilitator for HttpFacilitator {
             response,
             tier: VerificationTier::Observed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_is_required_except_for_loopback() {
+        // Secure or loopback: accepted.
+        assert!(require_secure_endpoint("https://facilitator.example.com").is_ok());
+        assert!(require_secure_endpoint("http://127.0.0.1:8080").is_ok());
+        assert!(require_secure_endpoint("http://[::1]:8080").is_ok());
+        assert!(require_secure_endpoint("http://localhost:8080/base").is_ok());
+        // Cleartext to a remote host, or an unsupported scheme: refused.
+        assert!(require_secure_endpoint("http://facilitator.example.com").is_err());
+        assert!(require_secure_endpoint("ftp://facilitator.example.com").is_err());
+    }
+
+    #[test]
+    fn new_rejects_a_cleartext_remote_endpoint() {
+        match HttpFacilitator::new("http://facilitator.example.com", std::sync::Arc::new(NoAuth)) {
+            Ok(_) => panic!("cleartext http to a remote host must be refused"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("cleartext") || msg.contains("https"),
+                    "error should explain the https requirement: {msg}"
+                );
+            }
+        }
     }
 }

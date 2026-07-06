@@ -18,11 +18,12 @@ const TOKEN: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const RECIPIENT: &str = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C";
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-/// Scripted RPC node: `(receipt result, head block)`.
+/// Scripted RPC node: `(receipt result, head block, chain id)`.
 struct RpcFixture {
     endpoint: String,
     receipt: Arc<parking_lot::Mutex<Value>>,
     head: Arc<parking_lot::Mutex<u64>>,
+    chain_id: Arc<parking_lot::Mutex<u64>>,
 }
 
 impl RpcFixture {
@@ -31,8 +32,11 @@ impl RpcFixture {
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let receipt = Arc::new(parking_lot::Mutex::new(Value::Null));
         let head = Arc::new(parking_lot::Mutex::new(100u64));
+        // Default to Base Sepolia (84532), matching the tests' CAIP-2.
+        let chain_id = Arc::new(parking_lot::Mutex::new(84_532u64));
         let receipt_task = receipt.clone();
         let head_task = head.clone();
+        let chain_id_task = chain_id.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -40,6 +44,7 @@ impl RpcFixture {
                 };
                 let receipt = receipt_task.clone();
                 let head = head_task.clone();
+                let chain_id = chain_id_task.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 2048];
@@ -76,6 +81,7 @@ impl RpcFixture {
                     let result = match request["method"].as_str() {
                         Some("eth_getTransactionReceipt") => receipt.lock().clone(),
                         Some("eth_blockNumber") => json!(format!("0x{:x}", *head.lock())),
+                        Some("eth_chainId") => json!(format!("0x{:x}", *chain_id.lock())),
                         _ => Value::Null,
                     };
                     let response =
@@ -95,6 +101,7 @@ impl RpcFixture {
             endpoint,
             receipt,
             head,
+            chain_id,
         }
     }
 
@@ -103,6 +110,9 @@ impl RpcFixture {
     }
     fn set_head(&self, head: u64) {
         *self.head.lock() = head;
+    }
+    fn set_chain_id(&self, chain_id: u64) {
+        *self.chain_id.lock() = chain_id;
     }
 }
 
@@ -292,4 +302,38 @@ async fn delivered_amount_binds_to_the_authorized_payer() {
         panic!("expected Included, got {verdict:?}");
     };
     assert_eq!(delivered.as_deref(), Some("10000"));
+}
+
+/// M7 regression: the checker confirms the RPC serves the CAIP-2 chain it
+/// is configured for before trusting any receipt. An RPC reporting a
+/// different chain id (a swapped/typo'd endpoint) is a terminal error —
+/// never a settlement on the wrong chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_id_mismatch_is_a_terminal_error() {
+    let rpc = RpcFixture::start().await;
+    // The endpoint actually serves Base *mainnet* (8453) while the checker
+    // is configured for Base Sepolia (84532).
+    rpc.set_chain_id(8453);
+    rpc.set_head(100);
+    rpc.set_receipt(json!({ "status": "0x1", "blockNumber": "0x5f", "logs": [] }));
+
+    let checker = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
+    let err = checker
+        .check("eip155:84532", TX, None)
+        .await
+        .expect_err("a chain-id mismatch must be terminal");
+    assert!(!err.retryable, "a wrong-chain RPC is a configuration fault");
+    assert!(
+        err.message.contains("chain id") || err.message.contains("chain"),
+        "error should name the chain mismatch: {}",
+        err.message
+    );
+
+    // Corrected to the right chain id, the same checker validates.
+    rpc.set_chain_id(84532);
+    let checker_ok = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
+    assert!(matches!(
+        checker_ok.check("eip155:84532", TX, None).await.expect("check"),
+        ChainVerdict::Included { .. }
+    ));
 }

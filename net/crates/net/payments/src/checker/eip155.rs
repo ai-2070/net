@@ -20,12 +20,22 @@ use crate::core::verification::{VerificationTier, VerifierRef};
 /// keccak256("Transfer(address,address,uint256)").
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+/// JSON-RPC responses (a receipt with many logs) are bounded but can be
+/// large; cap so a malicious/compromised RPC cannot stream a giant body
+/// within the timeout and exhaust memory.
+const MAX_RPC_BODY: usize = 16 * 1024 * 1024;
+
 /// The JSON-RPC checker for one eip155 network.
 pub struct Eip155Checker {
     rpc_endpoint: String,
     network: String,
     final_depth: u64,
     http: reqwest::Client,
+    /// Set once the RPC's `eth_chainId` has been confirmed to match
+    /// `network`'s CAIP-2 reference — a swapped/typo'd endpoint (a
+    /// testnet URL paired with a mainnet CAIP-2) must never validate a
+    /// worthless tx as a real settlement.
+    chain_id_verified: std::sync::atomic::AtomicBool,
 }
 
 impl Eip155Checker {
@@ -50,6 +60,7 @@ impl Eip155Checker {
             network,
             final_depth: 12,
             http,
+            chain_id_verified: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -77,10 +88,26 @@ impl Eip155Checker {
                 }
             })?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| CheckerError::retryable(e.to_string()))?;
+        // Bound the body: a hostile RPC could otherwise stream unbounded.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        loop {
+            match response
+                .chunk()
+                .await
+                .map_err(|e| CheckerError::retryable(e.to_string()))?
+            {
+                Some(chunk) => {
+                    if bytes.len().saturating_add(chunk.len()) > MAX_RPC_BODY {
+                        return Err(CheckerError::terminal(format!(
+                            "{method} response exceeded the {MAX_RPC_BODY}-byte cap"
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                None => break,
+            }
+        }
         if !status.is_success() {
             return Err(if status.is_server_error() {
                 CheckerError::retryable(format!("{method} -> {status}"))
@@ -96,6 +123,37 @@ impl Eip155Checker {
             )));
         }
         Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Confirm, once, that the RPC endpoint actually serves the CAIP-2
+    /// chain the checker is configured for. A swapped/typo'd RPC (e.g. a
+    /// Base-Sepolia URL paired with `eip155:8453`) would otherwise
+    /// validate a worthless testnet tx as a mainnet settlement.
+    async fn ensure_chain_id(&self) -> Result<(), CheckerError> {
+        use std::sync::atomic::Ordering;
+        if self.chain_id_verified.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let expected: u64 = self
+            .network
+            .strip_prefix("eip155:")
+            .and_then(|r| r.parse().ok())
+            .ok_or_else(|| {
+                CheckerError::terminal(format!(
+                    "network `{}` carries no numeric eip155 chain id",
+                    self.network
+                ))
+            })?;
+        let reported = parse_hex_u64(&self.rpc("eth_chainId", json!([])).await?, "eth_chainId")?;
+        if reported != expected {
+            return Err(CheckerError::terminal(format!(
+                "RPC at {} serves chain id {reported}, but the checker is configured for `{}` \
+                 (chain {expected}) — refusing to validate against the wrong chain",
+                self.rpc_endpoint, self.network
+            )));
+        }
+        self.chain_id_verified.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -147,6 +205,9 @@ impl ChainChecker for Eip155Checker {
                 self.network
             )));
         }
+        // Confirm (once) the RPC serves the chain we think it does before
+        // trusting any receipt from it.
+        self.ensure_chain_id().await?;
 
         let receipt = self
             .rpc("eth_getTransactionReceipt", json!([transaction]))
