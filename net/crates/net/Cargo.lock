@@ -2712,6 +2712,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-payments"
+version = "0.31.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "dirs",
+ "fs2",
+ "hex",
+ "net-mesh",
+ "net-mesh-sdk",
+ "parking_lot 0.12.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "net-python"
 version = "0.31.0"
 dependencies = [
