@@ -1,0 +1,65 @@
+net/crates/net/adapters/mcp/src/serve/payment.rs
+  s_928ee85c6ffc0a::t_97de5d38340a99 26,29-36,38-40,44-46
+  s_928ee85c6ffc0a::t_335a9580eb681c 54-63
+  s_928ee85c6ffc0a::t_b5a3e33b47ceeb 109-118
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_928ee85c6ffc0a::t_27ec749f9dd732 151-153,157
+  s_928ee85c6ffc0a::t_50a35b93367934 407
+  s_928ee85c6ffc0a::t_750f651eede340 425-428
+  s_928ee85c6ffc0a::t_b038f9ff309a42 492
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_928ee85c6ffc0a::t_d1c05e1c78c1d7 556,559-566
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_928ee85c6ffc0a::t_48824b8ba34d5a 30-31
+  s_928ee85c6ffc0a::t_67c1b91db56259 65-71
+net/crates/net/payments/src/engine/mod.rs
+  s_928ee85c6ffc0a::t_1558a9f7363855 154-168
+  s_928ee85c6ffc0a::t_6e046aa8a2175b 1040-1046,1051,1053,1062-1085
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_bccd254cd5b3d4 425-436,439
+  s_928ee85c6ffc0a::t_34e090f0fe5bfd 219-226
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_928ee85c6ffc0a::t_9e39036a94b0ab 72-74,80-83,85
+net/crates/net/payments/tests/lifecycle_modes.rs
+  s_928ee85c6ffc0a::t_a5a022ec9004c5 18-19
+  s_928ee85c6ffc0a::t_5039fc78e745e2 696-751
+  s_a772df20f47a78::t_dfa62c5b3954fe 647,664,675,684,695,778
+net/crates/net/adapters/mcp/src/serve/mod.rs
+  s_928ee85c6ffc0a::t_3ae0f00f8080db 53-54
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_928ee85c6ffc0a::t_bec1ee35bfdce4 297-299
+net/crates/net/payments/tests/adversarial_p1.rs
+  s_a772df20f47a78::t_8fa5dc68c196f4 176
+net/crates/net/payments/tests/checker_verification.rs
+  s_a772df20f47a78::t_c4c4b3218d0f66 218
+net/crates/net/payments/tests/exact_scheme_flow_e2e.rs
+  s_a772df20f47a78::t_7dde6c591b53bd 171
+net/crates/net/payments/tests/flow_end_to_end.rs
+  s_a772df20f47a78::t_d737dadb6edc8d 116,138,180
+net/crates/net/payments/tests/mesh_payments_e2e.rs
+  s_a772df20f47a78::t_da5526ef799418 122,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9b0f44d75d49d5a692e798fc341c0738e5bb6da7",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
