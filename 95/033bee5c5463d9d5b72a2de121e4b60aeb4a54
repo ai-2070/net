@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_06_HERMES_PLAN_2.md
+  s_e5e32f4de753a1::t_21ece75fb8d138 1-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "95033bee5c5463d9d5b72a2de121e4b60aeb4a54",
+  "prompts": {},
+  "sessions": {
+    "s_e5e32f4de753a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "139bb615-8f2e-43d6-82a3-80f12317e436",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
