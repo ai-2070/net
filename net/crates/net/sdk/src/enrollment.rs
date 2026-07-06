@@ -54,6 +54,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use parking_lot::Mutex;
 
 use crate::delegation::DelegationChain;
@@ -77,6 +78,10 @@ const JOIN_CHALLENGE_DOMAIN: &[u8] = b"net-mesh enrollment join-request v1";
 
 /// Domain-separation prefix for the displayed root [`fingerprint`].
 const FINGERPRINT_DOMAIN: &[u8] = b"net-mesh root-fingerprint v1";
+
+/// Scheme-like prefix on the copy-paste / QR invite string, so it's
+/// self-describing and unambiguous to a scanner or a human.
+const INVITE_STRING_PREFIX: &str = "net-invite:";
 
 /// Upper bound on tags accepted from a serialized [`JoinRequest`] — a framing
 /// sanity cap so a malformed/hostile blob can't declare a huge tag count.
@@ -282,6 +287,32 @@ impl InviteToken {
             nonce,
             expires_at,
         })
+    }
+
+    /// The copy-paste / QR invite string: a `net-invite:` prefix followed by
+    /// URL-safe, unpadded base64 of the canonical [`Self::to_bytes`]. This is
+    /// what `mesh.invite` hands the operator to share and `mesh.join` consumes;
+    /// a QR code is just this string encoded.
+    pub fn encode(&self) -> String {
+        let mut s = String::from(INVITE_STRING_PREFIX);
+        s.push_str(&URL_SAFE_NO_PAD.encode(self.to_bytes()));
+        s
+    }
+
+    /// Parse an invite string produced by [`Self::encode`]. Tolerates
+    /// surrounding whitespace (a trailing newline from copy-paste / a QR
+    /// scanner); rejects a missing prefix, invalid base64, or malformed bytes.
+    pub fn decode(s: &str) -> Result<Self, EnrollmentError> {
+        let body =
+            s.trim()
+                .strip_prefix(INVITE_STRING_PREFIX)
+                .ok_or(EnrollmentError::MalformedInvite(
+                    "missing net-invite: prefix",
+                ))?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(body)
+            .map_err(|_| EnrollmentError::MalformedInvite("invalid base64"))?;
+        Self::from_bytes(&bytes)
     }
 }
 
@@ -851,6 +882,21 @@ mod tests {
         // The round-tripped request still self-verifies.
         parsed.verify_self_signature().unwrap();
         assert!(JoinRequest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn invite_string_round_trips_and_tolerates_whitespace() {
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://some/rendezvous", HOUR, T0);
+        let s = invite.encode();
+        assert!(s.starts_with("net-invite:"));
+        assert_eq!(InviteToken::decode(&s).unwrap(), invite);
+        // A trailing newline / leading spaces from copy-paste or a QR scan.
+        assert_eq!(InviteToken::decode(&format!("  {s}\n")).unwrap(), invite);
+        // Missing prefix, invalid base64, and malformed bytes are all rejected.
+        assert!(InviteToken::decode("deadbeef").is_err());
+        assert!(InviteToken::decode("net-invite:!!!not-base64!!!").is_err());
+        assert!(InviteToken::decode("net-invite:AAAA").is_err());
     }
 
     #[test]
