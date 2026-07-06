@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_06_PAYMENTS_SDK.md
+  s_7ce219b0ad4e48::t_837437034b949d 1-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81d3a1dddc260b90355a08c219fb85e5717707e9",
+  "prompts": {},
+  "sessions": {
+    "s_7ce219b0ad4e48": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c2c00026-876e-416f-8d36-c904f76330b4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
