@@ -2639,6 +2639,7 @@ dependencies = [
  "dirs",
  "fs2",
  "futures",
+ "getrandom 0.4.3",
  "hdrhistogram",
  "net-mesh",
  "net-mesh-sdk-macros",
