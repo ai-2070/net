@@ -158,6 +158,12 @@ pub mod gang;
 pub mod identity;
 #[cfg(feature = "net")]
 pub mod revocation;
+// Agent-to-agent (A2A) task handoff (Hermes V2 Phase 3) — the transport-
+// independent task types + executor-side registry + cancellation, so one
+// enrolled agent hands a long job to another and can cancel it mid-run. The
+// mesh wiring (serve + client) is `mesh_a2a` (gated net + cortex).
+#[cfg(feature = "net")]
+pub mod a2a;
 #[cfg(feature = "net")]
 pub mod subnets;
 
@@ -264,6 +270,11 @@ pub use crate::mesh_enroll::{JoinFlowError, ENROLLMENT_SERVICE};
 pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};
+// Agent-to-agent task-handoff convenience re-exports (V2 Phase 3).
+#[cfg(feature = "net")]
+pub use crate::a2a::{
+    A2aError, CancelToken, TaskAck, TaskBrief, TaskExecutor, TaskRecord, TaskRegistry, TaskState,
+};
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
 
