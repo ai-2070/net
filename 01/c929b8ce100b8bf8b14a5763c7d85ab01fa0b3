@@ -1,0 +1,137 @@
+net/crates/net/payments/src/lib.rs
+  s_a772df20f47a78::t_f91288fb7f99f7 62
+net/crates/net/payments/tests/eip155_checker.rs
+  s_a772df20f47a78::t_4caead3afad3da 19,38-40,47-49,67-69,94-98,110-114,130-133,146-149,156-159,167-174,180-187,191-194,216-219,228-231
+net/crates/net/payments/tests/lifecycle_modes.rs
+  s_a772df20f47a78::t_98a8f00ea8aa62 189-192,231-236,247-248,257-259,264-267,278-279,288-290,298-299,305-308,319-320,325-329,342-350,353-357,376-385,399-400,420-425,435-437,452-454,465-467,473-476,488-491,499-501,514-517,521-526,531-533,545-548,557-559,569-570,648-654,662-667,671-674,679-681,701-707,751-754,822-824,838-842,866-867,918-923
+net/crates/net/payments/tests/live_testnet_conformance.rs
+  s_a772df20f47a78::t_0572cf9f73a11f 70,75-78,122-126,128-131,152-156,169,207-211,271,283,307-310,313-316,320,344-348
+net/crates/net/payments/tests/mcp_gate_composition.rs
+  s_a772df20f47a78::t_81fb75034ed186 23,85-89,107-109,185-191,237-242
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_928ee85c6ffc0a::t_5e698e6acbd1d5 561,574-580,591-597
+net/crates/net/adapters/mcp/src/serve/mod.rs
+  s_928ee85c6ffc0a::t_bacf62aaa2fbb5 41,52
+net/crates/net/adapters/mcp/src/wrap/descriptor.rs
+  s_928ee85c6ffc0a::t_d6cdff52320e4d 321-324
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_928ee85c6ffc0a::t_7bb3c2a99c39f4 297-300
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_928ee85c6ffc0a::t_215f4d04b50f55 183-187,400-402,418,761-769
+net/crates/net/payments/examples/gen_payments_fixtures.rs
+  s_928ee85c6ffc0a::t_6b27a59ba58a0d 65-68,84-87,117-118,162-165,172-175,187-190
+net/crates/net/payments/src/billing/mod.rs
+  s_928ee85c6ffc0a::t_8fba407fe1711f 40-44,49-52,69-72,119-124,146-147,151,172-174
+net/crates/net/payments/src/checker/eip155.rs
+  s_928ee85c6ffc0a::t_ab2cd1f02dcbe3 48-53,80-83,94-96,162-165
+net/crates/net/payments/src/checker/mod.rs
+  s_928ee85c6ffc0a::t_fce6eaff9f116d 33-36,39-42
+net/crates/net/payments/src/core/billing_event.rs
+  s_928ee85c6ffc0a::t_64776b6d5c14b5 142-149
+net/crates/net/payments/src/core/canonical.rs
+  s_928ee85c6ffc0a::t_aba08b8a79e3fe 216-225,235-240,249-252,302-305
+net/crates/net/payments/src/core/quote.rs
+  s_928ee85c6ffc0a::t_dbb17262be02b7 192-197,253-256,299-302,329-332,345-346,351-354,360-363
+net/crates/net/payments/src/core/registry.rs
+  s_928ee85c6ffc0a::t_193b735264bbf7 110-114,260-262,277-281
+net/crates/net/payments/src/core/settlement_ref.rs
+  s_928ee85c6ffc0a::t_2705fff495a897 109-110,120-123
+net/crates/net/payments/src/core/terms.rs
+  s_928ee85c6ffc0a::t_3c8497f681ec35 99-102
+net/crates/net/payments/src/core/units.rs
+  s_928ee85c6ffc0a::t_1ce5611166e76c 116-127,140
+net/crates/net/payments/src/core/verification.rs
+  s_928ee85c6ffc0a::t_6231e17be30eb4 240-243,257-260,275-279,290-292,306-312
+net/crates/net/payments/src/engine/mod.rs
+  s_928ee85c6ffc0a::t_f6793f23be3eed 110-113,116-119,132-136,352-354,357-359,426-428,431-433,436-438,476-478,501-503,520-529,540-542,545-546,550-552,554-556,560-593,596-600,602-622,624-627,629-647,649-651,655-692,694-695,755-793,798,800,802,806-849,927-928,950-953,976-978,982-985,1082-1085,1090-1093,1099-1100,1165,1218-1220
+net/crates/net/payments/src/facilitator/client.rs
+  s_928ee85c6ffc0a::t_baa6c1317bfa91 74-76,83-86,115-119,199-200,269-272,280-282,285-288,296-298,303-306
+net/crates/net/payments/src/facilitator/config.rs
+  s_928ee85c6ffc0a::t_662286374a48ff 195-202,218-219,235-237
+net/crates/net/payments/src/facilitator/mock.rs
+  s_928ee85c6ffc0a::t_a1dfb7fab79c83 152-155,179-182,188-195,207-212,217-222,226-229,361-364,378-381,390-397,415-418
+net/crates/net/payments/src/facilitator/mod.rs
+  s_928ee85c6ffc0a::t_6280e89cb7f7d8 18-20
+net/crates/net/payments/src/facilitator/packs.rs
+  s_928ee85c6ffc0a::t_856c8a195ca7f7 84-86,92,109-111,204-207,211-214
+net/crates/net/payments/src/facilitator/traits.rs
+  s_a772df20f47a78::t_9619a772f7976d 48-52,55-59,62-66,69-73
+net/crates/net/payments/src/flow/http402.rs
+  s_928ee85c6ffc0a::t_ab9730265ce5d0 149-153,203-206,210-213,223-226,233-237,239-243,254-257,267-270,298-302,305-309,321-324,339-342
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_928ee85c6ffc0a::t_48c9c82a5fdbbf 30-47,79-83
+net/crates/net/payments/src/flow/mesh.rs
+  s_a772df20f47a78::t_17c639d17b46da 71-72,85-87,89,102-105,110-113,159-162,191-194,204-210
+net/crates/net/payments/src/flow/mod.rs
+  s_928ee85c6ffc0a::t_57ec70bdcd0d5b 81-93,95-98,103-105,118-126,128-133,209-216,224-227,232-239,261-267,379-383,386-389,393-398,434-438,440-444,455-458,470-473,578,587-590,592,606-609
+net/crates/net/payments/src/flow/signer.rs
+  s_928ee85c6ffc0a::t_84526f3f287879 36-38,92-95,119-120,131-134,201-203
+net/crates/net/payments/src/policy/spend.rs
+  s_928ee85c6ffc0a::t_fa5f962e7115d4 167-171,215-217,249-253,257-263,357-358,378-383,390-391
+net/crates/net/payments/src/policy/store.rs
+  s_928ee85c6ffc0a::t_0ef5e94a47fe0b 44-47,164-166,172-174,300
+net/crates/net/payments/src/x402/caip.rs
+  s_928ee85c6ffc0a::t_e904ddb269896e 228-232,245-250,277-281,291-294
+net/crates/net/payments/src/x402/payload.rs
+  s_928ee85c6ffc0a::t_979400e061e28d 106-109
+net/crates/net/payments/src/x402/requirements.rs
+  s_928ee85c6ffc0a::t_ec7fe2dad9d5dc 67-69,74-76,79-81,121-148
+net/crates/net/payments/src/x402/schemes/exact_evm.rs
+  s_928ee85c6ffc0a::t_b8f4109f1a424b 55-57,84-91,188-191,193-196,223-226
+net/crates/net/payments/src/x402/schemes/exact_svm.rs
+  s_928ee85c6ffc0a::t_cee4da324d14e6 157-160,162-165,177,182
+net/crates/net/payments/src/x402/settlement.rs
+  s_928ee85c6ffc0a::t_a6b6c98203dd27 131
+net/crates/net/payments/tests/adversarial_p1.rs
+  s_928ee85c6ffc0a::t_65a57f11350c7a 12,15,34-37,95-99,159-164,183-187,205-210,214-218,221-224
+net/crates/net/payments/tests/billing_stream.rs
+  s_928ee85c6ffc0a::t_dff5cb0c5758d7 55-60,101-103,116-122,184-187
+net/crates/net/payments/tests/checker_verification.rs
+  s_928ee85c6ffc0a::t_84ed1115d35a23 44-47,98-104,118-125,132-135,143-148,163-166,173-176,204-211,216-221,227-230,234-245,260-265,272-274,299-304,310-312,318-321,331-336,340-346,354-359,370-372
+net/crates/net/payments/tests/exact_evm_signing.rs
+  s_928ee85c6ffc0a::t_63868aaff3eb8d 14,47-50,73-76,83-84
+net/crates/net/payments/tests/exact_scheme_flow_e2e.rs
+  s_928ee85c6ffc0a::t_851c96b70eecd6 26,56-59,172-177,194-197,201-203
+net/crates/net/payments/tests/exact_svm_scheme_flow.rs
+  s_928ee85c6ffc0a::t_fdd8cb4b5b281a 59-62,106-109,153-155,195-201,211-214,223-226,245-248
+net/crates/net/payments/tests/flow_end_to_end.rs
+  s_928ee85c6ffc0a::t_5465d5c572521b 18,108-114,122-127,133-135,151-156,179-183,201-206,214-218,235-238,262-265,313-322,354,404-410,416-419,449-453,472,486-489
+net/crates/net/payments/tests/http402_outbound.rs
+  s_928ee85c6ffc0a::t_9586222c4f2deb 57-59,66-68,86,138-142,151-154,180-182,197-202,239-244,248-251
+net/crates/net/payments/tests/http_facilitator_conformance.rs
+  s_928ee85c6ffc0a::t_fd3d1766d73ad0 56-58,209-211,233-236,244-247,249-252,264-267,273-276,292-295,338-343,349-353,378-383,387-389
+net/crates/net/payments/tests/mesh_payments_e2e.rs
+  s_928ee85c6ffc0a::t_2879b657fab7ca 40-43,55-57,126-131,160-164,168-173,177-181
+net/crates/net/payments/tests/payments_golden_vectors.rs
+  s_928ee85c6ffc0a::t_0ff285bcb28b10 21,43-44,167-170,173-174,187-194,214-216,274-276,312-315
+net/crates/net/payments/tests/spend_policy.rs
+  s_928ee85c6ffc0a::t_891d89db49a5b5 10,12,74-78,84-87,98,130-133,136-139,150-159,167-170,179-183,199,245-248,255-258,285-288,313-316,330-334,338-341,345-349,366-369,375-379,383-386,392-395,420-423,440-443,458-462,513-517
+net/crates/net/sdk/src/tool.rs
+  s_928ee85c6ffc0a::t_984b88f0555b78 34-35
+net/crates/net/src/adapter/net/cortex/tool.rs
+  s_928ee85c6ffc0a::t_01745795e58beb 746
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "01c929b8ce100b8bf8b14a5763c7d85ab01fa0b3",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
