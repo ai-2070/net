@@ -293,6 +293,18 @@ impl DelegationChain {
             .expect("a DelegationChain always has at least one link")
     }
 
+    /// Unix-seconds the chain expires — the **earliest** link's `not_after`
+    /// (the whole chain is only live while every link is). For a bare
+    /// `root → device` grant this is that single grant's expiry.
+    pub fn expires_at(&self) -> u64 {
+        self.chain
+            .tokens
+            .iter()
+            .map(|t| t.not_after)
+            .min()
+            .expect("a DelegationChain always has at least one link")
+    }
+
     /// Number of delegation links (2 for a bare gateway chain, +1 per
     /// subagent hop).
     pub fn len(&self) -> usize {

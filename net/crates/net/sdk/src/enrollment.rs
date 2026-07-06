@@ -52,10 +52,12 @@
 //! the `net mesh …` CLI, and the language bindings layer on top (Slice B).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::delegation::DelegationChain;
 use crate::identity::{EntityId, Identity, TokenError};
@@ -751,6 +753,213 @@ impl EnrollmentAuthority {
     }
 }
 
+/// A device's **persisted** enrollment — its own keypair plus the
+/// `root → device` delegation it received from [`EnrollmentAuthority::approve`],
+/// so the device survives restarts **without re-pairing**.
+///
+/// The device seed is secret material: [`Self::save`] writes it `0600` and the
+/// seed never leaves Rust ([`Self::device`] hands back an opaque [`Identity`]
+/// handle — H8). Revocation is enforced at the **provider** on invoke, so the
+/// device-side [`Self::is_valid`] checks the grant is well-formed and unexpired
+/// (a device doesn't hold the operator's revocation floors — it learns of a
+/// revocation when a provider refuses its next invoke).
+#[derive(Clone)]
+pub struct DeviceEnrollment {
+    device: Identity,
+    chain: DelegationChain,
+    enrolled_at: u64,
+}
+
+/// Errors persisting / loading a [`DeviceEnrollment`].
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceEnrollmentError {
+    /// An I/O error touching the enrollment file.
+    #[error("device enrollment I/O at {path}: {reason}")]
+    Io {
+        /// The path involved.
+        path: String,
+        /// The underlying reason.
+        reason: String,
+    },
+    /// The file exists but couldn't be parsed — surfaced, not silently treated
+    /// as unenrolled, so a corrupt file doesn't quietly trigger a re-pair.
+    #[error("device enrollment at {path} is corrupt: {reason}")]
+    Corrupt {
+        /// The path involved.
+        path: String,
+        /// The underlying reason.
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceEnrollmentFile {
+    /// The device's 32-byte ed25519 seed, lowercase hex — **secret**.
+    device_seed: String,
+    /// The `root → device` chain bytes, lowercase hex.
+    chain: String,
+    enrolled_at: u64,
+}
+
+impl DeviceEnrollment {
+    /// Bundle a freshly-joined `device` (whose key it holds) with the
+    /// `root → device` `chain` it received. `enrolled_at` is unix-seconds.
+    pub fn new(device: Identity, chain: DelegationChain, enrolled_at: u64) -> Self {
+        Self {
+            device,
+            chain,
+            enrolled_at,
+        }
+    }
+
+    /// The device's opaque identity handle (its private seed stays in Rust).
+    pub fn device(&self) -> &Identity {
+        &self.device
+    }
+
+    /// The `root → device` delegation chain.
+    pub fn chain(&self) -> &DelegationChain {
+        &self.chain
+    }
+
+    /// The mesh root the grant anchors at.
+    pub fn root(&self) -> EntityId {
+        self.chain.root()
+    }
+
+    /// Unix-seconds the device enrolled.
+    pub fn enrolled_at(&self) -> u64 {
+        self.enrolled_at
+    }
+
+    /// Unix-seconds the grant expires (the chain's earliest `not_after`).
+    pub fn expires_at(&self) -> u64 {
+        self.chain.expires_at()
+    }
+
+    /// Still usable: the chain verifies — roots at the mesh root, its leaf is
+    /// this device, is unexpired, and is unrevoked against `revocation`. A
+    /// device that doesn't track the provider's floors passes an empty registry
+    /// (expiry + well-formedness is the device-side check; the provider
+    /// enforces revocation on invoke).
+    pub fn is_valid(&self, revocation: &RevocationRegistry, skew_secs: u64) -> bool {
+        self.chain
+            .verify(self.device.entity_id(), &self.root(), revocation, skew_secs)
+            .is_ok()
+    }
+
+    /// Whether the grant is within `window_secs` of expiry at `now` — the
+    /// trigger for silent renewal.
+    pub fn needs_renewal(&self, window_secs: u64, now: u64) -> bool {
+        now.saturating_add(window_secs) >= self.expires_at()
+    }
+
+    /// Persist to `path` (`0600` on Unix, atomic temp+rename). Overwrites any
+    /// existing enrollment (e.g. after a renewal).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DeviceEnrollmentError> {
+        let path = path.as_ref();
+        let io = |e: std::io::Error| DeviceEnrollmentError::Io {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(io)?;
+            }
+        }
+        let file = DeviceEnrollmentFile {
+            device_seed: hex_lower(&self.device.to_bytes()),
+            chain: hex_lower(&self.chain.to_bytes()),
+            enrolled_at: self.enrolled_at,
+        };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| DeviceEnrollmentError::Io {
+            path: path.display().to_string(),
+            reason: format!("serialize device enrollment: {e}"),
+        })?;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).map_err(io)?;
+            f.write_all(&bytes).map_err(io)?;
+            f.flush().map_err(io)?;
+            f.sync_all().map_err(io)?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io(e)
+        })?;
+        Ok(())
+    }
+
+    /// Load from `path`. A missing file is `Ok(None)` (not enrolled yet); a
+    /// present-but-unparseable file is [`DeviceEnrollmentError::Corrupt`].
+    pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>, DeviceEnrollmentError> {
+        let path = path.as_ref();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(DeviceEnrollmentError::Io {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
+        };
+        let corrupt = |reason: String| DeviceEnrollmentError::Corrupt {
+            path: path.display().to_string(),
+            reason,
+        };
+        let file: DeviceEnrollmentFile =
+            serde_json::from_slice(&bytes).map_err(|e| corrupt(e.to_string()))?;
+        let seed = hex_to_vec(&file.device_seed)
+            .ok_or_else(|| corrupt("device_seed is not valid hex".to_string()))?;
+        let device = Identity::from_bytes(&seed)
+            .map_err(|_| corrupt("device_seed is not a 32-byte ed25519 seed".to_string()))?;
+        let chain_bytes =
+            hex_to_vec(&file.chain).ok_or_else(|| corrupt("chain is not valid hex".to_string()))?;
+        let chain = DelegationChain::from_bytes(&chain_bytes)
+            .map_err(|e| corrupt(format!("chain: {e}")))?;
+        Ok(Some(Self {
+            device,
+            chain,
+            enrolled_at: file.enrolled_at,
+        }))
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble is 0..16"));
+        s.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble is 0..16"));
+    }
+    s
+}
+
+fn hex_to_vec(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// Build the canonical, domain-separated, length-prefixed challenge the device
 /// signs and the authority reconstructs. Length prefixes make the framing
 /// unambiguous — no field-boundary confusion between name and tags.
@@ -1134,6 +1343,74 @@ mod tests {
         assert!(matches!(
             rejected.into_chain(device.entity_id(), &invite.root),
             Err(JoinError::Rejected { code, .. }) if code == reject::REPLAY
+        ));
+    }
+
+    fn enroll_a_device(grant_ttl: Duration) -> (EnrollmentAuthority, Identity, DeviceEnrollment) {
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        let enrollment = auth
+            .approve(&req, &invite, T0, grant_ttl, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        let de = DeviceEnrollment::new(device.clone(), enrollment.chain, now_unix());
+        (auth, device, de)
+    }
+
+    #[test]
+    fn device_enrollment_persists_and_reloads_without_re_pairing() {
+        let (auth, device, de) = enroll_a_device(HOUR);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-enrollment.json");
+        de.save(&path).unwrap();
+
+        // "Restart": load a fresh enrollment from disk — no re-pairing.
+        let loaded = DeviceEnrollment::load(&path)
+            .unwrap()
+            .expect("enrollment present");
+        assert_eq!(loaded.device().entity_id(), device.entity_id());
+        assert_eq!(&loaded.root(), auth.root_id());
+        let reg = RevocationRegistry::new();
+        assert!(
+            loaded.is_valid(&reg, 0),
+            "persisted grant still valid after reload"
+        );
+        // The reloaded device still holds its key: it can extend the grant to a
+        // gateway and that chain verifies at the root.
+        let gateway = Identity::generate();
+        let gw = loaded
+            .chain()
+            .extend_delegate(loaded.device(), gateway.entity_id())
+            .unwrap();
+        assert!(gw
+            .verify(gateway.entity_id(), auth.root_id(), &reg, 0)
+            .is_ok());
+    }
+
+    #[test]
+    fn device_enrollment_expiry_and_renewal_window() {
+        let (_auth, _device, de) = enroll_a_device(HOUR);
+        let now = now_unix();
+        // The grant expires ~1h out (issued against the real clock).
+        assert!(de.expires_at() > now);
+        assert!(de.expires_at() <= now + 3601);
+        // Within a 2h window → renewal due; within a minute → not yet.
+        assert!(de.needs_renewal(2 * 3600, now));
+        assert!(!de.needs_renewal(60, now));
+    }
+
+    #[test]
+    fn device_enrollment_load_missing_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-enrollment.json");
+        // Missing file → not enrolled yet.
+        assert!(DeviceEnrollment::load(&path).unwrap().is_none());
+        // Corrupt file → surfaced, not silently treated as unenrolled.
+        std::fs::write(&path, b"{ not valid json").unwrap();
+        assert!(matches!(
+            DeviceEnrollment::load(&path),
+            Err(DeviceEnrollmentError::Corrupt { .. })
         ));
     }
 
