@@ -244,7 +244,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -655,6 +655,11 @@ class NetMesh:
     def node_id(self) -> int:
         """u64 node identifier derived from the keypair."""
         ...
+    @property
+    def local_addr(self) -> str:
+        """This node's bound local UDP address (e.g. ``"127.0.0.1:54321"``);
+        resolves the OS-assigned port for a ``:0`` bind."""
+        ...
 
     def connect(
         self,
@@ -701,6 +706,27 @@ class NetMesh:
         the mesh, returning the verified fresh ``root -> device`` chain. This
         node must be ``start()``ed + ``permissive_channels=True``. (Requires
         ``delegation``.)"""
+        ...
+    def publish_tools(
+        self,
+        tools: List[Tuple[str, Optional[str], str]],
+        callback: Any,
+        version: str = ...,
+        owner_origin: Optional[int] = ...,
+    ) -> "LocalPublicationHandle":
+        """Publish this node's OWN local tools as mesh capabilities (V2 Phase 2)
+        — the inverse of ``net wrap``. ``tools`` is a list of
+        ``(name, description|None, input_schema_json)`` (the input schema as a
+        JSON string). ``callback`` is an **async** callable
+        ``async (tool_name: str, args_json: str) -> str | tuple[str, bool]``
+        invoked on a remote call; its return is the tool's text output (a
+        ``(text, is_error)`` tuple flags a tool-level error). A consumer
+        discovers + invokes these through the ordinary
+        :class:`AsyncCapabilityGateway`. ``owner_origin`` scopes admission (an
+        ``origin_hash`` admits only that caller; ``None`` admits any caller —
+        in-root / testing). Hold the returned handle to keep the tools
+        published. This node must be ``start()``ed + ``permissive_channels=True``.
+        (Requires the ``publish`` feature.)"""
         ...
 
     def push_to(self, peer_addr: str, json: str) -> bool:
@@ -1317,6 +1343,30 @@ class EnrollmentServeHandle:
         ...
     @property
     def serving(self) -> bool: ...
+
+class LocalPublicationHandle:
+    """A live publication of a node's OWN local tools (returned by
+    ``NetMesh.publish_tools``). Hold it to keep the tools announced + served."""
+
+    @property
+    def tools(self) -> List[str]:
+        """The served tool ids (channel-safe)."""
+        ...
+    @property
+    def skipped_tools(self) -> List[str]:
+        """Tool names skipped because they had no usable id (an empty name)."""
+        ...
+    @property
+    def serving(self) -> bool:
+        """Whether the publication is still live."""
+        ...
+    def withdraw(self) -> None:
+        """Withdraw immediately: re-announce the remaining set so peers stop
+        advertising these tools, then stop the services. Idempotent."""
+        ...
+    def stop(self) -> None:
+        """Stop serving (unregister on drop; does not re-announce). Idempotent."""
+        ...
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed

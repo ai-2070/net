@@ -45,6 +45,7 @@ default = [
     "consent",
     "mcp",
     "delegation",
+    "publish",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -145,6 +146,14 @@ mcp = ["consent", "dep:net-mcp"]
 # `serve_enrollment_auto`) compiles; the default wheel already enables the
 # same core `netdb` / `redex-disk` features, so this is marginal there.
 delegation = ["net", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
+# Publish a node's OWN local tools as mesh capabilities
+# (`HERMES_INTEGRATION_PLAN_V2.md` Phase 2, Slice B) — the inverse of `net
+# wrap`, backed by a Python async callback. Composite: `mcp` (the
+# `net_mcp::wrap::ServerPublisher::publish_tools` surface + `ToolInvoker`),
+# `delegation` (the `net` + `net-sdk/net` mesh surface `from_node_arc` needs),
+# and `cortex` (the binding's `async-trait` for the `ToolInvoker` impl + the
+# `dispatch_handler_coro` Rust→Python coroutine bridge).
+publish = ["mcp", "delegation", "cortex"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

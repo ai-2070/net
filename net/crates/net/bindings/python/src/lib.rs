@@ -52,6 +52,12 @@ mod delegation;
 // SDK `net` surface, returns `DelegationChain` handles).
 #[cfg(feature = "delegation")]
 mod enrollment;
+// Publish this node's OWN local tools as mesh capabilities (Hermes V2 Phase 2):
+// the inverse of `net wrap`, backed by a Python async callback. Thin wrappers
+// over `net_mcp::wrap::ServerPublisher::publish_tools`; gated on `publish`
+// (mcp + delegation + cortex).
+#[cfg(feature = "publish")]
+mod publish;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -1373,6 +1379,14 @@ mod mesh_bindings {
             Ok(node.node_id())
         }
 
+        /// This node's bound local UDP address (e.g. ``"127.0.0.1:54321"``).
+        /// With a ``:0`` bind this resolves the OS-assigned port, so a peer can
+        /// be told where to `connect`.
+        #[getter]
+        fn local_addr(&self) -> PyResult<String> {
+            Ok(self.get_node()?.local_addr().to_string())
+        }
+
         /// Connect to a peer (initiator side).
         #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
         fn connect(
@@ -1515,6 +1529,40 @@ mod mesh_bindings {
             enrollment: &crate::enrollment::PyDeviceEnrollment,
         ) -> PyResult<crate::delegation::PyDelegationChain> {
             crate::enrollment::mesh_renew(py, self.node_arc_clone()?, &self.runtime, enrollment)
+        }
+
+        /// Publish this node's OWN local tools as mesh capabilities (V2 Phase 2)
+        /// — the inverse of `net wrap`. `tools` is a list of
+        /// `(name, description|None, input_schema_json)` (the input schema as a
+        /// JSON string). `callback` is an **async** callable
+        /// `async (tool_name: str, args_json: str) -> str | (str, bool)` invoked
+        /// when a consumer calls a tool; its return is the tool's text output
+        /// (a `(text, is_error)` tuple flags a tool-level error). A consumer
+        /// discovers + invokes these through the ordinary
+        /// `AsyncCapabilityGateway`. `owner_origin` scopes admission: an
+        /// `origin_hash` admits only that caller; `None` admits any caller
+        /// (in-root / testing). Returns a handle that must be held to keep the
+        /// tools published. This node must be `start()`ed and built with
+        /// `permissive_channels=True`. (Requires the `publish` feature.)
+        #[cfg(feature = "publish")]
+        #[pyo3(signature = (tools, callback, version=String::new(), owner_origin=None))]
+        fn publish_tools(
+            &self,
+            py: Python<'_>,
+            tools: Vec<(String, Option<String>, String)>,
+            callback: pyo3::Py<pyo3::PyAny>,
+            version: String,
+            owner_origin: Option<u64>,
+        ) -> PyResult<crate::publish::PyLocalPublicationHandle> {
+            crate::publish::mesh_publish_tools(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                tools,
+                callback,
+                version,
+                owner_origin,
+            )
         }
 
         /// Send raw JSON to a direct peer.
@@ -3260,6 +3308,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<enrollment::PyEnrollmentServeHandle>()?;
         m.add_class::<enrollment::PyDeviceEnrollment>()?;
         m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
+    }
+    #[cfg(feature = "publish")]
+    {
+        // Local tool publication (V2 Phase 2, Slice B).
+        m.add_class::<publish::PyLocalPublicationHandle>()?;
     }
     #[cfg(feature = "cortex")]
     {

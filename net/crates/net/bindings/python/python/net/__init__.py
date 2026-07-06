@@ -890,5 +890,16 @@ else:
         ]
     )
 
+# Local tool publication (Hermes V2 Phase 2, the `publish` feature): the
+# return-value type of `NetMesh.publish_tools`. Exported for isinstance /
+# typing; the publish itself is driven from the `NetMesh` handle.
+try:
+    from ._net import LocalPublicationHandle
+except ImportError:
+    # `publish` feature not compiled in; the symbol stays undefined.
+    pass
+else:
+    __all__.append("LocalPublicationHandle")
+
 
 __version__ = "0.31.0"
