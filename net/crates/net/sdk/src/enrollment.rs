@@ -77,10 +77,19 @@ const JOIN_MAGIC: [u8; 4] = *b"NMJ1";
 /// v1).
 const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
 
+/// 4-byte magic + version for the [`RenewalRequest`] wire form (Net-Mesh Renew
+/// v1).
+const RENEWAL_MAGIC: [u8; 4] = *b"NMR1";
+
 /// Domain-separation prefix for the device's self-signature, so a join-request
 /// signature can never be confused with any other signature the device key
 /// produces (tokens, announcements, delegation-invoke envelopes).
 const JOIN_CHALLENGE_DOMAIN: &[u8] = b"net-mesh enrollment join-request v1";
+
+/// Domain-separation prefix for the device's renewal self-signature (distinct
+/// from the join challenge so a captured join signature can't be replayed as a
+/// renewal, or vice versa).
+const RENEWAL_CHALLENGE_DOMAIN: &[u8] = b"net-mesh enrollment renewal-request v1";
 
 /// Domain-separation prefix for the displayed root [`fingerprint`].
 const FINGERPRINT_DOMAIN: &[u8] = b"net-mesh root-fingerprint v1";
@@ -134,6 +143,10 @@ pub enum EnrollmentError {
     /// expire. Fail-closed so single-use is never silently dropped.
     #[error("invite ledger saturated; retry after outstanding invites expire")]
     LedgerSaturated,
+    /// A renewal presented a chain that is revoked, expired, or not anchored at
+    /// this mesh — it can't be renewed; the device must re-enroll.
+    #[error("the presented grant is not renewable (revoked, expired, or wrong mesh)")]
+    Unrenewable,
     /// The `root → device` delegation could not be minted (e.g. an
     /// out-of-range grant TTL).
     #[error(transparent)]
@@ -478,6 +491,99 @@ pub struct Enrollment {
     pub tags: Vec<String>,
 }
 
+/// A device's request to **renew** its `root → device` grant before it expires
+/// — the wire form of silent auto-renewal.
+///
+/// Unlike a [`JoinRequest`] (which needs an invite), the authorization *is* the
+/// device's own **currently valid, unrevoked** grant: the device presents that
+/// chain plus a fresh signature proving it still holds the device key, and the
+/// operator — if the chain still verifies and the device isn't revoked —
+/// re-issues a fresh grant. A revoked device's chain fails verification, so it
+/// can't renew and must re-enroll.
+#[derive(Clone, Debug)]
+pub struct RenewalRequest {
+    /// The device requesting renewal (the leaf of its current chain).
+    pub device: EntityId,
+    /// The device's current `root → device` chain bytes — proof of prior
+    /// enrollment and the authorization to renew.
+    pub chain: Vec<u8>,
+    /// The mesh root the grant anchors at.
+    pub root: EntityId,
+    /// Ed25519 signature by `device` over the renewal challenge.
+    pub signature: [u8; 64],
+}
+
+impl RenewalRequest {
+    /// Build + sign a renewal request from the device's current grant.
+    /// `device` must own its signing key.
+    pub fn create(device: &Identity, current_chain: &DelegationChain) -> Self {
+        let chain = current_chain.to_bytes();
+        let root = current_chain.root();
+        let challenge = renewal_challenge(device.entity_id(), &chain, &root);
+        let signature = device.sign(&challenge);
+        Self {
+            device: device.entity_id().clone(),
+            chain,
+            root,
+            signature,
+        }
+    }
+
+    /// Verify the device's self-signature — that it still holds the key.
+    pub fn verify_self_signature(&self) -> Result<(), EnrollmentError> {
+        let challenge = renewal_challenge(&self.device, &self.chain, &self.root);
+        self.device
+            .verify_bytes(&challenge, &self.signature)
+            .map_err(|_| EnrollmentError::BadSignature)
+    }
+
+    /// Canonical wire form (versioned, length-prefixed).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + 32 + 32 + 64 + 4 + self.chain.len());
+        buf.extend_from_slice(&RENEWAL_MAGIC);
+        buf.extend_from_slice(self.device.as_bytes());
+        buf.extend_from_slice(self.root.as_bytes());
+        buf.extend_from_slice(&self.signature);
+        push_lp(&mut buf, &self.chain);
+        buf
+    }
+
+    /// Parse the canonical wire form.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnrollmentError> {
+        let mut r = Reader::new(bytes);
+        let magic = r
+            .take_arr::<4>()
+            .ok_or(EnrollmentError::MalformedRequest("truncated"))?;
+        if magic != RENEWAL_MAGIC {
+            return Err(EnrollmentError::MalformedRequest("bad magic or version"));
+        }
+        let device = EntityId::from_bytes(
+            r.take_arr::<32>()
+                .ok_or(EnrollmentError::MalformedRequest("truncated device"))?,
+        );
+        let root = EntityId::from_bytes(
+            r.take_arr::<32>()
+                .ok_or(EnrollmentError::MalformedRequest("truncated root"))?,
+        );
+        let signature = r
+            .take_arr::<64>()
+            .ok_or(EnrollmentError::MalformedRequest("truncated signature"))?;
+        let chain = r
+            .take_lp()
+            .ok_or(EnrollmentError::MalformedRequest("bad chain"))?
+            .to_vec();
+        if !r.done() {
+            return Err(EnrollmentError::MalformedRequest("trailing bytes"));
+        }
+        Ok(Self {
+            device,
+            chain,
+            root,
+            signature,
+        })
+    }
+}
+
 /// [`JoinOutcome::Rejected`] codes — stable across versions so a device can
 /// branch on *why* it was turned away (e.g. `EXPIRED` → fetch a fresh invite).
 pub mod reject {
@@ -498,6 +604,9 @@ pub mod reject {
     /// distinct from a failed check: the invite/signature were valid, the
     /// operator said no.
     pub const DENIED: u16 = 7;
+    /// A renewal presented a grant that can't be renewed — revoked, expired, or
+    /// not anchored at this mesh; the device must re-enroll.
+    pub const UNRENEWABLE: u16 = 8;
 }
 
 /// The operator's response to a join request — the payload the enrollment RPC
@@ -724,6 +833,55 @@ impl EnrollmentAuthority {
             return Err(EnrollmentError::NonceMismatch);
         }
         request.verify_self_signature()
+    }
+
+    /// Renew a device's grant: verify the device still holds its key and that
+    /// its **currently presented** grant still verifies against `revocation`
+    /// (roots at this mesh, leaf is the requesting device, unexpired, and
+    /// unrevoked) — then re-issue a fresh `root → device` grant.
+    ///
+    /// The presented grant *is* the authorization (no invite): a revoked
+    /// (floor-bumped) or expired grant fails the check and returns
+    /// [`EnrollmentError::Unrenewable`], so a cut-off device can't renew — it
+    /// must re-enroll. This is the operator-side of silent auto-renewal.
+    pub fn renew(
+        &self,
+        request: &RenewalRequest,
+        revocation: &RevocationRegistry,
+        grant_ttl: Duration,
+        max_depth: u8,
+    ) -> Result<Enrollment, EnrollmentError> {
+        let root_id = self.root.entity_id();
+        if &request.root != root_id {
+            return Err(EnrollmentError::WrongMesh);
+        }
+        request.verify_self_signature()?;
+        // A revoked device can't renew. A bare `root → device` grant is issued
+        // by the *root*, so `chain.verify` alone won't catch a **device-floor**
+        // revocation (the operator's `revoke` bumps the *device's* floor, which
+        // kills its gateway subtree but not the root-issued grant) — check the
+        // device's floor explicitly. This is the "root policy permits" gate.
+        if revocation.floor(&request.device) > 0 {
+            return Err(EnrollmentError::Unrenewable);
+        }
+        let chain = DelegationChain::from_bytes(&request.chain)
+            .map_err(|_| EnrollmentError::MalformedRequest("chain"))?;
+        // The presented grant must still verify — roots at this mesh, its leaf
+        // is the requesting device, and it's unexpired. A lapsed grant must
+        // re-enroll, not renew.
+        chain
+            .verify(&request.device, root_id, revocation, 0)
+            .map_err(|_| EnrollmentError::Unrenewable)?;
+        let new_chain =
+            DelegationChain::derive_device(&self.root, &request.device, grant_ttl, max_depth)?;
+        Ok(Enrollment {
+            chain: new_chain,
+            device: request.device.clone(),
+            // Renewal doesn't carry name/tags — the operator facade preserves
+            // the existing record's when it re-records.
+            name: String::new(),
+            tags: Vec::new(),
+        })
     }
 
     /// [`Self::approve`] reading the system clock for `now`.
@@ -980,6 +1138,18 @@ fn join_challenge(
         push_lp(&mut msg, tag.as_bytes());
     }
     msg.extend_from_slice(invite_nonce);
+    push_lp(&mut msg, root.as_bytes());
+    msg
+}
+
+/// The domain-separated, length-prefixed challenge a device signs to renew its
+/// grant (over its device id, current chain bytes, and the mesh root).
+fn renewal_challenge(device: &EntityId, chain: &[u8], root: &EntityId) -> Vec<u8> {
+    let mut msg =
+        Vec::with_capacity(RENEWAL_CHALLENGE_DOMAIN.len() + 4 + 32 + 4 + chain.len() + 4 + 32);
+    msg.extend_from_slice(RENEWAL_CHALLENGE_DOMAIN);
+    push_lp(&mut msg, device.as_bytes());
+    push_lp(&mut msg, chain);
     push_lp(&mut msg, root.as_bytes());
     msg
 }
@@ -1411,6 +1581,73 @@ mod tests {
         assert!(matches!(
             DeviceEnrollment::load(&path),
             Err(DeviceEnrollmentError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn renewal_request_round_trips_and_self_verifies() {
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+        let req = RenewalRequest::create(&device, &chain);
+        assert_eq!(&req.device, device.entity_id());
+        assert_eq!(&req.root, root.entity_id());
+        req.verify_self_signature().unwrap();
+        let parsed = RenewalRequest::from_bytes(&req.to_bytes()).unwrap();
+        parsed.verify_self_signature().unwrap();
+        // Tampering the presented chain breaks the signature.
+        let mut bad = req.clone();
+        bad.chain[0] ^= 0xff;
+        assert!(bad.verify_self_signature().is_err());
+    }
+
+    #[test]
+    fn authority_renews_a_valid_grant_and_refuses_a_revoked_or_foreign_one() {
+        let auth = authority();
+        let root_id = auth.root_id().clone();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let jreq = JoinRequest::create(&device, "pc", vec![], &invite);
+        let chain = auth
+            .approve(&jreq, &invite, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+        let req = RenewalRequest::create(&device, &chain);
+        let reg = RevocationRegistry::new();
+
+        // A valid grant renews into a fresh one anchored at the same root.
+        let renewed = auth
+            .renew(&req, &reg, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        assert_eq!(&renewed.device, device.entity_id());
+        assert!(renewed
+            .chain
+            .verify(device.entity_id(), &root_id, &reg, 0)
+            .is_ok());
+
+        // Revoke the device (bump its floor) → renewal is refused.
+        reg.revoke_below(device.entity_id(), 1);
+        assert!(matches!(
+            auth.renew(&req, &reg, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(EnrollmentError::Unrenewable)
+        ));
+
+        // A request presented to a different mesh is refused.
+        let other = EnrollmentAuthority::new(Identity::generate());
+        assert!(matches!(
+            other.renew(
+                &req,
+                &RevocationRegistry::new(),
+                HOUR,
+                DEFAULT_DELEGATION_DEPTH
+            ),
+            Err(EnrollmentError::WrongMesh)
         ));
     }
 

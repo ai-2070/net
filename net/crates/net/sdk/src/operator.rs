@@ -33,12 +33,13 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use crate::delegation::RevocationRegistry;
 use crate::devices::{
     default_device_registry_path, DeviceRecord, DeviceRegistry, DeviceRegistryError,
 };
 use crate::enrollment::{
     now_unix, reject, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinOutcome,
-    JoinRequest,
+    JoinRequest, RenewalRequest,
 };
 use crate::identity::{EntityId, Identity};
 use crate::revocation::{default_revocation_store_path, RevocationStore, RevocationStoreError};
@@ -345,6 +346,67 @@ impl OperatorEnrollment {
         };
         outcome.to_bytes()
     }
+
+    /// Renew a device's grant — the operator side of silent auto-renewal. Loads
+    /// the current revocation floors, verifies the device's presented grant
+    /// still holds ([`EnrollmentAuthority::renew`]), re-issues a fresh grant,
+    /// and re-records the device (preserving its existing name/tags, fresh
+    /// `enrolled_at`). A revoked device is refused — its chain fails the check.
+    pub fn renew(
+        &self,
+        request: &RenewalRequest,
+        grant_ttl: Duration,
+        max_depth: u8,
+    ) -> Result<Enrollment, OperatorError> {
+        // Load the operator's revocation floors so a revoked device is refused
+        // (a missing store is empty = nothing revoked; a corrupt store errors).
+        let registry = RevocationRegistry::new();
+        RevocationStore::load(&self.revocation_path)?.apply_to(&registry);
+
+        let enrollment = self
+            .authority
+            .renew(request, &registry, grant_ttl, max_depth)?;
+
+        // Preserve the device's existing name/tags (renewal doesn't carry them),
+        // and refresh `enrolled_at` so the expiry surface stays current.
+        let existing = DeviceRegistry::load(&self.registry_path)?;
+        let (name, tags) = existing
+            .get(&enrollment.device)
+            .map(|r| (r.name.clone(), r.tags.clone()))
+            .unwrap_or_default();
+        DeviceRegistry::record(
+            &self.registry_path,
+            DeviceRecord::new(enrollment.device.clone(), name, tags, now_unix()),
+        )?;
+        Ok(enrollment)
+    }
+
+    /// The server-side of the renewal RPC: serialized [`RenewalRequest`] bytes
+    /// into serialized [`JoinOutcome`] bytes (`Admitted { chain }` with the
+    /// fresh grant, or a coded `Rejected`). Never errors out of band.
+    pub fn handle_renewal_request(
+        &self,
+        request_bytes: &[u8],
+        grant_ttl: Duration,
+        max_depth: u8,
+    ) -> Vec<u8> {
+        let outcome = match RenewalRequest::from_bytes(request_bytes) {
+            Err(e) => JoinOutcome::Rejected {
+                code: reject::MALFORMED,
+                message: e.to_string(),
+            },
+            Ok(request) => match self.renew(&request, grant_ttl, max_depth) {
+                Ok(enrollment) => JoinOutcome::Admitted {
+                    chain: enrollment.chain.to_bytes(),
+                },
+                Err(e) => JoinOutcome::Rejected {
+                    code: reject_code(&e),
+                    message: e.to_string(),
+                },
+            },
+        };
+        outcome.to_bytes()
+    }
 }
 
 /// Map an [`OperatorError`] to a stable [`reject`] code for a [`JoinOutcome`].
@@ -361,6 +423,7 @@ fn reject_code(err: &OperatorError) -> u16 {
             | EnrollmentError::WrongMesh
             | EnrollmentError::BadSignature => reject::BAD_REQUEST,
             EnrollmentError::Replay => reject::REPLAY,
+            EnrollmentError::Unrenewable => reject::UNRENEWABLE,
             EnrollmentError::LedgerSaturated | EnrollmentError::Token(_) => reject::INTERNAL,
         },
         OperatorError::Registry(_) | OperatorError::Revocation(_) => reject::INTERNAL,
@@ -594,5 +657,61 @@ mod tests {
         assert!(
             matches!(second, JoinOutcome::Rejected { code, .. } if code == reject::UNKNOWN_INVITE)
         );
+    }
+
+    #[test]
+    fn renew_via_the_facade_refreshes_and_preserves_name_tags() {
+        let (op, root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec!["region:office".into()], &invite);
+        let chain = op
+            .approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+
+        let renew_req = RenewalRequest::create(&device, &chain);
+        let renewed = op
+            .renew(&renew_req, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        assert_eq!(&renewed.device, device.entity_id());
+        assert_eq!(&renewed.chain.root(), root.entity_id());
+        // Name/tags preserved from the original record; still active.
+        let rec = &op.devices().unwrap()[0];
+        assert_eq!(rec.name, "pc");
+        assert_eq!(rec.tags, vec!["region:office".to_string()]);
+        assert!(!rec.is_revoked());
+    }
+
+    #[test]
+    fn handle_renewal_request_admits_then_refuses_after_revoke() {
+        let (op, _root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        let chain = op
+            .approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+        let renew_req = RenewalRequest::create(&device, &chain);
+
+        // A healthy device renews.
+        let out = JoinOutcome::from_bytes(&op.handle_renewal_request(
+            &renew_req.to_bytes(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(matches!(out, JoinOutcome::Admitted { .. }));
+
+        // Revoke the device → renewal is refused with UNRENEWABLE.
+        op.revoke_at(device.entity_id(), 1, T0).unwrap();
+        let out = JoinOutcome::from_bytes(&op.handle_renewal_request(
+            &renew_req.to_bytes(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        ))
+        .unwrap();
+        assert!(matches!(out, JoinOutcome::Rejected { code, .. } if code == reject::UNRENEWABLE));
     }
 }
