@@ -60,7 +60,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::delegation::DelegationChain;
-use crate::identity::{EntityId, Identity, TokenError};
+use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED};
 
 // Re-export the anchor type so `net_sdk::enrollment` is a complete surface.
 pub use crate::delegation::RevocationRegistry;
@@ -689,6 +689,11 @@ impl JoinOutcome {
     /// this device** — defending the joiner against a rogue operator returning
     /// a chain for a different mesh or a different key. On [`Self::Rejected`],
     /// surface the reason.
+    ///
+    /// Verification tolerates [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] of clock
+    /// drift: the operator stamps `not_before` with *its* clock, and a device
+    /// lagging by a few seconds (routine on containerized / edge fleets) must
+    /// not reject its own freshly-minted grant as `NotYetValid`.
     pub fn into_chain(
         self,
         device: &EntityId,
@@ -700,7 +705,7 @@ impl JoinOutcome {
                     DelegationChain::from_bytes(&chain).map_err(JoinError::MalformedGrant)?;
                 let reg = RevocationRegistry::new();
                 chain
-                    .verify(device, invite_root, &reg, 0)
+                    .verify(device, invite_root, &reg, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED)
                     .map_err(|_| JoinError::UntrustedGrant)?;
                 Ok(chain)
             }
@@ -1591,6 +1596,56 @@ mod tests {
         assert!(matches!(
             rejected.into_chain(device.entity_id(), &invite.root),
             Err(JoinError::Rejected { code, .. }) if code == reject::REPLAY
+        ));
+    }
+
+    /// Re-stamp `chain`'s single link with `not_before` shifted `lead_secs`
+    /// into the future (an operator whose clock runs ahead ≡ a device whose
+    /// clock lags), re-signing with `root` so the grant is genuinely valid.
+    fn future_dated_grant(root: &Identity, chain: &DelegationChain, lead_secs: u64) -> Vec<u8> {
+        use crate::delegation::TokenChain;
+        let mut tc = TokenChain::from_bytes(&chain.to_bytes()).unwrap();
+        assert_eq!(tc.tokens.len(), 1);
+        let tok = &mut tc.tokens[0];
+        tok.not_before += lead_secs;
+        tok.not_after += lead_secs;
+        let bytes = tok.to_bytes();
+        let payload = &bytes[..bytes.len() - 64];
+        tok.signature = root.keypair().try_sign(payload).unwrap().to_bytes();
+        tc.to_bytes()
+    }
+
+    #[test]
+    fn into_chain_tolerates_bounded_clock_skew() {
+        // The operator stamps not_before with ITS clock; a device lagging a few
+        // seconds must still accept its own grant (verification carries the
+        // recommended skew) — but a grant leading far beyond the tolerance is
+        // still refused.
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+
+        // 30s ahead: inside the recommended 60s tolerance → accepted.
+        let admitted = JoinOutcome::Admitted {
+            chain: future_dated_grant(&root, &chain, 30),
+        };
+        admitted
+            .into_chain(device.entity_id(), root.entity_id())
+            .expect("a grant within the skew tolerance is accepted");
+
+        // 10 minutes ahead: far beyond the tolerance → still refused.
+        let too_far = JoinOutcome::Admitted {
+            chain: future_dated_grant(&root, &chain, 600),
+        };
+        assert!(matches!(
+            too_far.into_chain(device.entity_id(), root.entity_id()),
+            Err(JoinError::UntrustedGrant)
         ));
     }
 
