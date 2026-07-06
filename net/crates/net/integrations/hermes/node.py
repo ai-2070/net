@@ -57,6 +57,10 @@ _state: Optional[Tuple[object, object, str, object]] = None
 # lazily on first mesh-admin tool use (needs a root seed). `(operator, handle)`.
 _operator: Optional[Tuple[object, object]] = None
 
+# The device-side silent-renewal service (device-mode: this machine is an
+# enrolled device keeping its own grant fresh), or None. Started at node build.
+_renewal: Optional[object] = None
+
 # The `root -> device` grant lifetime an enrolled device receives: **1 year**
 # (the token ceiling). The lifecycle model:
 #   * long grant so an enrolled device survives restarts without re-pairing;
@@ -180,6 +184,14 @@ def _build() -> Tuple[object, object, str, object]:
                 "net plugin: mesh shutdown during init rollback failed", exc_info=True
             )
         raise
+    # Device-mode (best-effort): if this machine is an enrolled device, keep its
+    # own grant silently fresh. Never let a device-renewal setup failure break
+    # the node — its capability / operator features still load.
+    try:
+        _start_device_renewal(mesh)
+    except Exception:  # noqa: BLE001
+        logger.warning("net plugin: device-renewal setup failed", exc_info=True)
+
     logger.info(
         "net plugin: node up (id=%s, bind=%s, pin_store=%s, delegated=%s)",
         getattr(mesh, "node_id", "?"),
@@ -275,6 +287,68 @@ def delegation_valid_for_invoke() -> bool:
         return False
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("net plugin: %s is not an integer (%r); using default", name, raw)
+        return default
+
+
+def _start_device_renewal(mesh_handle) -> None:
+    """Device-mode: if this machine is an enrolled device
+    (``NET_MESH_DEVICE_ENROLLMENT`` points at a persisted enrollment, or
+    ``NET_MESH_INVITE`` is set for a first run), load or create the enrollment
+    and start the silent-renewal loop so its `root -> device` grant stays fresh
+    without re-pairing. Best-effort — invoked under a try/except by the caller,
+    so a device-renewal failure never breaks the node.
+    """
+    global _renewal
+    path = (os.environ.get("NET_MESH_DEVICE_ENROLLMENT") or "").strip() or None
+    if not path:
+        return  # not configured as a self-renewing device
+
+    import time
+
+    from net import DeviceEnrollment, Identity, InviteToken
+
+    from .renewal import RenewalService
+
+    enrollment = DeviceEnrollment.load(path)  # None if not enrolled yet
+    if enrollment is None:
+        invite = (os.environ.get("NET_MESH_INVITE") or "").strip() or None
+        if not invite:
+            logger.info(
+                "net plugin: no device enrollment at %s and no NET_MESH_INVITE; "
+                "device renewal idle",
+                path,
+            )
+            return
+        # First run: generate our own device key, join the operator's mesh, and
+        # persist the enrollment so future starts skip re-pairing.
+        device = Identity.generate()
+        name = (os.environ.get("NET_MESH_DEVICE_NAME") or "").strip() or "device"
+        chain = mesh_handle.join(device, invite, name, [])
+        rendezvous = InviteToken.decode(invite).rendezvous
+        enrollment = DeviceEnrollment(device, chain, rendezvous, int(time.time()))
+        enrollment.save(path)
+        logger.info("net plugin: enrolled as a new device (persisted to %s)", path)
+
+    svc = RenewalService(
+        mesh_handle,
+        enrollment,
+        path,
+        check_interval=_env_int("NET_MESH_RENEWAL_INTERVAL", 24 * 60 * 60),
+        renewal_window=_env_int("NET_MESH_RENEWAL_WINDOW", 30 * 24 * 60 * 60),
+    )
+    svc.start()
+    _renewal = svc
+    logger.info("net plugin: silent device renewal started")
+
+
 def mesh():
     """The embedded :class:`net.NetMesh` — the raw node handle (for enrollment
     rendezvous / serving)."""
@@ -345,20 +419,26 @@ def operator():
 
 def shutdown() -> None:
     """Tear the node down (best-effort, idempotent). Called at session end."""
-    global _state, _operator
+    global _state, _operator, _renewal
     with _lock:
         op_handle = _operator[1] if _operator is not None else None
         _operator = None
-        if _state is None:
-            return
-        mesh_handle = _state[0]
+        renewal = _renewal
+        _renewal = None
+        mesh_handle = _state[0] if _state is not None else None
         _state = None
+    if renewal is not None:
+        try:
+            renewal.stop()
+        except Exception:  # noqa: BLE001 — cleanup must not fail session end
+            logger.debug("net plugin: renewal stop failed", exc_info=True)
     if op_handle is not None:
         try:
             op_handle.stop()
         except Exception:  # noqa: BLE001 — cleanup must not fail session end
             logger.debug("net plugin: enrollment serve-handle stop failed", exc_info=True)
-    try:
-        mesh_handle.shutdown()
-    except Exception as e:  # noqa: BLE001 — session end must not fail on cleanup
-        logger.debug("net plugin: shutdown error: %s", e)
+    if mesh_handle is not None:
+        try:
+            mesh_handle.shutdown()
+        except Exception as e:  # noqa: BLE001 — session end must not fail on cleanup
+            logger.debug("net plugin: shutdown error: %s", e)
