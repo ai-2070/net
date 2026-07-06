@@ -130,6 +130,12 @@ pub mod delegation;
 // delegation surface and pulls `getrandom` for the single-use invite nonce.
 #[cfg(feature = "net")]
 pub mod enrollment;
+// Machine-shared device registry — the operator's inventory of enrolled devices
+// (Hermes V2 Phase 1), backing `mesh.devices()`. Inventory/display state, not
+// enforcement (that's `revocation`); mirrors the revocation store's file
+// discipline. Rides `net` (records `EntityId`s).
+#[cfg(feature = "net")]
+pub mod devices;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -235,6 +241,10 @@ pub use crate::delegation::{
 pub use crate::enrollment::{
     fingerprint, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinRequest,
 };
+// Device-inventory convenience re-exports (V2 Phase 1): the registry backing
+// `mesh.devices()`.
+#[cfg(feature = "net")]
+pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegistry};
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};
 #[cfg(feature = "net")]
