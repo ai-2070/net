@@ -294,10 +294,19 @@ impl TaskRegistry {
             set_state(&inner, &id_run, TaskState::Running);
             // Cooperative cancellation: the executor watches the token and
             // returns promptly when it trips (the Hermes agent loop is wired to
-            // its interrupt machinery). Whatever it returns, a requested cancel
-            // makes the outcome `Cancelled` — the requester asked to stop, so a
-            // partial result isn't promoted.
-            let r = executor.run(brief, cancel.clone()).await;
+            // its interrupt machinery). The select! is the backstop for a
+            // NON-cooperative executor — one that ignores the token — whose
+            // future is dropped when the token trips, so a cancel stops the
+            // work either way ([`CancelToken`]'s documented guarantee).
+            // `biased` polls the executor first so a result that's already in
+            // wins over a simultaneous cancel. Whatever it returns, a requested
+            // cancel makes the outcome `Cancelled` — the requester asked to
+            // stop, so a partial result isn't promoted.
+            let r = tokio::select! {
+                biased;
+                r = executor.run(brief, cancel.clone()) => r,
+                _ = cancel.cancelled() => Err("cancelled".to_string()),
+            };
             let final_state = if cancel.is_cancelled() {
                 TaskState::Cancelled
             } else {
@@ -482,6 +491,58 @@ mod tests {
         );
         // Cancelling a terminal task is a no-op.
         assert!(!reg.cancel(&id));
+    }
+
+    /// An executor that IGNORES the cancel token — it just sleeps. Records
+    /// whether its future was dropped (`dropped`, via a guard) and whether it
+    /// ever ran to completion (`completed`).
+    struct StubbornExecutor {
+        dropped: Arc<AtomicBool>,
+        completed: Arc<AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for StubbornExecutor {
+        async fn run(&self, _brief: TaskBrief, _cancel: CancelToken) -> Result<String, String> {
+            let _guard = SetOnDrop(Arc::clone(&self.dropped));
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok("blob://too-late".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_non_cooperative_executor() {
+        // The registry's select! must drop an executor that ignores the token —
+        // the CancelToken doc's "a non-cooperative executor's future is dropped
+        // by the registry's select!" guarantee.
+        let reg = TaskRegistry::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let id = reg.submit(
+            TaskBrief::new("ignore the token"),
+            Arc::new(StubbornExecutor {
+                dropped: Arc::clone(&dropped),
+                completed: Arc::clone(&completed),
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(reg.cancel(&id));
+        // Terminal promptly — not after the executor's hour-long sleep.
+        let state = wait_terminal(&reg, &id).await;
+        assert_eq!(state, TaskState::Cancelled);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the non-cooperative executor's future was dropped"
+        );
+        assert!(!completed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
