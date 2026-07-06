@@ -478,11 +478,17 @@ pub struct PyDeviceEnrollment {
 #[pymethods]
 impl PyDeviceEnrollment {
     /// Bundle a device `Identity` handle with the `root → device` chain it
-    /// received from `join`, plus the unix-seconds it enrolled.
+    /// received from `join`, the operator's `rendezvous` locator (from the
+    /// invite, for renewal), and the unix-seconds it enrolled.
     #[new]
-    fn new(device: &Identity, chain: &PyDelegationChain, enrolled_at: u64) -> Self {
+    fn new(device: &Identity, chain: &PyDelegationChain, rendezvous: &str, enrolled_at: u64) -> Self {
         Self {
-            inner: DeviceEnrollment::new(to_sdk(device), chain.inner_chain(), enrolled_at),
+            inner: DeviceEnrollment::new(
+                to_sdk(device),
+                chain.inner_chain(),
+                rendezvous.to_string(),
+                enrolled_at,
+            ),
         }
     }
 
@@ -514,6 +520,12 @@ impl PyDeviceEnrollment {
     #[getter]
     fn chain(&self) -> PyDelegationChain {
         PyDelegationChain::from_inner(self.inner.chain().clone())
+    }
+
+    /// The operator's rendezvous locator — where the device dials to renew.
+    #[getter]
+    fn rendezvous(&self) -> String {
+        self.inner.rendezvous().to_string()
     }
 
     /// The mesh root the grant anchors at (32 bytes).
@@ -594,8 +606,27 @@ pub(crate) fn mesh_join(
     Ok(PyDelegationChain::from_inner(chain))
 }
 
-/// Operator-side: serve enrollment on the live `node` (auto — the invite is the
-/// authorization). Returns a handle that must be held to keep the service open.
+/// Device-side: renew the grant carried by `enrollment` over the live `node`,
+/// returning the verified **fresh** `root -> device` chain. Releases the GIL for
+/// the network round-trip.
+pub(crate) fn mesh_renew(
+    py: Python<'_>,
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    enrollment: &PyDeviceEnrollment,
+) -> PyResult<PyDelegationChain> {
+    let mesh = mesh_over(node, Some(enrollment.inner.device().clone()));
+    let rendezvous = enrollment.inner.rendezvous().to_string();
+    let chain = enrollment.inner.chain().clone();
+    let renewed = py
+        .detach(move || runtime.block_on(mesh.renew(&rendezvous, &chain)))
+        .map_err(enroll_err)?;
+    Ok(PyDelegationChain::from_inner(renewed))
+}
+
+/// Operator-side: serve the full device lifecycle on the live `node` (auto —
+/// the invite is the authorization): **enroll** (join) + **renew**. Returns a
+/// handle that must be held to keep the services open.
 pub(crate) fn mesh_serve_enrollment_auto(
     node: Arc<MeshNode>,
     runtime: &Runtime,
@@ -606,22 +637,25 @@ pub(crate) fn mesh_serve_enrollment_auto(
     let mesh = mesh_over(node, None);
     // `serve_rpc` spawns a bridge task, so it needs a runtime context.
     let _guard = runtime.enter();
-    let handle = mesh
-        .serve_enrollment_auto(operator, grant_ttl, max_depth)
+    let enroll = mesh
+        .serve_enrollment_auto(operator.clone(), grant_ttl, max_depth)
+        .map_err(enroll_err)?;
+    let renew = mesh
+        .serve_renewal_auto(operator, grant_ttl, max_depth)
         .map_err(enroll_err)?;
     Ok(PyEnrollmentServeHandle {
-        inner: Some((mesh, handle)),
+        inner: Some((mesh, vec![enroll, renew])),
     })
 }
 
-/// Keeps a served enrollment service alive. Dropping it (or calling
-/// [`Self::stop`]) unregisters the service.
+/// Keeps the served enrollment services alive. Dropping it (or calling
+/// [`Self::stop`]) unregisters them.
 #[pyclass(name = "EnrollmentServeHandle", skip_from_py_object)]
 pub struct PyEnrollmentServeHandle {
-    // The `Mesh` holds the channel registry the service registered against and
-    // the `ServeHandle` holds the dispatcher registration — both must outlive
-    // the service.
-    inner: Option<(Mesh, ServeHandle)>,
+    // The `Mesh` holds the channel registry the services registered against and
+    // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
+    // all must outlive the services.
+    inner: Option<(Mesh, Vec<ServeHandle>)>,
 }
 
 #[pymethods]

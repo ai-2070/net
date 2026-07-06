@@ -691,9 +691,16 @@ class NetMesh:
         grant_ttl_seconds: int,
         max_depth: Optional[int] = ...,
     ) -> "EnrollmentServeHandle":
-        """Operator-side: serve enrollment on this node (auto — the invite is
-        the authorization). Hold the returned handle to keep the service open.
-        This node must be ``start()``ed. (Requires ``delegation``.)"""
+        """Operator-side: serve the full device lifecycle on this node (auto —
+        the invite is the authorization): enroll (join) + renew. Hold the
+        returned handle to keep the services open. This node must be
+        ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
+        """Device-side renewal: refresh the grant carried by ``enrollment`` over
+        the mesh, returning the verified fresh ``root -> device`` chain. This
+        node must be ``start()``ed + ``permissive_channels=True``. (Requires
+        ``delegation``.)"""
         ...
 
     def push_to(self, peer_addr: str, json: str) -> bool:
@@ -1213,7 +1220,11 @@ class DeviceEnrollment:
     seed stays in Rust (H8); :attr:`device` hands back an opaque ``Identity``."""
 
     def __init__(
-        self, device: Identity, chain: DelegationChain, enrolled_at: int
+        self,
+        device: Identity,
+        chain: DelegationChain,
+        rendezvous: str,
+        enrolled_at: int,
     ) -> None: ...
     @staticmethod
     def load(path: str) -> Optional["DeviceEnrollment"]:
@@ -1237,6 +1248,10 @@ class DeviceEnrollment:
         ...
     @property
     def chain(self) -> DelegationChain: ...
+    @property
+    def rendezvous(self) -> str:
+        """The operator's rendezvous locator — where the device dials to renew."""
+        ...
     @property
     def root(self) -> bytes: ...
     @property

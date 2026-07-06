@@ -1504,6 +1504,19 @@ mod mesh_bindings {
             )
         }
 
+        /// Device-side renewal: refresh the grant carried by `enrollment` over
+        /// the mesh, returning the verified fresh `root -> device`
+        /// `DelegationChain`. This node must be `start()`ed and built with
+        /// `permissive_channels=True`. (Requires the `delegation` feature.)
+        #[cfg(feature = "delegation")]
+        fn renew(
+            &self,
+            py: Python<'_>,
+            enrollment: &crate::enrollment::PyDeviceEnrollment,
+        ) -> PyResult<crate::delegation::PyDelegationChain> {
+            crate::enrollment::mesh_renew(py, self.node_arc_clone()?, &self.runtime, enrollment)
+        }
+
         /// Send raw JSON to a direct peer.
         fn push_to(&self, peer_addr: &str, json: &str) -> PyResult<bool> {
             let node = self.get_node()?;

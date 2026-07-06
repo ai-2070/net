@@ -164,7 +164,7 @@ def test_device_enrollment_persists_and_reloads_without_re_pairing(tmp_path):
     device = net.Identity.generate()
     chain = op.approve(net.JoinRequest.create(device, "pc", [], invite), 3600)
 
-    de = net.DeviceEnrollment(device, chain, 1_700_000_000)
+    de = net.DeviceEnrollment(device, chain, "relay://rv", 1_700_000_000)
     path = str(tmp_path / "device-enrollment.json")
     de.save(path)
 
@@ -173,6 +173,7 @@ def test_device_enrollment_persists_and_reloads_without_re_pairing(tmp_path):
     assert loaded is not None
     assert loaded.device.entity_id == device.entity_id
     assert loaded.root == root.entity_id
+    assert loaded.rendezvous == "relay://rv"
     reg = net.RevocationRegistry()
     assert loaded.is_valid(reg) is True
     # The reloaded device still holds its key: extend to a gateway + verify.
@@ -189,7 +190,7 @@ def test_device_enrollment_expiry_and_renewal(tmp_path):
     device = net.Identity.generate()
     chain = op.approve(net.JoinRequest.create(device, "pc", [], invite), 3600)
     now = int(time.time())
-    de = net.DeviceEnrollment(device, chain, now)
+    de = net.DeviceEnrollment(device, chain, "relay://rv", now)
     assert de.expires_at > now
     assert de.needs_renewal(2 * 3600, now) is True
     assert de.needs_renewal(60, now) is False
@@ -234,6 +235,44 @@ def test_live_enrollment_over_the_mesh(tmp_path):
 
         handle.stop()
         assert handle.serving is False
+    finally:
+        for m in (dev_mesh, op_mesh):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+
+
+def test_live_renewal_over_the_mesh(tmp_path):
+    # A device joins, then renews its grant over the wire into a fresh one —
+    # silent auto-renewal, no re-pairing.
+    pytest.importorskip("net._net")
+    import time
+
+    psk = "59" * 32
+    root = net.Identity.generate()
+    op_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    op_mesh.start()
+    op = net.OperatorEnrollment(
+        root, str(tmp_path / "devices.json"), str(tmp_path / "revocations.json")
+    )
+    handle = op_mesh.serve_enrollment_auto(op, 3600)  # serves enroll + renew
+
+    rendezvous = op_mesh.rendezvous_string()
+    invite = op.invite(rendezvous, 300)
+
+    device = net.Identity.generate()
+    dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    dev_mesh.start()
+    try:
+        chain = dev_mesh.join(device, invite.encode(), "pc", [])
+        enrollment = net.DeviceEnrollment(device, chain, rendezvous, int(time.time()))
+
+        renewed = dev_mesh.renew(enrollment)
+        assert renewed.leaf == device.entity_id
+        assert renewed.root == root.entity_id
+
+        handle.stop()
     finally:
         for m in (dev_mesh, op_mesh):
             try:
