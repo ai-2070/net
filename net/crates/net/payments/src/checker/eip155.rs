@@ -234,6 +234,15 @@ impl ChainChecker for Eip155Checker {
             .rpc("eth_getTransactionReceipt", json!([transaction]))
             .await?;
         if receipt.is_null() {
+            // A missing receipt is ambiguous — not-yet-mined, transient RPC
+            // lag, or reorged out after a prior confirmation — so it maps to
+            // Pending (no answer), never an invalidation. Known limitation:
+            // a settlement that was previously confirmed and then reorged
+            // out degrades to Pending here rather than being flagged; the
+            // engine keeps the last tier. Distinguishing reorg-out from lag
+            // needs the checker to remember prior inclusion (stateful), out
+            // of scope for this receipt-only check. An on-chain *revert*
+            // (status 0) IS caught below.
             return Ok(ChainVerdict::Pending);
         }
         let status = parse_hex_u64(&receipt["status"], "receipt.status")?;

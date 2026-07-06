@@ -148,6 +148,15 @@ impl ToolMetadataBuilder {
     /// visible at discovery time. A paid capability is metadata +
     /// invocation policy, not a different kind of tool — and displaying
     /// a price never implies authorization to spend it.
+    ///
+    /// **Discovery-only today.** The provider-side redeem gate
+    /// (`PaymentAdmission` / quote redemption before the handler runs)
+    /// lives only in the MCP wrap path. A native tool served via
+    /// `serve_rpc` that announces `pricing_terms` therefore *advertises* a
+    /// price but does NOT enforce payment before invocation — any direct
+    /// caller pays nothing. Use this for discovery/announcement until a
+    /// native admission gate exists; do not rely on it to gate a
+    /// natively-served handler.
     pub fn pricing_terms(mut self, terms_json: impl Into<String>) -> Self {
         self.descriptor.pricing_terms = Some(terms_json.into());
         self
