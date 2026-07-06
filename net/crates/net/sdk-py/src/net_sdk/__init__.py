@@ -346,4 +346,28 @@ else:
         "derive_child_identity",
     ]
 
+# Device enrollment (`HERMES_INTEGRATION_PLAN_V2.md` Phase 1): the invite ->
+# join -> approve handshake + the operator device-lifecycle facade. Present iff
+# the wheel was built with the `delegation` feature (the default one is).
+try:
+    from net_sdk.enrollment import (  # noqa: E402
+        DeviceRecord,
+        InviteToken,
+        JoinOutcome,
+        JoinRequest,
+        OperatorEnrollment,
+        fingerprint,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "DeviceRecord",
+        "InviteToken",
+        "JoinOutcome",
+        "JoinRequest",
+        "OperatorEnrollment",
+        "fingerprint",
+    ]
+
 __version__ = "0.31.0"

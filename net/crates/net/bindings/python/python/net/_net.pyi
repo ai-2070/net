@@ -1077,6 +1077,161 @@ class DelegationChain:
         ...
     def __len__(self) -> int: ...
 
+# -----------------------------------------------------------------------------
+# Device enrollment (HERMES_INTEGRATION_PLAN_V2.md Phase 1).
+# -----------------------------------------------------------------------------
+
+def fingerprint(entity: bytes) -> str:
+    """A short, human-comparable fingerprint of a 32-byte entity-id, shown
+    on both sides of a join (``A1B2-C3D4-E5F6-0789``)."""
+    ...
+
+class InviteToken:
+    """A pre-authorization to *ask* to join a mesh — not a key. Carries the
+    mesh ``root``, a ``rendezvous`` locator, a single-use nonce, and a short
+    TTL. The copy-paste / QR form is :meth:`encode`."""
+
+    @staticmethod
+    def decode(s: str) -> "InviteToken":
+        """Parse a ``net-invite:<base64url>`` string. Raises on a missing
+        prefix, bad base64, or malformed bytes."""
+        ...
+    def encode(self) -> str:
+        """The copy-paste / QR invite string."""
+        ...
+    def root_fingerprint(self) -> str:
+        """The displayed fingerprint of the mesh root — show it to the joiner."""
+        ...
+    def is_expired(self, now: int) -> bool:
+        """Whether the invite has expired at ``now`` (unix secs)."""
+        ...
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "InviteToken": ...
+    @property
+    def root(self) -> bytes:
+        """The mesh root entity-id this invite admits into."""
+        ...
+    @property
+    def rendezvous(self) -> str:
+        """The transport locator the device dials."""
+        ...
+    @property
+    def expires_at(self) -> int: ...
+
+class JoinRequest:
+    """A device's request to join, signed by the device's own key."""
+
+    @staticmethod
+    def create(
+        device: Identity, name: str, tags: List[str], invite: InviteToken
+    ) -> "JoinRequest":
+        """Build + sign a request against ``invite``. ``device`` is the opaque
+        ``Identity`` handle whose key is enrolled (H8: seed stays in Rust)."""
+        ...
+    def verify_self_signature(self) -> bool:
+        """``True`` if the device's self-signature verifies."""
+        ...
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "JoinRequest":
+        """Parse wire bytes (does not verify the signature)."""
+        ...
+    @property
+    def device(self) -> bytes: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def tags(self) -> List[str]: ...
+
+class JoinOutcome:
+    """The operator's response to a join request — admitted (carrying the
+    granted chain) or rejected (with a stable code + message)."""
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "JoinOutcome": ...
+    def to_bytes(self) -> bytes: ...
+    def into_chain(self, device: bytes, invite_root: bytes) -> DelegationChain:
+        """Device-side: verify the admitted grant anchors at ``invite_root``
+        and binds to ``device``, returning the ``DelegationChain``. Raises on a
+        rejection or an untrusted grant (wrong root / device)."""
+        ...
+    @property
+    def is_admitted(self) -> bool: ...
+    @property
+    def reject_code(self) -> Optional[int]:
+        """The stable reject code (1..=7: malformed, unknown-invite, expired,
+        bad-request, replay, internal, denied) if rejected, else ``None``."""
+        ...
+    @property
+    def reject_message(self) -> Optional[str]: ...
+
+class DeviceRecord:
+    """One enrolled device in the operator's inventory."""
+
+    @property
+    def device(self) -> bytes: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def tags(self) -> List[str]: ...
+    @property
+    def enrolled_at(self) -> int: ...
+    @property
+    def revoked_at(self) -> Optional[int]:
+        """Unix-seconds the device was revoked, or ``None`` while active."""
+        ...
+    @property
+    def is_revoked(self) -> bool: ...
+
+class OperatorEnrollment:
+    """The operator side: mint invites, approve join requests into
+    ``root -> device`` delegations, and manage the device inventory."""
+
+    def __init__(
+        self, root: Identity, registry_path: str, revocation_path: str
+    ) -> None: ...
+    @staticmethod
+    def with_default_paths(root: Identity) -> "OperatorEnrollment":
+        """Build using the per-user default store paths. Raises if neither
+        resolves."""
+        ...
+    def invite(self, rendezvous: str, ttl_seconds: int) -> InviteToken:
+        """Mint an invite valid for ``ttl_seconds``, tracking it so a later
+        :meth:`approve` can match a request. ``rendezvous`` is the transport
+        locator devices dial."""
+        ...
+    def approve(
+        self, request: JoinRequest, grant_ttl_seconds: int, max_depth: Optional[int] = ...
+    ) -> DelegationChain:
+        """Approve a request (auto — invite-as-authorization): run the checks,
+        record the device, retire the single-use invite, return the
+        ``root -> device`` chain. Raises on any rejection."""
+        ...
+    def handle_join_request(
+        self, request_bytes: bytes, grant_ttl_seconds: int, max_depth: Optional[int] = ...
+    ) -> bytes:
+        """Server-side: turn serialized ``JoinRequest`` bytes into serialized
+        ``JoinOutcome`` bytes (auto — invite-as-authorization). Never raises; a
+        rejection is a coded ``JoinOutcome``."""
+        ...
+    def revoke(self, device: bytes) -> None:
+        """Revoke a device: raise its revocation floor and stamp the inventory."""
+        ...
+    def devices(self) -> List[DeviceRecord]:
+        """The enrolled devices in the inventory."""
+        ...
+    def forget(self, device: bytes) -> bool:
+        """Prune a device from the inventory (orthogonal to revoking its floor).
+        Returns whether a record existed."""
+        ...
+    def pending_invites(self, now: int) -> List[InviteToken]:
+        """Outstanding (minted, unredeemed, unexpired at ``now``) invites."""
+        ...
+    @property
+    def root_id(self) -> bytes: ...
+    def root_fingerprint(self) -> str: ...
+
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed
 # in detail here. Each class is declared without full method signatures so

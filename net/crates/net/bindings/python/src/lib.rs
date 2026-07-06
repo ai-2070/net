@@ -46,6 +46,12 @@ mod capability_gateway;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+// Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
+// + the operator device-lifecycle facade. Thin wrappers over
+// `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
+// SDK `net` surface, returns `DelegationChain` handles).
+#[cfg(feature = "delegation")]
+mod enrollment;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -3174,6 +3180,13 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "GATEWAY_DELEGATION_CHANNEL",
             delegation::GATEWAY_DELEGATION_CHANNEL,
         )?;
+        // Device enrollment (V2 Phase 1).
+        m.add_class::<enrollment::PyInviteToken>()?;
+        m.add_class::<enrollment::PyJoinRequest>()?;
+        m.add_class::<enrollment::PyJoinOutcome>()?;
+        m.add_class::<enrollment::PyDeviceRecord>()?;
+        m.add_class::<enrollment::PyOperatorEnrollment>()?;
+        m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
     }
     #[cfg(feature = "cortex")]
     {

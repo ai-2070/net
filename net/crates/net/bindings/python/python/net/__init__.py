@@ -858,5 +858,35 @@ else:
         ]
     )
 
+# Device enrollment (`HERMES_INTEGRATION_PLAN_V2.md` Phase 1): the
+# invite -> join -> approve handshake (InviteToken / JoinRequest /
+# JoinOutcome) and the operator device-lifecycle facade
+# (OperatorEnrollment: invite / approve / revoke / devices). Present iff the
+# module was built with the `delegation` feature. H8-clean: takes opaque
+# `Identity` handles; private seeds never cross into Python.
+try:
+    from ._net import (
+        DeviceRecord,
+        InviteToken,
+        JoinOutcome,
+        JoinRequest,
+        OperatorEnrollment,
+        fingerprint,
+    )
+except ImportError:
+    # `delegation` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "DeviceRecord",
+            "InviteToken",
+            "JoinOutcome",
+            "JoinRequest",
+            "OperatorEnrollment",
+            "fingerprint",
+        ]
+    )
+
 
 __version__ = "0.31.0"
