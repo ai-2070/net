@@ -292,6 +292,17 @@ impl TaskRegistry {
         let id_run = id.clone();
         tokio::spawn(async move {
             set_state(&inner, &id_run, TaskState::Running);
+            // Panic containment: an executor panic unwinds this task and
+            // would otherwise skip the final set_state, stranding the entry in
+            // `Running` forever (status/wait_terminal poll indefinitely, the
+            // entry leaks). The guard's Drop records a terminal state on
+            // unwind; the normal path disarms it before recording its own.
+            let mut panic_guard = PanicGuard {
+                inner: Arc::clone(&inner),
+                id: id_run.clone(),
+                cancel: cancel.clone(),
+                armed: true,
+            };
             // Cooperative cancellation: the executor watches the token and
             // returns promptly when it trips (the Hermes agent loop is wired to
             // its interrupt machinery). The select! is the backstop for a
@@ -307,6 +318,7 @@ impl TaskRegistry {
                 r = executor.run(brief, cancel.clone()) => r,
                 _ = cancel.cancelled() => Err("cancelled".to_string()),
             };
+            panic_guard.armed = false;
             let final_state = if cancel.is_cancelled() {
                 TaskState::Cancelled
             } else {
@@ -369,6 +381,35 @@ impl TaskRegistry {
     /// Returns whether a record existed.
     pub fn forget(&self, task_id: &str) -> bool {
         self.inner.lock().remove(task_id).is_some()
+    }
+}
+
+/// Drop-guard armed while [`TaskRegistry::submit`]'s spawned task awaits the
+/// executor: a panicking executor unwinds the task, and without this the
+/// final `set_state` never runs — the entry is stranded non-terminal (`cancel`
+/// returns `true` but nothing transitions, `status`/`wait_terminal` poll
+/// `Running` forever) and leaks. On an armed drop the task is recorded
+/// `Failed` — or `Cancelled` when the token was tripped (the requester asked
+/// to stop; the panic is incidental). The normal completion path disarms it.
+struct PanicGuard {
+    inner: Arc<Mutex<HashMap<String, Entry>>>,
+    id: String,
+    cancel: CancelToken,
+    armed: bool,
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let state = if self.cancel.is_cancelled() {
+                TaskState::Cancelled
+            } else {
+                TaskState::Failed {
+                    error: "executor panicked".to_string(),
+                }
+            };
+            set_state(&self.inner, &self.id, state);
+        }
     }
 }
 
@@ -543,6 +584,34 @@ mod tests {
             "the non-cooperative executor's future was dropped"
         );
         assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    /// An executor that panics mid-run.
+    struct PanickingExecutor;
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for PanickingExecutor {
+        async fn run(&self, _brief: TaskBrief, _cancel: CancelToken) -> Result<String, String> {
+            panic!("executor blew up");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_executor_marks_the_task_failed() {
+        // An executor panic must not strand the task in `Running` — the guard
+        // records `Failed` so pollers terminate and the entry can be forgotten.
+        let reg = TaskRegistry::new();
+        let id = reg.submit(TaskBrief::new("kaboom"), Arc::new(PanickingExecutor));
+        let state = wait_terminal(&reg, &id).await;
+        assert_eq!(
+            state,
+            TaskState::Failed {
+                error: "executor panicked".to_string()
+            }
+        );
+        // Terminal: cancel is a no-op, the record can be forgotten.
+        assert!(!reg.cancel(&id));
+        assert!(reg.forget(&id));
     }
 
     #[tokio::test]
