@@ -99,6 +99,12 @@ pub fn typed_data(
             "authorization value differs from requirements.amount".to_string(),
         ));
     }
+    if auth.valid_after >= auth.valid_before {
+        return Err(X402Error::Invalid(format!(
+            "authorization validity window is empty: validAfter ({}) >= validBefore ({})",
+            auth.valid_after, auth.valid_before
+        )));
+    }
 
     Ok(json!({
         "types": {
@@ -213,6 +219,14 @@ mod tests {
         let mut wrong_chain = requirements();
         wrong_chain.network = "solana:mainnet".into();
         assert!(typed_data(&wrong_chain, &auth()).is_err());
+
+        // An empty/inverted validity window never authorizes anything.
+        let mut empty_window = auth();
+        empty_window.valid_after = empty_window.valid_before;
+        assert!(typed_data(&requirements(), &empty_window).is_err());
+        let mut inverted = auth();
+        inverted.valid_after = inverted.valid_before + 1;
+        assert!(typed_data(&requirements(), &inverted).is_err());
     }
 
     #[test]

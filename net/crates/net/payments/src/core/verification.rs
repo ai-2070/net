@@ -189,6 +189,12 @@ impl SignedEnvelope for VerificationEvent {
 /// every `prev` must equal the chain hash of its predecessor, and events
 /// after an invalidation are a protocol violation (the engine freezes the
 /// quote instead of verifying past it).
+///
+/// **Precondition:** this validates the hash links and the freeze rule
+/// only — NOT event signatures, nor that every event shares one
+/// `quote_id` / authorized signer. When the events came from an untrusted
+/// source, verify each with [`VerificationEvent::from_json_bytes`] first;
+/// otherwise a well-linked chain of forged events passes here.
 pub fn check_chain(events: &[VerificationEvent]) -> Result<(), EnvelopeError> {
     let mut prev_hash: Option<String> = None;
     let mut invalidated = false;

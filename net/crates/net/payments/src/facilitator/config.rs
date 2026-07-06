@@ -137,9 +137,13 @@ impl FacilitatorConfig {
         self.final_depth.get(network).copied()
     }
 
-    /// The CAIP-2 networks this config enables.
+    /// The CAIP-2 networks this config enables, each once. `dedup` only
+    /// removes *adjacent* duplicates, so sort first — otherwise two pairs
+    /// on the same network separated by a third (e.g. `[A, B, A]`) would
+    /// leak a duplicate.
     pub fn networks(&self) -> Vec<String> {
         let mut networks: Vec<String> = self.pairs.iter().map(|p| p.network.clone()).collect();
+        networks.sort();
         networks.dedup();
         networks
     }
@@ -242,6 +246,29 @@ mod tests {
         let mut v1_only = supported(&[("exact", "eip155:84532")]);
         v1_only.kinds[0].x402_version = 1;
         assert!(c.validate_against(&v1_only).is_err());
+    }
+
+    #[test]
+    fn networks_dedups_non_adjacent_duplicates() {
+        let c = FacilitatorConfig {
+            pairs: vec![
+                SchemePair {
+                    scheme: "exact".into(),
+                    network: "eip155:8453".into(),
+                },
+                SchemePair {
+                    scheme: "exact".into(),
+                    network: "solana:x".into(),
+                },
+                // Same network as the first, but not adjacent to it.
+                SchemePair {
+                    scheme: "permit".into(),
+                    network: "eip155:8453".into(),
+                },
+            ],
+            ..config()
+        };
+        assert_eq!(c.networks(), vec!["eip155:8453", "solana:x"]);
     }
 
     #[test]

@@ -77,6 +77,12 @@ pub fn ensure_tag(expected: &str, got: &str) -> Result<(), VersionError> {
     let exp = parse_tag(expected)?;
     let g = parse_tag(got)?;
     if exp.name == g.name {
+        // Same object AND version, only spelled differently (e.g. a
+        // leading zero: `@01` parses to version 1). Accept it rather than
+        // report the nonsensical "unsupported_version: got @1, expected @1".
+        if exp.version == g.version {
+            return Ok(());
+        }
         return Err(VersionError::UnsupportedVersion {
             object: exp.name.to_string(),
             got: g.version,
@@ -118,6 +124,13 @@ mod tests {
             ensure_tag(TAG_PAYMENT_QUOTE, TAG_BILLING_EVENT),
             Err(VersionError::WrongObject { .. })
         ));
+    }
+
+    #[test]
+    fn a_leading_zero_version_spelling_is_the_same_version() {
+        // `@01` parses to version 1, so it must be accepted as TAG@1, not
+        // rejected with the nonsensical "got @1, expected @1".
+        assert_eq!(ensure_tag(TAG_PAYMENT_QUOTE, "net.payment.quote@01"), Ok(()));
     }
 
     #[test]
