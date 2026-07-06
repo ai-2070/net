@@ -476,7 +476,10 @@ mod tests {
         assert!(reg.cancel(&id), "an in-flight task cancels");
         let state = wait_terminal(&reg, &id).await;
         assert_eq!(state, TaskState::Cancelled);
-        assert!(saw.load(Ordering::SeqCst), "the executor observed the cancel");
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "the executor observed the cancel"
+        );
         // Cancelling a terminal task is a no-op.
         assert!(!reg.cancel(&id));
     }

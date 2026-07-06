@@ -426,7 +426,11 @@ mod tests {
             "properties": { "a": { "type": "integer" }, "b": { "type": "string" } },
             "type": "object"
         });
-        assert_eq!(schema_hash(&a), schema_hash(&b), "key order must not matter");
+        assert_eq!(
+            schema_hash(&a),
+            schema_hash(&b),
+            "key order must not matter"
+        );
         // A different schema -> a different hash.
         let c = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
         assert_ne!(schema_hash(&a), schema_hash(&c));

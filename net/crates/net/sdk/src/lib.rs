@@ -274,9 +274,7 @@ pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegis
 pub use crate::mesh_enroll::{JoinFlowError, ENROLLMENT_SERVICE};
 // Live A2A task-handoff convenience re-exports (V2 Phase 3 Slice B).
 #[cfg(all(feature = "net", feature = "cortex"))]
-pub use crate::mesh_a2a::{
-    A2aFlowError, A2A_CANCEL_SERVICE, A2A_STATUS_SERVICE, A2A_TASK_SERVICE,
-};
+pub use crate::mesh_a2a::{A2aFlowError, A2A_CANCEL_SERVICE, A2A_STATUS_SERVICE, A2A_TASK_SERVICE};
 #[cfg(feature = "net")]
 pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]

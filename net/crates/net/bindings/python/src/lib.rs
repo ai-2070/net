@@ -1578,7 +1578,10 @@ mod mesh_bindings {
         /// `submit_task`. Hold the returned handle to keep accepting tasks. This
         /// node must be `start()`ed. (Requires the `a2a` feature.)
         #[cfg(feature = "a2a")]
-        fn serve_a2a(&self, callback: pyo3::Py<pyo3::PyAny>) -> PyResult<crate::a2a::PyA2aServeHandle> {
+        fn serve_a2a(
+            &self,
+            callback: pyo3::Py<pyo3::PyAny>,
+        ) -> PyResult<crate::a2a::PyA2aServeHandle> {
             crate::a2a::mesh_serve_a2a(self.node_arc_clone()?, self.runtime.clone(), callback)
         }
 

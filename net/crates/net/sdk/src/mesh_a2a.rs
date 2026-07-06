@@ -106,14 +106,15 @@ impl Mesh {
             })?
         };
 
-        let cancel = self.serve_rpc_typed(A2A_CANCEL_SERVICE, Codec::Json, move |req: Vec<u8>| {
-            let registry = registry.clone();
-            async move {
-                let task_id: String = serde_json::from_slice(&req).unwrap_or_default();
-                let cancelled = registry.cancel(&task_id);
-                Ok::<Vec<u8>, String>(serde_json::to_vec(&cancelled).unwrap_or_default())
-            }
-        })?;
+        let cancel =
+            self.serve_rpc_typed(A2A_CANCEL_SERVICE, Codec::Json, move |req: Vec<u8>| {
+                let registry = registry.clone();
+                async move {
+                    let task_id: String = serde_json::from_slice(&req).unwrap_or_default();
+                    let cancelled = registry.cancel(&task_id);
+                    Ok::<Vec<u8>, String>(serde_json::to_vec(&cancelled).unwrap_or_default())
+                }
+            })?;
 
         Ok(vec![submit, status, cancel])
     }
@@ -288,7 +289,10 @@ mod tests {
             .expect("cancel"));
         let state = wait_status(&requester, exec_id, &brief.task_id, |s| s.is_terminal()).await;
         assert_eq!(state, TaskState::Cancelled);
-        assert!(saw.load(Ordering::SeqCst), "the remote executor observed the cancel");
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "the remote executor observed the cancel"
+        );
 
         requester.shutdown().await.ok();
         executor_mesh.shutdown().await.ok();
@@ -321,7 +325,10 @@ mod tests {
         let exec_id = executor_mesh.node_id();
 
         let brief = TaskBrief::new("summarize");
-        requester.submit_task(exec_id, &brief).await.expect("submit");
+        requester
+            .submit_task(exec_id, &brief)
+            .await
+            .expect("submit");
 
         // The result lands as an artifact ref.
         let state = wait_status(&requester, exec_id, &brief.task_id, |s| s.is_terminal()).await;
@@ -333,8 +340,15 @@ mod tests {
         );
 
         // Cancelling a finished task is a no-op; an unknown task is None.
-        assert!(!requester.cancel_task(exec_id, &brief.task_id).await.unwrap());
-        assert!(requester.task_status(exec_id, "nope").await.unwrap().is_none());
+        assert!(!requester
+            .cancel_task(exec_id, &brief.task_id)
+            .await
+            .unwrap());
+        assert!(requester
+            .task_status(exec_id, "nope")
+            .await
+            .unwrap()
+            .is_none());
 
         requester.shutdown().await.ok();
         executor_mesh.shutdown().await.ok();

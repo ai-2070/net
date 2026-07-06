@@ -14,8 +14,8 @@
 //! No fixture: the two-node mesh harness is pure SDK, so this runs on a plain
 //! `cargo test -p net-mesh-mcp` (unlike the fixture-gated wrap tests).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -221,7 +221,12 @@ async fn local_tools_are_discovered_described_and_invoked_across_two_nodes() {
     let invoker = Arc::new(LocalTools::default());
     let publisher = ServerPublisher::new(Arc::clone(&host));
     let publication = publisher
-        .publish_tools(&local_tools(), Arc::clone(&invoker) as Arc<dyn ToolInvoker>, ctx(), config)
+        .publish_tools(
+            &local_tools(),
+            Arc::clone(&invoker) as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
         .await
         .expect("publish local tools on the host");
     assert!(publication.tools().iter().any(|t| t == "echo"));
@@ -243,9 +248,11 @@ async fn local_tools_are_discovered_described_and_invoked_across_two_nodes() {
     // Describe: the consumer reads the local tool's schema + description off the
     // same `mcp.bridge.describe` service — this is what the demand-side gateway
     // fetches to validate arguments and render the tool.
-    let describe_reply = call_retry(&caller, b_id, DESCRIBE_SERVICE, || Bytes::from_static(b"{}"))
-        .await
-        .expect("describe succeeds");
+    let describe_reply = call_retry(&caller, b_id, DESCRIBE_SERVICE, || {
+        Bytes::from_static(b"{}")
+    })
+    .await
+    .expect("describe succeeds");
     let described: DescribeResponse =
         serde_json::from_slice(describe_reply.body.as_ref()).expect("decode DescribeResponse");
     let echo = described
@@ -258,7 +265,10 @@ async fn local_tools_are_discovered_described_and_invoked_across_two_nodes() {
     assert_eq!(echo.credential_status, "none");
     assert_eq!(echo.substitutability, "provider_local");
     // The schema content hash rides over the wire so a consumer can cache by it.
-    assert_eq!(echo.schema_hash, net_mcp::wrap::schema_hash(&echo.input_schema));
+    assert_eq!(
+        echo.schema_hash,
+        net_mcp::wrap::schema_hash(&echo.input_schema)
+    );
     assert!(!echo.schema_hash.is_empty());
 
     // Invoke: the mesh call reaches the callback invoker and the result
@@ -318,7 +328,12 @@ async fn an_invoke_policy_denies_an_admitted_call() {
     let invoker = Arc::new(LocalTools::default());
     let publisher = ServerPublisher::new(Arc::clone(&host));
     let _publication = publisher
-        .publish_tools(&local_tools(), invoker as Arc<dyn ToolInvoker>, ctx(), config)
+        .publish_tools(
+            &local_tools(),
+            invoker as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
         .await
         .expect("publish local tools");
 
@@ -383,7 +398,12 @@ async fn a_caller_outside_the_owner_scope_cannot_invoke_a_local_tool() {
     let invoker = Arc::new(LocalTools::default());
     let publisher = ServerPublisher::new(Arc::clone(&host));
     let _publication = publisher
-        .publish_tools(&local_tools(), invoker as Arc<dyn ToolInvoker>, ctx(), config)
+        .publish_tools(
+            &local_tools(),
+            invoker as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
         .await
         .expect("publish local tools");
 

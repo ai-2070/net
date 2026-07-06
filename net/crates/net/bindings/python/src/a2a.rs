@@ -136,10 +136,11 @@ pub(crate) fn mesh_task_status(
         .detach(move || runtime.block_on(mesh.task_status(target_node_id, &task_id)))
         .map_err(|e| PyRuntimeError::new_err(format!("task_status: {e}")))?;
     match record {
-        Some(rec) => Ok(Some(
-            String::from_utf8(rec.encode())
-                .map_err(|e| PyRuntimeError::new_err(format!("encode record: {e}")))?,
-        )),
+        Some(rec) => {
+            Ok(Some(String::from_utf8(rec.encode()).map_err(|e| {
+                PyRuntimeError::new_err(format!("encode record: {e}"))
+            })?))
+        }
         None => Ok(None),
     }
 }

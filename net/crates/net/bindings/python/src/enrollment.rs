@@ -481,7 +481,12 @@ impl PyDeviceEnrollment {
     /// received from `join`, the operator's `rendezvous` locator (from the
     /// invite, for renewal), and the unix-seconds it enrolled.
     #[new]
-    fn new(device: &Identity, chain: &PyDelegationChain, rendezvous: &str, enrolled_at: u64) -> Self {
+    fn new(
+        device: &Identity,
+        chain: &PyDelegationChain,
+        rendezvous: &str,
+        enrolled_at: u64,
+    ) -> Self {
         Self {
             inner: DeviceEnrollment::new(
                 to_sdk(device),

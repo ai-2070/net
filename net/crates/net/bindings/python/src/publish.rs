@@ -57,7 +57,9 @@ impl ToolInvoker for PyToolInvoker {
             crate::async_bridge::dispatch_handler_coro(py, coro)
         })
         .map_err(|e| {
-            McpError::Transport(format!("local tool `{name}`: invoking the handler failed: {e}"))
+            McpError::Transport(format!(
+                "local tool `{name}`: invoking the handler failed: {e}"
+            ))
         })?;
         let result = fut.await.map_err(|e| {
             McpError::Transport(format!("local tool `{name}`: handler raised: {e}"))
@@ -110,7 +112,9 @@ pub(crate) fn mesh_publish_tools(
     let mut sdk_tools = Vec::with_capacity(tools.len());
     for (name, description, schema_json) in &tools {
         let input_schema: Value = serde_json::from_str(schema_json).map_err(|e| {
-            PyValueError::new_err(format!("tool `{name}`: input_schema is not valid JSON: {e}"))
+            PyValueError::new_err(format!(
+                "tool `{name}`: input_schema is not valid JSON: {e}"
+            ))
         })?;
         sdk_tools.push(Tool {
             name: name.clone(),
@@ -159,7 +163,11 @@ pub(crate) fn mesh_publish_tools(
 /// `NetMesh.publish_tools`). Hold it to keep the tools announced + served;
 /// [`withdraw`](Self::withdraw) reverses it (re-announcing the remainder), and
 /// dropping it (or [`stop`](Self::stop)) unregisters the services.
-#[pyclass(name = "LocalPublicationHandle", module = "net._net", skip_from_py_object)]
+#[pyclass(
+    name = "LocalPublicationHandle",
+    module = "net._net",
+    skip_from_py_object
+)]
 pub struct PyLocalPublicationHandle {
     inner: Option<LocalPublicationHandle>,
     runtime: Arc<Runtime>,
