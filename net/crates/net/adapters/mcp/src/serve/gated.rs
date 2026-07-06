@@ -190,7 +190,17 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
     //     retry a timeout); a credentialed one is at-most-once so a lost reply
     //     never duplicates a real side effect. This is a resilience hint, NOT the
     //     security gate above (which never trusts a wire status).
-    let safety = InvokeSafety::from_credential_status(&detail.credential_status);
+    //
+    //     A paid invoke is always at-most-once regardless of credential
+    //     status: the money already moved and the provider's engine is
+    //     at-most-once, so a retried timeout re-sends a quote the provider
+    //     has already redeemed → ERR_PAYMENT → the payer loses the money
+    //     with no result. Surface the timeout instead of retrying.
+    let safety = if detail.pricing_terms.is_some() || payment_proof.is_some() {
+        InvokeSafety::AtMostOnce
+    } else {
+        InvokeSafety::from_credential_status(&detail.credential_status)
+    };
     match gateway.invoke(id, tool_args, safety, payment_proof).await {
         Ok(result) => GatedOutcome::Invoked(result),
         Err(e) => GatedOutcome::Failed(e),
@@ -212,6 +222,7 @@ mod tests {
         detail: CapabilityDetail,
         deny: bool,
         last_payment: parking_lot::Mutex<Option<Option<PaymentProof>>>,
+        last_safety: parking_lot::Mutex<Option<InvokeSafety>>,
     }
 
     impl StubGateway {
@@ -220,6 +231,7 @@ mod tests {
                 detail,
                 deny,
                 last_payment: parking_lot::Mutex::new(None),
+                last_safety: parking_lot::Mutex::new(None),
             }
         }
     }
@@ -242,12 +254,13 @@ mod tests {
             &self,
             id: &CapabilityId,
             arguments: Value,
-            _safety: InvokeSafety,
+            safety: InvokeSafety,
             payment: Option<PaymentProof>,
         ) -> Result<CallToolResult, GatewayError> {
             if self.deny {
                 return Err(GatewayError::Denied(OWNER_SCOPE_REJECTION.to_string()));
             }
+            *self.last_safety.lock() = Some(safety);
             *self.last_payment.lock() = Some(payment);
             Ok(CallToolResult::text_ok(format!(
                 "invoked {} with {}",
@@ -481,6 +494,31 @@ mod tests {
                 binding_sig: Some(vec![7u8; 64]),
             }))
         );
+        // M6: a paid invoke is at-most-once even though the credential
+        // status is `none` (which is otherwise duplicate-safe). Retrying a
+        // timed-out paid call would re-send an already-redeemed quote and
+        // lose the money with no result.
+        assert_eq!(*gw.last_safety.lock(), Some(InvokeSafety::AtMostOnce));
+    }
+
+    #[tokio::test]
+    async fn a_free_none_tool_stays_duplicate_safe() {
+        // The contrast to the paid case: an unpriced `none` tool keeps the
+        // duplicate-safe retry, so the M6 override is scoped to paid calls.
+        let gw = StubGateway::new(detail("none"), false);
+        let mut consent = ConsentPolicy::new();
+        consent.allow(echo_id());
+        let out = gated_invoke(
+            &gw,
+            &consent,
+            None,
+            None,
+            &echo_id(),
+            json!({ "message": "hi" }),
+        )
+        .await;
+        assert!(matches!(out, GatedOutcome::Invoked(_)), "{out:?}");
+        assert_eq!(*gw.last_safety.lock(), Some(InvokeSafety::DuplicateSafe));
     }
 
     #[tokio::test]
