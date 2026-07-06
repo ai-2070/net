@@ -233,8 +233,7 @@ async fn a_denied_caller_is_refused_at_quote_time_and_nothing_reserves() {
 }
 
 #[tokio::test]
-async fn real_network_only_terms_are_denied_by_the_flow() {
-    let w = world(SpendProfile::DevTest);
+async fn real_network_only_terms_are_denied_at_both_layers() {
     // Hand-craft terms whose only accepts entry is a real network.
     let provider = EntityKeypair::generate();
     let registry = default_mock_registry(provider.entity_id().clone());
@@ -259,11 +258,81 @@ async fn real_network_only_terms_are_denied_by_the_flow() {
     )
     .expect("utf8");
 
+    // Layer 1: without a settlement signer, the entry isn't settleable.
+    let w = world(SpendProfile::DevTest);
     let decision = w.flow.run(CAPABILITY, &terms_json).await;
     let CallerDecision::Denied { policy_reason } = decision else {
         panic!("expected Denied, got {decision:?}");
     };
-    assert!(policy_reason.contains("P1"), "{policy_reason}");
+    assert!(policy_reason.contains("no settleable"), "{policy_reason}");
+
+    // Layer 2: with a signer configured AND registries that know the
+    // asset, selection and quoting pass — but the spend policy's
+    // real-network gate still denies (config-driven allow is P1 WS4),
+    // and the signer callback must never even run.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
+    let provider_keys = Arc::new(EntityKeypair::generate());
+    let mut registry = default_mock_registry(provider_keys.entity_id().clone());
+    registry.assets.push(net_payments::core::registry::AssetEntry {
+        id: net_payments::x402::caip::AssetId::parse("eip155:8453/erc20:0xusdc").expect("caip"),
+        x402_asset: "0xusdc".into(),
+        decimals: 6,
+        symbol: "USDC".into(),
+        display_name: None,
+        equivalence_class: None,
+    });
+    let engine = Arc::new(
+        PaymentEngine::new(
+            provider_keys.clone(),
+            Arc::new(MockFacilitator::new()),
+            Arc::new(AdmitAll),
+            registry.clone(),
+            dir.path().join("engine.json"),
+        )
+        .expect("engine"),
+    );
+    let signed_terms = PricingTerms::new(
+        provider_keys.entity_id().clone(),
+        CAPABILITY,
+        vec![X402Carry::author(&PaymentRequirements {
+            scheme: "exact".into(),
+            network: "eip155:8453".into(),
+            amount: "10000".into(),
+            asset: "0xusdc".into(),
+            pay_to: "0xpayee".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author")],
+        registry.reference().expect("ref"),
+    );
+    let signed_terms_json = String::from_utf8(
+        net_payments::core::canonical::canonical_bytes(&signed_terms).expect("canonicalize"),
+    )
+    .expect("utf8");
+    let never_signs = net_payments::flow::signer::ExternalSigner::new(
+        "0x857b06519E91e3A54538791bDbb0E22373e36b66",
+        |_typed| {
+            Box::pin(async {
+                panic!("policy must deny before any signature is requested")
+            })
+        },
+    );
+    let flow = CallerPaymentFlow::new(
+        Arc::new(EntityKeypair::generate()),
+        SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest),
+        registry,
+        Arc::new(InProcessProvider::new(engine, clock.clone())),
+        clock,
+    )
+    .with_signer("eip155", Arc::new(never_signs));
+
+    let decision = flow.run(CAPABILITY, &signed_terms_json).await;
+    let CallerDecision::Denied { policy_reason } = decision else {
+        panic!("expected Denied, got {decision:?}");
+    };
+    assert!(policy_reason.contains("real network"), "{policy_reason}");
 }
 
 /// A channel that tampers with the quote: the provider quotes a higher

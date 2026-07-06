@@ -15,6 +15,7 @@
 pub mod caip;
 pub mod payload;
 pub mod requirements;
+pub mod schemes;
 pub mod settlement;
 
 use base64::engine::general_purpose::STANDARD as BASE64;

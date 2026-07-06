@@ -39,6 +39,7 @@ use crate::x402::{X402Carry, X402_VERSION};
 pub mod mcp_gate;
 #[cfg(feature = "mesh")]
 pub mod mesh;
+pub mod signer;
 
 /// Time source. There is no global clock — every timestamp in the flow
 /// comes from here, and tests inject fixed instants.
@@ -232,6 +233,11 @@ pub struct CallerPaymentFlow {
     registry: AssetRegistry,
     provider: Arc<dyn ProviderChannel>,
     clock: Arc<dyn Clock>,
+    /// Settlement signers by CAIP-2 namespace (`eip155`, …). A real
+    /// network's accepts entry is settleable only when its namespace
+    /// has a signer; nothing here can hold key material (see
+    /// [`signer::SchemeSigner`]).
+    signers: std::collections::BTreeMap<String, Arc<dyn signer::SchemeSigner>>,
 }
 
 impl CallerPaymentFlow {
@@ -242,16 +248,37 @@ impl CallerPaymentFlow {
         provider: Arc<dyn ProviderChannel>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self { caller, spend, registry, provider, clock }
+        Self {
+            caller,
+            spend,
+            registry,
+            provider,
+            clock,
+            signers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Register a settlement signer for a CAIP-2 namespace
+    /// (e.g. `eip155`). Without one, that namespace's accepts entries
+    /// are not settleable and are skipped at selection.
+    pub fn with_signer(
+        mut self,
+        namespace: impl Into<String>,
+        signer: Arc<dyn signer::SchemeSigner>,
+    ) -> Self {
+        self.signers.insert(namespace.into(), signer);
+        self
     }
 
     /// Run the paid lifecycle for `capability` (display form,
     /// `provider/capability`) against its announced `pricing_terms`.
     pub async fn run(&self, capability: &str, pricing_terms: &str) -> CallerDecision {
-        // -- [1] parse the announced terms; pick an accepts[] entry the
-        //    caller can settle: P0 is mock-only, so the first mock-network
-        //    template. Real networks are P1 — their entries are skipped,
-        //    and terms offering nothing else are denied outright.
+        // -- [1] parse the announced terms; pick the first accepts[]
+        //    entry this caller can *settle*: the mock network always, a
+        //    real network only when its namespace has a configured
+        //    settlement signer. (Whether policy *permits* the spend is
+        //    [3]'s job — settleability is about capability, not
+        //    authorization.)
         let terms = match PricingTerms::from_json_bytes(pricing_terms.as_bytes()) {
             Ok(t) => t,
             Err(e) => {
@@ -260,14 +287,17 @@ impl CallerPaymentFlow {
                 }
             }
         };
-        let Some(template) = terms
-            .accepts
-            .iter()
-            .find(|t| t.view().network.starts_with("mock:"))
-        else {
+        let Some(template) = terms.accepts.iter().find(|t| self.can_settle(t.view())) else {
+            let offered: Vec<String> = terms
+                .accepts
+                .iter()
+                .map(|t| format!("({}, {})", t.view().scheme, t.view().network))
+                .collect();
             return CallerDecision::Denied {
-                policy_reason: "no mock-network accepts[] entry; real-network settlement is P1"
-                    .to_string(),
+                policy_reason: format!(
+                    "no settleable accepts[] entry: terms offer {offered:?}; this caller \
+                     settles mock:* always and exact/eip155 when a signer is configured"
+                ),
             };
         };
 
@@ -365,10 +395,11 @@ impl CallerPaymentFlow {
             }
         }
 
-        // -- [4] author the x402 payload (mock scheme). The nonce derives
-        //    from the quote id, so a same-quote retry reuses the same
-        //    payload (idempotent) while distinct quotes never collide.
-        let payload = match self.author_payload(&quote) {
+        // -- [4] author the x402 payload for the quoted scheme. Nonces
+        //    derive from the quote id, so a same-quote retry reuses the
+        //    same payload (idempotent) while distinct quotes never
+        //    collide.
+        let payload = match self.author_payload(&quote).await {
             Ok(p) => p,
             Err(message) => {
                 self.release(&quote, now_ns).await;
@@ -430,22 +461,61 @@ impl CallerPaymentFlow {
         }
     }
 
-    fn author_payload(&self, quote: &PaymentQuote) -> Result<X402Carry<PaymentPayload>, String> {
-        let nonce = {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"net.payments.mock.payload_nonce@1");
-            hasher.update(quote.quote_id.as_bytes());
-            hasher.update(self.caller.entity_id().as_bytes());
-            hex::encode(hasher.finalize().as_bytes())
+    /// Can this caller author a payment for these requirements?
+    fn can_settle(&self, requirements: &PaymentRequirements) -> bool {
+        if requirements.network.starts_with("mock:") {
+            return true;
+        }
+        let namespace = requirements.network.split(':').next().unwrap_or_default();
+        requirements.scheme == "exact"
+            && namespace == "eip155"
+            && self.signers.contains_key(namespace)
+    }
+
+    /// Author the scheme payload for a quote. Dispatches on the quoted
+    /// scheme/network; the selection guard ([`Self::can_settle`]) makes
+    /// the fall-through unreachable in practice, and it fails closed
+    /// anyway.
+    async fn author_payload(
+        &self,
+        quote: &PaymentQuote,
+    ) -> Result<X402Carry<PaymentPayload>, String> {
+        let requirements = quote.requirements.view();
+        let payload_object = if requirements.network.starts_with("mock:") {
+            let nonce = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"net.payments.mock.payload_nonce@1");
+                hasher.update(quote.quote_id.as_bytes());
+                hasher.update(self.caller.entity_id().as_bytes());
+                hex::encode(hasher.finalize().as_bytes())
+            };
+            serde_json::json!({
+                "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
+                "nonce": nonce,
+            })
+        } else if self.can_settle(requirements) {
+            // exact / eip155: EIP-3009 typed data through the signer.
+            let signer = self
+                .signers
+                .get("eip155")
+                .ok_or_else(|| "no eip155 signer configured".to_string())?;
+            let auth = exact_evm_authorization_for_quote(quote, &signer.address());
+            let typed = crate::x402::schemes::exact_evm::typed_data(requirements, &auth)
+                .map_err(|e| e.to_string())?;
+            let signature =
+                signer.sign_typed_data(&typed).await.map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
+        } else {
+            return Err(format!(
+                "no payload author for scheme `{}` on `{}` (fail-closed)",
+                requirements.scheme, requirements.network
+            ));
         };
         X402Carry::author(&PaymentPayload {
             x402_version: X402_VERSION,
             resource: None,
-            accepted: quote.requirements.view().clone(),
-            payload: serde_json::json!({
-                "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
-                "nonce": nonce,
-            }),
+            accepted: requirements.clone(),
+            payload: payload_object,
             extensions: None,
         })
         .map_err(|e| e.to_string())
@@ -458,5 +528,34 @@ impl CallerPaymentFlow {
         if let Err(e) = self.spend.release_reservation(quote, now_ns).await {
             tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
         }
+    }
+}
+
+/// The EIP-3009 authorization a quote implies for payer `from`: recipient
+/// and value from the quoted requirements, the validity window from the
+/// quote's authoritative timestamps (60s of pre-validity tolerance — no
+/// global clock), and a nonce derived from the quote id so a same-quote
+/// retry re-presents the identical authorization (idempotent at the
+/// provider and at the token contract's replay guard) while distinct
+/// quotes never collide.
+pub fn exact_evm_authorization_for_quote(
+    quote: &PaymentQuote,
+    from: &str,
+) -> crate::x402::schemes::exact_evm::ExactEvmAuthorization {
+    let nonce = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"net.payments.exact_evm.nonce@1");
+        hasher.update(quote.quote_id.as_bytes());
+        hasher.update(from.as_bytes());
+        format!("0x{}", hex::encode(hasher.finalize().as_bytes()))
+    };
+    let requirements = quote.requirements.view();
+    crate::x402::schemes::exact_evm::ExactEvmAuthorization {
+        from: from.to_string(),
+        to: requirements.pay_to.clone(),
+        value: requirements.amount.clone(),
+        valid_after: (quote.issued_at_ns / 1_000_000_000).saturating_sub(60),
+        valid_before: quote.expires_at_ns / 1_000_000_000,
+        nonce,
     }
 }
