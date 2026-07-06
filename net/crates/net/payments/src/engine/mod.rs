@@ -359,7 +359,18 @@ impl PaymentEngine {
             });
         }
 
-        let payload_hash = payload.content_hash();
+        // Replay is keyed on the canonical payload, not the preserved carry
+        // bytes: two encodings of one authorization must map to a single
+        // replay identity so the "one payload → one quote" guard cannot be
+        // sidestepped by re-serializing (M2).
+        let payload_hash = match payload.replay_key() {
+            Ok(k) => k,
+            Err(e) => {
+                return Ok(PaymentDecision::Rejected {
+                    reason: RejectReason::BadQuote(e.to_string()),
+                })
+            }
+        };
         let idem = IdempotencyScope {
             caller: quote.caller.clone(),
             provider: quote.provider.clone(),

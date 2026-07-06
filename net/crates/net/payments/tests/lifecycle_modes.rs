@@ -240,6 +240,53 @@ async fn replayed_payload_never_satisfies_a_second_quote() {
     assert!(h.engine.status(&q2.quote_id).await.unwrap().is_none());
 }
 
+/// M2 regression: the replay guard keys on the canonical payload, so a
+/// second quote presenting a byte-different *re-encoding* of the same
+/// authorization is still caught. Before the fix the byte-keyed index
+/// missed it and both quotes served for one logical payment.
+#[tokio::test]
+async fn a_reencoded_payload_never_satisfies_a_second_quote() {
+    let h = harness();
+    let q1 = h.quote("2500");
+    let q2 = h.quote_at("2500", NOW + 10);
+    assert_ne!(q1.quote_id, q2.quote_id);
+
+    let payload_a = payload_for(&q1, "payer-1");
+    // A byte-different encoding of the identical logical payload: same
+    // fields, pretty-printed instead of compact.
+    let value: serde_json::Value = serde_json::from_slice(payload_a.bytes()).unwrap();
+    let reencoded = serde_json::to_vec_pretty(&value).unwrap();
+    let payload_b: X402Carry<PaymentPayload> = X402Carry::from_bytes(reencoded).unwrap();
+    assert_ne!(
+        payload_a.content_hash(),
+        payload_b.content_hash(),
+        "the re-encoding must differ byte-for-byte or the test proves nothing"
+    );
+
+    let first = h
+        .engine
+        .accept_payment(&q1, &payload_a, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(matches!(first, PaymentDecision::Served { .. }));
+
+    let replay = h
+        .engine
+        .accept_payment(&q2, &payload_b, VerificationTier::Observed, NOW + 11)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            replay,
+            PaymentDecision::Rejected {
+                reason: RejectReason::Replay
+            }
+        ),
+        "a re-encoded payload must still be caught as replay, got {replay:?}"
+    );
+    assert!(h.engine.status(&q2.quote_id).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn facilitator_reported_replay_rejects_and_consumes_nothing() {
     let h = harness();

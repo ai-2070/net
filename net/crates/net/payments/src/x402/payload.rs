@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::requirements::PaymentRequirements;
-use super::{X402Error, X402View, X402_VERSION};
+use super::{X402Carry, X402Error, X402View, X402_VERSION};
 
 /// Parsed view over an x402 v2 `PaymentPayload`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +60,25 @@ impl X402View for PaymentPayload {
             ));
         }
         Ok(())
+    }
+}
+
+impl X402Carry<PaymentPayload> {
+    /// The **encoding-agnostic** replay identity of this payment. Byte
+    /// preservation ([`X402Carry::content_hash`]) exists so signatures
+    /// survive round-trips untouched; it is the wrong key for the engine's
+    /// "one payload → one quote" replay guard, because two byte-different
+    /// JSON encodings of the *same* authorization (whitespace, key order)
+    /// hash differently and would each be admitted. Keying on the
+    /// canonical payload — which carries the scheme's nonce/authorization —
+    /// collapses those to one identity, so a re-encoded resubmission
+    /// cannot double-serve. Fails closed: an uncanonicalizable payload
+    /// (e.g. a float smuggled into the scheme object) yields an error the
+    /// caller turns into a rejection rather than a byte-keyed fallback.
+    pub fn replay_key(&self) -> Result<String, X402Error> {
+        let bytes = crate::core::canonical::canonical_bytes(self.view())
+            .map_err(|e| X402Error::Invalid(format!("payload not canonicalizable: {e}")))?;
+        Ok(hex::encode(blake3::hash(&bytes).as_bytes()))
     }
 }
 
@@ -117,5 +136,42 @@ mod tests {
             "\"payload\": \"oops\", \"ignored\": {\"signature\": \"0xdeadbeef\",",
         );
         assert!(X402Carry::<PaymentPayload>::from_bytes(bad.into_bytes()).is_err());
+    }
+
+    /// M2: the replay key ignores serialization. Two byte-different
+    /// encodings of the same authorization must collapse to one replay
+    /// identity even though their preserved-byte content hashes differ.
+    #[test]
+    fn replay_key_is_encoding_agnostic() {
+        // A re-encoding of FIXTURE: keys reordered inside `authorization`
+        // and `accepted`, extra whitespace — identical logical content.
+        const REENCODED: &str = r#"{
+  "payload": {
+    "authorization": {
+      "nonce": "0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480",
+      "validBefore": "1740672154", "validAfter": "1740672089",
+      "value": "10000", "to": "0xPayee", "from": "0xPayer"
+    },
+    "signature": "0xdeadbeef"
+  },
+  "accepted": {
+    "maxTimeoutSeconds": 60,
+    "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "amount": "10000", "network": "eip155:84532", "scheme": "exact"
+  },
+  "x402Version": 2
+}"#;
+
+        let a: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(FIXTURE.as_bytes().to_vec()).unwrap();
+        let b: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(REENCODED.as_bytes().to_vec()).unwrap();
+
+        // Preserved bytes differ — so the old byte-keyed index would have
+        // treated these as two distinct payloads.
+        assert_ne!(a.content_hash(), b.content_hash());
+        // But the canonical replay identity is one and the same.
+        assert_eq!(a.replay_key().unwrap(), b.replay_key().unwrap());
     }
 }
