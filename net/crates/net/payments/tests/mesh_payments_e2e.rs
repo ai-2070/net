@@ -119,7 +119,7 @@ async fn the_paid_lifecycle_crosses_the_wire() {
     // Auto-allow: quote, payload, and settlement all cross the wire;
     // the proof carries the provider-signed billing event back.
     let decision = flow.run(&capability, &terms_json).await;
-    let CallerDecision::Paid { proof } = decision else {
+    let CallerDecision::Paid { quote_id: _, proof } = decision else {
         panic!("expected Paid over the wire, got {decision:?}");
     };
     let billing_json = proof["billing_event"].as_str().expect("billing event");
@@ -152,7 +152,7 @@ async fn the_paid_lifecycle_crosses_the_wire() {
 
     configurer.approve(&quote_id).await.expect("approve");
     let redeemed = flow.run(&capability, &terms_json).await;
-    let CallerDecision::Paid { proof } = redeemed else {
+    let CallerDecision::Paid { quote_id: _, proof } = redeemed else {
         panic!("approval must unblock over the wire, got {redeemed:?}");
     };
     assert_eq!(proof["quote_id"].as_str(), Some(quote_id.as_str()));

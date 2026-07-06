@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
 use super::consent::ConsentPolicy;
-use super::payment::{PaymentFlow, PaymentFlowDecision};
+use super::payment::{PaymentFlow, PaymentFlowDecision, PaymentProof};
 use super::pins::PinStore;
 use super::validation;
 use crate::spec::CallToolResult;
@@ -138,6 +138,7 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
     //     engine and either clears silently, wants a human, or stops. A paid
     //     capability with no flow configured is fail-closed denied — the
     //     handler never sees an unpaid call.
+    let mut payment_proof: Option<PaymentProof> = None;
     if let Some(terms) = detail.pricing_terms.as_deref() {
         let Some(flow) = payment else {
             return GatedOutcome::Failed(GatewayError::Denied(format!(
@@ -147,10 +148,12 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
             )));
         };
         match flow.pay(id, terms, &tool_args).await {
-            PaymentFlowDecision::Paid { proof: _proof } => {
-                // Cleared. The proof context rides to the provider through
-                // the flow's own channel (quote/payload travel with the
-                // invocation); the gate needs nothing further from it.
+            PaymentFlowDecision::Paid { quote_id, proof: _proof } => {
+                // Cleared. The quote id rides with the invocation so the
+                // provider's own gate can redeem the payment before its
+                // handler runs — the caller-side clearance alone is never
+                // the provider's proof.
+                payment_proof = Some(PaymentProof { quote_id });
             }
             PaymentFlowDecision::RequiresPaymentApproval {
                 quote_id,
@@ -180,7 +183,7 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
     //     never duplicates a real side effect. This is a resilience hint, NOT the
     //     security gate above (which never trusts a wire status).
     let safety = InvokeSafety::from_credential_status(&detail.credential_status);
-    match gateway.invoke(id, tool_args, safety).await {
+    match gateway.invoke(id, tool_args, safety, payment_proof).await {
         Ok(result) => GatedOutcome::Invoked(result),
         Err(e) => GatedOutcome::Failed(e),
     }
@@ -195,10 +198,18 @@ mod tests {
 
     /// A minimal gateway whose describe returns a fixed detail and whose invoke
     /// echoes the arguments (or denies, or 404s), so the gate composition can be
-    /// tested in isolation from the mesh.
+    /// tested in isolation from the mesh. Records the payment proof each invoke
+    /// carried, so the tests can pin the gate → invoke payment binding.
     struct StubGateway {
         detail: CapabilityDetail,
         deny: bool,
+        last_payment: parking_lot::Mutex<Option<Option<PaymentProof>>>,
+    }
+
+    impl StubGateway {
+        fn new(detail: CapabilityDetail, deny: bool) -> Self {
+            Self { detail, deny, last_payment: parking_lot::Mutex::new(None) }
+        }
     }
 
     #[async_trait]
@@ -220,10 +231,12 @@ mod tests {
             id: &CapabilityId,
             arguments: Value,
             _safety: InvokeSafety,
+            payment: Option<PaymentProof>,
         ) -> Result<CallToolResult, GatewayError> {
             if self.deny {
                 return Err(GatewayError::Denied(OWNER_SCOPE_REJECTION.to_string()));
             }
+            *self.last_payment.lock() = Some(payment);
             Ok(CallToolResult::text_ok(format!(
                 "invoked {} with {}",
                 id.display(),
@@ -258,10 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_capability_is_failed_not_found() {
-        let gw = StubGateway {
-            detail: detail("none"),
-            deny: false,
-        };
+        let gw = StubGateway::new(detail("none"), false);
         let consent = ConsentPolicy::new();
         let out = gated_invoke(
             &gw,
@@ -281,10 +291,7 @@ mod tests {
     #[tokio::test]
     async fn bad_arguments_fail_validation_before_the_provider() {
         // Allow the capability so the ONLY thing that can stop it is validation.
-        let gw = StubGateway {
-            detail: detail("none"),
-            deny: false,
-        };
+        let gw = StubGateway::new(detail("none"), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         // `message` is required but absent.
@@ -296,10 +303,7 @@ mod tests {
     async fn a_wire_none_still_requires_approval_when_unadmitted() {
         // The trust boundary: even a self-declared `none` credential status is
         // gated until an allowlist entry or approved pin admits it.
-        let gw = StubGateway {
-            detail: detail("none"),
-            deny: false,
-        };
+        let gw = StubGateway::new(detail("none"), false);
         let consent = ConsentPolicy::new();
         let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
         assert!(matches!(out, GatedOutcome::RequiresApproval), "{out:?}");
@@ -307,10 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_allowlisted_capability_invokes() {
-        let gw = StubGateway {
-            detail: detail("credentialed"),
-            deny: false,
-        };
+        let gw = StubGateway::new(detail("credentialed"), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
@@ -328,10 +329,7 @@ mod tests {
         // An in-memory pin (as the static consent policy carries) admits it —
         // the persistent-store path is the same predicate, exercised by the
         // shim's own pin-store tests.
-        let gw = StubGateway {
-            detail: detail("external_api"),
-            deny: false,
-        };
+        let gw = StubGateway::new(detail("external_api"), false);
         let mut consent = ConsentPolicy::new();
         consent.pin(echo_id());
         let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
@@ -340,10 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrapper_denied_invoke_surfaces_as_failed_denied() {
-        let gw = StubGateway {
-            detail: detail("none"),
-            deny: true,
-        };
+        let gw = StubGateway::new(detail("none"), true);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
@@ -389,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_paid_capability_with_no_flow_fails_closed() {
-        let gw = StubGateway { detail: paid_detail(), deny: false };
+        let gw = StubGateway::new(paid_detail(), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let out = gated_invoke(&gw, &consent, None, None, &echo_id(), json!({ "message": "hi" })).await;
@@ -402,11 +397,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cleared_payment_invokes_and_the_flow_ran_once() {
-        let gw = StubGateway { detail: paid_detail(), deny: false };
+    async fn a_cleared_payment_invokes_with_the_quote_bound_to_the_call() {
+        let gw = StubGateway::new(paid_detail(), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
-        let flow = ScriptedFlow::new(PaymentFlowDecision::Paid { proof: json!({"quote": "q1"}) });
+        let flow = ScriptedFlow::new(PaymentFlowDecision::Paid {
+            quote_id: "q-1".to_string(),
+            proof: json!({"quote": "q-1"}),
+        });
         let out = gated_invoke(
             &gw,
             &consent,
@@ -418,11 +416,17 @@ mod tests {
         .await;
         assert!(matches!(out, GatedOutcome::Invoked(_)), "{out:?}");
         assert_eq!(flow.calls.load(Ordering::SeqCst), 1);
+        // The invoke carried the paid quote's binding — this is what the
+        // provider's own gate redeems before its handler runs.
+        assert_eq!(
+            *gw.last_payment.lock(),
+            Some(Some(PaymentProof { quote_id: "q-1".to_string() }))
+        );
     }
 
     #[tokio::test]
     async fn a_policy_hold_surfaces_the_structured_payment_approval() {
-        let gw = StubGateway { detail: paid_detail(), deny: false };
+        let gw = StubGateway::new(paid_detail(), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let flow = ScriptedFlow::new(PaymentFlowDecision::RequiresPaymentApproval {
@@ -450,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_free_capability_never_consults_the_flow() {
-        let gw = StubGateway { detail: detail("none"), deny: false };
+        let gw = StubGateway::new(detail("none"), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let flow = ScriptedFlow::new(PaymentFlowDecision::Denied {
@@ -467,6 +471,8 @@ mod tests {
         .await;
         assert!(matches!(out, GatedOutcome::Invoked(_)), "{out:?}");
         assert_eq!(flow.calls.load(Ordering::SeqCst), 0, "free tools skip the payment gate");
+        // And a free invoke carries no payment binding.
+        assert_eq!(*gw.last_payment.lock(), Some(None));
     }
 
     #[tokio::test]
@@ -474,9 +480,12 @@ mod tests {
         // An unadmitted paid capability stops at consent — the flow is
         // never consulted, so no quote is requested for a capability the
         // user hasn't consented to invoke.
-        let gw = StubGateway { detail: paid_detail(), deny: false };
+        let gw = StubGateway::new(paid_detail(), false);
         let consent = ConsentPolicy::new();
-        let flow = ScriptedFlow::new(PaymentFlowDecision::Paid { proof: json!({}) });
+        let flow = ScriptedFlow::new(PaymentFlowDecision::Paid {
+            quote_id: "q-unused".to_string(),
+            proof: json!({}),
+        });
         let out = gated_invoke(
             &gw,
             &consent,
@@ -492,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_payment_flow_is_fail_closed_transport() {
-        let gw = StubGateway { detail: paid_detail(), deny: false };
+        let gw = StubGateway::new(paid_detail(), false);
         let mut consent = ConsentPolicy::new();
         consent.allow(echo_id());
         let flow = ScriptedFlow::new(PaymentFlowDecision::Failed {

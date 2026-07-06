@@ -15,13 +15,14 @@ use async_trait::async_trait;
 use net::adapter::net::identity::EntityKeypair;
 use net_mcp::serve::{
     gated_invoke, CapabilityDetail, CapabilityGateway, CapabilityId, CapabilitySummary,
-    ConsentPolicy, GatedOutcome, GatewayError, InvokeSafety,
+    ConsentPolicy, GatedOutcome, GatewayError, InvokeSafety, PaymentAdmission as _, PaymentProof,
 };
 use net_mcp::spec::CallToolResult;
 use net_payments::core::registry::default_mock_registry;
 use net_payments::core::terms::PricingTerms;
 use net_payments::engine::{AdmitAll, PaymentEngine};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+use net_payments::flow::mcp_gate::EnginePaymentAdmission;
 use net_payments::flow::{CallerPaymentFlow, Clock, InProcessProvider};
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 use net_payments::core::units::AtomicAmount;
@@ -39,11 +40,13 @@ impl Clock for TestClock {
 }
 
 /// A provider-side gateway stub: describe announces the pricing terms;
-/// invoke counts handler executions (the thing that must never happen
-/// unpaid).
+/// invoke redeems the payment through the REAL engine admission (the
+/// exact check `WrapInvokeHandler` runs) and counts handler executions —
+/// the thing that must never happen unpaid.
 struct PaidToolGateway {
     detail: CapabilityDetail,
     handler_runs: AtomicU32,
+    admission: EnginePaymentAdmission,
 }
 
 #[async_trait]
@@ -60,10 +63,22 @@ impl CapabilityGateway for PaidToolGateway {
     }
     async fn invoke(
         &self,
-        _id: &CapabilityId,
+        id: &CapabilityId,
         arguments: Value,
         _safety: InvokeSafety,
+        payment: Option<PaymentProof>,
     ) -> Result<CallToolResult, GatewayError> {
+        // Mirror WrapInvokeHandler's paid path: no proof or a failed
+        // redemption never reaches the handler.
+        let Some(proof) = payment else {
+            return Err(GatewayError::Denied(
+                "paid tool invoked without a payment quote".to_string(),
+            ));
+        };
+        self.admission
+            .redeem(&id.capability, &proof.quote_id)
+            .await
+            .map_err(GatewayError::Denied)?;
         self.handler_runs.fetch_add(1, Ordering::SeqCst);
         Ok(CallToolResult::text_ok(format!("handled {arguments}")))
     }
@@ -95,7 +110,7 @@ fn world(profile: SpendProfile) -> World {
         )
         .expect("engine"),
     );
-    let channel = Arc::new(InProcessProvider::new(engine, clock.clone()));
+    let channel = Arc::new(InProcessProvider::new(engine.clone(), clock.clone()));
 
     // Announced terms → the describe surface's pricing_terms.
     let template = X402Carry::author(&PaymentRequirements {
@@ -138,6 +153,7 @@ fn world(profile: SpendProfile) -> World {
             pricing_terms: Some(terms_json),
         },
         handler_runs: AtomicU32::new(0),
+        admission: EnginePaymentAdmission::new(engine),
     };
 
     // Caller side: consent admits the capability (pinning is capability

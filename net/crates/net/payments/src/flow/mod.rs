@@ -212,7 +212,10 @@ impl ProviderChannel for InProcessProvider {
 /// feature maps it 1:1 onto `net_mcp::serve::PaymentFlowDecision`.
 #[derive(Debug, Clone)]
 pub enum CallerDecision {
-    Paid { proof: serde_json::Value },
+    /// Payment cleared: `quote_id` is the redemption binding the
+    /// invocation must carry to the provider's gate; `proof` is the
+    /// full payment context (settlement refs, the signed billing event).
+    Paid { quote_id: String, proof: serde_json::Value },
     RequiresPaymentApproval {
         quote_id: String,
         policy_reason: String,
@@ -382,6 +385,7 @@ impl CallerPaymentFlow {
                     let _ = self.spend.clear_approval(&held_id).await;
                 }
                 CallerDecision::Paid {
+                    quote_id: quote.quote_id.clone(),
                     proof: serde_json::json!({
                         "quote_id": quote.quote_id,
                         "transaction": transaction,

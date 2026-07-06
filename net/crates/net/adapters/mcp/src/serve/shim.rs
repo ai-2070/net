@@ -770,6 +770,7 @@ mod tests {
             id: &CapabilityId,
             arguments: Value,
             _safety: InvokeSafety,
+            _payment: Option<crate::serve::payment::PaymentProof>,
         ) -> Result<CallToolResult, GatewayError> {
             self.invoke_calls.fetch_add(1, Ordering::SeqCst);
             if self.find(id).is_none() {

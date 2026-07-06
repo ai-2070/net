@@ -76,6 +76,17 @@ pub enum WrapError {
     /// describe catalog.
     #[error("describe catalog build failed: {0}")]
     Catalog(#[from] super::catalog::CatalogError),
+    /// The config prices one or more tools but provides no payment
+    /// admission gate. Rejected before anything serves — a priced tool
+    /// that can't verify payment must never be reachable.
+    #[error(
+        "config prices {count} tool(s) but has no payment_admission gate — a priced tool \
+         cannot serve without payment verification"
+    )]
+    PricedWithoutPaymentGate {
+        /// How many tools the config prices.
+        count: usize,
+    },
     /// A publish/refresh step failed AND the rollback re-announce that would
     /// restore a consistent mesh state also failed — the node may be left
     /// advertising tools with no live handler. Both errors are surfaced so the
@@ -159,7 +170,9 @@ pub fn build_capability_set<'a>(
 
 /// Configuration for a publication: the credential-classification overrides
 /// and the substitutability the operator declared, plus who may invoke.
-#[derive(Debug, Clone)]
+// Debug is manual: `payment_admission` is a trait object with no Debug
+// bound (payments implements it), so the derive can't apply.
+#[derive(Clone)]
 pub struct WrapConfig {
     /// How this server identifies itself to the wrapped MCP server.
     pub client_info: Implementation,
@@ -184,6 +197,30 @@ pub struct WrapConfig {
     /// is metadata + invocation policy, not a different kind of tool.
     /// Empty (the default) publishes every tool as free.
     pub pricing: std::collections::BTreeMap<String, String>,
+    /// The provider's payment admission gate — redeems each paid invoke's
+    /// quote against the payment engine before the wrapped tool runs.
+    /// Required whenever `pricing` is non-empty: publishing a priced tool
+    /// with no gate is rejected at publish time (a priced tool that
+    /// can't verify payment must never serve).
+    pub payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
+}
+
+impl std::fmt::Debug for WrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrapConfig")
+            .field("client_info", &self.client_info)
+            .field("scope", &self.scope)
+            .field("delegation", &self.delegation)
+            .field("credential_override", &self.credential_override)
+            .field("force", &self.force)
+            .field("substitutability", &self.substitutability)
+            .field("pricing", &self.pricing)
+            .field(
+                "payment_admission",
+                &self.payment_admission.as_ref().map(|_| "PaymentAdmission"),
+            )
+            .finish()
+    }
 }
 
 impl WrapConfig {
@@ -198,6 +235,7 @@ impl WrapConfig {
             force: false,
             substitutability: Substitutability::ProviderLocal,
             pricing: std::collections::BTreeMap::new(),
+            payment_admission: None,
         }
     }
 }
@@ -364,6 +402,14 @@ impl ServerPublisher {
     ) -> Result<PublicationHandle, WrapError> {
         // Classify BEFORE spawning: an invalid override (e.g. downward without
         // --force) should fail fast without starting a process.
+        // Priced tools demand a payment gate before anything spawns or
+        // announces — a config that can't verify payment never serves.
+        if !config.pricing.is_empty() && config.payment_admission.is_none() {
+            return Err(WrapError::PricedWithoutPaymentGate {
+                count: config.pricing.len(),
+            });
+        }
+
         let credential_status = classify(
             &WrapEnv {
                 program,
@@ -429,7 +475,11 @@ impl ServerPublisher {
                 config.scope.clone(),
             )
             .with_service(tool_id.clone())
-            .with_delegation(config.delegation.clone());
+            .with_delegation(config.delegation.clone())
+            .with_payment(
+                lt.descriptor.pricing_terms.is_some(),
+                config.payment_admission.clone(),
+            );
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -458,6 +508,7 @@ impl ServerPublisher {
             ctx,
             scope: config.scope,
             delegation: config.delegation,
+            payment_admission: config.payment_admission,
             tools,
             skipped,
             registration: Registration {
@@ -511,6 +562,9 @@ pub struct PublicationHandle {
     /// promoted/refreshed tool enforces the same delegation policy as the
     /// initial publish.
     delegation: Option<Arc<DelegationGate>>,
+    /// Payment admission gate reused likewise — a tool that appears priced
+    /// on refresh enforces the same payment policy as the initial publish.
+    payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// MCP tool names skipped because they have no usable id (an empty name).
@@ -597,7 +651,11 @@ impl PublicationHandle {
                     self.scope.clone(),
                 )
                 .with_service(tool_id.clone())
-                .with_delegation(self.delegation.clone());
+                .with_delegation(self.delegation.clone())
+                .with_payment(
+                    lt.descriptor.pricing_terms.is_some(),
+                    self.payment_admission.clone(),
+                );
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);

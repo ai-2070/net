@@ -140,6 +140,16 @@ impl ProviderAdmissionPolicy for AdmitAll {
     }
 }
 
+/// The provider-side invocation gate's verdict
+/// ([`PaymentEngine::redeem_for_invocation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemDecision {
+    /// The quote's one invocation is admitted (and now consumed).
+    Admitted,
+    /// Fail-closed rejection; the reason travels to the caller.
+    Denied { reason: String },
+}
+
 /// Read-only snapshot of a quote's lifecycle state.
 #[derive(Debug, Clone)]
 pub struct QuoteStatus {
@@ -168,6 +178,12 @@ struct QuoteRecord {
     in_flight: bool,
     frozen: Option<String>,
     served: bool,
+    /// Whether the paid invocation was executed against this quote —
+    /// set (at most once) by [`PaymentEngine::redeem_for_invocation`],
+    /// the provider-side gate's check. Additive: pre-existing records
+    /// default to unredeemed.
+    #[serde(default)]
+    redeemed: bool,
     #[serde(default)]
     chain: Vec<VerificationEvent>,
     #[serde(default)]
@@ -330,6 +346,7 @@ impl PaymentEngine {
                 in_flight: true,
                 frozen: None,
                 served: false,
+                redeemed: false,
                 chain: Vec::new(),
                 billing: None,
             };
@@ -692,6 +709,65 @@ impl PaymentEngine {
             log.append(&event).await?;
         }
         Ok(())
+    }
+
+    /// The provider-side invocation gate: redeem a paid quote for its one
+    /// invocation. Admits iff the quote is settled and billed, unfrozen,
+    /// bound to `tool_id` (the capability's tool segment), and never
+    /// redeemed before — one payment, one serve, atomically under the
+    /// store lock. Deliberately at-most-once: a paid invoke whose reply
+    /// was lost is not re-servable on the same quote, matching the
+    /// at-most-once retry safety of credentialed tools.
+    pub async fn redeem_for_invocation(
+        &self,
+        tool_id: &str,
+        quote_id: &str,
+    ) -> Result<RedeemDecision, EngineError> {
+        let tool_id = tool_id.to_string();
+        let quote_id = quote_id.to_string();
+        let decision = mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
+            let Some(rec) = s.quotes.get_mut(&quote_id) else {
+                return RedeemDecision::Denied {
+                    reason: "unknown quote — no payment exists for this invocation".to_string(),
+                };
+            };
+            if let Some(reason) = &rec.frozen {
+                return RedeemDecision::Denied {
+                    reason: format!("quote is frozen ({reason}) — nothing serves against it"),
+                };
+            }
+            if rec.billing.is_none() {
+                return RedeemDecision::Denied {
+                    reason: "quote is not settled/billed — the payment never completed"
+                        .to_string(),
+                };
+            }
+            // The capability binds `provider/tool`; the tool segment is
+            // everything after the first `/` (tool ids may themselves
+            // contain `/`).
+            let bound_tool = rec
+                .capability
+                .split_once('/')
+                .map(|(_, tool)| tool)
+                .unwrap_or(rec.capability.as_str());
+            if bound_tool != tool_id {
+                return RedeemDecision::Denied {
+                    reason: format!(
+                        "quote is bound to capability `{}`, not to tool `{tool_id}`",
+                        rec.capability
+                    ),
+                };
+            }
+            if rec.redeemed {
+                return RedeemDecision::Denied {
+                    reason: "quote already redeemed — one payment, one serve".to_string(),
+                };
+            }
+            rec.redeemed = true;
+            RedeemDecision::Admitted
+        })
+        .await?;
+        Ok(decision)
     }
 
     /// Read-only lifecycle snapshot for gates and tests.

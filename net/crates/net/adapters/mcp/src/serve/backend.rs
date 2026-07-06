@@ -162,11 +162,18 @@ pub trait CapabilityGateway: Send + Sync {
     /// [`CallToolResult`] with `is_error = true`.
     ///
     /// `safety` selects the retry policy on a timeout — see [`InvokeSafety`].
+    /// `payment` is the paid-invocation binding
+    /// ([`super::payment::PaymentProof`], attached as the
+    /// [`super::payment::HDR_PAYMENT_QUOTE`] header by mesh
+    /// implementations) — `None` for free capabilities. A provider-side
+    /// payment rejection surfaces as [`GatewayError::Denied`], the same
+    /// authorization verdict as its owner-scope and delegation siblings.
     async fn invoke(
         &self,
         id: &CapabilityId,
         arguments: serde_json::Value,
         safety: InvokeSafety,
+        payment: Option<super::payment::PaymentProof>,
     ) -> Result<CallToolResult, GatewayError>;
 }
 

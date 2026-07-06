@@ -15,7 +15,8 @@ use net_payments::core::verification::{
     check_chain, ExceptionKind, InvalidationReason, VerificationStatus, VerificationTier,
 };
 use net_payments::engine::{
-    AdmitAll, PaymentDecision, PaymentEngine, ProviderAdmissionPolicy, RejectReason,
+    AdmitAll, PaymentDecision, PaymentEngine, ProviderAdmissionPolicy, RedeemDecision,
+    RejectReason,
 };
 use net_payments::facilitator::mock::{MockFacilitator, MockMode, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::facilitator::{
@@ -630,6 +631,101 @@ async fn an_unregistered_asset_is_never_quoted() {
 // ---------------------------------------------------------------------
 // second payload against a paid quote
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// invocation redemption: the provider-side gate's check
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn redemption_admits_a_paid_quote_exactly_once() {
+    let h = harness();
+    let quote = h.quote("2500");
+
+    // Unpaid: nothing to redeem.
+    let unpaid = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .await
+        .unwrap();
+    assert!(matches!(unpaid, RedeemDecision::Denied { .. }), "got {unpaid:?}");
+
+    // Pay + serve.
+    let payload = payload_for(&quote, "payer-1");
+    let served = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(matches!(served, PaymentDecision::Served { .. }));
+
+    // A quote pays for ITS capability's tool, nothing else.
+    let wrong_tool = h
+        .engine
+        .redeem_for_invocation("other-tool", &quote.quote_id)
+        .await
+        .unwrap();
+    match wrong_tool {
+        RedeemDecision::Denied { reason } => assert!(reason.contains("bound"), "{reason}"),
+        other => panic!("expected Denied, got {other:?}"),
+    }
+
+    // The one paid invocation.
+    assert_eq!(
+        h.engine
+            .redeem_for_invocation("fixture-tool", &quote.quote_id)
+            .await
+            .unwrap(),
+        RedeemDecision::Admitted
+    );
+
+    // One payment, one serve — the second redemption bounces.
+    let again = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .await
+        .unwrap();
+    match again {
+        RedeemDecision::Denied { reason } => {
+            assert!(reason.contains("already redeemed"), "{reason}")
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn redemption_denies_frozen_quotes() {
+    let h = harness();
+    let quote = h.quote("2500");
+    h.facilitator.arm(quote.requirements.content_hash(), MockMode::ReorgInvalidate);
+    let payload = payload_for(&quote, "payer-1");
+
+    let served = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(matches!(served, PaymentDecision::Served { .. }));
+
+    // The settlement reorgs out before the invocation arrives: the quote
+    // freezes, and the (paid! billed!) invocation is still refused —
+    // billing stays immutable, serving stops.
+    let reorg = h
+        .engine
+        .re_verify(&quote.quote_id, VerificationTier::Observed, NOW + 2)
+        .await
+        .unwrap();
+    assert!(matches!(reorg, PaymentDecision::Invalidated { .. }));
+
+    let redemption = h
+        .engine
+        .redeem_for_invocation("fixture-tool", &quote.quote_id)
+        .await
+        .unwrap();
+    match redemption {
+        RedeemDecision::Denied { reason } => assert!(reason.contains("frozen"), "{reason}"),
+        other => panic!("expected Denied, got {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn a_second_payload_for_a_satisfied_quote_is_rejected() {

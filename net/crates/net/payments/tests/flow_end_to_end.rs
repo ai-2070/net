@@ -20,7 +20,7 @@ use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME
 use net_payments::flow::{
     CallerDecision, CallerPaymentFlow, Clock, InProcessProvider, ProviderChannel,
 };
-use net_payments::policy::spend::{SpendLimits, SpendPolicyEngine, SpendProfile};
+use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 use net_payments::core::units::AtomicAmount;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
@@ -113,7 +113,7 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     let w = world(SpendProfile::DevTest);
 
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { proof } = decision else {
+    let CallerDecision::Paid { quote_id: _, proof } = decision else {
         panic!("expected Paid, got {decision:?}");
     };
 
@@ -135,7 +135,7 @@ async fn auto_allow_pays_silently_and_bills_exactly_once() {
     // by the engine's lifecycle tests). Here we pin the flow-level fact:
     // a second full run is a second charge with a distinct billing id.
     let second = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { proof: proof2 } = second else {
+    let CallerDecision::Paid { quote_id: _, proof: proof2 } = second else {
         panic!("expected Paid, got {second:?}");
     };
     assert_ne!(
@@ -177,7 +177,7 @@ async fn over_cap_surfaces_structured_approval_and_approval_unblocks() {
     assert!(approver.approve(&quote_id).await.expect("approve"));
 
     let retry = w.flow.run(CAPABILITY, &w.terms_json).await;
-    let CallerDecision::Paid { proof } = retry else {
+    let CallerDecision::Paid { quote_id: _, proof } = retry else {
         panic!("approval must unblock the paid invoke, got {retry:?}");
     };
     assert_eq!(
