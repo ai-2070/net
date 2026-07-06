@@ -35,6 +35,8 @@ use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::{X402Carry, X402_VERSION};
 
+#[cfg(feature = "http-facilitator")]
+pub mod http402;
 #[cfg(feature = "mcp-gate")]
 pub mod mcp_gate;
 #[cfg(feature = "mesh")]

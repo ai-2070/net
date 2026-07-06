@@ -14,6 +14,7 @@
 
 pub mod caip;
 pub mod payload;
+pub mod payment_required;
 pub mod requirements;
 pub mod schemes;
 pub mod settlement;
