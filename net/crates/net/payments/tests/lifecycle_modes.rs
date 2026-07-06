@@ -682,6 +682,90 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
     ));
 }
 
+/// H1 regression: an overpayment leaves the record settled-but-unbilled
+/// and unfrozen, so a retry routes `AlreadySettled → re_verify`. That
+/// re-verify must re-apply the amount policy and stay an Exception —
+/// never promote the overpaid `delivered` into an auto-billed serve.
+#[tokio::test]
+async fn overpayment_retry_via_re_verify_never_auto_bills() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(OverpayingFacilitator),
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .unwrap();
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+    let payload = payload_for(&quote, "payer-1");
+
+    // First call: overpayment exception, no serve, no billing.
+    let first = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            first,
+            PaymentDecision::Exception {
+                kind: ExceptionKind::Overpayment
+            }
+        ),
+        "got {first:?}"
+    );
+
+    // Retry (agents retry constantly): AlreadySettled → re_verify. The
+    // facilitator would happily re-`verify` as valid, but the recorded
+    // delivered amount is still an overpayment.
+    let retry = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            retry,
+            PaymentDecision::Exception {
+                kind: ExceptionKind::Overpayment
+            }
+        ),
+        "retry must stay an overpayment exception, got {retry:?}"
+    );
+
+    let status = engine.status(&quote.quote_id).await.unwrap().unwrap();
+    assert!(!status.served, "an overpayment retry must never serve");
+    assert!(
+        status.billing_event_id.is_none(),
+        "an overpayment retry must never bill"
+    );
+    // Two exception events now (original settle + the re-verify re-check),
+    // both Overpayment; nothing Verified crept in.
+    assert_eq!(status.chain.len(), 2);
+    for entry in &status.chain {
+        assert!(
+            matches!(
+                entry.status,
+                VerificationStatus::Exception {
+                    kind: ExceptionKind::Overpayment
+                }
+            ),
+            "every event stays an overpayment exception, got {:?}",
+            entry.status
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // provider policy at quote issuance
 // ---------------------------------------------------------------------

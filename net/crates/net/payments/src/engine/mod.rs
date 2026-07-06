@@ -749,6 +749,11 @@ impl PaymentEngine {
         let is_valid = verify.response.view().is_valid;
         let facilitator_reason = verify.response.view().invalid_reason.clone();
         let tier = verify.tier;
+        // The amount this quote requires: re-verify must re-apply the
+        // under/over/exact policy against the delivered amount recorded at
+        // settlement, not trust the facilitator's `is_valid` boolean alone.
+        let required_amount = AtomicAmount::parse(&requirements.view().amount)
+            .map_err(|e| EngineError::State(e.to_string()))?;
 
         let quote_id = quote_id.to_string();
         type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
@@ -792,6 +797,100 @@ impl PaymentEngine {
                     return Ok((PaymentDecision::Invalidated { reason }, None));
                 }
 
+                // The delivered amount recorded at settlement time. On the
+                // fresh path this is written only for over/under settlements
+                // (an exact `Verified` event carries no `delivered` extra).
+                let recorded_delivered = rec
+                    .chain
+                    .first()
+                    .and_then(|e| e.extra.get("delivered"))
+                    .and_then(|v| v.as_str())
+                    .map(AtomicAmount::parse)
+                    .transpose()
+                    .map_err(|e| EngineError::State(e.to_string()))?;
+
+                // A record already billed keeps serving idempotently; this
+                // re-verify only records the tier upgrade. The amount was
+                // vetted when the billing event was minted, so no re-check.
+                if let Some(billing) = rec.billing.clone() {
+                    let ev = self.build_event(
+                        rec,
+                        &quote_id,
+                        transaction,
+                        tier,
+                        VerificationStatus::Verified,
+                        now_ns,
+                        &[],
+                    )?;
+                    rec.chain.push(ev);
+                    return Ok((
+                        PaymentDecision::Served {
+                            billing: Box::new(billing),
+                            tier,
+                        },
+                        None,
+                    ));
+                }
+
+                // Not yet billed: re-apply the under/over/exact amount policy
+                // that `accept_payment` and `re_verify_with_checker` enforce.
+                // Trusting only the facilitator's `is_valid` here would let a
+                // retry auto-bill an overpayment (which the design routes to
+                // manual provider policy) or promote a short-pay to a serve.
+                use std::cmp::Ordering;
+                if let Some(delivered) = &recorded_delivered {
+                    match delivered.cmp(&required_amount) {
+                        Ordering::Less => {
+                            let ev = self.build_event(
+                                rec,
+                                &quote_id,
+                                transaction,
+                                tier,
+                                VerificationStatus::Invalidated {
+                                    reason: InvalidationReason::AmountMismatch,
+                                },
+                                now_ns,
+                                &[(
+                                    "delivered".to_string(),
+                                    serde_json::Value::String(delivered.to_canonical_string()),
+                                )],
+                            )?;
+                            rec.chain.push(ev);
+                            rec.frozen = Some("amount_mismatch".to_string());
+                            return Ok((
+                                PaymentDecision::Invalidated {
+                                    reason: InvalidationReason::AmountMismatch,
+                                },
+                                None,
+                            ));
+                        }
+                        Ordering::Greater => {
+                            let ev = self.build_event(
+                                rec,
+                                &quote_id,
+                                transaction,
+                                tier,
+                                VerificationStatus::Exception {
+                                    kind: ExceptionKind::Overpayment,
+                                },
+                                now_ns,
+                                &[(
+                                    "delivered".to_string(),
+                                    serde_json::Value::String(delivered.to_canonical_string()),
+                                )],
+                            )?;
+                            rec.chain.push(ev);
+                            return Ok((
+                                PaymentDecision::Exception {
+                                    kind: ExceptionKind::Overpayment,
+                                },
+                                None,
+                            ));
+                        }
+                        Ordering::Equal => {}
+                    }
+                }
+
                 let ev = self.build_event(
                     rec,
                     &quote_id,
@@ -803,26 +902,9 @@ impl PaymentEngine {
                 )?;
                 rec.chain.push(ev);
 
-                if let Some(billing) = &rec.billing {
-                    return Ok((
-                        PaymentDecision::Served {
-                            billing: Box::new(billing.clone()),
-                            tier,
-                        },
-                        None,
-                    ));
-                }
                 if tier.satisfies(&required_tier) {
                     let tx = transaction.unwrap_or_default();
-                    let delivered = rec
-                        .chain
-                        .first()
-                        .and_then(|e| e.extra.get("delivered"))
-                        .and_then(|v| v.as_str())
-                        .map(AtomicAmount::parse)
-                        .transpose()
-                        .map_err(|e| EngineError::State(e.to_string()))?;
-                    let amount = match delivered {
+                    let amount = match recorded_delivered {
                         Some(a) => a,
                         None => self.required_amount_from(rec)?,
                     };
