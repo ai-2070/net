@@ -202,6 +202,13 @@ struct QuoteRecord {
     requirements_b64: String,
     payload_b64: String,
     in_flight: bool,
+    /// When `in_flight` was last asserted (engine time, ns). A crash
+    /// between claim and completion — verify/settle run with no lock held
+    /// — would otherwise strand the quote `in_flight` forever; a retry
+    /// after `in_flight_ttl_ns` reclaims it. `None` on a legacy record is
+    /// treated as immediately stale so old stuck records can recover.
+    #[serde(default)]
+    in_flight_since_ns: Option<u64>,
     frozen: Option<String>,
     served: bool,
     /// Whether the paid invocation was executed against this quote —
@@ -267,6 +274,12 @@ pub struct PaymentEngine {
     /// Bounded policy tolerance added to quote expiry (no global clock;
     /// expiry uses signer timestamps).
     expiry_tolerance_ns: u64,
+    /// How long a claimed-but-uncompleted quote may stay `in_flight`
+    /// before a retry is allowed to reclaim it (crash recovery). Default 5
+    /// minutes — comfortably longer than any verify+settle round-trip, so
+    /// a genuinely in-progress attempt is never reclaimed out from under
+    /// itself, while a crashed one eventually frees up.
+    in_flight_ttl_ns: u64,
     /// Optional billing stream: every freshly-emitted billing event is
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
@@ -290,6 +303,7 @@ impl PaymentEngine {
             registry_ref,
             state_path: state_path.into(),
             expiry_tolerance_ns: 0,
+            in_flight_ttl_ns: 300_000_000_000,
             billing_log: None,
         })
     }
@@ -297,6 +311,14 @@ impl PaymentEngine {
     /// Set the expiry comparison tolerance (default 0).
     pub fn with_expiry_tolerance_ns(mut self, tolerance_ns: u64) -> Self {
         self.expiry_tolerance_ns = tolerance_ns;
+        self
+    }
+
+    /// Set the in-flight reclaim TTL (default 5 minutes). A claimed quote
+    /// whose completion never landed (process crash mid verify/settle) is
+    /// reclaimable by a retry once this much engine time has passed.
+    pub fn with_in_flight_ttl_ns(mut self, ttl_ns: u64) -> Self {
+        self.in_flight_ttl_ns = ttl_ns;
         self
     }
 
@@ -381,6 +403,7 @@ impl PaymentEngine {
         // -- claim: check-and-mark under the lock, then release it before
         // any facilitator I/O.
         let quote_id = quote.quote_id.clone();
+        let in_flight_ttl_ns = self.in_flight_ttl_ns;
         let claim = {
             let payload_hash = payload_hash.clone();
             let record = QuoteRecord {
@@ -391,6 +414,7 @@ impl PaymentEngine {
                 requirements_b64: BASE64.encode(quote.requirements.bytes()),
                 payload_b64: BASE64.encode(payload.bytes()),
                 in_flight: true,
+                in_flight_since_ns: Some(now_ns),
                 frozen: None,
                 served: false,
                 redeemed: false,
@@ -412,12 +436,28 @@ impl PaymentEngine {
                         );
                     }
                     if rec.in_flight {
-                        return Claim::InProgress;
+                        // Completion is atomic (chain push + in_flight=false
+                        // in one commit), so an in_flight record has an
+                        // empty chain: a prior attempt claimed it and then
+                        // crashed (or is still running) before completing.
+                        // Reclaim only after the TTL, refreshing the clock
+                        // so a concurrent retry still sees InProgress and
+                        // only one attempt re-runs verify/settle.
+                        let stale = rec
+                            .in_flight_since_ns
+                            .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
+                            .unwrap_or(true);
+                        if !stale {
+                            return Claim::InProgress;
+                        }
+                        rec.in_flight_since_ns = Some(now_ns);
+                        return Claim::Fresh;
                     }
                     if !rec.chain.is_empty() {
                         return Claim::AlreadySettled;
                     }
                     rec.in_flight = true;
+                    rec.in_flight_since_ns = Some(now_ns);
                     return Claim::Fresh;
                 }
                 if let Some(other) = s.consumed.get(&payload_hash) {

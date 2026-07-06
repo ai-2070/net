@@ -814,6 +814,145 @@ async fn overpayment_retry_via_re_verify_never_auto_bills() {
 }
 
 // ---------------------------------------------------------------------
+// crash recovery: a stranded in_flight claim is reclaimable (M3)
+// ---------------------------------------------------------------------
+
+/// A facilitator whose first `verify` never returns — standing in for an
+/// attempt that claims the quote (persisting `in_flight`) and then the
+/// process dies before completion. Once healed, later calls settle.
+struct CrashSimFacilitator {
+    healed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Facilitator for CrashSimFacilitator {
+    fn reference(&self) -> net_payments::core::verification::VerifierRef {
+        net_payments::core::verification::VerifierRef {
+            identity: None,
+            endpoint: "test-crash-sim".into(),
+        }
+    }
+    async fn verify(
+        &self,
+        _payload: &X402Carry<PaymentPayload>,
+        _requirements: &X402Carry<PaymentRequirements>,
+    ) -> Result<VerifyOutcome, FacilitatorError> {
+        if !self.healed.load(std::sync::atomic::Ordering::SeqCst) {
+            // The "crashed" attempt hangs here forever; the test aborts it.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+        Ok(VerifyOutcome {
+            response: X402Carry::author(&net_payments::x402::settlement::VerifyResponse {
+                is_valid: true,
+                invalid_reason: None,
+                payer: None,
+                extra: None,
+            })
+            .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
+            tier: VerificationTier::Observed,
+        })
+    }
+    async fn settle(
+        &self,
+        _payload: &X402Carry<PaymentPayload>,
+        requirements: &X402Carry<PaymentRequirements>,
+    ) -> Result<SettleOutcome, FacilitatorError> {
+        Ok(SettleOutcome {
+            response: X402Carry::author(&SettlementResponse {
+                success: true,
+                error_reason: None,
+                payer: None,
+                transaction: "test:crash-recovered".into(),
+                network: requirements.view().network.clone(),
+                amount: Some(requirements.view().amount.clone()),
+                extensions: None,
+            })
+            .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
+            tier: VerificationTier::Observed,
+        })
+    }
+}
+
+/// M3 regression: a claim that persists `in_flight=true` and then never
+/// completes (process crash mid verify/settle) must not strand the quote
+/// forever. Before the TTL a retry sees InProgress; after it, the stale
+/// claim is reclaimed and the payment completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let facilitator = Arc::new(CrashSimFacilitator {
+        healed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let engine = Arc::new(
+        PaymentEngine::new(
+            provider.clone(),
+            facilitator.clone(),
+            Arc::new(AdmitAll),
+            default_mock_registry(provider.entity_id().clone()),
+            dir.path().join("engine.json"),
+        )
+        .unwrap()
+        .with_in_flight_ttl_ns(1000),
+    );
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+    let payload = payload_for(&quote, "payer-1");
+
+    // Attempt 1: claims the quote, then hangs in verify. Abort it once the
+    // claim (in_flight=true) is durably persisted — that is the "crash".
+    let e1 = engine.clone();
+    let q1 = quote.clone();
+    let p1 = payload.clone();
+    let handle =
+        tokio::spawn(async move { e1.accept_payment(&q1, &p1, VerificationTier::Observed, NOW + 1).await });
+    loop {
+        if engine.status(&quote.quote_id).await.unwrap().is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    handle.abort();
+    let _ = handle.await;
+
+    // Before the TTL: the retry just sees an in-flight attempt.
+    let too_soon = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(too_soon, PaymentDecision::InProgress),
+        "before the TTL a retry must see InProgress, got {too_soon:?}"
+    );
+
+    // Heal and retry past the TTL: the stale claim is reclaimed and served.
+    facilitator
+        .healed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let recovered = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 5000)
+        .await
+        .unwrap();
+    assert!(
+        matches!(recovered, PaymentDecision::Served { .. }),
+        "a reclaimed quote must be able to complete, got {recovered:?}"
+    );
+
+    let status = engine.status(&quote.quote_id).await.unwrap().unwrap();
+    assert!(status.served);
+    assert!(status.billing_event_id.is_some());
+}
+
+// ---------------------------------------------------------------------
 // provider policy at quote issuance
 // ---------------------------------------------------------------------
 
