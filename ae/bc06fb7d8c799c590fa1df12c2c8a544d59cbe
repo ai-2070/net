@@ -1,0 +1,24 @@
+net/crates/net/sdk/src/identity.rs
+  s_ecf38b21f410fb::t_a8bbe9b532935e 58
+net/crates/net/sdk/src/enrollment.rs
+  s_ecf38b21f410fb::t_e6b4a088142a87 1625
+  s_ecf38b21f410fb::t_86454dbf716c53 692-696,708
+  s_ecf38b21f410fb::t_19a99006062119 63
+  s_ecf38b21f410fb::t_d051c61ce71b41 1602-1624,1626-1651
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "aebc06fb7d8c799c590fa1df12c2c8a544d59cbe",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
