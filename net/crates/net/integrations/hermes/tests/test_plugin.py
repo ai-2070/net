@@ -28,6 +28,10 @@ TOOL_NAMES = {
     "net_mesh_invite",
     "net_mesh_devices",
     "net_mesh_revoke",
+    # Agent-to-agent task-handoff tools (V2 Phase 3).
+    "net_a2a_submit",
+    "net_a2a_status",
+    "net_a2a_cancel",
 }
 
 

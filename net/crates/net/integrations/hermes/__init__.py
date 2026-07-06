@@ -23,16 +23,17 @@ import logging
 import os
 from typing import Optional
 
-from . import delegation, federate, node, pins, provider, renewal
+from . import a2a, delegation, federate, node, pins, provider, renewal
 from .tools import TOOLS
 
-# `delegation` / `renewal` / `provider` / `federate` are imported for
+# `delegation` / `renewal` / `provider` / `federate` / `a2a` are imported for
 # package-attribute access (tests, and the node's lazy imports); the node owns
 # their lifecycle.
 _ = delegation
 _ = renewal
 _ = provider
 _ = federate
+_ = a2a
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,11 @@ _provider: Optional["provider.LocalToolProvider"] = None
 # surfaces discovered mesh capabilities as machine-namespaced first-class tools.
 # Opt-in; held so the session-end hook can stop it.
 _federation: Optional["federate.FederationService"] = None
+
+# The running A2A executor service (V2 Phase 3), if started — accepts
+# hand-off tasks from sibling in-root agents and runs them through the host
+# agent loop. Opt-in; held so the session-end hook can stop it.
+_a2a_service: Optional["a2a.A2aService"] = None
 
 
 def _env_flag(name: str) -> bool:
@@ -69,12 +75,19 @@ def _federate_tools_enabled() -> bool:
     return _env_flag("NET_MESH_FEDERATE_TOOLS")
 
 
+def _a2a_executor_enabled() -> bool:
+    """Whether this Hermes accepts hand-off tasks from sibling agents. Opt-in via
+    ``NET_MESH_A2A_EXECUTOR`` — running other agents' work must be deliberate.
+    (The requester-side ``net_a2a_*`` tools are always available.)"""
+    return _env_flag("NET_MESH_A2A_EXECUTOR")
+
+
 def _on_session_start(**_kwargs) -> None:
     """Start the pin-promotion subscription (Phase 2) for this session. Promotes
     approved pins to first-class tools, driven by the SDK's pin-change
     subscription. Best-effort and idempotent — a failure here must never break a
     session; the meta-tools stand on their own."""
-    global _promotion, _provider
+    global _promotion, _provider, _federation, _a2a_service
     if _promotion is None:
         try:
             if node.check_net_available():
@@ -100,12 +113,24 @@ def _on_session_start(**_kwargs) -> None:
                 _federation = federate.start_federation()
         except Exception as e:  # noqa: BLE001 — a session must not fail on this
             logger.warning("net plugin: tool federation not started: %s", e)
+    # A2A executor side (opt-in): accept hand-off tasks from sibling agents and
+    # run them through the host agent loop. Best-effort — a failure must never
+    # break a session; the requester-side net_a2a_* tools stand on their own.
+    if _a2a_service is None and _a2a_executor_enabled():
+        try:
+            if node.check_net_available():
+                _a2a_service = a2a.start_a2a_service(node.mesh())
+        except Exception as e:  # noqa: BLE001 — a session must not fail on this
+            logger.warning("net plugin: A2A executor not started: %s", e)
 
 
 def _on_session_end(**_kwargs) -> None:
     """Best-effort teardown when the session ends. Idempotent; swallows errors
     so session end never fails on cleanup."""
-    global _promotion, _provider, _federation
+    global _promotion, _provider, _federation, _a2a_service
+    if _a2a_service is not None:
+        _a2a_service.stop()
+        _a2a_service = None
     if _federation is not None:
         _federation.stop()
         _federation = None

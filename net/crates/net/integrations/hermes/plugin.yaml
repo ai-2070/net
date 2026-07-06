@@ -12,5 +12,8 @@ provides_tools:
   - net_mesh_invite
   - net_mesh_devices
   - net_mesh_revoke
+  - net_a2a_submit
+  - net_a2a_status
+  - net_a2a_cancel
 hooks:
   - on_session_end

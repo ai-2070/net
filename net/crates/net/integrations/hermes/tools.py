@@ -16,6 +16,7 @@ the mesh-vs-local distinction explicitly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, Dict
@@ -417,6 +418,168 @@ async def handle_net_mesh_revoke(args: Dict[str, Any], **_kw) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Agent-to-agent (A2A) task-handoff tools — the requester side of V2 Phase 3.
+# Hand a long job to a sibling in-root agent (by its routing node id), poll it,
+# and cancel it. The protocol + cancellation live in the Rust SDK (H2); these
+# are thin async handlers over `node.mesh().{submit_task,task_status,cancel_task}`
+# (sync SDK calls, run off the event loop via `asyncio.to_thread`).
+# ---------------------------------------------------------------------------
+
+NET_A2A_SUBMIT_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_submit",
+    "description": (
+        "Hand off a long/parallel job to ANOTHER agent on your operator mesh "
+        "(A2A). Use this when a sibling machine should grind a task while you "
+        "keep working — NOT for a quick tool call (use net_invoke_capability or a "
+        "federated tool for that; asking the other agent is briefing an amnesiac "
+        "colleague). The other agent does NOT share your memory, so pass any "
+        "context it needs as `context_refs` (artifact refs). Returns a `task_id` "
+        "to poll with net_a2a_status and stop with net_a2a_cancel. Its result "
+        "comes back as an artifact ref, not inline."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {
+                "type": "integer",
+                "description": "The peer agent's routing node id (from mesh discovery).",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "The job for the other agent to run.",
+            },
+            "context_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Artifact (Datafort) refs the other agent should read for "
+                    "context — it doesn't share your memory."
+                ),
+            },
+        },
+        "required": ["target_node_id", "prompt"],
+        "additionalProperties": False,
+    },
+}
+
+NET_A2A_STATUS_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_status",
+    "description": (
+        "Check a handed-off A2A task's status by its `task_id` (from "
+        "net_a2a_submit) on the executing agent `target_node_id`. Returns the "
+        "task's state (requested/accepted/running/completed/failed/cancelled); a "
+        "completed task carries its result's artifact ref."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {"type": "integer", "description": "The executor's node id."},
+            "task_id": {"type": "string", "description": "The task id from net_a2a_submit."},
+        },
+        "required": ["target_node_id", "task_id"],
+        "additionalProperties": False,
+    },
+}
+
+NET_A2A_CANCEL_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_cancel",
+    "description": (
+        "Cancel a handed-off A2A task by its `task_id` on the executing agent "
+        "`target_node_id`. The other agent's work demonstrably stops. Returns "
+        "whether the task was still in flight (a finished task cancels to false)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {"type": "integer", "description": "The executor's node id."},
+            "task_id": {"type": "string", "description": "The task id to cancel."},
+        },
+        "required": ["target_node_id", "task_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _a2a_target(args: Dict[str, Any]):
+    """Parse a required integer `target_node_id`, or return an error string."""
+    raw = args.get("target_node_id")
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, _json({"status": "error", "error": "target_node_id must be an integer"})
+
+
+async def handle_net_a2a_submit(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return _json({"status": "error", "error": "prompt is required"})
+    refs = [str(r) for r in (args.get("context_refs") or [])]
+    try:
+        task_id = await asyncio.to_thread(node.mesh().submit_task, node_id, prompt, refs)
+    except Exception as e:  # noqa: BLE001 — surface transport/reject failures as data
+        return _json({"status": "error", "error": f"could not submit task: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "task_id": task_id,
+            "target_node_id": node_id,
+            "message": (
+                "Task handed off. Poll it with net_a2a_status and stop it with "
+                "net_a2a_cancel; its result returns as an artifact ref."
+            ),
+        }
+    )
+
+
+async def handle_net_a2a_status(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return _json({"status": "error", "error": "task_id is required"})
+    try:
+        raw = await asyncio.to_thread(node.mesh().task_status, node_id, task_id)
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not get task status: {e}"})
+    if raw is None:
+        return _json({"status": "unknown", "task_id": task_id})
+    try:
+        record = json.loads(raw)
+    except (TypeError, ValueError):
+        return _json({"status": "error", "error": "malformed status record"})
+    return _json({"status": "ok", "task_id": task_id, "record": record})
+
+
+async def handle_net_a2a_cancel(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return _json({"status": "error", "error": "task_id is required"})
+    try:
+        cancelled = await asyncio.to_thread(node.mesh().cancel_task, node_id, task_id)
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not cancel task: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "task_id": task_id,
+            "cancelled": bool(cancelled),
+            "message": (
+                "The task was cancelled; the remote agent's work stops."
+                if cancelled
+                else "The task was not in flight (already finished or unknown)."
+            ),
+        }
+    )
+
+
 # The (name, schema, handler, emoji) rows the plugin registers, toolset "net".
 TOOLS = (
     ("net_search_capabilities", NET_SEARCH_SCHEMA, handle_net_search, "\U0001f50e"),
@@ -427,4 +590,7 @@ TOOLS = (
     ("net_mesh_invite", NET_MESH_INVITE_SCHEMA, handle_net_mesh_invite, "\U0001f4e8"),
     ("net_mesh_devices", NET_MESH_DEVICES_SCHEMA, handle_net_mesh_devices, "\U0001f5a5️"),
     ("net_mesh_revoke", NET_MESH_REVOKE_SCHEMA, handle_net_mesh_revoke, "\U0001f6ab"),
+    ("net_a2a_submit", NET_A2A_SUBMIT_SCHEMA, handle_net_a2a_submit, "\U0001f91d"),
+    ("net_a2a_status", NET_A2A_STATUS_SCHEMA, handle_net_a2a_status, "\U0001f4dd"),
+    ("net_a2a_cancel", NET_A2A_CANCEL_SCHEMA, handle_net_a2a_cancel, "\U0001f6d1"),
 )
