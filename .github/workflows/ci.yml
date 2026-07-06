@@ -705,7 +705,7 @@ jobs:
       # `RevocationRegistry` for `test_delegation.py`. Default `redis` is
       # omitted because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,payments
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python

@@ -173,3 +173,59 @@ def test_async_malformed_id_and_arguments_are_structured(async_gateway):
     bad_id, bad_args = asyncio.run(body())
     assert bad_id["status"] == "invalid_capability_id"
     assert bad_args["status"] == "invalid_arguments"
+
+
+# ---------------------------------------------------------------------------
+# Payments (PAYMENTS_SDK_PLAN.md P0): the gateway accepts the payment kwargs
+# and keeps every result structured. The payment *decisions* are pinned in
+# Rust (net-payments flow_end_to_end / mcp_gate_composition tests + the
+# binding-level outcome_to_json contract test); these assert the Python
+# surface: construction, validation, and unchanged behavior for free tools.
+# ---------------------------------------------------------------------------
+
+
+def test_payment_kwargs_construct_a_gateway(mesh, tmp_path):
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            pin_store_path=str(tmp_path / "pins.json"),
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="dev_test",
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    # Free-tool behavior is unchanged: structured results, never exceptions.
+    assert json.loads(gw.search(""))["status"] == "ok"
+    result = json.loads(gw.invoke("42/echo", "{}"))
+    assert result["status"] in {"transport_error", "not_found"}
+
+
+def test_payment_profile_without_policy_path_is_a_config_error(mesh):
+    with pytest.raises(ValueError):
+        CapabilityGateway(mesh, payment_profile="dev_test")
+
+
+def test_unknown_payment_profile_is_a_config_error(mesh, tmp_path):
+    with pytest.raises(ValueError):
+        CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="yolo",
+        )
+
+
+def test_async_gateway_accepts_payment_kwargs(mesh, tmp_path):
+    try:
+        gw = AsyncCapabilityGateway(
+            mesh,
+            pin_store_path=str(tmp_path / "pins.json"),
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="production",
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+
+    async def roundtrip():
+        return json.loads(await gw.search(""))
+
+    assert asyncio.run(roundtrip())["status"] == "ok"

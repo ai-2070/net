@@ -37,6 +37,8 @@ use crate::x402::{X402Carry, X402_VERSION};
 
 #[cfg(feature = "mcp-gate")]
 pub mod mcp_gate;
+#[cfg(feature = "mesh")]
+pub mod mesh;
 
 /// Time source. There is no global clock — every timestamp in the flow
 /// comes from here, and tests inject fixed instants.

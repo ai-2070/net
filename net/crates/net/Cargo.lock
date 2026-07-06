@@ -2745,6 +2745,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
+ "net-payments",
  "parking_lot 0.12.5",
  "postcard",
  "pyo3",
