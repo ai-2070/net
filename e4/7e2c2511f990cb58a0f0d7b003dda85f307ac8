@@ -1,0 +1,107 @@
+net/crates/net/bindings/go/mcp-ffi/src/lib.rs
+  s_928ee85c6ffc0a::t_8d32314fd5c379 413-415
+net/crates/net/bindings/node/tool.ts
+  s_928ee85c6ffc0a::t_f7f1f474790dc5 96-102
+net/crates/net/src/adapter/net/cortex/tool.rs
+  s_928ee85c6ffc0a::t_f03816653af7a1 731-751
+  s_928ee85c6ffc0a::t_2a0d09c4da47bd 80-91
+  s_928ee85c6ffc0a::t_8add64edc2cf7c 144-151
+  s_928ee85c6ffc0a::t_a8a87b98b40a70 187-189
+  s_928ee85c6ffc0a::t_87397ef7c4eac1 202
+  s_928ee85c6ffc0a::t_750efc08ff3623 752-753
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_928ee85c6ffc0a::t_e506debc8e4501 683
+net/crates/net/cli/src/commands/typegen/ts.rs
+  s_928ee85c6ffc0a::t_081fbd7afe3b45 429
+net/crates/net/adapters/mcp/src/bridge.rs
+  s_928ee85c6ffc0a::t_7b68fd66461f86 106
+  s_928ee85c6ffc0a::t_e635287dda6dce 79-84
+net/crates/net/adapters/mcp/tests/helper_golden_vectors.rs
+  s_928ee85c6ffc0a::t_39511610b0095e 154
+net/crates/net/adapters/mcp/src/wrap/descriptor.rs
+  s_928ee85c6ffc0a::t_333928c8203ee5 165-171
+  s_928ee85c6ffc0a::t_3104f276771dac 242-247,325
+  s_928ee85c6ffc0a::t_54e1577511164f 388
+  s_928ee85c6ffc0a::t_9a24c3d19566fc 279
+  s_928ee85c6ffc0a::t_59fe8102ac75b9 295,302-324
+  s_928ee85c6ffc0a::t_7b887c626b1b50 204,220
+  s_928ee85c6ffc0a::t_88f21d9879a903 326
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_928ee85c6ffc0a::t_df20cbc3160c7a 803
+  s_928ee85c6ffc0a::t_f9e7e7e34ab5e4 444-447,455-459
+  s_928ee85c6ffc0a::t_4166004c53d013 460
+net/crates/net/sdk/src/tool.rs
+  s_928ee85c6ffc0a::t_17ca4a9856af79 204
+  s_928ee85c6ffc0a::t_923d52e8e7c429 1287
+  s_928ee85c6ffc0a::t_140ecfe466ac75 33-34
+  s_928ee85c6ffc0a::t_ab1692757bc77a 145-156
+net/crates/net/bindings/python/src/mcp_helpers.rs
+  s_928ee85c6ffc0a::t_390b98c19684ed 108-110
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_928ee85c6ffc0a::t_d0db5707a147a4 180-186
+  s_928ee85c6ffc0a::t_9e520549307d95 386
+  s_928ee85c6ffc0a::t_f18dec0713e641 921
+  s_928ee85c6ffc0a::t_d02841e747bfed 707
+  s_928ee85c6ffc0a::t_5b55b043574da1 200
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_928ee85c6ffc0a::t_ccceb95074a625 134
+  s_928ee85c6ffc0a::t_be86ca2eb4da17 165-175
+  s_928ee85c6ffc0a::t_05e64614e6fad0 244-247
+net/crates/net/sdk/tests/tool_format_golden_vectors.rs
+  s_928ee85c6ffc0a::t_f71f13706a299a 74-77
+net/crates/net/adapters/mcp/src/serve/payment.rs
+  s_928ee85c6ffc0a::t_f494845938149e 1-61
+net/crates/net/bindings/node/src/tool.rs
+  s_928ee85c6ffc0a::t_5f109680cdbce1 283,298
+  s_928ee85c6ffc0a::t_218431ead4d9df 135,150
+  s_928ee85c6ffc0a::t_85f452d63c2c29 258
+net/crates/net/adapters/mcp/src/wrap/catalog.rs
+  s_928ee85c6ffc0a::t_1ac87c18bf24d1 127
+  s_928ee85c6ffc0a::t_81ae39a1e200b5 230
+net/crates/net/adapters/mcp/src/serve/grouping.rs
+  s_928ee85c6ffc0a::t_2b7c1ee9e9bdb9 214
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_928ee85c6ffc0a::t_a766c083e04954 780
+  s_928ee85c6ffc0a::t_8ae23318fe4837 612
+net/crates/net/src/adapter/net/mesh.rs
+  s_928ee85c6ffc0a::t_585b784db31aa3 10049-10050
+  s_928ee85c6ffc0a::t_b30c0d6457fbfe 10101-10108
+  s_928ee85c6ffc0a::t_9b159470e6a0a7 10109-10110
+net/crates/net/adapters/mcp/src/serve/gated.rs
+  s_928ee85c6ffc0a::t_fd0daa1c6fb120 291,304,316,337,349
+  s_928ee85c6ffc0a::t_c43a6c761b0ecf 74-76,82-88,100
+  s_928ee85c6ffc0a::t_ae0180dc61d9a5 355-517
+  s_928ee85c6ffc0a::t_01735f4675ae7e 270
+  s_928ee85c6ffc0a::t_75d052794b618f 136-177
+  s_928ee85c6ffc0a::t_51e4e5649def2c 51-64
+  s_928ee85c6ffc0a::t_28a26a05e90bde 26
+  s_928ee85c6ffc0a::t_9c46a60940f465 251
+net/crates/net/bindings/node/src/mcp_helpers.rs
+  s_928ee85c6ffc0a::t_cf2038a06e3f9f 140-142
+net/crates/net/cli/src/commands/typegen/python.rs
+  s_928ee85c6ffc0a::t_a327f810266b5f 749
+net/crates/net/cli/src/commands/typegen/diff.rs
+  s_928ee85c6ffc0a::t_59e43731b812ce 495
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_928ee85c6ffc0a::t_7c724a32f51261 593,599
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_928ee85c6ffc0a::t_559f1e273c39d4 76-80
+net/crates/net/adapters/mcp/src/serve/mod.rs
+  s_928ee85c6ffc0a::t_ec5bd6f385882a 38,52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e47e2c2511f990cb58a0f0d7b003dda85f307ac8",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
