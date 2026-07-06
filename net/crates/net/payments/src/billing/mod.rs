@@ -151,6 +151,13 @@ impl BillingLog {
                 })?;
             events.push(event);
         }
+        // One charge per billing_event_id. A billing event that reaches the
+        // log more than once — a re-publish after a lost append, or a crash
+        // between the durable append and the engine's published-mark —
+        // would otherwise double-count. The id is content-derived from the
+        // idempotency scope, so first-occurrence-wins is exact.
+        let mut seen = std::collections::HashSet::new();
+        events.retain(|e| seen.insert(e.billing_event_id.clone()));
         Ok(events)
     }
 
@@ -173,5 +180,54 @@ impl BillingLog {
             .await
             .map_err(|e| BillingError::io(dest, e))?;
         Ok(events.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::canonical::{ExtraFields, SignedEnvelope as _};
+    use crate::core::units::AtomicAmount;
+    use crate::core::versioning::TAG_BILLING_EVENT;
+    use net::adapter::net::identity::EntityKeypair;
+
+    fn signed_event(kp: &EntityKeypair, idem: &str) -> BillingEvent {
+        let mut ev = BillingEvent {
+            object: TAG_BILLING_EVENT.to_string(),
+            billing_event_id: BillingEvent::derive_id(idem),
+            idempotency_key: idem.to_string(),
+            capability: "prov/tool".into(),
+            invocation_id: None,
+            quote_id: "q1".into(),
+            transaction: Some("0xabc".into()),
+            verification_ref: None,
+            payer: EntityKeypair::generate().entity_id().clone(),
+            payee: kp.entity_id().clone(),
+            network: "mock:net".into(),
+            asset: "musd".into(),
+            amount: AtomicAmount::from_u128(2_500),
+            occurred_at_ns: 42,
+            signature: None,
+            extra: ExtraFields::new(),
+        };
+        ev.sign_with(kp).unwrap();
+        ev
+    }
+
+    /// M4 safety net: a billing event appended twice (a re-publish after a
+    /// lost append) is one charge to every reader.
+    #[tokio::test]
+    async fn read_all_dedups_a_duplicated_append_by_event_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = BillingLog::new(dir.path().join("b.jsonl"));
+        let kp = EntityKeypair::generate();
+        let ev = signed_event(&kp, "k1");
+
+        log.append(&ev).await.unwrap();
+        log.append(&ev).await.unwrap();
+
+        let events = log.read_all().await.unwrap();
+        assert_eq!(events.len(), 1, "one charge per billing_event_id");
+        assert_eq!(events[0].billing_event_id, ev.billing_event_id);
     }
 }

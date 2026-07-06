@@ -221,6 +221,14 @@ struct QuoteRecord {
     chain: Vec<VerificationEvent>,
     #[serde(default)]
     billing: Option<BillingEvent>,
+    /// Whether `billing` has been durably appended to the attached billing
+    /// log. The event is committed to state at completion but the log
+    /// append happens after the lock (and to a different file); if that
+    /// append is lost (I/O failure or a crash before this flag is set) an
+    /// idempotent retry re-publishes it. `false` on a legacy record simply
+    /// means a retry will (idempotently) try once more.
+    #[serde(default)]
+    billing_published: bool,
 }
 
 /// Struct wrapper (not a bare map) so a schema-version field can land
@@ -244,7 +252,7 @@ struct EngineState {
 enum Claim {
     Fresh,
     AlreadySettled,
-    AlreadyServed(Box<BillingEvent>, Option<VerificationTier>),
+    AlreadyServed(Box<BillingEvent>, Option<VerificationTier>, bool),
     InProgress,
     Frozen(String),
     ReplayOtherQuote,
@@ -420,6 +428,7 @@ impl PaymentEngine {
                 redeemed: false,
                 chain: Vec::new(),
                 billing: None,
+                billing_published: false,
             };
             mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
                 if let Some(rec) = s.quotes.get_mut(&quote_id) {
@@ -433,6 +442,7 @@ impl PaymentEngine {
                         return Claim::AlreadyServed(
                             Box::new(billing.clone()),
                             last_verified_tier(&rec.chain),
+                            rec.billing_published,
                         );
                     }
                     if rec.in_flight {
@@ -489,8 +499,17 @@ impl PaymentEngine {
                 })
             }
             Claim::InProgress => return Ok(PaymentDecision::InProgress),
-            Claim::AlreadyServed(billing, tier) => {
+            Claim::AlreadyServed(billing, tier, published) => {
                 // Idempotent completion: same billing event id, no settle.
+                // The billing event is committed to state, but its log
+                // append may have been lost (append failure or a crash
+                // before the published-mark). Re-publish so the charge
+                // still reaches accounting; the log dedups by id, so this
+                // is safe to repeat until it lands.
+                if !published {
+                    self.publish_billing(&quote.quote_id, Some((*billing).clone()))
+                        .await?;
+                }
                 return Ok(PaymentDecision::Served {
                     billing,
                     tier: tier.unwrap_or(VerificationTier::Observed),
@@ -744,7 +763,7 @@ impl PaymentEngine {
                 }
             })
             .await??;
-        self.publish_billing(fresh_billing).await?;
+        self.publish_billing(&quote_id, fresh_billing).await?;
         Ok(decision)
     }
 
@@ -980,17 +999,33 @@ impl PaymentEngine {
                 }
             })
             .await??;
-        self.publish_billing(fresh_billing).await?;
+        self.publish_billing(&quote_id, fresh_billing).await?;
         Ok(decision)
     }
 
-    /// Append a freshly-emitted billing event to the attached log. No log
-    /// attached = the stream surface is simply off (state still holds the
-    /// signed event); an attached-but-failing log is a loud error.
-    async fn publish_billing(&self, fresh: Option<BillingEvent>) -> Result<(), EngineError> {
-        if let (Some(event), Some(log)) = (fresh, &self.billing_log) {
-            log.append(&event).await?;
-        }
+    /// Append a freshly-emitted billing event to the attached log, then
+    /// mark the record `billing_published` so retries don't re-append. No
+    /// log attached = the stream surface is simply off (state still holds
+    /// the signed event, and the mark stays unset so a later-attached log
+    /// can still receive it on a retry); an attached-but-failing log is a
+    /// loud error, and the unset mark makes the next retry try again.
+    async fn publish_billing(
+        &self,
+        quote_id: &str,
+        fresh: Option<BillingEvent>,
+    ) -> Result<(), EngineError> {
+        let Some(event) = fresh else { return Ok(()) };
+        let Some(log) = &self.billing_log else {
+            return Ok(());
+        };
+        log.append(&event).await?;
+        let quote_id = quote_id.to_string();
+        mutate_json::<EngineState, (), _>(&self.state_path, move |s| {
+            if let Some(rec) = s.quotes.get_mut(&quote_id) {
+                rec.billing_published = true;
+            }
+        })
+        .await?;
         Ok(())
     }
 
@@ -1248,7 +1283,7 @@ impl PaymentEngine {
                 }
             })
             .await??;
-        self.publish_billing(fresh_billing).await?;
+        self.publish_billing(&quote_id, fresh_billing).await?;
         Ok(decision)
     }
 

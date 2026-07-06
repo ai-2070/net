@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use net::adapter::net::identity::{EntityId, EntityKeypair};
+use net_payments::billing::BillingLog;
 use net_payments::core::canonical::SignedEnvelope as _;
 use net_payments::core::quote::PaymentQuote;
 use net_payments::core::registry::default_mock_registry;
@@ -950,6 +951,83 @@ async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
     let status = engine.status(&quote.quote_id).await.unwrap().unwrap();
     assert!(status.served);
     assert!(status.billing_event_id.is_some());
+}
+
+// ---------------------------------------------------------------------
+// billing durability: a lost log append is recovered on retry (M4)
+// ---------------------------------------------------------------------
+
+/// M4 regression: the billing event is committed to engine state at
+/// completion, but the log append happens after the lock. If that append
+/// fails, the record shows served-and-billed while the log is empty — and
+/// before the fix the idempotent retry returned Served without ever
+/// re-appending, so the charge was invisible to accounting forever. The
+/// retry must re-publish; the log dedups, so the charge lands exactly once.
+#[tokio::test]
+async fn a_lost_billing_append_is_recovered_on_retry() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("billing.jsonl");
+    // Force the first append to fail: a directory sits where the log file
+    // must be written, so OpenOptions can't open it for writing.
+    std::fs::create_dir(&log_path).unwrap();
+
+    let billing_log = Arc::new(BillingLog::new(&log_path));
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(net_payments::facilitator::mock::MockFacilitator::new()),
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .unwrap()
+    .with_billing_log(billing_log.clone());
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+    let payload = payload_for(&quote, "payer-1");
+
+    // First serve: billed in state, but the log append fails, so the call
+    // surfaces an error and nothing lands in the log.
+    let first = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await;
+    assert!(
+        first.is_err(),
+        "a broken billing stream must not report success: {first:?}"
+    );
+
+    // Heal the stream and retry: the AlreadyServed path re-publishes. (The
+    // directory must go before reading the log — a dir at the path is an
+    // I/O error, not an empty log.)
+    std::fs::remove_dir(&log_path).unwrap();
+    assert!(billing_log.read_all().await.unwrap().is_empty());
+    let recovered = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(recovered, PaymentDecision::Served { .. }),
+        "got {recovered:?}"
+    );
+
+    // The charge is now visible exactly once, and a further retry adds
+    // nothing (published flag is set).
+    assert_eq!(billing_log.read_all().await.unwrap().len(), 1);
+    let again = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 3)
+        .await
+        .unwrap();
+    assert!(matches!(again, PaymentDecision::Served { .. }));
+    assert_eq!(billing_log.read_all().await.unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------------
