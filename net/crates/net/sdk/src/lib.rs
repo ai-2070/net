@@ -124,6 +124,12 @@ pub mod capabilities;
 // core `TokenChain` / `RevocationRegistry` machinery.
 #[cfg(feature = "net")]
 pub mod delegation;
+// Device enrollment — the invite → join → approve handshake that admits a new
+// device into an operator's mesh with a `root → device` delegation to the
+// device's *own* key (Hermes V2 Phase 1). Rides `net`: composes the identity /
+// delegation surface and pulls `getrandom` for the single-use invite nonce.
+#[cfg(feature = "net")]
+pub mod enrollment;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -222,6 +228,12 @@ pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
 #[cfg(feature = "net")]
 pub use crate::delegation::{
     derive_child_seed, DelegationChain, RevocationRegistry, TokenChain, GATEWAY_DELEGATION_CHANNEL,
+};
+// Device-enrollment convenience re-exports (V2 Phase 1): the invite/join/approve
+// types + the displayed root fingerprint.
+#[cfg(feature = "net")]
+pub use crate::enrollment::{
+    fingerprint, Enrollment, EnrollmentAuthority, EnrollmentError, InviteToken, JoinRequest,
 };
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};

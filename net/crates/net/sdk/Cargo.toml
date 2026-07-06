@@ -62,6 +62,11 @@ notify = { version = "8", optional = true }
 # (delegation rides the same identity surface); already in the workspace
 # via `dataforts`.
 blake3 = { version = "1", optional = true }
+# CSPRNG for the enrollment invite nonce (`enrollment::InviteToken`), using the
+# same `getrandom::fill` idiom the core identity layer uses for keypair / token
+# nonces. Version-matched to core (`0.4`) so the workspace resolves one copy.
+# Pulled in with the `net` feature (enrollment rides the same identity surface).
+getrandom = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -115,7 +120,7 @@ jetstream = ["net/jetstream"]
 # auth uses identity + capabilities + subnets together), so exposing
 # them as separate SDK flags created pick-your-own-subset
 # combinations that weren't actually meaningful.
-net = ["net/net", "dep:blake3"]
+net = ["net/net", "dep:blake3", "dep:getrandom"]
 # NAT traversal — reflex probes, classification, and
 # rendezvous-coordinated hole-punch. Exposes `Mesh::nat_type`,
 # `reflex_addr`, `connect_direct`, `traversal_stats`,
