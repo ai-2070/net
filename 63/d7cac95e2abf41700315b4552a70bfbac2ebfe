@@ -1,0 +1,40 @@
+net/crates/net/payments/tests/checker_verification.rs
+  s_928ee85c6ffc0a::t_2bb683759f79bf 1-284
+net/crates/net/payments/tests/eip155_checker.rs
+  s_928ee85c6ffc0a::t_29481d988a662d 1-193
+net/crates/net/payments/src/checker/mod.rs
+  s_928ee85c6ffc0a::t_22ecd7020e09a0 1-84
+net/crates/net/payments/src/checker/eip155.rs
+  s_928ee85c6ffc0a::t_ff85db4e9fe9a5 1-190
+net/crates/net/payments/src/engine/mod.rs
+  s_928ee85c6ffc0a::t_095e1bf3bb009a 1068-1093,1105
+  s_928ee85c6ffc0a::t_009632b7c5f399 42
+  s_928ee85c6ffc0a::t_7cb0ab507026ff 715-943
+  s_a772df20f47a78::t_90a1861a310186 1067
+net/crates/net/payments/src/lib.rs
+  s_928ee85c6ffc0a::t_7f0888d2c080c1 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "63d7cac95e2abf41700315b4552a70bfbac2ebfe",
+  "prompts": {},
+  "sessions": {
+    "s_928ee85c6ffc0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e047eae9-2217-4dd5-bd25-c49d438c1220",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_a772df20f47a78": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65d307c0-5140-4189-83c8-dc7bac5cd3d9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
