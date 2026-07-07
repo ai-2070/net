@@ -45,6 +45,10 @@ pub const NETWORK_SOLANA: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 pub const RPC_BASE_SEPOLIA: &str = "https://sepolia.base.org";
 /// Public Base mainnet JSON-RPC, for the independent chain checker.
 pub const RPC_BASE: &str = "https://mainnet.base.org";
+/// Public Solana mainnet JSON-RPC, for the independent chain checker.
+/// Heavily rate-limited — fine for conformance shapes; production
+/// operators supply their own endpoint in the pack.
+pub const RPC_SOLANA: &str = "https://api.mainnet-beta.solana.com";
 
 /// `final`-tier confirmation depth for Base (an OP-stack L2). A dozen L2
 /// blocks (~24s) is *not* L1-backed finality — L2 blocks stay reversible
@@ -106,11 +110,12 @@ pub fn cdp_base_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
 /// the exact-SVM seam (`SchemeSigner::sign_svm_transfer` /
 /// [`ExternalSvmSigner`](crate::flow::signer::ExternalSvmSigner) — the
 /// wallet builds and partially signs; without one, accepts[] entries on
-/// this network are honestly refused at selection). **No SVM chain
-/// checker exists yet**, so `required_tier` is deliberately absent
-/// (= `observed`, receipt trust) and no `rpc_endpoints` entry ships:
-/// promising `confirmed(n)` with no checker to deliver it would make
-/// every settlement unservable.
+/// this network are honestly refused at selection). Independently
+/// checkable via [`SvmChecker`](crate::checker::svm::SvmChecker), so the
+/// pack serves at `confirmed(1)` like the eip155 rungs. `final_depth` is
+/// deliberately absent: Solana's `finalized` commitment is deterministic
+/// finality — there is no depth posture to configure and the SVM checker
+/// ignores the knob.
 pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     FacilitatorConfig {
         object: TAG_FACILITATOR_CONFIG.to_string(),
@@ -122,8 +127,11 @@ pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
             scheme: "exact".to_string(),
             network: NETWORK_SOLANA.to_string(),
         }],
-        rpc_endpoints: BTreeMap::new(),
-        required_tier: BTreeMap::new(),
+        rpc_endpoints: BTreeMap::from([(NETWORK_SOLANA.to_string(), RPC_SOLANA.to_string())]),
+        required_tier: BTreeMap::from([(
+            NETWORK_SOLANA.to_string(),
+            VerificationTier::Confirmed(1),
+        )]),
         final_depth: BTreeMap::new(),
     }
 }
@@ -201,8 +209,9 @@ mod tests {
 
     #[test]
     fn tier_posture_matches_checker_availability() {
-        // eip155 packs serve above receipt trust and say where to check;
-        // solana has no checker yet, so its pack must not promise one.
+        // Every pack serves above receipt trust and says where to check —
+        // eip155 via the depth-arithmetic checker, solana via the
+        // commitment-level checker.
         let sepolia = x402_org_base_sepolia();
         assert_eq!(
             sepolia.required_tier(NETWORK_BASE_SEPOLIA),
@@ -227,8 +236,11 @@ mod tests {
         let solana = cdp_solana_mainnet("k");
         assert_eq!(
             solana.required_tier(NETWORK_SOLANA),
-            VerificationTier::Observed
+            VerificationTier::Confirmed(1)
         );
-        assert!(solana.rpc_endpoints.is_empty());
+        assert!(solana.rpc_endpoints.contains_key(NETWORK_SOLANA));
+        // Deterministic finality: the depth knob is deliberately absent
+        // (the SVM checker ignores it either way).
+        assert_eq!(solana.final_depth(NETWORK_SOLANA), None);
     }
 }

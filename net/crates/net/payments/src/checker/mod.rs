@@ -18,6 +18,8 @@ use crate::core::verification::{VerificationTier, VerifierRef};
 
 #[cfg(feature = "http-facilitator")]
 pub mod eip155;
+#[cfg(feature = "http-facilitator")]
+pub mod svm;
 
 /// Checker failure (RPC unreachable, malformed answer). Retryability is
 /// the checker's honest claim; policy decides whether to use it.

@@ -584,6 +584,15 @@ impl PaymentEngine {
         let settle_network = settle.response.view().network.clone();
         let quoted_network = quote.requirements.view().network.clone();
         let tier = settle.tier;
+        // The facilitator's settle-time payer claim, recorded below as a
+        // chain fact. For schemes whose payload carries no on-chain payer
+        // (exact-SVM's opaque wallet blob), a later independent re-check
+        // binds delivery to THIS recorded claim — a facilitator that later
+        // substitutes some other customer's transaction must find one whose
+        // on-chain payer equals the payer it named when it first settled.
+        // Weaker than the caller-signed `authorization.from` bind (which
+        // wins when present), but it pins post-hoc substitution.
+        let settle_payer = settle.response.view().payer.clone();
 
         let quote_id = quote.quote_id.clone();
         type Completion = Result<(PaymentDecision, Option<BillingEvent>), EngineError>;
@@ -669,11 +678,25 @@ impl PaymentEngine {
                     .ok_or_else(|| EngineError::State("record vanished mid-settle".into()))?;
                 rec.in_flight = false;
 
+                // Every completion event carries the settle-time payer claim
+                // (when the facilitator reported one) so re-checks can bind
+                // delivery to it — see `settle_payer` above.
+                let mut completion_extra: Vec<(String, serde_json::Value)> = Vec::new();
+                if let Some(p) = &settle_payer {
+                    completion_extra
+                        .push(("payer".to_string(), serde_json::Value::String(p.clone())));
+                }
+
                 use std::cmp::Ordering;
                 match delivered.cmp(&required) {
                     Ordering::Less => {
                         // Money moved but short: the payment is invalid and the
                         // quote freezes — value was consumed, nothing serves.
+                        let mut extra = completion_extra.clone();
+                        extra.push((
+                            "delivered".to_string(),
+                            serde_json::Value::String(delivered.to_canonical_string()),
+                        ));
                         let ev = self.build_event(
                             rec,
                             &quote_id,
@@ -683,10 +706,7 @@ impl PaymentEngine {
                                 reason: InvalidationReason::AmountMismatch,
                             },
                             now_ns,
-                            &[(
-                                "delivered".to_string(),
-                                serde_json::Value::String(delivered.to_canonical_string()),
-                            )],
+                            &extra,
                         )?;
                         rec.chain.push(ev);
                         rec.frozen = Some("amount_mismatch".to_string());
@@ -700,6 +720,11 @@ impl PaymentEngine {
                     Ordering::Greater => {
                         // Overpayment: verification exception for provider
                         // policy, never auto-satisfied. Not frozen; no billing.
+                        let mut extra = completion_extra.clone();
+                        extra.push((
+                            "delivered".to_string(),
+                            serde_json::Value::String(delivered.to_canonical_string()),
+                        ));
                         let ev = self.build_event(
                             rec,
                             &quote_id,
@@ -709,10 +734,7 @@ impl PaymentEngine {
                                 kind: ExceptionKind::Overpayment,
                             },
                             now_ns,
-                            &[(
-                                "delivered".to_string(),
-                                serde_json::Value::String(delivered.to_canonical_string()),
-                            )],
+                            &extra,
                         )?;
                         rec.chain.push(ev);
                         Ok((
@@ -730,7 +752,7 @@ impl PaymentEngine {
                             tier,
                             VerificationStatus::Verified,
                             now_ns,
-                            &[],
+                            &completion_extra,
                         )?;
                         rec.chain.push(ev);
                         if tier.satisfies(&required_tier) {
@@ -1071,8 +1093,13 @@ impl PaymentEngine {
             .map_err(|e| EngineError::State(e.to_string()))?;
         // The authorized payer, so the checker binds delivery to *this*
         // quote's authorization and not merely to (token, recipient). For
-        // exact-EVM this is `payload.authorization.from`; schemes/paths
-        // without an on-chain payer leave it `None`.
+        // exact-EVM this is `payload.authorization.from` — caller-signed,
+        // the strongest bind. For schemes whose payload is an opaque
+        // wallet blob (exact-SVM), fall back to the settle-time payer the
+        // facilitator named, recorded as a chain fact on the first
+        // settlement event: weaker (the facilitator's own claim), but it
+        // pins post-hoc transaction substitution to the originally-named
+        // payer. Neither present leaves the bind `None`.
         let payload: X402Carry<PaymentPayload> = X402Carry::from_bytes(
             BASE64
                 .decode(&rec.payload_b64)
@@ -1084,7 +1111,14 @@ impl PaymentEngine {
             .get("authorization")
             .and_then(|a| a.get("from"))
             .and_then(|v| v.as_str())
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| {
+                rec.chain
+                    .first()
+                    .and_then(|e| e.extra.get("payer"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
         let query = TransferQuery {
             token: requirements.view().asset.clone(),
             to: requirements.view().pay_to.clone(),
