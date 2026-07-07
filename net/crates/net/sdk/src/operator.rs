@@ -169,20 +169,12 @@ impl OperatorEnrollment {
         let enrollment = self
             .authority
             .approve(request, &invite, now, grant_ttl, max_depth)?;
-        if let Err(e) = DeviceRegistry::record(
-            &self.registry_path,
-            DeviceRecord::new(
-                enrollment.device.clone(),
-                enrollment.name.clone(),
-                enrollment.tags.clone(),
-                now,
-            ),
-        ) {
+        if let Err(e) = self.record_admitted(&enrollment, now) {
             // The admission didn't commit — un-spend the nonce so the device's
             // retry (once the store recovers) isn't permanently rejected as a
             // replay while `pending` still advertises the invite.
             self.authority.unspend_nonce(&invite.nonce);
-            return Err(e.into());
+            return Err(e);
         }
         // Single-use: retire the invite only after a successful admission.
         self.pending.lock().remove(&request.invite_nonce);
@@ -234,22 +226,55 @@ impl OperatorEnrollment {
         let enrollment =
             self.authority
                 .approve(request, &invite, now_unix(), grant_ttl, max_depth)?;
-        if let Err(e) = DeviceRegistry::record(
-            &self.registry_path,
-            DeviceRecord::new(
-                enrollment.device.clone(),
-                enrollment.name.clone(),
-                enrollment.tags.clone(),
-                now_unix(),
-            ),
-        ) {
+        if let Err(e) = self.record_admitted(&enrollment, now_unix()) {
             // Mirror `approve_at`: a failed commit un-spends the nonce so the
             // invite stays redeemable for the device's retry.
             self.authority.unspend_nonce(&invite.nonce);
-            return Err(e.into());
+            return Err(e);
         }
         self.pending.lock().remove(&request.invite_nonce);
         Ok(enrollment)
+    }
+
+    /// The inventory half of an admission: build the record (revocation stamp
+    /// carried forward) and persist it. Everything here runs **after** the
+    /// authority spent the invite nonce, so any error must make the caller
+    /// roll the nonce back — keep all fallible post-spend work inside.
+    fn record_admitted(&self, enrollment: &Enrollment, now: u64) -> Result<(), OperatorError> {
+        let record = self.carry_forward_revocation(DeviceRecord::new(
+            enrollment.device.clone(),
+            enrollment.name.clone(),
+            enrollment.tags.clone(),
+            now,
+        ))?;
+        DeviceRegistry::record(&self.registry_path, record)?;
+        Ok(())
+    }
+
+    /// Keep a re-recorded device's revocation stamp: enforcement is the
+    /// [`RevocationStore`] floor, which re-recording must **not** appear to
+    /// undo. A floor-revoked device that re-joins with a fresh invite would
+    /// otherwise show "active" in `mesh.devices()` while every invoke is still
+    /// denied (its fresh grant is minted at generation 0, below the raised
+    /// floor) — the inventory contradicting enforcement. If the store shows a
+    /// raised floor, the stamp is carried forward (or minted from the floor's
+    /// existence when the old record was pruned). Deliberate re-admission of a
+    /// revoked device needs a floor-aware re-issue surface (not yet built);
+    /// until then the inventory keeps telling the truth.
+    fn carry_forward_revocation(
+        &self,
+        mut record: DeviceRecord,
+    ) -> Result<DeviceRecord, OperatorError> {
+        let existing = DeviceRegistry::load(&self.registry_path)?;
+        record.revoked_at = existing.get(&record.device).and_then(|r| r.revoked_at);
+        if record.revoked_at.is_none()
+            && RevocationStore::load(&self.revocation_path)?.floor(&record.device) > 0
+        {
+            // No stamp in the inventory (e.g. the record was pruned) but the
+            // floor says revoked — stamp it so display matches enforcement.
+            record.revoked_at = Some(record.enrolled_at);
+        }
+        Ok(record)
     }
 
     /// Revoke a device, reading the system clock: raise its floor to generation
@@ -379,16 +404,21 @@ impl OperatorEnrollment {
             .renew(request, &registry, grant_ttl, max_depth)?;
 
         // Preserve the device's existing name/tags (renewal doesn't carry them),
-        // and refresh `enrolled_at` so the expiry surface stays current.
+        // and refresh `enrolled_at` so the expiry surface stays current. The
+        // revocation stamp is carried forward too — a renewal must never flip a
+        // revoked-looking record back to "active".
         let existing = DeviceRegistry::load(&self.registry_path)?;
         let (name, tags) = existing
             .get(&enrollment.device)
             .map(|r| (r.name.clone(), r.tags.clone()))
             .unwrap_or_default();
-        DeviceRegistry::record(
-            &self.registry_path,
-            DeviceRecord::new(enrollment.device.clone(), name, tags, now_unix()),
-        )?;
+        let record = self.carry_forward_revocation(DeviceRecord::new(
+            enrollment.device.clone(),
+            name,
+            tags,
+            now_unix(),
+        ))?;
+        DeviceRegistry::record(&self.registry_path, record)?;
         Ok(enrollment)
     }
 
@@ -606,6 +636,41 @@ mod tests {
             0
         );
         assert!(!op.forget(device.entity_id()).unwrap());
+    }
+
+    #[test]
+    fn re_enrolling_a_revoked_device_does_not_show_active() {
+        // Enforcement is the floor; a fresh invite + approve must not flip the
+        // inventory back to "active" while the floor still denies every invoke
+        // (the fresh grant is generation 0, below the raised floor).
+        let (op, _root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        op.revoke_at(device.entity_id(), 1, T0 + 1).unwrap();
+
+        // Re-join with a fresh invite.
+        let invite2 = op.invite_at("relay://rv", HOUR, T0 + 2);
+        let req2 = JoinRequest::create(&device, "pc-again", vec![], &invite2);
+        op.approve_at(&req2, T0 + 2, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+
+        let rec = &op.devices().unwrap()[0];
+        assert_eq!(rec.name, "pc-again", "re-record still refreshes metadata");
+        assert!(
+            rec.is_revoked(),
+            "inventory must not contradict the still-raised floor"
+        );
+
+        // Even with the inventory record pruned, the floor re-stamps it.
+        assert!(op.forget(device.entity_id()).unwrap());
+        let invite3 = op.invite_at("relay://rv", HOUR, T0 + 3);
+        let req3 = JoinRequest::create(&device, "pc-3", vec![], &invite3);
+        op.approve_at(&req3, T0 + 3, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+        assert!(op.devices().unwrap()[0].is_revoked());
     }
 
     #[test]
