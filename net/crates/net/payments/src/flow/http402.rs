@@ -97,7 +97,7 @@ impl X402HttpFlow {
         registry: AssetRegistry,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, String> {
-        let roots = crate::tls_roots::webpki_roots().map_err(|e| format!("http client: {e}"))?;
+        let tls = crate::tls_roots::tls_config().map_err(|e| format!("http tls config: {e}"))?;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             // Never follow redirects: both the unpaid probe and the paid
@@ -105,10 +105,10 @@ impl X402HttpFlow {
             // authorization — a bearer instrument. Following a 3xx would
             // hand it to an origin we never scoped spend policy against.
             .redirect(reqwest::redirect::Policy::none())
-            // Pin the bundled Mozilla roots (see `crate::tls_roots`): the
-            // money path must not trust an OS store that could carry a
-            // corporate MITM root.
-            .tls_certs_only(roots)
+            // Ring provider + bundled Mozilla roots, no OS store and no
+            // process-global provider (see `crate::tls_roots`): the money
+            // path must not trust a store that could carry a MITM root.
+            .use_preconfigured_tls(tls)
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         Ok(Self {

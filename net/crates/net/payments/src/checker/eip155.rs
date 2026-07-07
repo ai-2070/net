@@ -51,11 +51,11 @@ impl Eip155Checker {
                 "Eip155Checker got non-eip155 network `{network}`"
             )));
         }
-        let roots = crate::tls_roots::webpki_roots()
-            .map_err(|e| CheckerError::terminal(format!("http client: {e}")))?;
+        let tls = crate::tls_roots::tls_config()
+            .map_err(|e| CheckerError::terminal(format!("http tls config: {e}")))?;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .tls_certs_only(roots)
+            .use_preconfigured_tls(tls)
             .build()
             .map_err(|e| CheckerError::terminal(format!("http client: {e}")))?;
         Ok(Self {

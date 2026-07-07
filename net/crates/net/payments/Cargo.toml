@@ -65,13 +65,23 @@ parking_lot = "0.12"
 # HTTP client for the real-facilitator boundary (`http-facilitator`).
 # rustls, no default features: no openssl, no cookies, no proxies from
 # env — the money path gets exactly the transport it needs. reqwest 0.13
-# folded the old `rustls-tls` feature into `rustls` (aws-lc-rs provider,
-# platform root verifier).
-reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
+# folded the old `rustls-tls` feature into `rustls`; we take
+# `rustls-no-provider` instead and supply the crypto provider ourselves
+# (see the `rustls` dep below) to keep ring rather than 0.13's aws-lc-rs
+# default — no cmake / C toolchain in the money-path build.
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls-no-provider"] }
+# The rustls crypto provider for the money path: ring, explicitly, so the
+# build needs no C compiler (aws-lc-rs, 0.13's default, pulls aws-lc-sys +
+# cmake). `src/tls_roots.rs` builds an explicit `ClientConfig` with this
+# provider and hands it to reqwest's `use_preconfigured_tls` — so no
+# process-global provider is ever installed (which would leak into other
+# rustls users in the host process). Pinned to reqwest's rustls (0.23) so
+# the graph has a single rustls and the preconfigured-TLS downcast matches.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Compiled-in Mozilla trust roots. reqwest 0.13 dropped the bundled-roots
 # feature in favor of the OS platform verifier; we pin these explicitly
-# via `tls_certs_only` (see `src/tls_roots.rs`) so the money path's trust
-# anchors stay hermetic and deterministic across deploy targets.
+# into the `ClientConfig` root store (see `src/tls_roots.rs`) so the money
+# path's trust anchors stay hermetic and deterministic across deploy targets.
 webpki-root-certs = { version = "1", optional = true }
 # secp256k1 ECDSA + keccak256, for the DEV signer only
 # (`unsafe-dev-signer`). Production signing is external; these never
@@ -96,7 +106,7 @@ mesh = ["net-sdk/net", "net-sdk/cortex"]
 # `POST /verify`, `POST /settle`, `GET /supported` per the pinned x402
 # v2 spec. The first (and only) HTTP dependency in the money path —
 # rustls only, feature-gated so mock-only consumers never build it.
-http-facilitator = ["dep:reqwest", "dep:webpki-root-certs"]
+http-facilitator = ["dep:reqwest", "dep:rustls", "dep:webpki-root-certs"]
 # DEV/TESTNET ONLY: a local-key EIP-712 signer for conformance runs.
 # The name is the warning — production settlement signing goes through
 # `ExternalSigner` (KMS/wallet/MPC; the key never enters Net memory).

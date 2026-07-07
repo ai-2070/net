@@ -110,12 +110,12 @@ impl HttpFacilitator {
         // The bearer secret (CDP key) must never ride cleartext http to a
         // remote host. Enforce https except to loopback (local/self-hosted).
         require_secure_endpoint(&endpoint)?;
-        let roots = crate::tls_roots::webpki_roots()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        let tls = crate::tls_roots::tls_config()
+            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .tls_certs_only(roots)
+            .use_preconfigured_tls(tls)
             .build()
             .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
         Ok(Self {
@@ -127,12 +127,12 @@ impl HttpFacilitator {
 
     /// Override request timeouts (per call).
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, FacilitatorError> {
-        let roots = crate::tls_roots::webpki_roots()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        let tls = crate::tls_roots::tls_config()
+            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
         self.http = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(Duration::from_secs(10)))
-            .tls_certs_only(roots)
+            .use_preconfigured_tls(tls)
             .build()
             .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
         Ok(self)
