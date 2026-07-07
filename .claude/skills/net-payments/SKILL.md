@@ -7,7 +7,6 @@ metadata:
   net-payments-version: 0.31.0
   x402-spec: "v2 @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
   last-updated: 2026-07-06
-  reflects-commit: 0d12fc79 (P1 carried items: node identity, python signer refs, exact-SVM seam)
 ---
 
 # Net Payments SDK (x402-native)
