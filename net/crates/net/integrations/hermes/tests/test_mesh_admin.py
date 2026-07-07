@@ -148,6 +148,24 @@ def test_revoke_rejects_a_bad_device_id(rooted_node, plugin):
     assert res["status"] == "error"  # wrong length
 
 
+@pytest.mark.parametrize("set_var", ["NET_MESH_DEVICE_STORE", "NET_MESH_REVOCATION_STORE"])
+def test_half_store_override_fails_loudly(plugin, tmp_path, monkeypatch, set_var):
+    # Setting only one of the two store overrides used to silently fall back to
+    # the machine-shared production files for BOTH stores — an "isolated" test
+    # would write the real inventory. It must refuse loudly instead.
+    other = (
+        "NET_MESH_REVOCATION_STORE"
+        if set_var == "NET_MESH_DEVICE_STORE"
+        else "NET_MESH_DEVICE_STORE"
+    )
+    monkeypatch.setenv("NET_MESH_IDENTITY_SEED", _ROOT_SEED_HEX)
+    monkeypatch.setenv(set_var, str(tmp_path / "store.json"))
+    monkeypatch.delenv(other, raising=False)
+    # The refusal fires before the mesh handle is touched: a dummy suffices.
+    with pytest.raises(RuntimeError, match=other):
+        plugin.node._build_operator(object())
+
+
 def test_mesh_tools_registered_in_toolset(plugin):
     names = {name for name, _schema, _handler, _emoji in plugin.tools.TOOLS}
     assert {"net_mesh_invite", "net_mesh_devices", "net_mesh_revoke"} <= names

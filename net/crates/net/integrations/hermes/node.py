@@ -429,6 +429,19 @@ def _build_operator(mesh_handle) -> Tuple[object, object]:
     rev = (os.environ.get("NET_MESH_REVOCATION_STORE") or "").strip() or None
     if dev and rev:
         operator = OperatorEnrollment(root, dev, rev)
+    elif dev or rev:
+        # Half an override is a misconfiguration trap: this used to fall back
+        # to the machine-shared production stores for BOTH files, so a test
+        # that set only one var silently wrote device records / revocations
+        # into the real inventory it meant to avoid. Refuse loudly instead of
+        # guessing which half was intended.
+        missing = "NET_MESH_REVOCATION_STORE" if dev else "NET_MESH_DEVICE_STORE"
+        present = "NET_MESH_DEVICE_STORE" if dev else "NET_MESH_REVOCATION_STORE"
+        raise RuntimeError(
+            f"net plugin: {present} is set but {missing} is not — the store "
+            "overrides must be set together (mixing an override with the "
+            "machine-shared default would split the inventory)"
+        )
     else:
         operator = OperatorEnrollment.with_default_paths(root)
 
