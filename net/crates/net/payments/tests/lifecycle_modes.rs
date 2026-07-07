@@ -914,8 +914,10 @@ async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
     let e1 = engine.clone();
     let q1 = quote.clone();
     let p1 = payload.clone();
-    let handle =
-        tokio::spawn(async move { e1.accept_payment(&q1, &p1, VerificationTier::Observed, NOW + 1).await });
+    let handle = tokio::spawn(async move {
+        e1.accept_payment(&q1, &p1, VerificationTier::Observed, NOW + 1)
+            .await
+    });
     loop {
         if engine.status(&quote.quote_id).await.unwrap().is_some() {
             break;

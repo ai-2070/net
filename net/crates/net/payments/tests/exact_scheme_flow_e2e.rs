@@ -249,7 +249,9 @@ impl Facilitator for RejectingExactFacilitator {
         _payload: &X402Carry<PaymentPayload>,
         _requirements: &X402Carry<PaymentRequirements>,
     ) -> Result<SettleOutcome, FacilitatorError> {
-        Err(FacilitatorError::protocol("settle must not run after a verify reject"))
+        Err(FacilitatorError::protocol(
+            "settle must not run after a verify reject",
+        ))
     }
 }
 

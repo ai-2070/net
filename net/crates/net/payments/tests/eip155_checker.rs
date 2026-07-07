@@ -333,7 +333,10 @@ async fn a_chain_id_mismatch_is_a_terminal_error() {
     rpc.set_chain_id(84532);
     let checker_ok = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
     assert!(matches!(
-        checker_ok.check("eip155:84532", TX, None).await.expect("check"),
+        checker_ok
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
         ChainVerdict::Included { .. }
     ));
 }
@@ -354,14 +357,14 @@ async fn final_depth_comes_from_the_config_pack() {
     config
         .rpc_endpoints
         .insert("eip155:84532".to_string(), rpc.endpoint.clone());
-    config
-        .final_depth
-        .insert("eip155:84532".to_string(), 100);
+    config.final_depth.insert("eip155:84532".to_string(), 100);
 
-    let checker =
-        Eip155Checker::from_config(&config, "eip155:84532").expect("checker from config");
+    let checker = Eip155Checker::from_config(&config, "eip155:84532").expect("checker from config");
     assert_eq!(
-        checker.check("eip155:84532", TX, None).await.expect("check"),
+        checker
+            .check("eip155:84532", TX, None)
+            .await
+            .expect("check"),
         ChainVerdict::Included {
             tier: VerificationTier::Confirmed(50),
             delivered: None

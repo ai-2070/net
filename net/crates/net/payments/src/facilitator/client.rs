@@ -394,7 +394,10 @@ mod tests {
 
     #[test]
     fn new_rejects_a_cleartext_remote_endpoint() {
-        match HttpFacilitator::new("http://facilitator.example.com", std::sync::Arc::new(NoAuth)) {
+        match HttpFacilitator::new(
+            "http://facilitator.example.com",
+            std::sync::Arc::new(NoAuth),
+        ) {
             Ok(_) => panic!("cleartext http to a remote host must be refused"),
             Err(e) => {
                 let msg = e.to_string();

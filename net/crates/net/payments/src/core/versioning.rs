@@ -130,7 +130,10 @@ mod tests {
     fn a_leading_zero_version_spelling_is_the_same_version() {
         // `@01` parses to version 1, so it must be accepted as TAG@1, not
         // rejected with the nonsensical "got @1, expected @1".
-        assert_eq!(ensure_tag(TAG_PAYMENT_QUOTE, "net.payment.quote@01"), Ok(()));
+        assert_eq!(
+            ensure_tag(TAG_PAYMENT_QUOTE, "net.payment.quote@01"),
+            Ok(())
+        );
     }
 
     #[test]
