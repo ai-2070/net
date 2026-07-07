@@ -1,0 +1,23 @@
+net/crates/net/payments/Cargo.toml
+  s_660ba3b6629e10::t_b3965b4c15d108 67-70
+net/crates/net/payments/src/checker/eip155.rs
+  s_660ba3b6629e10::t_8ec3e52875adb1 115-123,125
+net/crates/net/Cargo.lock
+  s_660ba3b6629e10::t_ab343ca657232b 333-355,538-539,722-730,1318-1323,1616-1621,2330-2388,3504-3509,3765,4124,4126,4144,4227,4258-4284,4291,4624-4639,5532-5540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e26fd081659d5a4ed29f6f18ee0a8a82ddb5c2b1",
+  "prompts": {},
+  "sessions": {
+    "s_660ba3b6629e10": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e9330eb-8a2d-40c0-8b01-521b0c8356eb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
