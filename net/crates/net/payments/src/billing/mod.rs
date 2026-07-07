@@ -109,7 +109,7 @@ impl BillingLog {
         opts.append(true).create(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
+            // `mode` is inherent on tokio's OpenOptions (no trait import).
             opts.mode(0o600);
         }
         let mut file = opts

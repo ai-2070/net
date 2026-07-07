@@ -255,6 +255,12 @@ impl PyJoinOutcome {
     /// `DelegationChain`. Raises if the outcome was a rejection, or the grant is
     /// untrusted (wrong root / wrong device) — defending the joiner against a
     /// rogue operator.
+    ///
+    /// `&self` despite the `into_` name: a `#[pymethods]` method on a pyclass
+    /// can't consume `self` (the object is Python-owned), and the Python-facing
+    /// name deliberately mirrors the SDK's `JoinOutcome::into_chain` (pinned by
+    /// the `.pyi` stub and callers).
+    #[allow(clippy::wrong_self_convention)]
     fn into_chain(&self, device: &[u8], invite_root: &[u8]) -> PyResult<PyDelegationChain> {
         let device_id = entity_id_from_bytes(device)?;
         let root_id = entity_id_from_bytes(invite_root)?;
