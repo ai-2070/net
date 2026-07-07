@@ -38,6 +38,7 @@ pub mod gated;
 pub mod grouping;
 pub mod mesh_gateway;
 pub mod meta_tools;
+pub mod payment;
 pub mod pins;
 pub mod shim;
 pub mod validation;
@@ -49,6 +50,10 @@ pub use backend::{
 pub use consent::{ConsentDecision, ConsentPolicy};
 pub use gated::{gated_invoke, GatedOutcome};
 pub use mesh_gateway::MeshGateway;
+pub use payment::{
+    PaymentAdmission, PaymentFlow, PaymentFlowDecision, PaymentProof, HDR_PAYMENT_BINDING,
+    HDR_PAYMENT_QUOTE,
+};
 pub use pins::{PinState, PinStore, PinStoreError};
 pub use shim::Shim;
 pub use validation::{validate_args, ValidationError};

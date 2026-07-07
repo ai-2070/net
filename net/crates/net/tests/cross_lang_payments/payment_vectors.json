@@ -1,0 +1,296 @@
+{
+  "abi_version_expected": 1,
+  "atomic_amount_vectors": [
+    {
+      "input": "0",
+      "valid": true
+    },
+    {
+      "input": "10000",
+      "valid": true
+    },
+    {
+      "input": "340282366920938463463374607431768211455",
+      "valid": true
+    },
+    {
+      "input": "340282366920938463463374607431768211456",
+      "valid": false
+    },
+    {
+      "input": "",
+      "valid": false
+    },
+    {
+      "input": "01",
+      "valid": false
+    },
+    {
+      "input": "-1",
+      "valid": false
+    },
+    {
+      "input": "+1",
+      "valid": false
+    },
+    {
+      "input": "1.0",
+      "valid": false
+    },
+    {
+      "input": "1e6",
+      "valid": false
+    },
+    {
+      "input": " 1",
+      "valid": false
+    },
+    {
+      "input": "1_000",
+      "valid": false
+    }
+  ],
+  "caip_confusion_note": "distinct-but-confusable pairs: ids compare exact and case-sensitive; equivalence is registry policy, never string normalization",
+  "caip_confusion_pairs": [
+    [
+      "eip155:8453/erc20:0xabc",
+      "eip155:8453/erc20:0xABC"
+    ],
+    [
+      "eip155:1/erc20:0xabc",
+      "eip155:8453/erc20:0xabc"
+    ],
+    [
+      "mock:net/token:musd",
+      "mock:net/token:musd/1"
+    ],
+    [
+      "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "eip155:84532/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    ],
+    [
+      "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    ]
+  ],
+  "caip_vectors": [
+    {
+      "input": "eip155:8453",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "eip155:84532",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "mock:net",
+      "kind": "chain",
+      "valid": true
+    },
+    {
+      "input": "EIP155:8453",
+      "kind": "chain",
+      "valid": false
+    },
+    {
+      "input": "eip155",
+      "kind": "chain",
+      "valid": false
+    },
+    {
+      "input": "eip155:",
+      "kind": "chain",
+      "valid": false
+    },
+    {
+      "input": "eip155:8453 ",
+      "kind": "chain",
+      "valid": false
+    },
+    {
+      "input": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "kind": "asset",
+      "valid": true
+    },
+    {
+      "input": "mock:net/token:musd",
+      "kind": "asset",
+      "valid": true
+    },
+    {
+      "input": "eip155:1/erc721:0xb47e3cd837dDF8e4c57f05d70ab865de6e193bbb/771769",
+      "kind": "asset",
+      "valid": true
+    },
+    {
+      "input": "eip155:8453/erc20",
+      "kind": "asset",
+      "valid": false
+    },
+    {
+      "input": "eip155:8453/ERC20:0x0",
+      "kind": "asset",
+      "valid": false
+    },
+    {
+      "input": "eip155:8453",
+      "kind": "asset",
+      "valid": false
+    }
+  ],
+  "decimals_vectors": [
+    {
+      "asset": "musd",
+      "declared_decimals": 6,
+      "network": "mock:net",
+      "valid": true
+    },
+    {
+      "asset": "musd",
+      "declared_decimals": null,
+      "network": "mock:net",
+      "valid": true
+    },
+    {
+      "asset": "musd",
+      "declared_decimals": 18,
+      "network": "mock:net",
+      "valid": false
+    },
+    {
+      "asset": "not-in-registry",
+      "declared_decimals": null,
+      "network": "mock:net",
+      "valid": false
+    }
+  ],
+  "description": "Golden vectors for net-payments envelope canonicalization, signing, and x402 byte-preservation. Rust is the source of truth (payments/tests/payments_golden_vectors.rs); the same file drives bindings/node/test/payments_golden_vectors.test.ts, bindings/python/tests/test_payments_golden_vectors.py, and go/payments_golden_vectors_test.go. Adding a case means updating all four verifiers in lockstep. Regenerate: cargo run -p net-payments --example gen_payments_fixtures",
+  "envelopes": [
+    {
+      "canonical": "{\"accepts\":[\"eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=\",\"ewogICJzY2hlbWUiOiAiZXhhY3QiLAogICJuZXR3b3JrIjogImVpcDE1NTo4NDUzMiIsCiAgImFtb3VudCI6ICIxMDAwMCIsCiAgImFzc2V0IjogIjB4MDM2Q2JENTM4NDJjNTQyNjYzNGU3OTI5NTQxZUMyMzE4ZjNkQ0Y3ZSIsCiAgInBheVRvIjogIjB4MjA5NjkzQmM2YWZjMEM1MzI4YkEzNkZhRjAzQzUxNEVGMzEyMjg3QyIsCiAgIm1heFRpbWVvdXRTZWNvbmRzIjogNjAsCiAgImV4dHJhIjogewogICAgIm5hbWUiOiAiVVNEQyIsCiAgICAidmVyc2lvbiI6ICIyIgogIH0KfQo=\"],\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"capability\":\"fixture-provider/fixture-tool\",\"object\":\"net.pricing.terms@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\"}",
+      "name": "pricing_terms",
+      "object": "net.pricing.terms@1",
+      "signature_hex": null,
+      "signed_payload": null,
+      "signer_hex": null
+    },
+    {
+      "canonical": "{\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"ef0a58c627b7c4085b618ac01c8af6469926f1aed5cfe0bbd428487e26c3aa0c\",\"requirements\":\"eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=\",\"signature\":\"7209b1fd4422ab3177378f08c6feae1e3bc203486fdad2a376fd34ffec0f8a382fb399f728bb2202eb7212628e9c6200d9c3a945c74a3002a567c7ed0cf2a60d\",\"terms_hash\":\"6357b741631aed2d027216a7b93c51c98188110c905f84438655469f9da2053c\"}",
+      "name": "payment_quote_mock",
+      "object": "net.payment.quote@1",
+      "quote_id": "ef0a58c627b7c4085b618ac01c8af6469926f1aed5cfe0bbd428487e26c3aa0c",
+      "signature_hex": "7209b1fd4422ab3177378f08c6feae1e3bc203486fdad2a376fd34ffec0f8a382fb399f728bb2202eb7212628e9c6200d9c3a945c74a3002a567c7ed0cf2a60d",
+      "signed_payload": "{\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"ef0a58c627b7c4085b618ac01c8af6469926f1aed5cfe0bbd428487e26c3aa0c\",\"requirements\":\"eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=\",\"terms_hash\":\"6357b741631aed2d027216a7b93c51c98188110c905f84438655469f9da2053c\"}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "terms_hash": "6357b741631aed2d027216a7b93c51c98188110c905f84438655469f9da2053c"
+    },
+    {
+      "canonical": "{\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"input_hash\":\"1fe2724b3d87f67139545b8527253b1de2055d3d55d44df6d79c95961510df4f\",\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"requirements\":\"ewogICJzY2hlbWUiOiAiZXhhY3QiLAogICJuZXR3b3JrIjogImVpcDE1NTo4NDUzMiIsCiAgImFtb3VudCI6ICIxMDAwMCIsCiAgImFzc2V0IjogIjB4MDM2Q2JENTM4NDJjNTQyNjYzNGU3OTI5NTQxZUMyMzE4ZjNkQ0Y3ZSIsCiAgInBheVRvIjogIjB4MjA5NjkzQmM2YWZjMEM1MzI4YkEzNkZhRjAzQzUxNEVGMzEyMjg3QyIsCiAgIm1heFRpbWVvdXRTZWNvbmRzIjogNjAsCiAgImV4dHJhIjogewogICAgIm5hbWUiOiAiVVNEQyIsCiAgICAidmVyc2lvbiI6ICIyIgogIH0KfQo=\",\"signature\":\"0ef6ec32f9bffcfa9e382bf789ad9a3bbfc192a5f73d03541cad4358e275bf0a93c7d4b5cc84a54ff0a69fb1f07da18a8aff70d5550601d7d229f3bdc2ea0009\",\"terms_hash\":\"0807a8381ae18d7b917dee96c45ef4d652783b760f6ee82620cdbd1b21f2496a\"}",
+      "name": "payment_quote_eip155",
+      "object": "net.payment.quote@1",
+      "quote_id": "4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524",
+      "signature_hex": "0ef6ec32f9bffcfa9e382bf789ad9a3bbfc192a5f73d03541cad4358e275bf0a93c7d4b5cc84a54ff0a69fb1f07da18a8aff70d5550601d7d229f3bdc2ea0009",
+      "signed_payload": "{\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"input_hash\":\"1fe2724b3d87f67139545b8527253b1de2055d3d55d44df6d79c95961510df4f\",\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"requirements\":\"ewogICJzY2hlbWUiOiAiZXhhY3QiLAogICJuZXR3b3JrIjogImVpcDE1NTo4NDUzMiIsCiAgImFtb3VudCI6ICIxMDAwMCIsCiAgImFzc2V0IjogIjB4MDM2Q2JENTM4NDJjNTQyNjYzNGU3OTI5NTQxZUMyMzE4ZjNkQ0Y3ZSIsCiAgInBheVRvIjogIjB4MjA5NjkzQmM2YWZjMEM1MzI4YkEzNkZhRjAzQzUxNEVGMzEyMjg3QyIsCiAgIm1heFRpbWVvdXRTZWNvbmRzIjogNjAsCiAgImV4dHJhIjogewogICAgIm5hbWUiOiAiVVNEQyIsCiAgICAidmVyc2lvbiI6ICIyIgogIH0KfQo=\",\"terms_hash\":\"0807a8381ae18d7b917dee96c45ef4d652783b760f6ee82620cdbd1b21f2496a\"}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "terms_hash": "0807a8381ae18d7b917dee96c45ef4d652783b760f6ee82620cdbd1b21f2496a"
+    },
+    {
+      "canonical": "{\"aa_sorts_first\":\"esc\\\"ape\\\\é\",\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"ef0a58c627b7c4085b618ac01c8af6469926f1aed5cfe0bbd428487e26c3aa0c\",\"requirements\":\"eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=\",\"signature\":\"9442ac15f0591b57f4a20b30b9ef8736de9126752b8da916d491ed5fc5d2b24778e8a7cbff63f04823a6da253995926c8718def4888f45d911c998bf2c755e04\",\"terms_hash\":\"6357b741631aed2d027216a7b93c51c98188110c905f84438655469f9da2053c\",\"zz_future_field\":{\"nested\":[1,true,null]}}",
+      "name": "payment_quote_with_unknowns",
+      "object": "net.payment.quote@1",
+      "signature_hex": "9442ac15f0591b57f4a20b30b9ef8736de9126752b8da916d491ed5fc5d2b24778e8a7cbff63f04823a6da253995926c8718def4888f45d911c998bf2c755e04",
+      "signed_payload": "{\"aa_sorts_first\":\"esc\\\"ape\\\\é\",\"asset_registry\":{\"hash\":\"3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484\",\"version\":\"net-default-0\"},\"caller\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"capability\":\"fixture-provider/fixture-tool\",\"expires_at_ns\":1000060000000000,\"issued_at_ns\":1000000000000000,\"object\":\"net.payment.quote@1\",\"provider\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"quote_id\":\"ef0a58c627b7c4085b618ac01c8af6469926f1aed5cfe0bbd428487e26c3aa0c\",\"requirements\":\"eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=\",\"terms_hash\":\"6357b741631aed2d027216a7b93c51c98188110c905f84438655469f9da2053c\",\"zz_future_field\":{\"nested\":[1,true,null]}}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "canonical": "{\"assets\":[{\"decimals\":6,\"display_name\":\"Mock USD (test asset, no value)\",\"id\":\"mock:net/token:musd\",\"symbol\":\"MUSD\",\"x402_asset\":\"musd\"}],\"signature\":\"5f17b4d2a4c5a67bc1a3e00ddc4d063634c4a8be65d8e8ba5a8b25c61336de4a217ae80d0b435189c0bce9fed682a9d955cac2b59d22be237cee54669ffdd708\",\"signer\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"version\":\"net-default-0\"}",
+      "name": "asset_registry_default",
+      "object": "net.payment.asset_registry@1",
+      "registry_ref_hash": "3909471e66f329addd94d76d09fbb6913b121fdebc51fc83d8536609ee09e484",
+      "registry_ref_version": "net-default-0",
+      "signature_hex": "5f17b4d2a4c5a67bc1a3e00ddc4d063634c4a8be65d8e8ba5a8b25c61336de4a217ae80d0b435189c0bce9fed682a9d955cac2b59d22be237cee54669ffdd708",
+      "signed_payload": "{\"assets\":[{\"decimals\":6,\"display_name\":\"Mock USD (test asset, no value)\",\"id\":\"mock:net/token:musd\",\"symbol\":\"MUSD\",\"x402_asset\":\"musd\"}],\"signer\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"version\":\"net-default-0\"}",
+      "signer_hex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
+    },
+    {
+      "canonical": "{\"facilitator\":{\"endpoint\":\"mock\"},\"network\":\"eip155:84532\",\"object\":\"net.settlement.ref@1\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"settled_at_ns\":1000001500000000,\"settlement\":\"ewogICJzdWNjZXNzIjogdHJ1ZSwKICAicGF5ZXIiOiAiMHg4NTdiMDY1MTlFOTFlM0E1NDUzODc5MWJEYmIwRTIyMzczZTM2YjY2IiwKICAidHJhbnNhY3Rpb24iOiAiMHgxZDMxYzhjOGMyODNmOWU1YTc2NmE0MzYzYjNjZDZkMzRlZjJlYzg5YmNiZjRiM2MxYzliMzM4ZDllMDVkMTBmIiwKICAibmV0d29yayI6ICJlaXAxNTU6ODQ1MzIiLAogICJhbW91bnQiOiAiMTAwMDAiLAogICJleHRlbnNpb25zIjoge30KfQo=\",\"signature\":\"9b673a747f06c0de62b79b4aeb72aea19c2347c6b3427518cf868a1a3a1fc6cd1a156d936ee2d8d5a5c7ad0c581abb594671d69c929ff940568a94542663e603\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\"}",
+      "name": "settlement_ref_eip155",
+      "object": "net.settlement.ref@1",
+      "signature_hex": "9b673a747f06c0de62b79b4aeb72aea19c2347c6b3427518cf868a1a3a1fc6cd1a156d936ee2d8d5a5c7ad0c581abb594671d69c929ff940568a94542663e603",
+      "signed_payload": "{\"facilitator\":{\"endpoint\":\"mock\"},\"network\":\"eip155:84532\",\"object\":\"net.settlement.ref@1\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"settled_at_ns\":1000001500000000,\"settlement\":\"ewogICJzdWNjZXNzIjogdHJ1ZSwKICAicGF5ZXIiOiAiMHg4NTdiMDY1MTlFOTFlM0E1NDUzODc5MWJEYmIwRTIyMzczZTM2YjY2IiwKICAidHJhbnNhY3Rpb24iOiAiMHgxZDMxYzhjOGMyODNmOWU1YTc2NmE0MzYzYjNjZDZkMzRlZjJlYzg5YmNiZjRiM2MxYzliMzM4ZDllMDVkMTBmIiwKICAibmV0d29yayI6ICJlaXAxNTU6ODQ1MzIiLAogICJhbW91bnQiOiAiMTAwMDAiLAogICJleHRlbnNpb25zIjoge30KfQo=\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\"}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "canonical": "{\"checked_at_ns\":1000001000000000,\"object\":\"net.payment.verification@1\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"signature\":\"c33842280ec24d0b45876dd4894829ed28fed6ec811d53b6e3c269790a152c8ba4433d1c23826cb374ff951469b76307bad01118a5dcbd82ec94519d543eb901\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"status\":\"verified\",\"tier\":\"observed\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verifier\":{\"endpoint\":\"mock\"}}",
+      "chain_hash": "d6d715f2b01117ccb73c8399b500a3e557d517aded068e6f7675ba4fd96ed5eb",
+      "name": "verification_event_observed",
+      "object": "net.payment.verification@1",
+      "signature_hex": "c33842280ec24d0b45876dd4894829ed28fed6ec811d53b6e3c269790a152c8ba4433d1c23826cb374ff951469b76307bad01118a5dcbd82ec94519d543eb901",
+      "signed_payload": "{\"checked_at_ns\":1000001000000000,\"object\":\"net.payment.verification@1\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"status\":\"verified\",\"tier\":\"observed\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verifier\":{\"endpoint\":\"mock\"}}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "canonical": "{\"checked_at_ns\":1000001000000001,\"object\":\"net.payment.verification@1\",\"prev\":\"d6d715f2b01117ccb73c8399b500a3e557d517aded068e6f7675ba4fd96ed5eb\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"signature\":\"2efcebd1f5c57017e143d7e026fa2eb23d00cf36ab47e754416fa3c6210471266e41e76dd71a211a036c361af5045222c6400835af14ef5dabfa6de7e13fd208\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"status\":\"verified\",\"tier\":{\"confirmed\":1},\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verifier\":{\"endpoint\":\"mock\"}}",
+      "chain_hash": "df7c32260a0606938604e837b21ecb0fc05309bb370d3827b930977ffef73f69",
+      "name": "verification_event_confirmed",
+      "object": "net.payment.verification@1",
+      "signature_hex": "2efcebd1f5c57017e143d7e026fa2eb23d00cf36ab47e754416fa3c6210471266e41e76dd71a211a036c361af5045222c6400835af14ef5dabfa6de7e13fd208",
+      "signed_payload": "{\"checked_at_ns\":1000001000000001,\"object\":\"net.payment.verification@1\",\"prev\":\"d6d715f2b01117ccb73c8399b500a3e557d517aded068e6f7675ba4fd96ed5eb\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"signer\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"status\":\"verified\",\"tier\":{\"confirmed\":1},\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verifier\":{\"endpoint\":\"mock\"}}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "canonical": "{\"amount\":\"10000\",\"asset\":\"0x036CbD53842c5426634e7929541eC2318f3dCF7e\",\"billing_event_id\":\"1a468794801201da43c0cad1b21a0cf2cb2492b1f893fc168eb5104aefedf3de\",\"capability\":\"fixture-provider/fixture-tool\",\"idempotency_key\":\"74be81e6d4c3b98f2e59394e1ab180e351da1c40a8f32de5327608d40fde88e8\",\"network\":\"eip155:84532\",\"object\":\"net.billing.event@1\",\"occurred_at_ns\":1000002000000000,\"payee\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"payer\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"signature\":\"2c2d194701d1bc9cb6de4130099291eaccf06d75113f166d631ee4633deea58970fd8d1103ad9c6d3ddb8337d675b7b3c890ce606172e62c4ddc55b32cd72a0d\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verification_ref\":\"df7c32260a0606938604e837b21ecb0fc05309bb370d3827b930977ffef73f69\"}",
+      "idempotency_key": "74be81e6d4c3b98f2e59394e1ab180e351da1c40a8f32de5327608d40fde88e8",
+      "name": "billing_event",
+      "object": "net.billing.event@1",
+      "signature_hex": "2c2d194701d1bc9cb6de4130099291eaccf06d75113f166d631ee4633deea58970fd8d1103ad9c6d3ddb8337d675b7b3c890ce606172e62c4ddc55b32cd72a0d",
+      "signed_payload": "{\"amount\":\"10000\",\"asset\":\"0x036CbD53842c5426634e7929541eC2318f3dCF7e\",\"billing_event_id\":\"1a468794801201da43c0cad1b21a0cf2cb2492b1f893fc168eb5104aefedf3de\",\"capability\":\"fixture-provider/fixture-tool\",\"idempotency_key\":\"74be81e6d4c3b98f2e59394e1ab180e351da1c40a8f32de5327608d40fde88e8\",\"network\":\"eip155:84532\",\"object\":\"net.billing.event@1\",\"occurred_at_ns\":1000002000000000,\"payee\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"payer\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"quote_id\":\"4d98fbb3087654ab540f311381495d66e030fd7be84b7b1fd70e1b75c80fb524\",\"transaction\":\"0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f\",\"verification_ref\":\"df7c32260a0606938604e837b21ecb0fc05309bb370d3827b930977ffef73f69\"}",
+      "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    }
+  ],
+  "identities": {
+    "_note": "fixed test seeds, public fixture data — never reuse outside tests",
+    "caller_pub_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "caller_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "provider_pub_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "provider_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "registry_signer_pub_hex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+    "registry_signer_seed_hex": "0303030303030303030303030303030303030303030303030303030303030303"
+  },
+  "x402_byte_preservation": [
+    {
+      "base64": "ewogICJzY2hlbWUiOiAiZXhhY3QiLAogICJuZXR3b3JrIjogImVpcDE1NTo4NDUzMiIsCiAgImFtb3VudCI6ICIxMDAwMCIsCiAgImFzc2V0IjogIjB4MDM2Q2JENTM4NDJjNTQyNjYzNGU3OTI5NTQxZUMyMzE4ZjNkQ0Y3ZSIsCiAgInBheVRvIjogIjB4MjA5NjkzQmM2YWZjMEM1MzI4YkEzNkZhRjAzQzUxNEVGMzEyMjg3QyIsCiAgIm1heFRpbWVvdXRTZWNvbmRzIjogNjAsCiAgImV4dHJhIjogewogICAgIm5hbWUiOiAiVVNEQyIsCiAgICAidmVyc2lvbiI6ICIyIgogIH0KfQo=",
+      "embedded_in": "payment_quote_eip155",
+      "envelope_field": "requirements",
+      "file": "fixtures/x402/v2.0/payment_requirements.json",
+      "name": "payment_requirements_v2"
+    },
+    {
+      "base64": "ewogICJ4NDAyVmVyc2lvbiI6IDIsCiAgInJlc291cmNlIjogewogICAgInVybCI6ICJodHRwczovL2FwaS5leGFtcGxlLmNvbS9maXh0dXJlLXRvb2wiCiAgfSwKICAiYWNjZXB0ZWQiOiB7CiAgICAic2NoZW1lIjogImV4YWN0IiwKICAgICJuZXR3b3JrIjogImVpcDE1NTo4NDUzMiIsCiAgICAiYW1vdW50IjogIjEwMDAwIiwKICAgICJhc3NldCI6ICIweDAzNkNiRDUzODQyYzU0MjY2MzRlNzkyOTU0MWVDMjMxOGYzZENGN2UiLAogICAgInBheVRvIjogIjB4MjA5NjkzQmM2YWZjMEM1MzI4YkEzNkZhRjAzQzUxNEVGMzEyMjg3QyIsCiAgICAibWF4VGltZW91dFNlY29uZHMiOiA2MCwKICAgICJleHRyYSI6IHsKICAgICAgIm5hbWUiOiAiVVNEQyIsCiAgICAgICJ2ZXJzaW9uIjogIjIiCiAgICB9CiAgfSwKICAicGF5bG9hZCI6IHsKICAgICJzaWduYXR1cmUiOiAiMHgyZDZhNzU4OGQ2YWNjYTUwNWNiZjBkOWE0YTIyN2UwYzUyYzZjMzQwMDhjOGU4OTg2YTEyODMyNTk3NjQxNzM2MDhhMmNlNjQ5NjY0MmUzNzdkNmRhOGRiYmY1ODM2ZTliZDE1MDkyZjllY2FiMDVkZWQzZDYyOTNhZjE0OGI1NzFjIiwKICAgICJhdXRob3JpemF0aW9uIjogewogICAgICAiZnJvbSI6ICIweDg1N2IwNjUxOUU5MWUzQTU0NTM4NzkxYkRiYjBFMjIzNzNlMzZiNjYiLAogICAgICAidG8iOiAiMHgyMDk2OTNCYzZhZmMwQzUzMjhiQTM2RmFGMDNDNTE0RUYzMTIyODdDIiwKICAgICAgInZhbHVlIjogIjEwMDAwIiwKICAgICAgInZhbGlkQWZ0ZXIiOiAiMTc0MDY3MjA4OSIsCiAgICAgICJ2YWxpZEJlZm9yZSI6ICIxNzQwNjcyMTU0IiwKICAgICAgIm5vbmNlIjogIjB4ZjM3NDY2MTNjMmQ5MjBiNWZkYWJjMDg1NmYyYWViMmQ0Zjg4ZWU2MDM3YjhjYzVkMDRhNzFhNDQ2MmYxMzQ4MCIKICAgIH0KICB9LAogICJleHRlbnNpb25zIjoge30KfQo=",
+      "embedded_in": null,
+      "envelope_field": null,
+      "file": "fixtures/x402/v2.0/payment_payload.json",
+      "name": "payment_payload_v2"
+    },
+    {
+      "base64": "ewogICJzdWNjZXNzIjogdHJ1ZSwKICAicGF5ZXIiOiAiMHg4NTdiMDY1MTlFOTFlM0E1NDUzODc5MWJEYmIwRTIyMzczZTM2YjY2IiwKICAidHJhbnNhY3Rpb24iOiAiMHgxZDMxYzhjOGMyODNmOWU1YTc2NmE0MzYzYjNjZDZkMzRlZjJlYzg5YmNiZjRiM2MxYzliMzM4ZDllMDVkMTBmIiwKICAibmV0d29yayI6ICJlaXAxNTU6ODQ1MzIiLAogICJhbW91bnQiOiAiMTAwMDAiLAogICJleHRlbnNpb25zIjoge30KfQo=",
+      "embedded_in": "settlement_ref_eip155",
+      "envelope_field": "settlement",
+      "file": "fixtures/x402/v2.0/settlement_response.json",
+      "name": "settlement_response_v2"
+    }
+  ],
+  "x402_spec_pin": "x402-foundation/x402 specs/x402-specification-v2.md @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
+}

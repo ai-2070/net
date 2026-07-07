@@ -410,6 +410,9 @@ pub unsafe extern "C" fn net_mcp_lower_tool(
                 server_version: server_version.to_string(),
                 credential_status,
                 substitutability,
+                // Pricing attaches through `publish_server` opts (the
+                // wrap session), not this per-tool lowering helper.
+                pricing: std::collections::BTreeMap::new(),
             },
         );
         let descriptor = match serde_json::to_value(&lowered.descriptor) {

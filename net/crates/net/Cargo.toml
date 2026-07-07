@@ -3,6 +3,7 @@ members = [
     ".",
     "sdk",
     "sdk-macros",
+    "payments",
     "deck",
     "cli",
     "adapters/mcp",

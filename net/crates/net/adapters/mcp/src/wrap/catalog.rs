@@ -124,6 +124,7 @@ fn to_bridged_tool_info(lt: &LoweredTool) -> Result<BridgedToolInfo, CatalogErro
         substitutability: meta(substitutability_key(id)),
         visibility: meta(visibility_key(id)),
         invocation_scope: meta(invocation_scope_key(id)),
+        pricing_terms: d.pricing_terms.clone(),
     })
 }
 
@@ -226,6 +227,7 @@ mod tests {
                 server_version: "2.0.0".to_string(),
                 credential_status: cred,
                 substitutability: Substitutability::ProviderLocal,
+                pricing: std::collections::BTreeMap::new(),
             },
         )
     }
