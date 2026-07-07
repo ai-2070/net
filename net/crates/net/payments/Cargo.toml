@@ -70,7 +70,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # (`unsafe-dev-signer`). Production signing is external; these never
 # compile into a default build.
 k256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
-sha3 = { version = "0.10", optional = true }
+sha3 = { version = "0.12", optional = true }
 tracing = "0.1"
 
 [features]
