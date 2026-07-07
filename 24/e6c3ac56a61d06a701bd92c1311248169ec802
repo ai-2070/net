@@ -1,0 +1,35 @@
+net/crates/net/payments/src/engine/mod.rs
+  s_2ce1bbf7d954a5::t_4353f46c2331dc 681-689,695-699,709,723-727,737,755
+  s_2ce1bbf7d954a5::t_3d6b4b142414ae 1096-1102,1114-1121
+  s_2ce1bbf7d954a5::t_c3809c2fb73064 587-595
+net/crates/net/payments/src/checker/mod.rs
+  s_2ce1bbf7d954a5::t_1277bdcc6d2b88 21-22
+net/crates/net/payments/src/checker/svm.rs
+  s_2ce1bbf7d954a5::t_5482050ef9a7ba 1-354
+net/crates/net/payments/tests/svm_checker.rs
+  s_2ce1bbf7d954a5::t_9de6ee84031d68 1-21,24-369
+  s_2ce1bbf7d954a5::t_58d6aea395e69f 22-23
+net/crates/net/payments/src/facilitator/packs.rs
+  s_2ce1bbf7d954a5::t_7acb2bf2212302 113-118,130-134
+  s_2ce1bbf7d954a5::t_a64c2358b94b07 48-51
+  s_2ce1bbf7d954a5::t_f4a7cf38192ad2 212-214,239,241-244
+net/crates/net/payments/tests/checker_verification.rs
+  s_2ce1bbf7d954a5::t_1b7f0c73afc3ae 375-483,488-502,507-515
+  s_2ce1bbf7d954a5::t_58d6aea395e69f 484-487,503-506
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "24e6c3ac56a61d06a701bd92c1311248169ec802",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
