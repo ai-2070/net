@@ -65,7 +65,7 @@ parking_lot = "0.12"
 # HTTP client for the real-facilitator boundary (`http-facilitator`).
 # rustls, no default features: no openssl, no cookies, no proxies from
 # env — the money path gets exactly the transport it needs.
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls-tls"] }
 # secp256k1 ECDSA + keccak256, for the DEV signer only
 # (`unsafe-dev-signer`). Production signing is external; these never
 # compile into a default build.
