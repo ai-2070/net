@@ -87,6 +87,20 @@ fn build_delegation(
     }
 }
 
+/// Validate + unbind the payment-signer callable at construction, so a
+/// non-callable fails here with a clear error instead of on the first
+/// paid invoke.
+fn unbind_signer(signer: Option<Bound<'_, PyAny>>) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+    match signer {
+        Some(callable) if callable.is_callable() => Ok(Some(callable.unbind())),
+        Some(_) => Err(PyValueError::new_err(
+            "payment_signer must be callable: (typed_data_json: str) -> str \
+             (the 0x-hex EIP-712 signature)",
+        )),
+        None => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared marshaling helpers
 // ---------------------------------------------------------------------------
@@ -131,6 +145,7 @@ fn detail_to_json(d: &CapabilityDetail, requires_approval: bool) -> String {
         "substitutability": d.substitutability,
         "version": d.version,
         "requires_approval": requires_approval,
+        "pricing_terms": d.pricing_terms,
     })
     .to_string()
 }
@@ -160,6 +175,21 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
                 id.display(),
                 id.display(),
             ),
+        }),
+        // The payment-gate mirror of `requires_approval` — passed through
+        // untouched (doctrine #1: the decision came from the Rust spend
+        // engine; this arm only names the fields). Approval resolves
+        // through the SDK consent API; the shared store holds the decision.
+        GatedOutcome::RequiresPaymentApproval {
+            quote_id,
+            policy_reason,
+            approve_hint,
+        } => json!({
+            "status": "requires_payment_approval",
+            "cap_id": id.display(),
+            "quote_id": quote_id,
+            "policy_reason": policy_reason,
+            "approve_hint": approve_hint,
         }),
         GatedOutcome::Failed(e) => json!({
             "status": gateway_status(&e),
@@ -225,11 +255,14 @@ async fn do_invoke(
     gateway: &MeshGateway,
     consent: &ConsentPolicy,
     pin_path: &Option<PathBuf>,
+    payment: Option<&dyn net_mcp::serve::PaymentFlow>,
     id: CapabilityId,
     args: Value,
 ) -> String {
     let pins = load_pins(pin_path).await;
-    let outcome = gated_invoke(gateway, consent, pins.as_ref(), &id, args).await;
+    // With no payment flow configured, a paid capability fails closed with
+    // a structured `denied` (never a silent unpaid serve).
+    let outcome = gated_invoke(gateway, consent, pins.as_ref(), payment, &id, args).await;
     outcome_to_json(&id, outcome)
 }
 
@@ -246,8 +279,72 @@ struct GatewayState {
     consent: Arc<ConsentPolicy>,
     /// The machine-shared pin store path, reloaded fresh per call.
     pin_store_path: Option<PathBuf>,
+    /// The caller-side payment flow for paid capabilities (`payments`
+    /// build feature + payment kwargs). `None` = paid capabilities fail
+    /// closed at the gate, per doctrine.
+    payment: Option<Arc<dyn net_mcp::serve::PaymentFlow>>,
     /// The mesh's own runtime — where the node's socket + timers live.
     runtime: Arc<Runtime>,
+}
+
+/// Payment kwargs, collected before the cfg boundary so both gateway
+/// constructors share the validation.
+///
+/// Without the `payments` build feature the fields are written by
+/// `collect` (so validation stays identical across builds) but only the
+/// feature-gated `build_payment_flow` reads them — hence the targeted
+/// dead-code allow; `-D warnings` still guards every other lint.
+#[cfg_attr(not(feature = "payments"), allow(dead_code))]
+struct PaymentConfig {
+    policy_path: String,
+    profile: String,
+    unsafe_mock_auto_allow: bool,
+    /// The settlement signer *reference*: the payer address plus a
+    /// Python callable `(typed_data_json: str) -> str` that forwards
+    /// the EIP-712 document to the host's wallet / KMS and returns
+    /// the 0x-hex signature. Only the typed document and the
+    /// signature ever cross the language boundary — key material
+    /// remains unrepresentable here (doctrine 4/7/8).
+    signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+}
+
+impl PaymentConfig {
+    fn collect(
+        payment_policy_path: Option<String>,
+        payment_profile: Option<String>,
+        payment_unsafe_mock_auto_allow: bool,
+        payment_signer_address: Option<String>,
+        payment_signer: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> PyResult<Option<Self>> {
+        let signer = match (payment_signer_address, payment_signer) {
+            (Some(address), Some(callable)) => Some((address, callable)),
+            (None, None) => None,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "payment_signer and payment_signer_address must be provided together \
+                     (the address names the payer; the callable signs its typed data)",
+                ))
+            }
+        };
+        match payment_policy_path {
+            Some(policy_path) => Ok(Some(Self {
+                policy_path,
+                profile: payment_profile.unwrap_or_else(|| "production".to_string()),
+                unsafe_mock_auto_allow: payment_unsafe_mock_auto_allow,
+                signer,
+            })),
+            None if payment_profile.is_some()
+                || payment_unsafe_mock_auto_allow
+                || signer.is_some() =>
+            {
+                Err(PyValueError::new_err(
+                    "payment_profile / payment_unsafe_mock_auto_allow / payment_signer \
+                     require payment_policy_path (the shared spend-policy store)",
+                ))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl GatewayState {
@@ -255,14 +352,15 @@ impl GatewayState {
         mesh: &crate::mesh_bindings::NetMesh,
         pin_store_path: Option<String>,
         delegation: Option<(SdkIdentity, Vec<u8>)>,
+        payment_config: Option<PaymentConfig>,
     ) -> PyResult<Self> {
         // Mirror `DaemonRuntime`: reuse the live node + its runtime so the
         // gateway drives mesh I/O on the same scheduler the node runs on.
         let node = mesh.node_arc_clone()?;
         let channel_configs = mesh.channel_configs_arc();
         let runtime = mesh.runtime_arc();
-        let sdk_mesh = SdkMesh::from_node_arc(node, channel_configs, None);
-        let mut gateway = MeshGateway::new(Arc::new(sdk_mesh));
+        let sdk_mesh = Arc::new(SdkMesh::from_node_arc(node, channel_configs, None));
+        let mut gateway = MeshGateway::new(sdk_mesh.clone());
         if let Some((leaf, chain_bytes)) = delegation {
             // Phase 3 Slice B2: sign + attach the delegation chain on every
             // invoke, so a provider running a `DelegationGate` admits by
@@ -270,12 +368,122 @@ impl GatewayState {
             // audits this gateway's leaf.
             gateway = gateway.with_delegation(Arc::new(DelegationSigner::new(leaf, chain_bytes)));
         }
+        let payment = build_payment_flow(sdk_mesh, payment_config)?;
         Ok(Self {
             gateway: Arc::new(gateway),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
+            payment,
             runtime,
         })
+    }
+}
+
+/// Build the caller payment flow from the payment kwargs (doctrine #1:
+/// zero decisions here — the flow and spend engine own them; this maps
+/// config strings to constructors).
+///
+/// The payment identity **is the node's mesh identity**: quotes are
+/// issued to, spend is tracked against, and invocation bindings are
+/// signed by the same ed25519 identity peers see on the mesh. The
+/// keypair is borrowed in-process from the node — nothing crosses the
+/// language boundary.
+#[cfg(feature = "payments")]
+fn build_payment_flow(
+    mesh: Arc<SdkMesh>,
+    config: Option<PaymentConfig>,
+) -> PyResult<Option<Arc<dyn net_mcp::serve::PaymentFlow>>> {
+    use net_payments::flow::mesh::MeshPaymentChannel;
+    use net_payments::flow::{CallerPaymentFlow, SystemClock};
+    use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
+
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let profile = match config.profile.as_str() {
+        "production" => SpendProfile::Production,
+        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown payment_profile {other:?} (expected \"production\" or \"dev_test\")"
+            )))
+        }
+    };
+    let caller = Arc::new(mesh.entity_keypair().clone());
+    // The v1 default registry (mock + the survey networks). A superset
+    // of P0's mock-only default: real networks stay unspendable until
+    // the operator lists them in the spend policy's `allowed_networks`
+    // AND configures a signer — the registry is the asset allowlist,
+    // never the enablement switch.
+    let registry = net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
+    let spend = SpendPolicyEngine::new(&config.policy_path, profile)
+        .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
+    let mut flow = CallerPaymentFlow::new(
+        caller,
+        spend,
+        registry,
+        Arc::new(MeshPaymentChannel::new(mesh)),
+        Arc::new(SystemClock),
+    );
+    if let Some((address, callable)) = config.signer {
+        flow = flow.with_signer("eip155", python_external_signer(address, callable));
+    }
+    Ok(Some(Arc::new(flow)))
+}
+
+/// Bridge a Python signing callable into the payments
+/// [`ExternalSigner`](net_payments::flow::signer::ExternalSigner) shape.
+///
+/// The callable receives the full `eth_signTypedData_v4` document as a
+/// JSON string — a policy-bearing wallet can inspect the amount and
+/// recipient it is authorizing — and returns the 65-byte `r‖s‖v`
+/// signature as `0x…` hex. There is no raw-bytes path: the *only* thing
+/// this surface can ask Python to sign is a logged, typed transfer
+/// authorization ("no arbitrary signing oracle"). Invoked via
+/// `spawn_blocking` + `Python::attach` (the blob-store FFI pattern) so
+/// GIL acquisition never stalls the mesh reactor.
+#[cfg(feature = "payments")]
+fn python_external_signer(
+    address: String,
+    callable: pyo3::Py<pyo3::PyAny>,
+) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
+    use net_payments::flow::signer::{ExternalSigner, SignerError};
+
+    let callable = Arc::new(callable);
+    Arc::new(ExternalSigner::new(address, move |typed| {
+        let callable = callable.clone();
+        Box::pin(async move {
+            let typed_json = typed.to_string();
+            let signed = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<String, String> {
+                    let out = callable
+                        .bind(py)
+                        .call1((typed_json,))
+                        .map_err(|e| format!("payment signer raised: {e}"))?;
+                    out.extract::<String>().map_err(|e| {
+                        format!("payment signer must return the 0x-hex signature string: {e}")
+                    })
+                })
+            })
+            .await
+            .map_err(|e| SignerError::new(format!("payment signer task: {e}")))?;
+            signed.map_err(SignerError::new)
+        })
+    }))
+}
+
+/// Without the `payments` build feature, payment kwargs are a loud
+/// config error — never a silently free paid capability.
+#[cfg(not(feature = "payments"))]
+fn build_payment_flow(
+    _mesh: Arc<SdkMesh>,
+    config: Option<PaymentConfig>,
+) -> PyResult<Option<Arc<dyn net_mcp::serve::PaymentFlow>>> {
+    match config {
+        Some(_) => Err(PyValueError::new_err(
+            "this build lacks the `payments` feature; payment_policy_path is unavailable",
+        )),
+        None => Ok(None),
     }
 }
 
@@ -346,16 +554,29 @@ pub struct PyCapabilityGateway {
 #[pymethods]
 impl PyCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
         pin_store_path: Option<String>,
         delegation_leaf: Option<&crate::identity::Identity>,
         delegation_chain: Option<Vec<u8>>,
+        payment_policy_path: Option<String>,
+        payment_profile: Option<String>,
+        payment_unsafe_mock_auto_allow: bool,
+        payment_signer_address: Option<String>,
+        payment_signer: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
+        let payment = PaymentConfig::collect(
+            payment_policy_path,
+            payment_profile,
+            payment_unsafe_mock_auto_allow,
+            payment_signer_address,
+            unbind_signer(payment_signer)?,
+        )?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path, delegation)?,
+            state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
         })
     }
 
@@ -419,7 +640,14 @@ impl PyCapabilityGateway {
         let h = self.state.handles();
         let runtime = self.state.runtime.clone();
         py.detach(move || {
-            runtime.block_on(do_invoke(&h.gateway, &h.consent, &h.pin_path, id, args))
+            runtime.block_on(do_invoke(
+                &h.gateway,
+                &h.consent,
+                &h.pin_path,
+                h.payment.as_deref(),
+                id,
+                args,
+            ))
         })
     }
 
@@ -444,16 +672,29 @@ pub struct PyAsyncCapabilityGateway {
 #[pymethods]
 impl PyAsyncCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
         pin_store_path: Option<String>,
         delegation_leaf: Option<&crate::identity::Identity>,
         delegation_chain: Option<Vec<u8>>,
+        payment_policy_path: Option<String>,
+        payment_profile: Option<String>,
+        payment_unsafe_mock_auto_allow: bool,
+        payment_signer_address: Option<String>,
+        payment_signer: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
+        let payment = PaymentConfig::collect(
+            payment_policy_path,
+            payment_profile,
+            payment_unsafe_mock_auto_allow,
+            payment_signer_address,
+            unbind_signer(payment_signer)?,
+        )?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path, delegation)?,
+            state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
         })
     }
 
@@ -516,10 +757,17 @@ impl PyAsyncCapabilityGateway {
             }
         };
         let h = self.state.handles();
-        let join = self
-            .state
-            .runtime
-            .spawn(async move { do_invoke(&h.gateway, &h.consent, &h.pin_path, id, args).await });
+        let join = self.state.runtime.spawn(async move {
+            do_invoke(
+                &h.gateway,
+                &h.consent,
+                &h.pin_path,
+                h.payment.as_deref(),
+                id,
+                args,
+            )
+            .await
+        });
         spawn_bridge(py, join)
     }
 
@@ -534,6 +782,7 @@ struct GatewayHandles {
     gateway: Arc<MeshGateway>,
     consent: Arc<ConsentPolicy>,
     pin_path: Option<PathBuf>,
+    payment: Option<Arc<dyn net_mcp::serve::PaymentFlow>>,
 }
 
 impl GatewayState {
@@ -542,6 +791,7 @@ impl GatewayState {
             gateway: self.gateway.clone(),
             consent: self.consent.clone(),
             pin_path: self.pin_store_path.clone(),
+            payment: self.payment.clone(),
         }
     }
 
@@ -550,5 +800,70 @@ impl GatewayState {
             Some(p) => format!("{name}(pin_store={:?})", p.display()),
             None => format!("{name}(pin_store=None)"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract tests — the structured-JSON passthrough is the binding's whole
+// job, so its shape is pinned here (the Python-level twin lives in
+// tests/test_capability_gateway.py).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The payment gate's structured error passes through untouched:
+    /// same fields the Rust spend engine produced, plus the status
+    /// discriminant and the capability id — nothing re-decided here.
+    #[test]
+    fn requires_payment_approval_passes_through_untouched() {
+        let id = CapabilityId::parse("42/fixture-tool").unwrap();
+        let json = outcome_to_json(
+            &id,
+            GatedOutcome::RequiresPaymentApproval {
+                quote_id: "q-77".to_string(),
+                policy_reason: "amount 2500 exceeds max_per_call 1000".to_string(),
+                approve_hint: "approve quote q-77 via the payments consent API".to_string(),
+            },
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "requires_payment_approval");
+        assert_eq!(v["cap_id"], "42/fixture-tool");
+        assert_eq!(v["quote_id"], "q-77");
+        assert_eq!(v["policy_reason"], "amount 2500 exceeds max_per_call 1000");
+        assert_eq!(
+            v["approve_hint"],
+            "approve quote q-77 via the payments consent API"
+        );
+    }
+
+    /// Payment kwargs are validated before any mesh state exists:
+    /// profile/unsafe/signer without a policy path is a config error,
+    /// and a signer address without its callable is incomplete. (The
+    /// callable-present arms need a live interpreter and are covered
+    /// by the pytest twin.)
+    #[test]
+    fn payment_kwargs_require_the_policy_path() {
+        assert!(PaymentConfig::collect(None, None, false, None, None)
+            .unwrap()
+            .is_none());
+        assert!(PaymentConfig::collect(None, Some("dev_test".into()), false, None, None).is_err());
+        assert!(PaymentConfig::collect(None, None, true, None, None).is_err());
+        // A signer reference is half of a pair: address alone is a
+        // caller error even with a policy path present.
+        assert!(PaymentConfig::collect(
+            Some("/tmp/p.json".into()),
+            None,
+            false,
+            Some("0xpayer".into()),
+            None
+        )
+        .is_err());
+        let c = PaymentConfig::collect(Some("/tmp/p.json".into()), None, false, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.profile, "production", "fail-closed default profile");
+        assert!(c.signer.is_none());
     }
 }

@@ -93,6 +93,13 @@ export interface ToolDescriptor {
   streaming: boolean
   /** Free-form host-attached tags (e.g. `["web", "research"]`). */
   tags: string[]
+  /**
+   * `net.pricing.terms@1` envelope as canonical JSON when the tool is
+   * paid. Opaque to the binding (payment semantics live in
+   * `@net-mesh/payments`); absent = free. Displaying a price never
+   * implies authorization to spend it.
+   */
+  pricingTerms?: string
   /** How many nodes currently serve this `(toolId, version)`. */
   nodeCount: number
 }

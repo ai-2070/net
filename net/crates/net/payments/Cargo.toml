@@ -1,0 +1,107 @@
+[package]
+name = "net-payments"
+version = "0.31.0"
+edition = "2021"
+description = "x402-native payments layer for the Net mesh: signed envelopes around x402 v2, tiered verification, spend policy, billing events"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+keywords = ["x402", "payments", "mesh", "caip"]
+categories = ["network-programming", "cryptography"]
+
+[lib]
+name = "net_payments"
+
+[lints.clippy]
+# Same panic-hygiene posture as the core crate (see the root
+# Cargo.toml for the warn-vs-deny rationale — CI enforces deny on
+# lib/bins, tests keep unwrap).
+unwrap_used                   = "warn"
+expect_used                   = "warn"
+undocumented_unsafe_blocks    = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+[dependencies]
+# Dependency direction is doctrine: net-payments depends on the core
+# and the SDK; the core and SDK NEVER depend on net-payments. The
+# substrate stays clean for apps that never touch money.
+#
+# `net` (feature "net") supplies the identity surface payment
+# envelopes sign with: `EntityKeypair` / `EntityId` (ed25519,
+# verify_strict). Provider identity on a quote IS the mesh entity
+# identity — x402 wallet identity is a payment credential, not a
+# participant identity.
+net = { package = "net-mesh", version = "0.31.0", path = "..", default-features = false, features = ["net"] }
+# The SDK supplies the consent/pins vocabulary the payment policy
+# store mirrors (`CapabilityId`, the locked-store pattern) and is the
+# surface WS4 composes against (gateway / publish options).
+net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../sdk", default-features = false }
+# The MCP demand-side gate seam (`net_mcp::serve::PaymentFlow`).
+# Optional, behind `mcp-gate`: only payment-aware gateway hosts (the
+# Python binding, agent runtimes) pull the adapter; the payments core
+# stays adapter-free. The adapter never depends back on this crate.
+net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../adapters/mcp", optional = true }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+# x402 carries are byte-preserved originals; envelopes transport them
+# base64-encoded so no binding can accidentally re-serialize JSON
+# through its own encoder (the envelope-drift bug class).
+base64 = "0.22"
+# terms_hash / verification-chain links / idempotency keys — blake3
+# is the established content hash in this workspace (dataforts,
+# delegation child-seed KDF).
+blake3 = "1"
+hex = "0.4"
+# Cross-process advisory lock + per-user path resolution for the
+# payment policy store — the exact `sdk/src/pins.rs` regime.
+fs2 = "0.4"
+dirs = "6"
+tokio = { version = "1", features = ["rt", "time", "sync", "fs"] }
+async-trait = "0.1"
+# Workspace lock discipline (clippy disallowed-methods bans
+# std::sync::Mutex::lock — poisoning is unhandled everywhere here).
+parking_lot = "0.12"
+# HTTP client for the real-facilitator boundary (`http-facilitator`).
+# rustls, no default features: no openssl, no cookies, no proxies from
+# env — the money path gets exactly the transport it needs.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+# secp256k1 ECDSA + keccak256, for the DEV signer only
+# (`unsafe-dev-signer`). Production signing is external; these never
+# compile into a default build.
+k256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.12", optional = true }
+tracing = "0.1"
+
+[features]
+# Implements `net_mcp::serve::PaymentFlow` for the caller flow, so the
+# gated-invoke composition can clear paid capabilities through this
+# crate's spend engine + lifecycle. Off by default — payments users who
+# never touch the MCP gateway don't pay the adapter's build cost.
+mcp-gate = ["dep:net-mcp"]
+# The mesh wire for the payment lifecycle: `serve_payments` (provider
+# side, nRPC quote/pay services over PaymentEngine) +
+# `MeshPaymentChannel` (caller side, the ProviderChannel that crosses
+# machines). Off by default — pulls the SDK's mesh transport + typed
+# nRPC surface.
+mesh = ["net-sdk/net", "net-sdk/cortex"]
+# The real-facilitator HTTP client (P1): `HttpFacilitator` speaking
+# `POST /verify`, `POST /settle`, `GET /supported` per the pinned x402
+# v2 spec. The first (and only) HTTP dependency in the money path —
+# rustls only, feature-gated so mock-only consumers never build it.
+http-facilitator = ["dep:reqwest"]
+# DEV/TESTNET ONLY: a local-key EIP-712 signer for conformance runs.
+# The name is the warning — production settlement signing goes through
+# `ExternalSigner` (KMS/wallet/MPC; the key never enters Net memory).
+# Never in default features, never in release binding builds; doctrine
+# 4/7/8 (non-custodial, keys never cross boundaries, no signing
+# oracle) is why this is a feature and not a constructor.
+unsafe-dev-signer = ["dep:k256", "dep:sha3"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tempfile = "3"
+# The mesh e2e test builds real two-node meshes (MeshBuilder + typed
+# nRPC); tests can't reach transitive deps, so the SDK appears here
+# with the transport features on.
+net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../sdk", default-features = false, features = ["net", "cortex"] }

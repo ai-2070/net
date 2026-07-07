@@ -79,6 +79,30 @@ pub enum WrapError {
     /// describe catalog.
     #[error("describe catalog build failed: {0}")]
     Catalog(#[from] super::catalog::CatalogError),
+    /// The config prices one or more tools but provides no payment
+    /// admission gate. Rejected before anything serves — a priced tool
+    /// that can't verify payment must never be reachable.
+    #[error(
+        "config prices {count} tool(s) but has no payment_admission gate — a priced tool \
+         cannot serve without payment verification"
+    )]
+    PricedWithoutPaymentGate {
+        /// How many tools the config prices.
+        count: usize,
+    },
+    /// One or more `pricing` keys did not match any discovered tool name.
+    /// Rejected before anything serves — an unmatched key (a typo, a
+    /// since-renamed tool, or the sanitized channel id used instead of the
+    /// tool's own name) means the tool it was meant to price would publish
+    /// for free, silently.
+    #[error(
+        "pricing keys matched no discovered tool: {keys:?} — price a tool by its \
+         wrapped name (not its sanitized channel id), and check for typos/renames"
+    )]
+    PricingKeyUnmatched {
+        /// The pricing keys that matched no discovered tool.
+        keys: Vec<String>,
+    },
     /// A publish/refresh step failed AND the rollback re-announce that would
     /// restore a consistent mesh state also failed — the node may be left
     /// advertising tools with no live handler. Both errors are surfaced so the
@@ -172,8 +196,9 @@ pub fn build_capability_set<'a>(
 /// Configuration for a publication: the credential-classification overrides
 /// and the substitutability the operator declared, plus who may invoke.
 ///
-/// `Debug` is hand-written (not derived) so [`InvokePolicy`] impls need not be
-/// `Debug` — a policy may wrap genuinely opaque state (e.g. a host callback).
+/// `Debug` is hand-written (not derived): [`InvokePolicy`] and
+/// [`crate::serve::payment::PaymentAdmission`] impls need not be `Debug` —
+/// both may wrap genuinely opaque state (a host callback, a payment engine).
 #[derive(Clone)]
 pub struct WrapConfig {
     /// How this server identifies itself to the wrapped MCP server.
@@ -198,6 +223,19 @@ pub struct WrapConfig {
     /// mesh adds reach, not authority. Flipping to an allowlist or a
     /// dangerous-tool approval policy is setting this field, not new plumbing.
     pub policy: Option<Arc<dyn InvokePolicy>>,
+    /// Pricing terms per wrapped tool, keyed by MCP tool name. Values
+    /// are `net.pricing.terms@1` canonical JSON (author with
+    /// `net-payments`; the bridge carries them opaquely). Same publish
+    /// option the native `serve_tool` path exposes — a paid capability
+    /// is metadata + invocation policy, not a different kind of tool.
+    /// Empty (the default) publishes every tool as free.
+    pub pricing: std::collections::BTreeMap<String, String>,
+    /// The provider's payment admission gate — redeems each paid invoke's
+    /// quote against the payment engine before the wrapped tool runs.
+    /// Required whenever `pricing` is non-empty: publishing a priced tool
+    /// with no gate is rejected at publish time (a priced tool that
+    /// can't verify payment must never serve).
+    pub payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
 }
 
 impl std::fmt::Debug for WrapConfig {
@@ -209,8 +247,14 @@ impl std::fmt::Debug for WrapConfig {
             .field("credential_override", &self.credential_override)
             .field("force", &self.force)
             .field("substitutability", &self.substitutability)
-            // The policy is opaque (not `Debug`); show only its presence.
+            // The policy / payment gates are opaque (not `Debug`); show only
+            // their presence.
             .field("policy", &self.policy.as_ref().map(|_| "<policy>"))
+            .field("pricing", &self.pricing)
+            .field(
+                "payment_admission",
+                &self.payment_admission.as_ref().map(|_| "PaymentAdmission"),
+            )
             .finish()
     }
 }
@@ -227,6 +271,8 @@ impl WrapConfig {
             force: false,
             substitutability: Substitutability::ProviderLocal,
             policy: None,
+            pricing: std::collections::BTreeMap::new(),
+            payment_admission: None,
         }
     }
 }
@@ -393,6 +439,14 @@ impl ServerPublisher {
     ) -> Result<PublicationHandle, WrapError> {
         // Classify BEFORE spawning: an invalid override (e.g. downward without
         // --force) should fail fast without starting a process.
+        // Priced tools demand a payment gate before anything spawns or
+        // announces — a config that can't verify payment never serves.
+        if !config.pricing.is_empty() && config.payment_admission.is_none() {
+            return Err(WrapError::PricedWithoutPaymentGate {
+                count: config.pricing.len(),
+            });
+        }
+
         let credential_status = classify(
             &WrapEnv {
                 program,
@@ -412,8 +466,30 @@ impl ServerPublisher {
             server_version: init.server_info.version,
             credential_status,
             substitutability: config.substitutability,
+            pricing: config.pricing.clone(),
         };
         let (lowered, skipped) = discover_and_lower(&client, &ctx).await?;
+
+        // Every pricing key must have matched a discovered+lowered tool.
+        // `lower_tool` looks pricing up by the tool's wrapped name and the
+        // publish-time guard only checks "pricing non-empty => a gate
+        // exists" — nothing catches a key that matched no tool. Left
+        // unchecked, such a key is silently ignored and the tool it was
+        // meant to price lowers free (`pricing_terms=None`) and serves to
+        // every caller. Fail closed before anything announces or serves.
+        if !config.pricing.is_empty() {
+            let priced: std::collections::BTreeSet<&str> =
+                lowered.iter().map(|lt| lt.mcp_name.as_str()).collect();
+            let unmatched: Vec<String> = config
+                .pricing
+                .keys()
+                .filter(|k| !priced.contains(k.as_str()))
+                .cloned()
+                .collect();
+            if !unmatched.is_empty() {
+                return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
+            }
+        }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -458,7 +534,11 @@ impl ServerPublisher {
             )
             .with_service(tool_id.clone())
             .with_delegation(config.delegation.clone())
-            .with_policy(config.policy.clone());
+            .with_policy(config.policy.clone())
+            .with_payment(
+                lt.descriptor.pricing_terms.is_some(),
+                config.payment_admission.clone(),
+            );
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -488,6 +568,7 @@ impl ServerPublisher {
             scope: config.scope,
             delegation: config.delegation,
             policy: config.policy,
+            payment_admission: config.payment_admission,
             tools,
             skipped,
             registration: Registration {
@@ -665,6 +746,9 @@ pub struct PublicationHandle {
     /// Invoke-path policy reused when serving tools that appear on refresh, so
     /// a refreshed tool enforces the same policy as the initial publish.
     policy: Option<Arc<dyn InvokePolicy>>,
+    /// Payment admission gate reused likewise — a tool that appears priced
+    /// on refresh enforces the same payment policy as the initial publish.
+    payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// MCP tool names skipped because they have no usable id (an empty name).
@@ -752,7 +836,11 @@ impl PublicationHandle {
                 )
                 .with_service(tool_id.clone())
                 .with_delegation(self.delegation.clone())
-                .with_policy(self.policy.clone());
+                .with_policy(self.policy.clone())
+                .with_payment(
+                    lt.descriptor.pricing_terms.is_some(),
+                    self.payment_admission.clone(),
+                );
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);
@@ -1013,6 +1101,7 @@ mod tests {
             server_version: "1.0.0".to_string(),
             credential_status: super::super::CredentialStatus::Unknown,
             substitutability: Substitutability::ProviderLocal,
+            pricing: std::collections::BTreeMap::new(),
         };
         names
             .iter()
@@ -1226,6 +1315,7 @@ mod tests {
             server_version: "1.0.0".to_string(),
             credential_status: super::super::CredentialStatus::Credentialed,
             substitutability: Substitutability::ProviderLocal,
+            pricing: std::collections::BTreeMap::new(),
         };
         let caps = build_capability_set(&[lower_tool(&tool("secretive", "uses a token"), &ctx)]);
         // The credential_status value is a fixed classification label.

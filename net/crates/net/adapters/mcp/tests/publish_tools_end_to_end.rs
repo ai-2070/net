@@ -101,6 +101,7 @@ fn ctx() -> LoweringContext {
         server_version: "hermes-1.0".to_string(),
         credential_status: CredentialStatus::None,
         substitutability: Substitutability::ProviderLocal,
+        pricing: Default::default(),
     }
 }
 

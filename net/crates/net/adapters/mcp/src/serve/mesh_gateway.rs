@@ -45,7 +45,8 @@ use crate::bridge::{
 };
 use crate::spec::CallToolResult;
 use crate::wrap::invoke::{
-    ERR_BAD_REQUEST, ERR_DELEGATION, ERR_OWNER_SCOPE, ERR_POLICY, ERR_TOOL, ERR_UPSTREAM,
+    ERR_BAD_REQUEST, ERR_DELEGATION, ERR_OWNER_SCOPE, ERR_PAYMENT, ERR_POLICY, ERR_TOOL,
+    ERR_UPSTREAM,
 };
 use crate::wrap::DelegationSigner;
 
@@ -187,6 +188,12 @@ impl MeshGateway {
     /// answer. `retriable` differs by call idempotency: a describe (idempotent)
     /// retries any transient error; a non-idempotent invoke only retries errors
     /// that prove the call never executed (see [`retriable_send_safe`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private call-plumbing helper with exactly one caller per parameter \
+                  combination; a params struct would name-launder the same eight values \
+                  without making any call site clearer"
+    )]
     async fn call_retry(
         &self,
         node: u64,
@@ -195,14 +202,17 @@ impl MeshGateway {
         timeout: Duration,
         retriable: fn(&RpcError) -> bool,
         delegate: bool,
+        extra_headers: &[(String, Vec<u8>)],
     ) -> Result<Bytes, RpcError> {
         let mut last: Option<RpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             // Mint fresh delegation headers PER ATTEMPT: the provider's replay
             // guard rejects a reused nonce, so a retry after a lost reply must
             // carry a new signature. Only invokes delegate; describe/search
-            // never do.
-            let headers = if delegate {
+            // never do. `extra_headers` (the payment-quote binding) are
+            // attempt-stable — the provider's redemption is idempotent per
+            // quote, so a retry presents the same one.
+            let mut headers = if delegate {
                 self.delegation
                     .as_ref()
                     .map(|s| s.headers(service, &body))
@@ -210,6 +220,7 @@ impl MeshGateway {
             } else {
                 Vec::new()
             };
+            headers.extend_from_slice(extra_headers);
             match self
                 .call_once(node, service, body.clone(), timeout, headers)
                 .await
@@ -245,6 +256,7 @@ impl MeshGateway {
                 DESCRIBE_TIMEOUT,
                 is_retriable,
                 false,
+                &[],
             )
             .await
         {
@@ -353,9 +365,18 @@ impl MeshGateway {
         capability: &str,
         body: Bytes,
         retriable: fn(&RpcError) -> bool,
+        payment_headers: &[(String, Vec<u8>)],
     ) -> Result<CallToolResult, GatewayError> {
         match self
-            .call_retry(node, capability, body, self.invoke_timeout, retriable, true)
+            .call_retry(
+                node,
+                capability,
+                body,
+                self.invoke_timeout,
+                retriable,
+                true,
+                payment_headers,
+            )
             .await
         {
             // Success: the wrap handler encoded the CallToolResult as the body.
@@ -394,7 +415,13 @@ impl MeshGateway {
 /// other status is a generic in-band error.
 fn map_invoke_server_error(status: u16, message: String) -> Result<CallToolResult, GatewayError> {
     match status {
-        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_POLICY => Err(GatewayError::Denied(message)),
+        // Payment and policy rejections join the authorization family: an
+        // unpaid / already-redeemed / frozen quote, or a policy deny (the
+        // in-root toll booth declined), is a verdict, not a tool bug, and no
+        // failover peer would answer differently.
+        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_PAYMENT | ERR_POLICY => {
+            Err(GatewayError::Denied(message))
+        }
         // The wrap handler put the full CallToolResult JSON in the message;
         // recover it so the model sees the structured error, falling back to a
         // plain text error if it won't decode.
@@ -518,12 +545,31 @@ impl CapabilityGateway for MeshGateway {
         id: &CapabilityId,
         arguments: Value,
         safety: InvokeSafety,
+        payment: Option<crate::serve::payment::PaymentProof>,
     ) -> Result<CallToolResult, GatewayError> {
         let primary = parse_node(&id.provider)?;
         let body = Bytes::from(
             serde_json::to_vec(&arguments)
                 .map_err(|e| GatewayError::Other(format!("encode arguments: {e}")))?,
         );
+        // The paid-invocation binding rides as a header; the provider's
+        // gate redeems it before the handler runs. Attempt-stable (the
+        // provider's redemption is per-quote idempotent). Note failover:
+        // a payment is provider-bound, so an equivalent provider will
+        // correctly refuse the quote — paid tools effectively never fail
+        // over, which is the right money-path behavior.
+        let payment_headers: Vec<(String, Vec<u8>)> = payment
+            .map(|p| {
+                let mut headers = vec![(
+                    crate::serve::payment::HDR_PAYMENT_QUOTE.to_string(),
+                    p.quote_id.into_bytes(),
+                )];
+                if let Some(sig) = p.binding_sig {
+                    headers.push((crate::serve::payment::HDR_PAYMENT_BINDING.to_string(), sig));
+                }
+                headers
+            })
+            .unwrap_or_default();
         // A duplicate-safe call retries any transient error; an at-most-once
         // invoke only retries errors that prove non-execution.
         let retriable: fn(&RpcError) -> bool = if safety.allows_timeout_retry() {
@@ -532,7 +578,13 @@ impl CapabilityGateway for MeshGateway {
             retriable_send_safe
         };
         match self
-            .invoke_on(primary, &id.capability, body.clone(), retriable)
+            .invoke_on(
+                primary,
+                &id.capability,
+                body.clone(),
+                retriable,
+                &payment_headers,
+            )
             .await
         {
             // Primary unreachable — fail over to an equivalent provider (see the
@@ -543,7 +595,13 @@ impl CapabilityGateway for MeshGateway {
             Err(GatewayError::Transport(primary_reason)) => {
                 for (node, _) in self.equivalent_providers(id, primary).await {
                     match self
-                        .invoke_on(node, &id.capability, body.clone(), retriable)
+                        .invoke_on(
+                            node,
+                            &id.capability,
+                            body.clone(),
+                            retriable,
+                            &payment_headers,
+                        )
                         .await
                     {
                         Err(GatewayError::Transport(_)) => continue, // this one is down too
@@ -612,6 +670,7 @@ fn detail_from(id: &CapabilityId, info: BridgedToolInfo) -> CapabilityDetail {
         credential_status: info.credential_status,
         substitutability: info.substitutability,
         version: info.version,
+        pricing_terms: info.pricing_terms,
     }
 }
 
@@ -779,6 +838,7 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
             output_schema: None,
+            pricing_terms: None,
             version: "1".into(),
             compat_tier: "mcp_bridge".into(),
             credential_status: "none".into(),

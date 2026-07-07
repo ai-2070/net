@@ -441,13 +441,22 @@ impl<G: CapabilityGateway> Shim<G> {
     /// failure strings.
     async fn invoke_capability(&self, id: &CapabilityId, tool_args: Value) -> CallToolResult {
         let pins = self.load_pins().await;
-        match gated_invoke(&self.gateway, &self.consent, pins.as_ref(), id, tool_args).await {
+        // The shim configures no payment flow: it is the CLI-adjacent
+        // surface, and the payments plan is SDK-only — a paid capability
+        // through the shim fails closed with the gate's denied message.
+        match gated_invoke(&self.gateway, &self.consent, pins.as_ref(), None, id, tool_args).await {
             GatedOutcome::Invoked(result) => result,
             GatedOutcome::ValidationFailed(reason) => CallToolResult::text_error(format!(
                 "argument validation failed: {reason}. See net_describe_capability for the schema.",
             )),
             GatedOutcome::RequiresApproval => {
                 CallToolResult::text_error(requires_approval_message(&id.display()))
+            }
+            GatedOutcome::RequiresPaymentApproval { quote_id, policy_reason, approve_hint } => {
+                CallToolResult::text_error(format!(
+                    "Payment approval required for `{}` (quote {quote_id}): {policy_reason}. {approve_hint}",
+                    id.display()
+                ))
             }
             GatedOutcome::Failed(GatewayError::Denied(reason)) => {
                 CallToolResult::text_error(denied_message(&reason))
@@ -761,6 +770,7 @@ mod tests {
             id: &CapabilityId,
             arguments: Value,
             _safety: InvokeSafety,
+            _payment: Option<crate::serve::payment::PaymentProof>,
         ) -> Result<CallToolResult, GatewayError> {
             self.invoke_calls.fetch_add(1, Ordering::SeqCst);
             if self.find(id).is_none() {
@@ -791,6 +801,7 @@ mod tests {
             credential_status: cred.to_string(),
             substitutability: "provider_local".to_string(),
             version: "1.0.0".to_string(),
+            pricing_terms: None,
         }
     }
 

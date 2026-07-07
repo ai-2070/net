@@ -41,7 +41,10 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --features redis
+          # `extension-module` (the cdylib must not link libpython) is
+          # passed explicitly rather than trusting maturin to merge
+          # `[tool.maturin] features` from pyproject.toml with CLI args.
+          args: --release --out dist --find-interpreter --features redis,extension-module
           sccache: "true"
           # Use manylinux_2_28 (Rocky 8, gcc 11+) instead of the
           # default `auto` (which picks manylinux2014 with gcc 4.8).
@@ -81,7 +84,10 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --features redis
+          # `extension-module` (the cdylib must not link libpython) is
+          # passed explicitly rather than trusting maturin to merge
+          # `[tool.maturin] features` from pyproject.toml with CLI args.
+          args: --release --out dist --find-interpreter --features redis,extension-module
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 
@@ -114,7 +120,10 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --features redis
+          # `extension-module` (the cdylib must not link libpython) is
+          # passed explicitly rather than trusting maturin to merge
+          # `[tool.maturin] features` from pyproject.toml with CLI args.
+          args: --release --out dist --find-interpreter --features redis,extension-module
           sccache: "true"
           working-directory: net/crates/net/bindings/python
 

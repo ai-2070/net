@@ -3031,6 +3031,16 @@ impl MeshNode {
         self.identity.entity_id()
     }
 
+    /// This node's ed25519 identity keypair — the one handed to
+    /// `MeshNode::new`. In-process surfaces that must sign *as the
+    /// node* (e.g. the payments caller flow binding quotes and
+    /// invocation proofs to the node identity) borrow it here; it
+    /// never crosses a language boundary. Same exposure precedent as
+    /// `compute::host` and `behavior::deck`.
+    pub fn entity_keypair(&self) -> &EntityKeypair {
+        &self.identity
+    }
+
     /// Look up a peer's pinned `entity_id`, if the TOFU binding
     /// has been established. Returns `None` before we've received
     /// a signature-verified `CapabilityAnnouncement` from the peer.
@@ -10046,7 +10056,8 @@ impl MeshNode {
         } else {
             use crate::adapter::net::behavior::ToolCapability;
             use crate::adapter::net::cortex::tool::{
-                description_metadata_key, streaming_metadata_key, tags_metadata_key,
+                description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+                tags_metadata_key,
             };
             let snapshot = self.tool_registry.snapshot();
             // Reconstruct ToolCapability values from each descriptor's
@@ -10095,6 +10106,16 @@ impl MeshNode {
                     merged = merged.with_metadata(
                         tags_metadata_key(&descriptor.tool_id),
                         descriptor.tags.join(","),
+                    );
+                }
+                // Pricing terms (net.pricing.terms@1 canonical JSON) ride
+                // the same hook — paid capability = metadata + invocation
+                // policy, not a different kind of tool. The substrate
+                // never parses the value.
+                if let Some(ref terms) = descriptor.pricing_terms {
+                    merged = merged.with_metadata(
+                        pricing_terms_metadata_key(&descriptor.tool_id),
+                        terms.clone(),
                     );
                 }
             }

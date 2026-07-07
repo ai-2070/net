@@ -73,6 +73,11 @@ pub struct CapabilityDetail {
     pub substitutability: String,
     /// Provider-declared version, if any.
     pub version: String,
+    /// `net.pricing.terms@1` canonical JSON when the capability is paid.
+    /// Opaque to the gateway (payment semantics live in `net-payments`);
+    /// `None` = free. The gate fails a paid capability closed unless a
+    /// payment flow is configured and clears it.
+    pub pricing_terms: Option<String>,
 }
 
 /// Errors a gateway operation can return. The variants map to the plan's
@@ -157,11 +162,18 @@ pub trait CapabilityGateway: Send + Sync {
     /// [`CallToolResult`] with `is_error = true`.
     ///
     /// `safety` selects the retry policy on a timeout — see [`InvokeSafety`].
+    /// `payment` is the paid-invocation binding
+    /// ([`super::payment::PaymentProof`], attached as the
+    /// [`super::payment::HDR_PAYMENT_QUOTE`] header by mesh
+    /// implementations) — `None` for free capabilities. A provider-side
+    /// payment rejection surfaces as [`GatewayError::Denied`], the same
+    /// authorization verdict as its owner-scope and delegation siblings.
     async fn invoke(
         &self,
         id: &CapabilityId,
         arguments: serde_json::Value,
         safety: InvokeSafety,
+        payment: Option<super::payment::PaymentProof>,
     ) -> Result<CallToolResult, GatewayError>;
 }
 

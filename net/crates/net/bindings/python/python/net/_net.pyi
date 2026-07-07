@@ -3043,10 +3043,18 @@ class CapabilityGateway:
       input_schema, output_schema, compat_tier, credential_status,
       substitutability, version, requires_approval}``
     - ``invoke(cap_id, arguments_json)`` -> ``{"status": "ok" |
-      "requires_approval" | "validation_error" | "denied" | "not_found" |
-      "transport_error" | "no_daemon" | "error", ...}``. On ``ok`` inspect
-      ``is_error`` for a tool-level failure; on ``requires_approval`` relay
-      ``approve_command``.
+      "requires_approval" | "requires_payment_approval" | "validation_error" |
+      "denied" | "not_found" | "transport_error" | "no_daemon" | "error",
+      ...}``. On ``ok`` inspect ``is_error`` for a tool-level failure; on
+      ``requires_approval`` relay ``approve_command``; on
+      ``requires_payment_approval`` relay ``{quote_id, policy_reason,
+      approve_hint}`` — spend policy wants a human, the decision resolves
+      through the payments consent surface, and nothing was charged.
+
+    ``describe`` results additionally carry ``pricing_terms`` (the announced
+    ``net.pricing.terms@1`` canonical JSON) when the capability is paid;
+    ``null`` means free. Displaying a price never implies authorization to
+    spend it.
 
     The methods release the GIL while the mesh call is in flight, so an
     ``async`` caller can await them off the event loop without blocking it::
@@ -3073,6 +3081,11 @@ class CapabilityGateway:
         pin_store_path: Optional[str] = None,
         delegation_leaf: Optional["Identity"] = None,
         delegation_chain: Optional[bytes] = None,
+        payment_policy_path: Optional[str] = None,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Build a gateway over a started ``mesh``. ``pin_store_path`` should
         be the machine-shared pin store so approvals are honored both ways;
@@ -3084,7 +3097,36 @@ class CapabilityGateway:
         every invoke carry a per-invoke signed delegation (Phase 3); a remote
         provider running a delegation gate then admits by verified delegation
         and audits this gateway's leaf. **Both or neither** — passing exactly
-        one raises ``ValueError``."""
+        one raises ``ValueError``.
+
+        Pass ``payment_policy_path`` (the machine-shared spend-policy store)
+        to enable paid capabilities: the invoke gate then clears them through
+        the Rust payments flow (quote -> spend policy -> x402 payload -> pay
+        over the mesh). ``payment_profile`` is ``"production"`` (the
+        fail-closed default: every mock spend holds for approval) or
+        ``"dev_test"`` (mock auto-allows under the configured limits);
+        ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
+        for production-profile demos. Without ``payment_policy_path``, a paid
+        capability fails closed as a structured ``denied`` — never a silent
+        unpaid serve. Requires the ``payments`` build feature (the default
+        wheel has it); passing payment kwargs on a build without it raises
+        ``ValueError``.
+
+        The payment identity is the node's mesh identity: quotes are issued
+        to, spend is tracked against, and invocation proofs are signed by the
+        same ed25519 identity peers see on the mesh.
+
+        Real (non-mock) networks additionally need a settlement signer
+        *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
+        address) **and** ``payment_signer`` (both or neither), a callable
+        ``(typed_data_json: str) -> str`` that forwards the full EIP-712
+        typed-data document to your wallet / KMS and returns the 65-byte
+        ``0x…``-hex signature. Only the typed document and the signature
+        cross the language boundary — there is no way to hand Net a private
+        key, and the only thing this surface can ask your signer for is a
+        logged, typed transfer authorization (never raw bytes). Enablement
+        still requires the network in the spend policy's
+        ``allowed_networks`` — the signer is capability, not consent."""
         ...
 
     @property
@@ -3135,10 +3177,21 @@ class AsyncCapabilityGateway:
         pin_store_path: Optional[str] = None,
         delegation_leaf: Optional["Identity"] = None,
         delegation_chain: Optional[bytes] = None,
+        payment_policy_path: Optional[str] = None,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
         ``delegation_chain`` together (both or neither) to sign + attach a
-        delegation on every invoke (Phase 3)."""
+        delegation on every invoke (Phase 3); pass ``payment_policy_path``
+        (+ optional ``payment_profile`` / unsafe flag) to enable paid
+        capabilities through the payments flow, and
+        ``payment_signer_address`` + ``payment_signer`` (both or neither)
+        for real-network settlement — see :class:`CapabilityGateway` for the
+        signer-reference contract. The signer callable runs on a blocking
+        worker thread, never on your event loop."""
         ...
     @property
     def pin_store_path(self) -> Optional[str]: ...

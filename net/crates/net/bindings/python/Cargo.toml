@@ -47,7 +47,19 @@ default = [
     "delegation",
     "publish",
     "a2a",
+    "payments",
 ]
+# pyo3's optional-extension-module pattern (pyo3 FAQ). The importable
+# cdylib must NOT link libpython — the host interpreter supplies the
+# C-API symbols at import time — so every wheel-shaped build enables
+# this feature explicitly: `[tool.maturin] features` in pyproject.toml
+# (covers sdist installs and bare `maturin develop`), the `--features`
+# args in release-python.yml, and the python-tests `maturin develop`
+# in ci.yml. Deliberately NOT a default feature: plain `cargo build` /
+# `cargo test` link the host libpython like any normal crate, so the
+# unit-test binary resolves the C-API symbols at link time and runs
+# standalone — no unresolved-symbol linker flags, no LD_PRELOAD.
+extension-module = ["pyo3/extension-module"]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
 # PyO3 wrapper around the canonical Rust implementation.
@@ -135,6 +147,14 @@ consent = ["dep:net-sdk", "net-sdk/pin-watch"]
 # only — publishing itself goes through the general SDK path; the
 # forwarding/keychain internals are never bound (bridge doctrine #3).
 mcp = ["consent", "dep:net-mcp"]
+# Paid capabilities through the gateway (`PAYMENTS_SDK_PLAN.md` P0):
+# constructing `CapabilityGateway` with `payment_policy_path=` wires the
+# net-payments caller flow (spend engine → quote → x402 payload → pay
+# over the mesh) into the invoke gate, and `requires_payment_approval`
+# surfaces as a structured result. Thin per doctrine #1: every payment
+# decision is the Rust flow's; the binding maps config strings and
+# passes the structured error through untouched.
+payments = ["mcp", "net", "dep:net-payments"]
 # Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3):
 # DelegationChain (root → machine → gateway → subagent), a shared
 # RevocationRegistry, and stable child-`Identity` derivation — thin
@@ -168,9 +188,14 @@ net = { package = "net-mesh", version = "0.31.0", path = "../..", default-featur
 net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../../sdk", default-features = false, optional = true }
 # The MCP bridge adapter, for the two pure helpers only (feature `mcp`).
 net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../adapters/mcp", optional = true }
+# The payments layer (feature `payments`): the caller flow + spend
+# engine the gateway's payment gate clears paid capabilities through.
+net-payments = { version = "0.31.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
-pyo3 = { version = "0.29.0", features = ["extension-module"] }
+# `extension-module` is NOT hardcoded here — see the feature of the
+# same name above.
+pyo3 = { version = "0.29.0" }
 # Bridge between Rust async (tokio) and Python asyncio coroutines.
 # `future_into_py` converts a Rust future into a Python awaitable
 # the user can `await`; `into_future` does the reverse for

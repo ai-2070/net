@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use net_mcp::spec::{CallToolResult, Implementation};
-use net_mcp::wrap::{OwnerScope, ServerPublisher, WrapConfig};
+use net_mcp::wrap::{OwnerScope, ServerPublisher, WrapConfig, WrapError};
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::CallOptions;
@@ -336,6 +336,68 @@ async fn refresh_reconciles_the_tool_set_on_list_changed() {
     );
 
     drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
+/// A trivial admission gate so a priced config clears the
+/// "priced-without-gate" guard and reaches the pricing-key validation.
+struct AdmitAllPayments;
+
+#[async_trait::async_trait]
+impl net_mcp::serve::PaymentAdmission for AdmitAllPayments {
+    async fn redeem(
+        &self,
+        _tool_id: &str,
+        _quote_id: &str,
+        _binding: Option<&[u8]>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// M5 regression: pricing keyed by a tool the server does not export
+/// (typo, since-renamed, or the sanitized channel id used instead of the
+/// wrapped name) must be rejected at publish time — otherwise that key is
+/// silently ignored and the tool it meant to price serves for free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mis_keyed_pricing_config_is_rejected_at_publish() {
+    const TERMS: &str = r#"{"object":"net.pricing.terms@1"}"#;
+    let host = Arc::new(build_mesh(&[0x51u8; 32]).await);
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+
+    // Correctly keyed by the fixture's real `echo` tool: publishes.
+    let mut good = WrapConfig::owner_only(client_info(), 0);
+    good.pricing.insert("echo".to_string(), TERMS.to_string());
+    good.payment_admission = Some(Arc::new(AdmitAllPayments));
+    let publication = publisher
+        .publish_server(FIXTURE, &[], &[], good)
+        .await
+        .expect("echo priced by its real name publishes");
+    publication.withdraw().await.expect("withdraw");
+
+    // Mis-keyed (`ecko`): matches no tool, rejected before serving.
+    let mut bad = WrapConfig::owner_only(client_info(), 0);
+    bad.pricing.insert("ecko".to_string(), TERMS.to_string());
+    bad.payment_admission = Some(Arc::new(AdmitAllPayments));
+    match publisher.publish_server(FIXTURE, &[], &[], bad).await {
+        Err(WrapError::PricingKeyUnmatched { keys }) => {
+            assert_eq!(keys, vec!["ecko".to_string()]);
+        }
+        Err(other) => panic!("expected PricingKeyUnmatched, got {other:?}"),
+        Ok(_) => panic!("a mis-keyed pricing config must be rejected, but publish succeeded"),
+    }
+
+    // The mis-key never announced: no `ecko` capability leaked onto the mesh.
+    assert!(
+        !host
+            .find_nodes(&CapabilityFilter::new().require_tag("ecko"))
+            .contains(&host.inner().node_id()),
+        "a rejected publish announces nothing",
+    );
+
     drop(publisher);
     if let Ok(host) = Arc::try_unwrap(host) {
         host.shutdown().await.ok();

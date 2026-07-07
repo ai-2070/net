@@ -148,6 +148,9 @@ pub(crate) fn mesh_publish_tools(
         // governs consent, not per-tool credential labels.
         credential_status: CredentialStatus::None,
         substitutability: Substitutability::ProviderLocal,
+        // No pricing surface on this binding path — every published tool is
+        // free (paid tools ride the net-payments publish path).
+        pricing: Default::default(),
     };
     let client_info = Implementation {
         name: "net-publish".to_string(),

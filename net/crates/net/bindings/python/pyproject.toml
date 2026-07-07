@@ -38,6 +38,12 @@ Repository = "https://github.com/ai-2070/net"
 testpaths = ["tests"]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+# The cdylib must not link libpython (the importing interpreter
+# supplies the C-API symbols); the crate leaves `extension-module`
+# off so `cargo test` links normally, and wheel builds opt in here.
+# This line covers sdist installs and bare `maturin develop`; CI and
+# release-python.yml also pass the feature explicitly on the CLI
+# rather than relying on maturin merging these defaults.
+features = ["extension-module"]
 python-source = "python"
 module-name = "net._net"

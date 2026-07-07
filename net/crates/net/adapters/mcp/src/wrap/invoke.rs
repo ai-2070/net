@@ -52,12 +52,19 @@ pub const ERR_TOOL: u16 = 0x8004;
 /// that doesn't root at the provider's owner. Distinct from
 /// [`ERR_OWNER_SCOPE`] (the no-chain origin-allowlist path).
 pub const ERR_DELEGATION: u16 = 0x8005;
+/// A paid tool's payment admission failed — the invocation carried no
+/// [`HDR_PAYMENT_QUOTE`](crate::serve::payment::HDR_PAYMENT_QUOTE), the
+/// quote was unpaid / frozen / already redeemed / bound to another tool,
+/// or the tool is priced but no payment gate is configured (fail-closed).
+/// An authorization verdict like its owner-scope and delegation siblings.
+pub const ERR_PAYMENT: u16 = 0x8006;
 /// The invoke was admitted but the provider's [`InvokePolicy`] refused it
 /// (V2 Phase 2's in-root toll booth — an allowlist deny, or a dangerous-tool
 /// approval that was declined / could not reach the operator). An
 /// authorization verdict, so the demand side maps it to `denied` like
 /// [`ERR_OWNER_SCOPE`] / [`ERR_DELEGATION`], never a tool-level `is_error`.
-pub const ERR_POLICY: u16 = 0x8006;
+/// (0x8007: 0x8006 was taken by [`ERR_PAYMENT`] when the branches merged.)
+pub const ERR_POLICY: u16 = 0x8007;
 
 /// Find the first request header named `name` in `ctx.payload.headers`
 /// (`Vec<(String, Vec<u8>)>` — the substrate's `RpcHeader` alias). First match
@@ -199,6 +206,14 @@ pub struct WrapInvokeHandler {
     /// booth. `None` is the allow-all preset (the check is skipped): the mesh
     /// adds reach, not authority.
     policy: Option<Arc<dyn InvokePolicy>>,
+    /// Whether this tool was published with pricing terms. A paid tool's
+    /// invoke must redeem its quote through `payment` before the wrapped
+    /// tool runs — a paid tool with no gate configured rejects everything
+    /// (fail-closed; the publish site also validates this up front).
+    paid: bool,
+    /// The provider's payment admission (the net-payments engine, behind
+    /// the [`crate::serve::payment::PaymentAdmission`] seam).
+    payment: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
 }
 
 impl WrapInvokeHandler {
@@ -215,6 +230,8 @@ impl WrapInvokeHandler {
             scope,
             delegation: None,
             policy: None,
+            paid: false,
+            payment: None,
         }
     }
 
@@ -244,6 +261,21 @@ impl WrapInvokeHandler {
     #[must_use]
     pub fn with_policy(mut self, policy: Option<Arc<dyn InvokePolicy>>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Mark this tool as paid and attach the provider's payment admission
+    /// gate. `paid = true` with `payment = None` is a valid (fail-closed)
+    /// configuration only as a defense in depth — the publish site rejects
+    /// it before serving.
+    #[must_use]
+    pub fn with_payment(
+        mut self,
+        paid: bool,
+        payment: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
+    ) -> Self {
+        self.paid = paid;
+        self.payment = payment;
         self
     }
 
@@ -304,10 +336,11 @@ impl RpcHandler for WrapInvokeHandler {
         };
 
         // [2] Translate the request body into tool arguments — BEFORE the
-        //     policy hook, so a structurally invalid call (one that can never
-        //     execute) is rejected as ERR_BAD_REQUEST without ever consulting
-        //     the policy. A real approval policy may prompt a human operator;
-        //     asking them to approve garbage would be noise at best and an
+        //     payment and policy gates, so a structurally invalid call (one
+        //     that can never execute) is rejected as ERR_BAD_REQUEST without
+        //     burning the caller's payment quote or consulting the policy.
+        //     A real approval policy may prompt a human operator; asking them
+        //     to approve garbage would be noise at best and an
         //     approval-fatigue vector at worst.
         let arguments =
             parse_arguments(&ctx.payload.body).map_err(|message| RpcHandlerError::Application {
@@ -315,13 +348,52 @@ impl RpcHandler for WrapInvokeHandler {
                 message,
             })?;
 
-        // [2b] Policy hook (V2 Phase 2, the in-root toll booth). The call is
-        //      admitted and well-formed; now the provider's policy — an
-        //      allowlist, or a dangerous-tool approval that routes to the
-        //      operator — gets the final say before the tool runs. `None` is
-        //      the allow-all preset (skipped): the mesh adds reach, not
-        //      authority. A deny becomes an ERR_POLICY the demand side reports
-        //      as `denied`.
+        // [3] Payment admission (paid tools only). The quote id the caller
+        //     attached is redeemed against the provider's payment engine —
+        //     settled, billed, unfrozen, bound to this tool, and never
+        //     redeemed before. Runs AFTER identity admission (never leak
+        //     payment state to a caller the scope would reject) and BEFORE
+        //     the wrapped tool: the handler never sees an unpaid call, no
+        //     matter what the demand side did or skipped. It also runs before
+        //     the policy hook — a caller commits its quote before it can put
+        //     a (possibly human) approval prompt in front of the operator.
+        if self.paid {
+            let Some(gate) = &self.payment else {
+                return Err(RpcHandlerError::Application {
+                    code: ERR_PAYMENT,
+                    message: "tool is priced but the provider has no payment gate configured \
+                              (fail-closed)"
+                        .to_string(),
+                });
+            };
+            let quote_id = find_header(
+                &ctx.payload.headers,
+                crate::serve::payment::HDR_PAYMENT_QUOTE,
+            )
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .ok_or_else(|| RpcHandlerError::Application {
+                code: ERR_PAYMENT,
+                message: "paid tool invoked without a payment quote header".to_string(),
+            })?;
+            let binding = find_header(
+                &ctx.payload.headers,
+                crate::serve::payment::HDR_PAYMENT_BINDING,
+            );
+            gate.redeem(&self.service, quote_id, binding)
+                .await
+                .map_err(|reason| RpcHandlerError::Application {
+                    code: ERR_PAYMENT,
+                    message: reason,
+                })?;
+        }
+
+        // [4] Policy hook (V2 Phase 2, the in-root toll booth). The call is
+        //     admitted, well-formed, and paid for; now the provider's policy —
+        //     an allowlist, or a dangerous-tool approval that routes to the
+        //     operator — gets the final say before the tool runs. `None` is
+        //     the allow-all preset (skipped): the mesh adds reach, not
+        //     authority. A deny becomes an ERR_POLICY the demand side reports
+        //     as `denied`.
         if let Some(policy) = &self.policy {
             if let PolicyDecision::Deny { reason } = policy
                 .check(&PolicyContext {
@@ -338,7 +410,7 @@ impl RpcHandler for WrapInvokeHandler {
             }
         }
 
-        // [3] Invoke the wrapped tool. A protocol failure (server gone,
+        // [5] Invoke the wrapped tool. A protocol failure (server gone,
         //     JSON-RPC error) is ERR_UPSTREAM; a tool-level `is_error`
         //     result is ERR_TOOL — kept distinct so the caller can tell
         //     "unreachable" from "the tool refused".
@@ -351,7 +423,7 @@ impl RpcHandler for WrapInvokeHandler {
                 message: e.to_string(),
             })?;
 
-        // [4] Encode the result. Do it per-branch: a tool-level error returns
+        // [6] Encode the result. Do it per-branch: a tool-level error returns
         //     the full structured result as the ERR_TOOL body via
         //     `tool_error_message` (which never fails — it can't mask the tool
         //     error as an internal one); a success encodes the response body,

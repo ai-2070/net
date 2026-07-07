@@ -30,9 +30,9 @@
 pub use net::adapter::net::behavior::fold::capability_aggregation::{TagMatcher, TagMatcherError};
 #[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
-    description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor, ToolEvent,
-    ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
-    TOOL_METADATA_FETCH_SERVICE,
+    description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+    tags_metadata_key, ToolDescriptor, ToolEvent, ToolListChange, ToolListWatch,
+    ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
 };
 
 #[cfg(feature = "cortex")]
@@ -141,6 +141,27 @@ impl ToolMetadataBuilder {
         self
     }
 
+    /// Attach pricing: a `net.pricing.terms@1` envelope as canonical
+    /// JSON (author it with `net-payments`; the SDK carries the string
+    /// opaquely — the substrate never parses payment objects). Announced
+    /// under the tool's `pricing_terms` metadata key, so the price is
+    /// visible at discovery time. A paid capability is metadata +
+    /// invocation policy, not a different kind of tool — and displaying
+    /// a price never implies authorization to spend it.
+    ///
+    /// **Discovery-only today.** The provider-side redeem gate
+    /// (`PaymentAdmission` / quote redemption before the handler runs)
+    /// lives only in the MCP wrap path. A native tool served via
+    /// `serve_rpc` that announces `pricing_terms` therefore *advertises* a
+    /// price but does NOT enforce payment before invocation — any direct
+    /// caller pays nothing. Use this for discovery/announcement until a
+    /// native admission gate exists; do not rely on it to gate a
+    /// natively-served handler.
+    pub fn pricing_terms(mut self, terms_json: impl Into<String>) -> Self {
+        self.descriptor.pricing_terms = Some(terms_json.into());
+        self
+    }
+
     /// Consume the builder and return the finished [`ToolDescriptor`].
     /// Pass this into the future `serve_tool` / `serve_tool_streaming`
     /// methods (A-2 / A-3).
@@ -188,6 +209,7 @@ where
             stateless: true,
             streaming: false,
             tags: Vec::new(),
+            pricing_terms: None,
             node_count: 0,
         },
     }
@@ -1270,6 +1292,7 @@ mod tests {
             stateless: true,
             streaming: false,
             tags: Vec::new(),
+            pricing_terms: None,
             node_count: 0,
         };
         // Empty-object fallback prevents provider validators from

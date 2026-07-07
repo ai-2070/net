@@ -1112,6 +1112,16 @@ impl Mesh {
         self.identity.as_ref()
     }
 
+    /// This node's ed25519 identity keypair — always present (the
+    /// node minted an ephemeral one if `.identity(...)` was never
+    /// called). For in-process surfaces that sign *as the node*,
+    /// e.g. the payments caller flow binding quotes and invocation
+    /// proofs to the same identity peers see on the mesh. The
+    /// keypair stays in Rust; bindings never surface it.
+    pub fn entity_keypair(&self) -> &EntityKeypair {
+        self.node.entity_keypair()
+    }
+
     // ── NAT traversal ──────────────────────────────────────────
     //
     // Framing (load-bearing — see `docs/NAT_TRAVERSAL_PLAN.md`

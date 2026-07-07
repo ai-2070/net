@@ -82,6 +82,12 @@ pub struct BridgedToolInfo {
     /// (`#[serde(default)]` for forward-compat).
     #[serde(default)]
     pub schema_hash: String,
+    /// `net.pricing.terms@1` canonical JSON when the tool was published
+    /// as paid. Carried opaquely (payment semantics live in
+    /// `net-payments`); absent = free. Additive + omitted-when-absent so
+    /// pre-payments peers see the exact prior wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_terms: Option<String>,
 }
 
 /// The describe service response: the wrap node's current bridged tools.
@@ -103,6 +109,7 @@ mod tests {
             description: Some("echo it back".to_string()),
             input_schema: json!({ "type": "object" }),
             output_schema: None,
+            pricing_terms: None,
             version: "1.0.0".to_string(),
             compat_tier: "mcp_bridge".to_string(),
             credential_status: "none".to_string(),

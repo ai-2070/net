@@ -65,7 +65,7 @@ bytes = "1"
 blake2 = "0.10"
 chacha20poly1305 = "0.11"
 getrandom = "0.4"
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 # Cross-process advisory file locking for the forwarding policy store
 # (`forward::store`). The pin store, which pioneered the pattern, graduated to
 # `net-mesh-sdk` (MCP_BRIDGE_SDK_PLAN.md P0) and carries its own fs2 dep.
