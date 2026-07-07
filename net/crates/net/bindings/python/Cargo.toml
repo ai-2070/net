@@ -45,6 +45,8 @@ default = [
     "consent",
     "mcp",
     "delegation",
+    "publish",
+    "a2a",
     "payments",
 ]
 # pyo3's optional-extension-module pattern (pyo3 FAQ). The importable
@@ -160,7 +162,26 @@ payments = ["mcp", "net", "dep:net-payments"]
 # identity + token-chain surface `delegation` composes), which `consent`
 # alone does not activate. H8-clean: takes/returns opaque `Identity`
 # handles + public entity-ids; private seeds never cross into Python.
-delegation = ["net", "dep:net-sdk", "net-sdk/net"]
+# `net-sdk/cortex` brings the SDK's nRPC surface (`net_sdk::mesh_rpc` /
+# `mesh_enroll`) so the live enrollment bridge (`NetMesh.join` /
+# `serve_enrollment_auto`) compiles; the default wheel already enables the
+# same core `netdb` / `redex-disk` features, so this is marginal there.
+delegation = ["net", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
+# Publish a node's OWN local tools as mesh capabilities
+# (`HERMES_INTEGRATION_PLAN_V2.md` Phase 2, Slice B) — the inverse of `net
+# wrap`, backed by a Python async callback. Composite: `mcp` (the
+# `net_mcp::wrap::ServerPublisher::publish_tools` surface + `ToolInvoker`),
+# `delegation` (the `net` + `net-sdk/net` mesh surface `from_node_arc` needs),
+# and `cortex` (the binding's `async-trait` for the `ToolInvoker` impl + the
+# `dispatch_handler_coro` Rust→Python coroutine bridge).
+publish = ["mcp", "delegation", "cortex"]
+# Agent-to-agent task handoff (`HERMES_INTEGRATION_PLAN_V2.md` Phase 3) — serve
+# the A2A task lifecycle backed by a Python async task-executor callback, and
+# submit/status/cancel by node id. Composite: `delegation` (the `net` +
+# `net-sdk/net,cortex` mesh surface `net_sdk::mesh_a2a` needs) and `cortex` (the
+# binding's `async-trait` for the `TaskExecutor` impl + the
+# `dispatch_handler_coro` Rust→Python coroutine bridge).
+a2a = ["delegation", "cortex"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }

@@ -10,7 +10,7 @@
 net/crates/net/sdk-ts/dist/
 net/crates/net/bindings/python/python/net/*.so
 net/crates/net/.claude/settings.local.json
-net/crates/net/bindings/python/.venv/*
+net/crates/net/bindings/python/.venv*/
 
 # Node binding build artifacts. The hand-written modules
 # (errors.ts, mesh_rpc.ts, meshdb.ts) compile to .js + .d.ts

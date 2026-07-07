@@ -44,12 +44,15 @@ use parking_lot::Mutex;
 use super::catalog::{build_catalog, shared_catalog, CatalogPart, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
 use super::delegation::DelegationGate;
-use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
-use super::invoke::{OwnerScope, WrapInvokeHandler};
+use super::descriptor::{
+    lower_tool, schema_hash, schema_hash_key, LoweredTool, LoweringContext, Substitutability,
+};
+use super::invoke::{OwnerScope, ToolInvoker, WrapInvokeHandler};
+use super::policy::InvokePolicy;
 use super::stdio::StdioMcpClient;
 use super::McpError;
 use crate::bridge::{BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE};
-use crate::spec::Implementation;
+use crate::spec::{Implementation, Tool};
 
 /// A failure setting up or reconciling a publication.
 #[derive(Debug, thiserror::Error)]
@@ -177,14 +180,25 @@ pub fn build_capability_set<'a>(
         if let Some(description) = &d.description {
             caps = caps.with_metadata(description_metadata_key(&d.tool_id), description.clone());
         }
+        // Provider-side schema hash in the announce baseline, so a discovering
+        // node reads it straight off the fold (fetch-once / cache / invalidate).
+        // Computed here from the tool's input schema rather than in `lower_tool`
+        // — its DTO is pinned by the cross-binding golden vectors.
+        if let Some(schema_str) = &d.input_schema {
+            if let Ok(schema) = serde_json::from_str::<serde_json::Value>(schema_str) {
+                caps = caps.with_metadata(schema_hash_key(&d.tool_id), schema_hash(&schema));
+            }
+        }
     }
     caps
 }
 
 /// Configuration for a publication: the credential-classification overrides
 /// and the substitutability the operator declared, plus who may invoke.
-// Debug is manual: `payment_admission` is a trait object with no Debug
-// bound (payments implements it), so the derive can't apply.
+///
+/// `Debug` is hand-written (not derived): [`InvokePolicy`] and
+/// [`crate::serve::payment::PaymentAdmission`] impls need not be `Debug` —
+/// both may wrap genuinely opaque state (a host callback, a payment engine).
 #[derive(Clone)]
 pub struct WrapConfig {
     /// How this server identifies itself to the wrapped MCP server.
@@ -203,6 +217,12 @@ pub struct WrapConfig {
     pub force: bool,
     /// Whether the tools are declared interchangeable across providers.
     pub substitutability: Substitutability,
+    /// Optional invoke-path policy (V2 Phase 2 — the in-root toll booth). When
+    /// set, every admitted invoke of this publication's tools is run past it
+    /// before the tool executes. `None` (default) is the allow-all preset: the
+    /// mesh adds reach, not authority. Flipping to an allowlist or a
+    /// dangerous-tool approval policy is setting this field, not new plumbing.
+    pub policy: Option<Arc<dyn InvokePolicy>>,
     /// Pricing terms per wrapped tool, keyed by MCP tool name. Values
     /// are `net.pricing.terms@1` canonical JSON (author with
     /// `net-payments`; the bridge carries them opaquely). Same publish
@@ -227,6 +247,9 @@ impl std::fmt::Debug for WrapConfig {
             .field("credential_override", &self.credential_override)
             .field("force", &self.force)
             .field("substitutability", &self.substitutability)
+            // The policy / payment gates are opaque (not `Debug`); show only
+            // their presence.
+            .field("policy", &self.policy.as_ref().map(|_| "<policy>"))
             .field("pricing", &self.pricing)
             .field(
                 "payment_admission",
@@ -247,6 +270,7 @@ impl WrapConfig {
             credential_override: CredentialOverride::Detect,
             force: false,
             substitutability: Substitutability::ProviderLocal,
+            policy: None,
             pricing: std::collections::BTreeMap::new(),
             payment_admission: None,
         }
@@ -504,12 +528,13 @@ impl ServerPublisher {
             // Serve under the channel-safe `tool_id`, invoke by the original
             // `mcp_name` (they differ only for a sanitized name).
             let handler = WrapInvokeHandler::new(
-                Arc::clone(&client),
+                Arc::clone(&client) as Arc<dyn ToolInvoker>,
                 lt.mcp_name.clone(),
                 config.scope.clone(),
             )
             .with_service(tool_id.clone())
             .with_delegation(config.delegation.clone())
+            .with_policy(config.policy.clone())
             .with_payment(
                 lt.descriptor.pricing_terms.is_some(),
                 config.payment_admission.clone(),
@@ -542,6 +567,7 @@ impl ServerPublisher {
             ctx,
             scope: config.scope,
             delegation: config.delegation,
+            policy: config.policy,
             payment_admission: config.payment_admission,
             tools,
             skipped,
@@ -552,6 +578,127 @@ impl ServerPublisher {
             },
         })
     }
+
+    /// Publish a set of **local, in-process tools** as mesh capabilities — the
+    /// inverse of [`publish_server`](Self::publish_server) for tools that are
+    /// *not* a wrapped MCP server (a native node announcing its own toolset).
+    ///
+    /// Each `tool` is lowered exactly as a wrapped tool is, so the same
+    /// announce baseline ([`BRIDGE_PROVIDER_TAG`] + a per-tool tag +
+    /// `tool::<id>::<field>` metadata) and the same describe service back it —
+    /// the **existing** demand-side gateway discovers, describes, and invokes
+    /// these with no consume-side change. `invoker` backs every tool of this
+    /// publication (a mesh call for tool `id` becomes
+    /// `invoker.call_tool(mcp_name, args)`); `ctx` supplies the per-publication
+    /// version / credential status / substitutability, and `config` the owner
+    /// scope + optional delegation gate. All of it merges into the node's
+    /// single announcement + describe catalog alongside any `publish_server`
+    /// publications, so a node can host both.
+    ///
+    /// A tool with an empty (or whitespace-only) name has no usable id and is
+    /// skipped — surfaced via [`LocalPublicationHandle::skipped_tools`]; every
+    /// other name is bridged, sanitized into a channel-safe id when necessary.
+    pub async fn publish_tools(
+        &self,
+        tools: &[Tool],
+        invoker: Arc<dyn ToolInvoker>,
+        ctx: LoweringContext,
+        config: WrapConfig,
+    ) -> Result<LocalPublicationHandle, WrapError> {
+        let (lowered, skipped) = lower_local_tools(tools, &ctx);
+
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+
+        // One writer at a time to the announced set / merged catalog.
+        let _sync = self.shared.sync.lock().await;
+
+        self.shared.insert(
+            id,
+            Contribution {
+                lowered: lowered.clone(),
+                scope: config.scope.clone(),
+            },
+        );
+
+        // Announce the merged set + swap the catalog, then make sure the
+        // describe service is up. Any failure rolls this contribution back out
+        // so a failed publish never leaves stale, uninvocable capabilities
+        // discoverable — same discipline as `publish_server`.
+        if let Err(e) = self.shared.sync_mesh(&self.mesh).await {
+            self.shared.remove(id);
+            return Err(e);
+        }
+        if let Err(e) = self.shared.ensure_describe(&self.mesh) {
+            self.shared.remove(id);
+            return Err(rollback_result(e, self.shared.sync_mesh(&self.mesh).await));
+        }
+
+        // Serve one handler per tool, all backed by the shared invoker.
+        let mut handles: HashMap<String, ServeHandle> = HashMap::with_capacity(lowered.len());
+        for lt in &lowered {
+            let tool_id = lt.descriptor.tool_id.clone();
+            let handler = WrapInvokeHandler::new(
+                Arc::clone(&invoker),
+                lt.mcp_name.clone(),
+                config.scope.clone(),
+            )
+            .with_service(tool_id.clone())
+            .with_delegation(config.delegation.clone())
+            .with_policy(config.policy.clone());
+            match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
+                Ok(handle) => {
+                    handles.insert(tool_id, handle);
+                }
+                Err(e) => {
+                    drop(handles);
+                    self.shared.remove(id);
+                    self.shared.drop_describe_if_idle();
+                    let serve_err = WrapError::Serve {
+                        tool: tool_id,
+                        reason: e.to_string(),
+                    };
+                    return Err(rollback_result(
+                        serve_err,
+                        self.shared.sync_mesh(&self.mesh).await,
+                    ));
+                }
+            }
+        }
+
+        let mut served: Vec<String> = handles.keys().cloned().collect();
+        served.sort();
+        Ok(LocalPublicationHandle {
+            invoker,
+            handles,
+            ctx,
+            scope: config.scope,
+            delegation: config.delegation,
+            policy: config.policy,
+            tools: served,
+            skipped,
+            registration: Registration {
+                mesh: Arc::clone(&self.mesh),
+                shared: Arc::clone(&self.shared),
+                id,
+            },
+        })
+    }
+}
+
+/// Lower an explicit local tool set, partitioning off empty-named tools (which
+/// have no usable id) as `skipped`. The local analogue of
+/// [`discover_and_lower`], which reads the set from a wrapped server instead.
+fn lower_local_tools(tools: &[Tool], ctx: &LoweringContext) -> (Vec<LoweredTool>, Vec<String>) {
+    let mut lowered = Vec::with_capacity(tools.len());
+    let mut skipped = Vec::new();
+    for t in tools {
+        if t.name.trim().is_empty() {
+            skipped.push(t.name.clone());
+        } else {
+            lowered.push(lower_tool(t, ctx));
+        }
+    }
+    (lowered, skipped)
 }
 
 /// De-registers a publication's contribution when its handle goes away, so no
@@ -596,6 +743,9 @@ pub struct PublicationHandle {
     /// promoted/refreshed tool enforces the same delegation policy as the
     /// initial publish.
     delegation: Option<Arc<DelegationGate>>,
+    /// Invoke-path policy reused when serving tools that appear on refresh, so
+    /// a refreshed tool enforces the same policy as the initial publish.
+    policy: Option<Arc<dyn InvokePolicy>>,
     /// Payment admission gate reused likewise — a tool that appears priced
     /// on refresh enforces the same payment policy as the initial publish.
     payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
@@ -680,12 +830,13 @@ impl PublicationHandle {
                 // tool by its original `mcp_name` (they differ for a sanitized
                 // name).
                 let handler = WrapInvokeHandler::new(
-                    Arc::clone(&self.client),
+                    Arc::clone(&self.client) as Arc<dyn ToolInvoker>,
                     lt.mcp_name.clone(),
                     self.scope.clone(),
                 )
                 .with_service(tool_id.clone())
                 .with_delegation(self.delegation.clone())
+                .with_policy(self.policy.clone())
                 .with_payment(
                     lt.descriptor.pricing_terms.is_some(),
                     self.payment_admission.clone(),
@@ -750,6 +901,160 @@ impl PublicationHandle {
         // `self` drops here: tool handles reverse their serve_rpc, the client
         // kills the wrapped process, and the Registration drop is a no-op
         // (already de-registered).
+        result
+    }
+}
+
+/// A live publication of a node's **own** local tools (via
+/// [`ServerPublisher::publish_tools`]). Like [`PublicationHandle`] but backed
+/// by a [`ToolInvoker`] instead of a wrapped child process: there is no
+/// process to keep alive and no server to re-read, so
+/// [`refresh`](Self::refresh) reconciles against an **explicitly supplied**
+/// new tool set (the node knows its own tools). [`withdraw`](Self::withdraw)
+/// reverses everything immediately; dropping the handle stops the tool
+/// services and leaves the announcement to the next registry change (Drop
+/// cannot announce).
+pub struct LocalPublicationHandle {
+    /// Backs every served tool. Held so a mesh call can reach the invoker for
+    /// this publication's lifetime (each handler also holds its own clone).
+    invoker: Arc<dyn ToolInvoker>,
+    /// `tool_id -> serve handle`. Dropping a handle reverses its `serve_rpc`.
+    /// Keyed so [`refresh`](Self::refresh) can reconcile against the new set.
+    handles: HashMap<String, ServeHandle>,
+    /// Lowering context reused when re-lowering on refresh (per-publication
+    /// version / credential status / substitutability).
+    ctx: LoweringContext,
+    /// Owner scope reused when serving tools that appear on refresh.
+    scope: OwnerScope,
+    /// Delegation gate reused when serving tools that appear on refresh, so a
+    /// refreshed tool enforces the same delegation policy as the initial
+    /// publish.
+    delegation: Option<Arc<DelegationGate>>,
+    /// Invoke-path policy reused when serving tools that appear on refresh, so
+    /// a refreshed tool enforces the same policy as the initial publish.
+    policy: Option<Arc<dyn InvokePolicy>>,
+    /// The tool ids served, sorted, for diagnostics.
+    tools: Vec<String>,
+    /// Tool names skipped because they have no usable id (an empty name).
+    skipped: Vec<String>,
+    /// The publisher linkage; its Drop de-registers this publication.
+    registration: Registration,
+}
+
+impl LocalPublicationHandle {
+    /// The tool ids this publication serves.
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+
+    /// Tool names skipped because they have no usable id (an empty name).
+    pub fn skipped_tools(&self) -> &[String] {
+        &self.skipped
+    }
+
+    /// Reconcile the mesh against a new local tool set: announce the merged
+    /// set, serve tools that appeared, and withdraw tools that vanished. The
+    /// node calls this when its own tool inventory changes — the local
+    /// analogue of [`PublicationHandle::refresh`] (which re-reads a wrapped
+    /// server), with the same rollback discipline: a failed re-announce or a
+    /// tool-id collision restores the prior contribution and re-announces it.
+    pub async fn refresh(&mut self, tools: &[Tool]) -> Result<RefreshDelta, WrapError> {
+        let (lowered, skipped) = lower_local_tools(tools, &self.ctx);
+        let desired: HashSet<String> = lowered
+            .iter()
+            .map(|lt| lt.descriptor.tool_id.clone())
+            .collect();
+
+        let shared = &self.registration.shared;
+        let mesh = &self.registration.mesh;
+        let id = self.registration.id;
+        let _sync = shared.sync.lock().await;
+
+        // Swap in the new contribution, keeping the prior one so any failure
+        // past this point can restore it (mirrors `PublicationHandle::refresh`).
+        let prior = shared.swap(
+            id,
+            Contribution {
+                lowered: lowered.clone(),
+                scope: self.scope.clone(),
+            },
+        );
+
+        if let Err(e) = shared.sync_mesh(mesh).await {
+            shared.restore(id, prior.clone());
+            return Err(rollback_result(e, shared.sync_mesh(mesh).await));
+        }
+
+        // Serve tools that appeared. On a serve failure, undo this refresh:
+        // drop the handles served in this call, restore the prior contribution,
+        // and re-announce the prior union.
+        let mut added = Vec::new();
+        for lt in &lowered {
+            let tool_id = lt.descriptor.tool_id.clone();
+            if !self.handles.contains_key(&tool_id) {
+                let handler = WrapInvokeHandler::new(
+                    Arc::clone(&self.invoker),
+                    lt.mcp_name.clone(),
+                    self.scope.clone(),
+                )
+                .with_service(tool_id.clone())
+                .with_delegation(self.delegation.clone())
+                .with_policy(self.policy.clone());
+                match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
+                    Ok(handle) => {
+                        self.handles.insert(tool_id.clone(), handle);
+                        added.push(tool_id);
+                    }
+                    Err(e) => {
+                        for served in &added {
+                            self.handles.remove(served);
+                        }
+                        shared.restore(id, prior.clone());
+                        let serve_err = WrapError::Serve {
+                            tool: tool_id,
+                            reason: e.to_string(),
+                        };
+                        return Err(rollback_result(serve_err, shared.sync_mesh(mesh).await));
+                    }
+                }
+            }
+        }
+        // Withdraw tools that vanished (dropping the handle reverses serve_rpc).
+        let removed: Vec<String> = self
+            .handles
+            .keys()
+            .filter(|id| !desired.contains(*id))
+            .cloned()
+            .collect();
+        for tool_id in &removed {
+            self.handles.remove(tool_id);
+        }
+
+        self.tools = self.handles.keys().cloned().collect();
+        self.tools.sort();
+        self.skipped = skipped;
+        added.sort();
+        Ok(RefreshDelta {
+            added,
+            removed: {
+                let mut r = removed;
+                r.sort();
+                r
+            },
+        })
+    }
+
+    /// Withdraw this publication immediately: re-announce the remaining
+    /// publications' union so peers stop advertising this publication's tools,
+    /// withdraw the describe service if idle, then stop the tool services
+    /// (they drop with `self`). Other publications on the node are untouched.
+    pub async fn withdraw(self) -> Result<(), WrapError> {
+        let shared = Arc::clone(&self.registration.shared);
+        let mesh = Arc::clone(&self.registration.mesh);
+        let _sync = shared.sync.lock().await;
+        shared.remove(self.registration.id);
+        let result = shared.sync_mesh(&mesh).await;
+        shared.drop_describe_if_idle();
         result
     }
 }

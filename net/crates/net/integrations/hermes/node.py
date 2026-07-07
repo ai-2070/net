@@ -53,6 +53,26 @@ _lock = threading.Lock()
 # the wheel has the `delegation` feature, else None (un-delegated dev node).
 _state: Optional[Tuple[object, object, str, object]] = None
 
+# The operator device-enrollment coordinator + its live serve handle, built
+# lazily on first mesh-admin tool use (needs a root seed). `(operator, handle)`.
+_operator: Optional[Tuple[object, object]] = None
+
+# The device-side silent-renewal service (device-mode: this machine is an
+# enrolled device keeping its own grant fresh), or None. Started at node build.
+_renewal: Optional[object] = None
+
+# The `root -> device` grant lifetime an enrolled device receives: **1 year**
+# (the token ceiling). The lifecycle model:
+#   * long grant so an enrolled device survives restarts without re-pairing;
+#   * **silent, automatic renewal** while the device is healthy and root policy
+#     permits (re-issued before expiry, re-recording the device so its expiry
+#     stays fresh) — a follow-on to this slice;
+#   * **manual revocation is always immediate** — bumping the device's floor
+#     denies its next invocation regardless of the grant's remaining lifetime;
+#   * an **expiry warning** surfaces (via `net_mesh_devices`) before the annual
+#     grant lapses, so a device that renewal couldn't reach gets attention.
+_GRANT_TTL_SECONDS = 365 * 24 * 60 * 60
+
 
 def _config() -> dict:
     return {
@@ -103,7 +123,13 @@ def _build() -> Tuple[object, object, str, object]:
                 "net plugin: delegation surface unavailable (%s); running un-delegated", e
             )
 
-    mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed)
+    # `permissive_channels=True` matches the Rust default (no strict
+    # ChannelConfigRegistry on the node). Required for the mesh nRPC surface —
+    # capability invoke *and* enrollment serving use reply channels whose names
+    # are dynamic per-caller-origin and can't be pre-registered. Capability
+    # security is unaffected (owner-scope / consent / delegation gate at the
+    # capability layer, not the channel layer).
+    mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed, permissive_channels=True)
 
     if cfg["peers"]:
         try:
@@ -158,6 +184,14 @@ def _build() -> Tuple[object, object, str, object]:
                 "net plugin: mesh shutdown during init rollback failed", exc_info=True
             )
         raise
+    # Device-mode (best-effort): if this machine is an enrolled device, keep its
+    # own grant silently fresh. Never let a device-renewal setup failure break
+    # the node — its capability / operator features still load.
+    try:
+        _start_device_renewal(mesh)
+    except Exception:  # noqa: BLE001
+        logger.warning("net plugin: device-renewal setup failed", exc_info=True)
+
     logger.info(
         "net plugin: node up (id=%s, bind=%s, pin_store=%s, delegated=%s)",
         getattr(mesh, "node_id", "?"),
@@ -253,15 +287,218 @@ def delegation_valid_for_invoke() -> bool:
         return False
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("net plugin: %s is not an integer (%r); using default", name, raw)
+        return default
+
+
+def _probe_writable(path: str) -> None:
+    """Prove `path`'s location is writable — create the parent directory and
+    write + remove a probe file — so a first-run enrollment can abort *before*
+    the join burns its single-use invite. Raises on failure."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    probe = path + ".probe"
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"net-mesh enrollment write probe")
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+
+def _start_device_renewal(mesh_handle) -> None:
+    """Device-mode: if this machine is an enrolled device
+    (``NET_MESH_DEVICE_ENROLLMENT`` points at a persisted enrollment, or
+    ``NET_MESH_INVITE`` is set for a first run), load or create the enrollment
+    and start the silent-renewal loop so its `root -> device` grant stays fresh
+    without re-pairing. Best-effort — invoked under a try/except by the caller,
+    so a device-renewal failure never breaks the node.
+    """
+    global _renewal
+    path = (os.environ.get("NET_MESH_DEVICE_ENROLLMENT") or "").strip() or None
+    if not path:
+        return  # not configured as a self-renewing device
+
+    import time
+
+    from net import DeviceEnrollment, Identity, InviteToken
+
+    from .renewal import RenewalService
+
+    enrollment = DeviceEnrollment.load(path)  # None if not enrolled yet
+    if enrollment is None:
+        invite = (os.environ.get("NET_MESH_INVITE") or "").strip() or None
+        if not invite:
+            logger.info(
+                "net plugin: no device enrollment at %s and no NET_MESH_INVITE; "
+                "device renewal idle",
+                path,
+            )
+            return
+        # First run: generate our own device key, join the operator's mesh, and
+        # persist the enrollment so future starts skip re-pairing.
+        #
+        # The join burns the single-use invite and admits a key that exists
+        # only in this process, so prove the enrollment path is writable
+        # BEFORE committing — an unwritable path (typo, permissions, read-only
+        # fs) must abort while the invite is still redeemable, not strand an
+        # admitted device whose every restart replays a spent invite with a
+        # fresh, discarded key.
+        _probe_writable(path)
+        device = Identity.generate()
+        name = (os.environ.get("NET_MESH_DEVICE_NAME") or "").strip() or "device"
+        chain = mesh_handle.join(device, invite, name, [])
+        rendezvous = InviteToken.decode(invite).rendezvous
+        enrollment = DeviceEnrollment(device, chain, rendezvous, int(time.time()))
+        save_error = None
+        for _ in range(3):
+            try:
+                enrollment.save(path)
+                save_error = None
+                break
+            except Exception as e:  # noqa: BLE001 — retried; surfaced loudly below
+                save_error = e
+                time.sleep(0.2)
+        if save_error is None:
+            logger.info("net plugin: enrolled as a new device (persisted to %s)", path)
+        else:
+            # The invite is already spent and the admitted key lives only in
+            # memory. Keep the session alive on the in-memory enrollment (the
+            # renewal loop below re-attempts persistence on every renewal) but
+            # say so loudly — a restart before a successful save needs a fresh
+            # invite.
+            logger.error(
+                "net plugin: enrolled as a new device but persisting to %s "
+                "failed (%s); the enrollment is only in memory — a restart "
+                "before a successful save will need a fresh invite",
+                path,
+                save_error,
+            )
+
+    svc = RenewalService(
+        mesh_handle,
+        enrollment,
+        path,
+        check_interval=_env_int("NET_MESH_RENEWAL_INTERVAL", 24 * 60 * 60),
+        renewal_window=_env_int("NET_MESH_RENEWAL_WINDOW", 30 * 24 * 60 * 60),
+    )
+    svc.start()
+    _renewal = svc
+    logger.info("net plugin: silent device renewal started")
+
+
+def mesh():
+    """The embedded :class:`net.NetMesh` — the raw node handle (for enrollment
+    rendezvous / serving)."""
+    return get_state()[0]
+
+
+def _build_operator(mesh_handle) -> Tuple[object, object]:
+    """Build the operator device-enrollment coordinator from the root seed and
+    start serving enrollment (auto — the invite is the authorization) on the
+    already-built `mesh_handle`, so minted invites are dialable. Returns
+    ``(operator, serve_handle)``.
+
+    Takes the mesh explicitly rather than calling ``mesh()`` because the caller
+    already holds ``_lock`` — and ``mesh()`` → ``get_state()`` re-acquires it
+    (``threading.Lock`` is not reentrant, so that would deadlock).
+    """
+    from net import Identity, OperatorEnrollment
+
+    cfg = _config()
+    if not cfg["identity_seed"]:
+        raise RuntimeError(
+            "net plugin: mesh device enrollment needs the user root identity; "
+            "set NET_MESH_IDENTITY_SEED"
+        )
+    root = Identity.from_seed(bytes.fromhex(cfg["identity_seed"]))
+
+    # Store paths: the machine-shared defaults (the same files `net wrap` /
+    # `net identity revoke` use) unless overridden — tests point these at a
+    # temp dir so they never touch the real inventory.
+    dev = (os.environ.get("NET_MESH_DEVICE_STORE") or "").strip() or None
+    rev = (os.environ.get("NET_MESH_REVOCATION_STORE") or "").strip() or None
+    if dev and rev:
+        operator = OperatorEnrollment(root, dev, rev)
+    elif dev or rev:
+        # Half an override is a misconfiguration trap: this used to fall back
+        # to the machine-shared production stores for BOTH files, so a test
+        # that set only one var silently wrote device records / revocations
+        # into the real inventory it meant to avoid. Refuse loudly instead of
+        # guessing which half was intended.
+        missing = "NET_MESH_REVOCATION_STORE" if dev else "NET_MESH_DEVICE_STORE"
+        present = "NET_MESH_DEVICE_STORE" if dev else "NET_MESH_REVOCATION_STORE"
+        raise RuntimeError(
+            f"net plugin: {present} is set but {missing} is not — the store "
+            "overrides must be set together (mixing an override with the "
+            "machine-shared default would split the inventory)"
+        )
+    else:
+        operator = OperatorEnrollment.with_default_paths(root)
+
+    # Serve enrollment on the node so an operator's invite can actually be
+    # redeemed. Auto-admit (invite-as-authorization) is the v1 model; an
+    # operator-approval-gated serve is the follow-up.
+    handle = mesh_handle.serve_enrollment_auto(operator, _GRANT_TTL_SECONDS)
+    return (operator, handle)
+
+
+def operator():
+    """The :class:`net.OperatorEnrollment` for this node's root, serving
+    enrollment on the node. Built once (needs ``NET_MESH_IDENTITY_SEED``).
+
+    Raises :class:`RuntimeError` when no root seed is set — device enrollment
+    is an operator action that requires the user root to sign delegations.
+    """
+    global _operator
+    if _operator is not None:
+        return _operator[0]
+    # Fail fast (and cheaply — no node build) when there's no root to sign as.
+    if not _config()["identity_seed"]:
+        raise RuntimeError(
+            "net plugin: mesh device enrollment needs the user root identity; "
+            "set NET_MESH_IDENTITY_SEED"
+        )
+    # Build the node BEFORE taking our lock: `mesh()` → `get_state()` acquires
+    # `_lock` itself, and `threading.Lock` is not reentrant.
+    mesh_handle = mesh()
+    with _lock:
+        if _operator is None:
+            _operator = _build_operator(mesh_handle)
+        return _operator[0]
+
+
 def shutdown() -> None:
     """Tear the node down (best-effort, idempotent). Called at session end."""
-    global _state
+    global _state, _operator, _renewal
     with _lock:
-        if _state is None:
-            return
-        mesh = _state[0]
+        op_handle = _operator[1] if _operator is not None else None
+        _operator = None
+        renewal = _renewal
+        _renewal = None
+        mesh_handle = _state[0] if _state is not None else None
         _state = None
-    try:
-        mesh.shutdown()
-    except Exception as e:  # noqa: BLE001 — session end must not fail on cleanup
-        logger.debug("net plugin: shutdown error: %s", e)
+    if renewal is not None:
+        try:
+            renewal.stop()
+        except Exception:  # noqa: BLE001 — cleanup must not fail session end
+            logger.debug("net plugin: renewal stop failed", exc_info=True)
+    if op_handle is not None:
+        try:
+            op_handle.stop()
+        except Exception:  # noqa: BLE001 — cleanup must not fail session end
+            logger.debug("net plugin: enrollment serve-handle stop failed", exc_info=True)
+    if mesh_handle is not None:
+        try:
+            mesh_handle.shutdown()
+        except Exception as e:  # noqa: BLE001 — session end must not fail on cleanup
+            logger.debug("net plugin: shutdown error: %s", e)

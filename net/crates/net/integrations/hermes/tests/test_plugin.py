@@ -18,11 +18,20 @@ pytest.importorskip("net")
 pytest.importorskip("net_sdk")
 
 TOOL_NAMES = {
+    # Capability meta-tools.
     "net_search_capabilities",
     "net_describe_capability",
     "net_invoke_capability",
     "net_list_pinned_capabilities",
     "net_request_pin",
+    # Device-enrollment (mesh admin) tools (V2 Phase 1).
+    "net_mesh_invite",
+    "net_mesh_devices",
+    "net_mesh_revoke",
+    # Agent-to-agent task-handoff tools (V2 Phase 3).
+    "net_a2a_submit",
+    "net_a2a_status",
+    "net_a2a_cancel",
 }
 
 
@@ -33,7 +42,7 @@ def _run(coro):
 # --- registration ----------------------------------------------------------
 
 
-def test_register_wires_five_tools_and_hook(plugin, ctx):
+def test_register_wires_all_tools_and_hook(plugin, ctx):
     plugin.register(ctx)
     assert set(ctx.tools) == TOOL_NAMES
     for name, entry in ctx.tools.items():
@@ -45,6 +54,40 @@ def test_register_wires_five_tools_and_hook(plugin, ctx):
         assert callable(entry["handler"])
     assert "on_session_start" in ctx.hooks
     assert "on_session_end" in ctx.hooks
+
+
+def test_session_end_teardown_survives_a_failing_stop(plugin, monkeypatch):
+    # One service's stop() raising must not skip the rest of the teardown —
+    # that would leak the mesh node, the renewal daemon thread, and the served
+    # RPC handles.
+    stopped = []
+
+    class _Svc:
+        def __init__(self, label, fail=False):
+            self._label = label
+            self._fail = fail
+
+        def stop(self):
+            stopped.append(self._label)
+            if self._fail:
+                raise RuntimeError(f"{self._label} refuses to stop")
+
+    shutdowns = []
+    monkeypatch.setattr(plugin.node, "shutdown", lambda: shutdowns.append(True))
+    monkeypatch.setattr(plugin, "_a2a_service", _Svc("a2a", fail=True))
+    monkeypatch.setattr(plugin, "_federation", _Svc("federation", fail=True))
+    monkeypatch.setattr(plugin, "_provider", _Svc("provider"))
+    monkeypatch.setattr(plugin, "_promotion", _Svc("promotion"))
+
+    plugin._on_session_end()
+
+    assert stopped == ["a2a", "federation", "provider", "promotion"]
+    assert shutdowns == [True], "node.shutdown still ran"
+    # The handles are cleared, so a second call is a clean no-op.
+    assert plugin._a2a_service is None and plugin._federation is None
+    assert plugin._provider is None and plugin._promotion is None
+    plugin._on_session_end()
+    assert stopped == ["a2a", "federation", "provider", "promotion"]
 
 
 def test_descriptions_disambiguate_from_local_tool_search(plugin, ctx):

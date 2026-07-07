@@ -55,7 +55,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-unit-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # `--lib` runs EVERY in-source `#[cfg(test)]` unit; the broad
       # `$UNIT_FEATURES` set is what makes feature-gated modules (meshos,
@@ -103,7 +103,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-integration-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # nextest gives us per-test process isolation, smarter scheduling,
       # and `--no-fail-fast` semantics across grouped test binaries.
@@ -401,7 +401,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-loom-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # Loom tests exhaustively explore thread interleavings; release
       # mode is mandatory (debug builds are too slow to converge in CI
@@ -444,7 +444,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-sdk-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # Feature set covers every SDK integration test except
       # `redis_dedup_contract` (gated on `redis`, deferred until CI
@@ -522,7 +522,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-node-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install npm dependencies
         run: npm i
@@ -588,7 +588,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-sdk-ts-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-sdk-ts-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # `sdk-ts/package.json` carries `@net-mesh/core: file:../bindings/node`
       # as a devDependency, so `npm i` over there picks up the sibling
@@ -673,7 +673,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-python-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # maturin develop requires a virtualenv (refuses to install into
       # the system Python). Create one and prepend it to PATH so every
@@ -709,7 +709,12 @@ jobs:
       # feature list, so nothing else re-enables it here and we don't
       # rely on maturin merging `[tool.maturin] features` with CLI args.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,payments,extension-module
+        # `publish` (V2 Phase 2 — NetMesh.publish_tools) and `a2a` (V2 Phase 3 —
+        # NetMesh.serve_a2a / submit_task / task_status / cancel_task) are shipped
+        # default features but this job builds `--no-default-features`, so they
+        # must be listed explicitly or `test_publish.py` / `test_a2a.py` fail with
+        # `AttributeError: 'NetMesh' object has no attribute ...`.
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
@@ -796,7 +801,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-go-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # The Go bindings link against SEVEN cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
@@ -902,7 +907,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # Stage 4 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
       # code (lib + bins) is denied for the four panic-hygiene + unsafe
@@ -976,7 +981,10 @@ jobs:
             # earlier set even omitted `meshdb`, which `python-tests`
             # builds) — without them those pyo3 surfaces went unlinted.
             # `consent` / `mcp` are the P1 consent + bridge-helper modules.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp
+            # `delegation` / `publish` / `a2a` add the V2 enrollment, local-tool
+            # publication, and A2A binding modules so clippy lints them (they
+            # match the `python-tests` build set).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -1062,7 +1070,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-clippy-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-ffi-${{ matrix.crate.name }}-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy
         working-directory: ${{ matrix.crate.path }}
@@ -1135,7 +1143,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # napi-rs links `napi_*` runtime symbols at load time (Node
       # provides them inside its embedded V8); a standalone
@@ -1388,7 +1396,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-cli-v2-${{ hashFiles('**/Cargo.lock') }}
 
       # Toolchains for the typegen downstream type-checks (E-2 / E-3). Without
       # these, tests/typegen_downstream_{ts,python}.rs self-skip; installing
@@ -1441,7 +1449,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-aggregator-daemon-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-aggregator-daemon-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run net-aggregator-daemon tests
         run: cargo test -p net-aggregator-daemon
@@ -1491,7 +1499,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-mcp-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-mcp-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy (production code, strict)
         run: cargo clippy -p net-mesh-mcp --lib --bins --features fixture -- -D warnings
@@ -1550,7 +1558,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-doc-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features

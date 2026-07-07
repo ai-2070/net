@@ -46,6 +46,24 @@ mod capability_gateway;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+// Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
+// + the operator device-lifecycle facade. Thin wrappers over
+// `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
+// SDK `net` surface, returns `DelegationChain` handles).
+#[cfg(feature = "delegation")]
+mod enrollment;
+// Publish this node's OWN local tools as mesh capabilities (Hermes V2 Phase 2):
+// the inverse of `net wrap`, backed by a Python async callback. Thin wrappers
+// over `net_mcp::wrap::ServerPublisher::publish_tools`; gated on `publish`
+// (mcp + delegation + cortex).
+#[cfg(feature = "publish")]
+mod publish;
+// Agent-to-agent task handoff (Hermes V2 Phase 3): serve the A2A task lifecycle
+// backed by a Python async task-executor callback + submit/status/cancel by node
+// id. Thin wrappers over `net_sdk::{a2a,mesh_a2a}`; gated on `a2a`
+// (delegation + cortex).
+#[cfg(feature = "a2a")]
+mod a2a;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -1367,6 +1385,14 @@ mod mesh_bindings {
             Ok(node.node_id())
         }
 
+        /// This node's bound local UDP address (e.g. ``"127.0.0.1:54321"``).
+        /// With a ``:0`` bind this resolves the OS-assigned port, so a peer can
+        /// be told where to `connect`.
+        #[getter]
+        fn local_addr(&self) -> PyResult<String> {
+            Ok(self.get_node()?.local_addr().to_string())
+        }
+
         /// Connect to a peer (initiator side).
         #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
         fn connect(
@@ -1438,6 +1464,195 @@ mod mesh_bindings {
             let _guard = self.runtime.enter();
             node.start();
             Ok(())
+        }
+
+        /// The invite `rendezvous` locator for this node (address + Noise
+        /// static key + node id), to pass to `OperatorEnrollment.invite`.
+        /// Devices dial it via `join`. (Hermes V2 Phase 1.)
+        #[cfg(feature = "delegation")]
+        fn rendezvous_string(&self) -> PyResult<String> {
+            Ok(crate::enrollment::mesh_rendezvous_string(
+                self.node_arc_clone()?,
+            ))
+        }
+
+        /// Device-side enrollment: enroll `device`'s key into the mesh named by
+        /// the `invite` string, under `name` + `tags`, returning the verified
+        /// `root -> device` `DelegationChain`. This node must be `start()`ed and
+        /// built with `permissive_channels=True` (the enrollment nRPC uses
+        /// dynamic per-caller reply channels the strict registry rejects).
+        #[cfg(feature = "delegation")]
+        fn join(
+            &self,
+            py: Python<'_>,
+            device: &crate::identity::Identity,
+            invite: &str,
+            name: &str,
+            tags: Vec<String>,
+        ) -> PyResult<crate::delegation::PyDelegationChain> {
+            crate::enrollment::mesh_join(
+                py,
+                self.node_arc_clone()?,
+                &self.runtime,
+                device,
+                invite.to_string(),
+                name.to_string(),
+                tags,
+            )
+        }
+
+        /// Operator-side: serve enrollment on this node (auto — the invite is
+        /// the authorization). Hold the returned handle for as long as
+        /// enrollment should stay open. This node must be `start()`ed and built
+        /// with `permissive_channels=True` (the enrollment nRPC uses dynamic
+        /// per-caller reply channels the strict registry rejects).
+        #[cfg(feature = "delegation")]
+        #[pyo3(signature = (operator, grant_ttl_seconds, max_depth=None))]
+        fn serve_enrollment_auto(
+            &self,
+            operator: &crate::enrollment::PyOperatorEnrollment,
+            grant_ttl_seconds: u64,
+            max_depth: Option<u8>,
+        ) -> PyResult<crate::enrollment::PyEnrollmentServeHandle> {
+            let depth = max_depth.unwrap_or(net_sdk::delegation::DEFAULT_DELEGATION_DEPTH);
+            crate::enrollment::mesh_serve_enrollment_auto(
+                self.node_arc_clone()?,
+                &self.runtime,
+                operator.arc(),
+                std::time::Duration::from_secs(grant_ttl_seconds),
+                depth,
+            )
+        }
+
+        /// Device-side renewal: refresh the grant carried by `enrollment` over
+        /// the mesh, returning the verified fresh `root -> device`
+        /// `DelegationChain`. This node must be `start()`ed and built with
+        /// `permissive_channels=True`. (Requires the `delegation` feature.)
+        #[cfg(feature = "delegation")]
+        fn renew(
+            &self,
+            py: Python<'_>,
+            enrollment: &crate::enrollment::PyDeviceEnrollment,
+        ) -> PyResult<crate::delegation::PyDelegationChain> {
+            crate::enrollment::mesh_renew(py, self.node_arc_clone()?, &self.runtime, enrollment)
+        }
+
+        /// Publish this node's OWN local tools as mesh capabilities (V2 Phase 2)
+        /// — the inverse of `net wrap`. `tools` is a list of
+        /// `(name, description|None, input_schema_json)` (the input schema as a
+        /// JSON string). `callback` is an **async** callable
+        /// `async (tool_name: str, args_json: str) -> str | (str, bool)` invoked
+        /// when a consumer calls a tool; its return is the tool's text output
+        /// (a `(text, is_error)` tuple flags a tool-level error). A consumer
+        /// discovers + invokes these through the ordinary
+        /// `AsyncCapabilityGateway`. `owner_origin` scopes admission: an
+        /// `origin_hash` admits only that caller; `None` admits only **this
+        /// node itself** (fail-closed default — the tools are backed by an
+        /// arbitrary local callback). Pass `allow_any_caller=True` to
+        /// explicitly admit every mesh peer (overrides `owner_origin`; gate
+        /// invocations yourself, e.g. with an approval callback). Returns a
+        /// handle that must be held to keep the tools published. This node
+        /// must be `start()`ed and built with `permissive_channels=True`.
+        /// (Requires the `publish` feature.)
+        #[cfg(feature = "publish")]
+        #[pyo3(signature = (tools, callback, version=String::new(), owner_origin=None, allow_any_caller=false))]
+        fn publish_tools(
+            &self,
+            py: Python<'_>,
+            tools: Vec<(String, Option<String>, String)>,
+            callback: pyo3::Py<pyo3::PyAny>,
+            version: String,
+            owner_origin: Option<u64>,
+            allow_any_caller: bool,
+        ) -> PyResult<crate::publish::PyLocalPublicationHandle> {
+            crate::publish::mesh_publish_tools(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                tools,
+                callback,
+                version,
+                owner_origin,
+                allow_any_caller,
+            )
+        }
+
+        /// Serve the agent-to-agent (A2A) task lifecycle on this node (V2 Phase
+        /// 3), backed by a Python **async** task-executor `callback`
+        /// `async (task_id, prompt, context_refs, tags) -> str` returning the
+        /// result's artifact ref. A sibling in-root agent hands off a job with
+        /// `submit_task`. Hold the returned handle to keep accepting tasks. This
+        /// node must be `start()`ed. (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn serve_a2a(
+            &self,
+            callback: pyo3::Py<pyo3::PyAny>,
+        ) -> PyResult<crate::a2a::PyA2aServeHandle> {
+            crate::a2a::mesh_serve_a2a(self.node_arc_clone()?, self.runtime.clone(), callback)
+        }
+
+        /// Hand off a task to the executor at `target_node_id`: `prompt` plus
+        /// optional Datafort `context_refs` (the executor doesn't share your
+        /// memory) and routing `tags`. Returns the accepted task id; raises if
+        /// the executor rejected it. The node must already be connected to
+        /// `target_node_id`. (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        #[pyo3(signature = (target_node_id, prompt, context_refs=Vec::new(), tags=Vec::new()))]
+        fn submit_task(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            prompt: String,
+            context_refs: Vec<String>,
+            tags: Vec<String>,
+        ) -> PyResult<String> {
+            crate::a2a::mesh_submit_task(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                prompt,
+                context_refs,
+                tags,
+            )
+        }
+
+        /// The executor's status for `task_id` as a JSON string
+        /// (`{brief, state, updated_at}`), or ``None`` if unknown. (Requires the
+        /// `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn task_status(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            task_id: String,
+        ) -> PyResult<Option<String>> {
+            crate::a2a::mesh_task_status(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                task_id,
+            )
+        }
+
+        /// Cancel `task_id` on the executor; returns whether it was in flight.
+        /// The executor's coroutine is cancelled — the remote work stops.
+        /// (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn cancel_task(
+            &self,
+            py: Python<'_>,
+            target_node_id: u64,
+            task_id: String,
+        ) -> PyResult<bool> {
+            crate::a2a::mesh_cancel_task(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+                task_id,
+            )
         }
 
         /// Send raw JSON to a direct peer.
@@ -3174,6 +3389,25 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "GATEWAY_DELEGATION_CHANNEL",
             delegation::GATEWAY_DELEGATION_CHANNEL,
         )?;
+        // Device enrollment (V2 Phase 1).
+        m.add_class::<enrollment::PyInviteToken>()?;
+        m.add_class::<enrollment::PyJoinRequest>()?;
+        m.add_class::<enrollment::PyJoinOutcome>()?;
+        m.add_class::<enrollment::PyDeviceRecord>()?;
+        m.add_class::<enrollment::PyOperatorEnrollment>()?;
+        m.add_class::<enrollment::PyEnrollmentServeHandle>()?;
+        m.add_class::<enrollment::PyDeviceEnrollment>()?;
+        m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
+    }
+    #[cfg(feature = "publish")]
+    {
+        // Local tool publication (V2 Phase 2, Slice B).
+        m.add_class::<publish::PyLocalPublicationHandle>()?;
+    }
+    #[cfg(feature = "a2a")]
+    {
+        // Agent-to-agent task handoff (V2 Phase 3).
+        m.add_class::<a2a::PyA2aServeHandle>()?;
     }
     #[cfg(feature = "cortex")]
     {

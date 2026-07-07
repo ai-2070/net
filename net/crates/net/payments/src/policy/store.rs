@@ -156,7 +156,7 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
+            // `mode` is inherent on tokio's OpenOptions (no trait import).
             opts.mode(0o600);
         }
         let mut file = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;

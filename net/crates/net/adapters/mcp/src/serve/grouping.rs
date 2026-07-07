@@ -84,9 +84,10 @@ pub fn is_collapsible(info: &BridgedToolInfo) -> bool {
 /// tools collapse only when these fingerprints match. Excludes the provider and
 /// the server version — two providers on slightly different builds with the
 /// same contract are still interchangeable — and includes what a caller
-/// observably depends on (id, tier, schemas). The schemas serialize
-/// deterministically (serde_json orders object keys), so the fingerprint is
-/// stable across providers announcing the same tool.
+/// observably depends on (id, tier, schemas). Schemas are folded in via the
+/// order-invariant [`crate::wrap::schema_hash`], so the fingerprint is stable
+/// across providers announcing the same tool with cosmetic ordering
+/// differences (object key order, `required` order).
 ///
 /// It also folds in the two collapse-gating fields [`is_collapsible`] checks —
 /// `substitutability` and `credential_status`. Grouping is unaffected (every
@@ -104,10 +105,16 @@ pub fn descriptor_fingerprint(info: &BridgedToolInfo) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     info.tool_id.hash(&mut hasher);
     info.compat_tier.hash(&mut hasher);
-    info.input_schema.to_string().hash(&mut hasher);
+    // Order-invariant schema hashing (`wrap::schema_hash`: sorted keys +
+    // sorted set-like `required` arrays) instead of `to_string()`, which is
+    // sensitive to key order under serde_json's `preserve_order` feature and
+    // to `required`-array order always — substitutable providers announcing
+    // the same contract with cosmetic ordering differences must still
+    // collapse into one group.
+    crate::wrap::schema_hash(&info.input_schema).hash(&mut hasher);
     info.output_schema
         .as_ref()
-        .map(|v| v.to_string())
+        .map(crate::wrap::schema_hash)
         .hash(&mut hasher);
     info.substitutability.hash(&mut hasher);
     info.credential_status.hash(&mut hasher);
@@ -205,6 +212,7 @@ mod tests {
         cred: &str,
         schema: serde_json::Value,
     ) -> BridgedToolInfo {
+        let schema_hash = crate::wrap::schema_hash(&schema);
         BridgedToolInfo {
             tool_id: tool.to_string(),
             name: tool.to_string(),
@@ -222,11 +230,40 @@ mod tests {
             },
             visibility: "owner_only".to_string(),
             invocation_scope: "same_root_identity".to_string(),
+            schema_hash,
         }
     }
 
     fn echo_schema() -> serde_json::Value {
         json!({ "type": "object", "properties": { "message": { "type": "string" } } })
+    }
+
+    #[test]
+    fn fingerprint_is_invariant_to_cosmetic_schema_ordering() {
+        // Two substitutable providers announcing the same contract with a
+        // different `required` order (or key order) must fingerprint — and so
+        // collapse — together; `to_string()` hashing used to split them.
+        let a = info(
+            "echo",
+            true,
+            "none",
+            json!({ "type": "object", "required": ["a", "b"] }),
+        );
+        let b = info(
+            "echo",
+            true,
+            "none",
+            json!({ "required": ["b", "a"], "type": "object" }),
+        );
+        assert_eq!(descriptor_fingerprint(&a), descriptor_fingerprint(&b));
+        // A genuinely different contract still splits.
+        let c = info(
+            "echo",
+            true,
+            "none",
+            json!({ "type": "object", "required": ["a", "c"] }),
+        );
+        assert_ne!(descriptor_fingerprint(&a), descriptor_fingerprint(&c));
     }
 
     #[test]

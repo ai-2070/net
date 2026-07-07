@@ -28,6 +28,7 @@ pub mod credentials;
 pub mod delegation;
 pub mod descriptor;
 pub mod invoke;
+pub mod policy;
 pub mod session;
 pub mod stdio;
 
@@ -36,10 +37,14 @@ pub use delegation::{
     build_challenge, build_envelope, AuditSink, DelegationAudit, DelegationGate, DelegationReject,
     DelegationSigner, HDR_DELEGATION, HDR_DELEGATION_SIG,
 };
-pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
-pub use invoke::{OwnerScope, WrapInvokeHandler, ERR_DELEGATION};
+pub use descriptor::{
+    lower_tool, schema_hash, schema_hash_key, LoweredTool, LoweringContext, Substitutability,
+};
+pub use invoke::{OwnerScope, ToolInvoker, WrapInvokeHandler, ERR_DELEGATION, ERR_POLICY};
+pub use policy::{AllowAllPolicy, InvokePolicy, PolicyContext, PolicyDecision};
 pub use session::{
-    build_capability_set, PublicationHandle, RefreshDelta, ServerPublisher, WrapConfig, WrapError,
+    build_capability_set, LocalPublicationHandle, PublicationHandle, RefreshDelta, ServerPublisher,
+    WrapConfig, WrapError,
 };
 pub use stdio::StdioMcpClient;
 

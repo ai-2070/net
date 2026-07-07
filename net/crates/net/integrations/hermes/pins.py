@@ -30,7 +30,7 @@ from . import node
 
 logger = logging.getLogger(__name__)
 
-#: The toolset promoted pins live in (distinct from the five meta-tools' "net").
+#: The toolset promoted pins live in (distinct from the meta-tools' "net").
 PINNED_TOOLSET = "net-pinned"
 
 _NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_]+")

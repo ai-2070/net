@@ -858,5 +858,59 @@ else:
         ]
     )
 
+# Device enrollment (`HERMES_INTEGRATION_PLAN_V2.md` Phase 1): the
+# invite -> join -> approve handshake (InviteToken / JoinRequest /
+# JoinOutcome) and the operator device-lifecycle facade
+# (OperatorEnrollment: invite / approve / revoke / devices). Present iff the
+# module was built with the `delegation` feature. H8-clean: takes opaque
+# `Identity` handles; private seeds never cross into Python.
+try:
+    from ._net import (
+        DeviceEnrollment,
+        DeviceRecord,
+        InviteToken,
+        JoinOutcome,
+        JoinRequest,
+        OperatorEnrollment,
+        fingerprint,
+    )
+except ImportError:
+    # `delegation` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "DeviceEnrollment",
+            "DeviceRecord",
+            "InviteToken",
+            "JoinOutcome",
+            "JoinRequest",
+            "OperatorEnrollment",
+            "fingerprint",
+        ]
+    )
+
+# Local tool publication (Hermes V2 Phase 2, the `publish` feature): the
+# return-value type of `NetMesh.publish_tools`. Exported for isinstance /
+# typing; the publish itself is driven from the `NetMesh` handle.
+try:
+    from ._net import LocalPublicationHandle
+except ImportError:
+    # `publish` feature not compiled in; the symbol stays undefined.
+    pass
+else:
+    __all__.append("LocalPublicationHandle")
+
+# Agent-to-agent task handoff (Hermes V2 Phase 3, the `a2a` feature): the
+# return-value type of `NetMesh.serve_a2a`. The submit/status/cancel client
+# surface lives on the `NetMesh` handle.
+try:
+    from ._net import A2aServeHandle
+except ImportError:
+    # `a2a` feature not compiled in; the symbol stays undefined.
+    pass
+else:
+    __all__.append("A2aServeHandle")
+
 
 __version__ = "0.31.0"

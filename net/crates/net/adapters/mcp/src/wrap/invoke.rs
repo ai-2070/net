@@ -22,7 +22,9 @@ use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayl
 use serde_json::Value;
 
 use super::delegation::{DelegationGate, HDR_DELEGATION, HDR_DELEGATION_SIG};
+use super::policy::{InvokePolicy, PolicyContext, PolicyDecision};
 use super::stdio::StdioMcpClient;
+use super::McpError;
 use crate::spec::CallToolResult;
 
 /// Application error code (nRPC `RpcStatus::Application`) for a caller that
@@ -56,6 +58,13 @@ pub const ERR_DELEGATION: u16 = 0x8005;
 /// or the tool is priced but no payment gate is configured (fail-closed).
 /// An authorization verdict like its owner-scope and delegation siblings.
 pub const ERR_PAYMENT: u16 = 0x8006;
+/// The invoke was admitted but the provider's [`InvokePolicy`] refused it
+/// (V2 Phase 2's in-root toll booth — an allowlist deny, or a dangerous-tool
+/// approval that was declined / could not reach the operator). An
+/// authorization verdict, so the demand side maps it to `denied` like
+/// [`ERR_OWNER_SCOPE`] / [`ERR_DELEGATION`], never a tool-level `is_error`.
+/// (0x8007: 0x8006 was taken by [`ERR_PAYMENT`] when the branches merged.)
+pub const ERR_POLICY: u16 = 0x8007;
 
 /// Find the first request header named `name` in `ctx.payload.headers`
 /// (`Vec<(String, Vec<u8>)>` — the substrate's `RpcHeader` alias). First match
@@ -139,11 +148,49 @@ pub fn encode_result(result: &CallToolResult) -> Result<Vec<u8>, String> {
     serde_json::to_vec(result).map_err(|e| format!("encode tool result: {e}"))
 }
 
-/// Serves one wrapped MCP tool over nRPC. Install with
-/// `Mesh::serve_rpc(tool_id, Arc::new(handler))`.
+/// The invoke seam a served tool actually calls when a mesh request arrives.
+///
+/// [`WrapInvokeHandler`] is generic over this so the *same*
+/// announce/describe/owner-scope/delegation path backs two producers that
+/// differ in exactly one step:
+///
+/// - `net wrap` — a wrapped stdio MCP server ([`StdioMcpClient`], the blanket
+///   impl below): the mesh call becomes a `tools/call` on the child process.
+/// - a native node publishing its **own** in-process toolset
+///   ([`ServerPublisher::publish_tools`](super::session::ServerPublisher::publish_tools)):
+///   the mesh call is dispatched to a local (e.g. callback-backed) invoker.
+///
+/// `name` is the tool's original name ([`super::descriptor::LoweredTool::mcp_name`])
+/// and `arguments` the caller's decoded JSON object. The result contract
+/// mirrors [`StdioMcpClient::call_tool`]: an `Ok` [`CallToolResult`] with
+/// `is_error == true` is a **tool-level** failure the tool reported in-band
+/// (surfaced as `ERR_TOOL`), while an `Err(McpError)` is a transport/protocol
+/// failure (`ERR_UPSTREAM`) — the two are kept apart so a caller can tell
+/// "the tool refused" from "the tool was unreachable".
+#[async_trait::async_trait]
+pub trait ToolInvoker: Send + Sync {
+    /// Invoke `name` with `arguments`, returning the tool's structured result.
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult, McpError>;
+}
+
+/// `net wrap`'s invoker: dispatch to the wrapped stdio MCP server's
+/// `tools/call`. The behavior `publish_server` has always used, now expressed
+/// through the shared seam so `publish_tools` can substitute a different one.
+#[async_trait::async_trait]
+impl ToolInvoker for StdioMcpClient {
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult, McpError> {
+        // Fully-qualified to call the inherent method (no trait recursion).
+        StdioMcpClient::call_tool(self, name, arguments).await
+    }
+}
+
+/// Serves one bridged tool over nRPC. Install with
+/// `Mesh::serve_rpc(tool_id, Arc::new(handler))`. Backed by any
+/// [`ToolInvoker`] — a wrapped MCP server or a node's own local tools.
 pub struct WrapInvokeHandler {
-    client: Arc<StdioMcpClient>,
-    /// The wrapped tool's MCP name — what `tools/call` is issued against.
+    invoker: Arc<dyn ToolInvoker>,
+    /// The tool's original name — what [`ToolInvoker::call_tool`] is issued
+    /// against.
     tool: String,
     /// The nRPC service name this handler is served under (the channel-safe
     /// `tool_id`) — what the caller invokes and signs the delegation challenge
@@ -154,6 +201,11 @@ pub struct WrapInvokeHandler {
     /// carries a [`HDR_DELEGATION`] chain is admitted iff the chain + its
     /// per-invoke signature verify; a no-chain invoke still uses `scope`.
     delegation: Option<Arc<DelegationGate>>,
+    /// Optional invoke-path policy (V2 Phase 2). When set, an *admitted* invoke
+    /// is additionally run past it before the tool executes — the in-root toll
+    /// booth. `None` is the allow-all preset (the check is skipped): the mesh
+    /// adds reach, not authority.
+    policy: Option<Arc<dyn InvokePolicy>>,
     /// Whether this tool was published with pricing terms. A paid tool's
     /// invoke must redeem its quote through `payment` before the wrapped
     /// tool runs — a paid tool with no gate configured rejects everything
@@ -165,17 +217,19 @@ pub struct WrapInvokeHandler {
 }
 
 impl WrapInvokeHandler {
-    /// Build a handler that invokes `tool` on `client`, admitting only
+    /// Build a handler that invokes `tool` on `invoker`, admitting only
     /// callers in `scope`. No delegation gate — use [`Self::with_delegation`]
-    /// to add one.
-    pub fn new(client: Arc<StdioMcpClient>, tool: impl Into<String>, scope: OwnerScope) -> Self {
+    /// to add one. `invoker` is any [`ToolInvoker`]; an `Arc<StdioMcpClient>`
+    /// coerces here directly (the `net wrap` path).
+    pub fn new(invoker: Arc<dyn ToolInvoker>, tool: impl Into<String>, scope: OwnerScope) -> Self {
         let tool = tool.into();
         Self {
-            client,
+            invoker,
             service: tool.clone(),
             tool,
             scope,
             delegation: None,
+            policy: None,
             paid: false,
             payment: None,
         }
@@ -197,6 +251,16 @@ impl WrapInvokeHandler {
     #[must_use]
     pub fn with_delegation(mut self, delegation: Option<Arc<DelegationGate>>) -> Self {
         self.delegation = delegation;
+        self
+    }
+
+    /// Attach an invoke-path policy (V2 Phase 2), or `None` for the allow-all
+    /// preset (the check is skipped). Builder-style so
+    /// `WrapInvokeHandler::new(...).with_policy(p)` reads cleanly at the serve
+    /// site, alongside `with_delegation`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Option<Arc<dyn InvokePolicy>>) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -235,7 +299,7 @@ impl RpcHandler for WrapInvokeHandler {
         //     (`identity/origin.rs`), because the *signature* proves leaf-key
         //     possession. A caller with no chain falls back to the owner-scope
         //     origin allowlist (the AEAD-verified `caller_origin`), unchanged.
-        match (
+        let delegated = match (
             &self.delegation,
             find_header(&ctx.payload.headers, HDR_DELEGATION),
         ) {
@@ -257,6 +321,7 @@ impl RpcHandler for WrapInvokeHandler {
                         code: ERR_DELEGATION,
                         message: e.to_string(),
                     })?;
+                true
             }
             _ => {
                 // No chain (or no gate configured): owner-scope path.
@@ -266,16 +331,32 @@ impl RpcHandler for WrapInvokeHandler {
                         message: OWNER_SCOPE_REJECTION.to_string(),
                     });
                 }
+                false
             }
-        }
+        };
 
-        // [2] Payment admission (paid tools only). The quote id the caller
+        // [2] Translate the request body into tool arguments — BEFORE the
+        //     payment and policy gates, so a structurally invalid call (one
+        //     that can never execute) is rejected as ERR_BAD_REQUEST without
+        //     burning the caller's payment quote or consulting the policy.
+        //     A real approval policy may prompt a human operator; asking them
+        //     to approve garbage would be noise at best and an
+        //     approval-fatigue vector at worst.
+        let arguments =
+            parse_arguments(&ctx.payload.body).map_err(|message| RpcHandlerError::Application {
+                code: ERR_BAD_REQUEST,
+                message,
+            })?;
+
+        // [3] Payment admission (paid tools only). The quote id the caller
         //     attached is redeemed against the provider's payment engine —
         //     settled, billed, unfrozen, bound to this tool, and never
         //     redeemed before. Runs AFTER identity admission (never leak
         //     payment state to a caller the scope would reject) and BEFORE
         //     the wrapped tool: the handler never sees an unpaid call, no
-        //     matter what the demand side did or skipped.
+        //     matter what the demand side did or skipped. It also runs before
+        //     the policy hook — a caller commits its quote before it can put
+        //     a (possibly human) approval prompt in front of the operator.
         if self.paid {
             let Some(gate) = &self.payment else {
                 return Err(RpcHandlerError::Application {
@@ -306,19 +387,35 @@ impl RpcHandler for WrapInvokeHandler {
                 })?;
         }
 
-        // [3] Translate the request body into tool arguments.
-        let arguments =
-            parse_arguments(&ctx.payload.body).map_err(|message| RpcHandlerError::Application {
-                code: ERR_BAD_REQUEST,
-                message,
-            })?;
+        // [4] Policy hook (V2 Phase 2, the in-root toll booth). The call is
+        //     admitted, well-formed, and paid for; now the provider's policy —
+        //     an allowlist, or a dangerous-tool approval that routes to the
+        //     operator — gets the final say before the tool runs. `None` is
+        //     the allow-all preset (skipped): the mesh adds reach, not
+        //     authority. A deny becomes an ERR_POLICY the demand side reports
+        //     as `denied`.
+        if let Some(policy) = &self.policy {
+            if let PolicyDecision::Deny { reason } = policy
+                .check(&PolicyContext {
+                    tool_id: self.service.clone(),
+                    caller_origin: ctx.caller_origin,
+                    delegated,
+                })
+                .await
+            {
+                return Err(RpcHandlerError::Application {
+                    code: ERR_POLICY,
+                    message: reason,
+                });
+            }
+        }
 
-        // [4] Invoke the wrapped tool. A protocol failure (server gone,
+        // [5] Invoke the wrapped tool. A protocol failure (server gone,
         //     JSON-RPC error) is ERR_UPSTREAM; a tool-level `is_error`
         //     result is ERR_TOOL — kept distinct so the caller can tell
         //     "unreachable" from "the tool refused".
         let result = self
-            .client
+            .invoker
             .call_tool(&self.tool, arguments)
             .await
             .map_err(|e| RpcHandlerError::Application {
@@ -326,7 +423,7 @@ impl RpcHandler for WrapInvokeHandler {
                 message: e.to_string(),
             })?;
 
-        // [5] Encode the result. Do it per-branch: a tool-level error returns
+        // [6] Encode the result. Do it per-branch: a tool-level error returns
         //     the full structured result as the ERR_TOOL body via
         //     `tool_error_message` (which never fails — it can't mask the tool
         //     error as an internal one); a success encodes the response body,

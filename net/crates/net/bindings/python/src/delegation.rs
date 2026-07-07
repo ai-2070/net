@@ -38,11 +38,11 @@ pub const GATEWAY_DELEGATION_CHANNEL: &str = net_sdk::delegation::GATEWAY_DELEGA
 /// Re-derive the SDK `Identity` (keypair + cache) from a Python `Identity`
 /// handle. Stays inside the crate — the seed bytes are read from the
 /// opaque handle and never surface to Python.
-fn to_sdk(id: &Identity) -> SdkIdentity {
+pub(crate) fn to_sdk(id: &Identity) -> SdkIdentity {
     SdkIdentity::from_seed(*id.keypair.secret_bytes())
 }
 
-fn entity_id_from_bytes(bytes: &[u8]) -> PyResult<EntityId> {
+pub(crate) fn entity_id_from_bytes(bytes: &[u8]) -> PyResult<EntityId> {
     if bytes.len() != 32 {
         return Err(identity_err(format!(
             "entity_id must be 32 bytes, got {}",
@@ -160,6 +160,20 @@ pub fn default_revocation_store_path() -> Option<String> {
 #[derive(Clone)]
 pub struct PyDelegationChain {
     inner: DelegationChain,
+}
+
+impl PyDelegationChain {
+    /// Wrap an SDK chain — used by the enrollment surface (`JoinOutcome`,
+    /// `OperatorEnrollment.approve`) to hand back a `DelegationChain` handle.
+    pub(crate) fn from_inner(inner: DelegationChain) -> Self {
+        Self { inner }
+    }
+
+    /// A clone of the underlying SDK chain — used by `DeviceEnrollment` to
+    /// bundle a chain handed in from Python.
+    pub(crate) fn inner_chain(&self) -> DelegationChain {
+        self.inner.clone()
+    }
 }
 
 #[pymethods]

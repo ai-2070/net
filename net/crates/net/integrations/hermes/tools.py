@@ -1,4 +1,4 @@
-"""Agent-facing tools for the ``net`` Hermes plugin — the five mesh meta-tools.
+"""Agent-facing tools for the ``net`` Hermes plugin — the mesh meta-tools.
 
 Each is a thin async handler over the embedded node's
 :class:`AsyncCapabilityGateway` (search / describe / invoke) or the shared pin
@@ -16,10 +16,17 @@ the mesh-vs-local distinction explicitly.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any, Dict
 
 from . import node
+
+# Surface a renewal warning once an enrolled device is within this window of its
+# annual grant expiry (the "expiry warning before annual grant expiry"
+# acceptance) — the signal that silent renewal hasn't refreshed it.
+_RENEWAL_WINDOW_SECONDS = 30 * 24 * 60 * 60
 
 
 def _json(obj: Any) -> str:
@@ -248,6 +255,336 @@ async def handle_net_request_pin(args: Dict[str, Any], **_kw) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Device-enrollment (mesh admin) tools — the operator side of V2 Phase 1. These
+# manage YOUR mesh's devices (invite / list / revoke); they are NOT capability
+# tools. They need the node's user root (NET_MESH_IDENTITY_SEED) to sign
+# delegations, and the invite tool serves enrollment on the node so a minted
+# invite is dialable. The device-registry / revocation stores + the handshake
+# all live in the Rust SDK (bridge doctrine H2).
+# ---------------------------------------------------------------------------
+
+NET_MESH_INVITE_SCHEMA: Dict[str, Any] = {
+    "name": "net_mesh_invite",
+    "description": (
+        "Mint an INVITE to add a new device to YOUR operator mesh (device "
+        "enrollment). Returns a single-use, short-lived invite STRING to share "
+        "with the new device — it joins by running its own net node and calling "
+        "`join` with the string — plus your mesh's root FINGERPRINT to confirm "
+        "out of band (evil-twin defense). This is an operator action that "
+        "authorizes a device to join the mesh you control; it does NOT invoke a "
+        "capability. Requires the node to run under your root identity."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ttl_seconds": {
+                "type": "integer",
+                "description": (
+                    "How long the invite stays valid, in seconds (default 600 = "
+                    "10 minutes). Keep it short — an invite is a pre-authorization "
+                    "to *ask* to join, single-use."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+NET_MESH_DEVICES_SCHEMA: Dict[str, Any] = {
+    "name": "net_mesh_devices",
+    "description": (
+        "List the DEVICES enrolled in YOUR operator mesh: each device's name, "
+        "id, tags, when it enrolled, and whether it's revoked. This is your mesh "
+        "device inventory — NOT the remote capabilities (that's "
+        "net_search_capabilities). Requires your root identity."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+NET_MESH_REVOKE_SCHEMA: Dict[str, Any] = {
+    "name": "net_mesh_revoke",
+    "description": (
+        "REVOKE a device from YOUR operator mesh by its `device_id` (the hex id "
+        "from net_mesh_devices). Raises the device's revocation floor — its "
+        "delegations stop being honored by your providers on the next check — "
+        "and marks it revoked in your inventory. Requires your root identity."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "device_id": {
+                "type": "string",
+                "description": "The device's hex id, from net_mesh_devices.",
+            },
+        },
+        "required": ["device_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def handle_net_mesh_invite(args: Dict[str, Any], **_kw) -> str:
+    ttl = args.get("ttl_seconds")
+    try:
+        ttl = int(ttl) if ttl is not None else 600
+    except (TypeError, ValueError):
+        return _json({"status": "error", "error": "ttl_seconds must be an integer"})
+    if ttl <= 0:
+        ttl = 600
+    try:
+        operator = node.operator()
+        invite = operator.invite(node.mesh().rendezvous_string(), ttl)
+    except Exception as e:  # noqa: BLE001 — surface config/store failures as data
+        return _json({"status": "error", "error": f"could not mint invite: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "invite": invite.encode(),
+            "root_fingerprint": operator.root_fingerprint(),
+            "expires_at": invite.expires_at,
+            "message": (
+                "Share this invite string with the new device. It is single-use "
+                "and expires soon. Confirm the root_fingerprint matches on the "
+                "device before it joins."
+            ),
+        }
+    )
+
+
+async def handle_net_mesh_devices(args: Dict[str, Any], **_kw) -> str:
+    try:
+        devices = node.operator().devices()
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not list devices: {e}"})
+    now = int(time.time())
+    rows = []
+    any_renewal = False
+    for d in devices:
+        # A device's grant lapses one grant-lifetime after it was (re-)recorded;
+        # silent renewal re-records it, keeping this fresh. Revocation, not
+        # expiry, is how a device is actually cut off.
+        expires_at = d.enrolled_at + node._GRANT_TTL_SECONDS
+        seconds_left = expires_at - now
+        renewal_recommended = (not d.is_revoked) and seconds_left < _RENEWAL_WINDOW_SECONDS
+        any_renewal = any_renewal or renewal_recommended
+        rows.append(
+            {
+                "name": d.name,
+                "device_id": d.device.hex(),
+                "tags": list(d.tags),
+                "enrolled_at": d.enrolled_at,
+                "revoked": d.is_revoked,
+                "expires_at": expires_at,
+                "expires_in_days": max(0, seconds_left // 86400),
+                "renewal_recommended": renewal_recommended,
+            }
+        )
+    result: Dict[str, Any] = {"status": "ok", "devices": rows}
+    if any_renewal:
+        result["warning"] = (
+            "One or more devices are within 30 days of their annual grant "
+            "expiry and silent renewal has not refreshed them — re-invite the "
+            "device or check its connectivity to this operator node."
+        )
+    return _json(result)
+
+
+async def handle_net_mesh_revoke(args: Dict[str, Any], **_kw) -> str:
+    device_id = str(args.get("device_id") or "").strip()
+    if not device_id:
+        return _json({"status": "error", "error": "device_id is required"})
+    try:
+        raw = bytes.fromhex(device_id.removeprefix("0x"))
+    except ValueError:
+        return _json({"status": "error", "error": "device_id must be a hex string"})
+    if len(raw) != 32:
+        return _json(
+            {"status": "error", "error": "device_id must be 32 bytes (64 hex chars)"}
+        )
+    try:
+        node.operator().revoke(raw)
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not revoke device: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "revoked": device_id,
+            "message": (
+                f"Device {device_id[:16]}… revoked; its delegations stop being "
+                "honored by your providers on the next check."
+            ),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent-to-agent (A2A) task-handoff tools — the requester side of V2 Phase 3.
+# Hand a long job to a sibling in-root agent (by its routing node id), poll it,
+# and cancel it. The protocol + cancellation live in the Rust SDK (H2); these
+# are thin async handlers over `node.mesh().{submit_task,task_status,cancel_task}`
+# (sync SDK calls, run off the event loop via `asyncio.to_thread`).
+# ---------------------------------------------------------------------------
+
+NET_A2A_SUBMIT_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_submit",
+    "description": (
+        "Hand off a long/parallel job to ANOTHER agent on your operator mesh "
+        "(A2A). Use this when a sibling machine should grind a task while you "
+        "keep working — NOT for a quick tool call (use net_invoke_capability or a "
+        "federated tool for that; asking the other agent is briefing an amnesiac "
+        "colleague). The other agent does NOT share your memory, so pass any "
+        "context it needs as `context_refs` (artifact refs). Returns a `task_id` "
+        "to poll with net_a2a_status and stop with net_a2a_cancel. Its result "
+        "comes back as an artifact ref, not inline."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {
+                "type": "integer",
+                "description": "The peer agent's routing node id (from mesh discovery).",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "The job for the other agent to run.",
+            },
+            "context_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Artifact (Datafort) refs the other agent should read for "
+                    "context — it doesn't share your memory."
+                ),
+            },
+        },
+        "required": ["target_node_id", "prompt"],
+        "additionalProperties": False,
+    },
+}
+
+NET_A2A_STATUS_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_status",
+    "description": (
+        "Check a handed-off A2A task's status by its `task_id` (from "
+        "net_a2a_submit) on the executing agent `target_node_id`. Returns the "
+        "task's state (requested/accepted/running/completed/failed/cancelled); a "
+        "completed task carries its result's artifact ref."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {"type": "integer", "description": "The executor's node id."},
+            "task_id": {"type": "string", "description": "The task id from net_a2a_submit."},
+        },
+        "required": ["target_node_id", "task_id"],
+        "additionalProperties": False,
+    },
+}
+
+NET_A2A_CANCEL_SCHEMA: Dict[str, Any] = {
+    "name": "net_a2a_cancel",
+    "description": (
+        "Cancel a handed-off A2A task by its `task_id` on the executing agent "
+        "`target_node_id`. The other agent's work demonstrably stops. Returns "
+        "whether the task was still in flight (a finished task cancels to false)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_node_id": {"type": "integer", "description": "The executor's node id."},
+            "task_id": {"type": "string", "description": "The task id to cancel."},
+        },
+        "required": ["target_node_id", "task_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _a2a_target(args: Dict[str, Any]):
+    """Parse a required integer `target_node_id`, or return an error string."""
+    raw = args.get("target_node_id")
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, _json({"status": "error", "error": "target_node_id must be an integer"})
+
+
+async def handle_net_a2a_submit(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return _json({"status": "error", "error": "prompt is required"})
+    raw_refs = args.get("context_refs") or []
+    if isinstance(raw_refs, str):
+        # A bare string ref (a model passing "artifact://x" instead of a list)
+        # would otherwise iterate into per-character refs.
+        raw_refs = [raw_refs]
+    refs = [str(r) for r in raw_refs]
+    try:
+        task_id = await asyncio.to_thread(node.mesh().submit_task, node_id, prompt, refs)
+    except Exception as e:  # noqa: BLE001 — surface transport/reject failures as data
+        return _json({"status": "error", "error": f"could not submit task: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "task_id": task_id,
+            "target_node_id": node_id,
+            "message": (
+                "Task handed off. Poll it with net_a2a_status and stop it with "
+                "net_a2a_cancel; its result returns as an artifact ref."
+            ),
+        }
+    )
+
+
+async def handle_net_a2a_status(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return _json({"status": "error", "error": "task_id is required"})
+    try:
+        raw = await asyncio.to_thread(node.mesh().task_status, node_id, task_id)
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not get task status: {e}"})
+    if raw is None:
+        return _json({"status": "unknown", "task_id": task_id})
+    try:
+        record = json.loads(raw)
+    except (TypeError, ValueError):
+        return _json({"status": "error", "error": "malformed status record"})
+    return _json({"status": "ok", "task_id": task_id, "record": record})
+
+
+async def handle_net_a2a_cancel(args: Dict[str, Any], **_kw) -> str:
+    node_id, err = _a2a_target(args)
+    if err is not None:
+        return err
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return _json({"status": "error", "error": "task_id is required"})
+    try:
+        cancelled = await asyncio.to_thread(node.mesh().cancel_task, node_id, task_id)
+    except Exception as e:  # noqa: BLE001
+        return _json({"status": "error", "error": f"could not cancel task: {e}"})
+    return _json(
+        {
+            "status": "ok",
+            "task_id": task_id,
+            "cancelled": bool(cancelled),
+            "message": (
+                "The task was cancelled; the remote agent's work stops."
+                if cancelled
+                else "The task was not in flight (already finished or unknown)."
+            ),
+        }
+    )
+
+
 # The (name, schema, handler, emoji) rows the plugin registers, toolset "net".
 TOOLS = (
     ("net_search_capabilities", NET_SEARCH_SCHEMA, handle_net_search, "\U0001f50e"),
@@ -255,4 +592,10 @@ TOOLS = (
     ("net_invoke_capability", NET_INVOKE_SCHEMA, handle_net_invoke, "⚡"),
     ("net_list_pinned_capabilities", NET_LIST_PINNED_SCHEMA, handle_net_list_pinned, "\U0001f4cc"),
     ("net_request_pin", NET_REQUEST_PIN_SCHEMA, handle_net_request_pin, "\U0001f64b"),
+    ("net_mesh_invite", NET_MESH_INVITE_SCHEMA, handle_net_mesh_invite, "\U0001f4e8"),
+    ("net_mesh_devices", NET_MESH_DEVICES_SCHEMA, handle_net_mesh_devices, "\U0001f5a5️"),
+    ("net_mesh_revoke", NET_MESH_REVOKE_SCHEMA, handle_net_mesh_revoke, "\U0001f6ab"),
+    ("net_a2a_submit", NET_A2A_SUBMIT_SCHEMA, handle_net_a2a_submit, "\U0001f91d"),
+    ("net_a2a_status", NET_A2A_STATUS_SCHEMA, handle_net_a2a_status, "\U0001f4dd"),
+    ("net_a2a_cancel", NET_A2A_CANCEL_SCHEMA, handle_net_a2a_cancel, "\U0001f6d1"),
 )

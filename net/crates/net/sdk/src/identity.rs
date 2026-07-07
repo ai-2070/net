@@ -55,7 +55,7 @@ use net::adapter::net::channel::ChannelName;
 // from `net_sdk::identity::*` instead of reaching into the core crate.
 pub use net::adapter::net::identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
-    TokenScope, MAX_TOKEN_TTL_SECS,
+    TokenScope, MAX_TOKEN_TTL_SECS, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
 };
 
 /// Caller-owned identity bundle: one ed25519 keypair + one token

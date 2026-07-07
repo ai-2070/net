@@ -124,6 +124,35 @@ pub mod capabilities;
 // core `TokenChain` / `RevocationRegistry` machinery.
 #[cfg(feature = "net")]
 pub mod delegation;
+// Device enrollment — the invite → join → approve handshake that admits a new
+// device into an operator's mesh with a `root → device` delegation to the
+// device's *own* key (Hermes V2 Phase 1). Rides `net`: composes the identity /
+// delegation surface and pulls `getrandom` for the single-use invite nonce.
+#[cfg(feature = "net")]
+pub mod enrollment;
+// Machine-shared device registry — the operator's inventory of enrolled devices
+// (Hermes V2 Phase 1), backing `mesh.devices()`. Inventory/display state, not
+// enforcement (that's `revocation`); mirrors the revocation store's file
+// discipline. Rides `net` (records `EntityId`s).
+#[cfg(feature = "net")]
+pub mod devices;
+// Operator-side mesh management (Hermes V2 Phase 1) — the transport-independent
+// `mesh.invite/approve/revoke/devices` surface, composing the enrollment
+// authority + device registry + revocation store into one coordinator.
+#[cfg(feature = "net")]
+pub mod operator;
+// Live enrollment over the mesh (Hermes V2 Phase 1 Slice B2b) — `mesh.join` /
+// `mesh.serve_enrollment` via direct-addressed nRPC. Needs `cortex` for the
+// nRPC surface, so gated net+cortex (the `operator` facade above is
+// transport-independent and rides `net` alone).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub mod mesh_enroll;
+// Live agent-to-agent task handoff over the mesh (Hermes V2 Phase 3 Slice B) —
+// `mesh.serve_a2a` (executor) + `mesh.submit_task`/`task_status`/`cancel_task`
+// (requester) via direct-addressed nRPC. Needs `cortex` for the nRPC surface,
+// like `mesh_enroll`; the `a2a` task core above is transport-independent (`net`).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub mod mesh_a2a;
 // Persistent, machine-shared delegation-revocation floors (Hermes plan Phase
 // 3): the provider side of revocation — a running `net wrap` honors an
 // operator's revocation of a delegated gateway without a restart. Mirrors the
@@ -135,6 +164,12 @@ pub mod gang;
 pub mod identity;
 #[cfg(feature = "net")]
 pub mod revocation;
+// Agent-to-agent (A2A) task handoff (Hermes V2 Phase 3) — the transport-
+// independent task types + executor-side registry + cancellation, so one
+// enrolled agent hands a long job to another and can cancel it mid-run. The
+// mesh wiring (serve + client) is `mesh_a2a` (gated net + cortex).
+#[cfg(feature = "net")]
+pub mod a2a;
 #[cfg(feature = "net")]
 pub mod subnets;
 
@@ -223,8 +258,32 @@ pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
 pub use crate::delegation::{
     derive_child_seed, DelegationChain, RevocationRegistry, TokenChain, GATEWAY_DELEGATION_CHANNEL,
 };
+// Device-enrollment convenience re-exports (V2 Phase 1): the invite/join/approve
+// types + the displayed root fingerprint.
+#[cfg(feature = "net")]
+pub use crate::enrollment::{
+    fingerprint, reject, DeviceEnrollment, DeviceEnrollmentError, Enrollment, EnrollmentAuthority,
+    EnrollmentError, InviteToken, JoinError, JoinOutcome, JoinRequest, RenewalRequest,
+};
+// Device-inventory convenience re-exports (V2 Phase 1): the registry backing
+// `mesh.devices()`.
+#[cfg(feature = "net")]
+pub use crate::devices::{default_device_registry_path, DeviceRecord, DeviceRegistry};
+// Operator-surface convenience re-exports (V2 Phase 1).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub use crate::mesh_enroll::{JoinFlowError, ENROLLMENT_SERVICE};
+// Live A2A task-handoff convenience re-exports (V2 Phase 3 Slice B).
+#[cfg(all(feature = "net", feature = "cortex"))]
+pub use crate::mesh_a2a::{A2aFlowError, A2A_CANCEL_SERVICE, A2A_STATUS_SERVICE, A2A_TASK_SERVICE};
+#[cfg(feature = "net")]
+pub use crate::operator::{OperatorEnrollment, OperatorError};
 #[cfg(feature = "net")]
 pub use crate::revocation::{default_revocation_store_path, RevocationStore};
+// Agent-to-agent task-handoff convenience re-exports (V2 Phase 3).
+#[cfg(feature = "net")]
+pub use crate::a2a::{
+    A2aError, CancelToken, TaskAck, TaskBrief, TaskExecutor, TaskRecord, TaskRegistry, TaskState,
+};
 #[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
 

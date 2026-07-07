@@ -154,6 +154,69 @@ impl DelegationChain {
         })
     }
 
+    /// Build a single-link `root → device` delegation to an **externally
+    /// generated** device identity (enrollment — Hermes V2 Phase 1).
+    ///
+    /// Unlike [`Self::derive_gateway`], the device keypair is **not** derived
+    /// from the root seed: the device generated it locally and only presented
+    /// its [`EntityId`] (public key) during the enrollment handshake — keys
+    /// never travel. The root signs a delegable grant
+    /// ([`INVOKE_ACTION`]` | DELEGATE`) so the device can locally extend the
+    /// chain to its own gateway ([`Self::extend_delegate`]) and per-task
+    /// subagents ([`Self::extend_to_subagent`]) without going back to the
+    /// root.
+    ///
+    /// This is the primitive that deprecates the shared-identity-file pattern
+    /// (root on every box): the root stays on one machine, each device holds a
+    /// delegation to *its own* key, and revoking one device — bumping the
+    /// **device's** floor in the [`RevocationRegistry`] — kills that device's
+    /// gateway subtree without touching a sibling, exactly as revoking a
+    /// machine does in [`Self::derive_gateway`].
+    ///
+    /// `ttl` is the grant's lifetime; renew by re-issuing before expiry.
+    pub fn derive_device(
+        root: &Identity,
+        device: &EntityId,
+        ttl: Duration,
+        max_depth: u8,
+    ) -> Result<Self, TokenError> {
+        let channel = Self::channel();
+        let delegable = INVOKE_ACTION.union(TokenScope::DELEGATE);
+        let root_to_device =
+            root.try_issue_token(device.clone(), delegable, &channel, ttl, max_depth)?;
+        Ok(Self {
+            chain: TokenChain {
+                tokens: vec![root_to_device],
+            },
+        })
+    }
+
+    /// Extend this chain with a `… → child` link that **keeps `DELEGATE`**,
+    /// signed by the current leaf's owner (`leaf_signer`, whose entity id must
+    /// equal this chain's leaf subject).
+    ///
+    /// This is the delegable sibling of [`Self::extend_to_subagent`]: use it
+    /// for an intermediate link that must itself delegate further — e.g. an
+    /// enrolled **device** ([`Self::derive_device`]) extending to its
+    /// **gateway** agent, which then extends to its own subagents. The child
+    /// keeps [`INVOKE_ACTION`]` | DELEGATE`; use [`Self::extend_to_subagent`]
+    /// for a terminal (non-delegating) leaf. Returns a *new* chain; `self` is
+    /// unchanged.
+    pub fn extend_delegate(
+        &self,
+        leaf_signer: &Identity,
+        child: &EntityId,
+    ) -> Result<Self, TokenError> {
+        let parent = self.chain.tokens.last().ok_or(TokenError::InvalidFormat)?;
+        let delegable = INVOKE_ACTION.union(TokenScope::DELEGATE);
+        let child_tok = parent.delegate(leaf_signer.keypair(), child.clone(), delegable)?;
+        let mut tokens = self.chain.tokens.clone();
+        tokens.push(child_tok);
+        Ok(Self {
+            chain: TokenChain { tokens },
+        })
+    }
+
     /// Extend this chain with a `… → subagent` link, signed by the current
     /// leaf's owner (`leaf_signer`, whose entity id must equal this chain's
     /// leaf subject — e.g. the gateway extending to one of its subagents).
@@ -227,6 +290,18 @@ impl DelegationChain {
             .tokens
             .first()
             .map(|t| t.issuer.clone())
+            .expect("a DelegationChain always has at least one link")
+    }
+
+    /// Unix-seconds the chain expires — the **earliest** link's `not_after`
+    /// (the whole chain is only live while every link is). For a bare
+    /// `root → device` grant this is that single grant's expiry.
+    pub fn expires_at(&self) -> u64 {
+        self.chain
+            .tokens
+            .iter()
+            .map(|t| t.not_after)
+            .min()
             .expect("a DelegationChain always has at least one link")
     }
 
@@ -462,5 +537,113 @@ mod tests {
         parsed
             .verify(gateway.entity_id(), root.entity_id(), &reg, 0)
             .expect("round-tripped chain must verify");
+    }
+
+    #[test]
+    fn device_chain_derives_and_verifies() {
+        // Enrollment: the device generated its own keypair; only its entity id
+        // crosses to the root, which signs a single root → device grant.
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+        let reg = RevocationRegistry::new();
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(&chain.root(), root.entity_id());
+        assert_eq!(&chain.leaf(), device.entity_id());
+        chain
+            .verify(device.entity_id(), root.entity_id(), &reg, 0)
+            .expect("fresh device chain must verify");
+    }
+
+    #[test]
+    fn enrolled_device_extends_to_gateway_and_subagent() {
+        // The enrolled device (root → device) locally extends to its gateway
+        // keeping DELEGATE, and the gateway to a subagent — all from the
+        // device's own key, never touching the root again.
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let device_chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+
+        // The device's gateway is reproducible from the *device's* own seed —
+        // no root seed needed, matching the "no extra persistence" property.
+        let gateway = Identity::from_seed(derive_child_seed(&device.to_bytes(), "gateway:hermes"));
+        let gw_chain = device_chain
+            .extend_delegate(&device, gateway.entity_id())
+            .unwrap();
+        let subagent = Identity::generate();
+        let sub_chain = gw_chain
+            .extend_to_subagent(&gateway, subagent.entity_id())
+            .unwrap();
+
+        let reg = RevocationRegistry::new();
+        assert_eq!(gw_chain.len(), 2);
+        assert_eq!(sub_chain.len(), 3);
+        assert_eq!(&gw_chain.root(), root.entity_id());
+        gw_chain
+            .verify(gateway.entity_id(), root.entity_id(), &reg, 0)
+            .expect("device → gateway chain must verify");
+        sub_chain
+            .verify(subagent.entity_id(), root.entity_id(), &reg, 0)
+            .expect("device → gateway → subagent chain must verify");
+        // The gateway kept DELEGATE, so extending to the subagent was possible;
+        // the subagent (terminal) dropped it — the round-trip above proves the
+        // gateway could delegate.
+    }
+
+    #[test]
+    fn revoking_a_device_kills_its_gateway_but_not_a_sibling() {
+        // Two devices enrolled under one root; each runs a gateway. Revoking
+        // one device (bumping *its* floor) kills its gateway subtree while the
+        // other device is untouched — the Phase-1 acceptance ("revoke kills its
+        // access"), reusing the Phase-3 revocation model unchanged.
+        let root = Identity::generate();
+        let ttl = Duration::from_secs(3600);
+
+        let d1 = Identity::generate();
+        let g1 = Identity::from_seed(derive_child_seed(&d1.to_bytes(), "gateway:hermes"));
+        let c1 =
+            DelegationChain::derive_device(&root, d1.entity_id(), ttl, DEFAULT_DELEGATION_DEPTH)
+                .unwrap()
+                .extend_delegate(&d1, g1.entity_id())
+                .unwrap();
+
+        let d2 = Identity::generate();
+        let g2 = Identity::from_seed(derive_child_seed(&d2.to_bytes(), "gateway:hermes"));
+        let c2 =
+            DelegationChain::derive_device(&root, d2.entity_id(), ttl, DEFAULT_DELEGATION_DEPTH)
+                .unwrap()
+                .extend_delegate(&d2, g2.entity_id())
+                .unwrap();
+
+        let reg = RevocationRegistry::new();
+        assert!(c1.verify(g1.entity_id(), root.entity_id(), &reg, 0).is_ok());
+        assert!(c2.verify(g2.entity_id(), root.entity_id(), &reg, 0).is_ok());
+
+        // Revoke device 1: raise d1's floor above the (generation-0) device →
+        // gateway link it issued.
+        reg.revoke_below(d1.entity_id(), 1);
+
+        assert!(
+            c1.verify(g1.entity_id(), root.entity_id(), &reg, 0)
+                .is_err(),
+            "revoking the device must kill its gateway chain"
+        );
+        assert!(
+            c2.verify(g2.entity_id(), root.entity_id(), &reg, 0).is_ok(),
+            "revoking one device must not touch a sibling's chain"
+        );
     }
 }

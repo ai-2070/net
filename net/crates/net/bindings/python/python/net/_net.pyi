@@ -244,7 +244,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -655,6 +655,11 @@ class NetMesh:
     def node_id(self) -> int:
         """u64 node identifier derived from the keypair."""
         ...
+    @property
+    def local_addr(self) -> str:
+        """This node's bound local UDP address (e.g. ``"127.0.0.1:54321"``);
+        resolves the OS-assigned port for a ``:0`` bind."""
+        ...
 
     def connect(
         self,
@@ -671,6 +676,92 @@ class NetMesh:
         ...
     def start(self) -> None:
         """Start the receive loop, heartbeats, and router."""
+        ...
+
+    def rendezvous_string(self) -> str:
+        """The invite ``rendezvous`` locator for this node (address + Noise
+        static key + node id), to pass to ``OperatorEnrollment.invite``.
+        (Requires the ``delegation`` feature.)"""
+        ...
+    def join(
+        self, device: Identity, invite: str, name: str, tags: List[str]
+    ) -> DelegationChain:
+        """Device-side enrollment: enroll ``device``'s key into the mesh named
+        by the ``invite`` string, returning the verified ``root -> device``
+        chain. This node must be ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def serve_enrollment_auto(
+        self,
+        operator: "OperatorEnrollment",
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+    ) -> "EnrollmentServeHandle":
+        """Operator-side: serve the full device lifecycle on this node (auto —
+        the invite is the authorization): enroll (join) + renew. Hold the
+        returned handle to keep the services open. This node must be
+        ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
+        """Device-side renewal: refresh the grant carried by ``enrollment`` over
+        the mesh, returning the verified fresh ``root -> device`` chain. This
+        node must be ``start()``ed + ``permissive_channels=True``. (Requires
+        ``delegation``.)"""
+        ...
+    def publish_tools(
+        self,
+        tools: List[Tuple[str, Optional[str], str]],
+        callback: Any,
+        version: str = ...,
+        owner_origin: Optional[int] = ...,
+        allow_any_caller: bool = ...,
+    ) -> "LocalPublicationHandle":
+        """Publish this node's OWN local tools as mesh capabilities (V2 Phase 2)
+        — the inverse of ``net wrap``. ``tools`` is a list of
+        ``(name, description|None, input_schema_json)`` (the input schema as a
+        JSON string). ``callback`` is an **async** callable
+        ``async (tool_name: str, args_json: str) -> str | tuple[str, bool]``
+        invoked on a remote call; its return is the tool's text output (a
+        ``(text, is_error)`` tuple flags a tool-level error). A consumer
+        discovers + invokes these through the ordinary
+        :class:`AsyncCapabilityGateway`. ``owner_origin`` scopes admission (an
+        ``origin_hash`` admits only that caller; ``None`` admits only **this
+        node itself** — the fail-closed default). Pass
+        ``allow_any_caller=True`` to explicitly admit every mesh peer
+        (overrides ``owner_origin``; gate invocations yourself, e.g. with an
+        approval callback). Hold the returned handle to keep the tools
+        published. This node must be ``start()``ed + ``permissive_channels=True``.
+        (Requires the ``publish`` feature.)"""
+        ...
+    def serve_a2a(self, callback: Any) -> "A2aServeHandle":
+        """Serve the agent-to-agent (A2A) task lifecycle (V2 Phase 3), backed by
+        a Python **async** task executor ``callback``
+        ``async (task_id: str, prompt: str, context_refs: list[str],
+        tags: list[str]) -> str`` returning the result's artifact ref. Hold the
+        returned handle to keep accepting tasks. This node must be ``start()``ed.
+        (Requires the ``a2a`` feature.)"""
+        ...
+    def submit_task(
+        self,
+        target_node_id: int,
+        prompt: str,
+        context_refs: List[str] = ...,
+        tags: List[str] = ...,
+    ) -> str:
+        """Hand off a task to the executor at ``target_node_id``: ``prompt`` plus
+        optional Datafort ``context_refs`` (the executor doesn't share your
+        memory) and routing ``tags``. Returns the accepted task id; raises if the
+        executor rejected it. The node must already be connected to
+        ``target_node_id``. (Requires the ``a2a`` feature.)"""
+        ...
+    def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:
+        """The executor's status for ``task_id`` as a JSON string
+        (``{brief, state, updated_at}``), or ``None`` if unknown. (Requires the
+        ``a2a`` feature.)"""
+        ...
+    def cancel_task(self, target_node_id: int, task_id: str) -> bool:
+        """Cancel ``task_id`` on the executor; returns whether it was in flight.
+        The executor's coroutine is cancelled — the remote work stops. (Requires
+        the ``a2a`` feature.)"""
         ...
 
     def push_to(self, peer_addr: str, json: str) -> bool:
@@ -1076,6 +1167,252 @@ class DelegationChain:
         """The root issuer entity-id the chain anchors at."""
         ...
     def __len__(self) -> int: ...
+
+# -----------------------------------------------------------------------------
+# Device enrollment (HERMES_INTEGRATION_PLAN_V2.md Phase 1).
+# -----------------------------------------------------------------------------
+
+def fingerprint(entity: bytes) -> str:
+    """A short, human-comparable fingerprint of a 32-byte entity-id, shown
+    on both sides of a join (``A1B2-C3D4-E5F6-0789``)."""
+    ...
+
+class InviteToken:
+    """A pre-authorization to *ask* to join a mesh — not a key. Carries the
+    mesh ``root``, a ``rendezvous`` locator, a single-use nonce, and a short
+    TTL. The copy-paste / QR form is :meth:`encode`."""
+
+    @staticmethod
+    def decode(s: str) -> "InviteToken":
+        """Parse a ``net-invite:<base64url>`` string. Raises on a missing
+        prefix, bad base64, or malformed bytes."""
+        ...
+    def encode(self) -> str:
+        """The copy-paste / QR invite string."""
+        ...
+    def root_fingerprint(self) -> str:
+        """The displayed fingerprint of the mesh root — show it to the joiner."""
+        ...
+    def is_expired(self, now: int) -> bool:
+        """Whether the invite has expired at ``now`` (unix secs)."""
+        ...
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "InviteToken": ...
+    @property
+    def root(self) -> bytes:
+        """The mesh root entity-id this invite admits into."""
+        ...
+    @property
+    def rendezvous(self) -> str:
+        """The transport locator the device dials."""
+        ...
+    @property
+    def expires_at(self) -> int: ...
+
+class JoinRequest:
+    """A device's request to join, signed by the device's own key."""
+
+    @staticmethod
+    def create(
+        device: Identity, name: str, tags: List[str], invite: InviteToken
+    ) -> "JoinRequest":
+        """Build + sign a request against ``invite``. ``device`` is the opaque
+        ``Identity`` handle whose key is enrolled (H8: seed stays in Rust)."""
+        ...
+    def verify_self_signature(self) -> bool:
+        """``True`` if the device's self-signature verifies."""
+        ...
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "JoinRequest":
+        """Parse wire bytes (does not verify the signature)."""
+        ...
+    @property
+    def device(self) -> bytes: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def tags(self) -> List[str]: ...
+
+class JoinOutcome:
+    """The operator's response to a join request — admitted (carrying the
+    granted chain) or rejected (with a stable code + message)."""
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "JoinOutcome": ...
+    def to_bytes(self) -> bytes: ...
+    def into_chain(self, device: bytes, invite_root: bytes) -> DelegationChain:
+        """Device-side: verify the admitted grant anchors at ``invite_root``
+        and binds to ``device``, returning the ``DelegationChain``. Raises on a
+        rejection or an untrusted grant (wrong root / device)."""
+        ...
+    @property
+    def is_admitted(self) -> bool: ...
+    @property
+    def reject_code(self) -> Optional[int]:
+        """The stable reject code (1..=7: malformed, unknown-invite, expired,
+        bad-request, replay, internal, denied) if rejected, else ``None``."""
+        ...
+    @property
+    def reject_message(self) -> Optional[str]: ...
+
+class DeviceRecord:
+    """One enrolled device in the operator's inventory."""
+
+    @property
+    def device(self) -> bytes: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def tags(self) -> List[str]: ...
+    @property
+    def enrolled_at(self) -> int: ...
+    @property
+    def revoked_at(self) -> Optional[int]:
+        """Unix-seconds the device was revoked, or ``None`` while active."""
+        ...
+    @property
+    def is_revoked(self) -> bool: ...
+
+class DeviceEnrollment:
+    """A device's persisted enrollment — its own key + the ``root -> device``
+    grant it received — so it survives restarts without re-pairing. The device
+    seed stays in Rust (H8); :attr:`device` hands back an opaque ``Identity``."""
+
+    def __init__(
+        self,
+        device: Identity,
+        chain: DelegationChain,
+        rendezvous: str,
+        enrolled_at: int,
+    ) -> None: ...
+    @staticmethod
+    def load(path: str) -> Optional["DeviceEnrollment"]:
+        """Load a persisted enrollment. ``None`` if none is saved yet; raises on
+        a corrupt file."""
+        ...
+    def save(self, path: str) -> None:
+        """Persist to ``path`` (0600, atomic). Overwrites — e.g. after renewal."""
+        ...
+    def is_valid(self, revocation: RevocationRegistry, skew_seconds: int = 0) -> bool:
+        """Whether the grant still verifies + is unexpired. An empty registry is
+        fine device-side (the provider enforces revocation on invoke)."""
+        ...
+    def needs_renewal(self, window_seconds: int, now: int) -> bool:
+        """Whether the grant is within ``window_seconds`` of expiry at ``now``."""
+        ...
+    @property
+    def device(self) -> Identity:
+        """The device's opaque ``Identity`` handle — extend the grant to a
+        gateway with it."""
+        ...
+    @property
+    def chain(self) -> DelegationChain: ...
+    @property
+    def rendezvous(self) -> str:
+        """The operator's rendezvous locator — where the device dials to renew."""
+        ...
+    @property
+    def root(self) -> bytes: ...
+    @property
+    def enrolled_at(self) -> int: ...
+    @property
+    def expires_at(self) -> int: ...
+
+class OperatorEnrollment:
+    """The operator side: mint invites, approve join requests into
+    ``root -> device`` delegations, and manage the device inventory."""
+
+    def __init__(
+        self, root: Identity, registry_path: str, revocation_path: str
+    ) -> None: ...
+    @staticmethod
+    def with_default_paths(root: Identity) -> "OperatorEnrollment":
+        """Build using the per-user default store paths. Raises if neither
+        resolves."""
+        ...
+    def invite(self, rendezvous: str, ttl_seconds: int) -> InviteToken:
+        """Mint an invite valid for ``ttl_seconds``, tracking it so a later
+        :meth:`approve` can match a request. ``rendezvous`` is the transport
+        locator devices dial."""
+        ...
+    def approve(
+        self, request: JoinRequest, grant_ttl_seconds: int, max_depth: Optional[int] = ...
+    ) -> DelegationChain:
+        """Approve a request (auto — invite-as-authorization): run the checks,
+        record the device, retire the single-use invite, return the
+        ``root -> device`` chain. Raises on any rejection."""
+        ...
+    def handle_join_request(
+        self, request_bytes: bytes, grant_ttl_seconds: int, max_depth: Optional[int] = ...
+    ) -> bytes:
+        """Server-side: turn serialized ``JoinRequest`` bytes into serialized
+        ``JoinOutcome`` bytes (auto — invite-as-authorization). Never raises; a
+        rejection is a coded ``JoinOutcome``."""
+        ...
+    def revoke(self, device: bytes) -> None:
+        """Revoke a device: raise its revocation floor and stamp the inventory."""
+        ...
+    def devices(self) -> List[DeviceRecord]:
+        """The enrolled devices in the inventory."""
+        ...
+    def forget(self, device: bytes) -> bool:
+        """Prune a device from the inventory (orthogonal to revoking its floor).
+        Returns whether a record existed."""
+        ...
+    def pending_invites(self, now: int) -> List[InviteToken]:
+        """Outstanding (minted, unredeemed, unexpired at ``now``) invites."""
+        ...
+    @property
+    def root_id(self) -> bytes: ...
+    def root_fingerprint(self) -> str: ...
+
+class EnrollmentServeHandle:
+    """Keeps a served enrollment service alive (returned by
+    ``NetMesh.serve_enrollment_auto``). Dropping it or calling :meth:`stop`
+    unregisters the service."""
+
+    def stop(self) -> None:
+        """Stop serving enrollment (unregister the service)."""
+        ...
+    @property
+    def serving(self) -> bool: ...
+
+class LocalPublicationHandle:
+    """A live publication of a node's OWN local tools (returned by
+    ``NetMesh.publish_tools``). Hold it to keep the tools announced + served."""
+
+    @property
+    def tools(self) -> List[str]:
+        """The served tool ids (channel-safe)."""
+        ...
+    @property
+    def skipped_tools(self) -> List[str]:
+        """Tool names skipped because they had no usable id (an empty name)."""
+        ...
+    @property
+    def serving(self) -> bool:
+        """Whether the publication is still live."""
+        ...
+    def withdraw(self) -> None:
+        """Withdraw immediately: re-announce the remaining set so peers stop
+        advertising these tools, then stop the services. Idempotent."""
+        ...
+    def stop(self) -> None:
+        """Stop serving (unregister on drop; does not re-announce). Idempotent."""
+        ...
+
+class A2aServeHandle:
+    """Keeps the served agent-to-agent task services alive (returned by
+    ``NetMesh.serve_a2a``). Dropping it or calling :meth:`stop` unregisters
+    them."""
+
+    def stop(self) -> None:
+        """Stop accepting A2A tasks (unregister the services)."""
+        ...
+    @property
+    def serving(self) -> bool: ...
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed

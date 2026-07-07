@@ -45,7 +45,8 @@ use crate::bridge::{
 };
 use crate::spec::CallToolResult;
 use crate::wrap::invoke::{
-    ERR_BAD_REQUEST, ERR_DELEGATION, ERR_OWNER_SCOPE, ERR_PAYMENT, ERR_TOOL, ERR_UPSTREAM,
+    ERR_BAD_REQUEST, ERR_DELEGATION, ERR_OWNER_SCOPE, ERR_PAYMENT, ERR_POLICY, ERR_TOOL,
+    ERR_UPSTREAM,
 };
 use crate::wrap::DelegationSigner;
 
@@ -395,11 +396,14 @@ impl MeshGateway {
 /// Map a provider application error (nRPC `ServerError`) from an *invoke* to a
 /// gateway result.
 ///
-/// **Authorization verdicts become `Denied`.** Both an owner-scope rejection
-/// ([`ERR_OWNER_SCOPE`], the confused-deputy defense) and a delegation-gate
+/// **Authorization verdicts become `Denied`.** An owner-scope rejection
+/// ([`ERR_OWNER_SCOPE`], the confused-deputy defense), a delegation-gate
 /// rejection ([`ERR_DELEGATION`] — a bad/replayed/stale signature, or the
-/// operator case of a chain the provider has since revoked) are authorization
-/// answers, not remote tool bugs. Surfacing `ERR_DELEGATION` as `Denied` (rather
+/// operator case of a chain the provider has since revoked), and an
+/// invoke-policy refusal ([`ERR_POLICY`] — the in-root toll booth declined, e.g.
+/// an allowlist deny or a dangerous-tool approval that was refused / could not
+/// reach the operator) are all authorization answers, not remote tool bugs.
+/// Surfacing them as `Denied` (rather
 /// than the opaque `is_error` tool result the fall-through would produce) keeps
 /// it consistent with its owner-scope sibling, so the demand side reports
 /// `denied` and a model doesn't mistake a revoked chain for a tool failure and
@@ -411,10 +415,13 @@ impl MeshGateway {
 /// other status is a generic in-band error.
 fn map_invoke_server_error(status: u16, message: String) -> Result<CallToolResult, GatewayError> {
     match status {
-        // Payment rejections join the authorization family: an unpaid /
-        // already-redeemed / frozen quote is a verdict, not a tool bug,
-        // and no failover peer would answer differently.
-        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_PAYMENT => Err(GatewayError::Denied(message)),
+        // Payment and policy rejections join the authorization family: an
+        // unpaid / already-redeemed / frozen quote, or a policy deny (the
+        // in-root toll booth declined), is a verdict, not a tool bug, and no
+        // failover peer would answer differently.
+        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_PAYMENT | ERR_POLICY => {
+            Err(GatewayError::Denied(message))
+        }
         // The wrap handler put the full CallToolResult JSON in the message;
         // recover it so the model sees the structured error, falling back to a
         // plain text error if it won't decode.
@@ -838,6 +845,7 @@ mod tests {
             substitutability: "provider_equivalent".into(),
             visibility: "owner_only".into(),
             invocation_scope: "same_root_identity".into(),
+            schema_hash: String::new(),
         };
         // Build the group through the real path so the primary/provider list
         // come from grouping, not a hand-rolled struct. Collapse enabled: this
