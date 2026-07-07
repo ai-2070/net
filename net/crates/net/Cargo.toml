@@ -308,7 +308,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional =
 # to seal the 32-byte ed25519 seed under the target's key — the
 # construction mirrors libsodium's `crypto_box_seal` but uses the
 # XChaCha AEAD already in-tree rather than pulling in XSalsa20.
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], optional = true }
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"], optional = true }
 # Audited, optimizer-resistant constant-time primitives. Used for the
 # bearer-secret newtype compares (`GroupId` / `SubnetId`); already
 # compiled in transitively via the dalek/curve25519 stack, so a direct
