@@ -1,0 +1,23 @@
+net/crates/net/bindings/python/src/publish.rs
+  s_ecf38b21f410fb::t_d84a30821420da 80-88
+net/crates/net/bindings/python/tests/test_publish.py
+  s_ecf38b21f410fb::t_c97d33c22cd018 161-201
+  s_ecf38b21f410fb::t_682cd7609d8dfd 158-160
+  s_ecf38b21f410fb::t_903f7a9a83841b 151-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b08cd169f509bffdeb5aaa699af5c6a082f695e4",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
