@@ -52,6 +52,8 @@ pub mod engine;
 pub mod facilitator;
 pub mod flow;
 pub mod policy;
+#[cfg(feature = "http-facilitator")]
+pub(crate) mod tls_roots;
 pub mod x402;
 
 pub use crate::core::billing_event::BillingEvent;
