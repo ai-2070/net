@@ -41,11 +41,11 @@ The one gap that caps confidence. A facilitator receipt justifies `observed`, fu
 
 The mesh flow authors exact-SVM payloads; the HTTP door's `can_settle` + `author_payload` never grew the arm. Pure parity work — no new seams.
 
-- [ ] `can_settle`: namespace match widens to `eip155 | solana` (mirroring `flow/mod.rs`), still gated on a configured `SchemeSigner` for the namespace
-- [ ] `author_payload`: add the exact-SVM arm — `exact_svm::transfer_intent(requirements)` → `signer.sign_svm_transfer(&intent)` → `exact_svm::payload_object` (verbatim the mesh-flow dispatch; wallet owns key, SPL machinery, and blockhash)
-- [ ] Retry honesty carried over: the wallet may bind a fresh blockhash, so same-quote payload bytes can differ — irrelevant on this path (HTTP has no provider-side idempotency; one `fetch_paid` = one attempt, already documented), but say so at the arm
-- [ ] Ride-along cleanup (review LOW): `exact_svm::transfer_intent` accepts a reference-less `solana` network outside the carry path — validate CAIP-2 shape at the intent builder
-- [ ] All H2/M1-era hardening applies automatically (redirect refusal, origin re-check, cleartext refusal, bearer-scheme reservation retention — all live in the shared path, not per-scheme); add one solana-accepts fixture case to `http402_outbound.rs` with a stub `ExternalSvmSigner` proving policy holds before signing and the reservation survives a claimed reject
+- [x] `can_settle`: namespace match widens to `eip155 | solana` (mirroring `flow/mod.rs`), still gated on a configured `SchemeSigner` for the namespace
+- [x] `author_payload`: add the exact-SVM arm — `exact_svm::transfer_intent(requirements)` → `signer.sign_svm_transfer(&intent)` → `exact_svm::payload_object` (verbatim the mesh-flow dispatch; wallet owns key, SPL machinery, and blockhash)
+- [x] Retry honesty carried over: the wallet may bind a fresh blockhash, so same-quote payload bytes can differ — irrelevant on this path (HTTP has no provider-side idempotency; one `fetch_paid` = one attempt, already documented), but say so at the arm
+- [x] Ride-along cleanup (review LOW): `exact_svm::transfer_intent` accepts a reference-less `solana` network outside the carry path — validate CAIP-2 shape at the intent builder
+- [x] All H2/M1-era hardening applies automatically (redirect refusal, origin re-check, cleartext refusal, bearer-scheme reservation retention — all live in the shared path, not per-scheme); add one solana-accepts fixture case to `http402_outbound.rs` with a stub `ExternalSvmSigner` proving policy holds before signing and the reservation survives a claimed reject
 
 **Acceptance:** `fetch_paid` against a fixture demanding `exact`/`solana:…` settles under the same spend policy, with nothing signed before policy clears; the eip155 tests are untouched.
 
