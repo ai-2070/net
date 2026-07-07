@@ -115,20 +115,36 @@ pub fn schema_hash(input_schema: &serde_json::Value) -> String {
 }
 
 /// Recursively sort object keys so equal schemas serialize identically
-/// regardless of the source key order.
+/// regardless of the source key order. `required` arrays — set-semantic in
+/// JSON Schema (`["a","b"]` validates identically to `["b","a"]`) — are also
+/// sorted, so two providers listing the same required fields in a different
+/// order still hash together. Other arrays keep their order: array position
+/// is meaningful in general JSON (and in schema keywords like `prefixItems`),
+/// so a missed dedup there is safer than a false merge.
 fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+    canonicalize_json_under(v, None)
+}
+
+fn canonicalize_json_under(v: &serde_json::Value, parent_key: Option<&str>) -> serde_json::Value {
     match v {
         serde_json::Value::Object(map) => {
             let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             let sorted: serde_json::Map<String, serde_json::Value> = entries
                 .into_iter()
-                .map(|(k, val)| (k.clone(), canonicalize_json(val)))
+                .map(|(k, val)| (k.clone(), canonicalize_json_under(val, Some(k))))
                 .collect();
             serde_json::Value::Object(sorted)
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
+            let mut items: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|item| canonicalize_json_under(item, None))
+                .collect();
+            if parent_key == Some("required") && items.iter().all(|i| i.is_string()) {
+                items.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            }
+            serde_json::Value::Array(items)
         }
         other => other.clone(),
     }
@@ -437,6 +453,27 @@ mod tests {
         // Hex, 16 bytes = 32 chars.
         assert_eq!(schema_hash(&a).len(), 32);
         assert!(schema_hash(&a).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn schema_hash_treats_required_as_a_set_but_keeps_other_array_order() {
+        // `required` is set-semantic in JSON Schema: the same contract listed
+        // in a different order must hash together (a dedup miss otherwise).
+        let a = json!({ "type": "object", "required": ["a", "b"] });
+        let b = json!({ "type": "object", "required": ["b", "a"] });
+        assert_eq!(
+            schema_hash(&a),
+            schema_hash(&b),
+            "required-array order must not matter"
+        );
+        // A genuinely different required set still discriminates.
+        let c = json!({ "type": "object", "required": ["a", "c"] });
+        assert_ne!(schema_hash(&a), schema_hash(&c));
+        // Other arrays keep their order — position is meaningful in general
+        // JSON (e.g. `prefixItems`), so no sorting outside `required`.
+        let e1 = json!({ "type": "object", "prefixItems": [{"type": "string"}, {"type": "integer"}] });
+        let e2 = json!({ "type": "object", "prefixItems": [{"type": "integer"}, {"type": "string"}] });
+        assert_ne!(schema_hash(&e1), schema_hash(&e2));
     }
 
     #[test]

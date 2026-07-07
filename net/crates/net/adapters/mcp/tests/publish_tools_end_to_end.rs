@@ -378,6 +378,93 @@ async fn an_invoke_policy_denies_an_admitted_call() {
     }
 }
 
+/// A policy that records every consultation — for proving the policy is never
+/// asked about a call that can't execute.
+struct CountingPolicy {
+    consulted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl InvokePolicy for CountingPolicy {
+    async fn check(&self, _ctx: &PolicyContext) -> PolicyDecision {
+        self.consulted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PolicyDecision::deny("counted, then denied")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_structurally_invalid_call_never_reaches_the_policy() {
+    // Arguments are parsed BEFORE the policy hook: a real approval policy may
+    // prompt a human operator, and a call that can never execute (non-object
+    // arguments) must be rejected as ERR_BAD_REQUEST without consulting it.
+    let caller = build_mesh(&[0x54u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x54u8; 32]).await);
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+
+    let consulted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = WrapConfig::owner_only(hermes_impl(), caller.origin_hash());
+    config.policy = Some(Arc::new(CountingPolicy {
+        consulted: Arc::clone(&consulted),
+    }));
+    let invoker = Arc::new(LocalTools::default());
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let _publication = publisher
+        .publish_tools(
+            &local_tools(),
+            invoker as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
+        .await
+        .expect("publish local tools");
+
+    let filter = CapabilityFilter::new().require_tag("echo");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "tools discovered",
+    );
+
+    // Structurally invalid arguments (a JSON array, not an object). Warm up
+    // the per-caller reply channel first (a fast rejection can outrace the
+    // first subscription).
+    let bad_body = || Bytes::from_static(b"[1,2,3]");
+    let _ = call_bounded(&caller, b_id, "echo", bad_body()).await;
+    let err = call_bounded(&caller, b_id, "echo", bad_body())
+        .await
+        .expect_err("non-object arguments are rejected");
+    assert!(
+        err.contains("must be a JSON object"),
+        "expected the bad-request reason, got: {err}",
+    );
+    assert_eq!(
+        consulted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the policy was never consulted for a call that can't execute",
+    );
+
+    // A well-formed call DOES reach the policy (which denies it) — the hook
+    // still runs, just after parsing.
+    let good_body = || Bytes::from(serde_json::to_vec(&json!({ "message": "hi" })).unwrap());
+    let err = call_bounded(&caller, b_id, "echo", good_body())
+        .await
+        .expect_err("the counting policy denies");
+    assert!(err.contains("counted, then denied"), "got: {err}");
+    assert!(consulted.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+    caller.shutdown().await.ok();
+    drop(_publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_outside_the_owner_scope_cannot_invoke_a_local_tool() {
     // The owner-scope gate applies to `publish_tools` exactly as to

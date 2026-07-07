@@ -303,12 +303,25 @@ impl RpcHandler for WrapInvokeHandler {
             }
         };
 
-        // [1b] Policy hook (V2 Phase 2, the in-root toll booth). The call is
-        //      admitted; now the provider's policy — an allowlist, or a
-        //      dangerous-tool approval that routes to the operator — gets the
-        //      final say before the tool runs. `None` is the allow-all preset
-        //      (skipped): the mesh adds reach, not authority. A deny becomes an
-        //      ERR_POLICY the demand side reports as `denied`.
+        // [2] Translate the request body into tool arguments — BEFORE the
+        //     policy hook, so a structurally invalid call (one that can never
+        //     execute) is rejected as ERR_BAD_REQUEST without ever consulting
+        //     the policy. A real approval policy may prompt a human operator;
+        //     asking them to approve garbage would be noise at best and an
+        //     approval-fatigue vector at worst.
+        let arguments =
+            parse_arguments(&ctx.payload.body).map_err(|message| RpcHandlerError::Application {
+                code: ERR_BAD_REQUEST,
+                message,
+            })?;
+
+        // [2b] Policy hook (V2 Phase 2, the in-root toll booth). The call is
+        //      admitted and well-formed; now the provider's policy — an
+        //      allowlist, or a dangerous-tool approval that routes to the
+        //      operator — gets the final say before the tool runs. `None` is
+        //      the allow-all preset (skipped): the mesh adds reach, not
+        //      authority. A deny becomes an ERR_POLICY the demand side reports
+        //      as `denied`.
         if let Some(policy) = &self.policy {
             if let PolicyDecision::Deny { reason } = policy
                 .check(&PolicyContext {
@@ -324,13 +337,6 @@ impl RpcHandler for WrapInvokeHandler {
                 });
             }
         }
-
-        // [2] Translate the request body into tool arguments.
-        let arguments =
-            parse_arguments(&ctx.payload.body).map_err(|message| RpcHandlerError::Application {
-                code: ERR_BAD_REQUEST,
-                message,
-            })?;
 
         // [3] Invoke the wrapped tool. A protocol failure (server gone,
         //     JSON-RPC error) is ERR_UPSTREAM; a tool-level `is_error`
