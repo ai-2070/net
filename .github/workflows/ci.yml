@@ -704,8 +704,12 @@ jobs:
       # feature) surfaces `derive_child_identity` / `DelegationChain` /
       # `RevocationRegistry` for `test_delegation.py`. Default `redis` is
       # omitted because the suite doesn't exercise the Redis adapter.
+      # `extension-module` (the cdylib must not link libpython) has to
+      # ride along explicitly: `--no-default-features` + an explicit
+      # feature list, so nothing else re-enables it here and we don't
+      # rely on maturin merging `[tool.maturin] features` with CLI args.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,payments
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,payments,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
@@ -1323,30 +1327,23 @@ jobs:
           LD_PRELOAD: "/tmp/libnapi_stub.so"
         run: cargo test --lib ${{ matrix.crate.features }}
 
-      # pyo3's `extension-module` feature (hardcoded — maturin builds the
-      # importable cdylib from this crate) deliberately does not link
-      # libpython: the host interpreter supplies the C-API symbols at
-      # import time. A standalone `cargo test --lib` executable therefore
-      # cannot resolve them at link time — the same problem class as
-      # node's napi symbols above. It only *surfaces* when a unit test
-      # statically reaches pyo3 runtime machinery (e.g. holding a
-      # `Py<PyAny>` whose drop glue references the GIL entry points);
-      # `--gc-sections` hid it while every unit test was pure-JSON. The
-      # unit tests never CALL the interpreter (interpreter-dependent
-      # coverage lives in the `python-tests` pytest job, where the real
-      # extension module is imported by a live Python), so unresolved
-      # symbols are ignored rather than stubbed. If a future unit test
-      # needs a live interpreter, it belongs in pytest — or the crate
-      # moves to pyo3's optional-extension-module pattern.
-      - name: Run tests (python — libpython unlinked by design)
+      # The python entry needs no napi-style stub: the crate follows
+      # pyo3's optional-extension-module pattern (see its Cargo.toml),
+      # so a plain `cargo test` build links the host libpython like
+      # any normal crate and the test binary runs standalone. Linking
+      # `-lpython3.X` needs the unversioned `.so` symlink from
+      # python3-dev; the runner image normally ships it, so this is a
+      # cheap guard rather than an unconditional install.
+      - name: Ensure libpython is linkable (python)
         if: matrix.crate.name == 'python'
-        working-directory: ${{ matrix.crate.path }}
-        env:
-          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
-        run: cargo test --lib ${{ matrix.crate.features }}
+        run: |
+          dpkg -s python3-dev >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-dev
+          }
 
       - name: Run tests
-        if: matrix.crate.name != 'node' && matrix.crate.name != 'python'
+        if: matrix.crate.name != 'node'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --lib ${{ matrix.crate.features }}
 
