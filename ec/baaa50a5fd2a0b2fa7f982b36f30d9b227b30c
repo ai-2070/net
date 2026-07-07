@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/PAYMENTS_P2_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_669dbebfd1d22d 94-95,104-105,111
+  s_2ce1bbf7d954a5::t_248ab438df89a1 7-20,25-27
+  s_2ce1bbf7d954a5::t_b5f0381c93226d 75
+  s_2ce1bbf7d954a5::t_e93d241d555695 53-54
+  s_2ce1bbf7d954a5::t_d47eaffcf408e7 82-83
+  s_2ce1bbf7d954a5::t_2bc2fe583bcf00 67-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ecbaaa50a5fd2a0b2fa7f982b36f30d9b227b30c",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
