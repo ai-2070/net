@@ -404,6 +404,12 @@ impl OperatorEnrollment {
     /// still holds ([`EnrollmentAuthority::renew`]), re-issues a fresh grant,
     /// and re-records the device (preserving its existing name/tags, fresh
     /// `enrolled_at`). A revoked device is refused — its chain fails the check.
+    ///
+    /// Only a device still **in the inventory** renews: `forget()` (pruning
+    /// without revoking) thereby also stops silent renewal — otherwise a
+    /// pruned device would quietly resurrect itself as an active record on its
+    /// next renewal tick. A forgotten device keeps its current grant until
+    /// expiry and must re-enroll to reappear.
     pub fn renew(
         &self,
         request: &RenewalRequest,
@@ -415,19 +421,21 @@ impl OperatorEnrollment {
         let registry = RevocationRegistry::new();
         RevocationStore::load(&self.revocation_path)?.apply_to(&registry);
 
+        // Membership gate + the record's name/tags (renewal doesn't carry
+        // them), checked before minting anything.
+        let existing = DeviceRegistry::load(&self.registry_path)?;
+        let (name, tags) = match existing.get(&request.device) {
+            Some(r) => (r.name.clone(), r.tags.clone()),
+            None => return Err(EnrollmentError::Unrenewable.into()),
+        };
+
         let enrollment = self
             .authority
             .renew(request, &registry, grant_ttl, max_depth)?;
 
-        // Preserve the device's existing name/tags (renewal doesn't carry them),
-        // and refresh `enrolled_at` so the expiry surface stays current. The
-        // revocation stamp is carried forward too — a renewal must never flip a
+        // Refresh `enrolled_at` so the expiry surface stays current. The
+        // revocation stamp is carried forward — a renewal must never flip a
         // revoked-looking record back to "active".
-        let existing = DeviceRegistry::load(&self.registry_path)?;
-        let (name, tags) = existing
-            .get(&enrollment.device)
-            .map(|r| (r.name.clone(), r.tags.clone()))
-            .unwrap_or_default();
         let record = self.carry_forward_revocation(DeviceRecord::new(
             enrollment.device.clone(),
             name,
@@ -481,6 +489,10 @@ fn reject_code(err: &OperatorError) -> u16 {
             | EnrollmentError::BadSignature => reject::BAD_REQUEST,
             EnrollmentError::Replay => reject::REPLAY,
             EnrollmentError::Unrenewable => reject::UNRENEWABLE,
+            // Not "re-enroll" — the device retries with a freshly signed
+            // request; BAD_REQUEST tells it the request (not the grant) was
+            // the problem.
+            EnrollmentError::StaleRenewal => reject::BAD_REQUEST,
             EnrollmentError::LedgerSaturated | EnrollmentError::Token(_) => reject::INTERNAL,
         },
         // Not reachable from the join/renewal wire handlers (revocation is a
@@ -833,6 +845,38 @@ mod tests {
         assert_eq!(rec.name, "pc");
         assert_eq!(rec.tags, vec!["region:office".to_string()]);
         assert!(!rec.is_revoked());
+    }
+
+    #[test]
+    fn renew_refuses_a_forgotten_device() {
+        // forget() prunes the inventory without touching floors; silent
+        // renewal must not resurrect the pruned device as an active record.
+        let (op, _root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        let chain = op
+            .approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+
+        assert!(op.forget(device.entity_id()).unwrap());
+        let renew_req = RenewalRequest::create(&device, &chain);
+        assert!(matches!(
+            op.renew(&renew_req, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(OperatorError::Enrollment(EnrollmentError::Unrenewable))
+        ));
+        assert!(op.devices().unwrap().is_empty(), "not resurrected");
+
+        // Re-enrolling through a fresh invite restores renewability.
+        let invite2 = op.invite_at("relay://rv", HOUR, T0 + 1);
+        let req2 = JoinRequest::create(&device, "pc-again", vec![], &invite2);
+        let chain2 = op
+            .approve_at(&req2, T0 + 1, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+        op.renew(&RenewalRequest::create(&device, &chain2), HOUR, DEFAULT_DELEGATION_DEPTH)
+            .expect("re-enrolled device renews again");
     }
 
     #[test]

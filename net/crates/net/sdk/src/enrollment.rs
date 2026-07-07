@@ -108,6 +108,13 @@ const MAX_TAGS: usize = 64;
 /// ([`EnrollmentError::LedgerSaturated`]) rather than forgetting a spent nonce.
 const MAX_OUTSTANDING_INVITES: usize = 4096;
 
+/// How old a [`RenewalRequest`]'s `issued_at` may be before the authority
+/// refuses it ([`EnrollmentError::StaleRenewal`]) — the anti-replay window for
+/// a captured renewal blob. The device's renewal client signs a fresh request
+/// per attempt, so a legitimate request is always seconds old; five minutes
+/// absorbs queueing plus clock drift.
+pub const RENEWAL_FRESHNESS_SECS: u64 = 5 * 60;
+
 /// Errors from the enrollment handshake.
 #[derive(Debug, thiserror::Error)]
 pub enum EnrollmentError {
@@ -147,6 +154,12 @@ pub enum EnrollmentError {
     /// this mesh — it can't be renewed; the device must re-enroll.
     #[error("the presented grant is not renewable (revoked, expired, or wrong mesh)")]
     Unrenewable,
+    /// A renewal request is outside its freshness window — a replay of a
+    /// captured request, or a badly skewed device clock. The device retries
+    /// with a freshly signed request (its renewal client mints one per
+    /// attempt).
+    #[error("renewal request is stale or future-dated; retry with a fresh request")]
+    StaleRenewal,
     /// The `root → device` delegation could not be minted (e.g. an
     /// out-of-range grant TTL).
     #[error(transparent)]
@@ -509,29 +522,40 @@ pub struct RenewalRequest {
     pub chain: Vec<u8>,
     /// The mesh root the grant anchors at.
     pub root: EntityId,
+    /// Unix-seconds the request was created — bound into the signature so a
+    /// captured renewal blob can't be replayed outside the authority's
+    /// freshness window ([`RENEWAL_FRESHNESS_SECS`]).
+    pub issued_at: u64,
     /// Ed25519 signature by `device` over the renewal challenge.
     pub signature: [u8; 64],
 }
 
 impl RenewalRequest {
-    /// Build + sign a renewal request from the device's current grant.
-    /// `device` must own its signing key.
+    /// Build + sign a renewal request from the device's current grant, stamped
+    /// with the current clock. `device` must own its signing key.
     pub fn create(device: &Identity, current_chain: &DelegationChain) -> Self {
+        Self::create_at(device, current_chain, now_unix())
+    }
+
+    /// [`Self::create`] with an explicit `issued_at` (unix secs) — for
+    /// deterministic tests and callers that already hold a clock reading.
+    pub fn create_at(device: &Identity, current_chain: &DelegationChain, issued_at: u64) -> Self {
         let chain = current_chain.to_bytes();
         let root = current_chain.root();
-        let challenge = renewal_challenge(device.entity_id(), &chain, &root);
+        let challenge = renewal_challenge(device.entity_id(), &chain, &root, issued_at);
         let signature = device.sign(&challenge);
         Self {
             device: device.entity_id().clone(),
             chain,
             root,
+            issued_at,
             signature,
         }
     }
 
     /// Verify the device's self-signature — that it still holds the key.
     pub fn verify_self_signature(&self) -> Result<(), EnrollmentError> {
-        let challenge = renewal_challenge(&self.device, &self.chain, &self.root);
+        let challenge = renewal_challenge(&self.device, &self.chain, &self.root, self.issued_at);
         self.device
             .verify_bytes(&challenge, &self.signature)
             .map_err(|_| EnrollmentError::BadSignature)
@@ -539,10 +563,11 @@ impl RenewalRequest {
 
     /// Canonical wire form (versioned, length-prefixed).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4 + 32 + 32 + 64 + 4 + self.chain.len());
+        let mut buf = Vec::with_capacity(4 + 32 + 32 + 8 + 64 + 4 + self.chain.len());
         buf.extend_from_slice(&RENEWAL_MAGIC);
         buf.extend_from_slice(self.device.as_bytes());
         buf.extend_from_slice(self.root.as_bytes());
+        buf.extend_from_slice(&self.issued_at.to_le_bytes());
         buf.extend_from_slice(&self.signature);
         push_lp(&mut buf, &self.chain);
         buf
@@ -565,6 +590,9 @@ impl RenewalRequest {
             r.take_arr::<32>()
                 .ok_or(EnrollmentError::MalformedRequest("truncated root"))?,
         );
+        let issued_at = r
+            .take_u64()
+            .ok_or(EnrollmentError::MalformedRequest("truncated issued_at"))?;
         let signature = r
             .take_arr::<64>()
             .ok_or(EnrollmentError::MalformedRequest("truncated signature"))?;
@@ -579,6 +607,7 @@ impl RenewalRequest {
             device,
             chain,
             root,
+            issued_at,
             signature,
         })
     }
@@ -861,6 +890,15 @@ impl EnrollmentAuthority {
             return Err(EnrollmentError::WrongMesh);
         }
         request.verify_self_signature()?;
+        // Freshness: the signed `issued_at` must be recent (anti-replay of a
+        // captured request) and not implausibly future-dated. A refused device
+        // just retries — its renewal client signs a fresh request per attempt.
+        let now = now_unix();
+        if request.issued_at.saturating_add(RENEWAL_FRESHNESS_SECS) < now
+            || request.issued_at > now.saturating_add(TOKEN_CLOCK_SKEW_SECS_RECOMMENDED)
+        {
+            return Err(EnrollmentError::StaleRenewal);
+        }
         // A revoked device can't renew. A bare `root → device` grant is issued
         // by the *root*, so `chain.verify` alone won't catch a **device-floor**
         // revocation (the operator's `revoke` bumps the *device's* floor, which
@@ -1083,7 +1121,13 @@ impl DeviceEnrollment {
             path: path.display().to_string(),
             reason: format!("serialize device enrollment: {e}"),
         })?;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // Unique per save, not just per process: two concurrent saves in one
+        // process (the renewal loop + a manual renew) must not truncate /
+        // rename-race each other's temp file. Each writes its own and the
+        // atomic renames serialize to last-writer-wins on the real path.
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
@@ -1236,14 +1280,16 @@ fn join_challenge(
 }
 
 /// The domain-separated, length-prefixed challenge a device signs to renew its
-/// grant (over its device id, current chain bytes, and the mesh root).
-fn renewal_challenge(device: &EntityId, chain: &[u8], root: &EntityId) -> Vec<u8> {
+/// grant (over its device id, current chain bytes, the mesh root, and the
+/// request's `issued_at` — the freshness binding).
+fn renewal_challenge(device: &EntityId, chain: &[u8], root: &EntityId, issued_at: u64) -> Vec<u8> {
     let mut msg =
-        Vec::with_capacity(RENEWAL_CHALLENGE_DOMAIN.len() + 4 + 32 + 4 + chain.len() + 4 + 32);
+        Vec::with_capacity(RENEWAL_CHALLENGE_DOMAIN.len() + 4 + 32 + 4 + chain.len() + 4 + 32 + 8);
     msg.extend_from_slice(RENEWAL_CHALLENGE_DOMAIN);
     push_lp(&mut msg, device.as_bytes());
     push_lp(&mut msg, chain);
     push_lp(&mut msg, root.as_bytes());
+    msg.extend_from_slice(&issued_at.to_le_bytes());
     msg
 }
 
@@ -1793,6 +1839,81 @@ mod tests {
             ),
             Err(EnrollmentError::WrongMesh)
         ));
+    }
+
+    #[test]
+    fn renew_refuses_a_stale_or_future_dated_request() {
+        // The signed issued_at is the anti-replay binding: a captured renewal
+        // blob outside the freshness window is refused, while a fresh one (and
+        // one within clock-skew tolerance) renews.
+        let auth = authority();
+        let invite = auth.mint_invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let jreq = JoinRequest::create(&device, "pc", vec![], &invite);
+        let chain = auth
+            .approve(&jreq, &invite, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap()
+            .chain;
+        let reg = RevocationRegistry::new();
+
+        let now = now_unix();
+        // Replay of a request captured beyond the freshness window.
+        let stale = RenewalRequest::create_at(&device, &chain, now - RENEWAL_FRESHNESS_SECS - 60);
+        assert!(matches!(
+            auth.renew(&stale, &reg, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(EnrollmentError::StaleRenewal)
+        ));
+        // Implausibly future-dated (beyond skew tolerance).
+        let future = RenewalRequest::create_at(&device, &chain, now + 600);
+        assert!(matches!(
+            auth.renew(&future, &reg, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(EnrollmentError::StaleRenewal)
+        ));
+        // Fresh (and mildly future within skew) requests renew.
+        let fresh = RenewalRequest::create(&device, &chain);
+        auth.renew(&fresh, &reg, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .expect("a fresh request renews");
+        let skewed = RenewalRequest::create_at(&device, &chain, now + 30);
+        auth.renew(&skewed, &reg, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .expect("a request within skew tolerance renews");
+
+        // Tampering issued_at breaks the signature (it is bound in).
+        let mut tampered = RenewalRequest::create(&device, &chain);
+        tampered.issued_at -= 1;
+        assert!(matches!(
+            tampered.verify_self_signature(),
+            Err(EnrollmentError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn concurrent_saves_never_tear_the_enrollment_file() {
+        // Two writers in one process (the renewal loop + a manual renew) each
+        // get a unique temp file; the atomic renames serialize and a reader
+        // always sees a complete, parseable enrollment.
+        let (_auth, _device, de) = enroll_a_device(HOUR);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enrollment.json");
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let de = de.clone();
+                let path = path.clone();
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        de.save(&path).expect("every save succeeds");
+                    }
+                });
+            }
+        });
+        let loaded = DeviceEnrollment::load(&path).unwrap().expect("present");
+        assert_eq!(loaded.device().entity_id(), de.device().entity_id());
+        // No stray temp files were left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
     #[test]
