@@ -248,6 +248,13 @@ pub trait TaskExecutor: Send + Sync {
     async fn run(&self, brief: TaskBrief, cancel: CancelToken) -> Result<String, String>;
 }
 
+/// How long a terminal record outlives its last state change before
+/// [`TaskRegistry::submit`]'s housekeeping evicts it: long enough for a
+/// requester to poll the outcome (and retry a few times), short enough that a
+/// long-lived executor's table doesn't grow without bound. `forget()` remains
+/// the immediate path once the result is retrieved.
+pub const TERMINAL_RECORD_TTL_SECS: u64 = 60 * 60;
+
 struct Entry {
     brief: TaskBrief,
     state: TaskState,
@@ -273,20 +280,41 @@ impl TaskRegistry {
     /// cancelled`, racing the executor against the cancel token so a cancel
     /// stops the work (a cooperative executor also watches the token).
     ///
+    /// Idempotent per task id: a re-submit of an id the registry already
+    /// knows (an nRPC retransmit of the accept) returns the id without
+    /// spawning a second executor — re-inserting would orphan the first
+    /// entry's cancel token (making the original run uncancellable) and race
+    /// two executors on the final state.
+    ///
+    /// Also evicts terminal records older than [`TERMINAL_RECORD_TTL_SECS`]
+    /// (see [`Self::evict_terminal`]) so a long-lived executor's table doesn't
+    /// grow without bound; [`Self::forget`] remains the immediate path.
+    ///
     /// Requires a tokio runtime context (the serve handler / a `#[tokio::test]`
     /// provides it).
     pub fn submit(&self, brief: TaskBrief, executor: Arc<dyn TaskExecutor>) -> String {
         let id = brief.task_id.clone();
         let cancel = CancelToken::new();
-        self.inner.lock().insert(
-            id.clone(),
-            Entry {
-                brief: brief.clone(),
-                state: TaskState::Accepted,
-                updated_at: now_secs(),
-                cancel: cancel.clone(),
-            },
-        );
+        {
+            let mut map = self.inner.lock();
+            let now = now_secs();
+            map.retain(|_, e| {
+                !e.state.is_terminal()
+                    || now.saturating_sub(e.updated_at) <= TERMINAL_RECORD_TTL_SECS
+            });
+            if map.contains_key(&id) {
+                return id;
+            }
+            map.insert(
+                id.clone(),
+                Entry {
+                    brief: brief.clone(),
+                    state: TaskState::Accepted,
+                    updated_at: now,
+                    cancel: cancel.clone(),
+                },
+            );
+        }
 
         let inner = Arc::clone(&self.inner);
         let id_run = id.clone();
@@ -381,6 +409,20 @@ impl TaskRegistry {
     /// Returns whether a record existed.
     pub fn forget(&self, task_id: &str) -> bool {
         self.inner.lock().remove(task_id).is_some()
+    }
+
+    /// Evict terminal records whose last state change is more than `ttl_secs`
+    /// before `now`, returning how many were dropped. In-flight tasks are
+    /// never touched. [`Self::submit`] runs this automatically with
+    /// [`TERMINAL_RECORD_TTL_SECS`]; exposed for callers that want a tighter
+    /// housekeeping schedule than "on the next submission".
+    pub fn evict_terminal(&self, ttl_secs: u64, now: u64) -> usize {
+        let mut map = self.inner.lock();
+        let before = map.len();
+        map.retain(|_, e| {
+            !e.state.is_terminal() || now.saturating_sub(e.updated_at) <= ttl_secs
+        });
+        before - map.len()
     }
 }
 
@@ -584,6 +626,80 @@ mod tests {
             "the non-cooperative executor's future was dropped"
         );
         assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    /// An executor that counts how many times it was started, then waits for
+    /// the cancel token.
+    struct CountingExecutor {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for CountingExecutor {
+        async fn run(&self, _brief: TaskBrief, cancel: CancelToken) -> Result<String, String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            cancel.cancelled().await;
+            Err("cancelled".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_is_idempotent() {
+        // An nRPC retransmit of an accepted brief must not spawn a second
+        // executor or replace the entry (which would orphan the first run's
+        // cancel token, leaving it uncancellable).
+        let reg = TaskRegistry::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let brief = TaskBrief::new("retransmitted job");
+        let exec = Arc::new(CountingExecutor {
+            runs: Arc::clone(&runs),
+        });
+        let id = reg.submit(brief.clone(), exec.clone());
+        let id2 = reg.submit(brief, exec);
+        assert_eq!(id, id2, "the retransmit acks the same id");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one executor ran");
+
+        // The (single, original) run is still wired to the entry's token.
+        assert!(reg.cancel(&id));
+        let state = wait_terminal(&reg, &id).await;
+        assert_eq!(state, TaskState::Cancelled);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_records_evict_after_ttl_running_ones_never() {
+        let reg = TaskRegistry::new();
+        let done = reg.submit(
+            TaskBrief::new("quick"),
+            Arc::new(MockExecutor {
+                result: "blob://r".to_string(),
+                saw_cancel: Arc::new(AtomicBool::new(false)),
+                wait_for_cancel: false,
+            }),
+        );
+        wait_terminal(&reg, &done).await;
+        // Within the TTL the record survives housekeeping.
+        assert_eq!(reg.evict_terminal(TERMINAL_RECORD_TTL_SECS, now_secs()), 0);
+        assert!(reg.status(&done).is_some());
+
+        let live = reg.submit(
+            TaskBrief::new("still running"),
+            Arc::new(MockExecutor {
+                result: String::new(),
+                saw_cancel: Arc::new(AtomicBool::new(false)),
+                wait_for_cancel: true,
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Past the TTL the terminal record evicts; the in-flight one never.
+        let future = now_secs() + TERMINAL_RECORD_TTL_SECS + 10;
+        assert_eq!(reg.evict_terminal(TERMINAL_RECORD_TTL_SECS, future), 1);
+        assert!(reg.status(&done).is_none());
+        assert!(reg.status(&live).is_some());
+        reg.cancel(&live);
     }
 
     /// An executor that panics mid-run.
