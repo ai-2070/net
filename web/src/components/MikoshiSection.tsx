@@ -4,7 +4,7 @@ import { DisplayHeading } from "./DisplayHeading";
 export function MikoshiSection() {
   return (
     <section id="mikoshi" className="border-b border-line px-6 py-20">
-      <SectionLabel>§05 / mikoshi // engram transit</SectionLabel>
+      <SectionLabel>§09 / mikoshi // engram transit</SectionLabel>
       <DisplayHeading>
         state moves.
         <br />

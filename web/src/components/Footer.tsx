@@ -6,10 +6,11 @@ const FOOTER_SPEC: ReadonlyArray<{
   label: string;
   class?: string;
 }> = [
-  { href: "#topology", label: "Topology classes" },
-  { href: "#properties", label: "Protocol properties" },
-  { href: "#mikoshi", label: "Mikoshi" },
-  { href: "#runtime", label: "Compute runtime" },
+  { href: "/why", label: "Why Net" },
+  { href: "/runtime", label: "Runtime" },
+  { href: "/dataforts", label: "Dataforts" },
+  { href: "/meshos", label: "MeshOS" },
+  { href: "/protocol", label: "Protocol" },
   { href: "#apps", label: "Applications" },
   { href: "#wall", label: "The Blackwall" },
   { href: "#releases", label: "Releases" },
@@ -93,8 +94,7 @@ export function Footer() {
             </span>
           </div>
           <p className="text-ink-dim text-[12px] leading-[1.6] max-w-[380px]">
-            Network Event Transport. A latency-first encrypted protocol for
-            compute.
+            Network Event Transport. A distributed mesh runtime for compute.
           </p>
         </div>
         <FooterColumn title="Spec" items={FOOTER_SPEC} />

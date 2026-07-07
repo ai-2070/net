@@ -151,6 +151,9 @@ function autoMeshHex4(): string {
 }
 
 const AUTOMESH_FEED_MAX = 7;
+// Module-scoped so the feed-line id survives React StrictMode's dev remount and
+// any effect re-run; a per-effect counter resets to 0 and produces duplicate keys.
+let autoMeshFeedCounter = 0;
 
 // Rich pool of random capability tags emitted on cap.announce. Mixes
 // edge hardware (sensors, mcus, radios), datacenter gear (gpu/cpu/nic),
@@ -278,16 +281,15 @@ function MeshAutoform() {
     let migrateTimer = 1.4;
     let advertiseTimer = 0;
     let rafId = 0;
-    let feedCounter = 0;
 
     const pushFeed = (
       prefix: string,
       prefixColor: string,
       body: React.ReactNode,
     ): void => {
-      feedCounter += 1;
+      autoMeshFeedCounter += 1;
       const line: AutoMeshFeedLine = {
-        id: feedCounter,
+        id: autoMeshFeedCounter,
         ts: autoMeshTs(),
         prefix,
         prefixColor,
@@ -878,22 +880,22 @@ const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
   {
     num: "mesh.os.1",
     name: "Mikoshi Lifecycle",
-    body: "spawn, migrate, supervise. daemons hop between machines without losing state, history, or place in the conversation.",
+    body: "Spawn, migrate, supervise. Daemons hop between machines without losing state, history, or place in the conversation.",
   },
   {
     num: "mesh.os.2",
     name: "Gravity Placement",
-    body: "workloads pull toward their data. compute lands near the bytes it touches — gravity-based scoring, not central scheduling.",
+    body: "Workloads pull toward their data. Compute lands near the bytes it touches — gravity-based scoring, not central scheduling.",
   },
   {
     num: "mesh.os.3",
     name: "Daemon Supervision",
-    body: "start, drain, restart, gate. exponential backoff. backpressure signals. graceful shutdown or forced.",
+    body: "Start, drain, restart, gate. Exponential backoff. Backpressure signals. Graceful shutdown or forced.",
   },
   {
     num: "mesh.os.4",
     name: "Capability Match",
-    body: "nodes advertise what they are — device, compute, storage, daemon, datafort. MeshOS routes daemons to nodes that fit.",
+    body: "Nodes advertise what they are — device, compute, storage, daemon, datafort. MeshOS routes daemons to nodes that fit.",
   },
 ];
 
@@ -903,7 +905,7 @@ export function MeshOsSection() {
       id="meshos"
       className="relative overflow-hidden border-b border-line px-6 py-20"
     >
-      <SectionLabel>§08 / cluster os // new</SectionLabel>
+      <SectionLabel>§12 / cluster os // new</SectionLabel>
       <DisplayHeading>
         MeshOS:
         <br />

@@ -11,7 +11,7 @@ export function ComputeRuntimeSection() {
       id="runtime"
       className="compute-bg border-b border-line px-6 py-20"
     >
-      <SectionLabel>§06 / daemon runtime // new</SectionLabel>
+      <SectionLabel>§10 / daemon runtime // new</SectionLabel>
       <DisplayHeading>
         compute
         <br />
@@ -21,6 +21,10 @@ export function ComputeRuntimeSection() {
           the wire.
         </span>
       </DisplayHeading>
+
+      <p className="text-[16px] text-accent max-w-[740px] leading-[1.6] font-light mb-12">
+        a daemon survives the host. identity travels. hosts don&apos;t.
+      </p>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         A program on NET is called a{" "}

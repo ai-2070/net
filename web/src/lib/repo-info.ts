@@ -151,16 +151,17 @@ export async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
 }
 
 export async function getRepoInfo(): Promise<RepoInfo> {
-  const [release, head, releases] = await Promise.all([
+  const [release, head] = await Promise.all([
     fetchLatestRelease(),
     fetchHeadCommit(),
-    fetchAllReleases(),
   ]);
   return {
     version: release?.tag ?? FALLBACK.version,
     codename: release?.codename ?? FALLBACK.codename,
     buildDate: head ? formatDate(head.date) : FALLBACK.buildDate,
     sha: head ? head.sha : FALLBACK.sha,
-    releases,
+    // Release bodies are no longer rendered on the homepage (§13 was demoted to
+    // a compact version strip), so we no longer fetch or ship them to the client.
+    releases: [],
   };
 }

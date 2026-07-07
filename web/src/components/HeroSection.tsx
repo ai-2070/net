@@ -697,31 +697,46 @@ export function HeroSection() {
             </span>
             <span className="text-ink-faint font-mono">PROTOCOL.0x4E45·54</span>
             <span className="text-ink-dim">REV {rev}</span>
+            <span className="text-ink-dim">net moves at light</span>
           </div>
 
           <h1
-            className="font-display leading-[0.88] tracking-[-0.02em] text-ink mb-5"
+            className="font-display lowercase leading-[0.88] tracking-[-0.02em] text-ink mb-5"
             style={{ fontSize: "clamp(56px, 10vw, 128px)" }}
           >
-            net.
+            every device
             <br />
-            <span className="text-accent">moves</span>
+            <span className="text-accent">becomes</span>
             <br />
-            at light.
+            a tool.
           </h1>
 
           <p className="text-[18px] text-ink mt-8 max-w-[580px] leading-[1.5] font-light">
-            A latency-first encrypted mesh where every computer, app and device
-            is a first-class node. Existing networks operate in milliseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
-            . NET operates in nanoseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>
-            .
+            NET is a distributed mesh runtime. Your{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">laptop</em>,{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">phone</em>,{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">sensor</em>,{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">robot</em>,{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">
+              satellite
+            </em>{" "}
+            — each advertises what it can do and finds what it needs. No cloud
+            middleman. Apache 2.0.
           </p>
 
           <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
-            No clients. No servers. No coordinators. The mesh propagates state,
-            not connections.
+            Announce a capability. Discover it in nanoseconds{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>,
+            not milliseconds{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
+            . No clients. No servers. No coordinators. The mesh propagates
+            state, not connections.
+          </p>
+
+          <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
+            Shipping now:{" "}
+            <em className="not-italic text-accent bg-accent/10 px-1">Hermes</em>{" "}
+            runs native on Net. Anything MCP joins through one config line.
           </p>
 
           <div className="mt-11 flex gap-3 flex-wrap items-center">
@@ -732,13 +747,13 @@ export function HeroSection() {
               ↓ Install NET <span className="text-sm">→</span>
             </a>
             <a
-              href="#bench"
+              href="/why"
               className="btn-ghost inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-ink-faint text-ink transition-all"
             >
-              Read benchmarks
+              Read why →
             </a>
             <a
-              href="#properties"
+              href="/protocol"
               className="btn-ghost inline-flex items-center gap-2.5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline text-ink transition-all"
             >
               // view spec ↘

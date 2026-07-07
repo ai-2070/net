@@ -81,7 +81,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
 export function ComponentsSection() {
   return (
     <section id="components" className="border-b border-line px-6 py-20">
-      <SectionLabel>§09 / components on the mesh</SectionLabel>
+      <SectionLabel>§13 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
         <br />

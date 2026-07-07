@@ -29,9 +29,9 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
-  title: "NET — Network Event Transport. A latency-first encrypted mesh.",
+  title: "NET — Network Event Transport. A distributed mesh runtime.",
   description:
-    "NET is a latency-first encrypted mesh runtime. Every device is a first-class node on a flat, encrypted topology. Nanosecond scheduling, zero-copy forwarding, capability-based routing. ~1.92 MB deployed binary.",
+    "NET is a distributed mesh runtime. Your laptop, phone, sensor, robot, satellite — each advertises what it can do and finds what it needs. Nanosecond scheduling, zero-copy forwarding, capability-based routing. No cloud middleman. Apache 2.0.",
 };
 
 export default async function RootLayout({

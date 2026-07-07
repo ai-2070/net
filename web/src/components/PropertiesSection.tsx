@@ -247,7 +247,7 @@ const AXIOMS: readonly AxiomCard[] = [
 export function PropertiesSection() {
   return (
     <section id="properties" className="border-b border-line px-6 py-20">
-      <SectionLabel>§03 / protocol properties</SectionLabel>
+      <SectionLabel>§07 / protocol properties</SectionLabel>
       <DisplayHeading>
         nine axioms.
         <br />

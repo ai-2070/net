@@ -15,7 +15,7 @@ export function SeedBanner() {
           <b className="text-accent">
             <GlitchText text="AI 2070" intervalMs={5400} />
           </b>{" "}
-          is raising seed funding to build post-cloud infrastructure.
+          is raising seed funding to build the distributed mesh runtime.
         </span>
         <span className="text-accent inline-flex items-center gap-1">
           get in touch

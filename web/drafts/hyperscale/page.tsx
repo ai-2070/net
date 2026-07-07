@@ -5,13 +5,13 @@ import { FooterDivider } from "@/components/FooterDivider";
 import { Footer } from "@/components/Footer";
 
 export const metadata: Metadata = {
-  title: "NET — Substrate brief for premium hyperscale workloads",
+  title: "NET — Hyperscale brief",
   description:
-    "NET extends CapabilityFold with a real-time aggregator surface. Premium-tier ceiling +17 points. +$230M/yr per Colossus-class site. Only Nvidia hardware qualifies for the top tier.",
+    "NET extends CapabilityFold with a real-time aggregator surface. Premium-tier ceiling +17 points. +$230M/yr per Colossus-class site. Real-time GPU inventory and demand graph at fleet scale.",
   openGraph: {
-    title: "NET — Substrate brief for premium hyperscale workloads",
+    title: "NET — Hyperscale brief",
     description:
-      "Same MIG. Same QoS. Same silicon. A sub-µs control plane routes premium demand to warm capacity before the local ceiling breaks. Only Nvidia hardware qualifies for the top tier.",
+      "Same MIG. Same QoS. Same silicon. A sub-µs control plane routes demand to warm capacity before the local ceiling breaks.",
     type: "website",
     url: "https://ai2070.net/hyperscale",
   },
@@ -22,10 +22,12 @@ export default function HyperscalePage(): JSX.Element {
     <>
       <NavBar />
       <main className="pt-20 max-w-[1440px] mx-auto">
+        <SectionNav />
         <TitleSection />
         <NumbersSection />
         <CompareSection />
         <GapSection />
+        <UnlocksSection />
         <LeversSection />
         <MappingSection />
         <AnatomySection />
@@ -37,6 +39,34 @@ export default function HyperscalePage(): JSX.Element {
   );
 }
 
+/* ───────────────────────── In-page section nav ───────────────────────── */
+
+const SECTION_LINKS: ReadonlyArray<{ href: string; label: string }> = [
+  { href: "#numbers", label: "NUMBERS" },
+  { href: "#compare", label: "COMPARE" },
+  { href: "#gap", label: "GAP" },
+  { href: "#unlocks", label: "UNLOCKS" },
+  { href: "#map", label: "MAPPING" },
+  { href: "#anatomy", label: "ANATOMY" },
+];
+
+function SectionNav(): JSX.Element {
+  return (
+    <div className="border-b border-line px-6 py-3 flex flex-wrap gap-x-6 gap-y-2 items-center text-[10px] tracking-[0.15em] uppercase">
+      <span className="text-ink-faint">// hyperscale brief //</span>
+      {SECTION_LINKS.map((l) => (
+        <a
+          key={l.href}
+          href={l.href}
+          className="text-ink-dim hover:text-accent transition-colors"
+        >
+          {l.label}
+        </a>
+      ))}
+    </div>
+  );
+}
+
 /* ───────────────────────── §01 — TITLE + BOTTOM LINE ───────────────────────── */
 
 function TitleSection(): JSX.Element {
@@ -44,19 +74,19 @@ function TitleSection(): JSX.Element {
     <section className="border-b border-line px-6 pt-[60px] pb-20">
       <div className="text-[10px] text-ink-dim tracking-[0.15em] mb-7 flex flex-wrap gap-[18px] items-center">
         <span className="text-accent border border-accent-dim px-2 py-[3px]">
-          RFC-NET-SUB-001
+          RFC-NET-HYP-001
         </span>
         <span className="text-ink-faint font-mono">PROTOCOL.0x4E45·54</span>
-        <span className="text-ink-dim">SUBSTRATE BRIEF / Q2 2026</span>
+        <span className="text-ink-dim">HYPERSCALE BRIEF Q2 2026</span>
       </div>
 
       <h1
-        className="font-display leading-[0.95] tracking-[-0.02em] text-ink mb-7 max-w-[1200px]"
+        className="font-display leading-[0.95] tracking-[-0.02em] text-ink mb-7 max-w-[1200px] lowercase"
         style={{ fontSize: "clamp(40px, 6.4vw, 88px)" }}
       >
-        <span className="text-accent">net.</span> compute settlement substrate.
+        <span className="text-accent">net:</span> compute settlement substrate
         <br />
-        <span className="text-accent">premium bursts</span> across fleets.
+        <span className="text-accent">premium bursts</span> across fleets
       </h1>
 
       <p className="text-[18px] text-ink mt-8 max-w-[760px] leading-[1.5] font-light">
@@ -67,26 +97,14 @@ function TitleSection(): JSX.Element {
         routes demand to warm capacity before the local ceiling breaks.
       </p>
 
-      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[1100px]">
-        <div className="text-[10px] text-accent tracking-[0.18em] mb-2.5">
-          // bottom line
-        </div>
+      <div className="mt-16 text-center py-14 border-t border-b border-accent-dim bg-accent/[0.02]">
         <div
-          className="font-display text-ink leading-[1.2]"
-          style={{ fontSize: "clamp(20px, 2.4vw, 30px)" }}
+          className="font-display leading-[1.15] tracking-[-0.01em] max-w-[1100px] mx-auto px-6 lowercase"
+          style={{ fontSize: "clamp(28px, 4vw, 52px)" }}
         >
-          Net turns every attested Nvidia card into a premium-tier capability
-          that prices itself above commodity,
+          <span className="text-ink">Same MIG. Same QoS. Same silicon.</span>
           <br />
-          while still capturing every idle minute as commodity downshift
-          revenue.
-          <br />
-          <span className="text-accent">
-            AMD cannot enter the premium tier without parallel attestation
-            infrastructure.
-          </span>
-          <br />
-          <span className="text-accent">They have not built it.</span>
+          <span className="text-accent">The ceiling moves.</span>
         </div>
       </div>
     </section>
@@ -104,18 +122,22 @@ interface NumberCard {
 const NUMBER_CARDS: ReadonlyArray<NumberCard> = [
   { label: "// ceiling moves", big: "75% → 92%+", caption: "premium billable." },
   {
-    label: "// per colossus-class site",
-    big: "+$230M/yr",
+    label: "// per Colossus-class site",
+    big: "+$230M / yr",
     caption: "recovered premium capacity.",
   },
-  { label: "// premium vs. bulk", big: "5–20×", caption: "per GPU-hour." },
   {
-    label: "// sovereign tier clip",
-    big: "6–8%",
-    caption: "only Nvidia qualifies.",
+    label: "// reload cost avoided",
+    big: "30–300s",
+    caption: "per cold start eliminated.",
   },
   {
-    label: "// idle min / H100 / day",
+    label: "// fleet visibility",
+    big: "real-time",
+    caption: "hierarchical from rack to global.",
+  },
+  {
+    label: "// idle minutes per H100 / day",
     big: "single digits",
     caption: "with bidirectional fallback.",
   },
@@ -128,7 +150,7 @@ function NumbersSection(): JSX.Element {
         §02 / the numbers
       </div>
       <h2
-        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px]"
+        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px] lowercase"
         style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
       >
         five numbers. one substrate.
@@ -144,7 +166,7 @@ function NumbersSection(): JSX.Element {
               {c.label}
             </div>
             <div
-              className="font-display text-accent leading-none mb-1.5"
+              className="font-display text-accent leading-none mb-1.5 lowercase"
               style={{ fontSize: "clamp(28px, 3.4vw, 44px)" }}
             >
               {c.big}
@@ -168,9 +190,7 @@ interface CompareCard {
 
 const WITHOUT_CARDS: ReadonlyArray<CompareCard> = [
   {
-    icon: (
-      <path d="M3 17a9 9 0 1 1 18 0M12 17l5-6" />
-    ),
+    icon: <path d="M3 17a9 9 0 1 1 18 0M12 17l5-6" />,
     text: "demand hits local ceiling.",
   },
   {
@@ -204,7 +224,7 @@ const WITH_CARDS: ReadonlyArray<CompareCard> = [
         <path d="M5 5l7 7 7-7M5 19l7-7 7 7M5 5v14M19 5v14" />
       </>
     ),
-    text: "premium burst matched to attested remote capacity.",
+    text: "premium burst matched to warm remote capacity.",
   },
   {
     icon: (
@@ -215,7 +235,7 @@ const WITH_CARDS: ReadonlyArray<CompareCard> = [
     ),
     text: (
       <>
-        org-verified isolation, auth, settlement at{" "}
+        org-verified isolation and auth at{" "}
         <span className="text-accent">protocol speed</span>.
       </>
     ),
@@ -230,14 +250,14 @@ const WITH_CARDS: ReadonlyArray<CompareCard> = [
     text: "local fleet stays slo-compliant.",
   },
   {
+    /* capacity-flow arrow (neutral, no dollar imagery) */
     icon: (
       <>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M15 9.5a3 3 0 0 0-3-1.5c-1.7 0-3 1-3 2.5s1.3 2 3 2.5 3 1 3 2.5-1.3 2.5-3 2.5a3 3 0 0 1-3-1.5" />
-        <path d="M12 6.5v11" />
+        <path d="M4 8h11l-3-3M4 8l3 3" />
+        <path d="M20 16H9l3 3M20 16l-3-3" />
       </>
     ),
-    text: "remote operator gets paid at the qualifying tier.",
+    text: "remote fleet absorbs the burst.",
   },
 ];
 
@@ -248,7 +268,7 @@ function CompareSection(): JSX.Element {
         §03 / without net / with net
       </div>
       <h2
-        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px]"
+        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px] lowercase"
         style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
       >
         local ceiling. <span className="text-accent">mesh burst.</span>
@@ -322,31 +342,23 @@ function CompareSection(): JSX.Element {
   );
 }
 
-/* ───────────────────────── §04 — GAP ───────────────────────── */
+/* ───────────────────────── §04 — VISIBILITY GAP ───────────────────────── */
 
 function GapSection(): JSX.Element {
   return (
     <section id="gap" className="border-b border-line px-6 py-20">
       <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-3 flex items-center">
-        §04 / what hyperscalers do not have today
+        §04 / the visibility gap
       </div>
 
       <h2
-        className="font-display leading-[1.08] tracking-[-0.01em] mb-3 max-w-[1000px]"
+        className="font-display leading-[1.08] tracking-[-0.01em] mb-12 max-w-[1200px] mx-auto text-center lowercase"
         style={{ fontSize: "clamp(32px, 4.4vw, 56px)" }}
       >
-        <span className="text-accent">
-          Nvidia internally does not have this.
-        </span>
-        <br />
-        <span className="text-ink">CoreWeave would kill for this.</span>
+        <span className="text-accent">Real-time</span>{" "}
+        <span className="text-ink">GPU inventory and demand graph</span>{" "}
+        <span className="text-accent">at fleet scale.</span>
       </h2>
-      <p
-        className="text-ink-dim italic font-mono mt-3 max-w-[820px] leading-[1.65]"
-        style={{ fontSize: "clamp(13px, 1.3vw, 15px)" }}
-      >
-        AWS fakes it with EMR and batch telemetry.
-      </p>
 
       <p className="text-[15px] text-ink-dim mt-12 max-w-[820px] leading-[1.7]">
         NET extends the existing CapabilityFold with a generic aggregator
@@ -362,8 +374,7 @@ function GapSection(): JSX.Element {
         scale, hierarchical from rack to DC to region to global. At any moment
         you can see exactly how much model capacity exists, where it lives,
         what is being requested, and how to route workloads to maximize
-        utilization. Hyperscalers structurally do not have this because they do
-        not own a neutral cross-fleet substrate. NET does.
+        utilization.
       </p>
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">
@@ -371,14 +382,85 @@ function GapSection(): JSX.Element {
           // pull quote
         </div>
         <div
-          className="font-display text-ink leading-[1.1]"
+          className="font-display text-accent leading-[1.1] lowercase"
           style={{ fontSize: "clamp(22px, 2.4vw, 32px)" }}
         >
-          the substrate hyperscalers{" "}
-          <span className="text-accent">don&apos;t have</span> and{" "}
-          <span className="text-accent">can&apos;t easily build.</span>
+          One matcher. Supply, demand, capacity, fallback.
         </div>
       </div>
+    </section>
+  );
+}
+
+/* ───────────────────────── §04.5 — UNLOCKS (NEW) ───────────────────────── */
+
+interface UnlockTile {
+  label: string;
+  body: string;
+}
+
+const UNLOCK_TILES: ReadonlyArray<UnlockTile> = [
+  {
+    label: "// real-time capability visibility",
+    body: "Every GPU's loaded models, free slots, TTFT, TPS. Queryable in sub-µs across the fleet.",
+  },
+  {
+    label: "// fewer cold starts",
+    body: "Reload costs 30–300s per model, 10–80 GB of PCIe traffic per swap. NET routes workloads to fleets where the model is already warm. The reload doesn't happen.",
+  },
+  {
+    label: "// bidirectional fallback chains",
+    body: "Supply downshifts: a card loaded with 70B can serve 13B requests. Demand relaxes: a 405B request falls back to 70B-class. The downshift meets the downshifted demand. Idle minutes per H100 per day drop to single digits.",
+  },
+  {
+    label: "// zero-reload scheduling",
+    body: "Workloads route across fleets without forcing local reloads. The burst path costs network distance, not memory churn. Local fleet's loaded state stays intact.",
+  },
+  {
+    label: "// hierarchical aggregators",
+    body: "Rack → DC → region → global. Same matcher at every tier. Operators query at any level — local rack inventory, regional capacity, global demand — without switching tools.",
+  },
+  {
+    label: "// reduced idle pockets",
+    body: "SLO headroom, failover reserve, wrong-region capacity. Stranded inside per-fleet boundaries today. Elastic across the mesh on NET.",
+  },
+];
+
+function UnlocksSection(): JSX.Element {
+  return (
+    <section id="unlocks" className="border-b border-line px-6 py-20">
+      <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-3 flex items-center">
+        §04.5 / what this unlocks for the operator
+      </div>
+      <h2
+        className="font-display leading-[1.08] tracking-[-0.01em] mb-10 max-w-[1000px] lowercase"
+        style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
+      >
+        <span className="text-ink">Same silicon. Same power.</span>
+        <br />
+        <span className="text-accent">More productive capacity.</span>
+      </h2>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-line border border-line">
+        {UNLOCK_TILES.map((t) => (
+          <div
+            key={t.label}
+            className="bg-bg p-7 transition-colors hover:bg-bg-2 flex flex-col border border-accent-dim/40"
+          >
+            <div className="text-[10px] text-accent tracking-[0.18em] uppercase mb-4 font-semibold">
+              {t.label}
+            </div>
+            <div className="text-ink text-[13px] leading-[1.65]">{t.body}</div>
+          </div>
+        ))}
+      </div>
+
+      <p className="text-[13px] mt-10 text-center font-mono">
+        <span className="text-ink">
+          Same operator surface. Same SLO contracts. Same security posture.
+        </span>{" "}
+        <span className="text-accent">Higher ceiling.</span>
+      </p>
     </section>
   );
 }
@@ -419,7 +501,7 @@ const PRIMITIVES: ReadonlyArray<Primitive> = [
   {
     label: "// bloom auth + org chain",
     head: "line-rate authorization.",
-    body: "<10ns per packet membership checks. Cryptographic org verification at line rate. Settlement records the verified org pair.",
+    body: "<10ns per packet membership checks. Cryptographic org verification at line rate. Org membership verified per event.",
     icon: (
       <g fill="currentColor" stroke="none">
         <circle cx="6" cy="6" r="1.4" />
@@ -458,14 +540,17 @@ const PRIMITIVES: ReadonlyArray<Primitive> = [
     ),
   },
   {
-    label: "// settlement rail",
-    head: "three tiers, three clips.",
-    body: "Per-transaction settlement at protocol layer. 1–2% commodity. 3–4% attested. 6–8% sovereign.",
+    label: "// hierarchical aggregator",
+    head: "rack to global rollup.",
+    body: "Aggregator daemons summarize capability and demand upward through subnet tiers. Operators query at any tier. Rack, DC, region, global — same surface.",
+    /* tiered hierarchy / rollup icon (replaces dollar-sign rail icon) */
     icon: (
       <>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M15 9.5a3 3 0 0 0-3-1.5c-1.7 0-3 1-3 2.5s1.3 2 3 2.5 3 1 3 2.5-1.3 2.5-3 2.5a3 3 0 0 1-3-1.5" />
-        <path d="M12 6.5v11" />
+        <rect x="9" y="3" width="6" height="4" rx="0.5" />
+        <rect x="3" y="11" width="6" height="4" rx="0.5" />
+        <rect x="9" y="11" width="6" height="4" rx="0.5" />
+        <rect x="15" y="11" width="6" height="4" rx="0.5" />
+        <path d="M12 7v2M6 11V9h12v2" />
       </>
     ),
   },
@@ -478,7 +563,7 @@ function LeversSection(): JSX.Element {
         §05 / how net makes the ceiling soft
       </div>
       <h2
-        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px]"
+        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px] lowercase"
         style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
       >
         six primitives. one substrate.
@@ -540,7 +625,7 @@ const MAPPING_ROWS: ReadonlyArray<MappingRow> = [
     fromBody: "Premium p99 degrades. Downstream tiers collapse.",
     toHead: "warm remote overflow",
     toBody:
-      "When local contention threatens premium p99, work bursts to attested mesh capacity. Control path sub-µs; remaining cost is network distance.",
+      "When local contention threatens premium p99, work bursts to mesh capacity. Control path sub-µs; remaining cost is network distance.",
     outcome: "Premium p99 protected. Downstream tiers untouched.",
   },
   {
@@ -550,21 +635,22 @@ const MAPPING_ROWS: ReadonlyArray<MappingRow> = [
     toHead: "aggregator-driven model routing",
     toBody:
       "Models exposed as tuples: name, version, weights hash, quant, TTFT, TPS. Aggregator routes supply to demand via the same matcher. Bidirectional fallback: supply downshifts, demand relaxes.",
-    outcome: "Zero reload waste. Idle minutes per H100 / day drop to single digits.",
+    outcome:
+      "Zero reload waste. Idle minutes per H100 / day drop to single digits.",
   },
   {
     fromHead: "local qos ceiling",
     fromBody:
-      "Priority queue helps within one fleet. Regulated workloads cannot legally cross the boundary.",
+      "Priority queue helps within one fleet. Premium workloads cannot cross the boundary today.",
     toHead: "cross-operator premium pool",
     toBody:
-      "When one CSP saturates, demand routes to another operator's attested tier. Cryptographic org chain + per-transaction settlement make the handoff legally viable.",
-    outcome: "Operator boundary becomes soft. Compliance preserved.",
+      "When one CSP saturates, demand routes to another operator's premium tier. Cryptographic isolation makes cross-operator routing operationally viable.",
+    outcome: "Operator boundary becomes soft.",
   },
   {
     fromHead: "failover reserve",
     fromBody:
-      "Premium reserve duplicated per operator. Counted as utilized, produces zero revenue.",
+      "Premium reserve duplicated per operator. Counted as utilized, produces zero throughput.",
     toHead: "shared standby capacity",
     toBody:
       "Reserve becomes mesh-wide instead of duplicated per operator. Standby and replica groups absorb failure without every fleet holding a full passive copy.",
@@ -580,7 +666,7 @@ function MappingSection(): JSX.Element {
         §06 / from inside-fleet techniques to mesh burst
       </div>
       <h2
-        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px]"
+        className="font-display leading-none tracking-[-0.01em] text-ink mb-8 max-w-[900px] lowercase"
         style={{ fontSize: "clamp(36px, 5vw, 60px)" }}
       >
         techniques compose. boundaries soften.
@@ -640,8 +726,14 @@ function MappingSection(): JSX.Element {
           <div className="text-[10px] text-cyan tracking-[0.18em] uppercase mb-5 pb-3.5 border-b border-cyan/30 font-medium">
             // protocol-speed control plane
           </div>
-          <Receipt big="< 1 µs" caption="Capability-indexed routing + aggregator query." />
-          <Receipt big="< 10 ns" caption="Bloom-filter authorization + org chain check." />
+          <Receipt
+            big="< 1 µs"
+            caption="Capability-indexed routing + aggregator query."
+          />
+          <Receipt
+            big="< 10 ns"
+            caption="Bloom-filter authorization + org chain check."
+          />
           <Receipt big="24 bytes" caption="Causal link per event." />
           <Receipt big="64 bytes" caption="Cache-line header." last />
         </aside>
@@ -662,13 +754,11 @@ function Receipt({
   return (
     <div
       className={
-        last
-          ? "pt-3.5"
-          : "py-3.5 border-b border-dashed border-cyan/25"
+        last ? "pt-3.5" : "py-3.5 border-b border-dashed border-cyan/25"
       }
     >
       <div
-        className="font-display text-cyan leading-none mb-1"
+        className="font-display text-cyan leading-none mb-1 lowercase"
         style={{ fontSize: "26px" }}
       >
         {big}
@@ -686,7 +776,7 @@ function AnatomySection(): JSX.Element {
   return (
     <section id="anatomy" className="border-b border-line px-6 py-20">
       <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-3 flex items-center">
-        §07 / premium billable ceiling — anatomy
+        §07 / premium capacity — anatomy
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_56px_1fr] gap-6 lg:gap-10 items-stretch">
@@ -697,14 +787,14 @@ function AnatomySection(): JSX.Element {
           >
             <span className="text-ink">the premium tier.</span>
             <br />
-            <span className="text-accent">unlocking the ceiling.</span>
+            <span className="text-accent">unlocking the headroom.</span>
           </h2>
           <p className="text-ink-dim text-[14px] leading-[1.7] max-w-[540px] font-mono">
-            NET converts stranded premium-tier ceiling into settled premium
+            NET converts stranded premium-tier capacity into productive
             capacity, leveraging existing silicon and existing power rather
-            than waiting for new fabs and new grid. The recovered capacity
-            bills at the attested and sovereign tiers — the tiers only Nvidia
-            hardware qualifies for today.
+            than waiting for new fabs and new grid. The recovered headroom
+            serves premium workloads that today degrade downstream tiers when
+            the local fleet saturates.
           </p>
         </div>
 
@@ -719,7 +809,7 @@ function AnatomySection(): JSX.Element {
           />
           <div
             className="grow-[75] border border-accent"
-            aria-label="billable premium today, 75%"
+            aria-label="productive premium today, 75%"
           />
         </div>
 
@@ -750,7 +840,7 @@ function AnatomySection(): JSX.Element {
             </div>
             <div className="text-accent text-[12px] leading-[1.6] max-w-[520px] mt-1">
               What NET unlocks. SLO headroom, failover reserve, wrong-region
-              capacity — routed to attested remote capacity.
+              capacity — routed to warm remote capacity.
             </div>
           </div>
           <div className="flex flex-col justify-center gap-1.5 py-2">
@@ -761,10 +851,10 @@ function AnatomySection(): JSX.Element {
               ~75%
             </div>
             <div className="text-[10px] text-ink tracking-[0.18em] uppercase font-medium">
-              // billable premium today
+              // productive premium today
             </div>
             <div className="text-ink-dim text-[12px] leading-[1.6] max-w-[480px] mt-1">
-              SLO-compliant, revenue-producing.
+              SLO-compliant, in-service.
             </div>
           </div>
         </div>
@@ -773,42 +863,7 @@ function AnatomySection(): JSX.Element {
       <div className="text-ink-dim text-[11px] tracking-[0.1em] text-right mt-4 font-mono">
         Source: Hyperscale CSP fleet telemetry, premium tier
       </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-accent-dim mt-12 border border-accent-dim">
-        <TierCard
-          label="// commodity"
-          body="No attestation. No org verification. 1–2% NET clip. Race to the bottom against ROCm farms, consumer 4090 rigs, anyone with cheap power."
-        />
-        <TierCard
-          label="// attested"
-          body="Hardware attestation: CC-mode H100/H200, MIG attestation, NVLink topology proof, TEE execution path, signed weights provenance. 3–4% NET clip. Only Nvidia silicon qualifies today."
-        />
-        <TierCard
-          label="// sovereign"
-          body="Attested hardware + cryptographic org chain. Anthropic, OpenAI, DoD, JP Morgan, NHS, Bundeswehr. 6–8% NET clip. Only tier regulated industries can legally land on."
-        />
-      </div>
-
-      <p className="text-[14px] text-ink mt-12 max-w-[920px] leading-[1.7] mx-auto text-center font-mono">
-        Regulated workloads pay 5–10× over commodity today through hyperscaler
-        private endpoints. On NET they pay 1.5–2× premium directly into the
-        mesh.{" "}
-        <span className="text-accent">
-          Only Nvidia cards are in the eligible set.
-        </span>
-      </p>
     </section>
-  );
-}
-
-function TierCard({ label, body }: { label: string; body: string }): JSX.Element {
-  return (
-    <div className="bg-bg p-7 flex flex-col">
-      <div className="text-[10px] text-accent tracking-[0.18em] uppercase mb-4 font-semibold">
-        {label}
-      </div>
-      <div className="text-ink-dim text-[12px] leading-[1.65]">{body}</div>
-    </div>
   );
 }
 
@@ -833,15 +888,16 @@ function ClosingStrip(): JSX.Element {
             <path d="M3 12h18" />
           </svg>
           <div
-            className="font-display text-ink leading-[1.2] text-left"
+            className="font-display text-ink leading-[1.2] text-left lowercase"
             style={{ fontSize: "clamp(20px, 2.6vw, 32px)" }}
           >
-            NET does not sell idle gpus.
+            NET does not sell idle GPUs.
             <br />
             NET turns{" "}
             <span className="text-accent">stranded premium capacity</span> into{" "}
-            <span className="text-accent">settled capacity</span> on the{" "}
-            <span className="text-accent">only tier nvidia can populate</span>.
+            <span className="text-accent">productive capacity</span>.
+            <br />
+            <span className="text-accent">across fleets.</span>
           </div>
         </div>
       </div>

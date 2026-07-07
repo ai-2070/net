@@ -12,22 +12,22 @@ const CAPABILITY_STRIP: ReadonlyArray<{
     num: "mesh.storage.1",
     name: "Overflow",
     isNew: true,
-    body: "storage doesn't run out. when one disk fills up, the mesh catches the spillover.",
+    body: "Storage doesn't run out. When one disk fills up, the mesh catches the spillover.",
   },
   {
     num: "mesh.storage.2",
     name: "Data Gravity",
-    body: "the files aren't moved. files settle near nodes that use them.",
+    body: "The files aren't moved. Files settle near nodes that use them.",
   },
   {
     num: "mesh.storage.3",
     name: "Content-Addressed",
-    body: "the hash is the handle. one address gets you the file — wherever it lives.",
+    body: "The hash is the handle. One address gets you the file — wherever it lives.",
   },
   {
     num: "mesh.storage.4",
     name: "Durability Tiers",
-    body: "pick your guarantee. fire-and-forget, fsync, or N-peer replicated. one call.",
+    body: "Pick your guarantee. Fire-and-forget, fsync, or N-peer replicated. One call.",
   },
 ];
 
@@ -37,7 +37,7 @@ export function DatafortsSection() {
       id="dataforts"
       className="relative overflow-hidden border-b border-line px-6 py-20"
     >
-      <SectionLabel>§07 / storage // new</SectionLabel>
+      <SectionLabel>§11 / storage // new</SectionLabel>
       <DisplayHeading>
         Dataforts:
         <br />

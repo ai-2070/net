@@ -1,6 +1,6 @@
+"use client";
+
 import { useState } from "react";
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
 
 interface InstallCard {
   lang: string;
@@ -41,7 +41,7 @@ const INSTALL_CARDS: readonly InstallCard[] = [
   },
 ];
 
-export function InstallSection() {
+export function SdkStrip() {
   const [copied, setCopied] = useState<string | null>(null);
 
   const handleCopy = async (lang: string, text: string): Promise<void> => {
@@ -57,20 +57,12 @@ export function InstallSection() {
   };
 
   return (
-    <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§10 / install</SectionLabel>
-      <DisplayHeading>
-        five languages.
-        <br />
-        one engine.
-      </DisplayHeading>
+    <div id="install" className="scroll-mt-20 mt-16 border-t border-line pt-10">
+      <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-6 flex items-center">
+        ▸ sdks · five languages, one engine
+      </div>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        All SDKs wrap the same Rust core. The SDK is the developer experience,
-        the engine is Rust.
-      </p>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {INSTALL_CARDS.map((c) => {
           const isCopied = copied === c.lang;
           return (
@@ -143,6 +135,6 @@ export function InstallSection() {
         <span className="text-accent">@net-mesh/core</span>,{" "}
         <span className="text-accent">net-mesh</span> (PyPI binding).
       </p>
-    </section>
+    </div>
   );
 }

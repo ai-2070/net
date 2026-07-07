@@ -1,14 +1,15 @@
 import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
+import { DatafortsConsole } from "./DatafortsConsole";
 
 export function ClosingSection() {
   return (
-    <section id="post-cloud" className="border-b border-line px-6 py-20">
-      <SectionLabel>§14 / post-cloud</SectionLabel>
+    <section id="no-middleman" className="border-b border-line px-6 py-20">
+      <SectionLabel>§09 / no middleman</SectionLabel>
       <DisplayHeading>
-        not anti-cloud.
+        no middleman.
         <br />
-        <span className="text-accent">post-cloud.</span>
+        <span className="text-accent">the path is yours.</span>
       </DisplayHeading>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
@@ -25,8 +26,8 @@ export function ClosingSection() {
             <strong className="text-ink font-medium">
               NET has no intermediaries.
             </strong>{" "}
-            Relay nodes forward encrypted bytes they cannot read. There is no
-            Cloudflare, no AWS, no Azure in the path because the path is yours.
+            Relay nodes forward encrypted bytes they cannot read. No third
+            party sits in the path.
           </p>
         </div>
         <div>
@@ -40,14 +41,19 @@ export function ClosingSection() {
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             A manufacturing plant running on NET doesn&apos;t route sensor data
-            to AWS us-east-1 and back. The sensor talks directly to the decision
-            system on the factory floor.{" "}
+            to a distant data center and back. The sensor talks directly to the
+            decision system on the factory floor.{" "}
             <strong className="text-ink font-medium">
               The latency is physics, not geography plus cloud overhead.
             </strong>
           </p>
         </div>
       </div>
+
+      <p className="text-ink-dim text-[13px] leading-[1.7] mt-8 max-w-[740px]">
+        Serverless removed the server. Net removes the cloud. Serverless put
+        your code in a datacenter — Net puts your code on the network itself.
+      </p>
 
       <div className="mt-16 text-center py-16 border-t border-b border-accent-dim bg-accent/[0.02]">
         <div
@@ -58,6 +64,20 @@ export function ClosingSection() {
           <br />
           running.
         </div>
+
+        <div className="max-w-[900px] mx-auto text-left mt-10 mb-2">
+          <DatafortsConsole />
+          <p className="text-[11px] text-ink-dim tracking-[0.05em] mt-3">
+            Live mesh storage pool —{" "}
+            <a
+              href="/dataforts"
+              className="text-accent hover:text-ink transition-colors"
+            >
+              explore dataforts →
+            </a>
+          </p>
+        </div>
+
         <a
           href="#install"
           className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all mt-5"

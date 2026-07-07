@@ -1,5 +1,7 @@
 import { DisplayHeading } from "./DisplayHeading";
 import { SectionLabel } from "./SectionLabel";
+import { LatencySpectrum } from "./LatencySpectrum";
+import { SdkStrip } from "./SdkStrip";
 
 interface BenchRow {
   op: string;
@@ -105,16 +107,62 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
   },
 ];
 
+interface TopologyClass {
+  header: string;
+  headerColor: "ink-dim" | "accent";
+  title: string;
+  titleColor: "ink" | "accent";
+  body: string;
+  floor: string;
+  floorColor: "ink" | "accent";
+  throughput: string;
+}
+
+const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
+  {
+    header: "// net",
+    headerColor: "accent",
+    title: "NET → latency-first",
+    titleColor: "accent",
+    body: "Nanoseconds on commodity hardware. No central coordination.",
+    floor: "nanoseconds",
+    floorColor: "accent",
+    throughput: "~20M events/s · per core",
+  },
+  {
+    header: "// real-time",
+    headerColor: "ink-dim",
+    title: "CAN / EtherCAT / TSN",
+    titleColor: "ink",
+    body: "Microseconds — but only because you own the wire. Fixed topologies, dedicated hardware.",
+    floor: "microseconds",
+    floorColor: "ink",
+    throughput: "~100K updates/s · dedicated bus",
+  },
+  {
+    header: "// best-effort",
+    headerColor: "ink-dim",
+    title: "TCP / IP / HTTP / gRPC",
+    titleColor: "ink",
+    body: "Milliseconds. Optimized for delivery: queues, backpressure, trust assumed.",
+    floor: "milliseconds",
+    floorColor: "ink",
+    throughput: "~10K req/s · per connection",
+  },
+];
+
 export function BenchmarksSection() {
   return (
     <section id="bench" className="border-b border-line px-6 py-20">
-      <SectionLabel>§04 / measured numbers</SectionLabel>
+      <SectionLabel>§06 / measured numbers</SectionLabel>
       <DisplayHeading>existence proofs.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         All numbers measure packet scheduling — the time to process, route,
         encrypt, and queue a packet for transmission. They do not include NIC
-        transfer or wire latency.
+        transfer or wire latency. The speed-of-light floor for machines 5 km
+        apart is ~33 μs; most systems run hundreds of times slower than physics
+        allows. The bottleneck is software.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
@@ -191,6 +239,59 @@ export function BenchmarksSection() {
             <span className="text-ink-faint">↗</span>
           </a>
         </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 border border-line border-b-0 mt-12">
+        {TOPOLOGY_CLASSES.map((c, i) => (
+          <div
+            key={c.title}
+            className={`bg-bg-2 ${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} text-[10px] tracking-[0.18em] uppercase px-6 py-3 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+          >
+            {c.header}
+          </div>
+        ))}
+        {TOPOLOGY_CLASSES.map((c, i) => (
+          <div
+            key={c.title + "-body"}
+            className={`flex flex-col px-6 py-7 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+          >
+            <div
+              className={`font-head text-[18px] leading-tight ${c.titleColor === "accent" ? "text-accent" : "text-ink"} mb-3.5 tracking-[0.04em] lowercase`}
+            >
+              {c.title}
+            </div>
+            <div className="text-ink-dim text-[12px] leading-[1.6] flex-1">
+              {c.body}
+            </div>
+            <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3 space-y-1">
+              <div>
+                latency floor:{" "}
+                <b
+                  className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
+                >
+                  {c.floor}
+                </b>
+              </div>
+              <div>
+                throughput:{" "}
+                <b
+                  className={`${c.floorColor === "accent" ? "text-accent" : "text-ink"} font-semibold`}
+                >
+                  {c.throughput}
+                </b>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <LatencySpectrum />
+      <SdkStrip />
+
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          <span className="text-accent">Measured, not projected.</span>
+        </p>
       </div>
     </section>
   );
