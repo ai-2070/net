@@ -215,7 +215,7 @@ class FederationService:
     def __init__(
         self,
         promoter: FederationPromoter,
-        search: Callable[[], "Awaitable[Sequence[Dict[str, Any]]]"],
+        search: Callable[[], "Awaitable[Optional[Sequence[Dict[str, Any]]]]"],
         interval_seconds: float = 30.0,
     ) -> None:
         self._promoter = promoter
@@ -225,11 +225,25 @@ class FederationService:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
 
+    async def _poll_once(self) -> None:
+        """One search → reconcile round. A search that yields ``None`` (errored
+        — see :func:`parse_search_result`) is NOT an empty mesh: reconciling
+        against ``[]`` would retire every federated tool on a transient
+        gateway/fold blip, only for the next poll to re-describe and re-promote
+        them all (tool flicker + a describe storm). Keep the current set and
+        let the next poll retry instead."""
+        caps = await self._search()
+        if caps is None:
+            logger.debug(
+                "net plugin: federation search unavailable; keeping the current tool set"
+            )
+            return
+        await self._promoter.reconcile(caps)
+
     async def _run(self) -> None:
         while True:
             try:
-                caps = await self._search()
-                await self._promoter.reconcile(caps)
+                await self._poll_once()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — a poll failure must not kill the loop
@@ -278,14 +292,28 @@ class FederationService:
         self._task = None
 
 
+def parse_search_result(raw_json: str) -> Optional[List[Dict[str, Any]]]:
+    """Map a gateway search reply to capability rows — or ``None`` when the
+    search itself errored (``status != "ok"``). ``None`` and ``[]`` are
+    deliberately distinct: an errored search says nothing about the mesh, while
+    an ok-but-empty result genuinely means "no capabilities" (and retires
+    everything)."""
+    raw = json.loads(raw_json)
+    if raw.get("status") != "ok":
+        logger.debug(
+            "net plugin: federation search errored (status=%s)", raw.get("status")
+        )
+        return None
+    return raw.get("capabilities", [])
+
+
 def start_federation() -> FederationService:
     """Build the production federation service (Hermes registrar + gateway-backed
     search/describe/invoke + node health check) and start it."""
     from . import node
 
-    async def _search() -> Sequence[Dict[str, Any]]:
-        raw = json.loads(await node.gateway().search(""))
-        return raw.get("capabilities", []) if raw.get("status") == "ok" else []
+    async def _search() -> Optional[List[Dict[str, Any]]]:
+        return parse_search_result(await node.gateway().search(""))
 
     async def _describe(cap_id: str) -> Dict[str, Any]:
         return json.loads(await node.gateway().describe(cap_id))

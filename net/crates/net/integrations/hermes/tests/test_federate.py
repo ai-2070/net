@@ -128,6 +128,41 @@ def test_bad_describe_skips_promotion_without_crashing(plugin):
     assert reg.registered == {}  # not promoted, and the reconcile didn't raise
 
 
+def test_parse_search_result_distinguishes_error_from_empty(plugin):
+    parse = plugin.federate.parse_search_result
+    # An errored search says nothing about the mesh → None (skip reconcile).
+    assert parse(json.dumps({"status": "fold_error", "error": "gateway down"})) is None
+    assert parse(json.dumps({"status": "error"})) is None
+    # An ok search maps to its rows; ok-but-empty genuinely means "no caps".
+    rows = [{"cap_id": "42/echo", "providers": [42]}]
+    assert parse(json.dumps({"status": "ok", "capabilities": rows})) == rows
+    assert parse(json.dumps({"status": "ok"})) == []
+
+
+def test_errored_search_keeps_the_current_tool_set(plugin):
+    # A transient gateway error must NOT retire every federated tool (and
+    # trigger a re-describe storm at the next successful poll).
+    reg = RecordingRegistrar()
+    prom, _ = _promoter(plugin, reg)
+    asyncio.run(prom.reconcile([{"cap_id": "42/echo", "providers": [42]}]))
+    assert set(reg.registered) == {"net_mesh__42__echo"}
+
+    results = [None, []]  # first poll errors, second genuinely empty
+
+    async def _search():
+        return results.pop(0)
+
+    svc = plugin.federate.FederationService(prom, _search)
+    # Errored poll: the promoted set survives untouched.
+    asyncio.run(svc._poll_once())
+    assert set(reg.registered) == {"net_mesh__42__echo"}
+    assert reg.deregistered == []
+    # A genuinely empty (ok) mesh still retires.
+    asyncio.run(svc._poll_once())
+    assert reg.registered == {}
+    assert reg.deregistered == ["net_mesh__42__echo"]
+
+
 def test_service_start_stop_is_idempotent(plugin):
     reg = RecordingRegistrar()
     prom, _ = _promoter(plugin, reg)
