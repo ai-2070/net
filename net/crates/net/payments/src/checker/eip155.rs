@@ -112,22 +112,17 @@ impl Eip155Checker {
         // Bound the body: a hostile RPC could otherwise stream unbounded.
         let mut response = response;
         let mut bytes = Vec::new();
-        loop {
-            match response
-                .chunk()
-                .await
-                .map_err(|e| CheckerError::retryable(e.to_string()))?
-            {
-                Some(chunk) => {
-                    if bytes.len().saturating_add(chunk.len()) > MAX_RPC_BODY {
-                        return Err(CheckerError::terminal(format!(
-                            "{method} response exceeded the {MAX_RPC_BODY}-byte cap"
-                        )));
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                None => break,
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| CheckerError::retryable(e.to_string()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_RPC_BODY {
+                return Err(CheckerError::terminal(format!(
+                    "{method} response exceeded the {MAX_RPC_BODY}-byte cap"
+                )));
             }
+            bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
             return Err(if status.is_server_error() {
