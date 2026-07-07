@@ -1,0 +1,25 @@
+net/crates/net/integrations/hermes/tests/test_renewal.py
+  s_ecf38b21f410fb::t_401a39c2e804a8 108-148,155-170,177-183,187-189,191,212-231
+  s_ecf38b21f410fb::t_0494a7657502e5 149-154,171-176,184-186,190,192-211
+net/crates/net/integrations/hermes/node.py
+  s_ecf38b21f410fb::t_9289e428e5b916 349-356,362-385
+  s_ecf38b21f410fb::t_f7c7ff3df2f063 301-317
+.gitignore
+  s_ecf38b21f410fb::t_d12cba82cf11fd 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "834fce73ac05f0e7acb16d56df4d02c6ed1d8c0b",
+  "prompts": {},
+  "sessions": {
+    "s_ecf38b21f410fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ac0e26d-f44d-4303-a31a-325922571411",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
