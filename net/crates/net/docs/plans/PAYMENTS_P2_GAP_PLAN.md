@@ -66,9 +66,9 @@ The review's "trap" (LOW, documented at `sdk/src/tool.rs` for now): `.pricing_te
 
 Not built in P2 — the deferral is the deliverable, P1-style. `exact` is the only scheme with a pinned spec shape at `087922a5`; `upto`/dynamic pricing remain immature upstream (P1 non-goal "RFQ/dynamic pricing waits on x402 v2 maturity" stands).
 
-- [ ] Record the seam inventory a new scheme must instantiate (this list, kept next to the code): a `schemes/<name>.rs` authoring module (typed-intent in, payload object out; no raw signing), a `SchemeSigner` operation, `can_settle` arms (mesh + HTTP door — WS-B makes them symmetric), replay-identity semantics for the `consumed` index (M2: what is this scheme's nonce?), amount-policy semantics (under/over/exact — `upto` changes the `Ordering::Greater` arm from Exception to serve-at-delivered, a *money-policy decision* that goes to review, not a code detail), and checker delivered-amount semantics
-- [ ] Entry criteria to unshelve: scheme spec pinned at a commit; a live facilitator advertising the `(scheme, network)` kind in `GET /supported`; the amount-policy review above resolved
-- [ ] Until then: an accepts[] entry with an unknown scheme keeps failing closed at selection (`can_settle` → structured Denied) — already the behavior; add one pinning test naming a hypothetical `upto` entry so the refusal is a recorded contract, not an accident
+- [x] Record the seam inventory a new scheme must instantiate (this list, kept next to the code): a `schemes/<name>.rs` authoring module (typed-intent in, payload object out; no raw signing), a `SchemeSigner` operation, `can_settle` arms (mesh + HTTP door — WS-B makes them symmetric), replay-identity semantics for the `consumed` index (M2: what is this scheme's nonce?), amount-policy semantics (under/over/exact — `upto` changes the `Ordering::Greater` arm from Exception to serve-at-delivered, a *money-policy decision* that goes to review, not a code detail), and checker delivered-amount semantics
+- [x] Entry criteria to unshelve: scheme spec pinned at a commit; a live facilitator advertising the `(scheme, network)` kind in `GET /supported`; the amount-policy review above resolved
+- [x] Until then: an accepts[] entry with an unknown scheme keeps failing closed at selection (`can_settle` → structured Denied) — already the behavior; add one pinning test naming a hypothetical `upto` entry so the refusal is a recorded contract, not an accident
 
 **Acceptance:** the refusal-of-unknown-schemes test pins today's behavior; the seam inventory is committed prose.
 
