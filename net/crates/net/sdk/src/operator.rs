@@ -61,6 +61,14 @@ pub enum OperatorError {
     /// signature was wrong; admission was refused.
     #[error("enrollment denied by the operator")]
     Denied,
+    /// [`OperatorEnrollment::revoke_at`] was called with floor generation 0 —
+    /// a no-op: the current grants *are* generation 0, and
+    /// `RevocationStore::revoke_below` only raises the floor, so the device
+    /// would be stamped "revoked" in the inventory while staying fully
+    /// authorized (and able to silently renew). Killing the current grant
+    /// needs generation ≥ 1.
+    #[error("revocation floor generation must be >= 1 (0 leaves the device fully authorized)")]
+    NoOpRevocation,
     /// The enrollment handshake rejected the request.
     #[error(transparent)]
     Enrollment(#[from] EnrollmentError),
@@ -290,12 +298,20 @@ impl OperatorEnrollment {
     /// provider honors), then stamp `revoked_at` in the inventory for display.
     /// A device absent from the inventory still gets its floor raised — the
     /// inventory stamp is best-effort metadata.
+    ///
+    /// `generation` must be ≥ 1: the current grants are generation 0 and
+    /// `revoke_below` only *raises* the floor, so 0 would stamp the inventory
+    /// "revoked" while leaving the device fully authorized (an easy off-by-one
+    /// — [`OperatorError::NoOpRevocation`] rejects it instead).
     pub fn revoke_at(
         &self,
         device: &EntityId,
         generation: u32,
         now: u64,
     ) -> Result<(), OperatorError> {
+        if generation == 0 {
+            return Err(OperatorError::NoOpRevocation);
+        }
         RevocationStore::revoke_below(&self.revocation_path, device, generation)?;
         DeviceRegistry::mark_revoked(&self.registry_path, device, now)?;
         Ok(())
@@ -467,7 +483,11 @@ fn reject_code(err: &OperatorError) -> u16 {
             EnrollmentError::Unrenewable => reject::UNRENEWABLE,
             EnrollmentError::LedgerSaturated | EnrollmentError::Token(_) => reject::INTERNAL,
         },
-        OperatorError::Registry(_) | OperatorError::Revocation(_) => reject::INTERNAL,
+        // Not reachable from the join/renewal wire handlers (revocation is a
+        // local operator action), but the mapping must stay total.
+        OperatorError::NoOpRevocation
+        | OperatorError::Registry(_)
+        | OperatorError::Revocation(_) => reject::INTERNAL,
     }
 }
 
@@ -601,6 +621,36 @@ mod tests {
         assert!(gw_chain
             .verify(gateway.entity_id(), root.entity_id(), &enforced, 0)
             .is_err());
+    }
+
+    #[test]
+    fn revoke_at_rejects_the_no_op_generation_zero() {
+        // Floor 0 is a no-op on the floor while mark_revoked would still stamp
+        // the inventory: the device would LOOK revoked yet stay fully
+        // authorized (and silently renewable). Reject it outright.
+        let (op, _root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+            .unwrap();
+
+        assert!(matches!(
+            op.revoke_at(device.entity_id(), 0, T0 + 1),
+            Err(OperatorError::NoOpRevocation)
+        ));
+        // Nothing was touched: no floor, no inventory stamp.
+        assert_eq!(
+            RevocationStore::load(&op.revocation_path)
+                .unwrap()
+                .floor(device.entity_id()),
+            0
+        );
+        assert!(!op.devices().unwrap()[0].is_revoked());
+
+        // The real revoke still works.
+        op.revoke_at(device.entity_id(), 1, T0 + 2).unwrap();
+        assert!(op.devices().unwrap()[0].is_revoked());
     }
 
     // A revoked device that was never in the inventory still gets its floor
