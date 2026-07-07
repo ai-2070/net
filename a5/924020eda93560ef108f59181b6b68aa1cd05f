@@ -1,0 +1,21 @@
+net/crates/net/payments/tests/exact_scheme_flow_e2e.rs
+  s_2ce1bbf7d954a5::t_34cac1f9bdd1ed 339-423
+net/crates/net/payments/src/x402/schemes/mod.rs
+  s_2ce1bbf7d954a5::t_16b50553ae759e 6-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a5924020eda93560ef108f59181b6b68aa1cd05f",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
