@@ -152,6 +152,7 @@ jobs:
           --test capability_auth_call_path
           --test capability_auth_conformance
           --test capability_schema_doc_guard
+          --test capability_aggregation_e2e
           --test gang_claim_node
           --test chain_discovery
           --test cross_lang_capability_fixtures
@@ -161,6 +162,7 @@ jobs:
           --test parsed_packet_short_input
           --test proxy_coverage_gaps
           --test stream_config_and_error_display
+          --test error_kind_mirror
 
       # === NAT traversal ==================================================
       - name: NAT traversal
@@ -243,13 +245,20 @@ jobs:
       # interop via the legacy cumulative-ACK + NACK path), and that
       # the `enable_stream_ack_ranges` kill switch suppresses the
       # capability advertisement.
-      - name: Dataforts greedy + gravity + stream SACK ranges
+      # The blob/dir transfer + transfer fairness/concurrency suites only
+      # need `dataforts` (no `redex-disk`), so they batch into this same
+      # in-memory dataforts compile rather than the on-disk blob e2e group.
+      - name: Dataforts greedy + gravity + stream SACK ranges + transfers
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --features dataforts
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
           --test stream_ack_ranges
+          --test blob_transfer
+          --test dir_transfer
+          --test transfer_concurrency
+          --test transfer_fairness
 
       # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
       # The whole NRPC_SEND_LOOP_BATCHING_PLAN gate, in one compile. The
