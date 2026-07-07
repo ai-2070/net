@@ -105,3 +105,127 @@ def test_start_device_renewal_is_idle_without_config(plugin, monkeypatch):
     node._renewal = None
     node._start_device_renewal(None)
     assert node._renewal is None
+
+
+def _device_env(monkeypatch, path, invite):
+    monkeypatch.setenv("NET_MESH_DEVICE_ENROLLMENT", str(path))
+    monkeypatch.setenv("NET_MESH_INVITE", invite)
+    # Keep the background loop quiet: nowhere near the (tiny) window, huge tick.
+    monkeypatch.setenv("NET_MESH_RENEWAL_WINDOW", "1")
+    monkeypatch.setenv("NET_MESH_RENEWAL_INTERVAL", str(10**9))
+
+
+def test_first_run_enrolls_joins_and_persists(plugin, tmp_path, monkeypatch):
+    psk = "5c" * 32
+    _root, op_mesh, op, handle = _operator(tmp_path, psk)
+    invite = op.invite(op_mesh.rendezvous_string(), 300)
+    path = tmp_path / "device-enrollment.json"
+    _device_env(monkeypatch, path, invite.encode())
+
+    node = plugin.node
+    node._renewal = None
+    dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    dev_mesh.start()
+    try:
+        node._start_device_renewal(dev_mesh)
+        assert node._renewal is not None
+        # Persisted: a restart would load this instead of replaying the invite.
+        assert net.DeviceEnrollment.load(str(path)) is not None
+    finally:
+        if node._renewal is not None:
+            node._renewal.stop()
+        node._renewal = None
+        handle.stop()
+        for m in (dev_mesh, op_mesh):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+
+
+def test_unwritable_enrollment_path_aborts_before_the_join(plugin, tmp_path, monkeypatch):
+    # The single-use invite must NOT be burned when the enrollment could never
+    # be persisted: the write probe fails first and join is never reached.
+    import os
+
+    ro_dir = tmp_path / "ro"
+    ro_dir.mkdir()
+    path = ro_dir / "enrollment.json"
+
+    root = net.Identity.generate()
+    op = net.OperatorEnrollment(
+        root, str(tmp_path / "d.json"), str(tmp_path / "r.json")
+    )
+    invite = op.invite("relay://rv", 300)
+    _device_env(monkeypatch, path, invite.encode())
+
+    joins = []
+
+    class _RecordingMesh:
+        def join(self, *args):  # pragma: no cover - must never be called
+            joins.append(args)
+            raise AssertionError("join must not run when the path is unwritable")
+
+    node = plugin.node
+    node._renewal = None
+    os.chmod(ro_dir, 0o500)  # readable/traversable, not writable
+    try:
+        with pytest.raises(OSError):
+            node._start_device_renewal(_RecordingMesh())
+    finally:
+        os.chmod(ro_dir, 0o700)
+    assert joins == [], "the invite was not spent"
+    assert node._renewal is None
+
+
+def test_save_failure_after_join_keeps_the_in_memory_enrollment(
+    plugin, tmp_path, monkeypatch, caplog
+):
+    # The probe passes but the post-join save keeps failing: the failure is
+    # surfaced loudly and the session continues on the in-memory enrollment —
+    # the renewal loop re-attempts persistence later.
+    psk = "5d" * 32
+    _root, op_mesh, op, handle = _operator(tmp_path, psk)
+    invite = op.invite(op_mesh.rendezvous_string(), 300)
+    path = tmp_path / "device-enrollment.json"
+    _device_env(monkeypatch, path, invite.encode())
+
+    real = net.DeviceEnrollment
+
+    class _UnsavableProxy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def save(self, _path):
+            raise RuntimeError("disk on fire")
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    class _FlakyDeviceEnrollment:
+        load = staticmethod(real.load)
+
+        def __new__(cls, *args):
+            return _UnsavableProxy(real(*args))
+
+    monkeypatch.setattr(net, "DeviceEnrollment", _FlakyDeviceEnrollment)
+
+    node = plugin.node
+    node._renewal = None
+    dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    dev_mesh.start()
+    try:
+        with caplog.at_level("ERROR", logger=node.logger.name):
+            node._start_device_renewal(dev_mesh)
+        assert node._renewal is not None, "the admitted key keeps the session alive"
+        assert any("only in memory" in r.message for r in caplog.records)
+    finally:
+        if node._renewal is not None:
+            node._renewal.stop()
+        node._renewal = None
+        handle.stop()
+        for m in (dev_mesh, op_mesh):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass

@@ -298,6 +298,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _probe_writable(path: str) -> None:
+    """Prove `path`'s location is writable — create the parent directory and
+    write + remove a probe file — so a first-run enrollment can abort *before*
+    the join burns its single-use invite. Raises on failure."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    probe = path + ".probe"
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"net-mesh enrollment write probe")
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+
 def _start_device_renewal(mesh_handle) -> None:
     """Device-mode: if this machine is an enrolled device
     (``NET_MESH_DEVICE_ENROLLMENT`` points at a persisted enrollment, or
@@ -329,13 +346,43 @@ def _start_device_renewal(mesh_handle) -> None:
             return
         # First run: generate our own device key, join the operator's mesh, and
         # persist the enrollment so future starts skip re-pairing.
+        #
+        # The join burns the single-use invite and admits a key that exists
+        # only in this process, so prove the enrollment path is writable
+        # BEFORE committing — an unwritable path (typo, permissions, read-only
+        # fs) must abort while the invite is still redeemable, not strand an
+        # admitted device whose every restart replays a spent invite with a
+        # fresh, discarded key.
+        _probe_writable(path)
         device = Identity.generate()
         name = (os.environ.get("NET_MESH_DEVICE_NAME") or "").strip() or "device"
         chain = mesh_handle.join(device, invite, name, [])
         rendezvous = InviteToken.decode(invite).rendezvous
         enrollment = DeviceEnrollment(device, chain, rendezvous, int(time.time()))
-        enrollment.save(path)
-        logger.info("net plugin: enrolled as a new device (persisted to %s)", path)
+        save_error = None
+        for _ in range(3):
+            try:
+                enrollment.save(path)
+                save_error = None
+                break
+            except Exception as e:  # noqa: BLE001 — retried; surfaced loudly below
+                save_error = e
+                time.sleep(0.2)
+        if save_error is None:
+            logger.info("net plugin: enrolled as a new device (persisted to %s)", path)
+        else:
+            # The invite is already spent and the admitted key lives only in
+            # memory. Keep the session alive on the in-memory enrollment (the
+            # renewal loop below re-attempts persistence on every renewal) but
+            # say so loudly — a restart before a successful save needs a fresh
+            # invite.
+            logger.error(
+                "net plugin: enrolled as a new device but persisting to %s "
+                "failed (%s); the enrollment is only in memory — a restart "
+                "before a successful save will need a fresh invite",
+                path,
+                save_error,
+            )
 
     svc = RenewalService(
         mesh_handle,
