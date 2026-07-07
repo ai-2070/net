@@ -98,6 +98,19 @@ def test_renewal_service_start_stop_is_idempotent(plugin, tmp_path):
     assert svc.maybe_renew() is False
 
 
+def test_check_interval_is_clamped_to_a_floor(plugin, tmp_path):
+    # NET_MESH_RENEWAL_INTERVAL=0 (or negative) used to make _stop.wait(0)
+    # return instantly — a 100%-CPU busy loop. The service clamps instead.
+    svc = plugin.renewal.RenewalService(
+        object(), object(), str(tmp_path / "e.json"), check_interval=0, renewal_window=1
+    )
+    assert svc._check_interval >= plugin.renewal._MIN_CHECK_INTERVAL
+    svc = plugin.renewal.RenewalService(
+        object(), object(), str(tmp_path / "e.json"), check_interval=-5, renewal_window=1
+    )
+    assert svc._check_interval >= plugin.renewal._MIN_CHECK_INTERVAL
+
+
 def test_start_device_renewal_is_idle_without_config(plugin, monkeypatch):
     # No NET_MESH_DEVICE_ENROLLMENT → device-mode is a no-op (mesh unused).
     monkeypatch.delenv("NET_MESH_DEVICE_ENROLLMENT", raising=False)

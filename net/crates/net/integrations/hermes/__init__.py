@@ -126,21 +126,29 @@ def _on_session_start(**_kwargs) -> None:
 
 def _on_session_end(**_kwargs) -> None:
     """Best-effort teardown when the session ends. Idempotent; swallows errors
-    so session end never fails on cleanup."""
+    so session end never fails on cleanup — and each step is guarded
+    individually, so one service's failing ``stop()`` can't skip the rest of
+    the teardown (which would leak the mesh node, the silent-renewal daemon
+    thread, and the served RPC handles)."""
     global _promotion, _provider, _federation, _a2a_service
-    if _a2a_service is not None:
-        _a2a_service.stop()
-        _a2a_service = None
-    if _federation is not None:
-        _federation.stop()
-        _federation = None
-    if _provider is not None:
-        _provider.stop()
-        _provider = None
-    if _promotion is not None:
-        _promotion.stop()
-        _promotion = None
-    node.shutdown()
+    services = (
+        ("a2a executor", _a2a_service),
+        ("tool federation", _federation),
+        ("local-tool provider", _provider),
+        ("pin promotion", _promotion),
+    )
+    _a2a_service = _federation = _provider = _promotion = None
+    for label, service in services:
+        if service is None:
+            continue
+        try:
+            service.stop()
+        except Exception:  # noqa: BLE001 — teardown must not fail session end
+            logger.debug("net plugin: %s stop failed", label, exc_info=True)
+    try:
+        node.shutdown()
+    except Exception:  # noqa: BLE001 — teardown must not fail session end
+        logger.debug("net plugin: node shutdown failed", exc_info=True)
 
 
 def register(ctx) -> None:

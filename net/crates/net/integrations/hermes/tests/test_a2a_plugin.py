@@ -70,6 +70,22 @@ def test_submit_tool_forwards_and_shapes(plugin, monkeypatch):
     assert fake.calls == [("submit", 5, "do it", ["blob://x"])]
 
 
+def test_submit_tool_normalizes_a_bare_string_context_ref(plugin, monkeypatch):
+    # A model passing context_refs="artifact://x" (not a list) must become a
+    # single ref — not iterate into per-character garbage refs.
+    fake = FakeMesh()
+    monkeypatch.setattr(plugin.node, "mesh", lambda: fake)
+    res = json.loads(
+        _run(
+            plugin.tools.handle_net_a2a_submit(
+                {"target_node_id": 5, "prompt": "do it", "context_refs": "artifact://x"}
+            )
+        )
+    )
+    assert res["status"] == "ok"
+    assert fake.calls == [("submit", 5, "do it", ["artifact://x"])]
+
+
 def test_submit_tool_validates(plugin):
     missing_target = json.loads(_run(plugin.tools.handle_net_a2a_submit({"prompt": "x"})))
     assert missing_target["status"] == "error"

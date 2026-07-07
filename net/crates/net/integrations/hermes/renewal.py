@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # for a while renews soon after it comes back.
 _DEFAULT_CHECK_INTERVAL = 24 * 60 * 60
 
+# The floor the check interval is clamped to. `_stop.wait(0)` (a zero/negative
+# NET_MESH_RENEWAL_INTERVAL) returns immediately — the loop would spin at 100%
+# CPU. A minute is far tighter than any sane renewal cadence needs.
+_MIN_CHECK_INTERVAL = 60
+
 # Renew once the grant is within this window of expiry (seconds). 30 days gives
 # many retry opportunities before a 1-year grant lapses.
 _DEFAULT_RENEWAL_WINDOW = 30 * 24 * 60 * 60
@@ -56,6 +61,13 @@ class RenewalService:
         self._mesh = mesh
         self._enrollment = enrollment
         self._path = path
+        if check_interval < _MIN_CHECK_INTERVAL:
+            logger.warning(
+                "net plugin: renewal check interval %ss is below the %ss floor; clamping",
+                check_interval,
+                _MIN_CHECK_INTERVAL,
+            )
+            check_interval = _MIN_CHECK_INTERVAL
         self._check_interval = check_interval
         self._renewal_window = renewal_window
         self._on_renew = on_renew

@@ -517,7 +517,12 @@ async def handle_net_a2a_submit(args: Dict[str, Any], **_kw) -> str:
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         return _json({"status": "error", "error": "prompt is required"})
-    refs = [str(r) for r in (args.get("context_refs") or [])]
+    raw_refs = args.get("context_refs") or []
+    if isinstance(raw_refs, str):
+        # A bare string ref (a model passing "artifact://x" instead of a list)
+        # would otherwise iterate into per-character refs.
+        raw_refs = [raw_refs]
+    refs = [str(r) for r in raw_refs]
     try:
         task_id = await asyncio.to_thread(node.mesh().submit_task, node_id, prompt, refs)
     except Exception as e:  # noqa: BLE001 — surface transport/reject failures as data
