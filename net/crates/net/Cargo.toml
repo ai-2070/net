@@ -301,7 +301,7 @@ reed-solomon-erasure = { version = "6", optional = true, default-features = fals
 # remove all O(1). Pinned to the 0.16 line — same major as the version
 # already pulled transitively, no second copy in the resolver graph.
 lru = "0.18"
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional = true }
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"], optional = true }
 # X25519 DH for the `IdentityEnvelope` sealed-box construction used
 # by daemon migration. We derive an ephemeral pubkey, DH against the
 # target's static X25519 pubkey, and key an XChaCha20-Poly1305 AEAD
