@@ -1,0 +1,96 @@
+# Implementation Plan: Payments — xrpl enablement (ladder rung 4)
+
+**Implements:** `PAYMENTS_P1_NETWORK_LADDER.md` rung 4 (go/no-go record: *facilitator live, enablement NO-GO until the scheme seam exists and a t54 conformance run passes*). Builds on the P2 gap burn-down (`PAYMENTS_P2_GAP_PLAN.md`, complete): the scheme seam inventory is pinned prose (`x402/schemes/mod.rs`), both `can_settle` arms are symmetric, the settle-time-payer fallback exists for opaque-blob schemes, and `SvmChecker` is the deterministic-finality checker exemplar this plan's checker mirrors.
+
+**The xrpl sentence:** xrpl becomes the fourth rung the moment — and only the moment — its payload shape stops being vendor-defined; everything after the pin is the same boring config-not-code climb as Base and Solana, with one genuinely new money-path fact (IOU decimal amounts) that goes to review, not into code.
+
+**Why this plan is gate-shaped.** The P1 survey (2026-07-06) verified t54.ai runs a live XRPL facilitator (`xrpl-x402.t54.ai`) speaking the standard `/verify`/`/settle`, settling XRP and RLUSD via **presigned Payment blobs** — but the pinned x402 spec commit (`087922a5`) carries `scheme_exact_*.md` for twelve chains and **none for xrpl**. Building against today's shape would couple the money path to an unversioned vendor format (the exact failure the ladder refuses). So WS-0 *is* the gate; WS-1..4 do not start until it holds. The deferral-until-pin is inherited from P2 WS-D's entry criteria — this plan is what "unshelving" looks like when the criteria resolve.
+
+---
+
+## WS-0 — the gate: pin the shape, resolve the money questions
+
+Nothing below this workstream starts until every box here is ticked and the amount-domain decision has a review sign-off.
+
+- [ ] **Pin the payload shape** at an immutable reference: an upstream `scheme_exact_xrpl.md` merged into the x402 spec repo (preferred), or t54 documentation versioned at a commit/dated URL. Record the pin in this file and in the ladder's rung-4 blanks. The pin must answer, explicitly:
+  1. the `payload` object shape around the presigned blob (`{"transaction": "<hex|base64>"}`? additional structured fields?);
+  2. whether the payload carries the payer (`Account`) as a structured field — decoding the signed binary blob to find it is XRPL transaction machinery in the money path, refused by the same doctrine as SVM. If absent, the engine's **settle-time-payer fallback** (built in P2 WS-A) is the payer-binding source, with its documented weaker trust;
+  3. the **destination-tag convention**: XRPL merchants on shared addresses disambiguate by `DestinationTag`; the pin must say whether `payTo` encodes address-only or address+tag, or the checker cannot bind delivery to the right merchant account;
+  4. the **IOU amount domain** (see the review item below).
+- [ ] **Amount-domain review (money-path decision, the P2 WS-D `upto` clause's sibling):** XRP amounts are integer drop strings (fits `AtomicAmount`'s u128 grammar untouched). RLUSD is an **IOU whose ledger value is a decimal string** (15 significant digits) — `AtomicAmount` deliberately rejects decimals. Enabling RLUSD requires a pinned atomic-unit convention (registry `decimals` × integer atomic units ↔ ledger decimal value, converted only at the wire boundary) reviewed as a money-path change. **Fallback posture: enable XRP-only first** — drops are already grammar-clean — and let RLUSD ride a second review.
+- [ ] **Re-verify the survey facts at enablement time** (facilitators move): t54's live `GET /supported` still offers `(exact, xrpl:…)` at x402Version 2; auth mechanism + ToS recorded and expressible through the existing `AuthProvider` seam (secret refs only, never values).
+- [ ] **Exactness pinned:** the `exact` scheme on xrpl means a direct Payment, full amount, no path-finding — authoring must make `tfPartialPayment` and cross-currency paths (`SendMax`/`Paths`) unrepresentable in the intent (see WS-1). A partial payment that delivers less than `Amount` is *the* classic XRPL integration exploit; it is excluded by construction, not by validation.
+
+**Acceptance:** the pin reference + all four answers recorded here and in the ladder; the amount-domain decision has review sign-off (or the XRP-only fallback is adopted in writing).
+
+## WS-1 — the scheme seam (`x402/schemes/exact_xrpl.rs`)
+
+The P2 seam inventory (`x402/schemes/mod.rs`), instantiated for xrpl — intent-in/blob-out, the exact-SVM pattern:
+
+- [ ] `XrplPaymentIntent`, derived **only** from quoted requirements (nothing caller-supplied): network (CAIP-2 `xrpl:0` mainnet / `xrpl:1` testnet), asset (XRP drops, or IOU `{currency, issuer}` if RLUSD clears WS-0), `pay_to` (+ destination tag per the pinned convention), amount, and an expiry hint the wallet maps to `LastLedgerSequence` (the `validBefore` analogue — bounds how long the blob stays submittable). The struct has **no flags field**: partial payments and paths are unrepresentable.
+- [ ] `SchemeSigner::sign_xrpl_payment(&XrplPaymentIntent) -> blob` with the defaulted structured refusal (an EVM/SVM signer registered under the wrong namespace fails closed); `ExternalXrplSigner` mirror of `ExternalSvmSigner` — the wallet owns the key, the XRPL serialization machinery, and the sequence number; none enter Net.
+- [ ] `payload_object` per the pinned shape, refusing an empty/non-encodable blob before it crosses any boundary.
+- [ ] **Both** `can_settle` arms — mesh flow and HTTP door in the same commit (they are symmetric since P2 WS-B; do not let them drift): `exact` + `xrpl` namespace + configured signer.
+- [ ] **Replay identity recorded at the seam:** the blob is single-use on-ledger by account `Sequence` (or Ticket). Same-quote retries must re-present the **identical blob** (the wallet must not re-sign with a fresh sequence — re-signing breaks byte idempotency exactly like SVM's fresh blockhash, and here it also burns a sequence slot). A blob whose `LastLedgerSequence` has passed is dead; a late retry needs a fresh quote. The engine's canonical-payload replay key (M2) applies unchanged.
+- [ ] Unit tests per the exact-SVM idiom: intent derivation, refusals (wrong scheme/namespace, reference-less `xrpl`, missing tag when the convention requires one), payload shape pin, blob-encoding refusal.
+
+**Acceptance:** the seam compiles the P2 inventory into code with zero engine/flow changes beyond the two dispatch arms; the negative tests prove partial payments and paths cannot be authored.
+
+## WS-2 — registry entries + config pack (config, not code)
+
+- [ ] **CAIP conventions decided and recorded:** CAIP-2 `xrpl:0` (mainnet `network_id` 0). CAIP-19 has no registered xrpl asset namespace — pick and pin a convention for the registry ids (proposal: `xrpl:0/slip44:144` for XRP; an `iou:<issuer>/<currency>` form for RLUSD with the issuer address taken from Ripple's published RLUSD issuer at pin time — never hardcoded from memory). Goes to the same review as the amount domain.
+- [ ] Registry entries for XRP (and RLUSD if cleared) — **landing WITH the conformance run, never before** (the ladder rule: the registry is an allowlist; absence is a hard reject, and premature entries are silent enablement).
+- [ ] `packs::t54_xrpl_mainnet(secret_ref)`: endpoint `xrpl-x402.t54.ai`, `(exact, xrpl:0)`, auth per t54's recorded terms through `AuthProvider` refs, `rpc_endpoints` naming a rippled JSON-RPC endpoint for the checker, `required_tier: Confirmed(1)` (serve above receipt trust from day one, like every other rung), **no `final_depth`** (validated-ledger finality is deterministic; the knob is meaningless here exactly as on Solana — document it on the pack).
+- [ ] Pack posture test rows in `packs.rs` (round-trip, registry-story agreement, tier-posture) extended to the new pack.
+
+**Acceptance:** the rung is a pack + registry entries + this document's records — any core-code requirement discovered here is a design failure that goes back to review.
+
+## WS-3 — independent XRPL checker (`checker/xrpl.rs`)
+
+The third `ChainChecker`, mirroring `SvmChecker`'s deterministic-finality shape (the trait does not change — third time proving it):
+
+- [ ] Verdict mapping from the rippled `tx` method (lookup by hash):
+  - transaction not found / found but `validated: false` → `Pending` (no confidence claim; candidate ledgers revert)
+  - `validated: true` + `meta.TransactionResult == "tesSUCCESS"` → **`Final`** (a validated XRPL ledger is deterministically final — no depth arithmetic, `final_depth` unused; `Confirmed(n)` is simply never emitted by this adapter, which the tier vocabulary permits)
+  - `validated: true` + any `tec*` result → `Reverted` (included, fee burned, **payment did not happen** — e.g. `tecPATH_DRY`/`tecNO_LINE` when the recipient lacks the RLUSD trust line; an honest first-class invalidation, not an edge case)
+  - documented refinement (decide at build, default conservative): a not-found transaction whose `LastLedgerSequence` is below the latest validated ledger index can *never* land — XRPL can prove never-included, which no other rung can. `ChainVerdict` has no vocabulary for it; the conservative mapping stays `Pending` (the engine's M3 in-flight TTL already unsticks the flow), and any vocabulary change is a trait review, not an adapter liberty.
+- [ ] **Delivered amount from `meta.delivered_amount` and nothing else** — never `tx.Amount`, which is an upper bound under partial payments. This is the delivered-not-sent doctrine (P1 WS3) meeting its sharpest real-world instance; the adversarial row in WS-4 proves a partial payment invalidates on amount-mismatch.
+- [ ] **Payer binding (H3 parity):** the matched transaction's `Account` must equal `query.from` — sourced from the pinned payload field (WS-0 question 2) or the settle-time-payer fallback the engine already threads. Recipient binding: `Destination` (+ `DestinationTag` per the pinned convention) must equal `query.to`.
+- [ ] **Network confirmation (M7 twin):** one-shot `server_info` → `network_id` must match the CAIP-2 reference before any status is trusted — the `eth_chainId`/`getGenesisHash` sibling; plus pinned TLS roots, bounded response bodies, retryable/terminal error mapping (the checker boilerplate, third copy — if a shared-RPC-helper refactor is worth it, it rides this WS as a mechanical follow-up, never a redesign).
+- [ ] Tests on the scripted-RPC fixture idiom: verdict map (incl. `tec*` → Reverted with a trust-line row), delivered from `delivered_amount` with a partial-payment mismatch row, wrong-payer zero, wrong/missing destination tag, `network_id` mismatch refusal + heal.
+
+**Acceptance:** an XRPL settlement reaches `Verified@Final` through the unchanged engine and `re_verify_with_checker`; a partial payment or a stranger's payment to the same address never bills.
+
+## WS-4 — conformance + adversarial rows (the rung's actual climb)
+
+- [ ] Fixture-first CI: an in-process rippled-shaped RPC fixture (WS-3's) plus the facilitator conformance suite parameterized over the t54 pack — the same lifecycle rows every facilitator passes.
+- [ ] Live suite (env-gated `#[ignore]`, never CI-required — the P1 rung-1 shape, 1a–1d): live `GET /supported` still offers the pinned pair → pack passes its load-time gate → a really-signed blob gets a structural answer from live `/verify` (spends nothing; a spec-vocabulary rejection is a passing answer) → the acceptance: real XRP through the unchanged engine and caller flow, settled live via t54, billed once, upgraded past receipt trust by the WS-3 checker.
+- [ ] Adversarial rows, xrpl instantiation: receipt replay across quotes (`consumed_transactions`), network confusion (testnet receipt against the mainnet pack), delivered-amount mismatch **via partial payment**, wrong payer, wrong destination tag, and the M1 row (a "rejected" claim from a holder of the presigned blob keeps the spend reservation — the blob is a bearer instrument exactly like EIP-3009).
+- [ ] Tick the ladder's rung-4 blanks (`xrpl seam: ____ · registry entries: ____ · t54 conformance: ____`) as each lands; this plan gets the same built-state treatment as P2's on completion.
+
+**Acceptance:** the ladder's rung-4 line reads GO with all three blanks filled; enablement remains, per the ladder, an operator decision (allowed_networks + signer + checker), never a default.
+
+---
+
+## Rollout order
+
+1. **WS-0 gates everything** — it is mostly not engineering: an upstream spec PR (or versioned t54 docs), one money-path review (IOU amounts), one re-verify. If the pin stalls upstream, nothing else starts; that is the plan working, not the plan failing.
+2. **WS-1 and WS-3 in parallel** after the gate (independent surfaces: authoring seam vs. checker; both consume WS-0's answers).
+3. **WS-2 lands with WS-4** (the ladder rule — registry entries ride the conformance run).
+
+## Non-goals
+
+Escrow / payment channels / Checks (different XRPL primitives, not `exact`); cross-currency paths and `SendMax` (excluded by construction — `exact` is a direct full-amount Payment); AMM/DEX interaction; USDC-as-IOU (the survey notes t54 settles it; demand-driven after RLUSD proves the IOU path); inbound HTTP-402 serving; Python/TS surfaces for xrpl (ride the existing carried items); any second XRPL facilitator (the standard `/verify`/`/settle` keeps t54 swappable — that optionality is the containment, not a work item).
+
+## Risks
+
+| Risk | Containment |
+|---|---|
+| The vendor shape never gets pinned upstream | The gate holds: no build. The seam inventory keeps the eventual work small; the pressure release is an upstream spec PR authored from t54's observed behavior, pinned at *our* PR commit |
+| IOU decimal amounts vs the u128 integer grammar | WS-0 review before any code; XRP-only fallback is always available (drops are grammar-clean) |
+| Partial payment delivers less than `Amount` | `tfPartialPayment` unrepresentable in the authoring intent; checker reads `meta.delivered_amount` only; a dedicated adversarial row proves the mismatch invalidates |
+| Destination-tag omission misdelivers on shared addresses | The tag convention is a WS-0 pin question; the checker binds `Destination`+tag; a wrong/missing-tag test row |
+| Recipient lacks the RLUSD trust line | `tec*` in a validated ledger maps to `Reverted` — first-class invalidation, tested |
+| t54 single-vendor dependency (auth/ToS drift, endpoint moves) | Load-time `GET /supported` gate fails loudly at startup; standard `/verify`/`/settle` means the pack, not the code, names the vendor |
+| Presigned blob is a bearer instrument | Already the M1 posture: a claimed rejection from the blob holder never releases the spend reservation; xrpl inherits the shared-path behavior, with its own WS-4 row |
+| Sequence-number coupling (wallet re-signs on retry, burning sequence slots / breaking idempotency) | The seam doc pins "same quote ⇒ same blob"; retry honesty documented at the arm exactly as SVM's blockhash note |

@@ -149,6 +149,10 @@ Basis:
 
 - [ ] xrpl seam: `____` · registry entries: `____` · t54 conformance: `____`
 
+Enablement plan: `PAYMENTS_XRPL_ENABLEMENT_PLAN.md` (gate-shaped — its WS-0
+is this rung's spec-pin gate; WS-1..4 instantiate the P2 seam inventory,
+the checker, the pack, and the conformance climb once the gate holds).
+
 ## Carried alongside the ladder
 
 - Record the two-machine P0 demo (mock pack; `mesh_payments_e2e` is its
