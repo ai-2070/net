@@ -21,19 +21,19 @@ Money-path invariants inherited unchanged: non-custodial, keys never cross the l
 
 The one gap that caps confidence. A facilitator receipt justifies `observed`, full stop (P1 survey fact 2); Solana settlements today can never rise above it because `src/checker/` has only the `eip155` adapter. Solana actually makes this *easier* than EVM: `finalized` commitment is deterministic rooted finality — no depth arithmetic, no `final_depth` posture question.
 
-- [ ] `SvmChecker` implementing the P1 `ChainChecker` trait verbatim (the trait must not change — same acceptance discipline as WS1/P1), behind the existing `http-facilitator` feature, JSON-RPC against a config-pack endpoint
-- [ ] Verdict mapping (chain semantics *into* the fixed tier vocabulary, nothing leaks upward):
+- [x] `SvmChecker` implementing the P1 `ChainChecker` trait verbatim (the trait must not change — same acceptance discipline as WS1/P1), behind the existing `http-facilitator` feature, JSON-RPC against a config-pack endpoint
+- [x] Verdict mapping (chain semantics *into* the fixed tier vocabulary, nothing leaks upward):
   - signature not found (`getSignatureStatuses` with `searchTransactionHistory: true`) → `Pending`
   - `meta.err != null` → `Reverted`
   - `confirmationStatus: "processed"` → `Pending` (no confidence claim — same doctrine as the eip155 missing-receipt arm)
   - `confirmationStatus: "confirmed"` → `Confirmed(n)` (n from `confirmations` / slot depth)
   - `confirmationStatus: "finalized"` → `Final` (deterministic; `final_depth` config is deliberately unused by this adapter — document it)
-- [ ] Delivered-amount cross-check from `getTransaction` (jsonParsed, `maxSupportedTransactionVersion: 0`) token-balance deltas: delivered = Σ positive `postTokenBalances − preTokenBalances` for `(mint == query.token, owner == query.to)` — the amount **delivered**, straight from the chain, robust through CPI
-- [ ] **Payer binding (H3 parity is non-negotiable):** a delta toward `pay_to` counts only when `query.from` (the authorized payer, threaded by the engine since `49c2782b6`) shows a negative delta for the same mint in the same transaction — a stranger's payment to the same merchant must sum to an honest zero, exactly as on eip155
-- [ ] **Genesis-hash confirmation (M7 parity):** one-shot `getGenesisHash` check that the endpoint's hash prefix matches the CAIP-2 reference (`solana:5eykt4…`) before trusting any status — the eip155 `ensure_chain_id` twin; plus the same bounded-body read (`MAX_RPC_BODY`) and retryable/terminal error mapping
-- [ ] Config pack: `cdp_solana_mainnet` gains `rpc_endpoints` and a `required_tier` (propose `Confirmed(1)` serve-gate default, mirroring Base) — the pack's "no checker yet, so no promises" comment retires
-- [ ] Amount domain note: SPL amounts are u64 raw units in a decimal string — parses through the existing `AtomicAmount` grammar; the eip155 `parse_hex_u128` overflow concern has no SVM analogue
-- [ ] Tests: scripted-RPC fixture (the `eip155_checker.rs` `RpcFixture` idiom) covering the verdict map, delivered extraction, **wrong-payer zero**, genesis-hash mismatch refusal; `checker_verification.rs`-style engine integration (tier upgrade → bill at required tier; revert → invalidate+freeze); adversarial rows re-run for SVM (receipt replay across quotes, network confusion, delivered mismatch)
+- [x] Delivered-amount cross-check from `getTransaction` (jsonParsed, `maxSupportedTransactionVersion: 0`) token-balance deltas: delivered = Σ positive `postTokenBalances − preTokenBalances` for `(mint == query.token, owner == query.to)` — the amount **delivered**, straight from the chain, robust through CPI
+- [x] **Payer binding (H3 parity is non-negotiable):** a delta toward `pay_to` counts only when `query.from` (the authorized payer, threaded by the engine since `49c2782b6`) shows a negative delta for the same mint in the same transaction — a stranger's payment to the same merchant must sum to an honest zero, exactly as on eip155
+- [x] **Genesis-hash confirmation (M7 parity):** one-shot `getGenesisHash` check that the endpoint's hash prefix matches the CAIP-2 reference (`solana:5eykt4…`) before trusting any status — the eip155 `ensure_chain_id` twin; plus the same bounded-body read (`MAX_RPC_BODY`) and retryable/terminal error mapping
+- [x] Config pack: `cdp_solana_mainnet` gains `rpc_endpoints` and a `required_tier` (propose `Confirmed(1)` serve-gate default, mirroring Base) — the pack's "no checker yet, so no promises" comment retires
+- [x] Amount domain note: SPL amounts are u64 raw units in a decimal string — parses through the existing `AtomicAmount` grammar; the eip155 `parse_hex_u128` overflow concern has no SVM analogue
+- [x] Tests: scripted-RPC fixture (the `eip155_checker.rs` `RpcFixture` idiom) covering the verdict map, delivered extraction, **wrong-payer zero**, genesis-hash mismatch refusal; `checker_verification.rs`-style engine integration (tier upgrade → bill at required tier; revert → invalidate+freeze); adversarial rows re-run for SVM (receipt replay across quotes, network confusion, delivered mismatch)
 
 **Acceptance:** an SPL settlement reaches `Verified@Final` through the *unchanged* engine and `re_verify_with_checker`; a facilitator pointing at a different customer's transfer to the same merchant is invalidated on the amount-mismatch arm; the Solana pack passes the same conformance shape as Base.
 
