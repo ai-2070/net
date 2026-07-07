@@ -4,14 +4,27 @@
 
 **The P2 sentence:** close the asymmetries — Solana rises from receipt-trust to independently-checked, the outbound HTTP door speaks every scheme the mesh flow speaks, and an announced price is *always* an enforced price, on every serving path.
 
-**The state being fixed (verified against the code, 2026-07-06):**
+---
+
+## Status (2026-07-07): **COMPLETE** — all four workstreams landed on `net-payments-gap`
+
+| WS | Landed | Commit | Key tests |
+|---|---|---|---|
+| A — SVM checker | ✅ | `24e6c3ac5` | `tests/svm_checker.rs` (4), `the_recorded_settle_payer_reaches_the_checker_when_the_payload_names_none` |
+| B — Solana HTTP door | ✅ | `0cc67608f` | `a_solana_demand_settles_under_policy_through_the_svm_signer`, `a_solana_reject_keeps_the_reservation` |
+| C — native price enforcement | ✅ | `4bf0305d1` | `a_priced_local_tool_enforces_payment_before_the_invoker`, `publish_tools_pricing_guards_fail_closed`, `a_priced_descriptor_is_refused_on_the_ungated_serve_path` |
+| D — scheme readiness pinned | ✅ | `a5924020e` | `an_unknown_scheme_accepts_entry_fails_closed_at_selection` |
+
+Every acceptance criterion below is met (per-workstream **Landed** notes record what building actually surfaced, including two discoveries the plan did not anticipate). Full payments suite, 272 MCP-adapter tests, SDK tool suites, and the core build are green.
+
+**The state that was fixed (as verified 2026-07-06) — all ❌ cells now ✅:**
 
 | Axis | eip155 `exact` | solana `exact` | native `serve_rpc` tools |
 |---|---|---|---|
 | Provider engine + mesh caller flow | ✅ | ✅ | n/a |
-| Independent checker (`confirmed(n)`/`final`) | ✅ `checker/eip155.rs` | ❌ **capped at `observed`** | n/a |
-| Outbound HTTP-402 door | ✅ | ❌ `http402.rs::can_settle` is eip155-only | n/a |
-| Payment enforced before serve | ✅ (engine redeem + MCP wrap gate) | ✅ (same) | ❌ `.pricing_terms()` is **discovery-only** (documented at `sdk/src/tool.rs`) |
+| Independent checker (`confirmed(n)`/`final`) | ✅ `checker/eip155.rs` | ~~❌ capped at `observed`~~ → ✅ `checker/svm.rs` (WS-A) | n/a |
+| Outbound HTTP-402 door | ✅ | ~~❌ eip155-only~~ → ✅ (WS-B) | n/a |
+| Payment enforced before serve | ✅ (engine redeem + MCP wrap gate) | ✅ (same) | ~~❌ discovery-only~~ → ✅ every path (WS-C) |
 
 Money-path invariants inherited unchanged: non-custodial, keys never cross the language boundary, no arbitrary signing oracle, byte-preservation, fail-closed on every error arm, "config, not code" for network variation.
 
@@ -37,6 +50,8 @@ The one gap that caps confidence. A facilitator receipt justifies `observed`, fu
 
 **Acceptance:** an SPL settlement reaches `Verified@Final` through the *unchanged* engine and `re_verify_with_checker`; a facilitator pointing at a different customer's transfer to the same merchant is invalidated on the amount-mismatch arm; the Solana pack passes the same conformance shape as Base.
 
+> **Landed** (`24e6c3ac5`), with one discovery the plan missed: exact-SVM payloads are opaque wallet blobs — **no `authorization.from` for the engine to thread**, so the H3-parity payer bind would have been inert on the very scheme it was built for. Resolution: the engine's completion events now record the facilitator's **settle-time payer claim** as a chain fact (`payer` extra), and `re_verify_with_checker` falls back to it when the payload names no payer. Weaker than the caller-signed bind (which wins when present), honestly documented at both sites — it pins post-hoc transaction substitution to the originally-named payer. Payer binding on SVM is *transaction-level* (balances carry no per-log `from`): delivery counts only when the queried payer's mint balance decreased in the same tx. `Confirmed(1)` adopted as the pack's serve tier. The plan's "adversarial rows re-run for SVM" resolves as: the engine-level rows (receipt replay, network confusion, delivered mismatch) are scheme-agnostic and already covered trait-generically by `checker_verification.rs`; the SVM-specific adversarial surface (wrong payer, wrong chain, fetch race, case-twiddled base58) is covered by the new fixture rows.
+
 ## Workstream B — Solana on the outbound HTTP-402 door (`flow/http402.rs`)
 
 The mesh flow authors exact-SVM payloads; the HTTP door's `can_settle` + `author_payload` never grew the arm. Pure parity work — no new seams.
@@ -49,18 +64,22 @@ The mesh flow authors exact-SVM payloads; the HTTP door's `can_settle` + `author
 
 **Acceptance:** `fetch_paid` against a fixture demanding `exact`/`solana:…` settles under the same spend policy, with nothing signed before policy clears; the eip155 tests are untouched.
 
+> **Landed** (`0cc67608f`) as planned — pure parity, no deviations. The `PaidServer` fixture grew a configurable accepts entry; the settle test also proves the wallet was shown the structured intent (mint/payTo/amount/feePayer derived from the demand, never caller-supplied) and the M1 bearer-scheme reservation retention holds on this path.
+
 ## Workstream C — native tools: announced price ⇒ enforced price
 
 The review's "trap" (LOW, documented at `sdk/src/tool.rs` for now): `.pricing_terms()` on a `ToolDescriptor` announces a price, but the redeem gate (`PaymentAdmission`) lives only in the MCP wrap path — a natively `serve_rpc`'d tool would *look* priced while serving free. The fix is not a second gate implementation; `publish_tools` (P2-A1) already routes native tools through `WrapInvokeHandler`, which carries the `PaymentAdmission` seam. The work is closing the unguarded path and proving the guarded one.
 
 - [x] **Prove the guarded path:** a native tool published via `publish_tools` with `pricing` + `payment_admission` in its `WrapConfig` is payment-gated end-to-end — quote redeemed before the invoker runs, unpaid caller refused (`ERR_PAYMENT`), M5's `PricingKeyUnmatched` and the priced-without-gate guard both fire for native tools exactly as for wrapped ones (they live in `publish_server`'s shared path — verify, don't reimplement)
 - [x] **Close the raw path:** announcing `pricing_terms` through bare `serve_rpc`/`announce` without an admission-wired publication is refused at announce time (fail-closed, the M5 pattern: loud error naming the fix — "publish paid tools via publish_tools with payment_admission"), not silently discovery-only
-  - Decision to make at build: refuse in the SDK announce path vs. a `debug_assert`+hard error behind a feature. Default position: hard refusal — a visible price that doesn't gate is the trap the review named; nobody is relying on it (verified: no live native paid-invoke path exists)
+  - ~~Decision to make at build~~ **Resolved: hard refusal.** `Mesh::serve_tool` / `serve_tool_streaming` return the new `ServeError::UnenforceablePricing` (core enum, additive — no exhaustive matches in-repo; the Python binding ships empty pricing by design and is unaffected)
 - [x] Retire the "discovery-only" escape-hatch doc on `ToolDescriptor::pricing_terms` once the refusal lands (the doc comment was the stopgap, `2f8317dec`)
 - [x] M6 parity: the caller-side gateway already forces `AtMostOnce` for paid invokes (`1128807a5`) — confirm the native invoke path flows through the same `gated_invoke`/`InvokeSafety` derivation, add the assert to its test
 - [x] Tests: native paid tool via `publish_tools` — unpaid invoke refused, paid invoke redeems exactly once, replayed quote refused; raw `serve_rpc` + `pricing_terms` → structured refusal at announce
 
 **Acceptance:** there is no code path on which a tool can be discovered as priced and invoked unpaid; the negative test proves the raw path refuses loudly.
+
+> **Landed** (`4bf0305d1`), with the plan's central assumption **half-wrong in the dangerous direction**: `publish_tools` routed native tools through `WrapInvokeHandler` (which *carries* the `PaymentAdmission` seam) but never wired it — no priced-without-gate guard, no pricing-key check, and no `.with_payment(...)` on the handler. "Verify, don't reimplement" became *wire, then verify*: `publish_tools` now mirrors `publish_server` (both guards + per-tool `.with_payment`), accepts pricing from `WrapConfig.pricing` (folded into the lowering context) or a caller-built context, and refuses two disagreeing maps with the new `WrapError::PricingSourceConflict` rather than silently picking one. The e2e proves the unpaid call is refused *before the invoker runs*, the paid call redeems its quote through the gate, and an unpriced sibling in the same publication stays free. One scope note: "replayed quote refused" is the engine's redeem-once guarantee (`redemption_admits_a_paid_quote_exactly_once`, engine-level and path-agnostic) — the native e2e proves the gate is *consulted*, not re-proving the engine. M6 parity needed no new code: `gated_invoke` derives `AtMostOnce` from `pricing_terms`/`payment_proof` regardless of publish path (asserted since `1128807a5`).
 
 ## Workstream D — scheme-family readiness (non-`exact`), deferred with entry criteria
 
@@ -72,6 +91,8 @@ Not built in P2 — the deferral is the deliverable, P1-style. `exact` is the on
 
 **Acceptance:** the refusal-of-unknown-schemes test pins today's behavior; the seam inventory is committed prose.
 
+> **Landed** (`a5924020e`): the seam inventory + entry criteria live next to the code (`src/x402/schemes/mod.rs` module doc — six seams, three criteria, the `upto` amount-policy review called out as the money-path decision). The pinning test drives an `upto` accepts entry on an *enabled* network with a *configured* signer and asserts the structured no-settleable `Denied` with nothing signed, sent, or reserved.
+
 ---
 
 ## Rollout order
@@ -80,11 +101,14 @@ Not built in P2 — the deferral is the deliverable, P1-style. `exact` is the on
 2. **B** after A's fixture idioms exist (it reuses the stub-signer + fixture patterns), though it only depends on A socially, not technically.
 3. **D** is prose + one test; ride it with whichever lands last.
 
+> **As executed:** sequentially A → B → C → D (single implementer; the A∥C parallelism was a team-shaped option). B did reuse A's fixture idioms as predicted; C grew beyond "verify" (see its Landed note) but stayed inside its acceptance.
+
 ## Carried alongside (adjacent, not gating)
 
 - Python surface for the outbound HTTP-402 client (ladder carry-over; still pending) — grows naturally after WS-B so the surface exposes both schemes at once.
 - TS parity waits on the node binding growing a payment flow (demand-driven, unchanged).
 - Nonce binding in the eip155 checker via `AuthorizationUsed` (the H3 fix's noted stronger follow-up) — needs keccak256 outside the dev-signer feature gate; fold into WS-A's review if a shared hashing home emerges, else it stays a recorded follow-up.
+- A **live** SVM conformance run (real Solana RPC + CDP facilitator, env-gated `#[ignore]`, same posture as P1's live suite) has not been executed — WS-A's coverage is fixture-first by design; run it at Solana enablement time alongside the P1 ladder's re-verify-at-enablement step.
 
 ## Non-goals (P2)
 
