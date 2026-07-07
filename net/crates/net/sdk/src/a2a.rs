@@ -419,9 +419,7 @@ impl TaskRegistry {
     pub fn evict_terminal(&self, ttl_secs: u64, now: u64) -> usize {
         let mut map = self.inner.lock();
         let before = map.len();
-        map.retain(|_, e| {
-            !e.state.is_terminal() || now.saturating_sub(e.updated_at) <= ttl_secs
-        });
+        map.retain(|_, e| !e.state.is_terminal() || now.saturating_sub(e.updated_at) <= ttl_secs);
         before - map.len()
     }
 }

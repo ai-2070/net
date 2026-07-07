@@ -518,8 +518,10 @@ mod tests {
         assert_ne!(schema_hash(&a), schema_hash(&c));
         // Other arrays keep their order — position is meaningful in general
         // JSON (e.g. `prefixItems`), so no sorting outside `required`.
-        let e1 = json!({ "type": "object", "prefixItems": [{"type": "string"}, {"type": "integer"}] });
-        let e2 = json!({ "type": "object", "prefixItems": [{"type": "integer"}, {"type": "string"}] });
+        let e1 =
+            json!({ "type": "object", "prefixItems": [{"type": "string"}, {"type": "integer"}] });
+        let e2 =
+            json!({ "type": "object", "prefixItems": [{"type": "integer"}, {"type": "string"}] });
         assert_ne!(schema_hash(&e1), schema_hash(&e2));
     }
 

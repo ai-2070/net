@@ -875,8 +875,12 @@ mod tests {
             .approve_at(&req2, T0 + 1, HOUR, DEFAULT_DELEGATION_DEPTH)
             .unwrap()
             .chain;
-        op.renew(&RenewalRequest::create(&device, &chain2), HOUR, DEFAULT_DELEGATION_DEPTH)
-            .expect("re-enrolled device renews again");
+        op.renew(
+            &RenewalRequest::create(&device, &chain2),
+            HOUR,
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .expect("re-enrolled device renews again");
     }
 
     #[test]
