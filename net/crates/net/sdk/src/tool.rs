@@ -149,14 +149,14 @@ impl ToolMetadataBuilder {
     /// invocation policy, not a different kind of tool — and displaying
     /// a price never implies authorization to spend it.
     ///
-    /// **Discovery-only today.** The provider-side redeem gate
-    /// (`PaymentAdmission` / quote redemption before the handler runs)
-    /// lives only in the MCP wrap path. A native tool served via
-    /// `serve_rpc` that announces `pricing_terms` therefore *advertises* a
-    /// price but does NOT enforce payment before invocation — any direct
-    /// caller pays nothing. Use this for discovery/announcement until a
-    /// native admission gate exists; do not rely on it to gate a
-    /// natively-served handler.
+    /// **An announced price must be an enforced price.** The redeem gate
+    /// (`PaymentAdmission` — quote redemption before the handler runs)
+    /// lives in the MCP adapter's publication path, so a priced
+    /// descriptor is refused by [`Mesh::serve_tool`] /
+    /// [`Mesh::serve_tool_streaming`]
+    /// (`ServeError::UnenforceablePricing`): those paths have no gate
+    /// and would serve the "paid" tool free. Publish paid tools via
+    /// `ServerPublisher::publish_tools` with a `payment_admission` gate.
     pub fn pricing_terms(mut self, terms_json: impl Into<String>) -> Self {
         self.descriptor.pricing_terms = Some(terms_json.into());
         self
@@ -313,6 +313,13 @@ impl Mesh {
         Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
     {
         let tool_id = descriptor.tool_id.clone();
+        // An announced price must always be an enforced price. This path
+        // has no payment-admission gate, so a priced descriptor would be
+        // discovered as paid while serving free to any direct caller —
+        // refuse loudly instead (see `ToolDescriptorBuilder::pricing_terms`).
+        if descriptor.pricing_terms.is_some() {
+            return Err(ServeError::UnenforceablePricing(tool_id));
+        }
         let registry = self.inner().tool_registry().clone();
 
         // Step 1: registry insert. Done before the handler so the
@@ -394,6 +401,11 @@ impl Mesh {
         // even if the caller forgot `.streaming(true)` on the builder.
         descriptor.streaming = true;
         let tool_id = descriptor.tool_id.clone();
+        // Same refusal as `serve_tool`: no payment gate on this path, so
+        // an announced price would be unenforceable.
+        if descriptor.pricing_terms.is_some() {
+            return Err(ServeError::UnenforceablePricing(tool_id));
+        }
         let registry = self.inner().tool_registry().clone();
 
         // Step 1: registry insert (same paired-remove rollback on

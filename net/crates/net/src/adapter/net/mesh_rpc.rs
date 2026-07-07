@@ -3934,6 +3934,17 @@ pub enum ServeError {
     /// node. Drop the prior `ServeHandle` to free the slot.
     #[error("already serving service `{0}` on this node")]
     AlreadyServing(String),
+    /// The descriptor announces `pricing_terms`, but this serve path
+    /// has no payment-admission gate — an announced price this path
+    /// cannot enforce must never reach discovery (callers would see a
+    /// priced tool that serves free). Publish paid tools through the
+    /// MCP adapter's `ServerPublisher::publish_tools` with a
+    /// `payment_admission` gate.
+    #[error(
+        "tool `{0}` announces pricing_terms but this serve path cannot enforce payment — \
+         publish paid tools via ServerPublisher::publish_tools with payment_admission"
+    )]
+    UnenforceablePricing(String),
 }
 
 // ============================================================================

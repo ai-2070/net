@@ -527,3 +527,260 @@ async fn a_caller_outside_the_owner_scope_cannot_invoke_a_local_tool() {
         host.shutdown().await.ok();
     }
 }
+
+// ---------------------------------------------------------------------
+// P2 WS-C: an announced price is an enforced price on this path too
+// ---------------------------------------------------------------------
+
+const TERMS: &str = r#"{"object":"net.pricing.terms@1"}"#;
+
+/// A payment gate that admits everything and records what it redeemed.
+struct RecordingAdmission {
+    redeemed: std::sync::Mutex<Vec<(String, String, bool)>>,
+}
+
+impl RecordingAdmission {
+    fn new() -> Self {
+        Self {
+            redeemed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl net_mcp::serve::PaymentAdmission for RecordingAdmission {
+    async fn redeem(
+        &self,
+        tool_id: &str,
+        quote_id: &str,
+        binding: Option<&[u8]>,
+    ) -> Result<(), String> {
+        self.redeemed.lock().unwrap().push((
+            tool_id.to_string(),
+            quote_id.to_string(),
+            binding.is_some(),
+        ));
+        Ok(())
+    }
+}
+
+/// `call_bounded` with caller-supplied request headers (the payment quote
+/// rides as a header, exactly as the demand-side gateway attaches it).
+async fn call_with_headers(
+    caller: &Mesh,
+    target: u64,
+    service: &str,
+    body: Bytes,
+    headers: Vec<(String, Vec<u8>)>,
+) -> Result<net_sdk::mesh_rpc::RpcReply, String> {
+    let opts = CallOptions {
+        request_headers: headers,
+        ..CallOptions::default()
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        caller.call(target, service, body, opts),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(e)) => Err(format!("rpc error: {e:?}")),
+        Err(_) => Err("call timed out".to_string()),
+    }
+}
+
+/// A native tool priced through `publish_tools` is payment-gated end to
+/// end: the unpaid call is refused before the invoker runs, the paid call
+/// redeems its quote through the admission gate exactly once per invoke,
+/// and an unpriced tool in the same publication stays free. Pricing rides
+/// in `WrapConfig.pricing` here, proving the config→context fold prices
+/// identically to a caller-built context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_priced_local_tool_enforces_payment_before_the_invoker() {
+    let caller = build_mesh(&[0x57u8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x57u8; 32]).await);
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+
+    let gate = Arc::new(RecordingAdmission::new());
+    let mut config = WrapConfig::owner_only(hermes_impl(), caller.origin_hash());
+    config.pricing.insert("add".to_string(), TERMS.to_string());
+    config.payment_admission = Some(gate.clone());
+
+    let invoker = Arc::new(LocalTools::default());
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let publication = publisher
+        .publish_tools(
+            &local_tools(),
+            invoker as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
+        .await
+        .expect("a priced publication with a gate publishes");
+
+    let filter = CapabilityFilter::new().require_tag("add");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "caller discovers the priced tool",
+    );
+
+    let add_body = || Bytes::from(serde_json::to_vec(&json!({ "a": 2, "b": 3 })).unwrap());
+
+    // Unpaid: refused before the invoker (warm up the reply channel first —
+    // a fast rejection can outrace the first subscription).
+    let _ = call_bounded(&caller, b_id, "add", add_body()).await;
+    let err = call_bounded(&caller, b_id, "add", add_body())
+        .await
+        .expect_err("a paid tool must refuse an unpaid call");
+    assert!(
+        err.contains("payment quote"),
+        "the refusal names the missing quote: {err}"
+    );
+    assert!(
+        gate.redeemed.lock().unwrap().is_empty(),
+        "nothing was redeemed for an unpaid call"
+    );
+
+    // Paid: the quote header rides the call, the gate redeems, the tool runs.
+    let mut paid = Err("never called".to_string());
+    for _ in 0..5 {
+        paid = call_with_headers(
+            &caller,
+            b_id,
+            "add",
+            add_body(),
+            vec![(
+                net_mcp::serve::HDR_PAYMENT_QUOTE.to_string(),
+                b"q-native-1".to_vec(),
+            )],
+        )
+        .await;
+        if paid.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reply = paid.expect("the paid call serves");
+    let result: CallToolResult =
+        serde_json::from_slice(reply.body.as_ref()).expect("decode add result");
+    assert_eq!(result.text(), "5");
+    {
+        let redeemed = gate.redeemed.lock().unwrap();
+        assert!(!redeemed.is_empty(), "the gate redeemed the quote");
+        assert!(
+            redeemed
+                .iter()
+                .all(|r| r == &("add".to_string(), "q-native-1".to_string(), false)),
+            "every redemption was for this tool + quote: {redeemed:?}"
+        );
+    }
+
+    // The unpriced sibling in the same publication stays free.
+    let echo_reply = call_retry(&caller, b_id, "echo", || {
+        Bytes::from(serde_json::to_vec(&json!({ "message": "free" })).unwrap())
+    })
+    .await
+    .expect("the unpriced tool serves without payment");
+    let echo_result: CallToolResult =
+        serde_json::from_slice(echo_reply.body.as_ref()).expect("decode echo result");
+    assert_eq!(echo_result.text(), "free");
+
+    caller.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
+
+/// The publish-time pricing guards hold on `publish_tools` exactly as on
+/// `publish_server`: priced-without-gate refuses, a mis-keyed pricing map
+/// refuses, and two disagreeing pricing sources refuse — all before
+/// anything announces or serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_tools_pricing_guards_fail_closed() {
+    use net_mcp::wrap::WrapError;
+
+    let host = Arc::new(build_mesh(&[0x58u8; 32]).await);
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+
+    // Priced (via the lowering context) with no admission gate: refused.
+    let mut priced_ctx = ctx();
+    priced_ctx
+        .pricing
+        .insert("add".to_string(), TERMS.to_string());
+    let config = WrapConfig::owner_only(hermes_impl(), 0);
+    match publisher
+        .publish_tools(
+            &local_tools(),
+            Arc::new(LocalTools::default()) as Arc<dyn ToolInvoker>,
+            priced_ctx.clone(),
+            config,
+        )
+        .await
+    {
+        Err(WrapError::PricedWithoutPaymentGate { count }) => assert_eq!(count, 1),
+        Err(other) => panic!("expected PricedWithoutPaymentGate, got {other:?}"),
+        Ok(_) => panic!("a priced publication without a gate must be refused"),
+    }
+
+    // Mis-keyed pricing (no such tool): refused even with a gate.
+    let mut misskeyed = WrapConfig::owner_only(hermes_impl(), 0);
+    misskeyed
+        .pricing
+        .insert("nope".to_string(), TERMS.to_string());
+    misskeyed.payment_admission = Some(Arc::new(RecordingAdmission::new()));
+    match publisher
+        .publish_tools(
+            &local_tools(),
+            Arc::new(LocalTools::default()) as Arc<dyn ToolInvoker>,
+            ctx(),
+            misskeyed,
+        )
+        .await
+    {
+        Err(WrapError::PricingKeyUnmatched { keys }) => {
+            assert_eq!(keys, vec!["nope".to_string()])
+        }
+        Err(other) => panic!("expected PricingKeyUnmatched, got {other:?}"),
+        Ok(_) => panic!("a mis-keyed pricing map must be refused"),
+    }
+
+    // Two disagreeing pricing sources: refused rather than silently picking.
+    let mut conflicted = WrapConfig::owner_only(hermes_impl(), 0);
+    conflicted
+        .pricing
+        .insert("echo".to_string(), TERMS.to_string());
+    conflicted.payment_admission = Some(Arc::new(RecordingAdmission::new()));
+    match publisher
+        .publish_tools(
+            &local_tools(),
+            Arc::new(LocalTools::default()) as Arc<dyn ToolInvoker>,
+            priced_ctx,
+            conflicted,
+        )
+        .await
+    {
+        Err(WrapError::PricingSourceConflict) => {}
+        Err(other) => panic!("expected PricingSourceConflict, got {other:?}"),
+        Ok(_) => panic!("disagreeing pricing sources must be refused"),
+    }
+
+    // Nothing announced through all three refusals.
+    assert!(
+        !host
+            .find_nodes(&CapabilityFilter::new().require_tag("add"))
+            .contains(&host.inner().node_id()),
+        "a refused publish announces nothing",
+    );
+
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
