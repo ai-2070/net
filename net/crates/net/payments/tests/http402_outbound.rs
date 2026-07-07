@@ -41,10 +41,24 @@ enum ServerMode {
     Redirect,
 }
 
+/// The default demanded accepts[] entry: mock-network requirements so
+/// tests settle without a chain.
+fn mock_accepts() -> serde_json::Value {
+    serde_json::json!({
+        "scheme": "mock",
+        "network": "mock:net",
+        "amount": "2500",
+        "asset": "musd",
+        "payTo": "external-server-account",
+        "maxTimeoutSeconds": 60
+    })
+}
+
 /// A paid-resource fixture speaking the v2 header transport.
 struct PaidServer {
     url: String,
     mode: Arc<parking_lot::Mutex<ServerMode>>,
+    accepts: Arc<parking_lot::Mutex<serde_json::Value>>,
     received_payloads: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -53,8 +67,10 @@ impl PaidServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("http://{}/resource", listener.local_addr().expect("addr"));
         let mode = Arc::new(parking_lot::Mutex::new(ServerMode::PaidAccept));
+        let accepts = Arc::new(parking_lot::Mutex::new(mock_accepts()));
         let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mode_task = mode.clone();
+        let accepts_task = accepts.clone();
         let received_task = received.clone();
         tokio::spawn(async move {
             loop {
@@ -62,6 +78,7 @@ impl PaidServer {
                     return;
                 };
                 let mode = mode_task.clone();
+                let accepts = accepts_task.clone();
                 let received = received_task.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -94,20 +111,13 @@ impl PaidServer {
                             b"",
                         ),
                         (_, None) => {
-                            // Demand payment: mock-network requirements so
-                            // the test settles without a chain.
+                            // Demand payment with the configured accepts
+                            // entry (mock by default).
                             let required = serde_json::json!({
                                 "x402Version": 2,
                                 "error": "payment required",
                                 "resource": { "url": "/resource" },
-                                "accepts": [{
-                                    "scheme": "mock",
-                                    "network": "mock:net",
-                                    "amount": "2500",
-                                    "asset": "musd",
-                                    "payTo": "external-server-account",
-                                    "maxTimeoutSeconds": 60
-                                }]
+                                "accepts": [accepts.lock().clone()]
                             });
                             let header = BASE64.encode(required.to_string());
                             http_response(
@@ -147,12 +157,16 @@ impl PaidServer {
         Self {
             url,
             mode,
+            accepts,
             received_payloads: received,
         }
     }
 
     fn set_mode(&self, mode: ServerMode) {
         *self.mode.lock() = mode;
+    }
+    fn set_accepts(&self, accepts: serde_json::Value) {
+        *self.accepts.lock() = accepts;
     }
 }
 
@@ -316,5 +330,147 @@ async fn a_cross_origin_redirect_is_refused_and_nothing_is_signed() {
     assert_eq!(
         spend.spent_today("mock:net", "musd", NOW).await.unwrap(),
         AtomicAmount::from_u128(0)
+    );
+}
+
+// ---------------------------------------------------------------------
+// P2 WS-B: the door speaks exact-SVM (parity with the mesh flow)
+// ---------------------------------------------------------------------
+
+const SOLANA_NETWORK: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOLANA_RECIPIENT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+const SOLANA_FEE_PAYER: &str = "FaciLitator111111111111111111111111111111111";
+const WALLET_BLOB_B64: &str = "AAECAw==";
+
+fn solana_accepts() -> serde_json::Value {
+    serde_json::json!({
+        "scheme": "exact",
+        "network": SOLANA_NETWORK,
+        "amount": "10000",
+        "asset": SOLANA_MINT,
+        "payTo": SOLANA_RECIPIENT,
+        "maxTimeoutSeconds": 60,
+        "extra": { "feePayer": SOLANA_FEE_PAYER }
+    })
+}
+
+/// A flow wired for real-network solana spending: registry v1 (knows the
+/// SPL USDC mint), an explicitly enabled network, and a stub wallet that
+/// records the intent it was shown and returns an opaque blob.
+async fn solana_flow(
+    dir: &tempfile::TempDir,
+) -> (
+    X402HttpFlow,
+    Arc<parking_lot::Mutex<Option<net_payments::x402::schemes::exact_svm::SvmTransferIntent>>>,
+) {
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
+    let spend_path = dir.path().join("spend.json");
+    let spend_config = SpendPolicyEngine::new(&spend_path, SpendProfile::Production);
+    spend_config
+        .configure(|defaults, _| {
+            defaults.allowed_networks = vec![SOLANA_NETWORK.to_string()];
+            defaults.max_per_call = Some(AtomicAmount::from_u128(50_000));
+        })
+        .await
+        .expect("configure");
+
+    let seen_intent: Arc<
+        parking_lot::Mutex<Option<net_payments::x402::schemes::exact_svm::SvmTransferIntent>>,
+    > = Arc::new(parking_lot::Mutex::new(None));
+    let seen = seen_intent.clone();
+    let signer = Arc::new(net_payments::flow::signer::ExternalSvmSigner::new(
+        "PayerWa11et11111111111111111111111111111111",
+        move |intent| {
+            *seen.lock() = Some(intent);
+            Box::pin(async { Ok(WALLET_BLOB_B64.to_string()) })
+        },
+    ));
+
+    let flow = X402HttpFlow::new(
+        caller,
+        SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
+        registry,
+        Arc::new(TestClock),
+    )
+    .expect("flow")
+    .with_signer("solana", signer);
+    (flow, seen_intent)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solana_demand_settles_under_policy_through_the_svm_signer() {
+    let server = PaidServer::start().await;
+    server.set_accepts(solana_accepts());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (flow, seen_intent) = solana_flow(&dir).await;
+
+    let outcome = flow.fetch_paid(&server.url).await;
+    let X402HttpOutcome::Paid { status, body, .. } = outcome else {
+        panic!("expected Paid, got {outcome:?}");
+    };
+    assert_eq!(status, 200);
+    assert_eq!(body, b"the paid content");
+
+    // The wallet was shown the structured intent derived from the demand
+    // — never raw bytes, never caller-supplied fields.
+    let intent = seen_intent.lock().clone().expect("wallet saw the intent");
+    assert_eq!(intent.network, SOLANA_NETWORK);
+    assert_eq!(intent.mint, SOLANA_MINT);
+    assert_eq!(intent.pay_to, SOLANA_RECIPIENT);
+    assert_eq!(intent.amount, "10000");
+    assert_eq!(intent.fee_payer, SOLANA_FEE_PAYER);
+
+    // What crossed the wire: a valid x402 payload accepting the solana
+    // demand, carrying the wallet's opaque blob in the pinned shape.
+    {
+        let received = server.received_payloads.lock();
+        assert_eq!(received.len(), 1);
+        let payload: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(received[0].clone()).expect("server got a valid payload");
+        assert_eq!(payload.view().accepted.network, SOLANA_NETWORK);
+        assert_eq!(payload.view().payload["transaction"], WALLET_BLOB_B64);
+    }
+
+    // The spend landed on the real network's day counter.
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert_eq!(
+        spend
+            .spent_today(SOLANA_NETWORK, SOLANA_MINT, NOW)
+            .await
+            .unwrap(),
+        AtomicAmount::from_u128(10_000)
+    );
+}
+
+/// M1 parity on this path: exact-SVM is a bearer scheme — the server
+/// already holds the signed blob when it claims "rejected", so the
+/// reservation must stand (unlike the chainless mock scheme, which
+/// releases).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solana_reject_keeps_the_reservation() {
+    let server = PaidServer::start().await;
+    server.set_accepts(solana_accepts());
+    server.set_mode(ServerMode::PaidReject);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (flow, _seen) = solana_flow(&dir).await;
+
+    let outcome = flow.fetch_paid(&server.url).await;
+    let X402HttpOutcome::PaymentRejected { status, .. } = outcome else {
+        panic!("expected PaymentRejected, got {outcome:?}");
+    };
+    assert_eq!(status, 402);
+
+    // The signed blob already crossed to the server: fail-closed
+    // accounting keeps the day counter spent.
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert_eq!(
+        spend
+            .spent_today(SOLANA_NETWORK, SOLANA_MINT, NOW)
+            .await
+            .unwrap(),
+        AtomicAmount::from_u128(10_000),
+        "a bearer-scheme reject must NOT release the reservation"
     );
 }

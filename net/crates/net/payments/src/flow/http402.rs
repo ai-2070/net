@@ -138,7 +138,7 @@ impl X402HttpFlow {
         }
         let namespace = requirements.network.split(':').next().unwrap_or_default();
         requirements.scheme == "exact"
-            && namespace == "eip155"
+            && matches!(namespace, "eip155" | "solana")
             && self.signers.contains_key(namespace)
     }
 
@@ -394,7 +394,7 @@ impl X402HttpFlow {
                 "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
                 "nonce": quote.quote_id,
             })
-        } else if self.can_settle(requirements) {
+        } else if self.can_settle(requirements) && requirements.network.starts_with("eip155:") {
             let signer = self
                 .signers
                 .get("eip155")
@@ -407,6 +407,27 @@ impl X402HttpFlow {
                 .await
                 .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
+        } else if self.can_settle(requirements) && requirements.network.starts_with("solana:") {
+            // exact / solana: the wallet authors a partially-signed SPL
+            // transfer for the intent derived from the demanded
+            // requirements (same dispatch as the mesh flow). Retry
+            // honesty: the wallet may bind a fresh blockhash, so a
+            // re-fetch can produce different payload bytes — irrelevant
+            // here, since HTTP has no provider-side idempotency anyway
+            // (one `fetch_paid` call = one payment attempt, per the
+            // module doc).
+            let signer = self
+                .signers
+                .get("solana")
+                .ok_or_else(|| "no solana signer configured".to_string())?;
+            let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
+                .map_err(|e| e.to_string())?;
+            let transaction = signer
+                .sign_svm_transfer(&intent)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_svm::payload_object(&transaction)
+                .map_err(|e| e.to_string())?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}`",
