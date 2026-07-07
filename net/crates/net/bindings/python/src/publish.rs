@@ -77,6 +77,15 @@ fn py_to_result(obj: &Bound<'_, PyAny>) -> Result<CallToolResult, McpError> {
         r.is_error = is_error;
         return Ok(r);
     }
+    // Int-as-bool leniency: `(text, 1)` / `(text, 0)` is idiomatic Python and
+    // the intent is unambiguous. A bool-only extract used to reject it as a
+    // *transport* error — silently dropping both the tool's text and its
+    // is_error flag (misclassified as a bridge failure, not a tool result).
+    if let Ok((text, is_error)) = obj.extract::<(String, i64)>() {
+        let mut r = CallToolResult::text_ok(text);
+        r.is_error = is_error != 0;
+        return Ok(r);
+    }
     if let Ok(text) = obj.extract::<String>() {
         return Ok(CallToolResult::text_ok(text));
     }

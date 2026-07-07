@@ -158,6 +158,57 @@ def test_publish_tools_default_scope_denies_remote_callers():
                 pass
 
 
+def test_publish_tools_accepts_int_as_bool_result_flags():
+    """`(text, 1)` / `(text, 0)` — int-as-bool, idiomatic Python — must map to
+    the tool-level is_error flag, not be rejected as a transport error that
+    drops the tool's text."""
+    provider = net.NetMesh("127.0.0.1:0", PSK, permissive_channels=True)
+    consumer = net.NetMesh("127.0.0.1:0", PSK, permissive_channels=True)
+
+    async def handler(name, args_json):
+        if name == "ok_tool":
+            return ("all fine", 0)
+        return ("it broke: E42", 1)
+
+    handle = None
+    try:
+        _handshake(consumer, provider)
+        provider.start()
+        consumer.start()
+        handle = provider.publish_tools(
+            [("ok_tool", None, ECHO_SCHEMA), ("err_tool", None, ECHO_SCHEMA)],
+            handler,
+            allow_any_caller=True,
+        )
+        rpc = net.MeshRpc(consumer)
+
+        # (text, 0) → a successful result carrying the text.
+        result = json.loads(
+            _call_retry(rpc, provider.node_id, "ok_tool", b"{}").decode("utf-8")
+        )
+        assert result["isError"] is False
+        assert any(b.get("text") == "all fine" for b in result["content"])
+
+        # (text, 1) → a tool-level error; the text rides in the ERR_TOOL body
+        # instead of vanishing into a transport failure. Warm up the reply
+        # channel first (a fast rejection can outrace the subscription).
+        try:
+            _call_retry(rpc, provider.node_id, "err_tool", b"{}", attempts=2)
+        except Exception:  # noqa: BLE001 — expected; establishing the reply channel
+            pass
+        with pytest.raises(Exception) as exc:
+            rpc.call(provider.node_id, "err_tool", b"{}")
+        assert "E42" in str(exc.value)
+    finally:
+        if handle is not None:
+            handle.stop()
+        for m in (consumer, provider):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def test_publish_tools_reports_tools_skips_and_withdraws():
     # No network: the publish surface itself (tools / skipped / serving /
     # withdraw) is exercisable on a single node.
