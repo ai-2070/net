@@ -15,7 +15,7 @@
 | 0 — gate | ✅ pin recorded (t54 dated URL) + review tightening (Kyra) | `819f4f238`, `14eba5ee5` | — |
 | 1 — seam | ✅ `schemes/exact_xrpl.rs` + signer + both dispatch arms | `e84641717` | exact_xrpl unit rows |
 | 3 — checker | ✅ `checker/xrpl.rs` + invoice binding + TransferQuery `reference`/`to_tag` | `ed461db2c` | `tests/xrpl_checker.rs` (review row list) |
-| 2+4 — pack/registry/conformance | ✅ `t54_xrpl_mainnet()`, XRP registry entry, flow e2e | `b66122560` | `tests/exact_xrpl_scheme_flow.rs` |
+| 2+4 — pack/registry/conformance | ✅ fixture-first (**live t54 run open** — enablement-time) | `b66122560` | `tests/exact_xrpl_scheme_flow.rs` |
 
 What remains is *enablement*, not engineering: the env-gated live t54 run (rung 1a–1d shape — it also re-verifies the facilitator base path the WS-0 caveat records), plus, per deployment, `allowed_networks` + an `ExternalXrplSigner`. Mode B (RLUSD) waits on its amount-domain review. The pin is a dated URL, not a commit — the load-time `/supported` gate and the live run are the drift alarms.
 
@@ -61,6 +61,8 @@ The P2 seam inventory (`x402/schemes/mod.rs`), instantiated for xrpl — intent-
 
 **Acceptance:** the seam compiles the P2 inventory into code with zero engine/flow changes beyond the two dispatch arms; the negative tests prove partial payments and paths cannot be authored.
 
+> **Landed** (`e84641717`) as planned — the SVM intent-in/blob-out pattern instantiated directly, both dispatch arms in the same commit, unit rows for every refusal (IOU/issuer/decimal, missing `invoiceId`, reference-less `xrpl`, bad tags, non-hex blob). The only engine-adjacent surface it touched was the two `can_settle`/`author_payload` arms, exactly as the acceptance demanded.
+
 ## WS-2 — registry entries + config pack (config, not code)
 
 - [x] **CAIP conventions decided and recorded:** CAIP-2 `xrpl:0` (mainnet `network_id` 0). CAIP-19 has no registered xrpl asset namespace — pick and pin a convention for the registry ids (proposal: `xrpl:0/slip44:144` for XRP; an `iou:<issuer>/<currency>` form for RLUSD with the issuer address taken from Ripple's published RLUSD issuer at pin time — never hardcoded from memory). Goes to the same review as the amount domain.
@@ -69,6 +71,8 @@ The P2 seam inventory (`x402/schemes/mod.rs`), instantiated for xrpl — intent-
 - [x] Pack posture test rows in `packs.rs` (round-trip, registry-story agreement, tier-posture) extended to the new pack.
 
 **Acceptance:** the rung is a pack + registry entries + this document's records — any core-code requirement discovered here is a design failure that goes back to review.
+
+> **Landed** (`b66122560`), one deviation from the text above: the pack is **`t54_xrpl_mainnet()` with no `secret_ref`** — the pinned t54 docs state plug-and-play *without API keys*, so the pack ships `AuthConfig::None` (the x402.org posture), not a bearer ref; if t54's terms change, that's a pack diff, not code. Registry: XRP at `xrpl:0/slip44:144` (`x402_asset: "XRP"`, 6 decimals — drops), Mode A only; the RLUSD `iou:` convention stays with the Mode-B review. Entries landed with the fixture conformance suite (the ladder rule's precedent from the Solana rung: the env-gated live run remains an enablement step). Posture tests extended; no core code was needed — the acceptance's design-failure clause never triggered.
 
 ## WS-3 — independent XRPL checker (`checker/xrpl.rs`)
 
@@ -91,14 +95,22 @@ The third `ChainChecker`, mirroring `SvmChecker`'s deterministic-finality shape 
 
 **Acceptance:** an XRPL settlement reaches `Verified@Final` through the unchanged engine and `re_verify_with_checker`; a partial payment, a non-Payment transaction, or a stranger's payment to the same address never bills.
 
+> **Landed** (`ed461db2c`), with four build-time facts recorded:
+> 1. rippled's JSON-RPC envelope differs from Ethereum's — errors ride *inside* `result` (`result.status == "error"`, `result.error = "txnNotFound"`), so the adapter's `rpc()` returns the raw result and maps rippled codes itself;
+> 2. legacy mainnet rippled servers may omit `server_info.network_id` — tolerated **only** when the expected id is 0 (mainnet); a testnet/devnet checker requires the explicit id (fixture rows both ways);
+> 3. the invoice/tag binds thread through **generic** `TransferQuery` extensions (`reference`, `to_tag`) — the engine reads `extra.invoiceId`/`extra.destinationTag` as opaque keys and never interprets them; schemes without them thread `None`, adapters without them ignore them (no scheme knowledge entered `PaymentEngine`);
+> 4. `sha2` became a direct dependency for the `InvoiceID = SHA256(invoiceId)` method — already in the workspace tree via ed25519-dalek, named as a money-path decision in the commit. The never-included refinement resolved to the conservative default (stays `Pending`; any `ChainVerdict` vocabulary change is a trait review).
+
 ## WS-4 — conformance + adversarial rows (the rung's actual climb)
 
-- [x] Fixture-first CI: an in-process rippled-shaped RPC fixture (WS-3's) plus the facilitator conformance suite parameterized over the t54 pack — the same lifecycle rows every facilitator passes.
-- [x] Live suite (env-gated `#[ignore]`, never CI-required — the P1 rung-1 shape, 1a–1d): live `GET /supported` still offers the pinned pair → pack passes its load-time gate → a really-signed blob gets a structural answer from live `/verify` (spends nothing; a spec-vocabulary rejection is a passing answer) → the acceptance: real XRP through the unchanged engine and caller flow, settled live via t54, billed once, upgraded past receipt trust by the WS-3 checker.
+- [x] Fixture-first CI: an in-process rippled-shaped RPC fixture (WS-3's) plus the paid lifecycle through the unchanged flow/engine against an exact-XRPL facilitator stub (`tests/exact_xrpl_scheme_flow.rs`) — the pinned payload shape asserted at the boundary, billed once in drops, no-signer refusal. (The t54-pack-parameterized rows against the *live* facilitator are the deferred box below.)
+- [ ] **OPEN — enablement-time.** Live suite (env-gated `#[ignore]`, never CI-required — the P1 rung-1 shape, 1a–1d): live `GET /supported` still offers the pinned pair (this also resolves the WS-0 base-path caveat) → pack passes its load-time gate → a really-signed blob gets a structural answer from live `/verify` (spends nothing; a spec-vocabulary rejection is a passing answer) → the acceptance: real XRP through the unchanged engine and caller flow, settled live via t54, billed once, upgraded past receipt trust by the WS-3 checker. Needs a real XRPL wallet — deliberately not simulated.
 - [x] Adversarial rows, xrpl instantiation: receipt replay across quotes (`consumed_transactions`), network confusion (testnet receipt against the mainnet pack), delivered-amount mismatch **via partial payment**, wrong payer, wrong destination tag, and the M1 row (a "rejected" claim from a holder of the presigned blob keeps the spend reservation — the blob is a bearer instrument exactly like EIP-3009).
 - [x] Tick the ladder's rung-4 blanks (`xrpl seam: ____ · registry entries: ____ · t54 conformance: ____`) as each lands; this plan gets the same built-state treatment as P2's on completion.
 
 **Acceptance:** the ladder's rung-4 line reads GO with all three blanks filled; enablement remains, per the ladder, an operator decision (allowed_networks + signer + checker), never a default.
+
+> **Landed** (`b66122560` + ladder `a6e2f1bb0`) except the live box above. Adversarial-row mapping, for the record: receipt replay across quotes and network-mismatch freezing are engine-level and scheme-agnostic (proven trait-generically since P1); the xrpl-specific rows live in `tests/xrpl_checker.rs` (partial-payment mismatch, wrong payer, wrong/missing tag, invoice mismatch, `network_id` confusion) and the M1 bearer row in the flow e2e. The ladder's `t54 conformance` blank reads **fixture ✅ / live pending** — it flips to GO when the live run lands.
 
 ---
 
@@ -107,6 +119,8 @@ The third `ChainChecker`, mirroring `SvmChecker`'s deterministic-finality shape 
 1. **WS-0 gates everything** — it is mostly not engineering: an upstream spec PR (or versioned t54 docs), one money-path review (IOU amounts), one re-verify. If the pin stalls upstream, nothing else starts; that is the plan working, not the plan failing.
 2. **WS-1 and WS-3 in parallel** after the gate (independent surfaces: authoring seam vs. checker; both consume WS-0's answers).
 3. **WS-2 lands with WS-4** (the ladder rule — registry entries ride the conformance run).
+
+> **As executed:** sequential — WS-0 (gate resolved live, same day) → review tightening (Kyra, mid-flight between WS-0 and WS-1) → WS-1 → WS-3 → WS-2+4 in one motion (single implementer; the 1∥3 parallelism was a team-shaped option). The gate held exactly as designed: zero code existed before the pin.
 
 ## Non-goals
 
