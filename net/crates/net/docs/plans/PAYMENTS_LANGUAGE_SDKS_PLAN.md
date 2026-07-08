@@ -53,11 +53,16 @@ The demand-side surface every language converges on ("—" = out of scope for th
 
 The reference surface exists; the work is making it *mirrorable*.
 
-- [ ] Commit the parity matrix above as the contract, cross-referenced from `payments/src/lib.rs`'s module doc — a language surface is "done" when its column matches.
-- [ ] Extend `payment_vectors.json` with failure-schematic vectors: a valid schematic (decode + field access), an unknown-reason/extra-field tolerance case, and a malformed case (must be treated as absent) — so every language's tolerance behavior is pinned by the same fixture, not per-language tests that can drift.
-- [ ] Audit the demand-side API for FFI-hostility (trait objects, lifetimes, async) and record the marshaling story per entry point: everything crossing a boundary is either a handle, a JSON string, or bytes. No API changes expected — `CallerDecision`/`X402HttpOutcome`/`SpendDecision` already serialize.
+- [x] Commit the parity matrix above as the contract, cross-referenced from `payments/src/lib.rs`'s module doc ("Language SDK surfaces — the parity contract") — a language surface is "done" when its column matches.
+- [x] Extend `payment_vectors.json` with failure-schematic vectors: a valid schematic (decode + field access), an unknown-reason/extra-field tolerance case, and malformed cases (must be treated as absent). Landed as `failure_schematic_vectors` (generated from the real `net_sdk::tool_payment::FailureSchematic` by `gen_payments_fixtures`, so the bytes ARE what a producer emits): six cases — `valid_already_redeemed`, `unknown_reason_and_extra_fields` (reserved reason + preserved extras), `foreign_major_version_tag` (`@2` ⇒ absent), `malformed_json`, `not_an_object`, `invalid_utf8`. Each case carries `header_utf8`/`header_base64` + `accepted` + (for accepted) `expect{...}`; every language runs the same tolerant predicate — decode UTF-8 JSON, accept iff an object tagged `net.payment.failure@1` (mirrors `FailureSchematic::from_header_bytes`) — pinned in all four suites (Rust source-of-truth via the real type + byte-stable re-emission; Python/TS/Go via the predicate).
+- [x] Audit the demand-side API for FFI-hostility. No API changes needed; the marshaling story per entry point, recorded:
+  - **Handle in, JSON/bytes out.** `CapabilityGateway` (native) and `X402HttpFlow` are `Arc`-held handles behind an opaque pointer/pyclass; a language never sees a trait object or a lifetime. `search`/`describe`/`invoke` take a cap-id string + args JSON string and return a status-discriminant JSON string (`GatedOutcome` → the `ok`/`requires_payment_approval`/`denied`/… projection). `X402HttpOutcome` projects the same way; its body is bytes.
+  - **Async is hidden behind the runtime seam.** The lifecycle is `async` in Rust; each binding owns the reactor bridge (Python `spawn_blocking`/mesh-runtime spawn, Node `ThreadsafeFunction`, Go dispatcher, C blocking call). The boundary itself is synchronous JSON/bytes — no `Future` crosses it.
+  - **Signer seam is a per-scheme callback.** Typed-intent JSON in → signature string out; no raw-bytes path, key material unrepresentable (doctrine 2). Bridged via each binding's proven callback pattern.
+  - **x402 material and the schematic are opaque.** `X402Carry` base64 and `net.pricing.terms@1`/`net.payment.failure@1` cross as strings/bytes, never re-serialized through a language-native type (byte-preservation; the vectors enforce it).
+  - Nothing crossing a boundary is anything but a handle, a JSON string, or bytes — `CallerDecision`/`X402HttpOutcome`/`SpendDecision`/`GatedOutcome` all already serialize.
 
-**Acceptance:** the matrix is committed prose; the extended vectors run green in the four existing golden-vector suites.
+**Acceptance:** the matrix is committed prose (crate module doc + this plan); the extended vectors run green — Rust + Python locally, Go compiles (cdylib link is CI-only), TS is CI-run (vitest, no local `node_modules`).
 
 ## Workstream P — Python: complete the demand surface (house style: kwargs + status-JSON + Async duals)
 

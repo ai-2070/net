@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 type paymentsEnvelopeVector struct {
@@ -50,9 +51,38 @@ type paymentsPreservationVector struct {
 	EnvelopeField *string `json:"envelope_field"`
 }
 
+type paymentsFailureExpect struct {
+	Stage        string `json:"stage"`
+	Reason       string `json:"reason"`
+	Retryable    bool   `json:"retryable"`
+	FundsMoved   string `json:"funds_moved"`
+	PriorPayment string `json:"prior_payment"`
+	Recovery     struct {
+		Class         string `json:"class"`
+		Actor         string `json:"actor"`
+		SafeToRetry   bool   `json:"safe_to_retry"`
+		SafeToRequote bool   `json:"safe_to_requote"`
+	} `json:"recovery"`
+}
+
+type paymentsFailureCase struct {
+	Name            string                 `json:"name"`
+	HeaderUTF8      *string                `json:"header_utf8"`
+	HeaderBase64    *string                `json:"header_base64"`
+	Accepted        bool                   `json:"accepted"`
+	Expect          *paymentsFailureExpect `json:"expect"`
+	ExpectExtraKeys []string               `json:"expect_extra_keys"`
+}
+
+type paymentsFailureVectors struct {
+	Tag   string                `json:"tag"`
+	Cases []paymentsFailureCase `json:"cases"`
+}
+
 type paymentsFixture struct {
-	Envelopes            []paymentsEnvelopeVector     `json:"envelopes"`
-	X402BytePreservation []paymentsPreservationVector `json:"x402_byte_preservation"`
+	Envelopes               []paymentsEnvelopeVector     `json:"envelopes"`
+	X402BytePreservation    []paymentsPreservationVector `json:"x402_byte_preservation"`
+	FailureSchematicVectors paymentsFailureVectors       `json:"failure_schematic_vectors"`
 }
 
 func paymentsFixtureDir(t *testing.T) string {
@@ -277,5 +307,101 @@ func TestPaymentsCanonicalWriterRejectsFloats(t *testing.T) {
 	err := paymentsCanonicalize(map[string]interface{}{"price": json.Number("1.5")}, &out)
 	if err == nil {
 		t.Fatal("floats must be rejected by the canonical writer")
+	}
+}
+
+// paymentsTolerantParse mirrors FailureSchematic::from_header_bytes:
+// decode the header bytes as UTF-8 JSON, accept iff the value is an object
+// tagged with the schematic tag — else nil (fall back to the human error).
+func paymentsTolerantParse(raw []byte, tag string) map[string]interface{} {
+	if !utf8.Valid(raw) {
+		return nil
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	obj, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if obj["object"] != tag {
+		return nil
+	}
+	return obj
+}
+
+func TestPaymentsFailureSchematicTolerance(t *testing.T) {
+	f := loadPaymentsFixture(t)
+	block := f.FailureSchematicVectors
+	if len(block.Cases) == 0 {
+		t.Fatal("fixture has no failure-schematic cases")
+	}
+	for _, c := range block.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			var raw []byte
+			switch {
+			case c.HeaderUTF8 != nil:
+				raw = []byte(*c.HeaderUTF8)
+			case c.HeaderBase64 != nil:
+				decoded, err := base64.StdEncoding.DecodeString(*c.HeaderBase64)
+				if err != nil {
+					t.Fatalf("decode base64: %v", err)
+				}
+				raw = decoded
+			default:
+				t.Fatal("case has neither header_utf8 nor header_base64")
+			}
+
+			parsed := paymentsTolerantParse(raw, block.Tag)
+			if (parsed != nil) != c.Accepted {
+				t.Fatalf("tolerance verdict drifted: got accepted=%v want %v", parsed != nil, c.Accepted)
+			}
+			if parsed == nil {
+				return
+			}
+			if parsed["object"] != block.Tag {
+				t.Fatal("accepted schematic does not carry the tag")
+			}
+			if c.Expect != nil {
+				if parsed["stage"] != c.Expect.Stage {
+					t.Fatalf("stage: got %v want %v", parsed["stage"], c.Expect.Stage)
+				}
+				if parsed["reason"] != c.Expect.Reason {
+					t.Fatalf("reason: got %v want %v", parsed["reason"], c.Expect.Reason)
+				}
+				if parsed["retryable"] != c.Expect.Retryable {
+					t.Fatalf("retryable: got %v want %v", parsed["retryable"], c.Expect.Retryable)
+				}
+				if parsed["funds_moved"] != c.Expect.FundsMoved {
+					t.Fatalf("funds_moved: got %v want %v", parsed["funds_moved"], c.Expect.FundsMoved)
+				}
+				if parsed["prior_payment"] != c.Expect.PriorPayment {
+					t.Fatalf("prior_payment: got %v want %v", parsed["prior_payment"], c.Expect.PriorPayment)
+				}
+				rec, ok := parsed["recovery"].(map[string]interface{})
+				if !ok {
+					t.Fatal("recovery is not an object")
+				}
+				if rec["class"] != c.Expect.Recovery.Class {
+					t.Fatalf("recovery.class: got %v want %v", rec["class"], c.Expect.Recovery.Class)
+				}
+				if rec["actor"] != c.Expect.Recovery.Actor {
+					t.Fatalf("recovery.actor: got %v want %v", rec["actor"], c.Expect.Recovery.Actor)
+				}
+				if rec["safe_to_retry"] != c.Expect.Recovery.SafeToRetry {
+					t.Fatalf("recovery.safe_to_retry: got %v", rec["safe_to_retry"])
+				}
+				if rec["safe_to_requote"] != c.Expect.Recovery.SafeToRequote {
+					t.Fatalf("recovery.safe_to_requote: got %v", rec["safe_to_requote"])
+				}
+			}
+			for _, k := range c.ExpectExtraKeys {
+				if _, ok := parsed[k]; !ok {
+					t.Fatalf("extra key %q not preserved", k)
+				}
+			}
+		})
 	}
 }

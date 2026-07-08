@@ -233,6 +233,77 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Terms are unsigned — emit its canonical form directly.
     let terms_canonical = String::from_utf8(canonical_bytes(&terms)?)?;
 
+    // ---- failure schematics (SDK wire object; unsigned) -----------------
+    // The `net.payment.failure@1` header tolerance contract, pinned for
+    // every consumer language. Built from the real `FailureSchematic` so the
+    // bytes ARE what a producer emits; regeneration re-derives them, and any
+    // drift in the type's wire shape shows up as a fixture diff.
+    use net_sdk::tool_payment::{failure_vocab, FailureSchematic, Recovery, TAG_PAYMENT_FAILURE};
+
+    let valid_schematic = FailureSchematic {
+        object: TAG_PAYMENT_FAILURE.to_string(),
+        code: failure_vocab::CODE_PAYMENT.to_string(),
+        stage: failure_vocab::STAGE_REDEEM.to_string(),
+        reason: "already_redeemed".to_string(),
+        message: "quote already redeemed — one payment, one serve".to_string(),
+        retryable: false,
+        recovery: Recovery {
+            class: failure_vocab::CLASS_NEW_QUOTE_REQUIRED.to_string(),
+            actor: failure_vocab::ACTOR_CALLER_AGENT.to_string(),
+            safe_to_retry: false,
+            safe_to_requote: true,
+            next_action: Some("request_new_quote".to_string()),
+        },
+        handler_executed: false,
+        funds_moved: failure_vocab::FUNDS_YES.to_string(),
+        prior_payment: failure_vocab::PRIOR_CONSUMED.to_string(),
+        quote_id: Some("q_fixture".to_string()),
+        tool_id: Some("paid_echo".to_string()),
+        extra: BTreeMap::new(),
+    };
+
+    // A future producer: a reserved reason with no v1 emitter, plus unknown
+    // top-level fields — same `@1` tag, so consumers must accept it and
+    // preserve the extras (the additive-tolerance contract).
+    let mut unknown_schematic = FailureSchematic {
+        object: TAG_PAYMENT_FAILURE.to_string(),
+        code: failure_vocab::CODE_PAYMENT.to_string(),
+        stage: "authoring".to_string(),
+        reason: "insufficient_funds".to_string(),
+        message: "insufficient funds for this quote".to_string(),
+        retryable: true,
+        recovery: Recovery {
+            class: failure_vocab::CLASS_USER_ACTION_REQUIRED.to_string(),
+            actor: failure_vocab::ACTOR_CALLER_USER.to_string(),
+            safe_to_retry: false,
+            safe_to_requote: true,
+            next_action: Some("top_up_wallet".to_string()),
+        },
+        handler_executed: false,
+        funds_moved: failure_vocab::FUNDS_NO.to_string(),
+        prior_payment: failure_vocab::PRIOR_NONE.to_string(),
+        quote_id: None,
+        tool_id: None,
+        extra: BTreeMap::new(),
+    };
+    unknown_schematic
+        .extra
+        .insert("required_amount".to_string(), json!("100000"));
+    unknown_schematic
+        .extra
+        .insert("zz_future".to_string(), json!({"nested": [1, true, null]}));
+
+    // A future MAJOR version — same body, `@2` tag: a consumer must treat it
+    // as absent and fall back to the human error body.
+    let mut foreign_schematic = valid_schematic.clone();
+    foreign_schematic.object = "net.payment.failure@2".to_string();
+
+    let valid_header = String::from_utf8(valid_schematic.to_header_bytes().expect("valid fits"))?;
+    let unknown_header =
+        String::from_utf8(unknown_schematic.to_header_bytes().expect("unknown fits"))?;
+    let foreign_header =
+        String::from_utf8(foreign_schematic.to_header_bytes().expect("foreign fits"))?;
+
     // ---- assemble -------------------------------------------------------
     let vectors = json!({
         "description": "Golden vectors for net-payments envelope canonicalization, signing, and x402 byte-preservation. Rust is the source of truth (payments/tests/payments_golden_vectors.rs); the same file drives bindings/node/test/payments_golden_vectors.test.ts, bindings/python/tests/test_payments_golden_vectors.py, and go/payments_golden_vectors_test.go. Adding a case means updating all four verifiers in lockstep. Regenerate: cargo run -p net-payments --example gen_payments_fixtures",
@@ -303,6 +374,70 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "envelope_field": "settlement",
             },
         ],
+        "failure_schematic_vectors": {
+            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate: decode the header bytes as UTF-8 JSON and accept iff the value is an object whose `object` == the tag (mirrors FailureSchematic::from_header_bytes). An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+            "tag": TAG_PAYMENT_FAILURE,
+            "header_name": net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC,
+            "cases": [
+                {
+                    "name": "valid_already_redeemed",
+                    "header_utf8": valid_header,
+                    "accepted": true,
+                    "expect": {
+                        "stage": "redeem",
+                        "reason": "already_redeemed",
+                        "retryable": false,
+                        "funds_moved": "yes",
+                        "prior_payment": "consumed",
+                        "recovery": {
+                            "class": "new_quote_required",
+                            "actor": "caller_agent",
+                            "safe_to_retry": false,
+                            "safe_to_requote": true,
+                        },
+                    },
+                },
+                {
+                    "name": "unknown_reason_and_extra_fields",
+                    "header_utf8": unknown_header,
+                    "accepted": true,
+                    "expect": {
+                        "stage": "authoring",
+                        "reason": "insufficient_funds",
+                        "retryable": true,
+                        "funds_moved": "no",
+                        "prior_payment": "none",
+                        "recovery": {
+                            "class": "user_action_required",
+                            "actor": "caller_user",
+                            "safe_to_retry": false,
+                            "safe_to_requote": true,
+                        },
+                    },
+                    "expect_extra_keys": ["required_amount", "zz_future"],
+                },
+                {
+                    "name": "foreign_major_version_tag",
+                    "header_utf8": foreign_header,
+                    "accepted": false,
+                },
+                {
+                    "name": "malformed_json",
+                    "header_utf8": "{ not json",
+                    "accepted": false,
+                },
+                {
+                    "name": "not_an_object",
+                    "header_utf8": "123",
+                    "accepted": false,
+                },
+                {
+                    "name": "invalid_utf8",
+                    "header_base64": BASE64.encode([0xFFu8, 0xFE]),
+                    "accepted": false,
+                },
+            ],
+        },
         "caip_vectors": [
             {"input": "eip155:8453", "kind": "chain", "valid": true},
             {"input": "eip155:84532", "kind": "chain", "valid": true},

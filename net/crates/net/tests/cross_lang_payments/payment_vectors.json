@@ -260,6 +260,73 @@
       "signer_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
     }
   ],
+  "failure_schematic_vectors": {
+    "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate: decode the header bytes as UTF-8 JSON and accept iff the value is an object whose `object` == the tag (mirrors FailureSchematic::from_header_bytes). An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+    "cases": [
+      {
+        "accepted": true,
+        "expect": {
+          "funds_moved": "yes",
+          "prior_payment": "consumed",
+          "reason": "already_redeemed",
+          "recovery": {
+            "actor": "caller_agent",
+            "class": "new_quote_required",
+            "safe_to_requote": true,
+            "safe_to_retry": false
+          },
+          "retryable": false,
+          "stage": "redeem"
+        },
+        "header_utf8": "{\"object\":\"net.payment.failure@1\",\"code\":\"payment\",\"stage\":\"redeem\",\"reason\":\"already_redeemed\",\"message\":\"quote already redeemed — one payment, one serve\",\"retryable\":false,\"recovery\":{\"class\":\"new_quote_required\",\"actor\":\"caller_agent\",\"safe_to_retry\":false,\"safe_to_requote\":true,\"next_action\":\"request_new_quote\"},\"handler_executed\":false,\"funds_moved\":\"yes\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"tool_id\":\"paid_echo\"}",
+        "name": "valid_already_redeemed"
+      },
+      {
+        "accepted": true,
+        "expect": {
+          "funds_moved": "no",
+          "prior_payment": "none",
+          "reason": "insufficient_funds",
+          "recovery": {
+            "actor": "caller_user",
+            "class": "user_action_required",
+            "safe_to_requote": true,
+            "safe_to_retry": false
+          },
+          "retryable": true,
+          "stage": "authoring"
+        },
+        "expect_extra_keys": [
+          "required_amount",
+          "zz_future"
+        ],
+        "header_utf8": "{\"object\":\"net.payment.failure@1\",\"code\":\"payment\",\"stage\":\"authoring\",\"reason\":\"insufficient_funds\",\"message\":\"insufficient funds for this quote\",\"retryable\":true,\"recovery\":{\"class\":\"user_action_required\",\"actor\":\"caller_user\",\"safe_to_retry\":false,\"safe_to_requote\":true,\"next_action\":\"top_up_wallet\"},\"handler_executed\":false,\"funds_moved\":\"no\",\"prior_payment\":\"none\",\"required_amount\":\"100000\",\"zz_future\":{\"nested\":[1,true,null]}}",
+        "name": "unknown_reason_and_extra_fields"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"object\":\"net.payment.failure@2\",\"code\":\"payment\",\"stage\":\"redeem\",\"reason\":\"already_redeemed\",\"message\":\"quote already redeemed — one payment, one serve\",\"retryable\":false,\"recovery\":{\"class\":\"new_quote_required\",\"actor\":\"caller_agent\",\"safe_to_retry\":false,\"safe_to_requote\":true,\"next_action\":\"request_new_quote\"},\"handler_executed\":false,\"funds_moved\":\"yes\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"tool_id\":\"paid_echo\"}",
+        "name": "foreign_major_version_tag"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{ not json",
+        "name": "malformed_json"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "123",
+        "name": "not_an_object"
+      },
+      {
+        "accepted": false,
+        "header_base64": "//4=",
+        "name": "invalid_utf8"
+      }
+    ],
+    "header_name": "net-failure-schematic",
+    "tag": "net.payment.failure@1"
+  },
   "identities": {
     "_note": "fixed test seeds, public fixture data — never reuse outside tests",
     "caller_pub_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",

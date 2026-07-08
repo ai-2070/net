@@ -44,6 +44,65 @@ const FIXTURE = JSON.parse(
     embedded_in: string | null
     envelope_field: string | null
   }[]
+  failure_schematic_vectors: {
+    tag: string
+    header_name: string
+    cases: {
+      name: string
+      header_utf8?: string
+      header_base64?: string
+      accepted: boolean
+      expect?: {
+        stage: string
+        reason: string
+        retryable: boolean
+        funds_moved: string
+        prior_payment: string
+        recovery: {
+          class: string
+          actor: string
+          safe_to_retry: boolean
+          safe_to_requote: boolean
+        }
+      }
+      expect_extra_keys?: string[]
+    }[]
+  }
+}
+
+const FAILURE = FIXTURE.failure_schematic_vectors
+
+function failureHeaderBytes(c: (typeof FAILURE.cases)[number]): Buffer {
+  return c.header_utf8 !== undefined
+    ? Buffer.from(c.header_utf8, 'utf8')
+    : Buffer.from(c.header_base64!, 'base64')
+}
+
+// Mirror `FailureSchematic::from_header_bytes`: decode the header bytes as
+// UTF-8 JSON, accept iff the value is an object tagged with the schematic
+// tag — else `null` (fall back to the human error body).
+function tolerantParse(raw: Buffer): Record<string, unknown> | null {
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(raw)
+  } catch {
+    return null
+  }
+  let obj: unknown
+  try {
+    obj = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (
+    typeof obj === 'object' &&
+    obj !== null &&
+    !Array.isArray(obj) &&
+    (obj as Record<string, unknown>).object === FAILURE.tag
+  ) {
+    return obj as Record<string, unknown>
+  }
+  return null
 }
 
 // The payments canonical writer, per the regime pinned by the fixture.
@@ -134,4 +193,28 @@ describe('payments golden vectors', () => {
   it('floats are rejected by the canonical writer', () => {
     expect(() => canonicalize({ price: 1.5 })).toThrow()
   })
+
+  for (const c of FAILURE.cases) {
+    it(`${c.name}: failure-schematic tolerance verdict + field access`, () => {
+      const parsed = tolerantParse(failureHeaderBytes(c))
+      expect(parsed !== null).toBe(c.accepted)
+      if (parsed === null) return
+      expect(parsed.object).toBe(FAILURE.tag)
+      if (c.expect) {
+        expect(parsed.stage).toBe(c.expect.stage)
+        expect(parsed.reason).toBe(c.expect.reason)
+        expect(parsed.retryable).toBe(c.expect.retryable)
+        expect(parsed.funds_moved).toBe(c.expect.funds_moved)
+        expect(parsed.prior_payment).toBe(c.expect.prior_payment)
+        const rec = parsed.recovery as Record<string, unknown>
+        expect(rec.class).toBe(c.expect.recovery.class)
+        expect(rec.actor).toBe(c.expect.recovery.actor)
+        expect(rec.safe_to_retry).toBe(c.expect.recovery.safe_to_retry)
+        expect(rec.safe_to_requote).toBe(c.expect.recovery.safe_to_requote)
+      }
+      for (const k of c.expect_extra_keys ?? []) {
+        expect(Object.prototype.hasOwnProperty.call(parsed, k)).toBe(true)
+      }
+    })
+  }
 })
