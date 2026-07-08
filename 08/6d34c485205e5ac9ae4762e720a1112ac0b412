@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md
+  s_2ce1bbf7d954a5::t_344fe16df2f9f5 1-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "086d34c485205e5ac9ae4762e720a1112ac0b412",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
