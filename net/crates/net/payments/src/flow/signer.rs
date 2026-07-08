@@ -70,6 +70,31 @@ pub trait SchemeSigner: Send + Sync {
             "this signer does not author solana transactions",
         ))
     }
+
+    /// Author a **presigned** XRPL `Payment` for a typed intent
+    /// (exact-XRPL: direct full-amount Payment, invoice binding via
+    /// `MemoData`/`InvoiceID`, account `Sequence` and
+    /// `LastLedgerSequence` owned by the wallet). Returns the
+    /// hex-serialized signed transaction blob. The intent is the whole
+    /// document — same doctrine as typed data: a policy-bearing wallet
+    /// inspects the amount, recipient, and invoice it is authorizing;
+    /// there is no raw-bytes path. Retry honesty: a same-quote retry
+    /// must re-present the identical blob (never re-sign with a fresh
+    /// sequence); an expired `LastLedgerSequence` means a fresh quote,
+    /// never a fresh signature on the same quote.
+    ///
+    /// Defaulted to a structured refusal: a signer registered under
+    /// the wrong namespace fails closed instead of authoring something
+    /// it does not understand.
+    async fn sign_xrpl_payment(
+        &self,
+        intent: &crate::x402::schemes::exact_xrpl::XrplPaymentIntent,
+    ) -> Result<String, SignerError> {
+        let _ = intent;
+        Err(SignerError::new(
+            "this signer does not author xrpl transactions",
+        ))
+    }
 }
 
 type SignFuture = Pin<Box<dyn Future<Output = Result<String, SignerError>> + Send>>;
@@ -150,6 +175,55 @@ impl SchemeSigner for ExternalSvmSigner {
     async fn sign_svm_transfer(
         &self,
         intent: &crate::x402::schemes::exact_svm::SvmTransferIntent,
+    ) -> Result<String, SignerError> {
+        (self.sign)(intent.clone()).await
+    }
+}
+
+/// The externally-held XRPL wallet: the host's callback receives the
+/// structured [`XrplPaymentIntent`](crate::x402::schemes::exact_xrpl::XrplPaymentIntent)
+/// and returns the hex presigned Payment blob. The wallet owns the key,
+/// the XRPL canonical-serialization machinery, and the `Sequence` /
+/// `LastLedgerSequence` bookkeeping — none of which enter Net.
+/// Registered under the `xrpl` namespace; its EVM method is a
+/// structured refusal by construction.
+pub struct ExternalXrplSigner {
+    address: String,
+    sign: Box<
+        dyn Fn(crate::x402::schemes::exact_xrpl::XrplPaymentIntent) -> SignFuture + Send + Sync,
+    >,
+}
+
+impl ExternalXrplSigner {
+    pub fn new(
+        address: impl Into<String>,
+        sign: impl Fn(crate::x402::schemes::exact_xrpl::XrplPaymentIntent) -> SignFuture
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            sign: Box::new(sign),
+        }
+    }
+}
+
+#[async_trait]
+impl SchemeSigner for ExternalXrplSigner {
+    fn address(&self) -> String {
+        self.address.clone()
+    }
+
+    async fn sign_typed_data(&self, _typed_data: &Value) -> Result<String, SignerError> {
+        Err(SignerError::new(
+            "this signer authors xrpl transactions, not EIP-712 documents",
+        ))
+    }
+
+    async fn sign_xrpl_payment(
+        &self,
+        intent: &crate::x402::schemes::exact_xrpl::XrplPaymentIntent,
     ) -> Result<String, SignerError> {
         (self.sign)(intent.clone()).await
     }

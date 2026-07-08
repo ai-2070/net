@@ -103,6 +103,15 @@ pub enum WrapError {
         /// The pricing keys that matched no discovered tool.
         keys: Vec<String>,
     },
+    /// `publish_tools` got two disagreeing pricing maps — the lowering
+    /// context's (which feeds the lowering) and the config's. One source
+    /// of truth, or none; silently picking either would price tools the
+    /// operator didn't intend.
+    #[error(
+        "pricing maps disagree between LoweringContext.pricing and WrapConfig.pricing — \
+         supply one source of truth (or identical maps)"
+    )]
+    PricingSourceConflict,
     /// A publish/refresh step failed AND the rollback re-announce that would
     /// restore a consistent mesh state also failed — the node may be left
     /// advertising tools with no live handler. Both errors are surfaced so the
@@ -605,7 +614,43 @@ impl ServerPublisher {
         ctx: LoweringContext,
         config: WrapConfig,
     ) -> Result<LocalPublicationHandle, WrapError> {
+        // Pricing on this path lives in `ctx.pricing` (it feeds the
+        // lowering); `config.pricing` is `publish_server`'s surface. Accept
+        // either — fold a config-only map into the context so both surfaces
+        // price uniformly — but refuse a disagreement rather than silently
+        // picking one.
+        let mut ctx = ctx;
+        if !config.pricing.is_empty() {
+            if ctx.pricing.is_empty() {
+                ctx.pricing = config.pricing.clone();
+            } else if ctx.pricing != config.pricing {
+                return Err(WrapError::PricingSourceConflict);
+            }
+        }
+        // The same publish-time payment guards as `publish_server`: a priced
+        // tool with no admission gate must never serve (it would look priced
+        // and serve free), and every pricing key must match a published tool.
+        if !ctx.pricing.is_empty() && config.payment_admission.is_none() {
+            return Err(WrapError::PricedWithoutPaymentGate {
+                count: ctx.pricing.len(),
+            });
+        }
+
         let (lowered, skipped) = lower_local_tools(tools, &ctx);
+
+        if !ctx.pricing.is_empty() {
+            let priced: std::collections::BTreeSet<&str> =
+                lowered.iter().map(|lt| lt.mcp_name.as_str()).collect();
+            let unmatched: Vec<String> = ctx
+                .pricing
+                .keys()
+                .filter(|k| !priced.contains(k.as_str()))
+                .cloned()
+                .collect();
+            if !unmatched.is_empty() {
+                return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
+            }
+        }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -633,7 +678,9 @@ impl ServerPublisher {
             return Err(rollback_result(e, self.shared.sync_mesh(&self.mesh).await));
         }
 
-        // Serve one handler per tool, all backed by the shared invoker.
+        // Serve one handler per tool, all backed by the shared invoker. A
+        // priced tool carries the payment gate — an announced price is an
+        // enforced price on this path exactly as on `publish_server`.
         let mut handles: HashMap<String, ServeHandle> = HashMap::with_capacity(lowered.len());
         for lt in &lowered {
             let tool_id = lt.descriptor.tool_id.clone();
@@ -644,7 +691,11 @@ impl ServerPublisher {
             )
             .with_service(tool_id.clone())
             .with_delegation(config.delegation.clone())
-            .with_policy(config.policy.clone());
+            .with_policy(config.policy.clone())
+            .with_payment(
+                lt.descriptor.pricing_terms.is_some(),
+                config.payment_admission.clone(),
+            );
             match self.mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                 Ok(handle) => {
                     handles.insert(tool_id, handle);
@@ -674,6 +725,7 @@ impl ServerPublisher {
             scope: config.scope,
             delegation: config.delegation,
             policy: config.policy,
+            payment_admission: config.payment_admission,
             tools: served,
             skipped,
             registration: Registration {
@@ -933,6 +985,12 @@ pub struct LocalPublicationHandle {
     /// Invoke-path policy reused when serving tools that appear on refresh, so
     /// a refreshed tool enforces the same policy as the initial publish.
     policy: Option<Arc<dyn InvokePolicy>>,
+    /// Payment-admission gate reused when serving priced tools that appear on
+    /// refresh, so a re-announced priced tool stays payment-gated — an
+    /// announced price is an enforced price on refresh too, exactly as on the
+    /// initial publish and on [`PublicationHandle::refresh`]. Without this a
+    /// re-appearing priced tool would be discovered as paid while serving free.
+    payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// Tool names skipped because they have no usable id (an empty name).
@@ -999,7 +1057,14 @@ impl LocalPublicationHandle {
                 )
                 .with_service(tool_id.clone())
                 .with_delegation(self.delegation.clone())
-                .with_policy(self.policy.clone());
+                .with_policy(self.policy.clone())
+                // A re-appearing priced tool re-announces its price, so it must
+                // re-enforce it — mirror the initial publish and
+                // `PublicationHandle::refresh`, never serve an announced price free.
+                .with_payment(
+                    lt.descriptor.pricing_terms.is_some(),
+                    self.payment_admission.clone(),
+                );
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);

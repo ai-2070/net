@@ -63,10 +63,17 @@ pub fn transfer_intent(requirements: &PaymentRequirements) -> Result<SvmTransfer
             requirements.scheme
         )));
     }
-    let namespace = requirements.network.split(':').next().unwrap_or_default();
-    if namespace != "solana" {
+    // CAIP-2 shape, validated here too — this builder is callable
+    // outside the carry path (which re-validates), and a reference-less
+    // `solana` is not a network anyone can settle on.
+    let reference = requirements
+        .network
+        .strip_prefix("solana:")
+        .unwrap_or_default();
+    if reference.is_empty() {
         return Err(X402Error::Invalid(format!(
-            "exact-SVM authoring needs a solana network, got `{}`",
+            "exact-SVM authoring needs a CAIP-2 solana network (`solana:<reference>`), \
+             got `{}`",
             requirements.network
         )));
     }
@@ -193,6 +200,14 @@ mod tests {
         let mut upto = requirements(Some(json!({ "feePayer": "F1" })));
         upto.scheme = "upto".into();
         assert!(transfer_intent(&upto).is_err());
+
+        // A reference-less `solana` is not a CAIP-2 network: refused even
+        // though the namespace prefix looks right.
+        for bad in ["solana", "solana:"] {
+            let mut no_ref = requirements(Some(json!({ "feePayer": "F1" })));
+            no_ref.network = bad.into();
+            assert!(transfer_intent(&no_ref).is_err(), "`{bad}` must be refused");
+        }
     }
 
     #[test]

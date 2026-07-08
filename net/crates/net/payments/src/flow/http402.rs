@@ -138,7 +138,7 @@ impl X402HttpFlow {
         }
         let namespace = requirements.network.split(':').next().unwrap_or_default();
         requirements.scheme == "exact"
-            && namespace == "eip155"
+            && (namespace == "eip155" || super::OPAQUE_BLOB_NAMESPACES.contains(&namespace))
             && self.signers.contains_key(namespace)
     }
 
@@ -394,7 +394,7 @@ impl X402HttpFlow {
                 "mock_authorization": hex::encode(self.caller.entity_id().as_bytes()),
                 "nonce": quote.quote_id,
             })
-        } else if self.can_settle(requirements) {
+        } else if self.can_settle(requirements) && requirements.network.starts_with("eip155:") {
             let signer = self
                 .signers
                 .get("eip155")
@@ -407,6 +407,24 @@ impl X402HttpFlow {
                 .await
                 .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
+        } else if self.can_settle(requirements)
+            && super::OPAQUE_BLOB_NAMESPACES
+                .contains(&requirements.network.split(':').next().unwrap_or_default())
+        {
+            // exact / solana | xrpl: the wallet authors the opaque blob
+            // from the demanded requirements, via the shared
+            // `author_opaque_blob_payload` (identical dispatch to the mesh
+            // flow — the two paths cannot drift). Retry honesty on this
+            // path: HTTP has no provider-side idempotency (one `fetch_paid`
+            // = one attempt), so a re-fetch that re-signs (fresh SPL
+            // blockhash / a re-quoted XRPL blob after an expired
+            // LastLedgerSequence) is simply the next attempt.
+            let namespace = requirements.network.split(':').next().unwrap_or_default();
+            let signer = self
+                .signers
+                .get(namespace)
+                .ok_or_else(|| format!("no {namespace} signer configured"))?;
+            super::author_opaque_blob_payload(namespace, requirements, signer).await?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}`",

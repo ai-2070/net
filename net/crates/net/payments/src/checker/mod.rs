@@ -18,6 +18,12 @@ use crate::core::verification::{VerificationTier, VerifierRef};
 
 #[cfg(feature = "http-facilitator")]
 pub mod eip155;
+#[cfg(feature = "http-facilitator")]
+pub mod svm;
+#[cfg(feature = "http-facilitator")]
+mod transport;
+#[cfg(feature = "http-facilitator")]
+pub mod xrpl;
 
 /// Checker failure (RPC unreachable, malformed answer). Retryability is
 /// the checker's honest claim; policy decides whether to use it.
@@ -60,6 +66,21 @@ pub struct TransferQuery {
     /// different customer's payment. `None` leaves delivery bound only to
     /// (token, recipient) — for schemes/paths with no on-chain payer.
     pub from: Option<String>,
+    /// The scheme's per-quote settlement reference, when the scheme has
+    /// one (exact-XRPL's `invoiceId`, carried on-ledger as
+    /// `MemoData`/`InvoiceID`). When set, an adapter that understands it
+    /// counts delivery only from a transaction bound to it — the
+    /// strongest per-quote bind available; adapters for schemes without
+    /// a reference ignore it.
+    pub reference: Option<String>,
+    /// The recipient sub-account tag, when the chain has one (XRPL
+    /// `DestinationTag` for shared-address merchants). When set, the
+    /// matched transaction must carry exactly this tag; when `None`, a
+    /// tag-aware adapter requires the transaction to carry *no* tag — a
+    /// quote that authorized no sub-account must not be satisfied by a
+    /// payment routed to one (M3). Adapters for chains without tags ignore
+    /// it.
+    pub to_tag: Option<u32>,
 }
 
 /// The chain's answer, in protocol vocabulary.

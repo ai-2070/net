@@ -735,3 +735,65 @@ async fn watch_tools_emits_added_when_remote_host_registers_tool() {
 // proves the substrate-level type is still reachable.
 #[allow(dead_code)]
 fn _proves_capabilityset_reexport(_: &CapabilitySet) {}
+
+/// P2 WS-C: an announced price must be an enforced price. The raw
+/// `serve_tool` / `serve_tool_streaming` paths have no payment-admission
+/// gate, so a descriptor carrying `pricing_terms` is refused before any
+/// registration — it would otherwise be discovered as paid while serving
+/// free. (Paid tools publish via `ServerPublisher::publish_tools` with a
+/// `payment_admission` gate.)
+#[tokio::test]
+async fn a_priced_descriptor_is_refused_on_the_ungated_serve_path() {
+    use net_sdk::mesh_rpc::ServeError;
+
+    let mesh = MeshBuilder::new("127.0.0.1:0", &[0x59u8; 32])
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let priced = metadata_for::<WebSearchReq, WebSearchResp>("paid_search")
+        .description("A tool that costs money.")
+        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
+        .build();
+    let err = match mesh
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(priced, |_req| async move {
+            Ok(WebSearchResp { results: vec![] })
+        }) {
+        Ok(_) => panic!("a priced descriptor must be refused on the ungated path"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, ServeError::UnenforceablePricing(id) if id == "paid_search"),
+        "{err}"
+    );
+
+    // The streaming path refuses identically.
+    let priced = metadata_for::<WebSearchReq, WebSearchResp>("paid_search")
+        .description("A tool that costs money.")
+        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
+        .build();
+    let err = match mesh.serve_tool_streaming::<WebSearchReq, _, _, _>(priced, |_req| async move {
+        futures::stream::empty::<ToolEvent>()
+    }) {
+        Ok(_) => panic!("streaming must refuse a priced descriptor too"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, ServeError::UnenforceablePricing(id) if id == "paid_search"),
+        "{err}"
+    );
+
+    // The refusal left no phantom registration: the same id serves fine
+    // once unpriced.
+    let unpriced = metadata_for::<WebSearchReq, WebSearchResp>("paid_search")
+        .description("Free after all.")
+        .build();
+    let _handle = mesh
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(unpriced, |_req| async move {
+            Ok(WebSearchResp { results: vec![] })
+        })
+        .expect("the unpriced descriptor serves");
+
+    mesh.shutdown().await.ok();
+}

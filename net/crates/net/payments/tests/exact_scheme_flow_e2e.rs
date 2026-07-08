@@ -336,3 +336,88 @@ async fn a_bearer_scheme_reject_keeps_the_reservation() {
         "a bearer-scheme reject must NOT release the reservation"
     );
 }
+
+/// P2 WS-D pinned contract: an accepts[] entry with an unknown scheme
+/// fails closed at selection — even on an enabled network with a
+/// configured signer. `exact` is the only scheme with a pinned spec;
+/// anything else (e.g. `upto`) stays refused until its entry criteria
+/// hold (pinned spec + facilitator kind + the amount-policy review — see
+/// `x402::schemes` module docs).
+#[tokio::test]
+async fn an_unknown_scheme_accepts_entry_fails_closed_at_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock: Arc<dyn Clock> = Arc::new(TestClock);
+
+    let provider_keys = Arc::new(EntityKeypair::generate());
+    let registry: AssetRegistry = default_registry_v1(provider_keys.entity_id().clone());
+    let spend_path = dir.path().join("spend.json");
+    let spend_config = SpendPolicyEngine::new(&spend_path, SpendProfile::Production);
+    spend_config
+        .configure(|defaults, _| {
+            defaults.allowed_networks = vec!["eip155:84532".to_string()];
+            defaults.max_per_call = Some(AtomicAmount::from_u128(50_000));
+        })
+        .await
+        .expect("configure");
+    let signer = Arc::new(DevLocalSigner::from_secret([21u8; 32]).expect("signer"));
+
+    let engine = Arc::new(
+        PaymentEngine::new(
+            provider_keys.clone(),
+            Arc::new(RejectingExactFacilitator),
+            Arc::new(AdmitAll),
+            registry.clone(),
+            dir.path().join("engine.json"),
+        )
+        .expect("engine"),
+    );
+
+    // Same network, same asset, same signer as the passing exact test —
+    // only the scheme differs.
+    let template = X402Carry::author(&PaymentRequirements {
+        scheme: "upto".into(),
+        network: "eip155:84532".into(),
+        amount: "10000".into(),
+        asset: TESTNET_USDC.into(),
+        pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".into(),
+        max_timeout_seconds: 60,
+        extra: Some(serde_json::json!({ "name": "USDC", "version": "2" })),
+    })
+    .expect("template");
+    let terms = PricingTerms::new(
+        provider_keys.entity_id().clone(),
+        CAPABILITY,
+        vec![template],
+        registry.reference().expect("ref"),
+    );
+    let terms_json =
+        String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+
+    let flow = CallerPaymentFlow::new(
+        Arc::new(EntityKeypair::generate()),
+        SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
+        registry,
+        Arc::new(InProcessProvider::new(engine, clock.clone())),
+        clock,
+    )
+    .with_signer("eip155", signer);
+
+    let decision = flow.run(CAPABILITY, &terms_json).await;
+    let CallerDecision::Denied { policy_reason } = decision else {
+        panic!("an unknown scheme must be refused at selection, got {decision:?}");
+    };
+    assert!(
+        policy_reason.contains("no settleable"),
+        "the refusal is the structured no-settleable-entry denial: {policy_reason}"
+    );
+
+    // Nothing was signed, sent, or reserved.
+    let spend = SpendPolicyEngine::new(&spend_path, SpendProfile::Production);
+    assert_eq!(
+        spend
+            .spent_today("eip155:84532", TESTNET_USDC, NOW)
+            .await
+            .unwrap(),
+        AtomicAmount::from_u128(0)
+    );
+}
