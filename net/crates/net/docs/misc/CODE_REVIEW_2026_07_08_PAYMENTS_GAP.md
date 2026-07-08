@@ -61,6 +61,8 @@ This path has no test — only `PublicationHandle::refresh` (wrapped-server) has
 
 **Fix:** store `payment_admission` on `LocalPublicationHandle` and add `.with_payment(lt.descriptor.pricing_terms.is_some(), self.payment_admission.clone())` to the refresh handler build, mirroring `PublicationHandle::refresh:891-894`. Add a regression that priced-tool refresh keeps enforcing.
 
+> **Fixed** (`4df531633`): `LocalPublicationHandle` now carries a `payment_admission` field (populated from `config.payment_admission` at construction), and `refresh` rebuilds the handler with `.with_payment(...)` exactly as the wrapped-server twin. Regression `a_refreshed_priced_local_tool_still_enforces_payment` drives a withdraw/re-add refresh cycle and asserts the unpaid call is refused before the invoker and the paid call redeems through the gate.
+
 ### H2 — SVM independent checker's payer bind fails **open** when the facilitator names no payer  `[CONFIRMED]`
 **Location:** `net/crates/net/payments/src/engine/mod.rs:1108-1120` (`payer_from`); `net/crates/net/payments/src/checker/svm.rs:344-346` (the zeroing guard).
 
@@ -80,6 +82,8 @@ With `q.from == None` the guard is skipped and delivery counts for **any** trans
 
 **Fix:** when the scheme has no on-chain payer **and** no settle-time payer, fail closed — do not grant delivery credit to arbitrary transfers (e.g. refuse to promote above `observed`, or treat a `None` payer for an opaque-blob scheme as an unverifiable bind). The current comment ("weaker bind … pins substitution to the originally-named payer") does not cover the case where no payer is named at all.
 
+> **Fixed** (`535a890e3`): the SVM checker returns a terminal `CheckerError` ("delivery cannot be bound to a payer") when a delivery query names no payer — the engine maps that to a fail-closed `FacilitatorFailure{Protocol}` (quote not frozen, recoverable if the facilitator later reports the payer). Tier-only checks (no query) are unaffected. Regression `delivery_without_a_payer_is_refused`; the extraction tests now bind the payer, the production query shape. The fix is scoped to `SvmChecker`, which is the real-money checker with no reference backstop — the mock/`ScriptedChecker` engine tests (which legitimately verify by delivered-amount alone) are untouched.
+
 ---
 
 ## MEDIUM
@@ -98,6 +102,8 @@ A crafted single transaction (payer sends X to an attacker + a stranger sends X 
 
 **Fix:** acknowledge the transaction-level bind's true strength in the doc, or (stronger) parse the SPL transfer instructions and bind payer→merchant→amount as one movement, matching eip155's per-transfer discipline.
 
+> **Documented** (`acd8a89cc`): on closer analysis the crafted-transaction case is **not a live exploit** — it needs the *authorized payer itself* to co-sign an atomic transaction that pays a third party while a stranger pays the merchant, so the only party defrauded is the attacker's own accomplice. The balance-delta model is deliberately CPI-robust, and a per-transfer instruction parse would risk *false-rejecting* legitimate CPI payments (a worse money-path failure) — so the fix is to state the bind's true transaction-level scope in the module doc and record per-transfer attribution as a deferred hardening. H2's guard (a payer is now *required*) closes the reachable half; the zeroing guard is simplified accordingly. No behavior change.
+
 ### M2 — XRPL checker assumes rippled api_version 1; a Clio / api_version-2 endpoint invalidates every settlement  `[VERIFY]`
 **Location:** `net/crates/net/payments/src/checker/xrpl.rs:262-263` (request, no `api_version`), `:309-334` (top-level field reads).
 
@@ -106,6 +112,8 @@ The `tx` request pins no `api_version`, and the checker reads `tx["TransactionTy
 The shipped default endpoint (`xrplcluster.com`, api_version 1) keeps CI green and fails **closed**, so this is availability/robustness, not a money-loss — but the pack comment explicitly invites operators to supply their own `rpc_endpoints` value, and the failure is silent and hard to debug (every settlement invalidates).
 
 **Fix:** request an explicit `"api_version": 1` on the `tx` call, or normalize `tx_json` at the checker boundary and fixture-test both shapes.
+
+> **Fixed** (`34140dec5`): the `tx` request now pins `"api_version": 1` (stable shape across endpoints), and a `tx_fields()` helper resolves the transaction-fields object from `tx_json` when present, so a server that returns the v2 shape anyway still verifies. `meta`/`validated` stay `result`-level in both versions. Regression `tx_json_v2_shape_is_read_correctly` drives the v2 envelope through the full bind plus a wrong-payer rejection.
 
 ### M3 — XRPL no-tag quote accepts any `DestinationTag`; engine silently drops a malformed tag  `[PLAUSIBLE]`
 **Location:** `net/crates/net/payments/src/checker/xrpl.rs:315-318`; `net/crates/net/payments/src/engine/mod.rs:1135-1141`.
@@ -118,6 +126,8 @@ Consistent with the documented spec (tag-absence is not required when the quote 
 
 **Fix:** reject a matched payment that carries a `DestinationTag` the quote did not authorize; align the engine's tag read with `optional_tag`'s hard-refuse so a malformed tag is an error, not a silently-unbound `None`.
 
+> **Fixed** (`2923e6db6`): the checker's `to_tag == None` arm now requires tag *absence* (`f["DestinationTag"].is_null()`) — an untagged quote matches only an untagged payment. The engine's `destinationTag` read hard-refuses a present-but-non-u32 tag (an `EngineError`) instead of dropping it to `None`, matching `exact_xrpl::optional_tag`. The `TransferQuery::to_tag` doc records the new semantics. Regression `an_untagged_quote_rejects_a_tagged_payment`; the invoice-binding rows now authorize the fixture's tag so they isolate the invoice bind.
+
 ---
 
 ## LOW
@@ -127,12 +137,16 @@ Consistent with the documented spec (tag-absence is not required when the quote 
 
 `delivered` is `Σ` per-account **positive** deltas (`saturating_sub` floors each account's negative delta to 0), so a second merchant-owned account of the same mint that *decreases* in the same tx is ignored. `delivered` can equal `required` while the merchant's net receipt is short. Narrow — debiting the merchant's own account requires the merchant's authority — but a net `Σ(post − pre)` over `owner == to` rows would be exact.
 
+> **Fixed** (`235adee7d`): `delivered` is now the signed `Σ(post − pre)` over the merchant's accounts, clamped at zero — the honest net receipt. SPL amounts are u64 so the signed sum stays in `i128`. Regression `delivered_nets_a_same_owner_debit`.
+
 ### L2 — SVM `fold_balances` parses every balance entry; an unrelated malformed entry blocks verification  `[PLAUSIBLE]`
 **Location:** `net/crates/net/payments/src/checker/svm.rs` `fold_balances` (`parse_amount` on every pre/post entry).
 
 `fold_balances` calls `parse_amount` on **every** token-balance entry, including accounts for mints unrelated to `query.token`. A missing/non-string `uiTokenAmount.amount` on any unrelated token account in the tx returns a terminal `CheckerError` and stalls an otherwise-valid settlement. eip155 only parses `log.data` for logs already matched to the queried token (`checker/eip155.rs:293`), so unrelated logs never poison it. Low-probability under honest RPC (Solana always returns string amounts) but a real brittleness divergence.
 
 **Fix:** parse the amount lazily, only for rows whose `(mint, owner)` participates in the delivered/payer computation.
+
+> **Fixed** (`a01fb7142`): `fold_balances` now filters each entry by `(mint == token, owner ∈ {merchant, payer})` before parsing, so only accounts that can participate are read; a malformed amount on a *relevant* account still errors. Regression `an_unrelated_token_account_does_not_poison_the_check`.
 
 ---
 
@@ -143,20 +157,28 @@ Consistent with the documented spec (tag-absence is not required when the quote 
 
 The `get signer → transfer/payment_intent → sign → payload_object` arms are duplicated between the two flows, kept identical only by the `x402/schemes/mod.rs` doc's "do not let them drift." That makes money-path symmetry a matter of human discipline: every new scheme edits two dispatch sites that must stay byte-identical, and a silent divergence is a per-transport money bug. A single `author_for(namespace, requirements, signer) -> Value` helper consumed by both would make symmetry structural.
 
+> **Fixed** (`e44058076`): extracted `author_opaque_blob_payload(namespace, requirements, signer)` + the `OPAQUE_BLOB_NAMESPACES` list into `flow/mod.rs`; both flows dispatch solana|xrpl through it. The retry-honesty difference between the paths is consequence-only (quote idempotency vs one-shot) and stays documented at each call site.
+
 ### C2 — bounded-body RPC transport copy-pasted across the three checkers
 **Location:** `net/crates/net/payments/src/checker/{eip155,svm,xrpl}.rs`.
 
 The transport (POST + `MAX_RPC_BODY` chunk loop + status→retryable/terminal mapping + TLS client build + one-shot chain-id/genesis `AtomicBool` guard) is now the third near-verbatim copy. The 16 MB cap and error-class mapping are the security-sensitive hardening; a tightening (smaller cap, a new retryable status class) must land identically in three files, and a miss in one leaves that chain's checker exploitable while the others are safe. The enablement plan itself flagged this ("the checker boilerplate, third copy"). A shared rpc-transport helper (endpoint + an envelope-shape closure) collapses all three.
+
+> **Fixed** (`8ec0befd6`): extracted `RpcTransport` (`checker/transport.rs`) — the TLS client build, the `MAX_RPC_BODY` streaming cap, and the transport/status → retryable/terminal classification live once. Each checker holds an `RpcTransport` and still extracts result/error per its chain's envelope convention (eip155/svm: top-level `error`; rippled: inside `result`). The `AtomicBool` chain-id/genesis guards stay per-checker (chain-specific).
 
 ### C3 — `author_payload` re-derives the namespace per arm
 **Location:** `net/crates/net/payments/src/flow/mod.rs` and `flow/http402.rs`, each `else if self.can_settle(..) && network.starts_with("<ns>:")`.
 
 The set of settleable namespaces now lives in two places — the `matches!(namespace, ...)` inside `can_settle` and the chain of `starts_with` arms. Adding a namespace to one and forgetting the other yields `can_settle == true` that falls through to the fail-closed "no payload author" error. Split the namespace once (`network.split(':').next()`) and `match` it.
 
+> **Fixed** (`7432fa55a`): both `can_settle` predicates now read the opaque set from `OPAQUE_BLOB_NAMESPACES` (plus the lone special-cased `eip155`), so the opaque list has one home shared with `author_opaque_blob_payload`; the authoring arms derive the namespace once via `split(':')`.
+
 ### C4 — hand-rolled `RpcFixture` HTTP server triplicated across the checker test files
 **Location:** `net/crates/net/payments/tests/{eip155,svm,xrpl}_checker.rs`.
 
 The bespoke HTTP/1.1 server (accept loop, header scan, content-length parse, bounded body read, JSON write — ~55 lines) is triplicated near-verbatim; only the per-method dispatch differs. A parsing bug hides identically in each, and every new checker test file pays the copy. A shared test helper taking a `method → Value` responder closure removes it.
+
+> **Fixed** (`ce1a07938`): extracted `HttpJsonServer` into `tests/rpc_fixture/mod.rs` (not a test target); each suite's `RpcFixture` keeps its scripted state + setters and passes a small `Fn(request) -> response-json` responder (jsonrpc+id envelope for eip155/svm, result-only for rippled).
 
 ---
 
