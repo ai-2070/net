@@ -1,0 +1,36 @@
+net/crates/net/payments/src/checker/mod.rs
+  s_2ce1bbf7d954a5::t_fcbd16106cd28b 23-24
+  s_2ce1bbf7d954a5::t_a3220a6421909e 67-78
+net/crates/net/payments/tests/svm_checker.rs
+  s_2ce1bbf7d954a5::t_802073e660a62f 160-161
+net/crates/net/payments/tests/eip155_checker.rs
+  s_2ce1bbf7d954a5::t_802073e660a62f 150-151
+  s_2ce1bbf7d954a5::t_2edf35c9cfcb32 158
+net/crates/net/payments/tests/xrpl_checker.rs
+  s_2ce1bbf7d954a5::t_3cf595352bd898 1-353
+  s_2ce1bbf7d954a5::t_70b9983f5c6683 354-359
+net/crates/net/payments/src/engine/mod.rs
+  s_2ce1bbf7d954a5::t_802073e660a62f 1122-1139,1144-1145
+net/crates/net/payments/src/checker/xrpl.rs
+  s_2ce1bbf7d954a5::t_cef37cf4e7d0a3 1-351
+net/crates/net/payments/Cargo.toml
+  s_2ce1bbf7d954a5::t_802073e660a62f 56-59
+net/crates/net/Cargo.lock
+  s_2ce1bbf7d954a5::t_591a17c69859b8 2953
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ed461db2c8f39f1b061e157dc27bf512bdc63e97",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
