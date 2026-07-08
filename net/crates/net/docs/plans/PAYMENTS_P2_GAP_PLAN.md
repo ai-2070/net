@@ -24,8 +24,17 @@ Every acceptance criterion below is met (per-workstream **Landed** notes record 
 **Extended by the N-series follow-ups** (branch `net-payments-gap-2`):
 
 - **N2 (`0f585a834`)** landed WS-C's deliberately-unbuilt "Best" variant: `Mesh::serve_tool_paid` + `net_sdk::tool_payment` (gate trait, wire constants single-sourced — net-mcp's now re-point to the SDK's) + `EngineToolPaymentGate` in net-payments. Priced native tools no longer require the MCP adapter; the matrix's "✅ every path" cell now includes a third sanctioned serving path, not just refusal.
-- **N3a (`20742d176`)** landed the carried eip155 `AuthorizationUsed` nonce bind (see Carried below).
-- **N3b (`7de7f13e2`)** closed the SVM co-sign residual the merge's `acd8a89cc` had scoped as deferred: attribution now requires a parsed payer→merchant transfer edge (outer or CPI-inner); delivered stays delta-derived.
+- **N3a (`20742d176`)** landed the carried eip155 `AuthorizationUsed` nonce bind (see Carried below). *(Hardened by the review pass — N-1/N-2 below: the bind engaged only for `0x`-prefixed nonces, and the caller-signed reference was read scheme-blind.)*
+- **N3b (`7de7f13e2`)** closed the SVM co-sign residual the merge's `acd8a89cc` had scoped as deferred: attribution now requires a parsed payer→merchant transfer edge (outer or CPI-inner); delivered stays delta-derived. *(Hardened by N-3 below: the first cut bound edge **existence**, not amount, so a zero/dust decoy edge re-opened the residual; attribution now requires the payer→merchant edge sum to **cover** the delivered delta.)*
+
+**Reviewed and hardened** (`net-payments-gap-2`, 2026-07-08): an xhigh-effort review pass over the N-series diff (three independent finders + adversarial verify) found ten items, all fixed in place — two of them real fail-open holes *inside* the N-series features themselves. Full detail lives in [`docs/misc/CODE_REVIEW_2026_07_08_PAYMENTS_GAP_2.md`](../misc/CODE_REVIEW_2026_07_08_PAYMENTS_GAP_2.md); the load-bearing fixes:
+
+- **N-1 (`fa9d4665f`)** — `is_nonce_hex` required a literal `0x` prefix while the settlement signer's `decode_bytes32` accepts a bare-hex nonce; a bare-hex nonce silently skipped the N3a bind (fail-open, back to the weaker `(token, from, to)` check). Now prefix-optional, with a regression whose load-bearing assertion is that the bind still fires when `AuthorizationUsed` is absent.
+- **N-2 (`c88f3ef38`)** — the reference precedence read `payload.authorization.nonce` for *all* schemes, but off-EVM payloads sign only their wallet blob; a caller could inject an unsigned nonce to override exact-XRPL's provider-authored `invoiceId`. The read is now scoped to eip155 networks (the only family whose checker consumes a nonce reference, and where the nonce is caller-signed).
+- **N-3 (`b14e68efa`)** — SVM attribution bound edge existence, not amount (see N3b note above).
+- **N-4…N-10 (`8b5e754d7`, `c435e6ae0`, `8f5f45d8a`, `7786fa741`, `1fda0d180`, `ce2ac28e8`, `2019a158a`)** — one documented fail-closed constraint (eip155 `AuthorizationUsed` emitter == asset) and six cleanups: single-sourced the engine-redeem mapping across the native + MCP gates, corrected the `Cargo.toml` event signature, dropped a dead payer fallback, scoped the SVM edge map to the merchant, computed the `Transfer` topic instead of memorizing it, and de-linked the ungated `tool_payment` module doc.
+
+Full `net-payments` suite + SDK `tool_serve_paid` + both gate feature paths (`mesh`, `mcp-gate`) green; `cargo clippy --lib` and `cargo doc --no-default-features` clean.
 
 **The state that was fixed (as verified 2026-07-06) — all ❌ cells now ✅:**
 
