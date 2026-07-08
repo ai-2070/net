@@ -603,7 +603,7 @@ impl CallerPaymentFlow {
         }
         let namespace = requirements.network.split(':').next().unwrap_or_default();
         requirements.scheme == "exact"
-            && matches!(namespace, "eip155" | "solana" | "xrpl")
+            && (namespace == "eip155" || OPAQUE_BLOB_NAMESPACES.contains(&namespace))
             && self.signers.contains_key(namespace)
     }
 
