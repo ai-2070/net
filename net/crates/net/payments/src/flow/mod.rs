@@ -642,47 +642,25 @@ impl CallerPaymentFlow {
                 .await
                 .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
-        } else if self.can_settle(requirements) && requirements.network.starts_with("solana:") {
-            // exact / solana: the wallet authors a partially-signed SPL
-            // transfer for the intent derived from the quoted
-            // requirements. Retry honesty: the wallet may bind a fresh
-            // blockhash, so same-quote retries can produce *different*
-            // payload bytes — idempotency holds at the quote (a served
-            // quote returns its original billing event), not at
-            // payload byte-identity as on eip155.
+        } else if self.can_settle(requirements)
+            && OPAQUE_BLOB_NAMESPACES
+                .contains(&requirements.network.split(':').next().unwrap_or_default())
+        {
+            // exact / solana | xrpl: the wallet authors the opaque blob
+            // (partially-signed SPL transfer / presigned XRPL Payment) from
+            // the intent derived from the quoted requirements, via the
+            // shared `author_opaque_blob_payload` (kept symmetric with the
+            // HTTP door). Retry honesty on this mesh path: idempotency holds
+            // at the quote — a re-signed SPL blob binds a fresh blockhash; an
+            // xrpl retry must re-present the IDENTICAL blob (never re-sign
+            // with a fresh Sequence), an expired LastLedgerSequence means a
+            // fresh quote, not a fresh signature.
+            let namespace = requirements.network.split(':').next().unwrap_or_default();
             let signer = self
                 .signers
-                .get("solana")
-                .ok_or_else(|| "no solana signer configured".to_string())?;
-            let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
-                .map_err(|e| e.to_string())?;
-            let transaction = signer
-                .sign_svm_transfer(&intent)
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::x402::schemes::exact_svm::payload_object(&transaction)
-                .map_err(|e| e.to_string())?
-        } else if self.can_settle(requirements) && requirements.network.starts_with("xrpl:") {
-            // exact / xrpl: the wallet authors a presigned Payment blob
-            // for the intent derived from the quoted requirements
-            // (XRP-only until the IOU amount-domain review; the intent
-            // carries the spec-required invoiceId the wallet binds via
-            // MemoData/InvoiceID). Retry honesty: a same-quote retry
-            // re-presents the IDENTICAL blob — the wallet must never
-            // re-sign with a fresh Sequence; an expired
-            // LastLedgerSequence means a fresh quote, not a fresh
-            // signature.
-            let signer = self
-                .signers
-                .get("xrpl")
-                .ok_or_else(|| "no xrpl signer configured".to_string())?;
-            let intent = crate::x402::schemes::exact_xrpl::payment_intent(requirements)
-                .map_err(|e| e.to_string())?;
-            let blob = signer
-                .sign_xrpl_payment(&intent)
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::x402::schemes::exact_xrpl::payload_object(&blob).map_err(|e| e.to_string())?
+                .get(namespace)
+                .ok_or_else(|| format!("no {namespace} signer configured"))?;
+            author_opaque_blob_payload(namespace, requirements, signer).await?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}` (fail-closed)",
@@ -720,6 +698,56 @@ impl CallerPaymentFlow {
 /// `max_per_day` as the wallet's loss bound.
 pub(crate) fn reject_releases_reservation(quote: &PaymentQuote) -> bool {
     quote.requirements.view().network.starts_with("mock:")
+}
+
+/// The set of CAIP-2 namespaces whose `exact` payload is an **opaque
+/// wallet blob** authored the same way on every path: derive the typed
+/// intent from the quoted requirements, hand it to the wallet, wrap the
+/// returned blob in the pinned payload object. eip155 (EIP-712 typed data)
+/// and the mock scheme author differently and are *not* here.
+pub(crate) const OPAQUE_BLOB_NAMESPACES: [&str; 2] = ["solana", "xrpl"];
+
+/// Author an opaque-blob exact-scheme payload (`solana`, `xrpl`) from the
+/// quoted requirements. Shared by the mesh flow ([`CallerPaymentFlow`]) and
+/// the outbound HTTP-402 door (`X402HttpFlow`) so the two dispatch sites
+/// cannot drift — the seam inventory's "both `can_settle` arms, kept
+/// symmetric" rule made structural instead of maintained by comment. The
+/// wallet owns the key, the chain-specific serialization, and the
+/// nonce/blockhash/`Sequence` bookkeeping; this only builds documents.
+///
+/// Retry honesty differs only in *consequence*, not code: the mesh flow's
+/// provider-side idempotency keys on the quote (a re-signed SPL blob binds
+/// a fresh blockhash; an xrpl retry must re-present the identical blob),
+/// while the HTTP door has no provider idempotency (one `fetch_paid` = one
+/// attempt). Both are documented at their call sites.
+pub(crate) async fn author_opaque_blob_payload(
+    namespace: &str,
+    requirements: &PaymentRequirements,
+    signer: &std::sync::Arc<dyn signer::SchemeSigner>,
+) -> Result<serde_json::Value, String> {
+    match namespace {
+        "solana" => {
+            let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
+                .map_err(|e| e.to_string())?;
+            let transaction = signer
+                .sign_svm_transfer(&intent)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_svm::payload_object(&transaction).map_err(|e| e.to_string())
+        }
+        "xrpl" => {
+            let intent = crate::x402::schemes::exact_xrpl::payment_intent(requirements)
+                .map_err(|e| e.to_string())?;
+            let blob = signer
+                .sign_xrpl_payment(&intent)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_xrpl::payload_object(&blob).map_err(|e| e.to_string())
+        }
+        other => Err(format!(
+            "no opaque-blob payload author for namespace `{other}`"
+        )),
+    }
 }
 
 /// The EIP-3009 authorization a quote implies for payer `from`: recipient

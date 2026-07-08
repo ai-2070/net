@@ -407,45 +407,24 @@ impl X402HttpFlow {
                 .await
                 .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_evm::payload_object(&auth, &signature)
-        } else if self.can_settle(requirements) && requirements.network.starts_with("solana:") {
-            // exact / solana: the wallet authors a partially-signed SPL
-            // transfer for the intent derived from the demanded
-            // requirements (same dispatch as the mesh flow). Retry
-            // honesty: the wallet may bind a fresh blockhash, so a
-            // re-fetch can produce different payload bytes — irrelevant
-            // here, since HTTP has no provider-side idempotency anyway
-            // (one `fetch_paid` call = one payment attempt, per the
-            // module doc).
+        } else if self.can_settle(requirements)
+            && super::OPAQUE_BLOB_NAMESPACES
+                .contains(&requirements.network.split(':').next().unwrap_or_default())
+        {
+            // exact / solana | xrpl: the wallet authors the opaque blob
+            // from the demanded requirements, via the shared
+            // `author_opaque_blob_payload` (identical dispatch to the mesh
+            // flow — the two paths cannot drift). Retry honesty on this
+            // path: HTTP has no provider-side idempotency (one `fetch_paid`
+            // = one attempt), so a re-fetch that re-signs (fresh SPL
+            // blockhash / a re-quoted XRPL blob after an expired
+            // LastLedgerSequence) is simply the next attempt.
+            let namespace = requirements.network.split(':').next().unwrap_or_default();
             let signer = self
                 .signers
-                .get("solana")
-                .ok_or_else(|| "no solana signer configured".to_string())?;
-            let intent = crate::x402::schemes::exact_svm::transfer_intent(requirements)
-                .map_err(|e| e.to_string())?;
-            let transaction = signer
-                .sign_svm_transfer(&intent)
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::x402::schemes::exact_svm::payload_object(&transaction)
-                .map_err(|e| e.to_string())?
-        } else if self.can_settle(requirements) && requirements.network.starts_with("xrpl:") {
-            // exact / xrpl: the wallet authors a presigned Payment blob
-            // (XRP-only until the IOU amount-domain review; invoiceId
-            // binding per the pinned t54 doc — same dispatch as the mesh
-            // flow). One `fetch_paid` = one attempt on this path, so the
-            // same-quote-same-blob rule is moot here; an expired
-            // LastLedgerSequence simply means the next fetch re-quotes.
-            let signer = self
-                .signers
-                .get("xrpl")
-                .ok_or_else(|| "no xrpl signer configured".to_string())?;
-            let intent = crate::x402::schemes::exact_xrpl::payment_intent(requirements)
-                .map_err(|e| e.to_string())?;
-            let blob = signer
-                .sign_xrpl_payment(&intent)
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::x402::schemes::exact_xrpl::payload_object(&blob).map_err(|e| e.to_string())?
+                .get(namespace)
+                .ok_or_else(|| format!("no {namespace} signer configured"))?;
+            super::author_opaque_blob_payload(namespace, requirements, signer).await?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}`",
