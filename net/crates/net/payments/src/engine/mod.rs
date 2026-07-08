@@ -1134,36 +1134,49 @@ impl PaymentEngine {
         // - On eip155 networks the reference is the caller-signed EIP-3009
         //   `authorization.nonce` (the signature covers it — same trust
         //   class as `authorization.from`); the eip155 checker binds it to
-        //   the token's `AuthorizationUsed` event.
+        //   the token's `AuthorizationUsed` event. The bind is MANDATORY
+        //   here: a missing or malformed nonce is refused (fail-closed),
+        //   never silently downgraded to the weaker (token, from, to)
+        //   check by threading `None`/`invoiceId` — the checker's
+        //   `is_nonce_hex` filter would treat a non-nonce reference as "no
+        //   nonce" and skip the bind, re-opening the H3 residual. Same
+        //   fail-closed posture as the SVM unbound-payer guard. (Every
+        //   eip155 `exact` settlement is EIP-3009, so a legitimate payload
+        //   always carries a nonce; a future non-3009 eip155 scheme would
+        //   surface loudly here rather than fail open.)
         // - Elsewhere the reference is the provider-authored
-        //   `requirements.extra.invoiceId` (exact-XRPL's vocabulary).
-        //
-        // The nonce read is gated to eip155 ON PURPOSE: off-EVM payloads
-        // sign only their wallet blob, not the surrounding JSON, so reading
-        // a caller-supplied `authorization.nonce` on e.g. exact-XRPL would
-        // let a caller override the provider's invoice bind with an
-        // unsigned field. The gate matches the one checker that consumes a
-        // nonce reference (`Eip155Checker`, itself eip155-only). Schemes
-        // with neither thread `None`.
-        let reference = network
-            .starts_with("eip155:")
-            .then(|| {
-                payload
-                    .view()
-                    .payload
-                    .get("authorization")
-                    .and_then(|a| a.get("nonce"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .flatten()
-            .or_else(|| {
-                req_extra
-                    .as_ref()
-                    .and_then(|e| e.get("invoiceId"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            });
+        //   `requirements.extra.invoiceId` (exact-XRPL's vocabulary). The
+        //   invoiceId is deliberately NOT an eip155 fallback: off-EVM
+        //   payloads sign only their wallet blob, and reading a
+        //   caller-supplied `authorization.nonce` off-EVM would let a
+        //   caller override the provider's invoice bind with an unsigned
+        //   field. Schemes with neither thread `None`.
+        let reference = if network.starts_with("eip155:") {
+            match payload
+                .view()
+                .payload
+                .get("authorization")
+                .and_then(|a| a.get("nonce"))
+                .and_then(|v| v.as_str())
+            {
+                Some(nonce) if crate::checker::is_eip3009_nonce(nonce) => Some(nonce.to_owned()),
+                _ => {
+                    return Ok(PaymentDecision::Rejected {
+                        reason: RejectReason::BadQuote(
+                            "eip155 settlement carries no valid EIP-3009 authorization.nonce — \
+                             refusing to verify delivery without the authorization bind"
+                                .into(),
+                        ),
+                    })
+                }
+            }
+        } else {
+            req_extra
+                .as_ref()
+                .and_then(|e| e.get("invoiceId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        };
         // The tag's *type* is validated here (M3): a present-but-malformed
         // `destinationTag` is a hard refusal — matching the authoring
         // seam's `exact_xrpl::optional_tag` — never a silent drop to

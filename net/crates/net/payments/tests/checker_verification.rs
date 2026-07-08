@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use net::adapter::net::identity::EntityKeypair;
 use net_payments::checker::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
-use net_payments::core::registry::default_mock_registry;
+use net_payments::core::registry::{default_mock_registry, default_registry_v1};
 use net_payments::core::verification::{
     check_chain, InvalidationReason, VerificationStatus, VerificationTier, VerifierRef,
 };
@@ -608,4 +608,138 @@ async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
         Some(PROVIDER_INVOICE),
         "the provider invoiceId must win; a caller-injected nonce must not override it off-EVM"
     );
+}
+
+// ---------------------------------------------------------------------
+// eip155 nonce bind is MANDATORY at re-verification (cubic P1 follow-up)
+// ---------------------------------------------------------------------
+
+const BASE_SEPOLIA: &str = "eip155:84532";
+const TESTNET_USDC: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+const MERCHANT_ADDR: &str = "0x000000000000000000000000000000000000dEaD";
+// 0x + 64 hex — a well-formed EIP-3009 bytes32 nonce.
+const VALID_NONCE: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Settle one Base-Sepolia (eip155) quote at observed with the given
+/// opaque payload body and return the engine + quote id. Fresh engine per
+/// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
+/// distinct quotes must not share a `consumed_transactions` namespace.
+async fn settled_eip155(payload_body: serde_json::Value) -> (PaymentEngine, String, tempfile::TempDir) {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(PayerNamingFacilitator),
+        Arc::new(AdmitAll),
+        default_registry_v1(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine");
+    let requirements = X402Carry::author(&PaymentRequirements {
+        scheme: "exact".into(),
+        network: BASE_SEPOLIA.into(),
+        amount: "2500".into(),
+        asset: TESTNET_USDC.into(),
+        pay_to: MERCHANT_ADDR.into(),
+        max_timeout_seconds: 60,
+        extra: None,
+    })
+    .expect("author");
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements,
+            NOW,
+            60_000_000_000,
+        )
+        .expect("quote");
+    let payload = X402Carry::author(&PaymentPayload {
+        x402_version: 2,
+        resource: None,
+        accepted: quote.requirements.view().clone(),
+        payload: payload_body,
+        extensions: None,
+    })
+    .expect("payload");
+    let decision = engine
+        .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
+        .await
+        .expect("accept");
+    assert!(
+        matches!(decision, PaymentDecision::PendingTier { .. }),
+        "{decision:?}"
+    );
+    (engine, quote.quote_id, dir)
+}
+
+/// The happy path: a valid caller-signed nonce is threaded to the checker
+/// as the reference (so the `AuthorizationUsed` bind can fire).
+#[tokio::test]
+async fn eip155_reverify_threads_the_signed_nonce() {
+    let (engine, quote_id, _dir) = settled_eip155(serde_json::json!({
+        "authorization": { "from": MERCHANT_ADDR, "nonce": VALID_NONCE }
+    }))
+    .await;
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Confirmed(3),
+        delivered: Some("2500".into()),
+    }]);
+    let decision = engine
+        .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .await
+        .expect("engine");
+    assert!(matches!(decision, PaymentDecision::Served { .. }), "{decision:?}");
+    let queries = checker.queries.lock();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].2.as_ref().and_then(|q| q.reference.as_deref()),
+        Some(VALID_NONCE),
+        "the eip155 reference must be the caller-signed nonce"
+    );
+}
+
+/// Fail-closed: a missing or malformed `authorization.nonce` on eip155 is
+/// refused at re-verification — never silently downgraded to the weaker
+/// (token, from, to) bind by threading `None`. The checker is never even
+/// consulted (a settlement we cannot bind to the authorization must not
+/// be counted).
+#[tokio::test]
+async fn eip155_reverify_refuses_a_missing_or_malformed_nonce() {
+    // (a) No `authorization` in the payload at all.
+    let (engine, quote_id, _dir) = settled_eip155(serde_json::json!({ "signature": "0xsig" })).await;
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Confirmed(3),
+        delivered: Some("2500".into()),
+    }]);
+    let decision = engine
+        .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .await
+        .expect("engine");
+    assert!(
+        matches!(&decision, PaymentDecision::Rejected { reason: RejectReason::BadQuote(m) } if m.contains("authorization.nonce")),
+        "missing nonce must be refused, got {decision:?}"
+    );
+    assert!(
+        checker.queries.lock().is_empty(),
+        "the checker must not be consulted without a nonce bind"
+    );
+
+    // (b) `authorization.nonce` present but not a 32-byte hex word.
+    let (engine, quote_id, _dir) =
+        settled_eip155(serde_json::json!({ "authorization": { "nonce": "not-a-nonce" } })).await;
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Confirmed(3),
+        delivered: Some("2500".into()),
+    }]);
+    let decision = engine
+        .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
+        .await
+        .expect("engine");
+    assert!(
+        matches!(&decision, PaymentDecision::Rejected { reason: RejectReason::BadQuote(_) }),
+        "malformed nonce must be refused, got {decision:?}"
+    );
+    assert!(checker.queries.lock().is_empty());
 }

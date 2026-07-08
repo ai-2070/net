@@ -170,15 +170,14 @@ fn authorization_used_topic() -> &'static str {
     TOPIC.get_or_init(|| keccak_topic(b"AuthorizationUsed(address,bytes32)"))
 }
 
-/// Is `s` a 32-byte hex word — the eip155 adapter's reference vocabulary
-/// (an EIP-3009 nonce)? The `0x` prefix is optional: the settlement
-/// signer's own `decode_bytes32` accepts a nonce with or without it, so
-/// the checker must too — treating a bare-hex nonce as "not a nonce"
-/// would silently skip the `AuthorizationUsed` bind (fail-open) on a
-/// perfectly valid authorization.
+/// Is `s` the eip155 adapter's reference vocabulary — an EIP-3009 nonce?
+/// Delegates to the crate-shared [`crate::checker::is_eip3009_nonce`] so
+/// this bind and the engine's reference derivation agree byte-for-byte on
+/// what counts as a nonce (a disagreement would be a fail-open). `0x` is
+/// optional — the settlement signer accepts a bare-hex nonce, so the
+/// checker must too, or it would skip the bind on a valid authorization.
 fn is_nonce_hex(s: &str) -> bool {
-    let h = s.strip_prefix("0x").unwrap_or(s);
-    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::checker::is_eip3009_nonce(s)
 }
 
 /// A 32-byte topic equals the 32-byte word `word` (both 0x-hex)?
