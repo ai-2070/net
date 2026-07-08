@@ -1,0 +1,37 @@
+net/crates/net/bindings/python/tests/test_capability_gateway.py
+  s_2ce1bbf7d954a5::t_6d472b65511ab1 380-387,394-465
+net/crates/net/bindings/python/src/payment_http.rs
+  s_2ce1bbf7d954a5::t_9464a6f376b1ec 162-167
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_2ce1bbf7d954a5::t_1257dae1b49dd9 3099-3102,3242-3245
+  s_2ce1bbf7d954a5::t_ef6d293d84b29a 3143-3152
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_8631e3a79b7247 728,1323-1327
+  s_2ce1bbf7d954a5::t_374c16a336866d 860,1033
+  s_2ce1bbf7d954a5::t_21477767b55382 1576-1577
+  s_2ce1bbf7d954a5::t_6c90a824860ca8 698-727,729-776
+  s_2ce1bbf7d954a5::t_b4b5aa1703d167 648-653
+  s_2ce1bbf7d954a5::t_e0c84e903d385e 1267-1285,1291-1295,1298-1322,1328,1330
+  s_2ce1bbf7d954a5::t_50861767bcc6e8 481,488-511,515,522-525,527-538,545-546,548,550
+  s_2ce1bbf7d954a5::t_60a4bdef1a82c8 872-875,884-887,1045-1048,1057-1060
+  s_2ce1bbf7d954a5::t_4756c255265e98 777
+net/crates/net/docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md
+  s_2ce1bbf7d954a5::t_a9e0b26c0e74d2 48
+  s_2ce1bbf7d954a5::t_e9bb614ef69ef2 74-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4ee735a4532bd223949437295e9cb08c9575e4f5",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
