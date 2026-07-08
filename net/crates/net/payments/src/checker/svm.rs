@@ -288,6 +288,24 @@ impl ChainChecker for SvmChecker {
         // (mint, recipient) — straight from the chain.
         let delivered = match query {
             Some(q) => {
+                // Fail closed on an unbound settlement (H2). SPL balances
+                // carry no per-transfer `from`, so the *only* way this
+                // adapter can attribute a delivery to this quote's caller
+                // is the payer's own debit — there is no per-quote
+                // reference like XRPL's `invoiceId` to fall back on. With
+                // no payer to bind, a transfer to the merchant is
+                // indistinguishable from a stranger's, and crediting it
+                // would let a facilitator that reports no payer point at
+                // any qualifying on-chain transfer. Refuse to attribute an
+                // unbound transfer rather than crediting one.
+                if q.from.as_deref().map_or(true, str::is_empty) {
+                    return Err(CheckerError::terminal(
+                        "solana delivery cannot be bound to a payer: the settlement \
+                         names none (opaque payload and no settle-time payer) — refusing \
+                         to attribute an unbound transfer"
+                            .to_string(),
+                    ));
+                }
                 let tx = self
                     .rpc(
                         "getTransaction",

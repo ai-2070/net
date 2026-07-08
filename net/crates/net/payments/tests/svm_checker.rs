@@ -268,8 +268,10 @@ async fn delivered_amount_comes_from_token_balance_deltas() {
     rpc.set_status(finalized());
     rpc.set_transaction(transfer_tx(10_000));
 
+    // The query binds the payer (the production shape — delivery is only
+    // attributable through the payer's own debit; see H2).
     let verdict = checker
-        .check(NETWORK, TX, Some(&query()))
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
         .await
         .expect("check");
     assert_eq!(
@@ -282,25 +284,27 @@ async fn delivered_amount_comes_from_token_balance_deltas() {
 
     // Multi-ATA recipient: two accounts owned by the merchant sum; a
     // different mint and an account created mid-transaction (no pre
-    // entry) are both handled.
+    // entry) are both handled — and the payer's own debit still binds.
     rpc.set_transaction(json!({
         "slot": 95,
         "meta": {
             "err": null,
             "preTokenBalances": [
                 token_balance(1, MINT, RECIPIENT, "0"),
-                token_balance(3, "OtherMint1111111111111111111111111111111111", RECIPIENT, "7"),
+                token_balance(2, MINT, PAYER, "50000"),
+                token_balance(4, "OtherMint1111111111111111111111111111111111", RECIPIENT, "7"),
             ],
             "postTokenBalances": [
                 token_balance(1, MINT, RECIPIENT, "6000"),
                 // Created in this tx: no pre entry, full post counts.
-                token_balance(2, MINT, RECIPIENT, "4000"),
-                token_balance(3, "OtherMint1111111111111111111111111111111111", RECIPIENT, "999"),
+                token_balance(3, MINT, RECIPIENT, "4000"),
+                token_balance(2, MINT, PAYER, "40000"),
+                token_balance(4, "OtherMint1111111111111111111111111111111111", RECIPIENT, "999"),
             ],
         },
     }));
     let verdict = checker
-        .check(NETWORK, TX, Some(&query()))
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
         .await
         .expect("check");
     let ChainVerdict::Included { delivered, .. } = verdict else {
@@ -313,10 +317,47 @@ async fn delivered_amount_comes_from_token_balance_deltas() {
     rpc.set_transaction(Value::Null);
     assert_eq!(
         checker
-            .check(NETWORK, TX, Some(&query()))
+            .check(NETWORK, TX, Some(&query_from(PAYER)))
             .await
             .expect("check"),
         ChainVerdict::Pending
+    );
+}
+
+/// H2 fail-closed: an SPL settlement carries no per-transfer `from` and no
+/// per-quote reference, so the payer debit is the *only* way this adapter
+/// can attribute a delivery to the caller. When the query names no payer
+/// (an opaque-blob scheme whose facilitator reported no settle-time payer),
+/// the checker refuses rather than crediting any transfer to the merchant —
+/// otherwise a facilitator could point at a stranger's on-chain transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_without_a_payer_is_refused() {
+    let rpc = RpcFixture::start().await;
+    let checker = SvmChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+    rpc.set_status(finalized());
+    // A real, well-formed transfer to the merchant — but the query binds no
+    // payer, so it must not be attributed to this quote.
+    rpc.set_transaction(transfer_tx(10_000));
+
+    let err = checker
+        .check(NETWORK, TX, Some(&query()))
+        .await
+        .expect_err("an unbound (no-payer) delivery query must be refused");
+    assert!(!err.retryable, "the refusal is terminal, not a transient shrug");
+    assert!(
+        err.message.contains("payer"),
+        "the refusal names the missing payer bind: {}",
+        err.message
+    );
+
+    // A tier-only check (no query at all) still needs no payer — it makes
+    // no delivery claim to attribute.
+    assert_eq!(
+        checker.check(NETWORK, TX, None).await.expect("tier-only"),
+        ChainVerdict::Included {
+            tier: VerificationTier::Final,
+            delivered: None
+        }
     );
 }
 
