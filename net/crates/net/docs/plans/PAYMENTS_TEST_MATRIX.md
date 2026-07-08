@@ -92,7 +92,7 @@ M1's mega-e2e (`mesh_paid_capability_e2e`) closes the survey's central gap: it r
 | 3 · Solana / CDP | none | same — SVM checker fixture-first by design; live run at enablement |
 | 4 · XRPL / t54 | none | same — conditional GO; unpinned no-gos are pinned deterministic (`exact_xrpl::iou_entries_refuse_until_the_amount_domain_review`, `exact_scheme_flow_e2e::an_unknown_scheme_accepts_entry_fails_closed_at_selection`) |
 
-CI home for any of this: **none today** → M4.
+CI home: **`.github/workflows/payments-live.yml`** (M4) — scheduled weekly + `workflow_dispatch`, never PR-blocking. Keyless 1a/1b run every time (the canary); 1c runs when the `NET_PAYMENTS_LIVE_EVM_KEY` secret is set; 1d (settle) only on a manual dispatch with `run_settle` checked, so a schedule never moves money. Rungs 2–4 slot in as their live suites land at enablement.
 
 ---
 
@@ -120,11 +120,11 @@ CI home for any of this: **none today** → M4.
 
 **Acceptance:** the Python row of Tier 2 flips to ✅ with driven receipts; the `requires_payment_approval` → approve → retry loop asserted through the binding's own JSON projections. ✅ — passes in 0.24s. Scope honestly recorded: *replay* and *wrong-tool* are not caller-driven behaviors at the Python/`gated_invoke` layer (it mints a fresh quote per call), so they stay covered at the provider gate by M1/M2; a pytest smoke was **not** added (the binding publishes free tools only — standing up a paid provider from pytest would need new supply-side binding surface, which the fence forbids).
 
-### M4 — a CI home for the live tier
+### M4 — a CI home for the live tier — ✅ LANDED
 
-- [ ] `payments-live.yml`: `schedule` (weekly to start) + `workflow_dispatch`; runs the **keyless** rung-1 tests (1a/1b — no secrets needed) unconditionally, and the keyed tests (1c/1d, later rungs) only when the corresponding secrets are configured; never PR-blocking; failure notifies rather than gates. Results recorded in the ladder doc per its runbook.
+- [x] `.github/workflows/payments-live.yml`: `schedule` (weekly, 06:00 UTC Mon) + `workflow_dispatch`; never PR-blocking (no `push`/`pull_request` trigger). Runs the **keyless** rung-1 canaries (1a `supported_offers…` + 1b `pack loads…`) unconditionally; 1c (`signed verify`, spends nothing) only when the `NET_PAYMENTS_LIVE_EVM_KEY` repo secret is configured (secret *presence* resolved into a plain env boolean so fork PRs / secret-less clones skip cleanly); 1d (`settle`) only on a manual dispatch with `run_settle` checked **and** the key present — a schedule never moves money. A red scheduled run is the notification (GitHub emails watchers); it gates nothing. The ladder doc (`PAYMENTS_P1_NETWORK_LADDER.md`) is the run record per its runbook.
 
-**Acceptance:** rung-1a/1b run on schedule without human action; a secret-present run of 1c is one click.
+**Acceptance:** rung-1a/1b run on schedule without human action; a secret-present run of 1c is one click. ✅ — YAML validates; the `live_testnet_conformance` binary compiles under the workflow's features and all four filtered test names resolve. (The live steps themselves are only exercisable in CI — they hit the real facilitator by design.)
 
 ### M5 — small pins
 
