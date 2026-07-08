@@ -157,6 +157,8 @@ fn query() -> TransferQuery {
         token: MINT.to_string(),
         to: RECIPIENT.to_string(),
         from: None,
+        reference: None,
+        to_tag: None,
     }
 }
 

@@ -147,14 +147,15 @@ fn query() -> TransferQuery {
         token: TOKEN.to_string(),
         to: RECIPIENT.to_string(),
         from: None,
+        reference: None,
+        to_tag: None,
     }
 }
 
 fn query_from(payer: &str) -> TransferQuery {
     TransferQuery {
-        token: TOKEN.to_string(),
-        to: RECIPIENT.to_string(),
         from: Some(payer.to_string()),
+        ..query()
     }
 }
 

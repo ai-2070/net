@@ -1119,10 +1119,30 @@ impl PaymentEngine {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned)
             });
+        // Scheme-generic opaque-extra reads: a scheme that binds its
+        // settlement to a per-quote reference (exact-XRPL's `invoiceId`,
+        // carried on-ledger as MemoData/InvoiceID) or a recipient
+        // sub-account tag (XRPL `DestinationTag`) carries them in
+        // `requirements.extra`. The engine reads the keys generically and
+        // never interprets them — the checker adapter does; schemes
+        // without them thread `None` (unchanged behavior).
+        let req_extra = requirements.view().extra.clone();
+        let reference = req_extra
+            .as_ref()
+            .and_then(|e| e.get("invoiceId"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let to_tag = req_extra
+            .as_ref()
+            .and_then(|e| e.get("destinationTag"))
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok());
         let query = TransferQuery {
             token: requirements.view().asset.clone(),
             to: requirements.view().pay_to.clone(),
             from: payer_from,
+            reference,
+            to_tag,
         };
 
         let verdict = match checker.check(&network, &transaction, Some(&query)).await {
