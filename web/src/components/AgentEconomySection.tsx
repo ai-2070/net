@@ -16,18 +16,11 @@ export function AgentEconomySection() {
         parents. The web&apos;s trust model has no nouns for any of that.
       </p>
 
-      <p className="text-[13px] text-ink-dim max-w-[740px] leading-[1.7] mb-6">
+      <p className="text-[13px] text-ink-dim max-w-[740px] leading-[1.7] mb-10">
         We handed agents the web&apos;s plumbing — HTTP, OAuth, bearer tokens,
         registries. All of it designed for a human with a browser and one
-        identity.
-      </p>
-
-      <p className="text-[13px] text-ink-dim max-w-[740px] leading-[1.7] mb-10">
-        Tool-definition bloat in every prompt. Token sprawl. Injection blast
-        radius. Subagents with no identity story. Stale schemas. Multi-agent
-        duct tape. Different costumes, same absence — the network layer agents
-        were supposed to have. We built minds without hands — and intelligence
-        means nothing if it can&apos;t act on the real world.
+        identity. We built minds without hands — and intelligence means nothing
+        if it can&apos;t act on the real world.
       </p>
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">

@@ -55,12 +55,6 @@ export function ClosingSection() {
         your code in a datacenter — Net puts your code on the network itself.
       </p>
 
-      <p className="text-ink text-[14px] leading-[1.7] mt-8 max-w-[740px] font-light">
-        A population needs a commons, identity, law, and an economy — the
-        internet has none of them for software, because every layer of it
-        assumes a human.
-      </p>
-
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
           The internet where{" "}
