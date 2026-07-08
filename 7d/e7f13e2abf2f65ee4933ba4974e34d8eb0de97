@@ -1,0 +1,23 @@
+net/crates/net/payments/tests/svm_checker.rs
+  s_2ce1bbf7d954a5::t_857745028c793e 88,103-138,274,368,410
+  s_2ce1bbf7d954a5::t_fa31a7cd69e5c0 488-621
+  s_2ce1bbf7d954a5::t_40799e04b7e2a8 622-624
+net/crates/net/payments/src/checker/svm.rs
+  s_2ce1bbf7d954a5::t_aa54df851147fd 31-47,223-308,466-476
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7de7f13e2abf2f65ee4933ba4974e34d8eb0de97",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
