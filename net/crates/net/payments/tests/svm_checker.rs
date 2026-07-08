@@ -361,6 +361,48 @@ async fn delivery_without_a_payer_is_refused() {
     );
 }
 
+/// L1: delivered is the merchant's NET receipt across the accounts it
+/// owns, not the sum of per-account positive deltas. When the merchant
+/// receives into one account but an offsetting debit leaves another of the
+/// same mint in the same transaction, the honest delivered amount is the
+/// net — flooring each account at zero would over-credit the merchant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_nets_a_same_owner_debit() {
+    let rpc = RpcFixture::start().await;
+    let checker = SvmChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+    rpc.set_status(finalized());
+    // Merchant receives 10000 into account 1 but 3000 leaves account 3
+    // (same mint, same owner) in the same tx; the payer funds it.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+                token_balance(3, MINT, RECIPIENT, "3000"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+                token_balance(3, MINT, RECIPIENT, "0"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(
+        delivered.as_deref(),
+        Some("7000"),
+        "delivered is the net receipt (10000 in − 3000 out), not the gross 10000"
+    );
+}
+
 /// H3 parity: when the query carries the authorized payer, a qualifying
 /// transfer to the same merchant funded by a *different* payer does not
 /// count. Balances are transaction-level facts, so the bind is

@@ -358,14 +358,24 @@ impl ChainChecker for SvmChecker {
                     "postTokenBalances",
                 )?;
 
-                let mut total: u128 = 0;
+                // Delivered = the merchant's NET receipt of the mint across
+                // all accounts it owns (L1): sum the signed per-account
+                // deltas, not just the positive ones. Flooring each
+                // account's delta at zero would ignore an offsetting debit
+                // on a second merchant-owned account of the same mint,
+                // over-crediting the merchant relative to what it actually
+                // netted. SPL amounts are u64, so the signed sum stays in
+                // i128; a net-negative receipt clamps to an honest zero.
+                let mut merchant_net: i128 = 0;
                 let mut payer_debited = false;
                 for row in rows.values() {
                     if row.mint != q.token {
                         continue;
                     }
                     if row.owner == q.to {
-                        total = total.saturating_add(row.post.saturating_sub(row.pre));
+                        let post = i128::try_from(row.post).unwrap_or(i128::MAX);
+                        let pre = i128::try_from(row.pre).unwrap_or(i128::MAX);
+                        merchant_net = merchant_net.saturating_add(post.saturating_sub(pre));
                     }
                     if let Some(from) = q.from.as_deref() {
                         if row.owner == from && row.pre > row.post {
@@ -373,6 +383,7 @@ impl ChainChecker for SvmChecker {
                         }
                     }
                 }
+                let mut total: u128 = u128::try_from(merchant_net.max(0)).unwrap_or(0);
                 // Transaction-level payer bind (balances carry no per-transfer
                 // `from`): the queried payer — guaranteed present by the guard
                 // above — must have spent this mint in this transaction, or
