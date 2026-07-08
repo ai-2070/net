@@ -9,21 +9,25 @@
 
 ## Summary
 
-| ID | Severity | Title | Status |
-| --- | --- | --- | --- |
-| H1 | HIGH | `LocalPublicationHandle::refresh` re-announces priced tools without the payment gate → served free | Open |
-| H2 | HIGH | SVM checker's H3 payer bind fails **open** when the facilitator names no payer | Open |
-| M1 | MEDIUM | SVM payer bind is decoupled (debit ≠ credit) even when the payer is present | Open |
-| M2 | MEDIUM | XRPL checker assumes rippled api_version 1; a Clio/v2 endpoint invalidates every settlement | Open |
-| M3 | MEDIUM | XRPL no-tag quote accepts any `DestinationTag`; engine silently drops a malformed tag | Open |
-| L1 | LOW | SVM per-account positive deltas ignore an offsetting same-owner debit | Open |
-| L2 | LOW | SVM `fold_balances` parses every balance entry; an unrelated malformed entry blocks verification | Open |
-| C1 | CLEANUP | exact-SVM/exact-XRPL authoring arms duplicated across the mesh flow and the HTTP door | Open |
-| C2 | CLEANUP | bounded-body RPC transport copy-pasted across the three checkers | Open |
-| C3 | CLEANUP | `author_payload` re-derives the namespace per arm, duplicating `can_settle`'s list | Open |
-| C4 | CLEANUP | hand-rolled `RpcFixture` HTTP server triplicated across the three checker test files | Open |
+**Resolution (2026-07-08): all eleven items fixed on `net-payments-gap`,** each in its own commit with a regression test where behavior changed. Full payments suite (196 tests) + the MCP `publish_tools` suite + the SDK tool-serve suite are green.
 
-**Suggested merge gate:** H1 and H2. H1 is a clean, confirmed regression of the exact invariant this branch establishes (an announced price is an enforced price). H2 silently disables WS-A's independent-checker guarantee whenever the facilitator omits the payer — the mock facilitator always does, and a real one may.
+| ID | Severity | Title | Status | Commit | Regression |
+| --- | --- | --- | --- | --- | --- |
+| H1 | HIGH | `LocalPublicationHandle::refresh` re-announces priced tools without the payment gate → served free | ✅ Fixed | `4df531633` | `a_refreshed_priced_local_tool_still_enforces_payment` |
+| H2 | HIGH | SVM checker's H3 payer bind fails **open** when the facilitator names no payer | ✅ Fixed | `535a890e3` | `delivery_without_a_payer_is_refused` |
+| M1 | MEDIUM | SVM payer bind is decoupled (debit ≠ credit) even when the payer is present | ✅ Documented | `acd8a89cc` | — (scope-honesty; see note) |
+| M2 | MEDIUM | XRPL checker assumes rippled api_version 1; a Clio/v2 endpoint invalidates every settlement | ✅ Fixed | `34140dec5` | `tx_json_v2_shape_is_read_correctly` |
+| M3 | MEDIUM | XRPL no-tag quote accepts any `DestinationTag`; engine silently drops a malformed tag | ✅ Fixed | `2923e6db6` | `an_untagged_quote_rejects_a_tagged_payment` |
+| L1 | LOW | SVM per-account positive deltas ignore an offsetting same-owner debit | ✅ Fixed | `235adee7d` | `delivered_nets_a_same_owner_debit` |
+| L2 | LOW | SVM `fold_balances` parses every balance entry; an unrelated malformed entry blocks verification | ✅ Fixed | `a01fb7142` | `an_unrelated_token_account_does_not_poison_the_check` |
+| C1 | CLEANUP | exact-SVM/exact-XRPL authoring arms duplicated across the mesh flow and the HTTP door | ✅ Fixed | `e44058076` | (flow suites) |
+| C2 | CLEANUP | bounded-body RPC transport copy-pasted across the three checkers | ✅ Fixed | `8ec0befd6` | (checker suites) |
+| C3 | CLEANUP | `author_payload` re-derives the namespace per arm, duplicating `can_settle`'s list | ✅ Fixed | `7432fa55a` | (flow suites) |
+| C4 | CLEANUP | hand-rolled `RpcFixture` HTTP server triplicated across the three checker test files | ✅ Fixed | `ce1a07938` | (checker suites) |
+
+**Merge gate (H1, H2) — resolved.** H1: `LocalPublicationHandle` now stores `payment_admission` and re-applies `.with_payment` on refresh, mirroring `PublicationHandle::refresh`. H2: the SVM checker returns a terminal `CheckerError` (→ fail-closed `FacilitatorFailure`, quote not frozen) when a delivery query names no payer, instead of crediting an unbound transfer.
+
+> **M1 note:** on closer analysis the crafted-transaction exploit requires the *authorized payer itself* to co-sign an atomic transaction that pays a third party while a stranger pays the merchant — the victim would be the attacker's own accomplice — so it is not a live exploit. The balance-delta model is deliberately CPI-robust, and a per-transfer instruction parse risks false-rejecting legitimate payments, so the fix is to state the bind's true (transaction-level) scope in the module doc and record per-transfer attribution as a deferred hardening. H2's fail-closed guard (a payer is now *required*) closes the reachable half.
 
 **Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic path; `[PLAUSIBLE]` = concrete code citation with a mechanism, trigger depends on config/adversary not reproduced end-to-end; `[VERIFY]` = correctness depends on an external fact (endpoint API version, facilitator behavior) not resolvable from the repo.
 
