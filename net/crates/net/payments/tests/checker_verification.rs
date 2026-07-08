@@ -624,7 +624,9 @@ const VALID_NONCE: &str = "0x111111111111111111111111111111111111111111111111111
 /// opaque payload body and return the engine + quote id. Fresh engine per
 /// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
 /// distinct quotes must not share a `consumed_transactions` namespace.
-async fn settled_eip155(payload_body: serde_json::Value) -> (PaymentEngine, String, tempfile::TempDir) {
+async fn settled_eip155(
+    payload_body: serde_json::Value,
+) -> (PaymentEngine, String, tempfile::TempDir) {
     let provider = Arc::new(EntityKeypair::generate());
     let caller = EntityKeypair::generate();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -690,7 +692,10 @@ async fn eip155_reverify_threads_the_signed_nonce() {
         .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
         .await
         .expect("engine");
-    assert!(matches!(decision, PaymentDecision::Served { .. }), "{decision:?}");
+    assert!(
+        matches!(decision, PaymentDecision::Served { .. }),
+        "{decision:?}"
+    );
     let queries = checker.queries.lock();
     assert_eq!(queries.len(), 1);
     assert_eq!(
@@ -708,7 +713,8 @@ async fn eip155_reverify_threads_the_signed_nonce() {
 #[tokio::test]
 async fn eip155_reverify_refuses_a_missing_or_malformed_nonce() {
     // (a) No `authorization` in the payload at all.
-    let (engine, quote_id, _dir) = settled_eip155(serde_json::json!({ "signature": "0xsig" })).await;
+    let (engine, quote_id, _dir) =
+        settled_eip155(serde_json::json!({ "signature": "0xsig" })).await;
     let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
         tier: VerificationTier::Confirmed(3),
         delivered: Some("2500".into()),
@@ -738,7 +744,12 @@ async fn eip155_reverify_refuses_a_missing_or_malformed_nonce() {
         .await
         .expect("engine");
     assert!(
-        matches!(&decision, PaymentDecision::Rejected { reason: RejectReason::BadQuote(_) }),
+        matches!(
+            &decision,
+            PaymentDecision::Rejected {
+                reason: RejectReason::BadQuote(_)
+            }
+        ),
         "malformed nonce must be refused, got {decision:?}"
     );
     assert!(checker.queries.lock().is_empty());
