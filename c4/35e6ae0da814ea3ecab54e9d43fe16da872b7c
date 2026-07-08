@@ -1,0 +1,24 @@
+net/crates/net/payments/src/flow/mod.rs
+  s_ac213343b6b34b::t_82376763afda88 47-74
+net/crates/net/payments/src/flow/mesh.rs
+  s_ac213343b6b34b::t_7764cb28b39e18 252-254
+net/crates/net/payments/src/flow/mcp_gate.rs
+  s_ac213343b6b34b::t_93f657f7c67f10 79-81
+  s_ac213343b6b34b::t_b16dcb96ee635c 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c435e6ae0da814ea3ecab54e9d43fe16da872b7c",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
