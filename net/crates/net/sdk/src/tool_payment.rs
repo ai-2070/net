@@ -188,23 +188,25 @@ pub struct Recovery {
 /// The v1 reason ↔ recovery mapping (redeem + admission stages) is the
 /// caller-facing contract — agents branch on it:
 ///
-/// | reason | stage | class | actor | retryable | safe_to_retry | safe_to_requote | funds_moved | prior_payment |
-/// |---|---|---|---|---|---|---|---|---|
-/// | `missing_quote` | admission | new_quote_required | caller_agent | false | false | true | no | none |
-/// | `gate_missing` | admission | provider_configuration_error | provider_operator | false | false | false | no | none |
-/// | `unknown_quote` | redeem | new_quote_required | caller_agent | false | false | true | no | none |
-/// | `binding_malformed` | redeem | caller_configuration_error | caller_operator | false | false | false | unknown | unknown |
-/// | `binding_rejected` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown |
-/// | `payer_record_corrupt` | redeem | provider_configuration_error | provider_operator | false | false | false | unknown | unknown |
-/// | `quote_frozen` | redeem | non_recoverable | caller_operator | false | false | false | unknown | unknown |
-/// | `not_settled` | redeem | payment_required | caller_agent | true | true | true | no | none |
-/// | `settlement_pending` | redeem | automatic_retry | caller_agent | true | true | true | unknown | pending |
-/// | `wrong_tool_binding` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown |
-/// | `already_redeemed` | redeem | new_quote_required | caller_agent | false | false | true | yes | consumed |
-/// | `engine_unavailable` | redeem | provider_configuration_error | provider_operator | true | true | true | unknown | unknown |
+/// | reason | stage | class | actor | retryable | safe_to_retry | safe_to_requote | funds_moved | prior_payment | next_action |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | `missing_quote` | admission | new_quote_required | caller_agent | false | false | true | no | none | `request_new_quote` |
+/// | `gate_missing` | admission | provider_configuration_error | provider_operator | false | false | false | no | none | `configure_payment_gate` |
+/// | `unknown_quote` | redeem | new_quote_required | caller_agent | false | false | true | no | none | `request_new_quote` |
+/// | `binding_malformed` | redeem | caller_configuration_error | caller_operator | false | false | false | unknown | unknown | `fix_payment_client` |
+/// | `binding_rejected` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown | — |
+/// | `payer_record_corrupt` | redeem | provider_configuration_error | provider_operator | false | false | false | unknown | unknown | `contact_provider_operator` |
+/// | `quote_frozen` | redeem | non_recoverable | caller_operator | false | false | false | unknown | unknown | — |
+/// | `not_settled` | redeem | payment_required | caller_agent | true | true | true | no | none | `complete_payment` |
+/// | `settlement_pending` | redeem | automatic_retry | caller_agent | true | true | true | unknown | pending | `retry_after_reverification` |
+/// | `wrong_tool_binding` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown | — |
+/// | `already_redeemed` | redeem | new_quote_required | caller_agent | false | false | true | yes | consumed | `request_new_quote` |
+/// | `engine_unavailable` | redeem | provider_configuration_error | provider_operator | true | true | true | unknown | unknown | `retry_later` |
 ///
-/// Binding-failure rows are deliberately `unknown`/`unknown`: a failed
-/// possession proof learns nothing about payment state.
+/// A `—` in `next_action` is `None` on the wire (the security and
+/// non-recoverable rows advise no next step). Binding-failure rows are
+/// deliberately `unknown`/`unknown`: a failed possession proof learns
+/// nothing about payment state.
 ///
 /// Reserved reasons (documented now, no v1 producer — future surfaces
 /// must use these names): `insufficient_funds`, `no_wallet_configured`,
@@ -491,5 +493,20 @@ mod tests {
         assert!(capped.len() <= MAX_SCHEMATIC_MESSAGE_BYTES);
         assert!(capped.chars().all(|c| c == 'é'));
         assert_eq!(FailureSchematic::cap_message("fits"), "fits");
+    }
+
+    /// The admission-stage rows of the mapping table's `next_action`
+    /// column — pinned at the constructors so the doc and code stay in
+    /// step (the redeem rows are pinned in `net-payments`' flow tests).
+    #[test]
+    fn admission_next_action_hints_match_the_mapping_table() {
+        assert_eq!(
+            FailureSchematic::missing_quote("t").recovery.next_action.as_deref(),
+            Some("request_new_quote")
+        );
+        assert_eq!(
+            FailureSchematic::gate_missing("t").recovery.next_action.as_deref(),
+            Some("configure_payment_gate")
+        );
     }
 }

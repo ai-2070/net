@@ -1144,4 +1144,50 @@ mod denial_render_tests {
         assert!(!denial.schematic.message.contains("facilitator"));
         assert!(!denial.schematic.message.contains("eip155"));
     }
+
+    /// The `next_action` column of the caller-facing mapping table
+    /// (`FailureSchematic`'s doc) — pinned here so the table and
+    /// `denial_for` cannot drift. Security and non-recoverable rows
+    /// advise nothing (`None`).
+    #[test]
+    fn next_action_hints_match_the_mapping_table() {
+        let na = |r: &R| denial_for(r, "t", "q").schematic.recovery.next_action;
+        assert_eq!(na(&R::UnknownQuote).as_deref(), Some("request_new_quote"));
+        assert_eq!(
+            na(&R::BindingMalformed).as_deref(),
+            Some("fix_payment_client")
+        );
+        assert_eq!(na(&R::BindingRejected), None);
+        assert_eq!(
+            na(&R::PayerRecordCorrupt).as_deref(),
+            Some("contact_provider_operator")
+        );
+        assert_eq!(
+            na(&R::QuoteFrozen {
+                freeze_reason: "x".into()
+            }),
+            None
+        );
+        assert_eq!(na(&R::NotSettled).as_deref(), Some("complete_payment"));
+        assert_eq!(
+            na(&R::SettlementPending).as_deref(),
+            Some("retry_after_reverification")
+        );
+        assert_eq!(
+            na(&R::WrongToolBinding {
+                capability: "p/a".into(),
+                tool_id: "b".into()
+            }),
+            None
+        );
+        assert_eq!(na(&R::AlreadyRedeemed).as_deref(), Some("request_new_quote"));
+        assert_eq!(
+            engine_unavailable_denial("t", "q")
+                .schematic
+                .recovery
+                .next_action
+                .as_deref(),
+            Some("retry_later")
+        );
+    }
 }
