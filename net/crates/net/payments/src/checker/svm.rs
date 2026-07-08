@@ -243,7 +243,15 @@ fn payer_edge_amount(tx: &Value, payer: &str, to: &str, token: &str) -> u128 {
         .flatten()
         .map(|k| k["pubkey"].as_str().or(k.as_str()).unwrap_or_default())
         .collect();
-    let mut ata: std::collections::BTreeMap<&str, (&str, &str)> = std::collections::BTreeMap::new();
+    // Only the MERCHANT's ATAs (owner == `to`), pubkey → mint. The map is
+    // consulted purely to resolve a transfer's destination, and only a
+    // merchant-owned destination can attribute anything — so scope it to
+    // the merchant up front rather than mapping every account. Membership
+    // then *is* the destination-ownership check (no separate `owner == to`
+    // downstream); the stored mint resolves plain `transfer` (which names
+    // none).
+    let mut merchant_ata: std::collections::BTreeMap<&str, &str> =
+        std::collections::BTreeMap::new();
     for entries in [
         &tx["meta"]["preTokenBalances"],
         &tx["meta"]["postTokenBalances"],
@@ -256,8 +264,11 @@ fn payer_edge_amount(tx: &Value, payer: &str, to: &str, token: &str) -> u128 {
             ) else {
                 continue;
             };
+            if owner != to {
+                continue;
+            }
             if let Some(pubkey) = usize::try_from(index).ok().and_then(|i| keys.get(i)) {
-                ata.insert(pubkey, (owner, mint));
+                merchant_ata.insert(pubkey, mint);
             }
         }
     }
@@ -293,15 +304,14 @@ fn payer_edge_amount(tx: &Value, payer: &str, to: &str, token: &str) -> u128 {
         if authority != Some(payer) {
             continue;
         }
-        let Some((dest_owner, dest_mint)) = info["destination"]
+        // Destination must be a merchant-owned ATA (map membership is the
+        // ownership check).
+        let Some(dest_mint) = info["destination"]
             .as_str()
-            .and_then(|dest| ata.get(dest).copied())
+            .and_then(|dest| merchant_ata.get(dest).copied())
         else {
             continue;
         };
-        if dest_owner != to {
-            continue;
-        }
         // `transferChecked` names its mint; plain `transfer` resolves
         // through the destination's balance entry.
         let mint_ok = info["mint"]
