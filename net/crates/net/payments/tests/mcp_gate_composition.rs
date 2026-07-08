@@ -73,8 +73,8 @@ impl CapabilityGateway for PaidToolGateway {
         // binding, so this composition also proves the signature the
         // flow produced verifies against the paying identity.
         let Some(proof) = payment else {
-            return Err(GatewayError::Denied(
-                "paid tool invoked without a payment quote".to_string(),
+            return Err(GatewayError::denied(
+                "paid tool invoked without a payment quote",
             ));
         };
         assert!(
@@ -88,7 +88,10 @@ impl CapabilityGateway for PaidToolGateway {
                 proof.binding_sig.as_deref(),
             )
             .await
-            .map_err(GatewayError::Denied)?;
+            .map_err(|denial| GatewayError::Denied {
+                message: denial.message,
+                schematic: Some(Box::new(denial.schematic)),
+            })?;
         self.handler_runs.fetch_add(1, Ordering::SeqCst);
         Ok(CallToolResult::text_ok(format!("handled {arguments}")))
     }
@@ -297,7 +300,7 @@ async fn without_a_flow_the_paid_capability_fails_closed() {
     )
     .await;
     assert!(
-        matches!(out, GatedOutcome::Failed(GatewayError::Denied(_))),
+        matches!(out, GatedOutcome::Failed(GatewayError::Denied { .. })),
         "{out:?}"
     );
     assert_eq!(w.gateway.handler_runs.load(Ordering::SeqCst), 0);

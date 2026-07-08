@@ -75,7 +75,7 @@ impl PaymentAdmission for EnginePaymentAdmission {
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), net_sdk::tool_payment::GateDenial> {
         // Single-sourced with the SDK-native gate
         // (`mesh::EngineToolPaymentGate`) — see `flow::redeem_via_engine`.
         super::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await

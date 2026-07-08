@@ -352,31 +352,38 @@ fn default_retryable_classifies_canonical_errors() {
     assert!(default_retryable(&RpcError::ServerError {
         status: RpcStatus::Internal.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     assert!(default_retryable(&RpcError::ServerError {
         status: RpcStatus::Backpressure.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     assert!(default_retryable(&RpcError::ServerError {
         status: RpcStatus::Timeout.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     // ServerError(Application / NotFound / Unauthorized / etc.) → not retry.
     assert!(!default_retryable(&RpcError::ServerError {
         status: RpcStatus::Application(net_sdk::mesh_rpc::NRPC_TYPED_HANDLER_ERROR).to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     assert!(!default_retryable(&RpcError::ServerError {
         status: RpcStatus::NotFound.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     assert!(!default_retryable(&RpcError::ServerError {
         status: RpcStatus::Unauthorized.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     assert!(!default_retryable(&RpcError::ServerError {
         status: RpcStatus::UnknownVersion.to_wire(),
         message: "x".into(),
+        headers: vec![],
     }));
     // Codec failures are caller-fixable bugs (wrong codec, schema
     // drift, malformed Serialize/Deserialize impl). Retrying just

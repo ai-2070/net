@@ -458,8 +458,8 @@ impl<G: CapabilityGateway> Shim<G> {
                     id.display()
                 ))
             }
-            GatedOutcome::Failed(GatewayError::Denied(reason)) => {
-                CallToolResult::text_error(denied_message(&reason))
+            GatedOutcome::Failed(GatewayError::Denied { message, schematic }) => {
+                denied_result(&message, schematic)
             }
             GatedOutcome::Failed(e) => CallToolResult::text_error(gateway_error_text(&e)),
         }
@@ -674,11 +674,25 @@ fn safe_tool_name(id: &CapabilityId) -> String {
 fn gateway_error_text(e: &GatewayError) -> String {
     match e {
         GatewayError::NoDaemon => super::MSG_NO_DAEMON.to_string(),
-        GatewayError::Denied(reason) => denied_message(reason),
+        GatewayError::Denied { message, .. } => denied_message(message),
         GatewayError::NotFound(id) => format!("no capability found for `{id}`"),
         GatewayError::Transport(m) => format!("transport error reaching the mesh: {m}"),
         GatewayError::Other(m) => m.clone(),
     }
+}
+
+/// Render a denial for the MCP client: the text stays the human message
+/// (compact, primary), and the failure schematic — when the provider
+/// attached one — rides `structured_content`, the field MCP already has
+/// for machine-readable payloads. An agent branches on
+/// `structured_content.reason` / `recovery` without parsing prose.
+fn denied_result(
+    message: &str,
+    schematic: Option<Box<net_sdk::tool_payment::FailureSchematic>>,
+) -> CallToolResult {
+    let mut result = CallToolResult::text_error(denied_message(message));
+    result.structured_content = schematic.and_then(|s| serde_json::to_value(*s).ok());
+    result
 }
 
 /// The wrapper-denied message. When the reason is the canonical owner-scope
@@ -777,8 +791,8 @@ mod tests {
                 return Err(GatewayError::NotFound(id.display()));
             }
             if self.deny.contains(&id.display()) {
-                return Err(GatewayError::Denied(
-                    crate::wrap::invoke::OWNER_SCOPE_REJECTION.to_string(),
+                return Err(GatewayError::denied(
+                    crate::wrap::invoke::OWNER_SCOPE_REJECTION,
                 ));
             }
             Ok(CallToolResult::text_ok(format!(
@@ -1703,5 +1717,30 @@ mod tests {
         );
         // Any other reason is wrapped generically.
         assert_eq!(denied_message("nope"), "Denied by remote wrapper: nope.");
+    }
+
+    /// The MCP projection: a denial's text stays the human message and
+    /// the failure schematic rides `structured_content` — the agent
+    /// branches on `reason`/`recovery` without parsing prose. Without a
+    /// schematic, the result is exactly the pre-schematic rendering.
+    #[test]
+    fn a_denied_result_projects_the_schematic_into_structured_content() {
+        let schematic = net_sdk::tool_payment::FailureSchematic::missing_quote("paid_echo");
+        let with = denied_result("no quote attached", Some(Box::new(schematic)));
+        assert!(with.is_error);
+        assert!(with.text().contains("Denied by remote wrapper"));
+        let structured = with.structured_content.expect("schematic projected");
+        assert_eq!(
+            structured.get("object").and_then(|v| v.as_str()),
+            Some(net_sdk::tool_payment::TAG_PAYMENT_FAILURE)
+        );
+        assert_eq!(
+            structured.get("reason").and_then(|v| v.as_str()),
+            Some("missing_quote")
+        );
+
+        let without = denied_result("no quote attached", None);
+        assert!(without.is_error);
+        assert!(without.structured_content.is_none());
     }
 }

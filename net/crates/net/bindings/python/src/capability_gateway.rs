@@ -118,7 +118,7 @@ async fn load_pins(path: &Option<PathBuf>) -> Option<PinStore> {
 fn gateway_status(e: &GatewayError) -> &'static str {
     match e {
         GatewayError::NotFound(_) => "not_found",
-        GatewayError::Denied(_) => "denied",
+        GatewayError::Denied { .. } => "denied",
         GatewayError::NoDaemon => "no_daemon",
         GatewayError::Transport(_) => "transport_error",
         GatewayError::Other(_) => "error",
@@ -191,10 +191,26 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
             "policy_reason": policy_reason,
             "approve_hint": approve_hint,
         }),
-        GatedOutcome::Failed(e) => json!({
-            "status": gateway_status(&e),
-            "error": e.to_string(),
-        }),
+        GatedOutcome::Failed(e) => {
+            let mut failed = json!({
+                "status": gateway_status(&e),
+                "error": e.to_string(),
+            });
+            // The provider's structured verdict (`net.payment.failure@1`),
+            // when one rode the refusal — beside the error string, never
+            // instead of it. Agents branch on `failure.reason` /
+            // `failure.recovery` without parsing prose.
+            if let GatewayError::Denied {
+                schematic: Some(schematic),
+                ..
+            } = &e
+            {
+                if let Ok(failure) = serde_json::to_value(schematic.as_ref()) {
+                    failed["failure"] = failure;
+                }
+            }
+            failed
+        }
     };
     v.to_string()
 }
@@ -865,5 +881,30 @@ mod tests {
             .unwrap();
         assert_eq!(c.profile, "production", "fail-closed default profile");
         assert!(c.signer.is_none());
+    }
+
+    /// A denied outcome projects the provider's failure schematic as a
+    /// `failure` object beside the `error` string — never instead of it;
+    /// a schematic-less denial is exactly the pre-schematic shape.
+    #[test]
+    fn a_denied_outcome_projects_the_failure_schematic() {
+        let id = CapabilityId::parse("prov/tool").expect("cap id");
+        let schematic = net_sdk::tool_payment::FailureSchematic::missing_quote("tool");
+        let denied = GatedOutcome::Failed(GatewayError::Denied {
+            message: "paid tool invoked without a payment quote header".into(),
+            schematic: Some(Box::new(schematic)),
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&outcome_to_json(&id, denied)).expect("json");
+        assert_eq!(v["status"], "denied");
+        assert!(v["error"].as_str().unwrap().contains("payment quote"));
+        assert_eq!(v["failure"]["reason"], "missing_quote");
+        assert_eq!(v["failure"]["object"], "net.payment.failure@1");
+
+        let plain = GatedOutcome::Failed(GatewayError::denied("owner scope"));
+        let v: serde_json::Value =
+            serde_json::from_str(&outcome_to_json(&id, plain)).expect("json");
+        assert_eq!(v["status"], "denied");
+        assert!(v.get("failure").is_none(), "no schematic, no failure field");
     }
 }

@@ -17,7 +17,7 @@ use net_payments::core::verification::{
 };
 use net_payments::engine::{
     invocation_binding_transcript, AdmitAll, PaymentDecision, PaymentEngine,
-    ProviderAdmissionPolicy, RedeemDecision, RejectReason,
+    ProviderAdmissionPolicy, RedeemDecision, RedeemDenialReason, RejectReason,
 };
 use net_payments::facilitator::mock::{MockFacilitator, MockMode, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::facilitator::{
@@ -1092,16 +1092,22 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     let h = harness();
     let quote = h.quote("2500");
 
-    // Unpaid: nothing to redeem.
+    // Unpaid: nothing to redeem. An issued-but-never-attempted quote
+    // has no record at all (records are minted at claim time, and a
+    // released claim removes them), so the typed verdict is
+    // UnknownQuote — "no payment exists for this invocation" — never
+    // the pending vocabulary.
     let unpaid = h
         .engine
         .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
         .await
         .unwrap();
-    assert!(
-        matches!(unpaid, RedeemDecision::Denied { .. }),
-        "got {unpaid:?}"
-    );
+    match unpaid {
+        RedeemDecision::Denied { reason } => {
+            assert_eq!(reason, RedeemDenialReason::UnknownQuote)
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
 
     // Pay + serve.
     let payload = payload_for(&quote, "payer-1");
@@ -1119,7 +1125,9 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
         .await
         .unwrap();
     match wrong_tool {
-        RedeemDecision::Denied { reason } => assert!(reason.contains("bound"), "{reason}"),
+        RedeemDecision::Denied { reason } => {
+            assert!(reason.to_string().contains("bound"), "{reason}")
+        }
         other => panic!("expected Denied, got {other:?}"),
     }
 
@@ -1140,9 +1148,74 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
         .unwrap();
     match again {
         RedeemDecision::Denied { reason } => {
-            assert!(reason.contains("already redeemed"), "{reason}")
+            assert!(reason.to_string().contains("already redeemed"), "{reason}")
         }
         other => panic!("expected Denied, got {other:?}"),
+    }
+}
+
+/// The redeem-denial vocabulary is a wire contract twice over: `Display`
+/// is the human message the error body has always carried, and
+/// `wire_reason` is the schematic's `reason` token. Drift in either
+/// fails here, not in a consumer.
+#[test]
+fn the_redeem_denial_vocabulary_is_pinned() {
+    use RedeemDenialReason as R;
+    let rows: [(R, &str, &str); 9] = [
+        (
+            R::UnknownQuote,
+            "unknown_quote",
+            "unknown quote — no payment exists for this invocation",
+        ),
+        (
+            R::BindingMalformed,
+            "binding_malformed",
+            "invocation binding is not a 64-byte signature",
+        ),
+        (
+            R::BindingRejected,
+            "binding_rejected",
+            "invocation binding signature does not verify against the paying identity",
+        ),
+        (
+            R::PayerRecordCorrupt,
+            "payer_record_corrupt",
+            "payer identity corrupt in record",
+        ),
+        (
+            R::QuoteFrozen {
+                freeze_reason: "reorged_out".into(),
+            },
+            "quote_frozen",
+            "quote is frozen (reorged_out) — nothing serves against it",
+        ),
+        (
+            R::NotSettled,
+            "not_settled",
+            "quote is not settled/billed — the payment never completed",
+        ),
+        (
+            R::SettlementPending,
+            "settlement_pending",
+            "quote settlement is recorded but not yet billed — awaiting verification confidence",
+        ),
+        (
+            R::WrongToolBinding {
+                capability: "prov/tool-a".into(),
+                tool_id: "tool-b".into(),
+            },
+            "wrong_tool_binding",
+            "quote is bound to capability `prov/tool-a`, not to tool `tool-b`",
+        ),
+        (
+            R::AlreadyRedeemed,
+            "already_redeemed",
+            "quote already redeemed — one payment, one serve",
+        ),
+    ];
+    for (reason, token, message) in rows {
+        assert_eq!(reason.wire_reason(), token);
+        assert_eq!(reason.to_string(), message);
     }
 }
 
@@ -1170,7 +1243,7 @@ async fn a_signed_binding_must_verify_against_the_paying_identity() {
         .unwrap();
     match denied {
         RedeemDecision::Denied { reason } => {
-            assert!(reason.contains("does not verify"), "{reason}")
+            assert!(reason.to_string().contains("does not verify"), "{reason}")
         }
         other => panic!("expected Denied, got {other:?}"),
     }
@@ -1240,7 +1313,9 @@ async fn redemption_denies_frozen_quotes() {
         .await
         .unwrap();
     match redemption {
-        RedeemDecision::Denied { reason } => assert!(reason.contains("frozen"), "{reason}"),
+        RedeemDecision::Denied { reason } => {
+            assert!(reason.to_string().contains("frozen"), "{reason}")
+        }
         other => panic!("expected Denied, got {other:?}"),
     }
 }

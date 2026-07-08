@@ -14,7 +14,9 @@ use net_payments::core::registry::{default_mock_registry, default_registry_v1};
 use net_payments::core::verification::{
     check_chain, InvalidationReason, VerificationStatus, VerificationTier, VerifierRef,
 };
-use net_payments::engine::{AdmitAll, PaymentDecision, PaymentEngine, RejectReason};
+use net_payments::engine::{
+    AdmitAll, PaymentDecision, PaymentEngine, RedeemDecision, RedeemDenialReason, RejectReason,
+};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::x402::payload::PaymentPayload;
 use net_payments::x402::requirements::PaymentRequirements;
@@ -284,6 +286,32 @@ async fn a_reverted_settlement_invalidates_and_freezes() {
         redemption,
         net_payments::engine::RedeemDecision::Denied { .. }
     ));
+}
+
+/// A settlement below the required tier denies redemption with the
+/// *pending* vocabulary, never "never completed": the payment exists
+/// and awaits confidence — "never paid" and "paid, awaiting confidence"
+/// route differently on the caller side.
+#[tokio::test]
+async fn a_pending_settlement_denies_redemption_as_pending_not_unpaid() {
+    let (w, decision) = settled_world(VerificationTier::Confirmed(1)).await;
+    assert!(
+        matches!(decision, PaymentDecision::PendingTier { .. }),
+        "{decision:?}"
+    );
+
+    let redemption = w
+        .engine
+        .redeem_for_invocation("fixture-tool", &w.quote_id, None)
+        .await
+        .unwrap();
+    match redemption {
+        RedeemDecision::Denied { reason } => {
+            assert_eq!(reason, RedeemDenialReason::SettlementPending);
+            assert!(reason.to_string().contains("not yet billed"), "{reason}");
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
 }
 
 #[tokio::test]

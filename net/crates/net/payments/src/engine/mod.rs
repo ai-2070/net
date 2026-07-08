@@ -151,14 +151,71 @@ impl ProviderAdmissionPolicy for AdmitAll {
     }
 }
 
+/// Why the invocation gate refused. The typed source of truth for both
+/// renderings of a redeem denial: `Display` is the human message the
+/// error body has always carried (the exact pre-existing strings —
+/// pinned by test), and [`wire_reason`](Self::wire_reason) is the
+/// stable `reason` token the gates render into a
+/// `net.payment.failure@1` schematic. Never parsed back out of strings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RedeemDenialReason {
+    #[error("unknown quote — no payment exists for this invocation")]
+    UnknownQuote,
+    #[error("invocation binding is not a 64-byte signature")]
+    BindingMalformed,
+    #[error("invocation binding signature does not verify against the paying identity")]
+    BindingRejected,
+    #[error("payer identity corrupt in record")]
+    PayerRecordCorrupt,
+    #[error("quote is frozen ({freeze_reason}) — nothing serves against it")]
+    QuoteFrozen { freeze_reason: String },
+    /// A payment attempt was claimed but no settlement was ever
+    /// recorded — mid-flight right now, or a crash-interrupted attempt
+    /// awaiting TTL reclaim (the M3 state). The payment never
+    /// completed. (A quote never attempted at all has no record —
+    /// records are minted at claim time and a released claim removes
+    /// them — so it denies as [`UnknownQuote`](Self::UnknownQuote).)
+    #[error("quote is not settled/billed — the payment never completed")]
+    NotSettled,
+    /// A settlement is recorded but hasn't completed to billing
+    /// (awaiting tier / re-verify, or held as an exception). Split from
+    /// [`NotSettled`](Self::NotSettled): an incomplete payment and
+    /// "paid, awaiting confidence" route differently.
+    #[error("quote settlement is recorded but not yet billed — awaiting verification confidence")]
+    SettlementPending,
+    #[error("quote is bound to capability `{capability}`, not to tool `{tool_id}`")]
+    WrongToolBinding { capability: String, tool_id: String },
+    #[error("quote already redeemed — one payment, one serve")]
+    AlreadyRedeemed,
+}
+
+impl RedeemDenialReason {
+    /// The stable snake_case `reason` token for the failure schematic.
+    /// Additive-only within `net.payment.failure@1`.
+    pub fn wire_reason(&self) -> &'static str {
+        match self {
+            Self::UnknownQuote => "unknown_quote",
+            Self::BindingMalformed => "binding_malformed",
+            Self::BindingRejected => "binding_rejected",
+            Self::PayerRecordCorrupt => "payer_record_corrupt",
+            Self::QuoteFrozen { .. } => "quote_frozen",
+            Self::NotSettled => "not_settled",
+            Self::SettlementPending => "settlement_pending",
+            Self::WrongToolBinding { .. } => "wrong_tool_binding",
+            Self::AlreadyRedeemed => "already_redeemed",
+        }
+    }
+}
+
 /// The provider-side invocation gate's verdict
 /// ([`PaymentEngine::redeem_for_invocation`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeemDecision {
     /// The quote's one invocation is admitted (and now consumed).
     Admitted,
-    /// Fail-closed rejection; the reason travels to the caller.
-    Denied { reason: String },
+    /// Fail-closed rejection; the typed reason renders the human
+    /// message (its `Display`) that travels to the caller.
+    Denied { reason: RedeemDenialReason },
 }
 
 /// The invocation-binding transcript: what the paying identity signs to
@@ -1424,13 +1481,13 @@ impl PaymentEngine {
         let decision = mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
             let Some(rec) = s.quotes.get_mut(&quote_id) else {
                 return RedeemDecision::Denied {
-                    reason: "unknown quote — no payment exists for this invocation".to_string(),
+                    reason: RedeemDenialReason::UnknownQuote,
                 };
             };
             if let Some(sig) = &binding {
                 let Ok(sig_bytes) = <&[u8; 64]>::try_from(sig.as_slice()) else {
                     return RedeemDecision::Denied {
-                        reason: "invocation binding is not a 64-byte signature".to_string(),
+                        reason: RedeemDenialReason::BindingMalformed,
                     };
                 };
                 let payer = hex::decode(&rec.caller_hex)
@@ -1439,27 +1496,35 @@ impl PaymentEngine {
                     .map(EntityId::from_bytes);
                 let Some(payer) = payer else {
                     return RedeemDecision::Denied {
-                        reason: "payer identity corrupt in record".to_string(),
+                        reason: RedeemDenialReason::PayerRecordCorrupt,
                     };
                 };
                 let transcript = invocation_binding_transcript(&quote_id, &tool_id);
                 if payer.verify_bytes(&transcript, sig_bytes).is_err() {
                     return RedeemDecision::Denied {
-                        reason: "invocation binding signature does not verify against the \
-                                 paying identity"
-                            .to_string(),
+                        reason: RedeemDenialReason::BindingRejected,
                     };
                 }
             }
             if let Some(reason) = &rec.frozen {
                 return RedeemDecision::Denied {
-                    reason: format!("quote is frozen ({reason}) — nothing serves against it"),
+                    reason: RedeemDenialReason::QuoteFrozen {
+                        freeze_reason: reason.clone(),
+                    },
                 };
             }
             if rec.billing.is_none() {
-                return RedeemDecision::Denied {
-                    reason: "quote is not settled/billed — the payment never completed".to_string(),
+                // "Never paid" and "paid, awaiting confidence" route
+                // differently: an empty event chain means no settlement
+                // was ever recorded; a non-empty one means the payment
+                // exists but hasn't completed to billing (pending tier /
+                // re-verify, or held as an exception).
+                let reason = if rec.chain.is_empty() {
+                    RedeemDenialReason::NotSettled
+                } else {
+                    RedeemDenialReason::SettlementPending
                 };
+                return RedeemDecision::Denied { reason };
             }
             // The capability binds `provider/tool`; the tool segment is
             // everything after the first `/` (tool ids may themselves
@@ -1471,15 +1536,15 @@ impl PaymentEngine {
                 .unwrap_or(rec.capability.as_str());
             if bound_tool != tool_id {
                 return RedeemDecision::Denied {
-                    reason: format!(
-                        "quote is bound to capability `{}`, not to tool `{tool_id}`",
-                        rec.capability
-                    ),
+                    reason: RedeemDenialReason::WrongToolBinding {
+                        capability: rec.capability.clone(),
+                        tool_id: tool_id.clone(),
+                    },
                 };
             }
             if rec.redeemed {
                 return RedeemDecision::Denied {
-                    reason: "quote already redeemed — one payment, one serve".to_string(),
+                    reason: RedeemDenialReason::AlreadyRedeemed,
                 };
             }
             rec.redeemed = true;

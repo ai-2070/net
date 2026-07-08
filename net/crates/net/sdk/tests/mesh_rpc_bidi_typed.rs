@@ -149,7 +149,9 @@ async fn client_stream_typed_handler_err_round_trips() {
     .expect("send");
     let err = call.finish().await.expect_err("must error");
     match err {
-        RpcError::ServerError { status, message } => {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
             assert_eq!(status, net_sdk::mesh_rpc::NRPC_TYPED_HANDLER_ERROR);
             assert!(message.contains("application-level reject"));
         }

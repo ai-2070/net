@@ -385,9 +385,11 @@ impl MeshGateway {
             // A provider application error — classify it (authorization verdict
             // vs tool-level vs in-band) in one place so the demand side and the
             // tests agree on the mapping.
-            Err(RpcError::ServerError { status, message }) => {
-                map_invoke_server_error(status, message)
-            }
+            Err(RpcError::ServerError {
+                status,
+                message,
+                headers,
+            }) => map_invoke_server_error(status, message, &headers),
             Err(e) => Err(GatewayError::Transport(e.to_string())),
         }
     }
@@ -413,15 +415,22 @@ impl MeshGateway {
 /// A tool-level error ([`ERR_TOOL`]) rides back as the structured
 /// `CallToolResult`; an upstream / malformed-request error surfaces in-band; any
 /// other status is a generic in-band error.
-fn map_invoke_server_error(status: u16, message: String) -> Result<CallToolResult, GatewayError> {
+fn map_invoke_server_error(
+    status: u16,
+    message: String,
+    headers: &[(String, Vec<u8>)],
+) -> Result<CallToolResult, GatewayError> {
     match status {
         // Payment and policy rejections join the authorization family: an
         // unpaid / already-redeemed / frozen quote, or a policy deny (the
         // in-root toll booth declined), is a verdict, not a tool bug, and no
-        // failover peer would answer differently.
-        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_PAYMENT | ERR_POLICY => {
-            Err(GatewayError::Denied(message))
-        }
+        // failover peer would answer differently. Payment refusals may carry
+        // a failure schematic on the reply headers — decoded tolerantly, so
+        // the human message never depends on it.
+        ERR_OWNER_SCOPE | ERR_DELEGATION | ERR_PAYMENT | ERR_POLICY => Err(GatewayError::Denied {
+            message,
+            schematic: schematic_from_error_headers(headers),
+        }),
         // The wrap handler put the full CallToolResult JSON in the message;
         // recover it so the model sees the structured error, falling back to a
         // plain text error if it won't decode.
@@ -434,6 +443,24 @@ fn map_invoke_server_error(status: u16, message: String) -> Result<CallToolResul
             "provider error {status:#06x}: {message}"
         ))),
     }
+}
+
+/// Decode the failure schematic from an error reply's headers, per the
+/// discipline rule: exactly one `net-failure-schematic` header, valid
+/// JSON, correct object tag — anything else (absent, duplicated,
+/// malformed) is `None` and the human error stands alone. Never an
+/// error: the schematic is a sidecar, not a dependency.
+fn schematic_from_error_headers(
+    headers: &[(String, Vec<u8>)],
+) -> Option<Box<net_sdk::tool_payment::FailureSchematic>> {
+    let mut entries = headers
+        .iter()
+        .filter(|(name, _)| name == net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC);
+    let first = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    net_sdk::tool_payment::FailureSchematic::from_header_bytes(&first.1).map(Box::new)
 }
 
 #[async_trait]
@@ -643,9 +670,9 @@ fn retriable_send_safe(e: &RpcError) -> bool {
 /// Map a describe-call error to a gateway error.
 fn map_describe_error(e: RpcError, node: u64) -> GatewayError {
     match e {
-        RpcError::ServerError { status, message } if status == ERR_OWNER_SCOPE => {
-            GatewayError::Denied(message)
-        }
+        RpcError::ServerError {
+            status, message, ..
+        } if status == ERR_OWNER_SCOPE => GatewayError::denied(message),
         RpcError::NoRoute { .. } => GatewayError::Transport(format!(
             "node {node} does not serve the describe service (not a bridge provider, or withdrawn)"
         )),
@@ -735,6 +762,7 @@ mod tests {
         assert!(!is_retriable(&RpcError::ServerError {
             status: ERR_OWNER_SCOPE,
             message: "denied".into(),
+            headers: vec![],
         }));
     }
 
@@ -753,6 +781,7 @@ mod tests {
         assert!(!retriable_send_safe(&RpcError::ServerError {
             status: ERR_OWNER_SCOPE,
             message: "denied".into(),
+            headers: vec![],
         }));
         assert!(
             is_retriable(&RpcError::Timeout { elapsed_ms: 10 }),
@@ -766,10 +795,11 @@ mod tests {
             RpcError::ServerError {
                 status: ERR_OWNER_SCOPE,
                 message: "caller root identity does not match owner scope".into(),
+                headers: vec![],
             },
             9,
         );
-        assert!(matches!(mapped, GatewayError::Denied(_)));
+        assert!(matches!(mapped, GatewayError::Denied { .. }));
         // A no-route is a transport-level "not a provider", not a denial.
         assert!(matches!(
             map_describe_error(
@@ -790,13 +820,13 @@ mod tests {
         // `denied`) — NOT as an opaque `is_error` tool result a model could
         // mistake for a tool failure and retry.
         assert!(matches!(
-            map_invoke_server_error(ERR_OWNER_SCOPE, "no owner match".into()),
-            Err(GatewayError::Denied(_))
+            map_invoke_server_error(ERR_OWNER_SCOPE, "no owner match".into(), &[]),
+            Err(GatewayError::Denied { .. })
         ));
         assert!(
             matches!(
-                map_invoke_server_error(ERR_DELEGATION, "chain revoked".into()),
-                Err(GatewayError::Denied(m)) if m == "chain revoked"
+                map_invoke_server_error(ERR_DELEGATION, "chain revoked".into(), &[]),
+                Err(GatewayError::Denied { message, .. }) if message == "chain revoked"
             ),
             "a delegation-gate rejection must be Denied, like its owner-scope sibling",
         );
@@ -807,7 +837,7 @@ mod tests {
         // A tool-level error rides back as the structured CallToolResult...
         let structured = CallToolResult::text_error("boom");
         let encoded = serde_json::to_string(&structured).unwrap();
-        match map_invoke_server_error(ERR_TOOL, encoded) {
+        match map_invoke_server_error(ERR_TOOL, encoded, &[]) {
             Ok(r) => {
                 assert!(r.is_error);
                 assert_eq!(r.text(), "boom");
@@ -816,12 +846,12 @@ mod tests {
         }
         // ...upstream / bad-request surface in-band as a text error...
         assert!(matches!(
-            map_invoke_server_error(ERR_UPSTREAM, "unreachable".into()),
+            map_invoke_server_error(ERR_UPSTREAM, "unreachable".into(), &[]),
             Ok(r) if r.is_error && r.text() == "unreachable"
         ));
         // ...and an unknown application status is a generic in-band error (never
         // a Denied, so it can't be confused with an authorization verdict).
-        match map_invoke_server_error(0x8099, "weird".into()) {
+        match map_invoke_server_error(0x8099, "weird".into(), &[]) {
             Ok(r) => {
                 assert!(r.is_error);
                 assert!(r.text().contains("0x8099"), "{}", r.text());
@@ -861,5 +891,57 @@ mod tests {
             "id uses the primary (lowest) node"
         );
         assert_eq!(s.providers, vec![42, 99]);
+    }
+
+    /// The header-discipline rule at the demand side: exactly one valid
+    /// `net-failure-schematic` header decodes; zero, duplicates, or
+    /// malformed bytes leave the human error standing alone — never an
+    /// error, never a guess.
+    #[test]
+    fn a_payment_denial_decodes_its_schematic_per_the_discipline_rule() {
+        let schematic = net_sdk::tool_payment::FailureSchematic::missing_quote("t");
+        let entry = schematic.header_entry().expect("fits");
+
+        // Exactly one valid header -> decoded, riding the denial.
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[entry.clone()]) {
+            Err(GatewayError::Denied {
+                schematic: Some(s), ..
+            }) => assert_eq!(s.reason, "missing_quote"),
+            other => panic!("expected a schematic-carrying denial, got {other:?}"),
+        }
+
+        // Duplicates -> the schematic is ignored entirely.
+        match map_invoke_server_error(
+            ERR_PAYMENT,
+            "no quote".into(),
+            &[entry.clone(), entry.clone()],
+        ) {
+            Err(GatewayError::Denied {
+                schematic: None,
+                message,
+            }) => assert_eq!(message, "no quote"),
+            other => panic!("duplicates must fall back to the human error, got {other:?}"),
+        }
+
+        // Malformed bytes -> ignored.
+        let bad = (
+            net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC.to_string(),
+            b"{ not json".to_vec(),
+        );
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[bad]) {
+            Err(GatewayError::Denied {
+                schematic: None, ..
+            }) => {}
+            other => panic!("malformed must fall back to the human error, got {other:?}"),
+        }
+
+        // A legacy provider (no header) -> exactly today's behavior.
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[]) {
+            Err(GatewayError::Denied {
+                schematic: None,
+                message,
+            }) => assert_eq!(message, "no quote"),
+            other => panic!("expected the plain denial, got {other:?}"),
+        }
     }
 }

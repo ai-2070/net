@@ -44,9 +44,189 @@ pub mod mcp_gate;
 pub mod mesh;
 pub mod signer;
 
+/// Render a typed redeem denial into both caller-facing renderings at
+/// once: the human message (the reason's `Display` — the exact strings
+/// the wire has always carried) and the failure schematic. The single
+/// render site for BOTH gates, so message and schematic are minted
+/// together from the same typed reason and can never drift; the
+/// mapping rows are pinned as `FailureSchematic`'s doc (the
+/// caller-facing contract) and by the tests below.
+#[cfg(any(feature = "mesh", feature = "mcp-gate"))]
+fn denial_for(
+    reason: &crate::engine::RedeemDenialReason,
+    tool_id: &str,
+    quote_id: &str,
+) -> net_sdk::tool_payment::GateDenial {
+    use crate::engine::RedeemDenialReason as R;
+    use net_sdk::tool_payment::failure_vocab as v;
+    // (class, actor, retryable, safe_to_retry, safe_to_requote,
+    //  funds_moved, prior_payment, next_action)
+    #[allow(clippy::type_complexity)]
+    let (class, actor, retryable, retry, requote, funds, prior, next): (
+        &str,
+        &str,
+        bool,
+        bool,
+        bool,
+        &str,
+        &str,
+        Option<&str>,
+    ) = match reason {
+        R::UnknownQuote => (
+            v::CLASS_NEW_QUOTE_REQUIRED,
+            v::ACTOR_CALLER_AGENT,
+            false,
+            false,
+            true,
+            v::FUNDS_NO,
+            v::PRIOR_NONE,
+            Some("request_new_quote"),
+        ),
+        R::BindingMalformed => (
+            v::CLASS_CALLER_CONFIGURATION_ERROR,
+            v::ACTOR_CALLER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            Some("fix_payment_client"),
+        ),
+        // Security rows advise nothing: do not retry, do not just buy
+        // another quote — report the mismatch.
+        R::BindingRejected | R::WrongToolBinding { .. } => (
+            v::CLASS_SECURITY_VIOLATION,
+            v::ACTOR_CALLER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            None,
+        ),
+        R::PayerRecordCorrupt => (
+            v::CLASS_PROVIDER_CONFIGURATION_ERROR,
+            v::ACTOR_PROVIDER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            Some("contact_provider_operator"),
+        ),
+        // A freeze often signals replay/wrong-chain/reorg — typed
+        // subreasons are reserved; until then the conservative verdict.
+        R::QuoteFrozen { .. } => (
+            v::CLASS_NON_RECOVERABLE,
+            v::ACTOR_CALLER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            None,
+        ),
+        R::NotSettled => (
+            v::CLASS_PAYMENT_REQUIRED,
+            v::ACTOR_CALLER_AGENT,
+            true,
+            true,
+            true,
+            v::FUNDS_NO,
+            v::PRIOR_NONE,
+            Some("complete_payment"),
+        ),
+        R::SettlementPending => (
+            v::CLASS_AUTOMATIC_RETRY,
+            v::ACTOR_CALLER_AGENT,
+            true,
+            true,
+            true,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_PENDING,
+            Some("retry_after_reverification"),
+        ),
+        R::AlreadyRedeemed => (
+            v::CLASS_NEW_QUOTE_REQUIRED,
+            v::ACTOR_CALLER_AGENT,
+            false,
+            false,
+            true,
+            v::FUNDS_YES,
+            v::PRIOR_CONSUMED,
+            Some("request_new_quote"),
+        ),
+    };
+    let message = reason.to_string();
+    net_sdk::tool_payment::GateDenial {
+        schematic: net_sdk::tool_payment::FailureSchematic {
+            object: net_sdk::tool_payment::TAG_PAYMENT_FAILURE.to_string(),
+            code: v::CODE_PAYMENT.to_string(),
+            stage: v::STAGE_REDEEM.to_string(),
+            reason: reason.wire_reason().to_string(),
+            message: net_sdk::tool_payment::FailureSchematic::cap_message(&message),
+            retryable,
+            recovery: net_sdk::tool_payment::Recovery {
+                class: class.to_string(),
+                actor: actor.to_string(),
+                safe_to_retry: retry,
+                safe_to_requote: requote,
+                next_action: next.map(str::to_string),
+            },
+            handler_executed: false,
+            funds_moved: funds.to_string(),
+            prior_payment: prior.to_string(),
+            quote_id: Some(quote_id.to_string()),
+            tool_id: Some(tool_id.to_string()),
+            extra: Default::default(),
+        },
+        message,
+    }
+}
+
+/// The fail-closed engine-failure denial, rendered from NOTHING but the
+/// generic verdict: the raw `EngineError` (file paths, serde detail,
+/// facilitator responses) is logged server-side by the caller of this
+/// function and never reaches it — the scrub survives by construction.
+#[cfg(any(feature = "mesh", feature = "mcp-gate"))]
+fn engine_unavailable_denial(tool_id: &str, quote_id: &str) -> net_sdk::tool_payment::GateDenial {
+    use net_sdk::tool_payment::failure_vocab as v;
+    let message = "payment engine unavailable (fail-closed)".to_string();
+    net_sdk::tool_payment::GateDenial {
+        schematic: net_sdk::tool_payment::FailureSchematic {
+            object: net_sdk::tool_payment::TAG_PAYMENT_FAILURE.to_string(),
+            code: v::CODE_PAYMENT.to_string(),
+            stage: v::STAGE_REDEEM.to_string(),
+            reason: "engine_unavailable".to_string(),
+            message: message.clone(),
+            // Retry is permitted but nothing stronger is promised — the
+            // scrub can't distinguish transient from broken, and the
+            // caller can't fix engine availability: the actor is the
+            // provider operator.
+            retryable: true,
+            recovery: net_sdk::tool_payment::Recovery {
+                class: v::CLASS_PROVIDER_CONFIGURATION_ERROR.to_string(),
+                actor: v::ACTOR_PROVIDER_OPERATOR.to_string(),
+                safe_to_retry: true,
+                safe_to_requote: true,
+                next_action: Some("retry_later".to_string()),
+            },
+            handler_executed: false,
+            funds_moved: v::FUNDS_UNKNOWN.to_string(),
+            prior_payment: v::PRIOR_UNKNOWN.to_string(),
+            quote_id: Some(quote_id.to_string()),
+            tool_id: Some(tool_id.to_string()),
+            extra: Default::default(),
+        },
+        message,
+    }
+}
+
 /// Redeem a paid quote against the engine for one invocation and map the
 /// outcome to the provider-gate vocabulary: `Ok(())` admits,
-/// `Err(reason)` refuses (the reason travels to the caller). Engine/store
+/// `Err(denial)` refuses — the denial's message travels to the caller as
+/// the error body (byte-identical to the pre-schematic wire) and its
+/// schematic rides the `net-failure-schematic` reply header. Engine/store
 /// failure is fail-closed — never serve on an unverifiable payment.
 ///
 /// Single-sourced so the SDK-native gate (`mesh::EngineToolPaymentGate`)
@@ -61,21 +241,35 @@ pub(crate) async fn redeem_via_engine(
     tool_id: &str,
     quote_id: &str,
     binding: Option<&[u8]>,
-) -> Result<(), String> {
+) -> Result<(), net_sdk::tool_payment::GateDenial> {
     use crate::engine::RedeemDecision;
     match engine
         .redeem_for_invocation(tool_id, quote_id, binding)
         .await
     {
         Ok(RedeemDecision::Admitted) => Ok(()),
-        Ok(RedeemDecision::Denied { reason }) => Err(reason),
+        Ok(RedeemDecision::Denied { reason }) => {
+            let denial = denial_for(&reason, tool_id, quote_id);
+            // Typed fields at the emission point: operators grep
+            // verdicts, not prose.
+            tracing::info!(
+                reason = %denial.schematic.reason,
+                stage = %denial.schematic.stage,
+                recovery_class = %denial.schematic.recovery.class,
+                tool_id,
+                "payment redemption denied"
+            );
+            Err(denial)
+        }
         Err(e) => {
             // Fail-closed — but the raw `EngineError` wraps StoreError /
             // EnvelopeError / X402Error, which can carry file paths, I/O
             // detail, or facilitator responses. Log the specifics
-            // server-side; hand the caller only a generic verdict.
+            // server-side; hand the caller only the generic verdict
+            // (message AND schematic — `engine_unavailable_denial` never
+            // sees the error).
             tracing::error!(error = %e, "payment engine unavailable (fail-closed)");
-            Err("payment engine unavailable (fail-closed)".to_string())
+            Err(engine_unavailable_denial(tool_id, quote_id))
         }
     }
 }
@@ -822,5 +1016,95 @@ pub fn exact_evm_authorization_for_quote(
         valid_after,
         valid_before,
         nonce,
+    }
+}
+
+#[cfg(all(test, any(feature = "mesh", feature = "mcp-gate")))]
+mod denial_render_tests {
+    use super::*;
+    use crate::engine::RedeemDenialReason as R;
+
+    fn all_reasons() -> Vec<R> {
+        vec![
+            R::UnknownQuote,
+            R::BindingMalformed,
+            R::BindingRejected,
+            R::PayerRecordCorrupt,
+            R::QuoteFrozen {
+                // Freeze reasons are free-form strings (facilitator
+                // invalidation reasons among them) — budget-test a fat one.
+                freeze_reason: "settlement reported on `eip155:1` , quote is on `eip155:84532` \
+                                — and a very long facilitator diagnostic follows"
+                    .repeat(4),
+            },
+            R::NotSettled,
+            R::SettlementPending,
+            R::WrongToolBinding {
+                capability: "some-provider/some-tool-with-a-longish-name".into(),
+                tool_id: "another-tool-with-a-longish-name".into(),
+            },
+            R::AlreadyRedeemed,
+        ]
+    }
+
+    /// Every redeem denial renders a schematic that fits the wire's
+    /// header budget, carries the typed reason's wire token, states the
+    /// invariant (`handler_executed: false`), and keeps the human
+    /// message byte-identical to the reason's `Display`.
+    #[test]
+    fn every_redeem_denial_renders_within_the_header_budget() {
+        let quote_id = "q_0123456789abcdef0123456789abcdef0123456789abcdef";
+        for reason in all_reasons() {
+            let denial = denial_for(&reason, "some-provider/some-tool", quote_id);
+            assert_eq!(denial.message, reason.to_string());
+            let s = &denial.schematic;
+            assert_eq!(s.reason, reason.wire_reason());
+            assert_eq!(s.stage, "redeem");
+            assert!(!s.handler_executed);
+            assert!(
+                s.header_entry().is_some(),
+                "`{}` must fit the wire budget",
+                s.reason
+            );
+        }
+        let engine = engine_unavailable_denial("some-tool", quote_id);
+        assert_eq!(engine.message, "payment engine unavailable (fail-closed)");
+        assert_eq!(engine.schematic.reason, "engine_unavailable");
+        assert!(engine.schematic.header_entry().is_some());
+    }
+
+    /// The risk-table pin: security rows never advise a retry or a
+    /// fresh quote — "do not just buy another quote and try again."
+    #[test]
+    fn security_rows_pin_no_retry_no_requote() {
+        let rows = [
+            R::BindingRejected,
+            R::WrongToolBinding {
+                capability: "p/a".into(),
+                tool_id: "b".into(),
+            },
+        ];
+        for reason in rows {
+            let d = denial_for(&reason, "b", "q");
+            assert_eq!(d.schematic.recovery.class, "security_violation");
+            assert!(!d.schematic.retryable);
+            assert!(!d.schematic.recovery.safe_to_retry);
+            assert!(!d.schematic.recovery.safe_to_requote);
+            assert!(d.schematic.recovery.next_action.is_none());
+        }
+    }
+
+    /// The review's split, rendered: an incomplete payment routes to
+    /// "pay it, then retry"; a pending settlement routes to "wait and
+    /// retry" — and the instrument fact differs (`none` vs `pending`).
+    #[test]
+    fn not_settled_and_settlement_pending_route_differently() {
+        let unpaid = denial_for(&R::NotSettled, "t", "q");
+        assert_eq!(unpaid.schematic.recovery.class, "payment_required");
+        assert_eq!(unpaid.schematic.prior_payment, "none");
+        let pending = denial_for(&R::SettlementPending, "t", "q");
+        assert_eq!(pending.schematic.recovery.class, "automatic_retry");
+        assert_eq!(pending.schematic.prior_payment, "pending");
+        assert!(pending.schematic.retryable && pending.schematic.recovery.safe_to_retry);
     }
 }

@@ -85,7 +85,9 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
         InnerRpcError::Timeout { elapsed_ms } => {
             nrpc_err("timeout", format!("elapsed_ms={elapsed_ms}"))
         }
-        InnerRpcError::ServerError { status, message } => nrpc_err(
+        InnerRpcError::ServerError {
+            status, message, ..
+        } => nrpc_err(
             "server_error",
             format!("status=0x{status:04x} message={message}"),
         ),
@@ -2112,7 +2114,7 @@ mod tests {
                 InnerRpcError::Timeout { elapsed_ms } => {
                     format!("{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}")
                 }
-                InnerRpcError::ServerError { status, message } => {
+                InnerRpcError::ServerError { status, message, .. } => {
                     format!(
                         "{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}"
                     )
@@ -2143,6 +2145,7 @@ mod tests {
         assert!(format_kind(InnerRpcError::ServerError {
             status: 0x4001,
             message: "x".into(),
+            headers: vec![],
         })
         .starts_with("nrpc:server_error:"));
         assert!(format_kind(InnerRpcError::Codec {

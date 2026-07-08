@@ -246,6 +246,13 @@ pub enum RpcError {
         /// UTF-8 diagnostic from the response body, when the body
         /// decodes as valid UTF-8; otherwise hex-truncated.
         message: String,
+        /// Reply headers from the error response — the wire has always
+        /// carried them (same frame field as success replies); the
+        /// caller used to discard them here. Empty when the server
+        /// attached none. The message stays the human diagnostic;
+        /// headers are the structured sidecar channel (e.g. a
+        /// `net-failure-schematic` verdict).
+        headers: Vec<(String, Vec<u8>)>,
     },
     /// Underlying transport error (publish failure, encryption,
     /// etc.).
@@ -621,7 +628,11 @@ impl futures::Stream for RpcStream {
                 });
                 self.observer
                     .latch_error(format!("server returned status {status:#06x}: {message}"));
-                std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
+                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
+                    status,
+                    message,
+                    headers: resp.headers,
+                })))
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -958,6 +969,7 @@ impl ClientStreamCallRaw {
             return Err(RpcError::ServerError {
                 status: resp.status.to_wire(),
                 message,
+                headers: resp.headers,
             });
         }
         self.observer.latch_ok();
@@ -1305,7 +1317,11 @@ impl futures::Stream for DuplexStream {
                 self.inner
                     .observer
                     .latch_error(format!("server returned status {status:#06x}: {message}"));
-                std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
+                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
+                    status,
+                    message,
+                    headers: resp.headers,
+                })))
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -3641,7 +3657,11 @@ impl MeshNode {
                     capability: service.to_string(),
                 });
             }
-            Err(RpcError::ServerError { status, message })
+            Err(RpcError::ServerError {
+                status,
+                message,
+                headers: resp.headers,
+            })
         }
     }
 
