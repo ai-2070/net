@@ -218,13 +218,31 @@ struct BalanceRow {
     post: u128,
 }
 
+/// Fold pre/post token balances into `rows`, parsing amounts **only** for
+/// accounts that can participate in the delivered/payer computation —
+/// `mint == token` and `owner ∈ {to, from}` (L2). An unrelated token
+/// account (a different mint, or an owner that is neither the merchant nor
+/// the payer — a router, a CPI intermediary, some third party) is skipped
+/// without parsing, so a malformed/missing `amount` on it cannot poison a
+/// legitimate settlement. A malformed amount on a *relevant* account still
+/// errors, as it must.
 fn fold_balances(
     rows: &mut std::collections::BTreeMap<u64, BalanceRow>,
     entries: &Value,
     post: bool,
     what: &str,
+    token: &str,
+    to: &str,
+    from: Option<&str>,
 ) -> Result<(), CheckerError> {
     for entry in entries.as_array().into_iter().flatten() {
+        // base58 is case-sensitive: mint/owner compare exactly, never
+        // case-folded (unlike eip155 hex).
+        let mint = entry["mint"].as_str().unwrap_or_default();
+        let owner = entry["owner"].as_str().unwrap_or_default();
+        if mint != token || (owner != to && Some(owner) != from) {
+            continue;
+        }
         let Some(index) = entry["accountIndex"].as_u64() else {
             return Err(CheckerError::terminal(format!(
                 "{what} entry carries no accountIndex"
@@ -232,10 +250,8 @@ fn fold_balances(
         };
         let amount = parse_amount(&entry["uiTokenAmount"]["amount"], what)?;
         let row = rows.entry(index).or_default();
-        // base58 is case-sensitive: mint/owner compare exactly, never
-        // case-folded (unlike eip155 hex).
-        row.mint = entry["mint"].as_str().unwrap_or_default().to_string();
-        row.owner = entry["owner"].as_str().unwrap_or_default().to_string();
+        row.mint = mint.to_string();
+        row.owner = owner.to_string();
         if post {
             row.post = amount;
         } else {
@@ -350,12 +366,18 @@ impl ChainChecker for SvmChecker {
                     &tx["meta"]["preTokenBalances"],
                     false,
                     "preTokenBalances",
+                    &q.token,
+                    &q.to,
+                    q.from.as_deref(),
                 )?;
                 fold_balances(
                     &mut rows,
                     &tx["meta"]["postTokenBalances"],
                     true,
                     "postTokenBalances",
+                    &q.token,
+                    &q.to,
+                    q.from.as_deref(),
                 )?;
 
                 // Delivered = the merchant's NET receipt of the mint across

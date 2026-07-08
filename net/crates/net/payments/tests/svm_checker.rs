@@ -361,6 +361,49 @@ async fn delivery_without_a_payer_is_refused() {
     );
 }
 
+/// L2: an unrelated token account in the same transaction (a different
+/// mint, a router/CPI intermediary, some third party) with a malformed or
+/// missing `amount` must be skipped, not poison the whole verification.
+/// Only accounts that participate in the delivered/payer computation are
+/// parsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrelated_token_account_does_not_poison_the_check() {
+    let rpc = RpcFixture::start().await;
+    let checker = SvmChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+    rpc.set_status(finalized());
+    // A valid USDC transfer PAYER -> RECIPIENT, alongside an unrelated
+    // token account whose entry is doubly malformed: `amount` is a number
+    // (not the string SPL always returns) and it carries no accountIndex.
+    // The old eager parse would turn this into a terminal error.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+                {
+                    "mint": "OtherMint1111111111111111111111111111111111",
+                    "owner": "Stranger1111111111111111111111111111111111",
+                    "uiTokenAmount": { "amount": 123 },
+                },
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("an unrelated malformed entry must not poison a valid settlement");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
+}
+
 /// L1: delivered is the merchant's NET receipt across the accounts it
 /// owns, not the sum of per-account positive deltas. When the merchant
 /// receives into one account but an offsetting debit leaves another of the
