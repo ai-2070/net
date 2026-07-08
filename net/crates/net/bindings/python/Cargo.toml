@@ -221,6 +221,15 @@ async-trait = { version = "0.1", optional = true }
 # when the `meshdb` feature activates.
 postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
+[dev-dependencies]
+# The driven-paid-invoke e2e (`capability_gateway` tests, `payments`
+# feature) needs `#[tokio::test]` (macros) + a bounded timeout (time),
+# isolated temp dirs for the spend-policy + engine + billing stores, and
+# `#[async_trait]` for the test's `ToolInvoker` (the trait is async).
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+async-trait = "0.1"
+
 [build-dependencies]
 pyo3-build-config = "0.29.0"
 

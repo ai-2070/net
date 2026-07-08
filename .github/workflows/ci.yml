@@ -1139,7 +1139,7 @@ jobs:
             features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""

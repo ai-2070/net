@@ -907,4 +907,341 @@ mod tests {
         assert_eq!(v["status"], "denied");
         assert!(v.get("failure").is_none(), "no schematic, no failure field");
     }
+
+    /// A served invocation projects `status:"ok"` with the tool result —
+    /// the driven-success branch of `outcome_to_json` (the constructed
+    /// twin of what the paid e2e below asserts over the wire).
+    #[test]
+    fn an_invoked_outcome_projects_status_ok() {
+        let id = CapabilityId::parse("prov/tool").expect("cap id");
+        let mut result = net_mcp::spec::CallToolResult::text_ok("42");
+        result.structured_content = Some(json!({ "sum": 42 }));
+        let v: serde_json::Value =
+            serde_json::from_str(&outcome_to_json(&id, GatedOutcome::Invoked(result)))
+                .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["is_error"], false);
+        assert_eq!(v["text"], "42");
+        assert_eq!(v["structured_content"]["sum"], 42);
+    }
+}
+
+/// The driven paid invoke through the **actual Python demand surface**
+/// (M3 of `docs/plans/PAYMENTS_TEST_MATRIX.md`): `build_payment_flow` →
+/// `do_invoke` (`gated_invoke` over a real `MeshGateway`) →
+/// `outcome_to_json`, exactly the composition `PyCapabilityGateway.invoke`
+/// wraps, against a real two-node paid provider.
+///
+/// The other e2es prove the *provider* gate over the wire
+/// (`mesh_paid_capability_e2e`, `mcp_wrap_paid_e2e`); this proves the
+/// *demand* side the binding owns: it discovers the announced pricing,
+/// runs the caller flow the Python kwargs build, invokes through the
+/// gateway, and projects the outcome to the status-JSON a Python caller
+/// reads. No Python interpreter is touched (`signer = None`), so it runs
+/// as a plain Rust test under `--features payments`.
+#[cfg(all(test, feature = "payments"))]
+mod paid_invoke_e2e {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use net::adapter::net::identity::EntityKeypair;
+    use net_mcp::spec::{CallToolResult, Implementation, Tool};
+    use net_mcp::wrap::{
+        CredentialStatus, LoweringContext, McpError, ServerPublisher, Substitutability,
+        ToolInvoker, WrapConfig,
+    };
+    use net_payments::core::canonical::canonical_bytes;
+    use net_payments::core::registry::default_registry_v1;
+    use net_payments::core::terms::PricingTerms;
+    use net_payments::engine::{AdmitAll, PaymentEngine};
+    use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+    use net_payments::flow::mcp_gate::EnginePaymentAdmission;
+    use net_payments::flow::mesh::serve_payments;
+    use net_payments::flow::{Clock, InProcessProvider, SystemClock};
+    use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
+    use net_payments::x402::requirements::PaymentRequirements;
+    use net_payments::x402::X402Carry;
+    use net_sdk::mesh::MeshBuilder;
+
+    /// The provider's wrapped tool: `add` sums two integers. A counter
+    /// proves it runs only on the paid, admitted invokes.
+    #[derive(Default)]
+    struct AddTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolInvoker for AddTool {
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: Value,
+        ) -> Result<CallToolResult, McpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let a = arguments.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = arguments.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+            let _ = name;
+            Ok(CallToolResult::text_ok((a + b).to_string()))
+        }
+    }
+
+    async fn handshake(server: &SdkMesh, caller: &SdkMesh) {
+        let server_addr = server.inner().local_addr();
+        let server_pub = *server.inner().public_key();
+        let server_id = server.inner().node_id();
+        let caller_id = caller.inner().node_id();
+        let (accept, connect) = tokio::join!(server.inner().accept(caller_id), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            caller
+                .inner()
+                .connect(server_addr, &server_pub, server_id)
+                .await
+        });
+        accept.expect("accept");
+        connect.expect("connect");
+        server.inner().start();
+        caller.inner().start();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_python_surface_drives_a_paid_invoke_and_projects_the_outcome() {
+        let psk = [0x63u8; 32];
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // ── two real nodes ─────────────────────────────────────────
+        let provider_mesh = Arc::new(
+            MeshBuilder::new("127.0.0.1:0", &psk)
+                .expect("builder")
+                .build()
+                .await
+                .expect("provider mesh"),
+        );
+        let caller_mesh = Arc::new(
+            MeshBuilder::new("127.0.0.1:0", &psk)
+                .expect("builder")
+                .build()
+                .await
+                .expect("caller mesh"),
+        );
+        handshake(&provider_mesh, &caller_mesh).await;
+        let provider_id = provider_mesh.inner().node_id();
+
+        // ── provider: engine behind the payment wire + the wrap gate ─
+        let provider_keys = Arc::new(EntityKeypair::generate());
+        // `build_payment_flow` uses `default_registry_v1`; the provider
+        // matches it (a superset of the mock registry, so a mock-scheme
+        // quote validates on both sides).
+        let registry = default_registry_v1(provider_keys.entity_id().clone());
+        let provider_log = Arc::new(net_payments::billing::BillingLog::new(
+            dir.path().join("provider-billing.jsonl"),
+        ));
+        let engine = Arc::new(
+            PaymentEngine::new(
+                provider_keys.clone(),
+                Arc::new(MockFacilitator::new()),
+                Arc::new(AdmitAll),
+                registry.clone(),
+                dir.path().join("engine.json"),
+            )
+            .expect("engine")
+            .with_billing_log(provider_log.clone()),
+        );
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock));
+        let _payments = serve_payments(&provider_mesh, in_process).expect("serve payments");
+
+        // The capability id the whole demand path keys on: describe by
+        // it, pay `id.display()`, redeem `id.capability`.
+        let id = CapabilityId::parse(&format!("{provider_id}/add")).expect("cap id");
+
+        // The announced pricing the caller will discover (the FULL terms
+        // with the mock template — `gated_invoke` fetches this via
+        // `describe` and hands it to the flow).
+        let template = X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "mock-provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author");
+        let terms = PricingTerms::new(
+            provider_keys.entity_id().clone(),
+            id.display(),
+            vec![template],
+            registry.reference().expect("registry reference"),
+        );
+        let terms_json =
+            String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+
+        // Publish the priced tool through the wrap path, gated by the
+        // real engine admission — the announced pricing is the full
+        // terms so the demand-side describe returns something payable.
+        let admission = Arc::new(EnginePaymentAdmission::new(engine.clone()));
+        let mut config = WrapConfig::owner_only(
+            Implementation {
+                name: "payments-e2e".to_string(),
+                version: "1.0".to_string(),
+            },
+            caller_mesh.origin_hash(),
+        );
+        config.pricing.insert("add".to_string(), terms_json);
+        config.payment_admission = Some(admission);
+        let invoker = Arc::new(AddTool::default());
+        let publisher = ServerPublisher::new(Arc::clone(&provider_mesh));
+        let _publication = publisher
+            .publish_tools(
+                &[Tool {
+                    name: "add".to_string(),
+                    title: None,
+                    description: Some("Sum two integers.".to_string()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "a": { "type": "integer" }, "b": { "type": "integer" } }
+                    }),
+                    output_schema: None,
+                }],
+                invoker.clone() as Arc<dyn ToolInvoker>,
+                LoweringContext {
+                    server_version: "1.0".to_string(),
+                    credential_status: CredentialStatus::None,
+                    substitutability: Substitutability::ProviderLocal,
+                    pricing: Default::default(),
+                },
+                config,
+            )
+            .await
+            .expect("publish the priced wrapped tool");
+
+        // ── caller: the EXACT Python demand surface ────────────────
+        // `build_payment_flow` is what the `payment_*` kwargs construct;
+        // `MeshGateway` is what the constructor builds; `do_invoke` is
+        // what `PyCapabilityGateway.invoke` calls.
+        let policy_path = dir.path().join("spend-policy.json");
+        let config = PaymentConfig {
+            policy_path: policy_path.to_string_lossy().into_owned(),
+            profile: "dev_test".to_string(),
+            unsafe_mock_auto_allow: false,
+            signer: None,
+        };
+        let flow = build_payment_flow(caller_mesh.clone(), Some(config))
+            .expect("build the payment flow")
+            .expect("a flow, since a config was supplied");
+        let gateway = MeshGateway::new(caller_mesh.clone());
+        // Consent is the gate *before* payment: allow the capability so
+        // the flow under test is the payment path, not the pin prompt.
+        let mut consent = ConsentPolicy::new();
+        consent.allow(id.clone());
+        let args = json!({ "a": 2, "b": 3 });
+
+        // (1) Paid invoke, DevTest auto-allow → the Python status-JSON
+        //     reports `ok` with the served result.
+        let mut ok = String::new();
+        for _ in 0..5 {
+            ok = do_invoke(
+                &gateway,
+                &consent,
+                &None,
+                Some(flow.as_ref()),
+                id.clone(),
+                args.clone(),
+            )
+            .await;
+            if serde_json::from_str::<Value>(&ok)
+                .ok()
+                .map(|v| v["status"] == "ok")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v: Value = serde_json::from_str(&ok).expect("json");
+        assert_eq!(v["status"], "ok", "the paid invoke projects ok: {ok}");
+        assert_eq!(v["text"], "5", "the served result rides the projection");
+        assert_eq!(
+            invoker.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the invoker ran once for the paid call"
+        );
+        assert_eq!(
+            provider_log.read_all().await.expect("read").len(),
+            1,
+            "one paid serve, one billing event"
+        );
+
+        // (2) Tighten the spend cap below the price → the flow holds and
+        //     the Python surface projects `requires_payment_approval`
+        //     with the quote id + approve hint (the loop's first half).
+        let configurer = SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest);
+        configurer
+            .configure(|defaults, _| {
+                defaults.max_per_call =
+                    Some(net_payments::core::units::AtomicAmount::from_u128(1000));
+            })
+            .await
+            .expect("configure");
+        let held = do_invoke(
+            &gateway,
+            &consent,
+            &None,
+            Some(flow.as_ref()),
+            id.clone(),
+            args.clone(),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&held).expect("json");
+        assert_eq!(
+            v["status"], "requires_payment_approval",
+            "an over-cap invoke holds for approval: {held}"
+        );
+        let quote_id = v["quote_id"].as_str().expect("a held quote id").to_string();
+        assert!(
+            v["approve_hint"].is_string(),
+            "the projection hints how to approve"
+        );
+        assert_eq!(
+            invoker.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a held invoke never reaches the tool"
+        );
+
+        // (3) Approve the held quote → the retry projects `ok` (the
+        //     loop's second half, entirely through the binding's JSON).
+        configurer.approve(&quote_id).await.expect("approve");
+        let mut approved = String::new();
+        for _ in 0..5 {
+            approved = do_invoke(
+                &gateway,
+                &consent,
+                &None,
+                Some(flow.as_ref()),
+                id.clone(),
+                args.clone(),
+            )
+            .await;
+            if serde_json::from_str::<Value>(&approved)
+                .ok()
+                .map(|v| v["status"] == "ok")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v: Value = serde_json::from_str(&approved).expect("json");
+        assert_eq!(
+            v["status"], "ok",
+            "approval unblocks the retry through the Python surface: {approved}"
+        );
+        assert_eq!(v["text"], "5");
+        assert_eq!(
+            invoker.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the approved retry served"
+        );
+    }
 }

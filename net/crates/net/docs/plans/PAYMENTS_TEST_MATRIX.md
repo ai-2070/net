@@ -55,7 +55,7 @@
 | raw `serve_tool` | ✅ | ❌ refused by design (1B) | ✅ refused | n/a | n/a |
 | `serve_tool_paid` | n/a | ✅ `tool_serve_paid::a_paid_native_tool_redeems_before_the_handler_runs` *(scripted gate)*; real engine gate over the wire: `mesh_paid_capability_e2e` (M1); in-process: `native_tool_gate` | ✅ `MissingPricingTerms` | ✅ M1 + in-process | ✅ M1 + in-process |
 | **mesh cross-machine, real engine gate** | — | ✅ `mesh_paid_capability_e2e::a_paid_capability_serves_once_and_only_once_across_the_mesh` | — | ✅ same | ✅ same |
-| Python gateway | ✅ (structured result, kwargs validated) | **M3** | ✅ fail-closed by construction | **M3** | **M3** |
+| Python gateway | ✅ (structured result, kwargs validated) | ✅ `capability_gateway::paid_invoke_e2e::the_python_surface_drives_a_paid_invoke_and_projects_the_outcome` (M3, driven over the wire) | ✅ fail-closed by construction | gate-level (M1/M2) | gate-level (M1/M2) |
 
 M1's mega-e2e (`mesh_paid_capability_e2e`) closes the survey's central gap: it runs the paid tool-invoke path across two real `MeshNode`s with the **real `EngineToolPaymentGate`** over one shared engine — the composition no prior test joined (over-wire paid invokes used scripted gates; real-engine gate tests were in-process; `mesh_payments_e2e` crosses the wire for the payment flow but never invokes a handler).
 
@@ -111,11 +111,14 @@ CI home for any of this: **none today** → M4.
 
 **Acceptance:** the MCP-wrap row of the Tier-2 matrix flips to ✅ with engine receipts. ✅ — passes in 0.12s; full payments suite 212 (was 211).
 
-### M3 — Python gateway: a driven paid invoke
+### M3 — Python gateway: a driven paid invoke — ✅ LANDED
 
-- [ ] A test that *drives* a paid invoke through the Python surface (today: kwargs validation + constructed-denial projection only). Scope honestly at build: preferred shape is a Rust `#[tokio::test]` in `bindings/python` composing `build_payment_flow` + `gated_invoke` + `outcome_to_json` against a real two-node paid provider (the pyo3 classes wrap these same bodies); a pytest smoke rides on top only if a provider can be stood up from the test without new binding surface (the binding publishes free tools only — do NOT grow supply-side surface for a test).
+- [x] A test that *drives* a paid invoke through the Python surface — landed as the preferred shape: a Rust `#[tokio::test]` in `bindings/python/src/capability_gateway.rs` (`paid_invoke_e2e::the_python_surface_drives_a_paid_invoke_and_projects_the_outcome`) composing the *actual* binding bodies — `build_payment_flow` (what the `payment_*` kwargs construct) + `do_invoke` (`gated_invoke` over a real `MeshGateway`, what `PyCapabilityGateway.invoke` calls) + `outcome_to_json` (the status-JSON projection) — against a real two-node paid provider (the M2 wrap-publication provider). No Python interpreter is touched (`signer = None`), so it runs as a plain Rust test.
+- [x] The loop, entirely through the binding's JSON: DevTest auto-allow → `status:"ok"` with the served result; tighten `max_per_call` below the price → `status:"requires_payment_approval"` with the quote id + approve hint; approve the held quote → retry → `status:"ok"`.
+- [x] `outcome_to_json`'s driven-success branch (`Invoked → ok`) also pinned as a constructed unit test (`an_invoked_outcome_projects_status_ok`) — completing the projection coverage alongside the existing `requires_payment_approval` and `denied + failure` constructed tests.
+- [x] **CI wiring:** added `payments` to the net-python cargo-test matrix features (`ci.yml`) — the binding's payment surface (`build_payment_flow`) wasn't compiled in that job before, so this is what makes M3 (and the existing payment projection tests) run per-push. Dev-deps grew `tokio` (macros/time), `tempfile`, `async-trait` (dev-only).
 
-**Acceptance:** the Python row of Tier 2 flips to ✅ for paid/replay/wrong-tool with receipts; the `requires_payment_approval` → approve → retry loop asserted through the binding's own JSON projections.
+**Acceptance:** the Python row of Tier 2 flips to ✅ with driven receipts; the `requires_payment_approval` → approve → retry loop asserted through the binding's own JSON projections. ✅ — passes in 0.24s. Scope honestly recorded: *replay* and *wrong-tool* are not caller-driven behaviors at the Python/`gated_invoke` layer (it mints a fresh quote per call), so they stay covered at the provider gate by M1/M2; a pytest smoke was **not** added (the binding publishes free tools only — standing up a paid provider from pytest would need new supply-side binding surface, which the fence forbids).
 
 ### M4 — a CI home for the live tier
 
