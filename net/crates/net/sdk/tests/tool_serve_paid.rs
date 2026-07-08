@@ -44,13 +44,13 @@ struct EchoResp {
 
 /// Records every redemption; admits unless the quote id is `q-deny`.
 struct RecordingGate {
-    redeemed: std::sync::Mutex<Vec<(String, String, bool)>>,
+    redeemed: parking_lot::Mutex<Vec<(String, String, bool)>>,
 }
 
 impl RecordingGate {
     fn new() -> Self {
         Self {
-            redeemed: std::sync::Mutex::new(Vec::new()),
+            redeemed: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -63,7 +63,7 @@ impl ToolPaymentGate for RecordingGate {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), String> {
-        self.redeemed.lock().unwrap().push((
+        self.redeemed.lock().push((
             tool_id.to_string(),
             quote_id.to_string(),
             binding.is_some(),
@@ -165,7 +165,7 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
         .await
         .expect_err("an unpaid call must be refused");
     assert!(err.contains("payment quote"), "{err}");
-    assert!(gate.redeemed.lock().unwrap().is_empty());
+    assert!(gate.redeemed.lock().is_empty());
 
     // Gate denial: the reason travels to the caller.
     let err = call_with_headers(
@@ -192,7 +192,7 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
     let resp: EchoResp = serde_json::from_slice(&reply).expect("decode");
     assert_eq!(resp.echoed, "hi");
     {
-        let redeemed = gate.redeemed.lock().unwrap();
+        let redeemed = gate.redeemed.lock();
         assert!(redeemed
             .iter()
             .any(|r| r == &("paid_echo".to_string(), "q-1".to_string(), false)));
@@ -200,7 +200,7 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
 
     // Ordering: a structurally invalid body is rejected BEFORE the gate —
     // the quote is not consumed by a call that can never execute.
-    let before = gate.redeemed.lock().unwrap().len();
+    let before = gate.redeemed.lock().len();
     let err = call_with_headers(
         &caller,
         host_id,
@@ -212,7 +212,7 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
     .expect_err("a bad body is refused");
     assert!(err.contains("bad request body"), "{err}");
     assert_eq!(
-        gate.redeemed.lock().unwrap().len(),
+        gate.redeemed.lock().len(),
         before,
         "a call that can never execute must never consume the quote"
     );

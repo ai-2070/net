@@ -76,6 +76,9 @@ base64 = { version = "0.22", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # Isolated temp dirs for the pin-store file tests.
 tempfile = "3"
+# Workspace lock discipline (clippy disallows std::sync::Mutex::lock);
+# the paid-tool serve test's scripted gate records under a lock.
+parking_lot = "0.12"
 criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 postcard = { version = "1", features = ["use-std"] }
