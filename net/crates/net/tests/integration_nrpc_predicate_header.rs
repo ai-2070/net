@@ -304,7 +304,9 @@ async fn predicate_header_malformed_surfaces_typed_error() {
         .await
         .expect_err("malformed header must surface as a server error");
     match err {
-        RpcError::ServerError { status, message } => {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
             assert_ne!(status, 0, "non-Ok wire status");
             assert!(
                 message.contains("predicate header decode failed"),

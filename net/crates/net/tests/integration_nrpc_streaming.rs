@@ -488,7 +488,9 @@ async fn rpc_streaming_terminal_error_after_partial_stream() {
         "must yield both pre-error chunks",
     );
     match terminal_err.expect("must terminate with Err") {
-        RpcError::ServerError { status, message } => {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
             // RpcStatus::Internal = 0x0006.
             assert_eq!(status, 0x0006, "expected Internal, got {status:#06x}");
             assert!(

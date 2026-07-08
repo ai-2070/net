@@ -436,7 +436,7 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
         InnerRpcError::Timeout { elapsed_ms } => {
             format!("timeout: elapsed_ms={elapsed_ms}")
         }
-        InnerRpcError::ServerError { status, message } => {
+        InnerRpcError::ServerError { status, message, .. } => {
             format!("server_error: status=0x{status:04x} message={message}")
         }
         InnerRpcError::Transport(e) => format!("transport: {e}"),
@@ -4030,6 +4030,7 @@ mod tests {
         assert!(format_rpc_error(&InnerRpcError::ServerError {
             status: 0x4001,
             message: "x".into(),
+            headers: vec![],
         })
         .starts_with("server_error:"));
         assert!(

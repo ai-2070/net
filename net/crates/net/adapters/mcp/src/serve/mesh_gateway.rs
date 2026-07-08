@@ -385,9 +385,9 @@ impl MeshGateway {
             // A provider application error — classify it (authorization verdict
             // vs tool-level vs in-band) in one place so the demand side and the
             // tests agree on the mapping.
-            Err(RpcError::ServerError { status, message }) => {
-                map_invoke_server_error(status, message)
-            }
+            Err(RpcError::ServerError {
+                status, message, ..
+            }) => map_invoke_server_error(status, message),
             Err(e) => Err(GatewayError::Transport(e.to_string())),
         }
     }
@@ -643,9 +643,9 @@ fn retriable_send_safe(e: &RpcError) -> bool {
 /// Map a describe-call error to a gateway error.
 fn map_describe_error(e: RpcError, node: u64) -> GatewayError {
     match e {
-        RpcError::ServerError { status, message } if status == ERR_OWNER_SCOPE => {
-            GatewayError::Denied(message)
-        }
+        RpcError::ServerError {
+            status, message, ..
+        } if status == ERR_OWNER_SCOPE => GatewayError::Denied(message),
         RpcError::NoRoute { .. } => GatewayError::Transport(format!(
             "node {node} does not serve the describe service (not a bridge provider, or withdrawn)"
         )),
@@ -735,6 +735,7 @@ mod tests {
         assert!(!is_retriable(&RpcError::ServerError {
             status: ERR_OWNER_SCOPE,
             message: "denied".into(),
+            headers: vec![],
         }));
     }
 
@@ -753,6 +754,7 @@ mod tests {
         assert!(!retriable_send_safe(&RpcError::ServerError {
             status: ERR_OWNER_SCOPE,
             message: "denied".into(),
+            headers: vec![],
         }));
         assert!(
             is_retriable(&RpcError::Timeout { elapsed_ms: 10 }),
@@ -766,6 +768,7 @@ mod tests {
             RpcError::ServerError {
                 status: ERR_OWNER_SCOPE,
                 message: "caller root identity does not match owner scope".into(),
+                headers: vec![],
             },
             9,
         );

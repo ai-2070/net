@@ -170,7 +170,7 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
         InnerRpcError::Timeout { elapsed_ms } => {
             RpcTimeoutError::new_err(format!("{ERR_NRPC_PREFIX}timeout: elapsed_ms={elapsed_ms}"))
         }
-        InnerRpcError::ServerError { status, message } => RpcServerError::new_err(format!(
+        InnerRpcError::ServerError { status, message, .. } => RpcServerError::new_err(format!(
             "{ERR_NRPC_PREFIX}server_error: status=0x{status:04x} message={message}"
         )),
         InnerRpcError::Transport(e) => {
@@ -3655,7 +3655,7 @@ mod tests {
                 InnerRpcError::Timeout { elapsed_ms } => {
                     format!("nrpc:timeout: elapsed_ms={elapsed_ms}")
                 }
-                InnerRpcError::ServerError { status, message } => {
+                InnerRpcError::ServerError { status, message, .. } => {
                     format!("nrpc:server_error: status=0x{status:04x} message={message}")
                 }
                 InnerRpcError::Transport(e) => format!("nrpc:transport: {e}"),
@@ -3688,6 +3688,7 @@ mod tests {
             format(InnerRpcError::ServerError {
                 status: 0x8001,
                 message: "app error".into(),
+                headers: vec![],
             }),
             "nrpc:server_error: status=0x8001 message=app error"
         );
@@ -3733,6 +3734,7 @@ mod tests {
             InnerRpcError::ServerError {
                 status: 0,
                 message: "x".into(),
+                headers: vec![],
             },
             InnerRpcError::Transport(AdapterError::Connection("x".into())),
             InnerRpcError::Codec {

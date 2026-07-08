@@ -125,12 +125,13 @@ Reserved reasons (documented now, no v1 producer — future surfaces must use th
 
 The three edits the wire already permits (`cortex/rpc.rs` + adapter `mesh_rpc.rs` — substrate, reviewed accordingly):
 
-- [ ] `RpcHandlerError::Application` gains `headers: Vec<RpcHeader>` (construction sites across the repo updated mechanically; `Internal` stays header-less — internal errors must stay opaque).
-- [ ] The response fold carries those headers through instead of hardcoding `vec![]` on the Application arm. Existing header caps (32 × name 64 B × value 4096 B) apply unchanged — enforced at encode as today.
-- [ ] Caller side: `RpcError::ServerError` gains `headers: Vec<(String, Vec<u8>)>` instead of discarding `resp.headers`. In-repo matches updated; this is the one public-enum break, taken deliberately and at once.
-- [ ] Tests: an error reply round-trips headers end-to-end over a live pair; an old-style header-less error frame decodes to empty headers (both interop directions); cap violations refuse at encode exactly as on the success path.
+- [x] ~~`RpcHandlerError::Application` gains `headers: Vec<RpcHeader>`~~ ~~The response fold carries those headers through~~ **Resolved at build: unnecessary.** The fold's `Ok(payload)` arm passes a handler-authored `RpcResponsePayload` through **verbatim** — status, headers, and body — so an error reply with headers was already expressible: `RpcHandlerError` is only a *convenience* channel ("doesn't fit the application's normal `Ok(RpcResponsePayload)` channel", its own doc). WS-3's producers author refusals as `Ok(payload)` with the Application status + schematic header; the convenience channel stays header-less by design. This removed both planned substrate edits and the churn at the ~54 `Application` construction sites across core, tests, and three bindings.
+- [x] Caller side: `RpcError::ServerError` gains `headers: Vec<(String, Vec<u8>)>` instead of discarding `resp.headers` — populated at all four wire-mapping sites (unary, client-streaming finish, both stream error arms). The one public-enum break, taken at once: ~30 mechanical updates (matches gain `..`, test constructions gain `headers: vec![]`) across core tests, SDK tests, the MCP gateway, and the go/python/node bindings.
+- [x] Tests: `rpc_error_replies_carry_headers_to_the_caller` (`integration_nrpc_mesh`) — the full-fidelity channel round-trips a schematic-shaped header byte-intact over a live pair; the legacy convenience channel yields empty headers (both interop directions). Cap enforcement is untouched code (encode path unchanged), covered by the existing codec tests.
 
-**Acceptance:** a handler can attach reply headers to an application error and the caller observes them; zero wire-format change (byte layout untouched — proven by the existing codec tests still passing unmodified).
+**Acceptance:** a handler can attach reply headers to an application error and the caller observes them; zero wire-format change (byte layout untouched — proven by the existing codec tests still passing unmodified). ✅ — met with zero *substrate* change at all: the server half always could; the caller just stopped discarding.
+
+> **Landed** with the plan's central assumption inverted in the cheap direction: the plan budgeted three substrate edits, but the server half needed *nothing* — only the caller discarded error-reply headers. One residual noted for WS-3: producers switching from the convenience channel to `Ok(payload)` must keep the message in the body themselves (the fold no longer does it for them).
 
 ## Workstream 3 — producers: render once, attach everywhere
 

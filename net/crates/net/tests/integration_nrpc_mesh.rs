@@ -219,7 +219,9 @@ async fn rpc_server_panic_surfaces_as_internal() {
         .await
         .expect_err("call must surface server panic as Err");
     match err {
-        RpcError::ServerError { status, message } => {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
             // RpcStatus::Internal = 0x0006.
             assert_eq!(
                 status, 0x0006,
@@ -619,4 +621,108 @@ async fn serve_handle_drop_does_not_abort_in_flight_request() {
         .expect("call task must not panic")
         .expect("in-flight handler must complete and RESPONSE must arrive");
     assert_eq!(reply.body.as_ref(), b"hello");
+}
+
+/// Error replies carry headers end-to-end. The response frame has
+/// always had a headers field regardless of status; the fold's
+/// `Ok(payload)` arm passes a handler-authored payload through
+/// verbatim — status, headers, and body — so a handler can attach a
+/// structured sidecar (e.g. a `net-failure-schematic` verdict) to an
+/// application error while the body stays the human diagnostic. The
+/// caller surfaces those headers on `RpcError::ServerError` instead
+/// of discarding them; the convenience channel
+/// (`Err(RpcHandlerError::Application)`) stays header-less, so a
+/// legacy-shaped error decodes to empty headers.
+#[tokio::test]
+async fn rpc_error_replies_carry_headers_to_the_caller() {
+    const SIDECAR: &[u8] = br#"{"object":"net.test.sidecar@1","reason":"pinned"}"#;
+
+    struct RefusingHandler;
+    #[async_trait::async_trait]
+    impl RpcHandler for RefusingHandler {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            // The full-fidelity channel: an application error WITH a
+            // structured reply header.
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Application(0x8123),
+                headers: vec![("net-failure-schematic".to_string(), SIDECAR.to_vec())],
+                body: Bytes::from_static(b"refused, humanly"),
+            })
+        }
+    }
+
+    struct LegacyRefusingHandler;
+    #[async_trait::async_trait]
+    impl RpcHandler for LegacyRefusingHandler {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            Err(RpcHandlerError::Application {
+                code: 0x8123,
+                message: "refused, plainly".to_string(),
+            })
+        }
+    }
+
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let _serve = server
+        .serve_rpc("refuse-with-detail", Arc::new(RefusingHandler))
+        .expect("serve_rpc");
+    let _serve_legacy = server
+        .serve_rpc("refuse-plain", Arc::new(LegacyRefusingHandler))
+        .expect("serve_rpc");
+
+    let err = caller
+        .call(
+            server.node_id(),
+            "refuse-with-detail",
+            Bytes::from_static(b"x"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("application status must surface as Err");
+    match err {
+        RpcError::ServerError {
+            status,
+            message,
+            headers,
+        } => {
+            assert_eq!(status, 0x8123);
+            assert_eq!(message, "refused, humanly");
+            let sidecar = headers
+                .iter()
+                .find(|(name, _)| name == "net-failure-schematic")
+                .map(|(_, value)| value.as_slice());
+            assert_eq!(sidecar, Some(SIDECAR), "header value must be byte-intact");
+        }
+        other => panic!("expected ServerError, got {other:?}"),
+    }
+
+    // The convenience channel stays header-less — a legacy-shaped
+    // error frame decodes to empty headers, never an error.
+    let err = caller
+        .call(
+            server.node_id(),
+            "refuse-plain",
+            Bytes::from_static(b"x"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("application error must surface as Err");
+    match err {
+        RpcError::ServerError {
+            status,
+            message,
+            headers,
+        } => {
+            assert_eq!(status, 0x8123);
+            assert_eq!(message, "refused, plainly");
+            assert!(
+                headers.is_empty(),
+                "the fold's convenience arm attaches no headers"
+            );
+        }
+        other => panic!("expected ServerError, got {other:?}"),
+    }
 }

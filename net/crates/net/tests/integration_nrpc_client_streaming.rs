@@ -345,7 +345,9 @@ async fn client_streaming_handler_application_error_round_trips() {
     call.send(Bytes::from_static(b"x")).await.expect("send");
     let err = call.finish().await.expect_err("must error");
     match err {
-        RpcError::ServerError { status, message } => {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
             assert_eq!(status, 0xBEEF);
             assert!(message.contains("validation failed"));
         }
