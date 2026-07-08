@@ -18,11 +18,30 @@
 //! associated token account, so multi-ATA recipients sum correctly.
 //!
 //! Payer binding: token balances are transaction-level facts (there is no
-//! per-log `from` topic as on eip155), so the bind is transaction-level —
-//! delivery counts only when the queried payer's own balance for the same
-//! mint *decreased* in this transaction. A qualifying transfer funded by
-//! a stranger sums to an honest zero, which the engine turns into an
-//! amount-mismatch invalidation.
+//! per-log `from` topic as on eip155), so the bind is **transaction-level**,
+//! not per-transfer — delivery counts only when the queried payer's own
+//! balance for the same mint *decreased* in the same transaction *and* a
+//! payer is bound at all. A settlement that names no payer is refused
+//! outright (the adapter has no per-quote reference like XRPL's `invoiceId`
+//! to fall back on, so an unbound transfer is unattributable — see the
+//! [`ChainChecker::check`] guard). A transfer to the merchant funded
+//! entirely by a stranger, with the queried payer untouched, sums to an
+//! honest zero.
+//!
+//! Scope of the bind (stated precisely, not overclaimed): the debit leg and
+//! the credit leg are matched at the *transaction* level, not tied to one
+//! source→destination movement. In a single transaction that both debits
+//! the queried payer (to anyone) *and* credits the merchant (from anyone)
+//! the two legs are satisfied independently. Fully attributing the credit
+//! to a payer→merchant transfer would require decoding the SPL transfer
+//! instructions (source/destination/authority), which the balance-delta
+//! model deliberately avoids for CPI-robustness. The residual is narrow:
+//! constructing such a transaction requires the *payer itself* to co-sign
+//! an atomic transaction that pays a third party while a stranger pays the
+//! merchant — i.e. the victim would be the attacker's own accomplice — so
+//! per-transfer attribution is a recorded, deferred hardening, not a live
+//! exploit. The engine turns any shortfall into an amount-mismatch
+//! invalidation.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -354,12 +373,16 @@ impl ChainChecker for SvmChecker {
                         }
                     }
                 }
-                // Transaction-level payer bind (balances carry no per-log
-                // `from`): the queried payer must have funded this
-                // transaction's transfer, or nothing was delivered *by
-                // this quote's payer* — a stranger's payment to the same
-                // merchant is an honest zero.
-                if q.from.is_some() && !payer_debited {
+                // Transaction-level payer bind (balances carry no per-transfer
+                // `from`): the queried payer — guaranteed present by the guard
+                // above — must have spent this mint in this transaction, or
+                // nothing counts *by this quote's payer*. A transfer to the
+                // merchant with the payer untouched is an honest zero. (The
+                // debit and credit legs are matched at the transaction level,
+                // not tied to one source→destination movement — see the module
+                // doc for the precise scope and the deferred per-transfer
+                // hardening.)
+                if !payer_debited {
                     total = 0;
                 }
                 Some(total.to_string())
