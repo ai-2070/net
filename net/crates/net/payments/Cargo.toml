@@ -126,5 +126,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-
 tempfile = "3"
 # The mesh e2e test builds real two-node meshes (MeshBuilder + typed
 # nRPC); tests can't reach transitive deps, so the SDK appears here
-# with the transport features on.
-net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../sdk", default-features = false, features = ["net", "cortex"] }
+# with the transport features on. `tool` powers the mega-e2e's
+# `serve_tool_paid` + `metadata_for` (the native paid-serve path,
+# driven against the real `EngineToolPaymentGate`) — dev-only, so the
+# shipped `mesh` feature keeps its narrower surface.
+net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../sdk", default-features = false, features = ["net", "cortex", "tool"] }
+# `JsonSchema` for the mega-e2e's tool request/response types (the
+# `serve_tool_paid` descriptor derives its schema from them).
+schemars = "1"
+# `Bytes` for the mega-e2e's `Mesh::call` tool invocation.
+bytes = "1"

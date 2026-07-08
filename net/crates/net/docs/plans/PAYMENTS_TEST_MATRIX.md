@@ -51,13 +51,13 @@
 | Serving path | Free | Priced + gate | Priced, no gate | Replay | Wrong tool |
 |---|---|---|---|---|---|
 | MCP wrap (`publish_server`) | ✅ `wrap_end_to_end::wrap_discover_and_invoke_across_two_nodes` | **M2** | ✅ publish-time guards (1B) | **M2** | **M2** |
-| `publish_tools` native | ✅ | ✅ `publish_tools_end_to_end::a_priced_local_tool_enforces_payment_before_the_invoker` + `…::a_refreshed_priced_local_tool_still_enforces_payment` *(scripted gate)* | ✅ 1B guards | engine-level in-process only → **M1** | engine-level in-process only → **M1** |
+| `publish_tools` native | ✅ | ✅ `publish_tools_end_to_end::a_priced_local_tool_enforces_payment_before_the_invoker` + `…::a_refreshed_priced_local_tool_still_enforces_payment` *(scripted gate)* | ✅ 1B guards | ✅ real gate over the wire (M1) | ✅ real gate over the wire (M1) |
 | raw `serve_tool` | ✅ | ❌ refused by design (1B) | ✅ refused | n/a | n/a |
-| `serve_tool_paid` | n/a | ✅ `tool_serve_paid::a_paid_native_tool_redeems_before_the_handler_runs` *(scripted gate)*; engine gate in-process: `native_tool_gate` | ✅ `MissingPricingTerms` | ✅ in-process | ✅ in-process |
-| **mesh cross-machine, real engine gate** | — | **M1** | — | **M1** | **M1** |
+| `serve_tool_paid` | n/a | ✅ `tool_serve_paid::a_paid_native_tool_redeems_before_the_handler_runs` *(scripted gate)*; real engine gate over the wire: `mesh_paid_capability_e2e` (M1); in-process: `native_tool_gate` | ✅ `MissingPricingTerms` | ✅ M1 + in-process | ✅ M1 + in-process |
+| **mesh cross-machine, real engine gate** | — | ✅ `mesh_paid_capability_e2e::a_paid_capability_serves_once_and_only_once_across_the_mesh` | — | ✅ same | ✅ same |
 | Python gateway | ✅ (structured result, kwargs validated) | **M3** | ✅ fail-closed by construction | **M3** | **M3** |
 
-The load-bearing survey finding behind M1: every over-wire paid invoke today uses a **scripted** gate, and every **real-engine** gate test is in-process; `mesh_payments_e2e` crosses the wire for the payment flow but never invokes a tool handler. No test composes both.
+M1's mega-e2e (`mesh_paid_capability_e2e`) closes the survey's central gap: it runs the paid tool-invoke path across two real `MeshNode`s with the **real `EngineToolPaymentGate`** over one shared engine — the composition no prior test joined (over-wire paid invokes used scripted gates; real-engine gate tests were in-process; `mesh_payments_e2e` crosses the wire for the payment flow but never invokes a handler).
 
 ## Tier 3 — verification tiers
 
@@ -98,12 +98,12 @@ CI home for any of this: **none today** → M4.
 
 ## Gap burn-down
 
-### M1 — the canonical mega-e2e (highest value)
+### M1 — the canonical mega-e2e (highest value) — ✅ LANDED
 
-- [ ] One test, impossible to regress, composing the company-level loop **across two real MeshNodes with the real engine gate** (no scripted gates): start provider → publish priced tool (`serve_tool_paid` + `EngineToolPaymentGate`, mock facilitator) → caller discovers `pricing_terms` → unpaid invoke → ERR_PAYMENT + `missing_quote` schematic → pay via `CallerPaymentFlow` → invoke serves → replay same quote → `already_redeemed` (+ `prior_payment=consumed`) → same quote on wrong tool → `wrong_tool_binding` → assert handler count == 1 AND billing count == 1 AND billing signature verifies caller-side.
-- Home: `payments/tests/` (features `mesh`) — payments already dev-composes the SDK there (`native_tool_gate` precedent). House-style name: `a_paid_capability_serves_once_and_only_once_across_the_mesh`.
+- [x] One test, impossible to regress, composing the company-level loop **across two real MeshNodes with the real engine gate** (no scripted gates): start provider → publish priced tool (`serve_tool_paid` + `EngineToolPaymentGate`, mock facilitator) → caller discovers `pricing_terms` → unpaid invoke → ERR_PAYMENT + `missing_quote` schematic → pay via `CallerPaymentFlow` → invoke serves → replay same quote → `already_redeemed` (+ `prior_payment=consumed`) → same quote on wrong tool → `wrong_tool_binding` → assert handler count == 1 AND billing count == 1 AND billing signature verifies caller-side.
+- Landed as `payments/tests/mesh_paid_capability_e2e.rs::a_paid_capability_serves_once_and_only_once_across_the_mesh` (features `mesh`). The dev-dep grew `net-sdk/tool` + `schemars` + `bytes` (dev-only; the shipped `mesh` feature is unchanged) so the payments test can drive `serve_tool_paid`/`metadata_for` against the real engine gate — the SDK can't host this test (it must not depend on payments), so payments is the composition point. Two build notes worth keeping: the happy-path invoke rides the flow's real possession-proof binding (the flow signs `transcript(quote_id, tool)` as `self.caller`, which the quote records as payer, so it verifies at redeem); the wrong-tool step uses **bearer** reuse (quote id only), because a present binding would fail the possession check *first* and mask the `wrong_tool_binding` verdict the step exists to prove.
 
-**Acceptance:** the brainstorm's ten-step flow in one fn, green in the per-push suite.
+**Acceptance:** the brainstorm's ten-step flow in one fn, green in the per-push suite. ✅ — passes in 0.15s; the full payments suite is 211 (was 208).
 
 ### M2 — MCP wrap path: paid invoke with the real admission
 
