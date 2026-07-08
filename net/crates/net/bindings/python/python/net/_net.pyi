@@ -3096,6 +3096,10 @@ class CapabilityGateway:
         payment_unsafe_mock_auto_allow: bool = False,
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
+        payment_signer_svm_address: Optional[str] = None,
+        payment_signer_svm: Optional[Callable[[str], str]] = None,
+        payment_signer_xrpl_address: Optional[str] = None,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Build a gateway over a started ``mesh``. ``pin_store_path`` should
         be the machine-shared pin store so approvals are honored both ways;
@@ -3136,7 +3140,16 @@ class CapabilityGateway:
         key, and the only thing this surface can ask your signer for is a
         logged, typed transfer authorization (never raw bytes). Enablement
         still requires the network in the spend policy's
-        ``allowed_networks`` — the signer is capability, not consent."""
+        ``allowed_networks`` — the signer is capability, not consent.
+
+        Solana and XRPL settlement use the same seam under their own
+        namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
+        (a ``(intent_json: str) -> str`` returning the base64 partially-signed
+        SVM transaction) and ``payment_signer_xrpl_address`` +
+        ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
+        blob). Each pair is both-or-neither; an absent pair means that scheme
+        is simply unavailable. The callable always sees a typed intent JSON,
+        never key material — identical doctrine to the eip155 seam."""
         ...
 
     @property
@@ -3226,6 +3239,10 @@ class AsyncCapabilityGateway:
         payment_unsafe_mock_auto_allow: bool = False,
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
+        payment_signer_svm_address: Optional[str] = None,
+        payment_signer_svm: Optional[Callable[[str], str]] = None,
+        payment_signer_xrpl_address: Optional[str] = None,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
         ``delegation_chain`` together (both or neither) to sign + attach a

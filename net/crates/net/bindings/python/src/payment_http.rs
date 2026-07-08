@@ -159,6 +159,12 @@ fn collect_required(
         payment_unsafe_mock_auto_allow,
         payment_signer_address,
         unbind_signer(payment_signer)?,
+        // The outbound HTTP client wires only the eip155 signer in v1;
+        // svm/xrpl on this path are deferred (matrix WS-P3 is gateway-only).
+        None,
+        None,
+        None,
+        None,
     )?
     .ok_or_else(|| {
         PyValueError::new_err(

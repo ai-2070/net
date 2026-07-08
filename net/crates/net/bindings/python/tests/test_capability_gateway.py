@@ -377,10 +377,89 @@ def test_no_payment_kwarg_accepts_key_material(mesh, tmp_path):
     rejected as an unexpected argument — the signer *reference* (address +
     callable) is the only way in, and the callable only ever sees typed
     data."""
-    for kwarg in ("payment_private_key", "payment_secret", "payment_key_bytes"):
+    for kwarg in (
+        "payment_private_key",
+        "payment_secret",
+        "payment_key_bytes",
+        # …extended to the svm/xrpl seams: still no key kwarg anywhere.
+        "payment_signer_svm_key",
+        "payment_signer_xrpl_secret",
+    ):
         with pytest.raises(TypeError):
             CapabilityGateway(
                 mesh,
                 payment_policy_path=str(tmp_path / "payment-policy.json"),
                 **{kwarg: b"\x11" * 32},
             )
+
+
+# ---------------------------------------------------------------------------
+# The svm/xrpl signer seams (PAYMENTS_LANGUAGE_SDKS_PLAN WS-P3): the same
+# reference shape as eip155 under their own namespaces — a payer address plus
+# a `(intent_json: str) -> str` callable (base64 SVM tx / hex XRPL blob out).
+# The contract: each pair is both-or-neither, the callable only ever sees a
+# typed intent (never key material), and all three schemes coexist.
+# ---------------------------------------------------------------------------
+
+
+def test_svm_signer_reference_constructs_a_gateway(mesh, tmp_path):
+    def signer(intent_json: str) -> str:
+        raise AssertionError("never invoked at construction")
+
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_svm_address="So11111111111111111111111111111111111111112",
+            payment_signer_svm=signer,
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"
+
+
+def test_xrpl_signer_reference_constructs_a_gateway(mesh, tmp_path):
+    def signer(intent_json: str) -> str:
+        raise AssertionError("never invoked at construction")
+
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_xrpl_address="rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            payment_signer_xrpl=signer,
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"
+
+
+def test_svm_and_xrpl_signer_pairs_are_both_or_neither(mesh, tmp_path):
+    policy = str(tmp_path / "payment-policy.json")
+    for addr_kw, call_kw in (
+        ("payment_signer_svm_address", "payment_signer_svm"),
+        ("payment_signer_xrpl_address", "payment_signer_xrpl"),
+    ):
+        with pytest.raises(ValueError):
+            CapabilityGateway(mesh, payment_policy_path=policy, **{addr_kw: "addr"})
+        with pytest.raises(ValueError):
+            CapabilityGateway(
+                mesh, payment_policy_path=policy, **{call_kw: lambda t: "sig"}
+            )
+
+
+def test_all_three_signer_schemes_coexist(mesh, tmp_path):
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_address="0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            payment_signer=lambda t: "0x",
+            payment_signer_svm_address="So11111111111111111111111111111111111111112",
+            payment_signer_svm=lambda t: "base64tx",
+            payment_signer_xrpl_address="rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            payment_signer_xrpl=lambda t: "hexblob",
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"

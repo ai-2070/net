@@ -478,46 +478,76 @@ pub(crate) struct PaymentConfig {
     pub(crate) policy_path: String,
     pub(crate) profile: String,
     pub(crate) unsafe_mock_auto_allow: bool,
-    /// The settlement signer *reference*: the payer address plus a
+    /// The eip155 settlement signer *reference*: the payer address plus a
     /// Python callable `(typed_data_json: str) -> str` that forwards
     /// the EIP-712 document to the host's wallet / KMS and returns
     /// the 0x-hex signature. Only the typed document and the
     /// signature ever cross the language boundary — key material
     /// remains unrepresentable here (doctrine 4/7/8).
     pub(crate) signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    /// The solana signer reference: address + `(intent_json: str) -> str`
+    /// returning the base64 partially-signed versioned transaction.
+    pub(crate) signer_svm: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    /// The xrpl signer reference: address + `(intent_json: str) -> str`
+    /// returning the hex presigned Payment blob.
+    pub(crate) signer_xrpl: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+}
+
+/// Pair an address with its callable: both-or-neither, else a clear caller
+/// error naming the pair.
+#[cfg_attr(not(feature = "payments"), allow(dead_code))]
+fn signer_pair(
+    address: Option<String>,
+    callable: Option<pyo3::Py<pyo3::PyAny>>,
+    kwarg: &str,
+) -> PyResult<Option<(String, pyo3::Py<pyo3::PyAny>)>> {
+    match (address, callable) {
+        (Some(address), Some(callable)) => Ok(Some((address, callable))),
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(format!(
+            "{kwarg} and {kwarg}_address must be provided together \
+             (the address names the payer; the callable signs its typed intent)"
+        ))),
+    }
 }
 
 impl PaymentConfig {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn collect(
         payment_policy_path: Option<String>,
         payment_profile: Option<String>,
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<pyo3::Py<pyo3::PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<pyo3::Py<pyo3::PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<pyo3::Py<pyo3::PyAny>>,
     ) -> PyResult<Option<Self>> {
-        let signer = match (payment_signer_address, payment_signer) {
-            (Some(address), Some(callable)) => Some((address, callable)),
-            (None, None) => None,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "payment_signer and payment_signer_address must be provided together \
-                     (the address names the payer; the callable signs its typed data)",
-                ))
-            }
-        };
+        let signer = signer_pair(payment_signer_address, payment_signer, "payment_signer")?;
+        let signer_svm = signer_pair(
+            payment_signer_svm_address,
+            payment_signer_svm,
+            "payment_signer_svm",
+        )?;
+        let signer_xrpl = signer_pair(
+            payment_signer_xrpl_address,
+            payment_signer_xrpl,
+            "payment_signer_xrpl",
+        )?;
+        let any_signer = signer.is_some() || signer_svm.is_some() || signer_xrpl.is_some();
         match payment_policy_path {
             Some(policy_path) => Ok(Some(Self {
                 policy_path,
                 profile: payment_profile.unwrap_or_else(|| "production".to_string()),
                 unsafe_mock_auto_allow: payment_unsafe_mock_auto_allow,
                 signer,
+                signer_svm,
+                signer_xrpl,
             })),
-            None if payment_profile.is_some()
-                || payment_unsafe_mock_auto_allow
-                || signer.is_some() =>
-            {
+            None if payment_profile.is_some() || payment_unsafe_mock_auto_allow || any_signer => {
                 Err(PyValueError::new_err(
-                    "payment_profile / payment_unsafe_mock_auto_allow / payment_signer \
+                    "payment_profile / payment_unsafe_mock_auto_allow / a payment signer \
                      require payment_policy_path (the shared spend-policy store)",
                 ))
             }
@@ -615,6 +645,12 @@ fn build_payment_flow(
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));
     }
+    if let Some((address, callable)) = config.signer_svm {
+        flow = flow.with_signer("solana", python_svm_signer(address, callable));
+    }
+    if let Some((address, callable)) = config.signer_xrpl {
+        flow = flow.with_signer("xrpl", python_xrpl_signer(address, callable));
+    }
     Ok(Some(Arc::new(flow)))
 }
 
@@ -654,6 +690,86 @@ pub(crate) fn python_external_signer(
             })
             .await
             .map_err(|e| SignerError::new(format!("payment signer task: {e}")))?;
+            signed.map_err(SignerError::new)
+        })
+    }))
+}
+
+/// Bridge a Python signing callable into the
+/// [`ExternalSvmSigner`](net_payments::flow::signer::ExternalSvmSigner)
+/// shape (registered under the `solana` namespace).
+///
+/// Same doctrine as the eip155 seam: the callable receives the typed
+/// `SvmTransferIntent` as a JSON string — a policy-bearing wallet inspects
+/// the amount, mint, and recipient it is authorizing — and returns the
+/// base64 partially-signed versioned transaction. No raw-bytes path; the
+/// wallet owns the key + the SPL transaction machinery. `spawn_blocking` +
+/// `Python::attach` so GIL acquisition never stalls the reactor.
+#[cfg(feature = "payments")]
+pub(crate) fn python_svm_signer(
+    address: String,
+    callable: pyo3::Py<pyo3::PyAny>,
+) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
+    use net_payments::flow::signer::{ExternalSvmSigner, SignerError};
+
+    let callable = Arc::new(callable);
+    Arc::new(ExternalSvmSigner::new(address, move |intent| {
+        let callable = callable.clone();
+        Box::pin(async move {
+            let intent_json = serde_json::to_string(&intent)
+                .map_err(|e| SignerError::new(format!("svm transfer intent serialize: {e}")))?;
+            let signed = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<String, String> {
+                    let out = callable
+                        .bind(py)
+                        .call1((intent_json,))
+                        .map_err(|e| format!("svm payment signer raised: {e}"))?;
+                    out.extract::<String>().map_err(|e| {
+                        format!("svm payment signer must return the base64 signed transaction: {e}")
+                    })
+                })
+            })
+            .await
+            .map_err(|e| SignerError::new(format!("svm payment signer task: {e}")))?;
+            signed.map_err(SignerError::new)
+        })
+    }))
+}
+
+/// Bridge a Python signing callable into the
+/// [`ExternalXrplSigner`](net_payments::flow::signer::ExternalXrplSigner)
+/// shape (registered under the `xrpl` namespace).
+///
+/// The callable receives the typed `XrplPaymentIntent` as a JSON string and
+/// returns the hex presigned `Payment` blob. Retry honesty is the wallet's
+/// contract (a same-quote retry re-presents the identical blob); here we
+/// only marshal typed intent in, hex artifact out — no raw-bytes path.
+#[cfg(feature = "payments")]
+pub(crate) fn python_xrpl_signer(
+    address: String,
+    callable: pyo3::Py<pyo3::PyAny>,
+) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
+    use net_payments::flow::signer::{ExternalXrplSigner, SignerError};
+
+    let callable = Arc::new(callable);
+    Arc::new(ExternalXrplSigner::new(address, move |intent| {
+        let callable = callable.clone();
+        Box::pin(async move {
+            let intent_json = serde_json::to_string(&intent)
+                .map_err(|e| SignerError::new(format!("xrpl payment intent serialize: {e}")))?;
+            let signed = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<String, String> {
+                    let out = callable
+                        .bind(py)
+                        .call1((intent_json,))
+                        .map_err(|e| format!("xrpl payment signer raised: {e}"))?;
+                    out.extract::<String>().map_err(|e| {
+                        format!("xrpl payment signer must return the hex signed Payment blob: {e}")
+                    })
+                })
+            })
+            .await
+            .map_err(|e| SignerError::new(format!("xrpl payment signer task: {e}")))?;
             signed.map_err(SignerError::new)
         })
     }))
@@ -741,7 +857,7 @@ pub struct PyCapabilityGateway {
 #[pymethods]
 impl PyCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
@@ -753,6 +869,10 @@ impl PyCapabilityGateway {
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<Bound<'_, PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         let payment = PaymentConfig::collect(
@@ -761,6 +881,10 @@ impl PyCapabilityGateway {
             payment_unsafe_mock_auto_allow,
             payment_signer_address,
             unbind_signer(payment_signer)?,
+            payment_signer_svm_address,
+            unbind_signer(payment_signer_svm)?,
+            payment_signer_xrpl_address,
+            unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
             state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
@@ -906,7 +1030,7 @@ pub struct PyAsyncCapabilityGateway {
 #[pymethods]
 impl PyAsyncCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
@@ -918,6 +1042,10 @@ impl PyAsyncCapabilityGateway {
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<Bound<'_, PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         let payment = PaymentConfig::collect(
@@ -926,6 +1054,10 @@ impl PyAsyncCapabilityGateway {
             payment_unsafe_mock_auto_allow,
             payment_signer_address,
             unbind_signer(payment_signer)?,
+            payment_signer_svm_address,
+            unbind_signer(payment_signer_svm)?,
+            payment_signer_xrpl_address,
+            unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
             state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
@@ -1132,26 +1264,70 @@ mod tests {
     /// by the pytest twin.)
     #[test]
     fn payment_kwargs_require_the_policy_path() {
-        assert!(PaymentConfig::collect(None, None, false, None, None)
-            .unwrap()
-            .is_none());
-        assert!(PaymentConfig::collect(None, Some("dev_test".into()), false, None, None).is_err());
-        assert!(PaymentConfig::collect(None, None, true, None, None).is_err());
-        // A signer reference is half of a pair: address alone is a
-        // caller error even with a policy path present.
+        // Terse helper: the common all-None-signers call shape.
+        let collect = |path: Option<&str>, profile: Option<&str>, unsafe_flag: bool| {
+            PaymentConfig::collect(
+                path.map(Into::into),
+                profile.map(Into::into),
+                unsafe_flag,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert!(collect(None, None, false).unwrap().is_none());
+        assert!(collect(None, Some("dev_test"), false).is_err());
+        assert!(collect(None, None, true).is_err());
+        // A signer reference is half of a pair: address alone is a caller
+        // error even with a policy path present — for every scheme.
         assert!(PaymentConfig::collect(
             Some("/tmp/p.json".into()),
             None,
             false,
             Some("0xpayer".into()),
-            None
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .is_err());
-        let c = PaymentConfig::collect(Some("/tmp/p.json".into()), None, false, None, None)
-            .unwrap()
-            .unwrap();
+        assert!(PaymentConfig::collect(
+            Some("/tmp/p.json".into()),
+            None,
+            false,
+            None,
+            None,
+            Some("svm-payer".into()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(PaymentConfig::collect(
+            Some("/tmp/p.json".into()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some("r-payer".into()),
+            None,
+        )
+        .is_err());
+        // An svm/xrpl signer without a policy path is a config error too.
+        assert!(
+            PaymentConfig::collect(None, None, false, None, None, None, None, None, None,)
+                .unwrap()
+                .is_none()
+        );
+        let c = collect(Some("/tmp/p.json"), None, false).unwrap().unwrap();
         assert_eq!(c.profile, "production", "fail-closed default profile");
-        assert!(c.signer.is_none());
+        assert!(c.signer.is_none() && c.signer_svm.is_none() && c.signer_xrpl.is_none());
     }
 
     /// A denied outcome projects the provider's failure schematic as a
@@ -1397,6 +1573,8 @@ mod paid_invoke_e2e {
             profile: "dev_test".to_string(),
             unsafe_mock_auto_allow: false,
             signer: None,
+            signer_svm: None,
+            signer_xrpl: None,
         };
         let flow = build_payment_flow(caller_mesh.clone(), Some(config))
             .expect("build the payment flow")
