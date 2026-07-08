@@ -1,0 +1,31 @@
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_2d0f0df1b516be 100-111
+net/crates/net/bindings/python/src/payment_provider.rs
+  s_2ce1bbf7d954a5::t_e220c1d491da17 1-41,43-132
+  s_2ce1bbf7d954a5::t_3eaa14c885fc86 42
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_2ce1bbf7d954a5::t_8e38fc3be1a2f8 3362-3384
+net/crates/net/bindings/python/tests/test_payment_provider.py
+  s_2ce1bbf7d954a5::t_7a40c00443e2e9 1-61
+net/crates/net/bindings/python/src/lib.rs
+  s_2ce1bbf7d954a5::t_8e6e6d0b84289b 49-52
+  s_2ce1bbf7d954a5::t_6051770da90b03 3379-3382
+net/crates/net/bindings/python/python/net/__init__.py
+  s_2ce1bbf7d954a5::t_310aa6cc2a42d5 844-853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c3ecde4ec3a3ebaaa1d8b2130f17b158019c5703",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
