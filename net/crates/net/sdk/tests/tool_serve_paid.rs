@@ -63,11 +63,9 @@ impl ToolPaymentGate for RecordingGate {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), String> {
-        self.redeemed.lock().push((
-            tool_id.to_string(),
-            quote_id.to_string(),
-            binding.is_some(),
-        ));
+        self.redeemed
+            .lock()
+            .push((tool_id.to_string(), quote_id.to_string(), binding.is_some()));
         if quote_id == "q-deny" {
             return Err("quote already redeemed (scripted denial)".to_string());
         }
