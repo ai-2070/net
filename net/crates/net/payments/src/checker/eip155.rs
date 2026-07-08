@@ -18,7 +18,6 @@ use super::transport::RpcTransport;
 use super::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
 use crate::core::verification::{VerificationTier, VerifierRef};
 
-
 /// The JSON-RPC checker for one eip155 network.
 pub struct Eip155Checker {
     transport: RpcTransport,

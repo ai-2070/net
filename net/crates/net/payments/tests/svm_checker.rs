@@ -122,7 +122,13 @@ fn message(instructions: Value) -> Value {
 /// A parsed spl-token `transferChecked` edge moving `amount` of `mint`.
 /// The amount rides `tokenAmount` (the transferChecked shape) so the
 /// checker's N3b amount-coverage bind can read it.
-fn edge(authority: &str, source_index: usize, dest_index: usize, mint: &str, amount: &str) -> Value {
+fn edge(
+    authority: &str,
+    source_index: usize,
+    dest_index: usize,
+    mint: &str,
+    amount: &str,
+) -> Value {
     json!({
         "program": "spl-token",
         "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",

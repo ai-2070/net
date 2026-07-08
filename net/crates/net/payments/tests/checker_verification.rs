@@ -596,7 +596,10 @@ async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
         )
         .await
         .expect("engine");
-    assert!(matches!(decision, PaymentDecision::Served { .. }), "{decision:?}");
+    assert!(
+        matches!(decision, PaymentDecision::Served { .. }),
+        "{decision:?}"
+    );
 
     let queries = checker.queries.lock();
     assert_eq!(queries.len(), 1);
