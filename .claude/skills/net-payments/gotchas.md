@@ -98,15 +98,16 @@ they go red (`testing.md`).
 
 - Only **Rust and Python** have a native payment/caller flow. **Node** has
   read-only `ToolDescriptor.pricingTerms` at discovery and a golden-vector
-  verifier — no flow, no publish-side price setter. **Go** has *nothing* for
-  payments (not even a verifier). Don't send a user to `@net-mesh/payments`
-  (it doesn't exist) or a Go payments test (it doesn't exist). See
-  `bindings.md`.
-- Python's payment identity is the **node's mesh identity** and it accepts
-  `payment_signer_address` + `payment_signer` (both-or-neither, require the
-  policy store). But it wires the signer under `eip155` **only** — solana
-  settlement from Python isn't wired yet, even though the Rust crate has the
-  SVM seam. See `bindings.md`.
+  verifier — no flow, no publish-side price setter. **Go** has a golden-vector
+  verifier (`go/payments_golden_vectors_test.go`) but **no flow**. Don't send a
+  user to `@net-mesh/payments` (it doesn't exist) or promise a Node/Go payment
+  flow — neither is built. See `bindings.md`.
+- Python's payment identity is the **node's mesh identity**. It now wires
+  signers under **all three** namespaces — `payment_signer(_address)` (eip155),
+  `payment_signer_svm(_address)` (solana), `payment_signer_xrpl(_address)` (xrpl)
+  — each pair both-or-neither, requiring the policy store; it also exposes the
+  operator approval verbs and an opt-in `PaymentHttpClient`. (The earlier "eip155
+  only / no HTTP-402 wrapper" caveats are stale — those landed.) See `bindings.md`.
 
 ## Dependency direction (don't invert it)
 

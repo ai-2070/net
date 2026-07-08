@@ -64,10 +64,9 @@ per deployment:
 
 ## The network-enablement ladder (operational state, 2026-07-06)
 
-Engineering for P0 + P1 WS1–WS6 is complete; each rung is a shipped config
-pack + registry entries + a conformance run. Status is tracked in
-`docs/plans/PAYMENTS_P1_NETWORK_LADDER.md` — check it before telling the user a
-network is "live."
+Engineering for the P0 + P1 rungs is complete; each rung is a shipped config
+pack + registry entries + a conformance run. Check the rung's state in the
+table below before telling the user a network is "live."
 
 | Rung | Network | Pack | State |
 |---|---|---|---|
@@ -123,7 +122,7 @@ Overrides: `NET_PAYMENTS_LIVE_FACILITATOR`, `NET_PAYMENTS_LIVE_RPC`,
    policy) — validated against live `GET /supported`.
 3. A `SchemeSigner` for the namespace if it's not EVM `exact`.
 4. A `ChainChecker` for the namespace if serving above `observed`.
-5. A conformance run (the WS1 suite + WS5 adversarial rows against the pack).
+5. A conformance run (the lifecycle suite + the adversarial rows against the pack).
 
 If any step reaches for a new envelope type or a branch in core, stop — that's
 the review invariant firing.

@@ -13,11 +13,18 @@ caller flow that doesn't exist in that language.
 | **Rust** (`payments/`, `sdk/`, `adapters/mcp/`) | ✅ full | ✅ `tool.rs` `pricing_terms(..)` | ✅ | ✅ `GatedOutcome::RequiresPaymentApproval` | ✅ source of truth |
 | **Python** | ✅ via `CapabilityGateway` | ❌ (no pricing on `tool.py`) | ✅ `describe()` JSON | ✅ `invoke()` JSON | ✅ |
 | **Node / TS** | ❌ | ❌ | ✅ read-only `ToolDescriptor.pricingTerms` | ❌ | ✅ |
-| **Go** | ❌ | ❌ | ❌ | ❌ | ❌ (none) |
+| **Go** | ❌ | ❌ | ❌ | ❌ | ✅ (`go/payments_golden_vectors_test.go`) |
 
 Only **Rust and Python** have a native payment flow. Node has pricing as a
-read-only discovery field and a golden-vector verifier; Go is entirely absent
-from the payments surface.
+read-only discovery field; Node, Go, and Rust all carry a golden-vector
+verifier (Go's is at the repo root `go/`, not `bindings/go/`).
+
+**Built state** (as of 2026-07-08): the full Python demand surface — approval
+verbs, HTTP-402 client, svm/xrpl signers — is done, along with the parity
+matrix pinned in the crate module doc and the cross-language
+`failure_schematic_vectors`. A Node `CapabilityGateway` (the long pole), a
+`bindings/go/payments-ffi` cdylib, and a hand-written `include/net_payments.h`
+are **not built** — don't promise them.
 
 ## Rust — the whole thing
 
@@ -43,53 +50,90 @@ gw = CapabilityGateway(
     payment_profile=None,               # "production" | "dev_test"
     payment_unsafe_mock_auto_allow=False,
     payment_signer_address=None,
-    payment_signer=None,                # callable (typed_data_json: str) -> "0x..." (65-byte EIP-712 sig)
+    payment_signer=None,                # eip155: (typed_data_json: str) -> "0x..." (65-byte EIP-712 sig)
+    payment_signer_svm_address=None,
+    payment_signer_svm=None,            # solana: (intent_json: str) -> base64 partially-signed tx
+    payment_signer_xrpl_address=None,
+    payment_signer_xrpl=None,           # xrpl:   (intent_json: str) -> hex presigned Payment blob
 )
 gw.describe(cap_id)                     # JSON string; includes "pricing_terms" (null = free)
-gw.invoke(cap_id, arguments_json="{}")  # JSON string; status discriminant
+gw.invoke(cap_id, arguments_json="{}")  # JSON string; status discriminant (+ "failure" on denials)
+
+# Operator approval verbs — resolve a requires_payment_approval:
+gw.approve_payment(quote_id)            # {"status":"ok","quote_id","changed"}
+gw.reject_payment(quote_id)             # {"status":"ok","quote_id","changed"}
+gw.pending_payments()                   # {"status":"ok","pending":[quote_id,...]}
+gw.spent_today(network, asset)          # {"status":"ok","spent":"<atomic>"}  (x402 wire values)
 ```
 
-`AsyncCapabilityGateway` has the same surface. Key facts:
+`AsyncCapabilityGateway` has the same surface (coroutine duals). Key facts:
 
 - **Methods return a structured JSON *string* with a `status` discriminant —
   they never raise on a gate outcome.** `invoke` can return
   `status="requires_payment_approval"` with `{cap_id, quote_id, policy_reason,
   approve_hint}` (mirrors `GatedOutcome::RequiresPaymentApproval`). `describe`
   carries the announced `net.pricing.terms@1` JSON under `pricing_terms`.
+- **Denials carry a `failure` object** — the `net.payment.failure@1` schematic
+  beside `error` when the provider attached one. Branch on `failure["reason"]` /
+  `failure["recovery"]` instead of parsing prose; its absence means no schematic
+  rode the refusal (`failure-schematic.md`).
+- **Approval verbs close the loop:** `approve_payment` / `reject_payment` /
+  `pending_payments` / `spent_today` are thin wrappers over
+  `SpendPolicyEngine` on the same shared spend-policy store the flow reserves
+  against — the store, lock protocol, and Pending→Approved transition stay in
+  Rust. Without `payment_policy_path` they return a structured
+  `no_payment_policy`; without the `payments` feature, `unsupported`. This is
+  the **operator** surface — `invoke` only *requests* approval; these grant it
+  (`spend-policy.md`).
 - **Payments wiring** builds a `CallerPaymentFlow` over `SpendPolicyEngine`,
   `default_registry_v1`, and `MeshPaymentChannel`. `payment_profile` maps to
   `SpendProfile`. The payment identity is the **node's mesh ed25519 identity**
   (`mesh.entity_keypair()`), borrowed in-process.
-- **The signer never sees a key.** `payment_signer` is a Python callable
-  `(typed_data_json) -> signature_hex`, bridged into `ExternalSigner` under
-  scheme `eip155`. Only the typed `eth_signTypedData_v4` doc and the resulting
-  signature cross the boundary — doctrine 7/8 holds at the language edge. The
-  two signer kwargs are **both-or-neither** and **require `payment_policy_path`**
-  (the shared spend-policy store); the callable is validated as callable at
-  construction, not on first invoke. It runs on a **blocking worker thread**
-  (`spawn_blocking` + `Python::attach`) so the GIL never stalls the mesh
-  reactor.
+- **The signer never sees a key — for every scheme.** Each `payment_signer*` is
+  a Python callable `(typed_intent_json) -> artifact_str`, bridged into
+  `ExternalSigner` (`eip155`) / `ExternalSvmSigner` (`solana`) /
+  `ExternalXrplSigner` (`xrpl`). Only the typed document and the returned
+  artifact cross the boundary — doctrine 7/8 holds at the language edge. Each
+  address+callable pair is **both-or-neither** (shared validator) and
+  **requires `payment_policy_path`**; the callable is validated as callable at
+  construction, not on first invoke; all three schemes coexist on one gateway.
+  Each runs on a **blocking worker thread** (`spawn_blocking` + `Python::attach`)
+  so the GIL never stalls the mesh reactor.
 - **Fail-closed when payments is compiled out:** if the `payments` feature is
   off, passing any payment kwarg **raises `ValueError`** — never a silent free
   serve.
 
+## Python — the outbound HTTP-402 client (opt-in `payments-http`)
+
+`PaymentHttpClient` / `AsyncPaymentHttpClient` pay an external x402 HTTP API
+through the same spend policy + signers (`http402.md`). Behind an **opt-in
+`payments-http` feature** (it pulls `net-payments/http-facilitator` =
+reqwest/rustls, kept OUT of the default wheel), so `try/except ImportError`
+before promising it.
+
+```python
+from net import PaymentHttpClient       # present iff built with payments-http
+client = PaymentHttpClient(
+    payment_policy_path,                 # REQUIRED — the caller's spend policy is the entire gate
+    payment_profile="dev_test",
+    payment_signer_address=None, payment_signer=None,   # same eip155 seam as the gateway
+    identity=None,                       # optional payer Identity handle; ephemeral if omitted
+)
+status_json, body = client.fetch_paid(url)   # (str, bytes): the X402HttpOutcome projection + raw body
+```
+
+`fetch_paid` returns `(status_json, body)` — status is
+`fetched | paid | requires_payment_approval | denied | provider_refused |
+transport_error`; `body` is the raw HTTP bytes (empty for the non-body
+outcomes). The HTTP client wires **eip155 only** in v1 (svm/xrpl on this path
+are deferred).
+
 Caveats to remember (state them if the user hits them):
 
-- **The gateway wires the signer under `eip155` only.** Even though the Rust
-  crate now has an SVM signer seam (`ExternalSvmSigner`, `signer.md`), the
-  Python gateway registers only the EVM signer — **solana settlement from
-  Python is not yet wired** (needs an SVM-signer bridge in the binding).
 - The Python **tool/publish** surface (`net/tool.py`, re-exported by
   `net_sdk.tool`) has **no pricing field.** Python sees pricing only through
   `CapabilityGateway.describe()`, never on the publish side. `sdk-py` has no
   payments module.
-- Still pending for Python: a surface for the **outbound HTTP-402 client**
-  (`X402HttpFlow` exists in Rust; no Python wrapper yet).
-
-(Both landed 2026-07-06 and are now current in this skill: the payment identity
-is the **node's mesh identity** via `Mesh::entity_keypair()`, and the
-`_net.pyi` stub documents the `payment_signer_address` / `payment_signer`
-kwargs — the stub no longer lags the impl.)
 
 ## Node / TS — pricing passthrough on read only
 
@@ -103,12 +147,15 @@ kwargs — the stub no longer lags the impl.)
 - **`@net-mesh/payments` does not exist** in this repo — it's referenced only
   in a doc comment. Don't point a user at it.
 
-## Go — absent
+## Go — verifier only, no flow
 
-The Go SDK has zero pricing/payment references, no publish-side pricing, and
-**no golden-vector verifier** (despite what an old plan line implies — the
-`go/payments_golden_vectors_test.go` file does not exist). If a user needs Go
-payments, the honest answer is: not built; use Rust or Python.
+The Go SDK has **no** payment flow, no publish-side pricing, and no
+`payments-ffi` binding. What it *does* have (and the skill previously denied) is
+a **golden-vector verifier** at the repo root: `go/payments_golden_vectors_test.go`
+runs the same cross-language fixture (canonical encoding, ed25519, x402
+byte-preservation, and the `failure_schematic_vectors` tolerance predicate). A
+real `bindings/go/payments-ffi` cdylib + Go wrapper is **not built** — for a
+payment flow today, the honest answer is still Rust or Python.
 
 ## The one invariant every binding upholds
 

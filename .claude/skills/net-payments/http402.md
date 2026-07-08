@@ -62,6 +62,30 @@ The spend-policy surface is identical to `caller.md`: over-cap yields
 `RequiresPaymentApproval`, an operator `approve`s, the next call proceeds. A
 network with no configured signer is `Denied`, never a silent fallback.
 
+## Python — `PaymentHttpClient` (opt-in `payments-http`)
+
+The Python demand surface for this flow. Behind an **opt-in `payments-http`
+feature** (it pulls `net-payments/http-facilitator` = reqwest/rustls, kept out
+of the default wheel — `try/except ImportError` before promising it):
+
+```python
+from net import PaymentHttpClient       # or AsyncPaymentHttpClient
+client = PaymentHttpClient(
+    payment_policy_path,                 # REQUIRED — the caller's spend policy is the entire gate
+    payment_profile="dev_test",
+    payment_signer_address=None, payment_signer=None,   # eip155 seam (svm/xrpl deferred on this path)
+    identity=None,                       # optional payer Identity; ephemeral if omitted
+)
+status_json, body = client.fetch_paid(url)   # (str, bytes)
+```
+
+The status-JSON projects `X402HttpOutcome` to `fetched | paid |
+requires_payment_approval | denied | provider_refused | transport_error`
+(`paid` carries the byte-preserved settlement as base64); `body` is the raw
+response bytes (empty for the non-body outcomes). The lifecycle stays in Rust —
+the binding only marshals typed intent in / status-JSON + bytes out
+(`bindings.md`).
+
 ## Why this is the same code, not a bridge
 
 There is no translation layer because there is nothing to translate — the

@@ -13,8 +13,8 @@ Read this file first. Every other file in this skill assumes the model here.
 > does not intermediate the money.** It does not custody funds, process
 > payments, issue invoices, determine taxes, or clear transactions.
 
-This sentence is in the crate's `lib.rs`, in the SDK plan, and in the review
-invariant. It is the load-bearing constraint. When you are unsure whether a
+This sentence is in the crate's `lib.rs` and in the review invariant. It is the
+load-bearing constraint. When you are unsure whether a
 feature belongs, ask: *does this intermediate money, or does it sign a fact
 around money someone else moved?* The second is in scope. The first is a
 rejected PR.

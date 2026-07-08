@@ -86,6 +86,14 @@ let decision: CallerDecision = flow.run("prov/fixture-tool", pricing_terms_json)
 | `Denied { policy_reason }` | Policy refused (e.g. network not allowed, no signer). Terminal. |
 | `Failed { message, retryable }` | Channel/authoring failure. Retry if `retryable`. |
 
+This `Denied` is the *caller-side spend* refusal. A distinct refusal happens at
+**redemption**: when `Paid`'s `{quote_id, binding_sig}` reaches the provider
+gate and it refuses (unpaid / frozen / already-redeemed / wrong-tool), the
+provider returns `ERR_PAYMENT` carrying the `net.payment.failure@1` schematic —
+branch on `failure.reason` / `failure.recovery` rather than the prose
+(`failure-schematic.md`). The demand-side gateway (`gated_invoke`, the Python
+`invoke`) projects it.
+
 `SpendDecision::RequiresPaymentApproval` mirrors the consent shape exactly —
 same `{quote_id, policy_reason, approve_hint}` fields. **Pinning a capability
 is consent, not spending consent:** a pinned paid tool still hits spend policy.

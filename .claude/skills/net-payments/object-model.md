@@ -212,7 +212,7 @@ pub struct BillingEvent {
     pub billing_event_id: String,             // derived from idempotency_key — SAME key ⇒ SAME id ⇒ one charge
     pub idempotency_key: String,              // {caller, provider, capability, quote}
     pub capability: String,
-    pub invocation_id: Option<String>,        // bound by the WS4 payment gate; additive
+    pub invocation_id: Option<String>,        // bound by the payment gate; additive
     pub quote_id: String,
     pub transaction: Option<String>,
     pub verification_ref: Option<String>,     // chain hash of the verification event it was emitted under
