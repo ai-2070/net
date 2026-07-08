@@ -138,7 +138,7 @@ impl X402HttpFlow {
         }
         let namespace = requirements.network.split(':').next().unwrap_or_default();
         requirements.scheme == "exact"
-            && matches!(namespace, "eip155" | "solana")
+            && matches!(namespace, "eip155" | "solana" | "xrpl")
             && self.signers.contains_key(namespace)
     }
 
@@ -428,6 +428,24 @@ impl X402HttpFlow {
                 .map_err(|e| e.to_string())?;
             crate::x402::schemes::exact_svm::payload_object(&transaction)
                 .map_err(|e| e.to_string())?
+        } else if self.can_settle(requirements) && requirements.network.starts_with("xrpl:") {
+            // exact / xrpl: the wallet authors a presigned Payment blob
+            // (XRP-only until the IOU amount-domain review; invoiceId
+            // binding per the pinned t54 doc — same dispatch as the mesh
+            // flow). One `fetch_paid` = one attempt on this path, so the
+            // same-quote-same-blob rule is moot here; an expired
+            // LastLedgerSequence simply means the next fetch re-quotes.
+            let signer = self
+                .signers
+                .get("xrpl")
+                .ok_or_else(|| "no xrpl signer configured".to_string())?;
+            let intent = crate::x402::schemes::exact_xrpl::payment_intent(requirements)
+                .map_err(|e| e.to_string())?;
+            let blob = signer
+                .sign_xrpl_payment(&intent)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::x402::schemes::exact_xrpl::payload_object(&blob).map_err(|e| e.to_string())?
         } else {
             return Err(format!(
                 "no payload author for scheme `{}` on `{}`",

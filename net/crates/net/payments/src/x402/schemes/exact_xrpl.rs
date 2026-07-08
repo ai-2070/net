@@ -216,10 +216,13 @@ mod tests {
         assert_eq!(intent.destination_tag, Some(7));
         assert_eq!(intent.source_tag, Some(804_681_468));
 
-        let bad = requirements(Some(json!({ "invoiceId": "inv-1", "destinationTag": "seven" })));
+        let bad = requirements(Some(
+            json!({ "invoiceId": "inv-1", "destinationTag": "seven" }),
+        ));
         assert!(payment_intent(&bad).is_err());
-        let oversized =
-            requirements(Some(json!({ "invoiceId": "inv-1", "destinationTag": 4294967296u64 })));
+        let oversized = requirements(Some(
+            json!({ "invoiceId": "inv-1", "destinationTag": 4294967296u64 }),
+        ));
         assert!(payment_intent(&oversized).is_err());
     }
 
