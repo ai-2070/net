@@ -3049,7 +3049,17 @@ class CapabilityGateway:
       ``requires_approval`` relay ``approve_command``; on
       ``requires_payment_approval`` relay ``{quote_id, policy_reason,
       approve_hint}`` — spend policy wants a human, the decision resolves
-      through the payments consent surface, and nothing was charged.
+      through the payments consent surface, and nothing was charged. On a
+      payment refusal (usually ``denied``) a ``failure`` object may ride
+      *beside* ``error`` (never instead of it) when the provider attached the
+      ``net.payment.failure@1`` schematic — the machine-actionable verdict:
+      ``{object, code, stage, reason, message, retryable, recovery: {class,
+      actor, safe_to_retry, safe_to_requote, next_action?}, handler_executed,
+      funds_moved, prior_payment, quote_id?, tool_id?, ...}``. Branch on
+      ``failure["reason"]`` / ``failure["recovery"]`` instead of parsing prose;
+      unknown reasons and extra fields are tolerated (the schematic's ``@1``
+      additive-forward-compat contract). Its absence means the refusal carried
+      no schematic — fall back to ``error``.
 
     ``describe`` results additionally carry ``pricing_terms`` (the announced
     ``net.pricing.terms@1`` canonical JSON) when the capability is paid;
