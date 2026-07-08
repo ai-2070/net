@@ -73,8 +73,11 @@ pub struct TransferQuery {
     pub reference: Option<String>,
     /// The recipient sub-account tag, when the chain has one (XRPL
     /// `DestinationTag` for shared-address merchants). When set, the
-    /// matched transaction must carry exactly this tag; adapters for
-    /// chains without tags ignore it.
+    /// matched transaction must carry exactly this tag; when `None`, a
+    /// tag-aware adapter requires the transaction to carry *no* tag — a
+    /// quote that authorized no sub-account must not be satisfied by a
+    /// payment routed to one (M3). Adapters for chains without tags ignore
+    /// it.
     pub to_tag: Option<u32>,
 }
 

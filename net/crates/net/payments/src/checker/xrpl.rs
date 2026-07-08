@@ -343,7 +343,13 @@ impl ChainChecker for XrplChecker {
                 let to_ok = f["Destination"].as_str() == Some(q.to.as_str());
                 let tag_ok = match q.to_tag {
                     Some(expected) => f["DestinationTag"].as_u64() == Some(u64::from(expected)),
-                    None => true,
+                    // Defense in depth (M3): a quote that authorized no
+                    // sub-account tag must not be satisfied by a payment
+                    // carrying one. On a shared/tag-routed custodial
+                    // address a stray `DestinationTag` routes the funds to
+                    // a *different* sub-account, so an untagged quote only
+                    // matches an untagged payment.
+                    None => f["DestinationTag"].is_null(),
                 };
                 let from_ok = match q.from.as_deref() {
                     Some(from) => f["Account"].as_str() == Some(from),

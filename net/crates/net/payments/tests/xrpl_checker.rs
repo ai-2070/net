@@ -333,10 +333,13 @@ async fn payer_tag_and_invoice_bindings_hold() {
     };
     assert_eq!(delivered_of(&checker, &wants_tag).await, "0");
 
-    // Invoice binding, method A (MemoData = hex(invoiceId)): matches.
+    // Invoice binding, method A (MemoData = hex(invoiceId)): matches. The
+    // fixture tx carries DestinationTag 7, so the query authorizes it too
+    // (M3) — this row isolates the invoice bind, not the tag.
     rpc.set_tx(payment_tx(1_000_000));
     let invoiced = TransferQuery {
         reference: Some(INVOICE.to_string()),
+        to_tag: Some(7),
         ..query()
     };
     assert_eq!(delivered_of(&checker, &invoiced).await, "1000000");
@@ -353,9 +356,41 @@ async fn payer_tag_and_invoice_bindings_hold() {
     // A payment bound to a DIFFERENT invoice never satisfies this quote.
     let other = TransferQuery {
         reference: Some("inv-other-quote".to_string()),
+        to_tag: Some(7),
         ..query()
     };
     assert_eq!(delivered_of(&checker, &other).await, "0");
+}
+
+/// M3 defense in depth: a quote that authorized no sub-account tag must
+/// not be satisfied by a payment that carries one — on a shared/tag-routed
+/// custodial address a stray `DestinationTag` sends the XRP to a different
+/// sub-account. An untagged quote matches only an untagged payment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untagged_quote_rejects_a_tagged_payment() {
+    let rpc = RpcFixture::start().await;
+    let checker = XrplChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+
+    // A full, correctly-bound Payment that happens to carry DestinationTag
+    // 7 (routed to a sub-account). A quote with no tag must NOT be credited.
+    rpc.set_tx(payment_tx(1_000_000));
+    let untagged_quote = TransferQuery {
+        from: Some(PAYER.to_string()),
+        reference: Some(INVOICE.to_string()),
+        to_tag: None,
+        ..query()
+    };
+    assert_eq!(
+        delivered_of(&checker, &untagged_quote).await,
+        "0",
+        "a tagged payment must not satisfy an untagged quote"
+    );
+
+    // The same quote against a genuinely untagged payment: satisfied.
+    let mut untagged_tx = payment_tx(1_000_000);
+    untagged_tx.as_object_mut().unwrap().remove("DestinationTag");
+    rpc.set_tx(untagged_tx);
+    assert_eq!(delivered_of(&checker, &untagged_quote).await, "1000000");
 }
 
 /// M2: rippled api_version 2 (and Clio's default) nest the transaction

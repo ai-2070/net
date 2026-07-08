@@ -1124,19 +1124,32 @@ impl PaymentEngine {
         // carried on-ledger as MemoData/InvoiceID) or a recipient
         // sub-account tag (XRPL `DestinationTag`) carries them in
         // `requirements.extra`. The engine reads the keys generically and
-        // never interprets them — the checker adapter does; schemes
-        // without them thread `None` (unchanged behavior).
+        // never interprets their *meaning* — the checker adapter does;
+        // schemes without them thread `None` (unchanged behavior).
         let req_extra = requirements.view().extra.clone();
         let reference = req_extra
             .as_ref()
             .and_then(|e| e.get("invoiceId"))
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let to_tag = req_extra
-            .as_ref()
-            .and_then(|e| e.get("destinationTag"))
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok());
+        // The tag's *type* is validated here (M3): a present-but-malformed
+        // `destinationTag` is a hard refusal — matching the authoring
+        // seam's `exact_xrpl::optional_tag` — never a silent drop to
+        // `None`. Silently dropping it would ask the checker to verify
+        // against "no tag" (which now requires tag *absence*), quietly
+        // discarding a sub-account routing the quote meant to bind.
+        let to_tag = match req_extra.as_ref().and_then(|e| e.get("destinationTag")) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        EngineError::State(
+                            "requirements.extra.destinationTag is not a u32 sub-account tag".into(),
+                        )
+                    })?,
+            ),
+        };
         let query = TransferQuery {
             token: requirements.view().asset.clone(),
             to: requirements.view().pay_to.clone(),
