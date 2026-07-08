@@ -141,7 +141,7 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
     let mut payment_proof: Option<PaymentProof> = None;
     if let Some(terms) = detail.pricing_terms.as_deref() {
         let Some(flow) = payment else {
-            return GatedOutcome::Failed(GatewayError::Denied(format!(
+            return GatedOutcome::Failed(GatewayError::denied(format!(
                 "capability `{}` is paid but this caller has no payment flow configured \
                  (fail-closed: paid capabilities never serve unpaid)",
                 id.display()
@@ -175,7 +175,7 @@ pub async fn gated_invoke<G: CapabilityGateway + ?Sized>(
                 }
             }
             PaymentFlowDecision::Denied { policy_reason } => {
-                return GatedOutcome::Failed(GatewayError::Denied(policy_reason))
+                return GatedOutcome::Failed(GatewayError::denied(policy_reason))
             }
             PaymentFlowDecision::Failed { message, retryable } => {
                 return GatedOutcome::Failed(GatewayError::Transport(format!(
@@ -258,7 +258,7 @@ mod tests {
             payment: Option<PaymentProof>,
         ) -> Result<CallToolResult, GatewayError> {
             if self.deny {
-                return Err(GatewayError::Denied(OWNER_SCOPE_REJECTION.to_string()));
+                return Err(GatewayError::denied(OWNER_SCOPE_REJECTION));
             }
             *self.last_safety.lock() = Some(safety);
             *self.last_payment.lock() = Some(payment);
@@ -400,7 +400,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(out, GatedOutcome::Failed(GatewayError::Denied(_))),
+            matches!(out, GatedOutcome::Failed(GatewayError::Denied { .. })),
             "{out:?}"
         );
     }
@@ -457,7 +457,9 @@ mod tests {
         )
         .await;
         match out {
-            GatedOutcome::Failed(GatewayError::Denied(reason)) => {
+            GatedOutcome::Failed(GatewayError::Denied {
+                message: reason, ..
+            }) => {
                 assert!(reason.contains("no payment flow"), "{reason}");
             }
             other => panic!("paid + no flow must fail closed, got {other:?}"),

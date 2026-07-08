@@ -220,7 +220,7 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
     assert!(
         matches!(
             outcome,
-            Err(GatewayError::Denied(_)) | Err(GatewayError::Transport(_))
+            Err(GatewayError::Denied { .. }) | Err(GatewayError::Transport(_))
         ),
         "an out-of-scope caller must not get a result; got {outcome:?}",
     );

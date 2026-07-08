@@ -248,7 +248,19 @@ pub(crate) async fn redeem_via_engine(
         .await
     {
         Ok(RedeemDecision::Admitted) => Ok(()),
-        Ok(RedeemDecision::Denied { reason }) => Err(denial_for(&reason, tool_id, quote_id)),
+        Ok(RedeemDecision::Denied { reason }) => {
+            let denial = denial_for(&reason, tool_id, quote_id);
+            // Typed fields at the emission point: operators grep
+            // verdicts, not prose.
+            tracing::info!(
+                reason = %denial.schematic.reason,
+                stage = %denial.schematic.stage,
+                recovery_class = %denial.schematic.recovery.class,
+                tool_id,
+                "payment redemption denied"
+            );
+            Err(denial)
+        }
         Err(e) => {
             // Fail-closed — but the raw `EngineError` wraps StoreError /
             // EnvelopeError / X402Error, which can carry file paths, I/O

@@ -87,10 +87,17 @@ pub enum GatewayError {
     /// No capability matched the id (describe / invoke).
     #[error("no capability found for `{0}`")]
     NotFound(String),
-    /// The remote wrapper rejected the caller — its owner-scope gate fired.
-    /// The message is the wrapper's structured rejection reason.
-    #[error("{0}")]
-    Denied(String),
+    /// The remote wrapper rejected the caller — an owner-scope,
+    /// delegation, policy, or payment verdict. The message is the
+    /// wrapper's structured rejection reason; `schematic`, when the
+    /// provider attached one (payment refusals), is the decoded
+    /// `net.payment.failure@1` verdict — always optional, so the human
+    /// path never depends on it.
+    #[error("{message}")]
+    Denied {
+        message: String,
+        schematic: Option<Box<net_sdk::tool_payment::FailureSchematic>>,
+    },
     /// No daemon is reachable. Surfaced to the host as [`super::MSG_NO_DAEMON`].
     #[error("no Net daemon is running")]
     NoDaemon,
@@ -100,6 +107,18 @@ pub enum GatewayError {
     /// Anything else, carried verbatim.
     #[error("{0}")]
     Other(String),
+}
+
+impl GatewayError {
+    /// A denial carrying no structured verdict — the common case for
+    /// owner-scope / delegation / policy rejections; payment refusals
+    /// arrive with their schematic via the mesh gateway's mapping.
+    pub fn denied(message: impl Into<String>) -> Self {
+        GatewayError::Denied {
+            message: message.into(),
+            schematic: None,
+        }
+    }
 }
 
 /// Whether re-executing an invoke is harmless — the retry policy for
