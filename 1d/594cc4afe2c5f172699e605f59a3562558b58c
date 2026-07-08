@@ -1,0 +1,26 @@
+net/crates/net/payments/src/checker/eip155.rs
+  s_ac213343b6b34b::t_5253b7a070eb5c 173-178,180
+net/crates/net/payments/src/engine/mod.rs
+  s_ac213343b6b34b::t_a4010ed7821f7e 1137-1146,1148-1179
+net/crates/net/payments/src/checker/mod.rs
+  s_ac213343b6b34b::t_a07b9676ff8ae4 28-40
+net/crates/net/payments/tests/checker_verification.rs
+  s_ac213343b6b34b::t_95a4fa8dd445ed 612-745
+  s_ac213343b6b34b::t_8e9e4db8bda7c4 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1d594cc4afe2c5f172699e605f59a3562558b58c",
+  "prompts": {},
+  "sessions": {
+    "s_ac213343b6b34b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d7c0951-4b90-460d-a264-8a57a5f7927a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
