@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/PAYMENTS_TEST_MATRIX.md
+  s_2ce1bbf7d954a5::t_af85284903b6e5 108,110,112
+  s_2ce1bbf7d954a5::t_af2d5ef6c92938 53
+net/crates/net/payments/tests/mcp_wrap_paid_e2e.rs
+  s_2ce1bbf7d954a5::t_14902c9520636d 1-316,321-333,337-398,402-434,438
+  s_2ce1bbf7d954a5::t_03c85ac0fc6303 317-320
+  s_2ce1bbf7d954a5::t_f0f0508df82a5b 334-336,399-401,435-437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "317950973b80de5d4f4ee446bdc22995f106c950",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
