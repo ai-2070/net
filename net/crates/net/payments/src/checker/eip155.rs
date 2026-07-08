@@ -149,6 +149,33 @@ fn parse_hex_u128(s: &str, what: &str) -> Result<u128, CheckerError> {
         .map_err(|e| CheckerError::terminal(format!("{what} `{s}`: {e}")))
 }
 
+/// The `AuthorizationUsed(address indexed authorizer, bytes32 indexed
+/// nonce)` event topic (EIP-3009 requires the token emit it on
+/// `transferWithAuthorization`). Computed at runtime from the signature
+/// — never a memorized constant on the money path.
+fn authorization_used_topic() -> &'static str {
+    use sha3::Digest as _;
+    static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOPIC.get_or_init(|| {
+        let digest = sha3::Keccak256::digest(b"AuthorizationUsed(address,bytes32)");
+        format!("0x{}", hex::encode(digest))
+    })
+}
+
+/// Is `s` a 0x-prefixed 32-byte hex word — the eip155 adapter's
+/// reference vocabulary (an EIP-3009 nonce)?
+fn is_nonce_hex(s: &str) -> bool {
+    s.strip_prefix("0x")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A 32-byte topic equals the 32-byte word `word` (both 0x-hex)?
+fn topic_is_word(topic: &str, word: &str) -> bool {
+    let topic = topic.trim_start_matches("0x");
+    let word = word.trim_start_matches("0x");
+    topic.len() == 64 && word.len() == 64 && topic.eq_ignore_ascii_case(word)
+}
+
 /// A 32-byte topic holding a left-padded address equals `addr`?
 fn topic_is_address(topic: &str, addr: &str) -> bool {
     let topic = topic.trim_start_matches("0x");
@@ -219,6 +246,37 @@ impl ChainChecker for Eip155Checker {
         // recipient — straight from the chain.
         let delivered = match query {
             Some(q) => {
+                // Nonce binding (the H3 fix's recorded stronger follow-up):
+                // when the quote threads its caller-signed EIP-3009 nonce as
+                // the reference, the token contract must have emitted the
+                // matching `AuthorizationUsed(authorizer, nonce)` in THIS
+                // transaction — binding the settlement to this exact
+                // authorization, not merely to (token, payer, recipient).
+                // The eip155 adapter's reference vocabulary is a 0x 32-byte
+                // hex nonce; any other reference shape belongs to another
+                // adapter and is ignored here (the `to_tag` convention).
+                let nonce_bound = match q.reference.as_deref().filter(|r| is_nonce_hex(r)) {
+                    Some(nonce) => receipt["logs"].as_array().into_iter().flatten().any(|log| {
+                        let topics: Vec<&str> = log["topics"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        log["address"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case(&q.token)
+                            && topics.len() >= 3
+                            && topics[0].eq_ignore_ascii_case(authorization_used_topic())
+                            && q.from
+                                .as_deref()
+                                .map(|from| topic_is_address(topics[1], from))
+                                .unwrap_or(true)
+                            && topic_is_word(topics[2], nonce)
+                    }),
+                    None => true,
+                };
                 let mut total: u128 = 0;
                 for log in receipt["logs"].as_array().into_iter().flatten() {
                     let emitter = log["address"].as_str().unwrap_or_default();
@@ -249,6 +307,13 @@ impl ChainChecker for Eip155Checker {
                             parse_hex_u128(log["data"].as_str().unwrap_or("0x0"), "log.data")?;
                         total = total.saturating_add(value);
                     }
+                }
+                // A settlement that never consumed THIS quote's
+                // authorization delivered nothing for this quote — an
+                // honest zero the engine turns into an amount-mismatch
+                // invalidation.
+                if !nonce_bound {
+                    total = 0;
                 }
                 Some(total.to_string())
             }

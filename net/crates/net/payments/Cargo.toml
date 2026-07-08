@@ -110,7 +110,9 @@ mesh = ["net-sdk/net", "net-sdk/cortex"]
 # `POST /verify`, `POST /settle`, `GET /supported` per the pinned x402
 # v2 spec. The first (and only) HTTP dependency in the money path —
 # rustls only, feature-gated so mock-only consumers never build it.
-http-facilitator = ["dep:reqwest", "dep:rustls", "dep:webpki-root-certs"]
+# sha3 also rides here: the eip155 checker computes the
+# AuthorizationUsed(address,address,bytes32) topic hash at runtime.
+http-facilitator = ["dep:reqwest", "dep:rustls", "dep:webpki-root-certs", "dep:sha3"]
 # DEV/TESTNET ONLY: a local-key EIP-712 signer for conformance runs.
 # The name is the warning — production settlement signing goes through
 # `ExternalSigner` (KMS/wallet/MPC; the key never enters Net memory).

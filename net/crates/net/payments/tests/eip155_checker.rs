@@ -320,3 +320,125 @@ async fn final_depth_comes_from_the_config_pack() {
         "50 < configured final_depth 100 → Confirmed, not Final"
     );
 }
+
+// ---------------------------------------------------------------------
+// N3a: the settlement must have consumed THIS quote's authorization
+// ---------------------------------------------------------------------
+
+const NONCE: &str = "0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480";
+
+/// Computed here independently of the checker's own helper — a drift in
+/// either spelling of the EIP-3009 event signature fails the suite.
+fn authorization_used_topic() -> String {
+    use sha3::Digest as _;
+    format!(
+        "0x{}",
+        hex::encode(sha3::Keccak256::digest(
+            b"AuthorizationUsed(address,bytes32)"
+        ))
+    )
+}
+
+fn authorization_used_log(token: &str, authorizer: &str, nonce: &str) -> Value {
+    json!({
+        "address": token,
+        "topics": [authorization_used_topic(), topic_for(authorizer), nonce],
+        "data": "0x",
+    })
+}
+
+fn query_with_nonce(payer: &str, nonce: &str) -> TransferQuery {
+    TransferQuery {
+        from: Some(payer.to_string()),
+        reference: Some(nonce.to_string()),
+        ..query()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_amount_binds_to_the_authorization_nonce() {
+    let rpc = RpcFixture::start().await;
+    let checker = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
+    rpc.set_head(100);
+
+    // The settlement consumed THIS authorization: Transfer + the token's
+    // AuthorizationUsed(authorizer, nonce) in the same receipt.
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [
+            transfer_log(TOKEN, RECIPIENT, "0x2710"),
+            authorization_used_log(TOKEN, PAYER, NONCE),
+        ],
+    }));
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query_with_nonce(PAYER, NONCE)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
+
+    // A qualifying transfer WITHOUT this quote's AuthorizationUsed —
+    // e.g. the same payer's OTHER purchase from the same merchant —
+    // delivers nothing for this quote.
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [ transfer_log(TOKEN, RECIPIENT, "0x2710") ],
+    }));
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query_with_nonce(PAYER, NONCE)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(
+        delivered.as_deref(),
+        Some("0"),
+        "a settlement that never consumed this authorization must not count"
+    );
+
+    // A DIFFERENT nonce (another authorization by the same payer): zero.
+    let other_nonce = format!("0x{}", "22".repeat(32));
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [
+            transfer_log(TOKEN, RECIPIENT, "0x2710"),
+            authorization_used_log(TOKEN, PAYER, &other_nonce),
+        ],
+    }));
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&query_with_nonce(PAYER, NONCE)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("0"));
+
+    // A non-nonce-shaped reference belongs to another adapter's
+    // vocabulary (e.g. an xrpl invoiceId): ignored here, delivery
+    // counts on the (token, payer, recipient) binds alone.
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [ transfer_log(TOKEN, RECIPIENT, "0x2710") ],
+    }));
+    let foreign_ref = TransferQuery {
+        from: Some(PAYER.to_string()),
+        reference: Some("inv-quote-42".to_string()),
+        ..query()
+    };
+    let verdict = checker
+        .check("eip155:84532", TX, Some(&foreign_ref))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
+}

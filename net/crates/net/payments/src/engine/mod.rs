@@ -1127,11 +1127,25 @@ impl PaymentEngine {
         // never interprets their *meaning* — the checker adapter does;
         // schemes without them thread `None` (unchanged behavior).
         let req_extra = requirements.view().extra.clone();
-        let reference = req_extra
-            .as_ref()
-            .and_then(|e| e.get("invoiceId"))
+        // Reference precedence: the CALLER-SIGNED authorization nonce
+        // (exact-EVM's EIP-3009 `authorization.nonce` — the strongest
+        // per-quote reference, same trust class as `authorization.from`)
+        // wins over the requirements' `invoiceId` (provider-authored,
+        // exact-XRPL's vocabulary). Schemes with neither thread `None`.
+        let reference = payload
+            .view()
+            .payload
+            .get("authorization")
+            .and_then(|a| a.get("nonce"))
             .and_then(|v| v.as_str())
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| {
+                req_extra
+                    .as_ref()
+                    .and_then(|e| e.get("invoiceId"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
         // The tag's *type* is validated here (M3): a present-but-malformed
         // `destinationTag` is a hard refusal — matching the authoring
         // seam's `exact_xrpl::optional_tag` — never a silent drop to
