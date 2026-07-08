@@ -4,6 +4,17 @@
 
 **The sentence:** every payment refusal carries, next to its human message, a versioned machine-readable verdict — code, stage, reason, recovery — built from the engine's *typed* decision at a single render site, never parsed back out of strings.
 
+**Review (2026-07-08, Kyra): approved — "build it"** — with tightening edits, all incorporated below before WS-1 froze anything:
+
+- The field set stays the original v1 shape (`retryable`, `recovery.safe_to_retry`, `funds_moved` — no `current_attempt_charged`/`prior_payment`/`funds_status` variants): ambiguity is resolved by **definitions, not new fields**. "For v1, clarity beats perfect ontology."
+- `retryable` vs `recovery.safe_to_retry` pinned: coarse operation verdict vs recovery instruction (Retry semantics block below).
+- `funds_moved` pinned: the payment state known for this quote/proof — never a fresh charge caused by the rejected invocation.
+- `engine_unavailable` → actor `provider_operator`, conservative class — the scrub can't distinguish transient from broken, so don't overpromise recovery.
+- `binding_malformed` → conservative (a new quote doesn't fix a client serialization bug).
+- `quote_frozen` → `non_recoverable` (a freeze often signals replay/wrong-chain; typed freeze subreasons reserved).
+- `not_settled` split from `settlement_pending` — "never paid" and "paid, awaiting confidence" route differently; the record's event chain distinguishes them typed.
+- Reserved reason vocabulary recorded now so future surfaces align; header discipline pinned (exactly one; duplicates/malformed → human-error fallback).
+
 ---
 
 ## Ground truth (as researched 2026-07-08)
@@ -51,8 +62,16 @@ Field rules:
 - `stage` — where in the lifecycle the refusal fired: `admission | quote | claim | verify | settle | completion | redeem` (provider-side, v1) plus reserved caller-side values `authoring | caller_policy` (produced by the demand side in a later phase, not v1).
 - `reason` — specific, snake_case, **string-typed on the wire**. Producers use Rust enums (no typos); consumers must tolerate unknown reasons (forward compat — new reasons are additive within `@1`).
 - `message` — the same human string that rides the error body, truncated to a fixed cap (proposed 512 B) inside the schematic; the body carries it in full. Single-sourced from the same `Display` so the two can never disagree.
-- `recovery.class` — one of `automatic_retry | new_quote_required | user_action_required | operator_approval_required | provider_configuration_error | caller_configuration_error | network_transient | security_violation | non_recoverable`. `actor` names who can act (`caller_agent | caller_user | caller_operator | provider_operator`).
-- `handler_executed` — always `false` for anything the gate refuses (the invariant, stated as data). `funds_moved` — `"no" | "yes" | "unknown"`, derived from engine state (e.g. `not_settled` → no; `already_redeemed` → yes).
+- `recovery.class` — one of `automatic_retry | payment_required | new_quote_required | user_action_required | operator_approval_required | provider_configuration_error | caller_configuration_error | network_transient | security_violation | non_recoverable`. `payment_required` = "the quote exists — pay it, then retry"; a routing distinct from requoting.
+- `recovery.actor` — who can *fix* it: `caller_agent | caller_user | caller_operator | provider_operator`.
+- `handler_executed` — always `false` for anything these stages refuse: the invariant, stated as data.
+- `funds_moved` — `no | yes | unknown`: the payment state known to the provider for this quote/proof — **never** a fresh charge caused by this rejected invocation (a refusal never charges; the paired `message` carries the context, e.g. `already_redeemed` → `yes` reads with "one payment, one serve"). `unknown` is deliberate on binding-failure rows: a failed possession proof learns nothing about payment state.
+
+### Retry semantics
+
+- `retryable` — the coarse verdict for the failed operation: whether retrying it may succeed **without changing configuration or user/operator state**.
+- `recovery.safe_to_retry` — the recovery instruction: whether retrying the same attempt is part of the recommended recovery.
+- `recovery.safe_to_requote` — the agent may request a fresh quote and attempt a new payment. It does not imply the current proof can be reused; `false` on security rows means *do not just buy another quote and try again*.
 - **Redaction (Kyra's avoid-list, promoted to contract):** no bearer material, no key references beyond names, no payment blobs, no filesystem paths, no serde/transport detail, no facilitator response bodies. The schematic is built **only from typed fields** of the engine decision — never by inspecting an `EngineError`.
 
 ## Carrier: a reply header, not a JSON body
@@ -61,6 +80,7 @@ The human message stays the error body, byte-for-byte as today — every existin
 
 - `HDR_FAILURE_SCHEMATIC = "net-failure-schematic"` (constant next to `HDR_PAYMENT_QUOTE` in `net_sdk::tool_payment`), value = the schematic JSON bytes.
 - Header values cap at 4096 B on the wire — adopted as a *feature*: the schematic must stay small, ids/hashes ride truncated where needed, and a max-size test pins that the largest producible schematic fits.
+- **Header discipline (review-pinned):** producers emit **exactly one** schematic header, value = raw JSON bytes, single-encoded (never a JSON string containing JSON). Consumers: more than one `net-failure-schematic` header → ignore the schematic entirely and fall back to the human error (no ambiguity to exploit); malformed JSON or invalid UTF-8 → the same fallback. Both rules tested in WS-4.
 - Rejected alternative, recorded: JSON-as-body (the `ERR_TOOL` precedent). It works only when every reader knows the trick from day one; here it would turn the primary message into JSON on every legacy surface, violating "primary = human".
 
 ---
@@ -71,25 +91,30 @@ The types, before any wiring.
 
 - [ ] `FailureSchematic` (+ `Recovery`) in `net_sdk::tool_payment` — serde struct per the shape above, `TAG_PAYMENT_FAILURE = "net.payment.failure@1"`, `HDR_FAILURE_SCHEMATIC`. The SDK already owns the wire vocabulary (ERR_PAYMENT, header names); this is wire vocabulary, not payment parsing — the "SDK never verifies payments" doctrine holds. Cross-reference the tag from `payments/src/core/versioning.rs` prose so the registry stays discoverable.
 - [ ] `GateDenial { message: String, schematic: FailureSchematic }` in the same module — the new refusal type for both gate traits (WS-3 changes the signatures; the type lands first).
-- [ ] Payments core: promote the redeem-gate strings to `RedeemDenialReason` (`unknown_quote | binding_malformed | binding_rejected | payer_record_corrupt | quote_frozen | not_settled | wrong_tool_binding | already_redeemed`); `RedeemDecision::Denied` gains the typed reason alongside the message. **`Display` preserves today's exact strings** — wire messages and every existing assertion stay put.
+- [ ] Payments core: promote the redeem-gate strings to `RedeemDenialReason` (`unknown_quote | binding_malformed | binding_rejected | payer_record_corrupt | quote_frozen | not_settled | settlement_pending | wrong_tool_binding | already_redeemed`); `RedeemDecision::Denied` gains the typed reason. **`Display` preserves today's exact strings** — wire messages and every existing assertion stay put — with one review-sanctioned exception: the `not_settled`/`settlement_pending` split (typed at the source: `rec.chain` empty vs non-empty while `billing` is `None`) mints a *new* message for the pending case; the never-paid case keeps today's string verbatim.
 - [ ] Pin the reason↔recovery mapping table (draft below) as committed prose next to the types. It is a **caller-facing contract reviewed like a money-path decision** — agents will branch on it.
 - [ ] Golden JSON fixture for the schematic (the `gen_payments_fixtures.rs` idiom), plus a tolerance test: a schematic with an unknown `reason`/extra fields deserializes fine.
 
-Draft mapping (v1, redeem + admission stages):
+Mapping (v1, redeem + admission stages — tightened per review):
 
-| reason | stage | class | safe_to_retry | safe_to_requote | funds_moved |
-|---|---|---|---|---|---|
-| `missing_quote` | admission | `new_quote_required` | false | true | no |
-| `gate_missing` | admission | `provider_configuration_error` | false | false | no |
-| `unknown_quote` | redeem | `new_quote_required` | false | true | no |
-| `binding_malformed` | redeem | `caller_configuration_error` | false | true | unknown |
-| `binding_rejected` | redeem | `security_violation` | false | false | unknown |
-| `payer_record_corrupt` | redeem | `provider_configuration_error` | false | false | unknown |
-| `quote_frozen` | redeem | `new_quote_required` | false | true | unknown |
-| `not_settled` | redeem | `new_quote_required` | false | true | no |
-| `wrong_tool_binding` | redeem | `security_violation` | false | false | unknown |
-| `already_redeemed` | redeem | `new_quote_required` | false | true | yes |
-| `engine_unavailable` | redeem | `network_transient` | true | true | unknown |
+| reason | stage | class | actor | retryable | safe_to_retry | safe_to_requote | funds_moved |
+|---|---|---|---|---|---|---|---|
+| `missing_quote` | admission | `new_quote_required` | caller_agent | false | false | true | no |
+| `gate_missing` | admission | `provider_configuration_error` | provider_operator | false | false | false | no |
+| `unknown_quote` | redeem | `new_quote_required` | caller_agent | false | false | true | no |
+| `binding_malformed` | redeem | `caller_configuration_error` | caller_operator | false | false | false | unknown |
+| `binding_rejected` | redeem | `security_violation` | caller_operator | false | false | false | unknown |
+| `payer_record_corrupt` | redeem | `provider_configuration_error` | provider_operator | false | false | false | unknown |
+| `quote_frozen` | redeem | `non_recoverable` | caller_operator | false | false | false | unknown |
+| `not_settled` | redeem | `payment_required` | caller_agent | true | true | true | no |
+| `settlement_pending` | redeem | `automatic_retry` | caller_agent | true | true | true | unknown |
+| `wrong_tool_binding` | redeem | `security_violation` | caller_operator | false | false | false | unknown |
+| `already_redeemed` | redeem | `new_quote_required` | caller_agent | false | false | true | yes |
+| `engine_unavailable` | redeem | `provider_configuration_error` | provider_operator | true | true | true | unknown |
+
+Row notes (the review's reasoning, kept next to the contract): `binding_malformed` is a client serialization bug — a new quote doesn't fix it (`next_action: fix_payment_client`). `quote_frozen` often signals replay/wrong-chain/reorg — "get a new quote" understates it; typed freeze subreasons (`quote_frozen_replay | _wrong_chain | _reorg | _amount`) are **reserved** pending a typed freeze tag in the store record. `engine_unavailable`'s actor is the provider (the caller can't fix engine availability); retry is permitted but nothing stronger is promised — the scrub can't distinguish transient from broken. `not_settled` vs `settlement_pending`: the record's event chain distinguishes "never paid" (pay the quote, then retry) from "paid, awaiting confidence" (wait and retry after re-verification).
+
+Reserved reasons (documented now, no v1 producer — future surfaces must use these names, per review): `insufficient_funds`, `no_wallet_configured`, `network_not_allowed`, `quote_expired`, `tier_below_required`, `checker_unavailable`, `facilitator_rejected` — the caller-side authoring and pay-path stages of WS-5.
 
 **Acceptance:** the object round-trips through serde with golden bytes; unknown-reason tolerance proven; the mapping table is committed prose; nothing is wired yet and the full suite is untouched.
 
@@ -120,7 +145,7 @@ The three edits the wire already permits (`cortex/rpc.rs` + adapter `mesh_rpc.rs
 - [ ] Demand-side MCP gateway: on `RpcError::ServerError`, decode `HDR_FAILURE_SCHEMATIC` **tolerantly** (absent/malformed → behave exactly as today); `GatewayError::Denied` carries `Option<FailureSchematic>`; the shim surfaces it as the error `CallToolResult`'s `structured_content` while `text` stays the human `denied_message`. Kyra's "compact primary + expandable detail", materialized in the field MCP already has.
 - [ ] Python bindings: the outcome JSON gains `"failure": {…schematic…}` beside the existing `error` string when present; the `status` vocabulary is untouched.
 - [ ] Logs: the emission point gains structured `tracing` fields (`reason`, `stage`, `recovery_class`) so operators grep verdicts, not prose.
-- [ ] Tests: end-to-end MCP — a denied paid call yields `is_error: true`, human text, and `structured_content.object == "net.payment.failure@1"`; a legacy provider (no header) yields today's exact behavior; Python round-trip for the `failure` field.
+- [ ] Tests: end-to-end MCP — a denied paid call yields `is_error: true`, human text, and `structured_content.object == "net.payment.failure@1"`; a legacy provider (no header) yields today's exact behavior; duplicate or malformed schematic headers → schematic ignored, human path intact (the discipline rule); Python round-trip for the `failure` field.
 
 **Acceptance:** an agent driving the MCP surface can branch on `reason`/`recovery.class` without string-matching prose; every surface degrades gracefully against peers that predate the header.
 
