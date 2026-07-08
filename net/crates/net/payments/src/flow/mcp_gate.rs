@@ -14,7 +14,7 @@ use net_mcp::serve::{CapabilityId, PaymentAdmission, PaymentFlow, PaymentFlowDec
 use serde_json::Value;
 
 use super::{CallerDecision, CallerPaymentFlow};
-use crate::engine::{PaymentEngine, RedeemDecision};
+use crate::engine::PaymentEngine;
 
 #[async_trait]
 impl PaymentFlow for CallerPaymentFlow {
@@ -76,16 +76,8 @@ impl PaymentAdmission for EnginePaymentAdmission {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), String> {
-        match self
-            .engine
-            .redeem_for_invocation(tool_id, quote_id, binding)
-            .await
-        {
-            Ok(RedeemDecision::Admitted) => Ok(()),
-            Ok(RedeemDecision::Denied { reason }) => Err(reason),
-            // Engine/store failure is fail-closed: never serve on an
-            // unverifiable payment.
-            Err(e) => Err(format!("payment engine unavailable (fail-closed): {e}")),
-        }
+        // Single-sourced with the SDK-native gate
+        // (`mesh::EngineToolPaymentGate`) — see `flow::redeem_via_engine`.
+        super::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
     }
 }

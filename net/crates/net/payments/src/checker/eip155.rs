@@ -18,9 +18,6 @@ use super::transport::RpcTransport;
 use super::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
 use crate::core::verification::{VerificationTier, VerifierRef};
 
-/// keccak256("Transfer(address,address,uint256)").
-const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
 /// The JSON-RPC checker for one eip155 network.
 pub struct Eip155Checker {
     transport: RpcTransport,
@@ -149,6 +146,47 @@ fn parse_hex_u128(s: &str, what: &str) -> Result<u128, CheckerError> {
         .map_err(|e| CheckerError::terminal(format!("{what} `{s}`: {e}")))
 }
 
+/// The 0x-prefixed keccak256 of an event signature — its `topics[0]`.
+/// Every event topic on the money path is computed here from its
+/// signature, never memorized as a magic constant.
+fn keccak_topic(signature: &[u8]) -> String {
+    use sha3::Digest as _;
+    format!("0x{}", hex::encode(sha3::Keccak256::digest(signature)))
+}
+
+/// The `Transfer(address indexed from, address indexed to, uint256 value)`
+/// ERC-20 event topic. Computed from the signature — see [`keccak_topic`].
+fn transfer_topic() -> &'static str {
+    static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOPIC.get_or_init(|| keccak_topic(b"Transfer(address,address,uint256)"))
+}
+
+/// The `AuthorizationUsed(address indexed authorizer, bytes32 indexed
+/// nonce)` event topic (EIP-3009 requires the token emit it on
+/// `transferWithAuthorization`). Computed from the signature — see
+/// [`keccak_topic`].
+fn authorization_used_topic() -> &'static str {
+    static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOPIC.get_or_init(|| keccak_topic(b"AuthorizationUsed(address,bytes32)"))
+}
+
+/// Is `s` the eip155 adapter's reference vocabulary — an EIP-3009 nonce?
+/// Delegates to the crate-shared [`crate::checker::is_eip3009_nonce`] so
+/// this bind and the engine's reference derivation agree byte-for-byte on
+/// what counts as a nonce (a disagreement would be a fail-open). `0x` is
+/// optional — the settlement signer accepts a bare-hex nonce, so the
+/// checker must too, or it would skip the bind on a valid authorization.
+fn is_nonce_hex(s: &str) -> bool {
+    crate::checker::is_eip3009_nonce(s)
+}
+
+/// A 32-byte topic equals the 32-byte word `word` (both 0x-hex)?
+fn topic_is_word(topic: &str, word: &str) -> bool {
+    let topic = topic.trim_start_matches("0x");
+    let word = word.trim_start_matches("0x");
+    topic.len() == 64 && word.len() == 64 && topic.eq_ignore_ascii_case(word)
+}
+
 /// A 32-byte topic holding a left-padded address equals `addr`?
 fn topic_is_address(topic: &str, addr: &str) -> bool {
     let topic = topic.trim_start_matches("0x");
@@ -219,6 +257,50 @@ impl ChainChecker for Eip155Checker {
         // recipient — straight from the chain.
         let delivered = match query {
             Some(q) => {
+                // Nonce binding (the H3 fix's recorded stronger follow-up):
+                // when the quote threads its caller-signed EIP-3009 nonce as
+                // the reference, the token contract must have emitted the
+                // matching `AuthorizationUsed(authorizer, nonce)` in THIS
+                // transaction — binding the settlement to this exact
+                // authorization, not merely to (token, payer, recipient).
+                // The eip155 adapter's reference vocabulary is a 32-byte hex
+                // nonce (`0x` optional); any other reference shape belongs to
+                // another adapter and is ignored here (the `to_tag`
+                // convention).
+                //
+                // The emitter must be `q.token` itself. This is exactly right
+                // for conforming EIP-3009 tokens, PROXIES INCLUDED: a proxy
+                // (USDC) emits under the proxy address during the delegatecall
+                // into its implementation, and that proxy address *is* the
+                // quoted asset. A token that emits `AuthorizationUsed` from a
+                // *different* contract than the quoted asset, or a
+                // non-standard token that omits/renames the event, fails this
+                // bind and zeroes out — intentional fail-closed: relaxing the
+                // emitter to "any address" would let an unrelated contract's
+                // event satisfy the bind. Widen the asset registry, don't
+                // widen this check.
+                let nonce_bound = match q.reference.as_deref().filter(|r| is_nonce_hex(r)) {
+                    Some(nonce) => receipt["logs"].as_array().into_iter().flatten().any(|log| {
+                        let topics: Vec<&str> = log["topics"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        log["address"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case(&q.token)
+                            && topics.len() >= 3
+                            && topics[0].eq_ignore_ascii_case(authorization_used_topic())
+                            && q.from
+                                .as_deref()
+                                .map(|from| topic_is_address(topics[1], from))
+                                .unwrap_or(true)
+                            && topic_is_word(topics[2], nonce)
+                    }),
+                    None => true,
+                };
                 let mut total: u128 = 0;
                 for log in receipt["logs"].as_array().into_iter().flatten() {
                     let emitter = log["address"].as_str().unwrap_or_default();
@@ -241,7 +323,7 @@ impl ChainChecker for Eip155Checker {
                     };
                     if emitter.eq_ignore_ascii_case(&q.token)
                         && topics.len() >= 3
-                        && topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC)
+                        && topics[0].eq_ignore_ascii_case(transfer_topic())
                         && from_ok
                         && topic_is_address(topics[2], &q.to)
                     {
@@ -249,6 +331,13 @@ impl ChainChecker for Eip155Checker {
                             parse_hex_u128(log["data"].as_str().unwrap_or("0x0"), "log.data")?;
                         total = total.saturating_add(value);
                     }
+                }
+                // A settlement that never consumed THIS quote's
+                // authorization delivered nothing for this quote — an
+                // honest zero the engine turns into an amount-mismatch
+                // invalidation.
+                if !nonce_bound {
+                    total = 0;
                 }
                 Some(total.to_string())
             }

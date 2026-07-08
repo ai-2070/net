@@ -28,20 +28,27 @@
 //! entirely by a stranger, with the queried payer untouched, sums to an
 //! honest zero.
 //!
-//! Scope of the bind (stated precisely, not overclaimed): the debit leg and
-//! the credit leg are matched at the *transaction* level, not tied to one
-//! source→destination movement. In a single transaction that both debits
-//! the queried payer (to anyone) *and* credits the merchant (from anyone)
-//! the two legs are satisfied independently. Fully attributing the credit
-//! to a payer→merchant transfer would require decoding the SPL transfer
-//! instructions (source/destination/authority), which the balance-delta
-//! model deliberately avoids for CPI-robustness. The residual is narrow:
-//! constructing such a transaction requires the *payer itself* to co-sign
-//! an atomic transaction that pays a third party while a stranger pays the
-//! merchant — i.e. the victim would be the attacker's own accomplice — so
-//! per-transfer attribution is a recorded, deferred hardening, not a live
-//! exploit. The engine turns any shortfall into an amount-mismatch
-//! invalidation.
+//! Scope of the bind — **per-transfer attribution (N3b)**: the debit and
+//! credit legs are no longer matched only at the transaction level. On
+//! top of the balance-delta rules, the parsed instructions (outer and
+//! inner/CPI) must contain spl-token `transfer` / `transferChecked`
+//! **edge(s) from the payer to the merchant** — authority == payer,
+//! destination ATA owned by the recipient, right mint (from
+//! `transferChecked` itself, or resolved through the account-keys ×
+//! token-balances map for plain `transfer`) — **whose summed amount
+//! covers the delivered delta**. Amount coverage (not mere existence) is
+//! what closes the co-sign residual the earlier transaction-level bind
+//! recorded (payer debited toward a third party while a stranger credits
+//! the merchant, in one atomic transaction): a zero/dust decoy edge no
+//! longer buys attribution, since its amount cannot cover a
+//! stranger-funded credit. Delivered stays delta-derived — the edge is
+//! the *attribution*, never the amount source (deltas remain CPI-robust);
+//! the edge amount only has to *account for* the delta, floor not source.
+//! Fail-closed consequence, stated honestly: a settlement whose transfer
+//! the RPC cannot express as parseable spl-token instruction(s) covering
+//! the delta zeroes out and the engine invalidates on amount-mismatch —
+//! standard facilitator settlements are plain (possibly CPI-nested)
+//! transfers of the full amount, which parse and cover.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -217,6 +224,115 @@ fn fold_balances(
     Ok(())
 }
 
+/// Summed spl-token `transfer` / `transferChecked` amount over edges
+/// **from the payer to the merchant** (authority == `payer`, destination
+/// ATA owned by `to`, mint == `token`), across outer and inner (CPI)
+/// instructions. N3b attribution requires this sum to *cover* the
+/// delivered delta — edge **existence alone is not enough**: a zero/dust
+/// decoy edge would otherwise let a stranger-funded merchant credit be
+/// attributed to the payer's quote. Destination ownership and — for plain
+/// `transfer`, which carries no mint — the destination's mint are resolved
+/// through the account-keys × token-balances map. The map is built
+/// leniently (malformed unrelated entries are skipped — the L2 posture):
+/// a lenient *bind* can only fail closed, never over-credit, and a
+/// missing/malformed amount contributes zero (fail-closed).
+fn payer_edge_amount(tx: &Value, payer: &str, to: &str, token: &str) -> u128 {
+    let keys: Vec<&str> = tx["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| k["pubkey"].as_str().or(k.as_str()).unwrap_or_default())
+        .collect();
+    // Only the MERCHANT's ATAs (owner == `to`), pubkey → mint. The map is
+    // consulted purely to resolve a transfer's destination, and only a
+    // merchant-owned destination can attribute anything — so scope it to
+    // the merchant up front rather than mapping every account. Membership
+    // then *is* the destination-ownership check (no separate `owner == to`
+    // downstream); the stored mint resolves plain `transfer` (which names
+    // none).
+    let mut merchant_ata: std::collections::BTreeMap<&str, &str> =
+        std::collections::BTreeMap::new();
+    for entries in [
+        &tx["meta"]["preTokenBalances"],
+        &tx["meta"]["postTokenBalances"],
+    ] {
+        for entry in entries.as_array().into_iter().flatten() {
+            let (Some(index), Some(owner), Some(mint)) = (
+                entry["accountIndex"].as_u64(),
+                entry["owner"].as_str(),
+                entry["mint"].as_str(),
+            ) else {
+                continue;
+            };
+            if owner != to {
+                continue;
+            }
+            if let Some(pubkey) = usize::try_from(index).ok().and_then(|i| keys.get(i)) {
+                merchant_ata.insert(pubkey, mint);
+            }
+        }
+    }
+
+    let outer = tx["transaction"]["message"]["instructions"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    let inner = tx["meta"]["innerInstructions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group["instructions"].as_array().into_iter().flatten());
+    let mut summed: u128 = 0;
+    for instr in outer.chain(inner) {
+        if !matches!(
+            instr["program"].as_str(),
+            Some("spl-token") | Some("spl-token-2022")
+        ) {
+            continue;
+        }
+        let parsed = &instr["parsed"];
+        if !matches!(
+            parsed["type"].as_str(),
+            Some("transfer") | Some("transferChecked")
+        ) {
+            continue;
+        }
+        let info = &parsed["info"];
+        let authority = info["authority"]
+            .as_str()
+            .or_else(|| info["multisigAuthority"].as_str());
+        if authority != Some(payer) {
+            continue;
+        }
+        // Destination must be a merchant-owned ATA (map membership is the
+        // ownership check).
+        let Some(dest_mint) = info["destination"]
+            .as_str()
+            .and_then(|dest| merchant_ata.get(dest).copied())
+        else {
+            continue;
+        };
+        // `transferChecked` names its mint; plain `transfer` resolves
+        // through the destination's balance entry.
+        let mint_ok = info["mint"]
+            .as_str()
+            .map(|m| m == token)
+            .unwrap_or(dest_mint == token);
+        if mint_ok {
+            // `transferChecked` carries the amount under `tokenAmount`;
+            // plain `transfer` under `amount`. A missing/unparseable
+            // amount contributes zero — fail-closed, never over-credit.
+            let amount = info["amount"]
+                .as_str()
+                .or_else(|| info["tokenAmount"]["amount"].as_str())
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            summed = summed.saturating_add(amount);
+        }
+    }
+    summed
+}
+
 #[async_trait]
 impl ChainChecker for SvmChecker {
     fn reference(&self) -> VerifierRef {
@@ -289,14 +405,14 @@ impl ChainChecker for SvmChecker {
                 // would let a facilitator that reports no payer point at
                 // any qualifying on-chain transfer. Refuse to attribute an
                 // unbound transfer rather than crediting one.
-                if q.from.as_deref().map_or(true, str::is_empty) {
+                let Some(payer) = q.from.as_deref().filter(|p| !p.is_empty()) else {
                     return Err(CheckerError::terminal(
                         "solana delivery cannot be bound to a payer: the settlement \
                          names none (opaque payload and no settle-time payer) — refusing \
                          to attribute an unbound transfer"
                             .to_string(),
                     ));
-                }
+                };
                 let tx = self
                     .rpc(
                         "getTransaction",
@@ -366,12 +482,23 @@ impl ChainChecker for SvmChecker {
                 // `from`): the queried payer — guaranteed present by the guard
                 // above — must have spent this mint in this transaction, or
                 // nothing counts *by this quote's payer*. A transfer to the
-                // merchant with the payer untouched is an honest zero. (The
-                // debit and credit legs are matched at the transaction level,
-                // not tied to one source→destination movement — see the module
-                // doc for the precise scope and the deferred per-transfer
-                // hardening.)
+                // merchant with the payer untouched is an honest zero. This is
+                // the coarse first gate; per-transfer attribution (that the
+                // payer→merchant edge itself covers the delivered delta) is
+                // enforced by `payer_edge_amount` immediately below (N3b) — no
+                // longer deferred.
                 if !payer_debited {
+                    total = 0;
+                }
+                // Per-transfer attribution (N3b): the transaction must
+                // carry parseable payer→merchant transfer edge(s) whose
+                // amount COVERS the delivered delta. Existence is not
+                // enough — a zero/dust decoy edge would otherwise let the
+                // co-sign residual (payer debited toward a third party
+                // while a stranger credits the merchant, atomically)
+                // satisfy the bind. Fail-closed: edges that do not cover
+                // `total`, no attribution.
+                if total > 0 && payer_edge_amount(&tx, payer, &q.to, &q.token) < total {
                     total = 0;
                 }
                 Some(total.to_string())

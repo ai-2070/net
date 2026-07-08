@@ -157,7 +157,7 @@ impl HttpFacilitator {
             .map_err(|e| FacilitatorError::protocol(format!("/supported decode: {e}")))
     }
 
-    /// Build from a [`FacilitatorConfig`], fetching `GET /supported`
+    /// Build from a [`super::config::FacilitatorConfig`], fetching `GET /supported`
     /// and validating every enabled pair — the load-time gate the
     /// config object promises ("fails loudly at load, not at first
     /// payment"). The caller resolves `config.auth`'s secret ref into

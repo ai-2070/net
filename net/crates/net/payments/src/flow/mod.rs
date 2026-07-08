@@ -44,6 +44,42 @@ pub mod mcp_gate;
 pub mod mesh;
 pub mod signer;
 
+/// Redeem a paid quote against the engine for one invocation and map the
+/// outcome to the provider-gate vocabulary: `Ok(())` admits,
+/// `Err(reason)` refuses (the reason travels to the caller). Engine/store
+/// failure is fail-closed — never serve on an unverifiable payment.
+///
+/// Single-sourced so the SDK-native gate (`mesh::EngineToolPaymentGate`)
+/// and the MCP adapter gate (`mcp_gate::EnginePaymentAdmission`) cannot
+/// drift: both are thin trait wrappers over this one mapping. (Plain
+/// spans, not intra-doc links: each gate module is behind its own feature
+/// while this fn compiles under `any(mesh, mcp-gate)`, so a link to the
+/// other module would dangle when docs build with only one feature on.)
+#[cfg(any(feature = "mesh", feature = "mcp-gate"))]
+pub(crate) async fn redeem_via_engine(
+    engine: &PaymentEngine,
+    tool_id: &str,
+    quote_id: &str,
+    binding: Option<&[u8]>,
+) -> Result<(), String> {
+    use crate::engine::RedeemDecision;
+    match engine
+        .redeem_for_invocation(tool_id, quote_id, binding)
+        .await
+    {
+        Ok(RedeemDecision::Admitted) => Ok(()),
+        Ok(RedeemDecision::Denied { reason }) => Err(reason),
+        Err(e) => {
+            // Fail-closed — but the raw `EngineError` wraps StoreError /
+            // EnvelopeError / X402Error, which can carry file paths, I/O
+            // detail, or facilitator responses. Log the specifics
+            // server-side; hand the caller only a generic verdict.
+            tracing::error!(error = %e, "payment engine unavailable (fail-closed)");
+            Err("payment engine unavailable (fail-closed)".to_string())
+        }
+    }
+}
+
 /// Time source. There is no global clock — every timestamp in the flow
 /// comes from here, and tests inject fixed instants.
 pub trait Clock: Send + Sync {

@@ -25,6 +25,19 @@ mod transport;
 #[cfg(feature = "http-facilitator")]
 pub mod xrpl;
 
+/// Is `s` a 32-byte hex word — an EIP-3009 authorization nonce? The `0x`
+/// prefix is optional (the settlement signer's `decode_bytes32` accepts a
+/// nonce with or without it). The canonical nonce-shape predicate, shared
+/// by the engine's reference derivation (which requires a valid nonce on
+/// eip155 before threading it) and the eip155 checker's `AuthorizationUsed`
+/// bind — a single source so the two layers cannot disagree on what counts
+/// as a nonce (a disagreement is a fail-open: one treats a value as a
+/// nonce, the other skips the bind).
+pub(crate) fn is_eip3009_nonce(s: &str) -> bool {
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Checker failure (RPC unreachable, malformed answer). Retryability is
 /// the checker's honest claim; policy decides whether to use it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

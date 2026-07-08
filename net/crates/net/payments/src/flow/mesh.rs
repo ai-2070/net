@@ -223,3 +223,34 @@ impl ProviderChannel for MeshPaymentChannel {
             .map_err(Self::map_rpc_error)
     }
 }
+
+/// The provider-side gate for **natively-served** paid tools
+/// ([`net_sdk::tool_payment::ToolPaymentGate`], consumed by
+/// `Mesh::serve_tool_paid`): each paid invoke's quote is redeemed
+/// against the [`crate::PaymentEngine`] — settled, billed, unfrozen, bound to
+/// this tool, never redeemed before, at-most-once under the store lock.
+/// The SDK-native twin of the MCP wrap path's `EnginePaymentAdmission`
+/// (`flow/mcp_gate.rs`), byte-identical semantics.
+pub struct EngineToolPaymentGate {
+    engine: Arc<crate::engine::PaymentEngine>,
+}
+
+impl EngineToolPaymentGate {
+    pub fn new(engine: Arc<crate::engine::PaymentEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait::async_trait]
+impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
+    async fn redeem(
+        &self,
+        tool_id: &str,
+        quote_id: &str,
+        binding: Option<&[u8]>,
+    ) -> Result<(), String> {
+        // Single-sourced with the MCP gate (`mcp_gate::EnginePaymentAdmission`)
+        // so the fail-closed mapping cannot drift — see `flow::redeem_via_engine`.
+        crate::flow::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
+    }
+}

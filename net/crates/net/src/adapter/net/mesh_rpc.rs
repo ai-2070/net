@@ -3937,14 +3937,26 @@ pub enum ServeError {
     /// The descriptor announces `pricing_terms`, but this serve path
     /// has no payment-admission gate — an announced price this path
     /// cannot enforce must never reach discovery (callers would see a
-    /// priced tool that serves free). Publish paid tools through the
+    /// priced tool that serves free). Serve paid tools via the SDK's
+    /// `Mesh::serve_tool_paid` (native gate), or publish through the
     /// MCP adapter's `ServerPublisher::publish_tools` with a
     /// `payment_admission` gate.
     #[error(
         "tool `{0}` announces pricing_terms but this serve path cannot enforce payment — \
-         publish paid tools via ServerPublisher::publish_tools with payment_admission"
+         serve paid tools via Mesh::serve_tool_paid, or publish via \
+         ServerPublisher::publish_tools with payment_admission"
     )]
     UnenforceablePricing(String),
+    /// The gated serve path (`Mesh::serve_tool_paid`) got a descriptor
+    /// with **no** `pricing_terms`: a payment gate on an unannounced
+    /// price means every caller is refused with no way to know why.
+    /// Announce the price (the gate enforces it), or serve the tool
+    /// free via `Mesh::serve_tool`.
+    #[error(
+        "tool `{0}` is served through the payment gate but announces no pricing_terms — \
+         attach terms to the descriptor, or serve it free via Mesh::serve_tool"
+    )]
+    MissingPricingTerms(String),
 }
 
 // ============================================================================
