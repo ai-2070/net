@@ -48,3 +48,4 @@
 
 pub mod exact_evm;
 pub mod exact_svm;
+pub mod exact_xrpl;
