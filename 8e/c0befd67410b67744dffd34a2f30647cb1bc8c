@@ -1,0 +1,38 @@
+net/crates/net/payments/src/checker/transport.rs
+  s_a797c9974a8f7a::t_f7ec749e412f14 1-101
+net/crates/net/payments/src/checker/mod.rs
+  s_a797c9974a8f7a::t_beba60a73c500a 24-25
+net/crates/net/payments/src/checker/eip155.rs
+  s_a797c9974a8f7a::t_f8c70d6d0b1f86 50
+  s_a797c9974a8f7a::t_998962b7c6d2d6 167
+  s_a797c9974a8f7a::t_6373764174e816 86-93
+  s_a797c9974a8f7a::t_47fe7e51ed5631 17,26
+  s_a797c9974a8f7a::t_eba1f32e1bec10 126-127
+net/crates/net/payments/src/checker/svm.rs
+  s_a797c9974a8f7a::t_56a8679947e7d5 225
+  s_a797c9974a8f7a::t_fe6172e766959a 49,59
+  s_a797c9974a8f7a::t_2e3583915399d1 89
+  s_a797c9974a8f7a::t_249c4b8f28e8fb 113-120
+  s_a797c9974a8f7a::t_146f3071a9b949 147-148
+net/crates/net/payments/src/checker/xrpl.rs
+  s_a797c9974a8f7a::t_de3083b7dbd732 82
+  s_a797c9974a8f7a::t_2be6791202d78e 43,53
+  s_a797c9974a8f7a::t_eaf11a02006d3e 154-155,162-163,213
+  s_a797c9974a8f7a::t_c57008ab6d38af 110-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ec0befd67410b67744dffd34a2f30647cb1bc8c",
+  "prompts": {},
+  "sessions": {
+    "s_a797c9974a8f7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c9069b3-7f10-427a-9e70-65573d5f98b9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
