@@ -1138,18 +1138,17 @@ impl PaymentEngine {
         // `None`. Silently dropping it would ask the checker to verify
         // against "no tag" (which now requires tag *absence*), quietly
         // discarding a sub-account routing the quote meant to bind.
-        let to_tag = match req_extra.as_ref().and_then(|e| e.get("destinationTag")) {
-            None | Some(serde_json::Value::Null) => None,
-            Some(v) => Some(
-                v.as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| {
+        let to_tag =
+            match req_extra.as_ref().and_then(|e| e.get("destinationTag")) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(
+                    || {
                         EngineError::State(
                             "requirements.extra.destinationTag is not a u32 sub-account tag".into(),
                         )
-                    })?,
-            ),
-        };
+                    },
+                )?),
+            };
         let query = TransferQuery {
             token: requirements.view().asset.clone(),
             to: requirements.view().pay_to.clone(),

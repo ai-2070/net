@@ -290,7 +290,10 @@ async fn delivery_without_a_payer_is_refused() {
         .check(NETWORK, TX, Some(&query()))
         .await
         .expect_err("an unbound (no-payer) delivery query must be refused");
-    assert!(!err.retryable, "the refusal is terminal, not a transient shrug");
+    assert!(
+        !err.retryable,
+        "the refusal is terminal, not a transient shrug"
+    );
     assert!(
         err.message.contains("payer"),
         "the refusal names the missing payer bind: {}",

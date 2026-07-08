@@ -339,7 +339,10 @@ async fn an_untagged_quote_rejects_a_tagged_payment() {
 
     // The same quote against a genuinely untagged payment: satisfied.
     let mut untagged_tx = payment_tx(1_000_000);
-    untagged_tx.as_object_mut().unwrap().remove("DestinationTag");
+    untagged_tx
+        .as_object_mut()
+        .unwrap()
+        .remove("DestinationTag");
     rpc.set_tx(untagged_tx);
     assert_eq!(delivered_of(&checker, &untagged_quote).await, "1000000");
 }

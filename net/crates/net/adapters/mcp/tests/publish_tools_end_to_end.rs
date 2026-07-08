@@ -818,7 +818,10 @@ async fn a_refreshed_priced_local_tool_still_enforces_payment() {
 
     // Churn the inventory: withdraw `add` (refresh to the echo-only set), then
     // re-add it. The re-served handler must re-enforce the announced price.
-    let echo_only: Vec<Tool> = local_tools().into_iter().filter(|t| t.name == "echo").collect();
+    let echo_only: Vec<Tool> = local_tools()
+        .into_iter()
+        .filter(|t| t.name == "echo")
+        .collect();
     publication.refresh(&echo_only).await.expect("withdraw add");
     let delta = publication
         .refresh(&local_tools())
