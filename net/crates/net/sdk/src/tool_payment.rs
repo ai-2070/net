@@ -1,10 +1,10 @@
 //! The native tool payment seam: the wire vocabulary and the provider
 //! gate for **paid tools served straight from the SDK**
-//! ([`Mesh::serve_tool_paid`]) — no MCP adapter required.
+//! (`Mesh::serve_tool_paid`) — no MCP adapter required.
 //!
 //! The invariant this module completes: **an announced price is an
-//! enforced price on every serving path.** [`Mesh::serve_tool`] refuses
-//! a priced descriptor outright ([`ServeError::UnenforceablePricing`]);
+//! enforced price on every serving path.** `Mesh::serve_tool` refuses
+//! a priced descriptor outright (`ServeError::UnenforceablePricing`);
 //! `serve_tool_paid` is the sanctioned alternative — it wraps the
 //! handler so the quote is redeemed through a [`ToolPaymentGate`]
 //! *before* the handler runs, failing closed with [`ERR_PAYMENT`].
@@ -23,9 +23,12 @@
 //! bound to this tool, never redeemed before — at-most-once under the
 //! engine's store lock); tests script it.
 //!
-//! [`Mesh::serve_tool_paid`]: crate::mesh::Mesh::serve_tool_paid
-//! [`Mesh::serve_tool`]: crate::mesh::Mesh::serve_tool
-//! [`ServeError::UnenforceablePricing`]: crate::mesh_rpc::ServeError::UnenforceablePricing
+//! (`Mesh::serve_tool_paid` / `Mesh::serve_tool` /
+//! `ServeError::UnenforceablePricing` are named as plain spans, not
+//! intra-doc links: they live behind the `net`/`cortex` features, and
+//! this module is intentionally ungated so gate implementors don't pull
+//! the full `tool` surface — a link would dangle under
+//! `--no-default-features`.)
 
 use async_trait::async_trait;
 
