@@ -1,0 +1,103 @@
+name: Payments Live Conformance
+
+# The network ladder's live rung 1 (Base Sepolia via the x402.org
+# facilitator) has no home in `ci.yml`: its tests are `#[ignore]` and CI
+# never touches the network. This workflow is that home — scheduled +
+# manual, and **never PR-blocking** (no `push` / `pull_request` trigger,
+# so it cannot gate a merge).
+#
+# What runs, and when:
+#   * 1a + 1b — the KEYLESS canaries. They read the live facilitator's
+#     `GET /supported` and load the shipped pack against it; no secrets,
+#     no money. They run on every schedule/dispatch. A red run is the
+#     whole point: it means the live boundary moved (endpoint gone, pair
+#     dropped, vocabulary drift) — a finding about the boundary, not a
+#     test bug. GitHub emails watchers on a failed scheduled run; that is
+#     the notification (it gates nothing).
+#   * 1c — the signed structural verify. Needs a testnet key but spends
+#     nothing. Runs only when the `NET_PAYMENTS_LIVE_EVM_KEY` repo secret
+#     is configured (fork PRs / secret-less clones skip it cleanly).
+#   * 1d — the settle test. It moves real testnet USDC, so it runs ONLY
+#     on a manual dispatch with `run_settle` checked AND the key present
+#     — a scheduled run never moves money.
+#
+# Record each run in `net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md`
+# per its runbook (the doc is the ladder's go/no-go record).
+
+on:
+  schedule:
+    # 06:00 UTC Monday — a weekly canary against the live facilitator.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      run_settle:
+        description: "Run 1d (settle) — moves real testnet USDC; needs NET_PAYMENTS_LIVE_EVM_KEY + a funded payer"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-conformance:
+    name: Rung 1 — Base Sepolia (x402.org)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Resolve secret PRESENCE into a plain env boolean the step `if:`
+    # conditions can read — the secret value itself never leaves the
+    # steps that actually need it.
+    env:
+      HAS_EVM_KEY: ${{ secrets.NET_PAYMENTS_LIVE_EVM_KEY != '' }}
+    defaults:
+      run:
+        working-directory: net/crates/net/payments
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-payments-live-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-payments-live-
+            ${{ runner.os }}-cargo-
+
+      # The whole `live_testnet_conformance` binary is gated on both
+      # features, so every step compiles it the same way; the keyless
+      # canaries simply never touch the signer.
+      - name: Rung 1a/1b — keyless canaries (offered pair + pack load)
+        run: |
+          cargo test --features http-facilitator,unsafe-dev-signer \
+            --test live_testnet_conformance -- --ignored --nocapture \
+            supported_offers_the_conformance_pair_live \
+            the_shipped_pack_loads_against_the_live_facilitator
+
+      - name: Rung 1c — signed verify (structural, spends nothing)
+        if: ${{ env.HAS_EVM_KEY == 'true' }}
+        env:
+          NET_PAYMENTS_LIVE_EVM_KEY: ${{ secrets.NET_PAYMENTS_LIVE_EVM_KEY }}
+        run: |
+          cargo test --features http-facilitator,unsafe-dev-signer \
+            --test live_testnet_conformance -- --ignored --nocapture \
+            a_signed_verify_answers_structurally_live
+
+      # 1d moves real testnet USDC — gated on BOTH the key AND an explicit
+      # manual opt-in, so a scheduled run can never spend.
+      - name: Rung 1d — settle (moves real testnet USDC)
+        if: ${{ env.HAS_EVM_KEY == 'true' && github.event.inputs.run_settle == 'true' }}
+        env:
+          NET_PAYMENTS_LIVE_EVM_KEY: ${{ secrets.NET_PAYMENTS_LIVE_EVM_KEY }}
+          NET_PAYMENTS_LIVE_SETTLE: "1"
+        run: |
+          cargo test --features http-facilitator,unsafe-dev-signer \
+            --test live_testnet_conformance -- --ignored --nocapture \
+            the_unchanged_engine_settles_on_base_sepolia_live

@@ -63,6 +63,13 @@ Optional overrides: `NET_PAYMENTS_LIVE_FACILITATOR` (endpoint),
 self-payment, keeping the test USDC), `NET_PAYMENTS_LIVE_AMOUNT` (atomic,
 default `1000` = 0.001 USDC).
 
+**CI home:** `.github/workflows/payments-live.yml` runs this suite weekly
+(schedule) and on manual `workflow_dispatch`, never blocking a PR. The
+keyless canaries (1a/1b) run every time; 1c runs when the
+`NET_PAYMENTS_LIVE_EVM_KEY` repo secret is set; 1d (settle) runs only on a
+manual dispatch with `run_settle` checked, so a scheduled run never moves
+money. Record each meaningful run below.
+
 **Exit criterion:** all four green in one run; record the settlement
 transaction hash and the printed verification chain here.
 

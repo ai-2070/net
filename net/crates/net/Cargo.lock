@@ -2938,6 +2938,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "dirs",
  "fs2",
  "hex",
@@ -2948,6 +2949,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "reqwest",
  "rustls",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2956,6 +2958,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "webpki-root-certs",
 ]
 
@@ -2978,6 +2981,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "pyo3-build-config",
  "serde_json",
+ "tempfile",
  "tokio",
  "zeroize",
 ]
