@@ -85,7 +85,9 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
         InnerRpcError::Timeout { elapsed_ms } => {
             nrpc_err("timeout", format!("elapsed_ms={elapsed_ms}"))
         }
-        InnerRpcError::ServerError { status, message, .. } => nrpc_err(
+        InnerRpcError::ServerError {
+            status, message, ..
+        } => nrpc_err(
             "server_error",
             format!("status=0x{status:04x} message={message}"),
         ),

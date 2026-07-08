@@ -436,7 +436,9 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
         InnerRpcError::Timeout { elapsed_ms } => {
             format!("timeout: elapsed_ms={elapsed_ms}")
         }
-        InnerRpcError::ServerError { status, message, .. } => {
+        InnerRpcError::ServerError {
+            status, message, ..
+        } => {
             format!("server_error: status=0x{status:04x} message={message}")
         }
         InnerRpcError::Transport(e) => format!("transport: {e}"),
