@@ -507,11 +507,17 @@ mod tests {
     #[test]
     fn admission_next_action_hints_match_the_mapping_table() {
         assert_eq!(
-            FailureSchematic::missing_quote("t").recovery.next_action.as_deref(),
+            FailureSchematic::missing_quote("t")
+                .recovery
+                .next_action
+                .as_deref(),
             Some("request_new_quote")
         );
         assert_eq!(
-            FailureSchematic::gate_missing("t").recovery.next_action.as_deref(),
+            FailureSchematic::gate_missing("t")
+                .recovery
+                .next_action
+                .as_deref(),
             Some("configure_payment_gate")
         );
     }

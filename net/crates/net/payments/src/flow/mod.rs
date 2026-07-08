@@ -1189,7 +1189,10 @@ mod denial_render_tests {
             }),
             None
         );
-        assert_eq!(na(&R::AlreadyRedeemed).as_deref(), Some("request_new_quote"));
+        assert_eq!(
+            na(&R::AlreadyRedeemed).as_deref(),
+            Some("request_new_quote")
+        );
         assert_eq!(
             engine_unavailable_denial("t", "q")
                 .schematic

@@ -460,9 +460,9 @@ fn map_invoke_server_error(
 fn schematic_from_error_headers(
     headers: &[(String, Vec<u8>)],
 ) -> Option<Box<net_sdk::tool_payment::FailureSchematic>> {
-    let mut entries = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC));
+    let mut entries = headers.iter().filter(|(name, _)| {
+        name.eq_ignore_ascii_case(net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC)
+    });
     let first = entries.next()?;
     if entries.next().is_some() {
         return None;
