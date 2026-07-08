@@ -1,0 +1,22 @@
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_9f662bf3f2895f::t_44d8c2ec0e86f2 85-87
+net/crates/net/sdk/src/tool_payment.rs
+  s_9f662bf3f2895f::t_27ea24680b5dc3 377-378
+  s_9f662bf3f2895f::t_8d4cf6a5fa3808 221-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c901a2a0301c33cd840f3db6c5e333f7859d68a3",
+  "prompts": {},
+  "sessions": {
+    "s_9f662bf3f2895f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "451f4855-6551-4904-9cc0-f53e5fd0f95d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
