@@ -97,16 +97,18 @@ Vec<X402Carry<PaymentRequirements>>, registry.reference())` + `canonical_bytes`,
 and a hand-written string fails the registry/reference checks. So the provider
 surface needs a typed builder.
 
-- [ ] Bind a `build_pricing_terms(...)` helper (module `net._net`): takes the
-  capability id + a list of typed `PaymentRequirements` (scheme, network,
-  amount, asset, pay_to, max_timeout_seconds, extra) + the registry reference,
-  authors each requirement through `X402Carry::author`, and returns the
-  canonical `net.pricing.terms@1` JSON string. The provider entity id and
-  registry come from the engine handle (A2), so the caller supplies only the
-  price shape. Byte-preservation holds: the output crosses as an opaque string
-  that describe/discovery echo verbatim.
-- [ ] Document each requirement field and the mock vs real-network shape
-  (mock: `scheme="mock"`, `network="mock:net"`, `asset="musd"`).
+- [x] Bind `build_pricing_terms(provider_entity_id, capability, requirements_json)`
+  (module `net._net`): `provider_entity_id` is the node's 32-byte mesh entity id
+  (`mesh.entity_id` — public only, keys never cross), `requirements_json` is a
+  JSON array of x402 `PaymentRequirements` (camelCase wire names: `scheme`,
+  `network`, `amount`, `asset`, `payTo`, `maxTimeoutSeconds`, optional `extra`).
+  Authors each through `X402Carry::author` (the sanctioned serialization point
+  for locally-originated x402 — no byte-preservation violation) under
+  `default_registry_v1` (signer-independent `reference()`, so it matches any
+  caller's default registry), and returns the canonical `net.pricing.terms@1`
+  JSON string. Fail-closed on empty/malformed/non-32-byte id (`ValueError`).
+  Rust unit tests (canonical + decodable + multi-accept + rejects) + pytest +
+  stub + `__init__` re-export.
 
 ### A2 — The payment provider: engine + wire + priced publish
 

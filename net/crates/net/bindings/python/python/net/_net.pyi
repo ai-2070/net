@@ -3359,3 +3359,26 @@ class AsyncPaymentHttpClient:
         ...
 
     def __repr__(self) -> str: ...
+
+def build_pricing_terms(
+    provider_entity_id: bytes,
+    capability: str,
+    requirements_json: str,
+) -> str:
+    """Author the canonical ``net.pricing.terms@1`` JSON that prices a
+    capability — the provider (supply) side of payments. Present iff the
+    module was built with the ``payments`` feature.
+
+    ``provider_entity_id`` is the node's 32-byte mesh entity id
+    (``mesh.entity_id``) — the identity that will issue quotes for these terms;
+    only the public id crosses, never a key. ``capability`` is the
+    ``provider/capability`` display id. ``requirements_json`` is a JSON **array**
+    of x402 ``PaymentRequirements`` objects using the camelCase wire names —
+    ``scheme``, ``network``, ``amount`` (atomic string), ``asset``, ``payTo``,
+    ``maxTimeoutSeconds`` (int), optional ``extra`` — one entry per acceptable
+    ``(scheme, network, asset)``. Returns the canonical, byte-preserved terms
+    string to hand to the priced-publish path or announce at discovery (opaque
+    downstream; displaying a price never implies authorization to spend it).
+    Raises ``ValueError`` on a non-32-byte id, malformed JSON, or an empty
+    list."""
+    ...

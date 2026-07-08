@@ -46,6 +46,10 @@ mod capability_gateway;
 // `net-payments/http-facilitator`).
 #[cfg(feature = "payments-http")]
 mod payment_http;
+// Provider-side payment surface: pricing a capability (+ charging for it).
+// Behind `payments` (needs the net-payments core types).
+#[cfg(feature = "payments")]
+mod payment_provider;
 // Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
 // DelegationChain (root → machine → gateway → subagent) + shared
 // RevocationRegistry + child-`Identity` derivation. Thin wrappers over
@@ -3371,6 +3375,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<payment_http::PyPaymentHttpClient>()?;
         m.add_class::<payment_http::PyAsyncPaymentHttpClient>()?;
+    }
+    #[cfg(feature = "payments")]
+    {
+        m.add_function(wrap_pyfunction!(payment_provider::build_pricing_terms, m)?)?;
     }
     #[cfg(feature = "net")]
     {

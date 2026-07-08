@@ -841,6 +841,16 @@ except ImportError:
 else:
     __all__.extend(["AsyncPaymentHttpClient", "PaymentHttpClient"])
 
+# The provider (supply) side: author net.pricing.terms@1 to price a capability.
+# Present iff the module was built with the `payments` feature (default wheel).
+try:
+    from ._net import build_pricing_terms
+except ImportError:
+    # `payments` not compiled in; symbol stays undefined.
+    pass
+else:
+    __all__.append("build_pricing_terms")
+
 # Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): a
 # DelegationChain (`root -> machine -> gateway -> subagent`) for
 # capability-invocation attribution, a shared RevocationRegistry, and
