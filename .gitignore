@@ -68,3 +68,4 @@ DEBUG_*.md
 
 # OpenClaw — root-level reference clone only (anchored, same reason).
 /openclaw/
+net/crates/net/docs/BRAINSTORMING.md
