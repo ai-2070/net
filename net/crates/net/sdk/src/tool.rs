@@ -1144,6 +1144,93 @@ pub mod formats {
     }
 }
 
+/// The handler wrapper behind [`Mesh::serve_tool_paid`]: decode →
+/// redeem → run → encode. Decode comes first so a structurally invalid
+/// call never consumes the quote (the MCP wrap path's ordering); the
+/// gate runs before the user's handler so it never sees an unpaid call.
+#[cfg(feature = "cortex")]
+struct PaidToolHandler<Req, Resp, F> {
+    tool_id: String,
+    gate: std::sync::Arc<dyn crate::tool_payment::ToolPaymentGate>,
+    codec: Codec,
+    inner: std::sync::Arc<F>,
+    _req: std::marker::PhantomData<Req>,
+    _resp: std::marker::PhantomData<Resp>,
+}
+
+#[cfg(feature = "cortex")]
+fn paid_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_slice())
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl<Req, Resp, F, Fut> RpcHandler for PaidToolHandler<Req, Resp, F>
+where
+    Req: DeserializeOwned + Send + Sync + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+    F: Fn(Req) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcContext,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        // [1] Decode BEFORE the gate: a call that can never execute must
+        //     never consume the quote. Same code as the typed path.
+        let req: Req = match self.codec.decode(&ctx.payload.body) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(RpcHandlerError::Application {
+                    code: NRPC_TYPED_BAD_REQUEST,
+                    message: format!("typed handler: bad request body: {e}"),
+                })
+            }
+        };
+
+        // [2] The payment gate — the quote is redeemed (settled, billed,
+        //     unfrozen, bound to this tool, never redeemed before) or the
+        //     call is refused. Fail-closed: the handler never runs unpaid.
+        let quote_id = paid_header(&ctx.payload.headers, crate::tool_payment::HDR_PAYMENT_QUOTE)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .ok_or_else(|| RpcHandlerError::Application {
+                code: crate::tool_payment::ERR_PAYMENT,
+                message: "paid tool invoked without a payment quote header".to_string(),
+            })?;
+        let binding = paid_header(
+            &ctx.payload.headers,
+            crate::tool_payment::HDR_PAYMENT_BINDING,
+        );
+        self.gate
+            .redeem(&self.tool_id, quote_id, binding)
+            .await
+            .map_err(|reason| RpcHandlerError::Application {
+                code: crate::tool_payment::ERR_PAYMENT,
+                message: reason,
+            })?;
+
+        // [3] Run + encode, mirroring the typed-handler conventions.
+        let resp = (self.inner)(req)
+            .await
+            .map_err(|message| RpcHandlerError::Application {
+                code: NRPC_TYPED_HANDLER_ERROR,
+                message,
+            })?;
+        let body = self
+            .codec
+            .encode(&resp)
+            .map_err(|e| RpcHandlerError::Internal(format!("typed handler encode: {e}")))?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: body.into(),
+        })
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1411,92 +1498,5 @@ mod tests {
         assert_eq!(mcp["inputSchema"]["type"], "object");
         let gemini = formats::gemini::to_gemini_function_declaration(&desc);
         assert_eq!(gemini["parameters"]["type"], "object");
-    }
-}
-
-/// The handler wrapper behind [`Mesh::serve_tool_paid`]: decode →
-/// redeem → run → encode. Decode comes first so a structurally invalid
-/// call never consumes the quote (the MCP wrap path's ordering); the
-/// gate runs before the user's handler so it never sees an unpaid call.
-#[cfg(feature = "cortex")]
-struct PaidToolHandler<Req, Resp, F> {
-    tool_id: String,
-    gate: std::sync::Arc<dyn crate::tool_payment::ToolPaymentGate>,
-    codec: Codec,
-    inner: std::sync::Arc<F>,
-    _req: std::marker::PhantomData<Req>,
-    _resp: std::marker::PhantomData<Resp>,
-}
-
-#[cfg(feature = "cortex")]
-fn paid_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
-    headers
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v.as_slice())
-}
-
-#[cfg(feature = "cortex")]
-#[async_trait::async_trait]
-impl<Req, Resp, F, Fut> RpcHandler for PaidToolHandler<Req, Resp, F>
-where
-    Req: DeserializeOwned + Send + Sync + 'static,
-    Resp: Serialize + Send + Sync + 'static,
-    F: Fn(Req) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
-{
-    async fn call(
-        &self,
-        ctx: RpcContext,
-    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
-        // [1] Decode BEFORE the gate: a call that can never execute must
-        //     never consume the quote. Same code as the typed path.
-        let req: Req = match self.codec.decode(&ctx.payload.body) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(RpcHandlerError::Application {
-                    code: NRPC_TYPED_BAD_REQUEST,
-                    message: format!("typed handler: bad request body: {e}"),
-                })
-            }
-        };
-
-        // [2] The payment gate — the quote is redeemed (settled, billed,
-        //     unfrozen, bound to this tool, never redeemed before) or the
-        //     call is refused. Fail-closed: the handler never runs unpaid.
-        let quote_id = paid_header(&ctx.payload.headers, crate::tool_payment::HDR_PAYMENT_QUOTE)
-            .and_then(|raw| std::str::from_utf8(raw).ok())
-            .ok_or_else(|| RpcHandlerError::Application {
-                code: crate::tool_payment::ERR_PAYMENT,
-                message: "paid tool invoked without a payment quote header".to_string(),
-            })?;
-        let binding = paid_header(
-            &ctx.payload.headers,
-            crate::tool_payment::HDR_PAYMENT_BINDING,
-        );
-        self.gate
-            .redeem(&self.tool_id, quote_id, binding)
-            .await
-            .map_err(|reason| RpcHandlerError::Application {
-                code: crate::tool_payment::ERR_PAYMENT,
-                message: reason,
-            })?;
-
-        // [3] Run + encode, mirroring the typed-handler conventions.
-        let resp = (self.inner)(req)
-            .await
-            .map_err(|message| RpcHandlerError::Application {
-                code: NRPC_TYPED_HANDLER_ERROR,
-                message,
-            })?;
-        let body = self
-            .codec
-            .encode(&resp)
-            .map_err(|e| RpcHandlerError::Internal(format!("typed handler encode: {e}")))?;
-        Ok(RpcResponsePayload {
-            status: RpcStatus::Ok,
-            headers: vec![],
-            body: body.into(),
-        })
     }
 }
