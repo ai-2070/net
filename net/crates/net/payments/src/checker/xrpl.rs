@@ -213,9 +213,24 @@ impl XrplChecker {
     }
 }
 
+/// The object carrying the transaction-level fields (`Account`,
+/// `Destination`, `TransactionType`, `Flags`, `Memos`, `InvoiceID`, …).
+/// api_version 1 places them at the top of `result`; api_version 2 and
+/// Clio nest them under `tx_json`. We pin api_version 1 on the request, but
+/// resolve `tx_json` when present so a server that returns the v2 shape
+/// (ignoring the pin) still verifies correctly rather than reading every
+/// field as absent. `meta` and `validated` are `result`-level in both.
+fn tx_fields(tx: &Value) -> &Value {
+    match tx.get("tx_json") {
+        Some(inner) if inner.is_object() => inner,
+        _ => tx,
+    }
+}
+
 /// Does the validated transaction carry this quote's invoice binding —
 /// `MemoData = HEX(UTF-8(invoiceId))` (method A) or
-/// `InvoiceID = SHA256(invoiceId)` (method B), per the pinned doc?
+/// `InvoiceID = SHA256(invoiceId)` (method B), per the pinned doc? `tx` is
+/// the transaction-fields object (see [`tx_fields`]).
 fn invoice_bound(tx: &Value, invoice_id: &str) -> bool {
     let memo_hex = hex::encode(invoice_id.as_bytes());
     let memo_match = tx["Memos"]
@@ -259,8 +274,19 @@ impl ChainChecker for XrplChecker {
         // does before trusting any answer from it.
         self.ensure_network().await?;
 
+        // Pin `api_version: 1`: rippled api_version 1 returns the
+        // transaction fields (Account, Destination, TransactionType, …) at
+        // the top of `result`, which is the shape this adapter reads. Under
+        // api_version 2 (and Clio's default) those fields nest under
+        // `tx_json`; pinning keeps the shape stable across endpoints, and
+        // `tx_fields` below tolerates the v2 shape anyway for a server that
+        // ignores the pin. (`meta`/`validated` stay at `result` level in
+        // both versions.)
         let tx = self
-            .rpc("tx", json!({ "transaction": transaction, "binary": false }))
+            .rpc(
+                "tx",
+                json!({ "transaction": transaction, "binary": false, "api_version": 1 }),
+            )
             .await?;
         if tx["status"].as_str() == Some("error") {
             return match tx["error"].as_str() {
@@ -301,27 +327,30 @@ impl ChainChecker for XrplChecker {
 
         let delivered = match query {
             Some(q) => {
+                // Transaction-level fields live at `result` top level under
+                // api_version 1 (pinned) or under `tx_json` under v2/Clio.
+                let f = tx_fields(&tx);
                 // Satisfaction form: a direct full Payment. Anything
                 // else — another transaction type, or a partial payment
                 // (rejected even when it delivered the full amount; this
                 // checker verifies settlements it did not author) —
                 // contributes an honest zero.
-                let is_payment = tx["TransactionType"].as_str() == Some("Payment");
-                let partial = tx["Flags"].as_u64().unwrap_or(0) & TF_PARTIAL_PAYMENT != 0;
+                let is_payment = f["TransactionType"].as_str() == Some("Payment");
+                let partial = f["Flags"].as_u64().unwrap_or(0) & TF_PARTIAL_PAYMENT != 0;
                 // Binds: recipient (+ tag when the quote carries one),
                 // payer (H3), and the pinned invoice binding when the
                 // quote threads its reference.
-                let to_ok = tx["Destination"].as_str() == Some(q.to.as_str());
+                let to_ok = f["Destination"].as_str() == Some(q.to.as_str());
                 let tag_ok = match q.to_tag {
-                    Some(expected) => tx["DestinationTag"].as_u64() == Some(u64::from(expected)),
+                    Some(expected) => f["DestinationTag"].as_u64() == Some(u64::from(expected)),
                     None => true,
                 };
                 let from_ok = match q.from.as_deref() {
-                    Some(from) => tx["Account"].as_str() == Some(from),
+                    Some(from) => f["Account"].as_str() == Some(from),
                     None => true,
                 };
                 let invoice_ok = match q.reference.as_deref() {
-                    Some(invoice_id) => invoice_bound(&tx, invoice_id),
+                    Some(invoice_id) => invoice_bound(f, invoice_id),
                     None => true,
                 };
                 // Delivered: canonical `meta.delivered_amount` only —

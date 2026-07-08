@@ -357,3 +357,47 @@ async fn payer_tag_and_invoice_bindings_hold() {
     };
     assert_eq!(delivered_of(&checker, &other).await, "0");
 }
+
+/// M2: rippled api_version 2 (and Clio's default) nest the transaction
+/// fields under `tx_json`, leaving `meta`/`validated` at `result` level.
+/// The checker pins api_version 1, but must still read the v2 shape
+/// correctly if a server returns it — otherwise every field reads as
+/// absent, delivery sums to zero, and every settlement silently
+/// invalidates. Bind, tag, invoice, and delivered all resolve from
+/// `tx_json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tx_json_v2_shape_is_read_correctly() {
+    let rpc = RpcFixture::start().await;
+    let checker = XrplChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+
+    // Reshape the v1 fixture into the v2 envelope: transaction fields move
+    // under `tx_json`; `validated` and `meta` stay at `result` level.
+    let v1 = payment_tx(1_000_000);
+    let obj = v1.as_object().unwrap();
+    let mut tx_json = serde_json::Map::new();
+    let mut result = serde_json::Map::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            "validated" | "meta" => {
+                result.insert(k.clone(), v.clone());
+            }
+            _ => {
+                tx_json.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    result.insert("tx_json".to_string(), Value::Object(tx_json));
+    rpc.set_tx(Value::Object(result));
+
+    // Full bind (payer + tag + invoice) resolves from tx_json, delivered
+    // from the result-level meta.
+    assert_eq!(delivered_of(&checker, &full_query()).await, "1000000");
+
+    // And the satisfaction-form rejection still fires on the v2 shape: a
+    // wrong payer nested in tx_json is caught, not silently accepted.
+    let stranger = TransferQuery {
+        from: Some("rSomebodyE1se111111111111111111111".to_string()),
+        ..query()
+    };
+    assert_eq!(delivered_of(&checker, &stranger).await, "0");
+}
