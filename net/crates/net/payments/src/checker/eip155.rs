@@ -256,9 +256,22 @@ impl ChainChecker for Eip155Checker {
                 // matching `AuthorizationUsed(authorizer, nonce)` in THIS
                 // transaction — binding the settlement to this exact
                 // authorization, not merely to (token, payer, recipient).
-                // The eip155 adapter's reference vocabulary is a 0x 32-byte
-                // hex nonce; any other reference shape belongs to another
-                // adapter and is ignored here (the `to_tag` convention).
+                // The eip155 adapter's reference vocabulary is a 32-byte hex
+                // nonce (`0x` optional); any other reference shape belongs to
+                // another adapter and is ignored here (the `to_tag`
+                // convention).
+                //
+                // The emitter must be `q.token` itself. This is exactly right
+                // for conforming EIP-3009 tokens, PROXIES INCLUDED: a proxy
+                // (USDC) emits under the proxy address during the delegatecall
+                // into its implementation, and that proxy address *is* the
+                // quoted asset. A token that emits `AuthorizationUsed` from a
+                // *different* contract than the quoted asset, or a
+                // non-standard token that omits/renames the event, fails this
+                // bind and zeroes out — intentional fail-closed: relaxing the
+                // emitter to "any address" would let an unrelated contract's
+                // event satisfy the bind. Widen the asset registry, don't
+                // widen this check.
                 let nonce_bound = match q.reference.as_deref().filter(|r| is_nonce_hex(r)) {
                     Some(nonce) => receipt["logs"].as_array().into_iter().flatten().any(|log| {
                         let topics: Vec<&str> = log["topics"]
