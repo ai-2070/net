@@ -395,14 +395,14 @@ impl ChainChecker for SvmChecker {
                 // would let a facilitator that reports no payer point at
                 // any qualifying on-chain transfer. Refuse to attribute an
                 // unbound transfer rather than crediting one.
-                if q.from.as_deref().map_or(true, str::is_empty) {
+                let Some(payer) = q.from.as_deref().filter(|p| !p.is_empty()) else {
                     return Err(CheckerError::terminal(
                         "solana delivery cannot be bound to a payer: the settlement \
                          names none (opaque payload and no settle-time payer) — refusing \
                          to attribute an unbound transfer"
                             .to_string(),
                     ));
-                }
+                };
                 let tx = self
                     .rpc(
                         "getTransaction",
@@ -488,10 +488,7 @@ impl ChainChecker for SvmChecker {
                 // while a stranger credits the merchant, atomically)
                 // satisfy the bind. Fail-closed: edges that do not cover
                 // `total`, no attribution.
-                if total > 0
-                    && payer_edge_amount(&tx, q.from.as_deref().unwrap_or(""), &q.to, &q.token)
-                        < total
-                {
+                if total > 0 && payer_edge_amount(&tx, payer, &q.to, &q.token) < total {
                     total = 0;
                 }
                 Some(total.to_string())
