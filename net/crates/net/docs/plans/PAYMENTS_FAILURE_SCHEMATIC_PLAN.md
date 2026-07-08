@@ -1,6 +1,6 @@
 # Implementation Plan: Payments — Failure schematic (machine-actionable failure semantics)
 
-**Implements:** the 2026-07-08 brainstorm ([`docs/BRAINSTORMING.md`](../BRAINSTORMING.md)) — primary error stays human/actionable, a structured **failure schematic** rides alongside it so agents, demos, and reviews can see *which invariant the system protected* and *what recovery is allowed*. Kyra's framing, adopted verbatim as the thesis: error as routing instruction, not dead end.
+**Implements:** the 2026-07-08 brainstorm (an internal design artifact, `docs/BRAINSTORMING.md`, deliberately kept local via `.gitignore`; its framing is inlined below) — primary error stays human/actionable, a structured **failure schematic** rides alongside it so agents, demos, and reviews can see *which invariant the system protected* and *what recovery is allowed*. Kyra's framing, adopted verbatim as the thesis: error as routing instruction, not dead end.
 
 **The sentence:** every payment refusal carries, next to its human message, a versioned machine-readable verdict — code, stage, reason, recovery — built from the engine's *typed* decision at a single render site, never parsed back out of strings.
 

@@ -47,8 +47,10 @@ use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_rpc::{CallOptions, RpcError};
-use net_sdk::tool::metadata_for;
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped, Codec, RpcError};
+use net_sdk::tool::{
+    metadata_for, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
+};
 use net_sdk::tool_payment::{
     FailureSchematic, ERR_PAYMENT, HDR_FAILURE_SCHEMATIC, HDR_PAYMENT_BINDING, HDR_PAYMENT_QUOTE,
 };
@@ -204,53 +206,13 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
     let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock.clone()));
     let _payments = serve_payments(&provider_mesh, in_process).expect("serve payments");
 
-    // The priced tool, published through the native paid-serve path and
-    // gated by the real engine. `fixture-tool` is the tool segment of
-    // the capability the caller pays.
-    let gate = Arc::new(EngineToolPaymentGate::new(engine.clone()));
-    let handler_runs = Arc::new(AtomicUsize::new(0));
-    let counted = handler_runs.clone();
-    let paid_tool = metadata_for::<EchoReq, EchoResp>("fixture-tool")
-        .description("Echo, for money.")
-        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
-        .build();
-    let _served_paid = provider_mesh
-        .serve_tool_paid::<EchoReq, EchoResp, _, _>(paid_tool, gate.clone(), move |req: EchoReq| {
-            let counted = counted.clone();
-            async move {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Ok(EchoResp {
-                    echoed: req.message,
-                })
-            }
-        })
-        .expect("a priced descriptor serves through the engine gate");
-
-    // A second priced tool on the same gate — the target the wrong-tool
-    // reuse aims at. Its handler must never run.
-    let other_tool = metadata_for::<EchoReq, EchoResp>("other-tool")
-        .description("A different priced tool.")
-        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
-        .build();
-    let _served_other = provider_mesh
-        .serve_tool_paid::<EchoReq, EchoResp, _, _>(
-            other_tool,
-            gate.clone(),
-            |req: EchoReq| async move {
-                Ok(EchoResp {
-                    echoed: req.message,
-                })
-            },
-        )
-        .expect("second priced tool serves");
-
     // The capability id the mesh routes by: `<provider node>/<tool>`.
     let capability = format!("{provider_id}/fixture-tool");
 
-    // (2) Discover the announced pricing — the `net.pricing.terms@1`
-    //     envelope a describe would carry (constructed locally from the
-    //     provider's known template, the established flow-input idiom).
-    //     Built before the registry moves into the flow.
+    // The full `net.pricing.terms@1` envelope the provider ANNOUNCES on
+    // its priced descriptor — the payable template, not a placeholder.
+    // Built before the registry moves into the flow so it can ride the
+    // descriptor the caller will discover.
     let template = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
         network: MOCK_NETWORK.into(),
@@ -267,8 +229,50 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
         vec![template],
         registry.reference().expect("registry reference"),
     );
-    let terms_json =
+    let announced_terms =
         String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+
+    // The priced tool, published through the native paid-serve path and
+    // gated by the real engine — its descriptor announces the full
+    // payable terms, so discovery (below) is a real round-trip.
+    let gate = Arc::new(EngineToolPaymentGate::new(engine.clone()));
+    let handler_runs = Arc::new(AtomicUsize::new(0));
+    let counted = handler_runs.clone();
+    let paid_tool = metadata_for::<EchoReq, EchoResp>("fixture-tool")
+        .description("Echo, for money.")
+        .pricing_terms(&announced_terms)
+        .build();
+    let _served_paid = provider_mesh
+        .serve_tool_paid::<EchoReq, EchoResp, _, _>(paid_tool, gate.clone(), move |req: EchoReq| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(EchoResp {
+                    echoed: req.message,
+                })
+            }
+        })
+        .expect("a priced descriptor serves through the engine gate");
+
+    // A second priced tool on the same gate — the target the wrong-tool
+    // reuse aims at. Its handler must never run; its price is a
+    // placeholder (the caller never pays it, it reuses fixture-tool's
+    // quote).
+    let other_tool = metadata_for::<EchoReq, EchoResp>("other-tool")
+        .description("A different priced tool.")
+        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
+        .build();
+    let _served_other = provider_mesh
+        .serve_tool_paid::<EchoReq, EchoResp, _, _>(
+            other_tool,
+            gate.clone(),
+            |req: EchoReq| async move {
+                Ok(EchoResp {
+                    echoed: req.message,
+                })
+            },
+        )
+        .expect("second priced tool serves");
 
     // ── caller: the payment flow over the wire ─────────────────────
     let caller_keys = Arc::new(EntityKeypair::generate());
@@ -279,6 +283,38 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
         registry,
         Arc::new(MeshPaymentChannel::new(caller_mesh.clone())),
         clock,
+    );
+
+    // (2) DISCOVER the announced pricing over the wire: fetch the
+    //     descriptor from the provider's tool-metadata service and read
+    //     its `pricing_terms`. Paying THIS (not a locally-rebuilt copy)
+    //     is what makes a discovery/publishing regression fail the test.
+    let mut discovered_terms = String::new();
+    for _ in 0..5 {
+        let fetched: Result<ToolMetadataResponse, _> = caller_mesh
+            .call_typed(
+                provider_id,
+                TOOL_METADATA_FETCH_SERVICE,
+                &ToolMetadataRequest {
+                    name: "fixture-tool".to_string(),
+                },
+                CallOptionsTyped {
+                    codec: Codec::Json,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Ok(ToolMetadataResponse::Found { descriptor }) = fetched {
+            discovered_terms = descriptor
+                .pricing_terms
+                .expect("the discovered descriptor carries its announced price");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        discovered_terms, announced_terms,
+        "the discovered price round-trips the announced terms byte-for-byte"
     );
 
     let echo_body = serde_json::to_vec(&EchoReq {
@@ -315,13 +351,14 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
         "the handler never runs on an unpaid call"
     );
 
-    // (4) PAY over the wire: quote → DevTest auto-allow → payload →
-    //     settle. The proof carries the provider-signed billing event.
+    // (4) PAY over the wire against the DISCOVERED terms: quote → DevTest
+    //     auto-allow → payload → settle. The proof carries the
+    //     provider-signed billing event.
     let CallerDecision::Paid {
         quote_id,
         binding_sig,
         proof,
-    } = flow.run(&capability, &terms_json).await
+    } = flow.run(&capability, &discovered_terms).await
     else {
         panic!("expected Paid over the wire");
     };
