@@ -190,3 +190,103 @@ async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
         "leaked parser detail: {json}"
     );
 }
+
+/// A `tracing::Layer` that records every event's fields as (name, value)
+/// pairs — precise enough to assert the emit site's *structured* fields
+/// by key + value, not a formatted-string substring.
+struct FieldCapture {
+    fields: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Collector<'a>(&'a mut Vec<(String, String)>);
+        impl tracing::field::Visit for Collector<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                // `%x` (Display) records here via a wrapper whose Debug is
+                // the display string — no quotes to strip.
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+        let mut buf = self.fields.lock().unwrap();
+        event.record(&mut Collector(&mut buf));
+    }
+}
+
+/// The redeem-denial emit site carries typed fields, not prose: operators
+/// grep `reason` / `stage` / `recovery_class`, so those are a captured
+/// contract (the Tier-4 "logs" projection cell of `PAYMENTS_TEST_MATRIX.md`).
+/// `redeem_via_engine` renders every gate denial through one
+/// `tracing::info!` — an unknown quote is the simplest trigger. Sync +
+/// current-thread runtime so the emit fires on the same thread the
+/// capturing subscriber is the default for.
+#[test]
+fn a_redeem_denial_emits_the_typed_tracing_fields() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let fields = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(FieldCapture {
+        fields: fields.clone(),
+    });
+
+    tracing::subscriber::with_default(subscriber, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let provider = Arc::new(EntityKeypair::generate());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let engine = Arc::new(
+                PaymentEngine::new(
+                    provider.clone(),
+                    Arc::new(MockFacilitator::new()),
+                    Arc::new(AdmitAll),
+                    default_mock_registry(provider.entity_id().clone()),
+                    dir.path().join("engine.json"),
+                )
+                .expect("engine"),
+            );
+            let gate = EngineToolPaymentGate::new(engine);
+            let err = gate
+                .redeem("fixture-tool", "no-such-quote", None)
+                .await
+                .expect_err("an unknown quote is denied");
+            assert_eq!(err.schematic.reason, "unknown_quote");
+        });
+    });
+
+    let captured = fields.lock().unwrap();
+    let has = |k: &str, v: &str| captured.iter().any(|(name, value)| name == k && value == v);
+    assert!(
+        has("reason", "unknown_quote"),
+        "the denial's typed reason rides the trace: {captured:?}"
+    );
+    assert!(
+        has("stage", "redeem"),
+        "the lifecycle stage rides the trace"
+    );
+    assert!(
+        has("recovery_class", "new_quote_required"),
+        "the recovery class rides the trace"
+    );
+    assert!(
+        has("tool_id", "fixture-tool"),
+        "the tool id rides the trace"
+    );
+    // The message stays prose; the verdict is the structured fields.
+    assert!(
+        captured
+            .iter()
+            .any(|(name, value)| name == "message" && value == "payment redemption denied"),
+        "the human message is a field, the verdict is the typed fields"
+    );
+}

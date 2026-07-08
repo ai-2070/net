@@ -81,7 +81,7 @@ M1's mega-e2e (`mesh_paid_capability_e2e`) closes the survey's central gap: it r
 | full reason ↔ recovery matrix (all 9 typed reasons + `engine_unavailable` + admission rows + `next_action` column); security rows pin no-retry/no-requote; `not_settled` vs `settlement_pending` routing | `flow::denial_render_tests::*`; `lifecycle_modes::the_redeem_denial_vocabulary_is_pinned`; `tool_payment::admission_next_action_hints_match_the_mapping_table` |
 | redaction: no store paths, no serde detail, freeze free-text off the schematic | `native_tool_gate::a_store_failure_fails_closed_without_leaking_internal_detail`; `flow::denial_render_tests::a_frozen_denial_keeps_the_free_form_reason_off_the_schematic` |
 | MCP `structured_content` projection; Python `failure` field | `shim::a_denied_result_projects_the_schematic_into_structured_content`; `capability_gateway::a_denied_outcome_projects_the_failure_schematic` |
-| tracing fields (`reason`, `stage`, `recovery_class`) asserted | **M5** — emit sites exist, never captured in a test |
+| tracing fields (`reason`, `stage`, `recovery_class`, `tool_id`) asserted | `native_tool_gate::a_redeem_denial_emits_the_typed_tracing_fields` (M5 — a capturing `Layer` asserts each field by key+value) |
 
 ## Tier 5 — live conformance (ignored; operator-run; ladder-governed)
 
@@ -90,7 +90,7 @@ M1's mega-e2e (`mesh_paid_capability_e2e`) closes the survey's central gap: it r
 | 1 · Base Sepolia / x402.org | `live_testnet_conformance::*` (1a `supported…`, 1b `pack loads…`, 1c `signed verify…`, 1d `settles…`) — env-gated `NET_PAYMENTS_LIVE_*` | 1a+1b **passed 2026-07-08**; 1c/1d pending `NET_PAYMENTS_LIVE_EVM_KEY` (+ `…_SETTLE=1`) |
 | 2 · Base mainnet / CDP | none | pack shipped + pack-tested; live suite is enablement-time work (ladder-owned) |
 | 3 · Solana / CDP | none | same — SVM checker fixture-first by design; live run at enablement |
-| 4 · XRPL / t54 | none | same — conditional GO; unpinned no-gos are pinned deterministic (`exact_xrpl::iou_entries_refuse_until_the_amount_domain_review`, `exact_scheme_flow_e2e::an_unknown_scheme_accepts_entry_fails_closed_at_selection`) |
+| 4 · XRPL / t54 | none | same — conditional GO; off-by-default is a named contract (`exact_xrpl_scheme_flow::xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed`, M5); unpinned no-gos pinned deterministic (`exact_xrpl::iou_entries_refuse_until_the_amount_domain_review`, `exact_scheme_flow_e2e::an_unknown_scheme_accepts_entry_fails_closed_at_selection`) |
 
 CI home: **`.github/workflows/payments-live.yml`** (M4) — scheduled weekly + `workflow_dispatch`, never PR-blocking. Keyless 1a/1b run every time (the canary); 1c runs when the `NET_PAYMENTS_LIVE_EVM_KEY` secret is set; 1d (settle) only on a manual dispatch with `run_settle` checked, so a schedule never moves money. Rungs 2–4 slot in as their live suites land at enablement.
 
@@ -126,11 +126,13 @@ CI home: **`.github/workflows/payments-live.yml`** (M4) — scheduled weekly + `
 
 **Acceptance:** rung-1a/1b run on schedule without human action; a secret-present run of 1c is one click. ✅ — YAML validates; the `live_testnet_conformance` binary compiles under the workflow's features and all four filtered test names resolve. (The live steps themselves are only exercisable in CI — they hit the real facilitator by design.)
 
-### M5 — small pins
+### M5 — small pins — ✅ (two landed; one deferred)
 
-- [ ] Tracing-capture test at the redeem-denial emit site asserting the typed fields (`reason`, `stage`, `recovery_class`, `tool_id`) — the projection row's last cell.
-- [ ] A literal XRPL disabled-by-default pin (today enforced by construction: pack + `allowed_networks` + signer are all opt-in; one test names it so the posture is a recorded contract).
-- [ ] (Optional) billing-stream ordering under concurrent appends — the one 1C edge the survey called thin.
+- [x] Tracing-capture test at the redeem-denial emit site — `native_tool_gate::a_redeem_denial_emits_the_typed_tracing_fields`. A capturing `tracing::Layer` records every event's fields as (name, value) pairs and asserts `reason`/`stage`/`recovery_class`/`tool_id` by key+value (plus `message` staying prose). Build note: `tracing-test`'s default filter scopes to the test crate and captured nothing from `net_payments`'s emit; the custom layer + a current-thread runtime under `with_default` is both robust and more precise. Dev-dep: `tracing-subscriber`.
+- [x] A literal XRPL disabled-by-default pin — `exact_xrpl_scheme_flow::xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed`. The signer gate was already pinned (`without_an_xrpl_signer…`); this pins the *allowlist* gate — even with a wallet configured, an XRPL price is denied at the spend policy (`not enabled`) with nothing signed or sent, so a change that ambient-enables XRPL fails a clearly-named test.
+- [ ] (Deferred — genuinely optional) billing-stream ordering under concurrent appends: the existing `billing_stream` tests cover append-once/dedup/tamper-evidence; the concurrent-append ordering edge is low-value and unowned. Left for a demand-driven follow-up.
+
+**Acceptance:** the projection row's tracing cell flips to ✅; the XRPL off-by-default posture is a recorded contract. ✅
 
 ## Non-goals
 

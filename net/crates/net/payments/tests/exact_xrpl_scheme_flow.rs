@@ -259,6 +259,72 @@ async fn without_an_xrpl_signer_the_terms_are_refused_at_selection() {
     assert!(w.facilitator.payloads.lock().is_empty());
 }
 
+/// XRPL is **off by default, by construction** — the recorded contract
+/// for the ladder's rung 4. Enabling it takes BOTH a settlement signer
+/// AND the network in `allowed_networks`; neither gate auto-opens.
+/// `without_an_xrpl_signer…` pins the signer gate (no wallet → refused at
+/// selection); this pins the allowlist gate: even WITH a wallet, an
+/// XRPL price is denied at the spend policy until the network is
+/// explicitly enabled — nothing is signed or sent. A future change that
+/// silently ambient-enables XRPL fails a clearly-named test.
+#[tokio::test]
+async fn xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock: Arc<dyn Clock> = Arc::new(TestClock);
+    let provider_keys = Arc::new(EntityKeypair::generate());
+    let registry = default_registry_v1(provider_keys.entity_id().clone());
+    // Default Production policy: `allowed_networks` is empty — no real
+    // network is enabled. (The registry carrying XRP is the asset
+    // allowlist, NOT the enablement switch.)
+    let spend_path = dir.path().join("spend.json");
+    let facilitator = Arc::new(XrplFacilitator {
+        payloads: parking_lot::Mutex::new(Vec::new()),
+        reject: false,
+    });
+    let engine = Arc::new(
+        PaymentEngine::new(
+            provider_keys.clone(),
+            facilitator.clone(),
+            Arc::new(AdmitAll),
+            registry.clone(),
+            dir.path().join("engine.json"),
+        )
+        .expect("engine"),
+    );
+    let terms_json = xrpl_terms(&provider_keys, registry.reference().expect("ref"));
+    let flow = CallerPaymentFlow::new(
+        Arc::new(EntityKeypair::generate()),
+        SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
+        registry,
+        Arc::new(InProcessProvider::new(engine, clock.clone())),
+        clock,
+    )
+    // A wallet IS configured — so settleability is not what holds XRPL
+    // off here; the allowlist is.
+    .with_signer(
+        "xrpl",
+        Arc::new(ExternalXrplSigner::new(
+            "rPayerAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            move |_intent| Box::pin(async move { Ok(SIGNED_BLOB.to_string()) }),
+        )),
+    );
+
+    let decision = flow.run(CAPABILITY, &terms_json).await;
+    let CallerDecision::Denied { policy_reason } = decision else {
+        panic!("XRPL must be denied until the network is allowlisted, got {decision:?}");
+    };
+    // Denied at the spend policy (network not enabled), NOT at selection —
+    // the wallet made it settleable; enablement is the separate gate.
+    assert!(
+        policy_reason.contains("not enabled"),
+        "the denial names the enablement gate: {policy_reason}"
+    );
+    assert!(
+        facilitator.payloads.lock().is_empty(),
+        "nothing is signed or sent for an unenabled network"
+    );
+}
+
 /// M1 posture, xrpl edition: the presigned blob is a bearer instrument —
 /// once it crossed to the provider, a claimed rejection does NOT release
 /// the caller's spend reservation.
