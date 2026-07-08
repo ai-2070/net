@@ -24,7 +24,7 @@ use super::backend::CapabilityId;
 /// Request header carrying the paid invocation's quote id — the binding
 /// between the payment (settled out-of-band via the payment services)
 /// and this invocation. Same convention as `net-delegation`.
-pub const HDR_PAYMENT_QUOTE: &str = "net-payment-quote";
+pub const HDR_PAYMENT_QUOTE: &str = net_sdk::tool_payment::HDR_PAYMENT_QUOTE;
 
 /// Request header carrying the caller's ed25519 signature over the
 /// invocation-binding transcript (quote id + tool id) — proof that the
@@ -32,7 +32,7 @@ pub const HDR_PAYMENT_QUOTE: &str = "net-payment-quote";
 /// who saw the quote id. Replay of the header is harmless: redemption
 /// is at-most-once regardless. Optional in P1 (bearer fallback for
 /// pre-binding callers); providers may require it by policy.
-pub const HDR_PAYMENT_BINDING: &str = "net-payment-quote-sig";
+pub const HDR_PAYMENT_BINDING: &str = net_sdk::tool_payment::HDR_PAYMENT_BINDING;
 
 /// The caller-side proof that an invocation was paid: the quote id the
 /// provider's engine can redeem, plus the optional signed binding.

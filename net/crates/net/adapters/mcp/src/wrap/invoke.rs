@@ -57,7 +57,7 @@ pub const ERR_DELEGATION: u16 = 0x8005;
 /// quote was unpaid / frozen / already redeemed / bound to another tool,
 /// or the tool is priced but no payment gate is configured (fail-closed).
 /// An authorization verdict like its owner-scope and delegation siblings.
-pub const ERR_PAYMENT: u16 = 0x8006;
+pub const ERR_PAYMENT: u16 = net_sdk::tool_payment::ERR_PAYMENT;
 /// The invoke was admitted but the provider's [`InvokePolicy`] refused it
 /// (V2 Phase 2's in-root toll booth — an allowlist deny, or a dangerous-tool
 /// approval that was declined / could not reach the operator). An

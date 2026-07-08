@@ -83,6 +83,11 @@ pub mod stream;
 pub mod testing;
 #[cfg(feature = "tool")]
 pub mod tool;
+// The native tool payment seam (wire constants + the provider gate for
+// `Mesh::serve_tool_paid`). Deliberately ungated: implementors of the
+// gate (net-payments) need the trait without pulling the full `tool`
+// feature's schemars surface.
+pub mod tool_payment;
 // On-demand cross-peer movement primitives (blob + directory transfer
 // over the fairscheduler stream transport). Needs the networked node
 // (`net`) and the blob storage layer (`dataforts`); the transfer
