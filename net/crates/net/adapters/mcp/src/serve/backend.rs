@@ -82,7 +82,9 @@ pub struct CapabilityDetail {
 
 /// Errors a gateway operation can return. The variants map to the plan's
 /// exact failure strings at the shim boundary (see [`super`]).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+// No `Eq`: `Denied` carries an optional `FailureSchematic`, which isn't `Eq`
+// (see `net_sdk::tool_payment::FailureSchematic`). `PartialEq` suffices.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GatewayError {
     /// No capability matched the id (describe / invoke).
     #[error("no capability found for `{0}`")]

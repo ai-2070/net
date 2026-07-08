@@ -218,7 +218,12 @@ pub struct Recovery {
 /// names, no payment blobs, no filesystem paths, no serde/transport
 /// detail, no facilitator response bodies. Built only from typed
 /// decision fields — never by inspecting an engine error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: the `extra` field is a `BTreeMap<String, serde_json::Value>`,
+// and `serde_json::Value: Eq` holds only while nothing in the build graph
+// enables `serde_json/arbitrary_precision` (which drops it). `PartialEq`
+// is enough for every use here; deriving `Eq` would couple this type to a
+// global feature flag it has no reason to care about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailureSchematic {
     /// Always [`TAG_PAYMENT_FAILURE`].
     pub object: String,
@@ -369,7 +374,8 @@ impl FailureSchematic {
 /// [`HDR_FAILURE_SCHEMATIC`]). The refusal type of both gate traits;
 /// `net-payments`' `flow::redeem_via_engine` is the single render
 /// site for engine denials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq` — it embeds a `FailureSchematic`, which deliberately isn't `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GateDenial {
     pub message: String,
     pub schematic: FailureSchematic,
