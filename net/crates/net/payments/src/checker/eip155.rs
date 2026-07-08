@@ -162,11 +162,15 @@ fn authorization_used_topic() -> &'static str {
     })
 }
 
-/// Is `s` a 0x-prefixed 32-byte hex word — the eip155 adapter's
-/// reference vocabulary (an EIP-3009 nonce)?
+/// Is `s` a 32-byte hex word — the eip155 adapter's reference vocabulary
+/// (an EIP-3009 nonce)? The `0x` prefix is optional: the settlement
+/// signer's own `decode_bytes32` accepts a nonce with or without it, so
+/// the checker must too — treating a bare-hex nonce as "not a nonce"
+/// would silently skip the `AuthorizationUsed` bind (fail-open) on a
+/// perfectly valid authorization.
 fn is_nonce_hex(s: &str) -> bool {
-    s.strip_prefix("0x")
-        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A 32-byte topic equals the 32-byte word `word` (both 0x-hex)?
