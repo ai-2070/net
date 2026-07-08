@@ -11,9 +11,9 @@ const FOOTER_SPEC: ReadonlyArray<{
   { href: "/dataforts", label: "Dataforts" },
   { href: "/meshos", label: "MeshOS" },
   { href: "/protocol", label: "Protocol" },
-  { href: "#apps", label: "Applications" },
-  { href: "#wall", label: "The Blackwall" },
-  { href: "#releases", label: "Releases" },
+  { href: "/#apps", label: "Applications" },
+  { href: "/#wall", label: "The Blackwall" },
+  { href: "/#releases", label: "Releases" },
 ];
 
 const FOOTER_DOCS: ReadonlyArray<{

@@ -41,7 +41,7 @@ const BUILD_ITEMS: readonly BuildItem[] = [
 export function BuildingOnNetSection() {
   return (
     <section id="building" className="border-b border-line px-6 py-20">
-      <SectionLabel>§08 / building on net</SectionLabel>
+      <SectionLabel>§07 / building on net</SectionLabel>
       <DisplayHeading>
         works at n = 2 machines.
         <br />

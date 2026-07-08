@@ -60,7 +60,9 @@ export function IdentitySection() {
 
       <p className="text-[12px] text-ink-dim max-w-[740px] leading-[1.6] mb-12">
         Delegation chains: root → machine → agent → subagent. Each link
-        budgeted, attributable, individually revocable.
+        budgeted, attributable, individually revocable. &apos;Which subagent
+        spent that, and can I revoke just it&apos; is a query, not an
+        investigation.
       </p>
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">

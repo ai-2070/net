@@ -1,13 +1,13 @@
 import Link from "next/link";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "/protocol", label: "PROTOCOL" },
-  { href: "#bench", label: "BENCH" },
-  { href: "/runtime", label: "RUNTIME" },
-  { href: "#apps", label: "APPS" },
-  { href: "#install", label: "SDKS" },
-  { href: "#wall", label: "BLACKWALL" },
-  { href: "/why", label: "WHY" },
+  { href: "/#bridge", label: "BRIDGE" },
+  { href: "/#everywhere", label: "APPS" },
+  { href: "/#identity", label: "IDENTITY" },
+  { href: "/#wall", label: "BLACKWALL" },
+  { href: "/#bench", label: "BENCH" },
+  { href: "/#building", label: "BUILD" },
+  { href: "/#under-the-hood", label: "HOOD" },
   { href: "/docs", label: "DOCS" },
 ];
 
@@ -35,20 +35,20 @@ export function NavBar() {
           </li>
         ))}
         <li>
-          <a
-            href="#install"
+          <Link
+            href="/#install"
             className="install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
           >
             ↓ INSTALL
-          </a>
+          </Link>
         </li>
       </ul>
-      <a
-        href="#install"
+      <Link
+        href="/#install"
         className="lg:hidden ml-auto install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
       >
         ↓ INSTALL
-      </a>
+      </Link>
     </nav>
   );
 }

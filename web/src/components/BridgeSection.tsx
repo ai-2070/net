@@ -49,7 +49,9 @@ export function BridgeSection() {
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-10">
         One line of config: any MCP server joins the mesh — findable, watchable,
         callable across machines, owner&apos;s rules, no API keys copied.
-        Millions already running. It works both ways.
+        Millions already running. It works both ways. And the network&apos;s job
+        is to arrive in the model&apos;s context window small, current, and true
+        — the announcement is the schema, so a stale type is unrepresentable.
       </p>
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">

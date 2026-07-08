@@ -30,8 +30,8 @@ export default function Home(): JSX.Element {
         <IdentitySection />
         <BlackwallSection />
         <BenchmarksSection />
-        <UnderTheHoodSection />
         <BuildingOnNetSection />
+        <UnderTheHoodSection />
         <ClosingSection />
         <ReleasesSection />
         <FooterDivider />

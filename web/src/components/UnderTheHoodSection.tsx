@@ -35,7 +35,7 @@ const HOOD_CARDS: readonly HoodCard[] = [
 export function UnderTheHoodSection() {
   return (
     <section id="under-the-hood" className="border-b border-line px-6 py-20">
-      <SectionLabel>§07 / under the hood</SectionLabel>
+      <SectionLabel>§08 / under the hood</SectionLabel>
       <DisplayHeading>
         under the <span className="text-accent">hood.</span>
       </DisplayHeading>
