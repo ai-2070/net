@@ -12,15 +12,17 @@
 
 **Status: no correctness bugs found.** This is careful, well-tested work — golden wire-shape pin, tolerance contract, the header-discipline rule at both producer and consumer, scrub-survival by construction, the not-settled/pending routing split, and a live e2e header round-trip are all pinned by test. The design (optional reply-header sidecar; message + schematic rendered together from one typed reason at a single site; malformed/duplicate headers treated as absent) is sound and consistently applied across the SDK, MCP, and all three bindings. Every item below is **advisory / non-blocking** — documentation, a latent coupling, and one intentional-but-worth-recording semantic choice. Nothing here should have blocked the merge.
 
-| ID | Severity | Title | Verdict | Status |
-| --- | --- | --- | --- | --- |
-| FS-1 | LOW | `quote_frozen` copies the stored `rec.frozen` string into the schematic — the one spot where free-form text (possibly facilitator diagnostics) rides the otherwise-controlled structured header | `[CONFIRMED]` | Open (advisory) |
-| FS-2 | DOC | The `FailureSchematic` reason↔recovery mapping table omits a `next_action` column, though every row in `denial_for` emits one | `[CONFIRMED]` | Open (advisory) |
-| FS-3 | LOW | Header-name match (`name == HDR_FAILURE_SCHEMATIC`) is case-sensitive — correct for the mesh frame, a silent (fail-safe) miss if a schematic ever transits a case-normalizing layer | `[CONFIRMED]` | Open (advisory) |
-| FS-4 | LOW | `#[derive(Eq)]` on `FailureSchematic`/`GateDenial` depends on `serde_json::Value: Eq`, which holds only while nothing in the graph enables `serde_json/arbitrary_precision` | `[CONFIRMED]` | Open (advisory) |
-| FS-5 | DESIGN-NOTE | `wrong_tool_binding` renders `funds_moved=unknown` / `prior_payment=unknown` although it is reached only after `billing.is_some()` (the payment definitively settled + billed) | `[CONFIRMED]` | Intended (recorded) |
+**Status (2026-07-08): all five items addressed,** each in its own commit with a regression/anti-drift test where code behavior changed. Verification: `net-payments` lib (95) + `native_tool_gate` (11) + `lifecycle_modes` (22) + `checker_verification` (22) + `mcp_gate_composition` (2) under `mesh,mcp-gate`; `net-mesh-sdk` `tool_payment` (8) + `tool_serve_paid` (2); `net-mesh-mcp` lib (246) — all green. `cargo clippy` clean on the touched crates; the python / go / node bindings type-check with `Eq` removed.
 
-**Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic path. All items are advisory; none is a defect that changes observable behavior versus the pre-schematic wire.
+| ID | Severity | Title | Verdict | Status | Commit | Test |
+| --- | --- | --- | --- | --- | --- | --- |
+| FS-1 | LOW | `quote_frozen` copies the stored `rec.frozen` string into the schematic — the one spot where free-form text (possibly facilitator diagnostics) rides the otherwise-controlled structured header | `[CONFIRMED]` | ✅ Fixed | `7f76a35de` | `a_frozen_denial_keeps_the_free_form_reason_off_the_schematic` |
+| FS-2 | DOC | The `FailureSchematic` reason↔recovery mapping table omits a `next_action` column, though every row in `denial_for` emits one | `[CONFIRMED]` | ✅ Fixed | `e709dca49` | `next_action_hints_match_the_mapping_table`, `admission_next_action_hints_match_the_mapping_table` |
+| FS-3 | LOW | Header-name match (`name == HDR_FAILURE_SCHEMATIC`) is case-sensitive — correct for the mesh frame, a silent (fail-safe) miss if a schematic ever transits a case-normalizing layer | `[CONFIRMED]` | ✅ Fixed | `d364c38e9` | `a_case_shifted_schematic_header_still_decodes` |
+| FS-4 | LOW | `#[derive(Eq)]` on `FailureSchematic`/`GateDenial` depends on `serde_json::Value: Eq`, which holds only while nothing in the graph enables `serde_json/arbitrary_precision` | `[CONFIRMED]` | ✅ Fixed | `c901a2a03` | — (compile-checked across sdk/mcp/payments + 3 bindings) |
+| FS-5 | DESIGN-NOTE | `wrong_tool_binding` renders `funds_moved=unknown` / `prior_payment=unknown` although it is reached only after `billing.is_some()` (the payment definitively settled + billed) | `[CONFIRMED]` | ✅ Documented | `cd2e54b35` | — (intended; comment-only) |
+
+**Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic path. All items were advisory; none was a defect that changed observable behavior versus the pre-schematic wire — the fixes harden the redaction contract, the docs/contract, a forward-compat robustness gap, and a latent build coupling.
 
 ---
 
@@ -116,9 +118,12 @@ Strictly, `wrong_tool_binding` is not a possession-proof failure — the payment
 
 ## Disposition
 
-All five items are advisory. Recommended follow-ups, smallest first:
+All five items addressed on `payments-failure-schematic-code-review` (2026-07-08):
 
-1. **FS-2** — add the `next_action` column to the doc table (doc-only, 5 min).
-2. **FS-4** — optionally drop `Eq` from `FailureSchematic`/`GateDenial` to remove the `serde_json` feature coupling (mechanical).
-3. **FS-1** — fold into the reserved-freeze-subreason work already on the roadmap; until then, no action.
-4. **FS-3 / FS-5** — record-only; act only if the schematic is bridged to HTTP (FS-3) or a future revision reweighs the disclosure trade-off (FS-5).
+1. **FS-1** (`7f76a35de`) — `RedeemDenialReason::schematic_message()` renders a generic frozen message; the free-form `rec.frozen` text stays on the human body only. The reserved typed freeze subreasons will later narrow `schematic.reason` and replace the generic message.
+2. **FS-2** (`e709dca49`) — `next_action` column added to the mapping table; redeem rows pinned in `net-payments` flow tests, admission rows in `net-mesh-sdk`.
+3. **FS-3** (`d364c38e9`) — reply-header name matched with `eq_ignore_ascii_case`; the "exactly one" discipline is unchanged (case-only duplicates still fall back).
+4. **FS-4** (`c901a2a03`) — `Eq` dropped from `FailureSchematic` / `GateDenial` / `GatewayError` (kept `PartialEq`); the `serde_json/arbitrary_precision` coupling is gone.
+5. **FS-5** (`cd2e54b35`) — the deliberate `unknown`/`unknown` choice for `wrong_tool_binding` is now documented at the render site (comment-only, no behavior change).
+
+Remaining roadmap tie-in: FS-1's clean resolution is the reserved freeze subreasons (`quote_frozen_replay | _wrong_chain | _reorg | _amount`) — when those land, the schematic renders from the typed subreason and the generic message is retired.
