@@ -81,27 +81,40 @@ async fn the_engine_gate_redeems_a_paid_quote_exactly_once() {
         .await
         .expect("first redemption admits");
 
-    // At-most-once: the same quote never serves twice.
+    // At-most-once: the same quote never serves twice. The denial
+    // carries both renderings — the unchanged human message and the
+    // schematic with the mapping table's `already_redeemed` row (a
+    // consumed instrument whose money moved: requote, don't retry).
     let err = gate
         .redeem("fixture-tool", &quote_id, None)
         .await
         .expect_err("a second redemption must be denied");
-    assert!(err.contains("redeem"), "{err}");
+    assert!(err.message.contains("redeem"), "{}", err.message);
+    assert_eq!(err.schematic.reason, "already_redeemed");
+    assert_eq!(err.schematic.funds_moved, "yes");
+    assert_eq!(err.schematic.prior_payment, "consumed");
+    assert!(err.schematic.recovery.safe_to_requote);
+    assert!(!err.schematic.recovery.safe_to_retry);
 
-    // Bound to the capability's tool: another tool never redeems it.
+    // Bound to the capability's tool: another tool never redeems it —
+    // a security row: do not retry, do not just buy another quote.
     let fresh = paid_quote_id(&engine, &caller).await;
     let err = gate
         .redeem("some-other-tool", &fresh, None)
         .await
         .expect_err("a quote never redeems for a different tool");
-    assert!(!err.is_empty());
+    assert!(!err.message.is_empty());
+    assert_eq!(err.schematic.reason, "wrong_tool_binding");
+    assert_eq!(err.schematic.recovery.class, "security_violation");
+    assert!(!err.schematic.recovery.safe_to_requote);
 
     // An unknown quote is a structured denial, not a panic.
     let err = gate
         .redeem("fixture-tool", "no-such-quote", None)
         .await
         .expect_err("unknown quote denied");
-    assert!(err.contains("unknown quote"), "{err}");
+    assert!(err.message.contains("unknown quote"), "{}", err.message);
+    assert_eq!(err.schematic.reason, "unknown_quote");
 }
 
 /// A store failure (here: a corrupted state file) fails closed with a
@@ -139,14 +152,41 @@ async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
 
     // Fail-closed AND scrubbed: exactly the generic verdict, with no file
     // path, tempdir, or serde/StoreError internals leaked to the caller.
-    assert_eq!(err, "payment engine unavailable (fail-closed)");
-    assert!(!err.contains("engine.json"), "leaked store path: {err}");
+    assert_eq!(err.message, "payment engine unavailable (fail-closed)");
     assert!(
-        !err.contains(dir.path().to_string_lossy().as_ref()),
-        "leaked tempdir path: {err}"
+        !err.message.contains("engine.json"),
+        "leaked store path: {}",
+        err.message
     );
     assert!(
-        !err.to_lowercase().contains("json") && !err.to_lowercase().contains("corrupt"),
-        "leaked parser detail: {err}"
+        !err.message.contains(dir.path().to_string_lossy().as_ref()),
+        "leaked tempdir path: {}",
+        err.message
+    );
+    assert!(
+        !err.message.to_lowercase().contains("json")
+            && !err.message.to_lowercase().contains("corrupt"),
+        "leaked parser detail: {}",
+        err.message
+    );
+
+    // The schematic obeys the same scrub by construction — it is
+    // rendered from NOTHING but the generic verdict, and its serialized
+    // bytes carry no store path, tempdir, or parser detail either.
+    assert_eq!(err.schematic.reason, "engine_unavailable");
+    let json = String::from_utf8(
+        err.schematic
+            .to_header_bytes()
+            .expect("the generic schematic always fits"),
+    )
+    .expect("schematic is UTF-8");
+    assert!(!json.contains("engine.json"), "leaked store path: {json}");
+    assert!(
+        !json.contains(dir.path().to_string_lossy().as_ref()),
+        "leaked tempdir path: {json}"
+    );
+    assert!(
+        !json.to_lowercase().contains("corrupt") && !json.contains("not-valid"),
+        "leaked parser detail: {json}"
     );
 }

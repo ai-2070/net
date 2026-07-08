@@ -353,7 +353,7 @@ impl net_mcp::serve::PaymentAdmission for AdmitAllPayments {
         _tool_id: &str,
         _quote_id: &str,
         _binding: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), net_sdk::tool_payment::GateDenial> {
         Ok(())
     }
 }

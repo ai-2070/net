@@ -88,7 +88,7 @@ impl CapabilityGateway for PaidToolGateway {
                 proof.binding_sig.as_deref(),
             )
             .await
-            .map_err(GatewayError::Denied)?;
+            .map_err(|denial| GatewayError::Denied(denial.message))?;
         self.handler_runs.fetch_add(1, Ordering::SeqCst);
         Ok(CallToolResult::text_ok(format!("handled {arguments}")))
     }

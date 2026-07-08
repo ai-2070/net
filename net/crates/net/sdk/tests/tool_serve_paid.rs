@@ -23,9 +23,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_rpc::{CallOptions, ServeError};
+use net_sdk::mesh_rpc::{CallOptions, RpcError, ServeError};
 use net_sdk::tool::metadata_for;
-use net_sdk::tool_payment::{ToolPaymentGate, HDR_PAYMENT_QUOTE};
+use net_sdk::tool_payment::{
+    failure_vocab, FailureSchematic, GateDenial, Recovery, ToolPaymentGate, ERR_PAYMENT,
+    HDR_FAILURE_SCHEMATIC, HDR_PAYMENT_QUOTE, TAG_PAYMENT_FAILURE,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -62,12 +65,39 @@ impl ToolPaymentGate for RecordingGate {
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), GateDenial> {
         self.redeemed
             .lock()
             .push((tool_id.to_string(), quote_id.to_string(), binding.is_some()));
         if quote_id == "q-deny" {
-            return Err("quote already redeemed (scripted denial)".to_string());
+            // A scripted denial with a scripted schematic: the handler
+            // must pass BOTH through untouched (message → body,
+            // schematic → reply header).
+            let message = "quote already redeemed (scripted denial)".to_string();
+            return Err(GateDenial {
+                schematic: FailureSchematic {
+                    object: TAG_PAYMENT_FAILURE.to_string(),
+                    code: failure_vocab::CODE_PAYMENT.to_string(),
+                    stage: failure_vocab::STAGE_REDEEM.to_string(),
+                    reason: "scripted_denial".to_string(),
+                    message: message.clone(),
+                    retryable: false,
+                    recovery: Recovery {
+                        class: failure_vocab::CLASS_NEW_QUOTE_REQUIRED.to_string(),
+                        actor: failure_vocab::ACTOR_CALLER_AGENT.to_string(),
+                        safe_to_retry: false,
+                        safe_to_requote: true,
+                        next_action: None,
+                    },
+                    handler_executed: false,
+                    funds_moved: failure_vocab::FUNDS_UNKNOWN.to_string(),
+                    prior_payment: failure_vocab::PRIOR_UNKNOWN.to_string(),
+                    quote_id: Some(quote_id.to_string()),
+                    tool_id: Some(tool_id.to_string()),
+                    extra: Default::default(),
+                },
+                message,
+            });
         }
         Ok(())
     }
@@ -102,16 +132,27 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: SocketAddr) {
     b.inner().start();
 }
 
+/// A server refusal, both renderings: the wire status + human message,
+/// and the schematic decoded from the reply header per the discipline
+/// rule (exactly one valid header, else `None` and the human path).
+#[derive(Debug)]
+struct ServerRefusal {
+    status: u16,
+    message: String,
+    schematic: Option<FailureSchematic>,
+}
+
 /// A bounded call with request headers, retried a few times (the first
 /// cross-node call can lose its reply before the per-caller reply
-/// subscription propagates — the round-trip suite's idiom).
+/// subscription propagates — the round-trip suite's idiom). A server
+/// refusal is terminal (never retried) and returns both renderings.
 async fn call_with_headers(
     caller: &Mesh,
     target: u64,
     service: &str,
     body: &[u8],
     headers: Vec<(String, Vec<u8>)>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ServerRefusal> {
     let mut last = String::new();
     for _ in 0..5 {
         let opts = CallOptions {
@@ -125,12 +166,35 @@ async fn call_with_headers(
         .await
         {
             Ok(Ok(reply)) => return Ok(reply.body.to_vec()),
+            Ok(Err(RpcError::ServerError {
+                status,
+                message,
+                headers,
+            })) => {
+                let entries: Vec<&Vec<u8>> = headers
+                    .iter()
+                    .filter(|(name, _)| name == HDR_FAILURE_SCHEMATIC)
+                    .map(|(_, value)| value)
+                    .collect();
+                // The discipline rule: exactly one valid schematic
+                // header counts; zero, duplicates, or malformed → the
+                // human error alone.
+                let schematic = match entries.as_slice() {
+                    [bytes] => FailureSchematic::from_header_bytes(bytes),
+                    _ => None,
+                };
+                return Err(ServerRefusal {
+                    status,
+                    message,
+                    schematic,
+                });
+            }
             Ok(Err(e)) => last = format!("rpc error: {e:?}"),
             Err(_) => last = "call timed out".to_string(),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(last)
+    panic!("call never reached the server: {last}");
 }
 
 #[tokio::test]
@@ -158,14 +222,23 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
     .unwrap();
 
     // Unpaid: refused with the payment error, handler never ran, gate
-    // never consulted.
+    // never consulted — and the handler-authored `missing_quote`
+    // schematic rides the reply header beside the human message.
     let err = call_with_headers(&caller, host_id, "paid_echo", &body, vec![])
         .await
         .expect_err("an unpaid call must be refused");
-    assert!(err.contains("payment quote"), "{err}");
+    assert_eq!(err.status, ERR_PAYMENT);
+    assert!(err.message.contains("payment quote"), "{}", err.message);
+    let schematic = err.schematic.expect("the refusal carries its schematic");
+    assert_eq!(schematic.reason, "missing_quote");
+    assert_eq!(schematic.stage, "admission");
+    assert!(!schematic.handler_executed);
+    assert_eq!(schematic.recovery.class, "new_quote_required");
+    assert_eq!(schematic.tool_id.as_deref(), Some("paid_echo"));
     assert!(gate.redeemed.lock().is_empty());
 
-    // Gate denial: the reason travels to the caller.
+    // Gate denial: BOTH renderings travel to the caller — the message
+    // as the error body, the gate's schematic untouched on the header.
     let err = call_with_headers(
         &caller,
         host_id,
@@ -175,7 +248,11 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
     )
     .await
     .expect_err("a denied quote must be refused");
-    assert!(err.contains("scripted denial"), "{err}");
+    assert_eq!(err.status, ERR_PAYMENT);
+    assert!(err.message.contains("scripted denial"), "{}", err.message);
+    let schematic = err.schematic.expect("the gate's schematic passes through");
+    assert_eq!(schematic.reason, "scripted_denial");
+    assert_eq!(schematic.quote_id.as_deref(), Some("q-deny"));
 
     // Paid: redeems through the gate, handler serves.
     let reply = call_with_headers(
@@ -208,7 +285,11 @@ async fn a_paid_native_tool_redeems_before_the_handler_runs() {
     )
     .await
     .expect_err("a bad body is refused");
-    assert!(err.contains("bad request body"), "{err}");
+    assert!(err.message.contains("bad request body"), "{}", err.message);
+    assert!(
+        err.schematic.is_none(),
+        "a codec refusal carries no payment schematic"
+    );
     assert_eq!(
         gate.redeemed.lock().len(),
         before,

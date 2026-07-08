@@ -105,15 +105,17 @@ pub trait PaymentFlow: Send + Sync {
 /// safety of credentialed tools).
 #[async_trait]
 pub trait PaymentAdmission: Send + Sync {
-    /// `Err(reason)` rejects the invocation; the reason travels to the
-    /// caller as the payment-rejection application error. `binding` is
-    /// the caller's signature over the binding transcript when the
-    /// invoke carried one — a present-but-invalid binding must reject
-    /// (never fall back to bearer).
+    /// `Err(denial)` rejects the invocation; the denial's `message`
+    /// travels to the caller as the body of the payment-rejection
+    /// application error (byte-identical to the pre-schematic wire)
+    /// and its `schematic` rides the `net-failure-schematic` reply
+    /// header. `binding` is the caller's signature over the binding
+    /// transcript when the invoke carried one — a present-but-invalid
+    /// binding must reject (never fall back to bearer).
     async fn redeem(
         &self,
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String>;
+    ) -> Result<(), net_sdk::tool_payment::GateDenial>;
 }

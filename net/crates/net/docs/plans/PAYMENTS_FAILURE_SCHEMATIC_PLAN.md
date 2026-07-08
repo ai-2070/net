@@ -135,14 +135,14 @@ The three edits the wire already permits (`cortex/rpc.rs` + adapter `mesh_rpc.rs
 
 ## Workstream 3 — producers: render once, attach everywhere
 
-- [ ] Both gate traits change refusal type: `ToolPaymentGate::redeem` and `PaymentAdmission::redeem` return `Result<(), GateDenial>`. Two real impls (`EngineToolPaymentGate`, `EnginePaymentAdmission`) plus scripted test gates — compiler-driven, small blast radius.
-- [ ] `flow::redeem_via_engine` renders `RedeemDenialReason` → `FailureSchematic` — the **single render site** for both gates. The `Err(EngineError)` arm produces the fixed `engine_unavailable` schematic **from nothing but the generic verdict** (the scrub survives by construction); extend the store-corruption test to assert the *schematic* leaks no path/serde/"corrupt" either.
-- [ ] `PaidToolHandler` (SDK): missing-header arm authors its own `missing_quote` schematic; both refusal arms attach the schematic JSON as `HDR_FAILURE_SCHEMATIC` on the ERR_PAYMENT reply; body message unchanged.
-- [ ] MCP wrap `invoke.rs`: same treatment for its three arms (`gate_missing`, `missing_quote`, gate denial pass-through).
-- [ ] Size honesty: a test producing the largest schematic (longest reason, capped message, full recovery block, ids) asserts it encodes under the 4096 B header cap.
-- [ ] Ordering unchanged and re-asserted: bad body still refuses **before** the gate (no schematic minted, quote untouched).
+- [x] Both gate traits change refusal type: `ToolPaymentGate::redeem` and `PaymentAdmission::redeem` return `Result<(), GateDenial>`. Two real impls (`EngineToolPaymentGate`, `EnginePaymentAdmission`) plus scripted test gates — compiler-driven, small blast radius (one extra consumer surfaced: the `mcp_gate_composition` test's gateway mirror).
+- [x] `flow::redeem_via_engine` renders `RedeemDenialReason` → `FailureSchematic` — the **single render site** for both gates (`denial_for` + `engine_unavailable_denial`, message and schematic minted together from the typed reason). The `Err(EngineError)` arm produces the fixed `engine_unavailable` schematic **from nothing but the generic verdict**; the store-corruption test now asserts the *schematic's serialized bytes* leak no path/"corrupt"/parser detail either.
+- [x] `PaidToolHandler` (SDK): missing-header arm authors `FailureSchematic::missing_quote` (constructor lives with the type); both refusal arms attach the schematic via `HDR_FAILURE_SCHEMATIC`; body message unchanged. *(WS-2 residual honored: refusals ride the full-fidelity `Ok(payload)` channel — the handler keeps the message in the body itself.)*
+- [x] MCP wrap `invoke.rs`: same treatment for its three arms (`gate_missing`, `missing_quote`, gate denial pass-through) via a wire-identical `payment_refusal` twin.
+- [x] Size honesty: `every_redeem_denial_renders_within_the_header_budget` renders all nine typed reasons (including a fat repeated freeze-reason) + `engine_unavailable` and asserts each encodes under the 4096 B cap; an over-budget schematic degrades to message-alone (`header_entry` → `None`), never truncated JSON.
+- [x] Ordering unchanged and re-asserted: bad body still refuses **before** the gate (no schematic minted — asserted — and the quote untouched).
 
-**Acceptance:** `tool_serve_paid.rs` and the MCP invoke tests observe, on every payment refusal, an unchanged human message **plus** a decodable schematic whose `reason` matches the typed cause; the scrubbing test passes with its new schematic assertions.
+**Acceptance:** `tool_serve_paid.rs` and the MCP invoke tests observe, on every payment refusal, an unchanged human message **plus** a decodable schematic whose `reason` matches the typed cause; the scrubbing test passes with its new schematic assertions. ✅ — plus the risk-table pin landed as a unit test: security rows assert `retryable == safe_to_retry == safe_to_requote == false` with no `next_action`.
 
 ## Workstream 4 — projections
 

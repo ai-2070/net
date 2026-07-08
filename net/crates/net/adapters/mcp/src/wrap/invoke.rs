@@ -76,6 +76,25 @@ fn find_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [
         .map(|(_, v)| v.as_slice())
 }
 
+/// A payment refusal on the full-fidelity reply channel: the human
+/// message stays the body (byte-identical to the pre-schematic wire)
+/// and the schematic rides the reply header — exactly one, dropped
+/// (never truncated) if it exceeds the wire budget. Returned as
+/// `Ok(payload)` because the fold passes a handler-authored payload
+/// through verbatim; the `RpcHandlerError` convenience channel
+/// flattens headers away. Twin of the SDK-native `PaidToolHandler`'s
+/// helper — wire-identical refusals on both serving paths.
+fn payment_refusal(
+    message: String,
+    schematic: &net_sdk::tool_payment::FailureSchematic,
+) -> RpcResponsePayload {
+    RpcResponsePayload {
+        status: RpcStatus::Application(ERR_PAYMENT),
+        headers: schematic.header_entry().into_iter().collect(),
+        body: Bytes::from(message),
+    }
+}
+
 /// Who may invoke a wrapped tool. Owner-only by default (doctrine #3): only
 /// caller origins the operator has admitted. Widening flags
 /// (`--allow peer:<node_id>`) add origins.
@@ -358,33 +377,37 @@ impl RpcHandler for WrapInvokeHandler {
         //     the policy hook — a caller commits its quote before it can put
         //     a (possibly human) approval prompt in front of the operator.
         if self.paid {
+            // Refusals ride the full-fidelity channel (`Ok(payload)` —
+            // the fold passes it through verbatim): the human message
+            // stays the body, byte-identical to the pre-schematic wire,
+            // and the failure schematic rides the reply header.
             let Some(gate) = &self.payment else {
-                return Err(RpcHandlerError::Application {
-                    code: ERR_PAYMENT,
-                    message: "tool is priced but the provider has no payment gate configured \
-                              (fail-closed)"
-                        .to_string(),
-                });
+                let schematic =
+                    net_sdk::tool_payment::FailureSchematic::gate_missing(&self.service);
+                let message = schematic.message.clone();
+                return Ok(payment_refusal(message, &schematic));
             };
-            let quote_id = find_header(
+            let quote_id = match find_header(
                 &ctx.payload.headers,
                 crate::serve::payment::HDR_PAYMENT_QUOTE,
             )
             .and_then(|raw| std::str::from_utf8(raw).ok())
-            .ok_or_else(|| RpcHandlerError::Application {
-                code: ERR_PAYMENT,
-                message: "paid tool invoked without a payment quote header".to_string(),
-            })?;
+            {
+                Some(quote_id) => quote_id,
+                None => {
+                    let schematic =
+                        net_sdk::tool_payment::FailureSchematic::missing_quote(&self.service);
+                    let message = schematic.message.clone();
+                    return Ok(payment_refusal(message, &schematic));
+                }
+            };
             let binding = find_header(
                 &ctx.payload.headers,
                 crate::serve::payment::HDR_PAYMENT_BINDING,
             );
-            gate.redeem(&self.service, quote_id, binding)
-                .await
-                .map_err(|reason| RpcHandlerError::Application {
-                    code: ERR_PAYMENT,
-                    message: reason,
-                })?;
+            if let Err(denial) = gate.redeem(&self.service, quote_id, binding).await {
+                return Ok(payment_refusal(denial.message, &denial.schematic));
+            }
         }
 
         // [4] Policy hook (V2 Phase 2, the in-root toll booth). The call is

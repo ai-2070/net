@@ -554,7 +554,7 @@ impl net_mcp::serve::PaymentAdmission for RecordingAdmission {
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), net_sdk::tool_payment::GateDenial> {
         self.redeemed.lock().unwrap().push((
             tool_id.to_string(),
             quote_id.to_string(),

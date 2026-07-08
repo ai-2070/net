@@ -69,15 +69,17 @@ pub const HDR_FAILURE_SCHEMATIC: &str = "net-failure-schematic";
 pub const ERR_PAYMENT: u16 = 0x8006;
 
 /// The provider-side payment gate for natively-served paid tools:
-/// redeem a paid quote for its one invocation. `Err(reason)` refuses
-/// the invocation (the reason travels to the caller inside the
-/// [`ERR_PAYMENT`] application error); `binding`, when present, is the
+/// redeem a paid quote for its one invocation. `Err(denial)` refuses
+/// the invocation — the denial's `message` travels to the caller as
+/// the body of the [`ERR_PAYMENT`] application error (byte-identical
+/// to the pre-schematic wire) and its `schematic` rides
+/// [`HDR_FAILURE_SCHEMATIC`]. `binding`, when present, is the
 /// caller's signature over the invocation-binding transcript — a
 /// present-but-invalid binding must reject, never fall back to bearer.
 ///
 /// This is the SDK-native twin of the MCP adapter's `PaymentAdmission`
 /// (same shape, same semantics); `net-payments` provides the
-/// engine-backed implementation.
+/// engine-backed implementation and the single denial-render site.
 #[async_trait]
 pub trait ToolPaymentGate: Send + Sync {
     async fn redeem(
@@ -85,7 +87,7 @@ pub trait ToolPaymentGate: Send + Sync {
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String>;
+    ) -> Result<(), GateDenial>;
 }
 
 /// Object tag of the failure schematic. SDK wire vocabulary (like
@@ -287,13 +289,80 @@ impl FailureSchematic {
         }
         message[..end].to_string()
     }
+
+    /// This schematic as its reply-header entry
+    /// (([`HDR_FAILURE_SCHEMATIC`], JSON bytes)) — `None` when it
+    /// exceeds the wire budget; the reply then carries the human
+    /// message alone. Producers attach exactly one.
+    pub fn header_entry(&self) -> Option<(String, Vec<u8>)> {
+        self.to_header_bytes()
+            .map(|bytes| (HDR_FAILURE_SCHEMATIC.to_string(), bytes))
+    }
+
+    /// The `missing_quote` admission verdict: a paid tool invoked
+    /// without a quote header. Authored by the serving handler (SDK
+    /// native or MCP wrap) — the engine was never consulted, nothing
+    /// was consumed.
+    pub fn missing_quote(tool_id: &str) -> Self {
+        Self {
+            object: TAG_PAYMENT_FAILURE.to_string(),
+            code: failure_vocab::CODE_PAYMENT.to_string(),
+            stage: failure_vocab::STAGE_ADMISSION.to_string(),
+            reason: "missing_quote".to_string(),
+            message: "paid tool invoked without a payment quote header".to_string(),
+            retryable: false,
+            recovery: Recovery {
+                class: failure_vocab::CLASS_NEW_QUOTE_REQUIRED.to_string(),
+                actor: failure_vocab::ACTOR_CALLER_AGENT.to_string(),
+                safe_to_retry: false,
+                safe_to_requote: true,
+                next_action: Some("request_new_quote".to_string()),
+            },
+            handler_executed: false,
+            funds_moved: failure_vocab::FUNDS_NO.to_string(),
+            prior_payment: failure_vocab::PRIOR_NONE.to_string(),
+            quote_id: None,
+            tool_id: Some(tool_id.to_string()),
+            extra: Default::default(),
+        }
+    }
+
+    /// The `gate_missing` admission verdict: the tool is priced but the
+    /// provider wired no payment gate — a provider configuration error,
+    /// refused fail-closed before any caller state is touched.
+    pub fn gate_missing(tool_id: &str) -> Self {
+        Self {
+            object: TAG_PAYMENT_FAILURE.to_string(),
+            code: failure_vocab::CODE_PAYMENT.to_string(),
+            stage: failure_vocab::STAGE_ADMISSION.to_string(),
+            reason: "gate_missing".to_string(),
+            message: "tool is priced but the provider has no payment gate configured \
+                      (fail-closed)"
+                .to_string(),
+            retryable: false,
+            recovery: Recovery {
+                class: failure_vocab::CLASS_PROVIDER_CONFIGURATION_ERROR.to_string(),
+                actor: failure_vocab::ACTOR_PROVIDER_OPERATOR.to_string(),
+                safe_to_retry: false,
+                safe_to_requote: false,
+                next_action: Some("configure_payment_gate".to_string()),
+            },
+            handler_executed: false,
+            funds_moved: failure_vocab::FUNDS_NO.to_string(),
+            prior_payment: failure_vocab::PRIOR_NONE.to_string(),
+            quote_id: None,
+            tool_id: Some(tool_id.to_string()),
+            extra: Default::default(),
+        }
+    }
 }
 
 /// A gate refusal, both renderings together: the human `message`
 /// (travels as the error body, byte-identical to the pre-schematic
 /// wire) and the structured `schematic` (rides
-/// [`HDR_FAILURE_SCHEMATIC`]). The gate traits move to this type when
-/// the producers land; until then it is the shared vocabulary.
+/// [`HDR_FAILURE_SCHEMATIC`]). The refusal type of both gate traits;
+/// `net-payments`' `flow::redeem_via_engine` is the single render
+/// site for engine denials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateDenial {
     pub message: String,

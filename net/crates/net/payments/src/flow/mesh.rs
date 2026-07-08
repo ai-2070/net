@@ -248,7 +248,7 @@ impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), net_sdk::tool_payment::GateDenial> {
         // Single-sourced with the MCP gate (`mcp_gate::EnginePaymentAdmission`)
         // so the fail-closed mapping cannot drift — see `flow::redeem_via_engine`.
         crate::flow::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
