@@ -94,6 +94,15 @@ fn denial_for(
         ),
         // Security rows advise nothing: do not retry, do not just buy
         // another quote — report the mismatch.
+        //
+        // `WrongToolBinding` reports `funds_moved=unknown` /
+        // `prior_payment=unknown` even though the engine only reaches it
+        // AFTER the billing guard (the payment for the bound tool did
+        // settle and bill). This is deliberate, not a stale/lossy read:
+        // reporting `yes`/`consumed` here would confirm to a caller
+        // redeeming against the WRONG tool that a real, paid quote
+        // exists for some other capability. The conservative `unknown`
+        // withholds that — grouping it with the binding-failure rows.
         R::BindingRejected | R::WrongToolBinding { .. } => (
             v::CLASS_SECURITY_VIOLATION,
             v::ACTOR_CALLER_OPERATOR,
