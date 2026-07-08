@@ -28,6 +28,8 @@
 
 > **N-4 note:** no behaviour change — requiring the `AuthorizationUsed` emitter to equal `q.token` is correct and fail-closed for conforming EIP-3009 tokens (proxies like USDC emit under the proxy address, which *is* the quoted asset). Relaxing the emitter would let an unrelated contract's event satisfy the bind, so the resolution is a comment stating the constraint; widen the asset registry, not the check.
 
+> **N-2 follow-up (P1, cubic review of the N-2 commit, `1d594cc4a`):** scoping the nonce read to eip155 left a residual — a *missing or malformed* `authorization.nonce` on an eip155 quote fell through to the `invoiceId`/`None` branch, and the eip155 checker's `is_nonce_hex` filter then treated that as "no nonce" and **skipped** the `AuthorizationUsed` bind (the same fail-open as N-1, now reachable by omitting/mangling the nonce instead of formatting it bare). Fixed: on eip155 the reference derivation now **requires** a valid nonce and refuses (`Rejected`/`BadQuote`, fail-closed, checker never consulted) when it is absent or not a 32-byte hex word — the `invoiceId` is strictly a non-eip155 fallback. The nonce-shape predicate is single-sourced as `checker::is_eip3009_nonce` so the engine's gate and the checker's bind cannot disagree. Regressions: `eip155_reverify_threads_the_signed_nonce`, `eip155_reverify_refuses_a_missing_or_malformed_nonce`.
+
 **Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic path; `[PLAUSIBLE]` = concrete code citation with a mechanism, trigger depends on config/adversary/token not reproduced end-to-end.
 
 **Checked and clean (not findings):**
