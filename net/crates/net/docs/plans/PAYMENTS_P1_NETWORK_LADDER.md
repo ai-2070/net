@@ -103,15 +103,16 @@ transaction hash and the printed verification chain here.
   network; structured refusal without a wallet). Retry honesty: a
   same-quote retry may re-author against a fresh blockhash, so
   idempotency holds at the quote, not at payload byte-identity.
-- One honest gap still blocks serving above receipt trust: **no SVM
-  chain checker.** The pack therefore deliberately omits `required_tier`
-  (= `observed`) and ships no `rpc_endpoints` entry — promising
-  `confirmed(n)` with no checker would make every settlement
-  unservable, and *claiming* one that doesn't exist would be worse.
-- Enablement = SVM checker + this suite's shape run against a solana
-  pair (CDP credentials). Config stays as shipped.
+- ~~One honest gap still blocks serving above receipt trust: no SVM
+  chain checker.~~ **Resolved 2026-07-07 (P2 WS-A, `24e6c3ac5`):**
+  `SvmChecker` maps the commitment ladder into the tier vocabulary
+  (deterministic `finalized` → `Final`), cross-checks delivery from
+  token-balance deltas with payer binding, and the pack now ships
+  `rpc_endpoints` + `required_tier: Confirmed(1)` like the eip155 rungs.
+- Enablement = this suite's shape run against a solana pair (CDP
+  credentials). Config stays as shipped.
 
-- [x] SVM signer seam landed: `2026-07-06` · [ ] checker: `____` · [ ] conformance: `____`
+- [x] SVM signer seam landed: `2026-07-06` · [x] checker: `2026-07-07` (`24e6c3ac5`) · [ ] conformance: `____` (live run, env-gated)
 
 ## Rung 4 — xrpl: go/no-go record
 
