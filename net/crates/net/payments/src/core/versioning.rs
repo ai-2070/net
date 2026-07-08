@@ -27,6 +27,13 @@ pub const TAG_BILLING_EVENT: &str = "net.billing.event@1";
 /// nothing else squats on it.
 pub const TAG_PAYMENT_DISPUTE: &str = "net.payment.dispute@1";
 
+// `net.payment.failure@1` — the failure schematic (structured refusal
+// verdict on the `net-failure-schematic` reply header) — is deliberately
+// NOT minted here: it is SDK wire vocabulary like `ERR_PAYMENT`, owned by
+// `net_sdk::tool_payment::TAG_PAYMENT_FAILURE` (unsigned, additive within
+// `@1`, consumers tolerate unknown reasons/fields). Listed for registry
+// completeness only.
+
 /// Structured version/tag rejection.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

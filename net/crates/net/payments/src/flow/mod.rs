@@ -68,7 +68,10 @@ pub(crate) async fn redeem_via_engine(
         .await
     {
         Ok(RedeemDecision::Admitted) => Ok(()),
-        Ok(RedeemDecision::Denied { reason }) => Err(reason),
+        // The typed reason's Display is the exact string this arm has
+        // always produced; the schematic rendering rides the same type
+        // when the gates move to `GateDenial`.
+        Ok(RedeemDecision::Denied { reason }) => Err(reason.to_string()),
         Err(e) => {
             // Fail-closed — but the raw `EngineError` wraps StoreError /
             // EnvelopeError / X402Error, which can carry file paths, I/O
