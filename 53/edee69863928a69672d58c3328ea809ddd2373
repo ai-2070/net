@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md
+  s_2ce1bbf7d954a5::t_471201ba072f54 66-72
+.github/workflows/payments-live.yml
+  s_2ce1bbf7d954a5::t_5682d6c5ee4716 1-103
+net/crates/net/docs/plans/PAYMENTS_TEST_MATRIX.md
+  s_2ce1bbf7d954a5::t_55bc8821af56e5 95
+  s_2ce1bbf7d954a5::t_1116b3bcae4fde 123,125,127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "53edee69863928a69672d58c3328ea809ddd2373",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
