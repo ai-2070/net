@@ -1,0 +1,36 @@
+net/crates/net/sdk/tests/tool_serve_paid.rs
+  s_2ce1bbf7d954a5::t_4b4f399737db48 1-272
+net/crates/net/payments/tests/native_tool_gate.rs
+  s_2ce1bbf7d954a5::t_48994e60001164 1-105
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_2ce1bbf7d954a5::t_0b304ca300b9ec 3940-3941,3946-3947,3950-3959
+net/crates/net/payments/src/flow/mesh.rs
+  s_2ce1bbf7d954a5::t_051bf7bb1ad712 226-264
+net/crates/net/sdk/src/tool_payment.rs
+  s_2ce1bbf7d954a5::t_134676620e09a5 1-71
+net/crates/net/sdk/src/tool.rs
+  s_2ce1bbf7d954a5::t_c648b0e05b8994 367-456,1416-1502
+  s_2ce1bbf7d954a5::t_499d7decc48cf5 44-47
+net/crates/net/sdk/src/lib.rs
+  s_2ce1bbf7d954a5::t_499d7decc48cf5 86-90
+net/crates/net/adapters/mcp/src/serve/payment.rs
+  s_2ce1bbf7d954a5::t_00a807ab4f7f13 27,35
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_2ce1bbf7d954a5::t_00a807ab4f7f13 60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0f585a8345c9982cb91601cc6660ac1adee10f12",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
