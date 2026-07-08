@@ -1,0 +1,30 @@
+net/crates/net/bindings/python/Cargo.toml
+  s_2ce1bbf7d954a5::t_fb83a09710c036 227-228,231
+  s_2ce1bbf7d954a5::t_193959c4e9b634 224-226,229-230,232
+net/crates/net/docs/plans/PAYMENTS_TEST_MATRIX.md
+  s_2ce1bbf7d954a5::t_7bce0518123e95 58
+  s_2ce1bbf7d954a5::t_f6e847c15c028d 114,116-119,121
+.github/workflows/ci.yml
+  s_2ce1bbf7d954a5::t_75b55710e5e9a9 1142
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_2ce1bbf7d954a5::t_960ba7382b8fb9 910-948,950,953-980,982-1133,1138-1152,1158-1201,1206-1225,1231-1246
+  s_2ce1bbf7d954a5::t_c6c5970bf4fa63 949,951-952
+  s_2ce1bbf7d954a5::t_e4ecab16049560 981,1153-1157,1202-1205,1226-1230
+  s_2ce1bbf7d954a5::t_530633d395ce83 1134-1137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "be0cd1d2f5965e5db09504a24f1abc9d157ce7b2",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
