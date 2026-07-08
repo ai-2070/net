@@ -14,7 +14,7 @@
 //! - Keys never cross this boundary in either direction. The
 //!   [`ExternalSigner`] path hands the document out (KMS/wallet/MPC
 //!   compute the digest and sign; the key never enters Net memory).
-//!   The [`DevLocalSigner`] exists only behind the loud
+//!   The [`dev::DevLocalSigner`] exists only behind the loud
 //!   `unsafe-dev-signer` feature, for testnet conformance.
 
 use std::future::Future;

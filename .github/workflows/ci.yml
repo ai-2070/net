@@ -947,8 +947,32 @@ jobs:
           -A clippy::undocumented_unsafe_blocks
           -A clippy::multiple_unsafe_ops_per_block
 
-  # The `clippy` job above lints only the root `net` package — `cargo
-  # clippy` without `--workspace` doesn't traverse workspace members,
+      # net-payments is a workspace member, not the root `net-mesh`
+      # crate, so the bare `cargo clippy` above (no `-p` / `--workspace`,
+      # no `default-members`) never lints it — leaving the panic-hygiene
+      # warnings in its own `[lints.clippy]` table unpromoted to `-D
+      # warnings`, contrary to what that table's comment promises. Lint
+      # it explicitly, mirroring the two-step split above: strict on
+      # lib/bins, panic lints relaxed on the unwrap-heavy test surface.
+      - name: Run clippy — net-payments (production code, strict)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: cargo clippy --all-features --lib --bins -- -D warnings
+
+      - name: Run clippy — net-payments (all targets, test surface allowed to panic)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: >
+          cargo clippy --all-features --all-targets --
+          -D warnings
+          -A clippy::unwrap_used
+          -A clippy::expect_used
+          -A clippy::undocumented_unsafe_blocks
+          -A clippy::multiple_unsafe_ops_per_block
+
+  # The `clippy` job above lints the root `net` package and net-payments
+  # — `cargo clippy` without `--workspace` doesn't traverse the other
+  # workspace members,
   # and the bindings each need a different feature combination so a
   # single `--workspace --all-features` invocation isn't workable
   # either (the Python and Node bindings carry build-tool-specific
@@ -1630,5 +1654,15 @@ jobs:
       # them warning-free like the other workspace members.
       - name: Build net-mesh-mcp documentation
         run: cargo doc -p net-mesh-mcp --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-payments` is a workspace member the bare `cargo doc` above
+      # never documents, so its rustdoc has gone unchecked. Build it with
+      # `--all-features` (matches the test job — turns on `unsafe-dev-signer`
+      # etc. so gated items resolve) and deny warnings like every other
+      # member.
+      - name: Build net-payments documentation
+        run: cargo doc -p net-payments --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings

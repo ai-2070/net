@@ -227,7 +227,7 @@ impl ProviderChannel for MeshPaymentChannel {
 /// The provider-side gate for **natively-served** paid tools
 /// ([`net_sdk::tool_payment::ToolPaymentGate`], consumed by
 /// `Mesh::serve_tool_paid`): each paid invoke's quote is redeemed
-/// against the [`PaymentEngine`] — settled, billed, unfrozen, bound to
+/// against the [`crate::PaymentEngine`] — settled, billed, unfrozen, bound to
 /// this tool, never redeemed before, at-most-once under the store lock.
 /// The SDK-native twin of the MCP wrap path's `EnginePaymentAdmission`
 /// (`flow/mcp_gate.rs`), byte-identical semantics.
