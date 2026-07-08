@@ -103,3 +103,50 @@ async fn the_engine_gate_redeems_a_paid_quote_exactly_once() {
         .expect_err("unknown quote denied");
     assert!(err.contains("unknown quote"), "{err}");
 }
+
+/// A store failure (here: a corrupted state file) fails closed with a
+/// GENERIC caller-facing message. The raw `EngineError` wraps `StoreError`,
+/// whose `Corrupt { path, .. }` / `io` variants carry the on-disk path and
+/// serde detail — none of which may travel to an SDK/MCP caller.
+#[tokio::test]
+async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_path = dir.path().join("engine.json");
+    let engine = Arc::new(
+        PaymentEngine::new(
+            provider.clone(),
+            Arc::new(MockFacilitator::new()),
+            Arc::new(AdmitAll),
+            default_mock_registry(provider.entity_id().clone()),
+            state_path.clone(),
+        )
+        .expect("engine"),
+    );
+    let quote_id = paid_quote_id(&engine, &caller).await;
+    let gate = EngineToolPaymentGate::new(engine.clone());
+
+    // Corrupt the on-disk store: the next redeem's `mutate_json` load fails
+    // with a `StoreError::Corrupt { path, .. }` instead of reaching a
+    // decision — the exact path that used to interpolate the raw error.
+    std::fs::write(&state_path, b"{ not-valid-json").expect("corrupt the store");
+
+    let err = gate
+        .redeem("fixture-tool", &quote_id, None)
+        .await
+        .expect_err("a store failure must fail closed");
+
+    // Fail-closed AND scrubbed: exactly the generic verdict, with no file
+    // path, tempdir, or serde/StoreError internals leaked to the caller.
+    assert_eq!(err, "payment engine unavailable (fail-closed)");
+    assert!(!err.contains("engine.json"), "leaked store path: {err}");
+    assert!(
+        !err.contains(dir.path().to_string_lossy().as_ref()),
+        "leaked tempdir path: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("json") && !err.to_lowercase().contains("corrupt"),
+        "leaked parser detail: {err}"
+    );
+}
