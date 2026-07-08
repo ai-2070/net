@@ -85,7 +85,7 @@ fn token_balance(index: u64, mint: &str, owner: &str, amount: &str) -> Value {
 fn transfer_tx(amount: u128) -> Value {
     json!({
         "slot": 95,
-        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT, &amount.to_string())])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -119,8 +119,10 @@ fn message(instructions: Value) -> Value {
     })
 }
 
-/// A parsed spl-token `transferChecked` edge.
-fn edge(authority: &str, source_index: usize, dest_index: usize, mint: &str) -> Value {
+/// A parsed spl-token `transferChecked` edge moving `amount` of `mint`.
+/// The amount rides `tokenAmount` (the transferChecked shape) so the
+/// checker's N3b amount-coverage bind can read it.
+fn edge(authority: &str, source_index: usize, dest_index: usize, mint: &str, amount: &str) -> Value {
     json!({
         "program": "spl-token",
         "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -131,6 +133,7 @@ fn edge(authority: &str, source_index: usize, dest_index: usize, mint: &str) -> 
                 "source": ACCOUNT_KEYS[source_index],
                 "destination": ACCOUNT_KEYS[dest_index],
                 "mint": mint,
+                "tokenAmount": { "amount": amount, "decimals": 6 },
             },
         },
     })
@@ -271,7 +274,12 @@ async fn delivered_amount_comes_from_token_balance_deltas() {
     // entry) are both handled — and the payer's own debit still binds.
     rpc.set_transaction(json!({
         "slot": 95,
-        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
+        // Two payer→merchant edges (into accounts 1 and 3) summing to the
+        // 10000 delivered net — the amount-coverage bind (N3b).
+        "transaction": { "message": message(json!([
+            edge(PAYER, 2, 1, MINT, "6000"),
+            edge(PAYER, 2, 3, MINT, "4000"),
+        ])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -365,7 +373,7 @@ async fn an_unrelated_token_account_does_not_poison_the_check() {
     // The old eager parse would turn this into a terminal error.
     rpc.set_transaction(json!({
         "slot": 95,
-        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT, "10000")])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -407,7 +415,10 @@ async fn delivered_nets_a_same_owner_debit() {
     // (same mint, same owner) in the same tx; the payer funds it.
     rpc.set_transaction(json!({
         "slot": 95,
-        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
+        // Gross 10000 payer→merchant into account 1 (covers the 7000 net;
+        // the 3000 leaving account 3 is a merchant-side debit, not a
+        // payer edge).
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT, "10000")])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -505,8 +516,8 @@ async fn attribution_requires_a_payer_to_merchant_transfer_edge() {
     rpc.set_transaction(json!({
         "slot": 95,
         "transaction": { "message": message(json!([
-            edge(PAYER, 2, 5, MINT),    // payer → third party
-            edge(STRANGER, 4, 1, MINT), // stranger → merchant
+            edge(PAYER, 2, 5, MINT, "10000"),    // payer → third party
+            edge(STRANGER, 4, 1, MINT, "10000"), // stranger → merchant
         ])) },
         "meta": {
             "err": null,
@@ -535,6 +546,44 @@ async fn attribution_requires_a_payer_to_merchant_transfer_edge() {
         "a payer debit toward a third party must not attribute a stranger's credit"
     );
 
+    // The dust-decoy variant (N-3): same stranger credit, but the payer
+    // now adds a 0-amount payer→merchant edge to fake attribution. Edge
+    // *existence* is satisfied; amount *coverage* is not (0 < 10000), so
+    // it stays an honest zero.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "transaction": { "message": message(json!([
+            edge(PAYER, 2, 5, MINT, "10000"),    // payer → third party (real debit)
+            edge(STRANGER, 4, 1, MINT, "10000"), // stranger → merchant (real credit)
+            edge(PAYER, 2, 1, MINT, "0"),        // 0-amount decoy payer → merchant
+        ])) },
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+                token_balance(5, MINT, THIRD, "0"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+                token_balance(5, MINT, THIRD, "10000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(
+        delivered.as_deref(),
+        Some("0"),
+        "a zero/dust decoy payer→merchant edge must not attribute a stranger's credit"
+    );
+
     // A CPI settlement: the payer→merchant edge lives in the INNER
     // instructions (a router program invoked spl-token) — still counts.
     rpc.set_transaction(json!({
@@ -543,7 +592,7 @@ async fn attribution_requires_a_payer_to_merchant_transfer_edge() {
         "meta": {
             "err": null,
             "innerInstructions": [
-                { "index": 0, "instructions": [edge(PAYER, 2, 1, MINT)] }
+                { "index": 0, "instructions": [edge(PAYER, 2, 1, MINT, "10000")] }
             ],
             "preTokenBalances": [
                 token_balance(1, MINT, RECIPIENT, "0"),
@@ -564,14 +613,17 @@ async fn attribution_requires_a_payer_to_merchant_transfer_edge() {
     };
     assert_eq!(delivered.as_deref(), Some("10000"));
 
-    // A plain `transfer` (no mint field) resolves the destination's mint
-    // through the balance map — still counts.
-    let mut plain = edge(PAYER, 2, 1, MINT);
+    // A plain `transfer` (no mint field, amount under `amount` not
+    // `tokenAmount`) resolves the destination's mint through the balance
+    // map and its amount from `info.amount` — still counts.
+    let mut plain = edge(PAYER, 2, 1, MINT, "10000");
     plain["parsed"]["type"] = json!("transfer");
-    plain["parsed"]["info"]
-        .as_object_mut()
-        .unwrap()
-        .remove("mint");
+    {
+        let info = plain["parsed"]["info"].as_object_mut().unwrap();
+        info.remove("mint");
+        info.remove("tokenAmount");
+        info.insert("amount".into(), json!("10000"));
+    }
     rpc.set_transaction(json!({
         "slot": 95,
         "transaction": { "message": message(json!([plain])) },
