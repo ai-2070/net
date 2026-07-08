@@ -450,12 +450,19 @@ fn map_invoke_server_error(
 /// JSON, correct object tag — anything else (absent, duplicated,
 /// malformed) is `None` and the human error stands alone. Never an
 /// error: the schematic is a sidecar, not a dependency.
+///
+/// The name match is ASCII-case-insensitive: the mesh carries header
+/// names verbatim (lowercase, as the producer emits them), but a
+/// schematic may also arrive via the outbound HTTP 402 two-way door,
+/// where header names are case-insensitive and intermediaries routinely
+/// re-case them. Two entries that differ only in case still count as a
+/// duplicate here — the fail-safe branch below applies unchanged.
 fn schematic_from_error_headers(
     headers: &[(String, Vec<u8>)],
 ) -> Option<Box<net_sdk::tool_payment::FailureSchematic>> {
-    let mut entries = headers
-        .iter()
-        .filter(|(name, _)| name == net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC);
+    let mut entries = headers.iter().filter(|(name, _)| {
+        name.eq_ignore_ascii_case(net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC)
+    });
     let first = entries.next()?;
     if entries.next().is_some() {
         return None;
@@ -942,6 +949,36 @@ mod tests {
                 message,
             }) => assert_eq!(message, "no quote"),
             other => panic!("expected the plain denial, got {other:?}"),
+        }
+    }
+
+    /// The name match is ASCII-case-insensitive, so a schematic that
+    /// crosses a case-normalizing hop (e.g. the HTTP 402 door) still
+    /// decodes — and a case-only duplicate still trips the fail-safe.
+    #[test]
+    fn a_case_shifted_schematic_header_still_decodes() {
+        let schematic = net_sdk::tool_payment::FailureSchematic::missing_quote("t");
+        let (_, bytes) = schematic.header_entry().expect("fits");
+
+        // Title-cased name -> decoded.
+        let recased = ("Net-Failure-Schematic".to_string(), bytes.clone());
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[recased.clone()]) {
+            Err(GatewayError::Denied {
+                schematic: Some(s), ..
+            }) => assert_eq!(s.reason, "missing_quote"),
+            other => panic!("a re-cased header must still decode, got {other:?}"),
+        }
+
+        // Same header in two casings is still a duplicate -> fall back.
+        let lower = (
+            net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC.to_string(),
+            bytes,
+        );
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[recased, lower]) {
+            Err(GatewayError::Denied {
+                schematic: None, ..
+            }) => {}
+            other => panic!("case-only duplicates must fall back, got {other:?}"),
         }
     }
 }

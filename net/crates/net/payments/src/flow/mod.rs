@@ -94,6 +94,15 @@ fn denial_for(
         ),
         // Security rows advise nothing: do not retry, do not just buy
         // another quote — report the mismatch.
+        //
+        // `WrongToolBinding` reports `funds_moved=unknown` /
+        // `prior_payment=unknown` even though the engine only reaches it
+        // AFTER the billing guard (the payment for the bound tool did
+        // settle and bill). This is deliberate, not a stale/lossy read:
+        // reporting `yes`/`consumed` here would confirm to a caller
+        // redeeming against the WRONG tool that a real, paid quote
+        // exists for some other capability. The conservative `unknown`
+        // withholds that — grouping it with the binding-failure rows.
         R::BindingRejected | R::WrongToolBinding { .. } => (
             v::CLASS_SECURITY_VIOLATION,
             v::ACTOR_CALLER_OPERATOR,
@@ -157,14 +166,19 @@ fn denial_for(
             Some("request_new_quote"),
         ),
     };
+    // The human body carries the full `Display` (byte-identical to the
+    // pre-schematic wire); the schematic's copy is the redaction-safe
+    // rendering — for `QuoteFrozen` that drops the free-form freeze text
+    // so it never rides the structured header.
     let message = reason.to_string();
+    let schematic_message = reason.schematic_message();
     net_sdk::tool_payment::GateDenial {
         schematic: net_sdk::tool_payment::FailureSchematic {
             object: net_sdk::tool_payment::TAG_PAYMENT_FAILURE.to_string(),
             code: v::CODE_PAYMENT.to_string(),
             stage: v::STAGE_REDEEM.to_string(),
             reason: reason.wire_reason().to_string(),
-            message: net_sdk::tool_payment::FailureSchematic::cap_message(&message),
+            message: net_sdk::tool_payment::FailureSchematic::cap_message(&schematic_message),
             retryable,
             recovery: net_sdk::tool_payment::Recovery {
                 class: class.to_string(),
@@ -1106,5 +1120,86 @@ mod denial_render_tests {
         assert_eq!(pending.schematic.recovery.class, "automatic_retry");
         assert_eq!(pending.schematic.prior_payment, "pending");
         assert!(pending.schematic.retryable && pending.schematic.recovery.safe_to_retry);
+    }
+
+    /// Redaction: the free-form freeze reason (provider- and
+    /// facilitator-supplied invalidation text) rides the human error
+    /// body alone — the structured schematic carries a generic frozen
+    /// message, never the free-form text, so nothing leaks onto the
+    /// `net-failure-schematic` header.
+    #[test]
+    fn a_frozen_denial_keeps_the_free_form_reason_off_the_schematic() {
+        let free_form =
+            "settlement reported on `eip155:1`, quote on `eip155:84532` — facilitator diag 0xdeadbeef";
+        let denial = denial_for(
+            &R::QuoteFrozen {
+                freeze_reason: free_form.to_string(),
+            },
+            "t",
+            "q",
+        );
+        // The human body keeps the full reason (byte-identical to Display).
+        assert_eq!(
+            denial.message,
+            format!("quote is frozen ({free_form}) — nothing serves against it")
+        );
+        assert!(denial.message.contains(free_form), "{}", denial.message);
+        // The schematic scrubs it: generic message, no free-form text.
+        assert_eq!(denial.schematic.reason, "quote_frozen");
+        assert_eq!(
+            denial.schematic.message,
+            "quote is frozen — nothing serves against it"
+        );
+        assert!(!denial.schematic.message.contains("facilitator"));
+        assert!(!denial.schematic.message.contains("eip155"));
+    }
+
+    /// The `next_action` column of the caller-facing mapping table
+    /// (`FailureSchematic`'s doc) — pinned here so the table and
+    /// `denial_for` cannot drift. Security and non-recoverable rows
+    /// advise nothing (`None`).
+    #[test]
+    fn next_action_hints_match_the_mapping_table() {
+        let na = |r: &R| denial_for(r, "t", "q").schematic.recovery.next_action;
+        assert_eq!(na(&R::UnknownQuote).as_deref(), Some("request_new_quote"));
+        assert_eq!(
+            na(&R::BindingMalformed).as_deref(),
+            Some("fix_payment_client")
+        );
+        assert_eq!(na(&R::BindingRejected), None);
+        assert_eq!(
+            na(&R::PayerRecordCorrupt).as_deref(),
+            Some("contact_provider_operator")
+        );
+        assert_eq!(
+            na(&R::QuoteFrozen {
+                freeze_reason: "x".into()
+            }),
+            None
+        );
+        assert_eq!(na(&R::NotSettled).as_deref(), Some("complete_payment"));
+        assert_eq!(
+            na(&R::SettlementPending).as_deref(),
+            Some("retry_after_reverification")
+        );
+        assert_eq!(
+            na(&R::WrongToolBinding {
+                capability: "p/a".into(),
+                tool_id: "b".into()
+            }),
+            None
+        );
+        assert_eq!(
+            na(&R::AlreadyRedeemed).as_deref(),
+            Some("request_new_quote")
+        );
+        assert_eq!(
+            engine_unavailable_denial("t", "q")
+                .schematic
+                .recovery
+                .next_action
+                .as_deref(),
+            Some("retry_later")
+        );
     }
 }
