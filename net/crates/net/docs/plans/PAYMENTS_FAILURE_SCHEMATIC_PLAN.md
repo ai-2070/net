@@ -6,9 +6,10 @@
 
 **Review (2026-07-08, Kyra): approved — "build it"** — with tightening edits, all incorporated below before WS-1 froze anything:
 
-- The field set stays the original v1 shape (`retryable`, `recovery.safe_to_retry`, `funds_moved` — no `current_attempt_charged`/`prior_payment`/`funds_status` variants): ambiguity is resolved by **definitions, not new fields**. "For v1, clarity beats perfect ontology."
+- The field set stays close to the original v1 shape (`retryable`, `recovery.safe_to_retry`, `funds_moved` — no `current_attempt_charged`/`funds_status` variants): ambiguity is resolved by **definitions, not renames**. "For v1, clarity beats perfect ontology."
 - `retryable` vs `recovery.safe_to_retry` pinned: coarse operation verdict vs recovery instruction (Retry semantics block below).
 - `funds_moved` pinned: the payment state known for this quote/proof — never a fresh charge caused by the rejected invocation.
+- One field survived the minimalism pass on a second look: `prior_payment` (`none | pending | consumed | unknown`) — the **instrument**-lifecycle fact beside `funds_moved`'s **money** fact. It routes recovery in ways the money fact can't: `none` → pay it, `pending` → wait, `consumed` → requote.
 - `engine_unavailable` → actor `provider_operator`, conservative class — the scrub can't distinguish transient from broken, so don't overpromise recovery.
 - `binding_malformed` → conservative (a new quote doesn't fix a client serialization bug).
 - `quote_frozen` → `non_recoverable` (a freeze often signals replay/wrong-chain; typed freeze subreasons reserved).
@@ -51,6 +52,7 @@ A versioned JSON object in house style (`object` tag first, `#[serde(default, sk
   },
   "handler_executed": false,
   "funds_moved": "yes",
+  "prior_payment": "consumed",
   "quote_id": "q_…",
   "tool_id": "paid_echo"
 }
@@ -65,7 +67,8 @@ Field rules:
 - `recovery.class` — one of `automatic_retry | payment_required | new_quote_required | user_action_required | operator_approval_required | provider_configuration_error | caller_configuration_error | network_transient | security_violation | non_recoverable`. `payment_required` = "the quote exists — pay it, then retry"; a routing distinct from requoting.
 - `recovery.actor` — who can *fix* it: `caller_agent | caller_user | caller_operator | provider_operator`.
 - `handler_executed` — always `false` for anything these stages refuse: the invariant, stated as data.
-- `funds_moved` — `no | yes | unknown`: the payment state known to the provider for this quote/proof — **never** a fresh charge caused by this rejected invocation (a refusal never charges; the paired `message` carries the context, e.g. `already_redeemed` → `yes` reads with "one payment, one serve"). `unknown` is deliberate on binding-failure rows: a failed possession proof learns nothing about payment state.
+- `funds_moved` — `no | yes | unknown`: the **money** fact — whether the payment associated with this quote/proof is known to have moved funds. **Never** a fresh charge caused by this rejected invocation (a refusal never charges). `unknown` is deliberate on binding-failure rows: a failed possession proof learns nothing about payment state.
+- `prior_payment` — `none | pending | consumed | unknown`: the **instrument** fact — the lifecycle state of the payment attached to the quote. `none` = no settlement recorded (never paid); `pending` = settled, not yet billed (awaiting tier/re-verify, or held as an exception); `consumed` = billed and redeemed; `unknown` = the record can't say, and deliberately on binding-failure rows. The pair answers the agent's two distinct questions: *did money move?* and *can I still use this instrument?*
 
 ### Retry semantics
 
@@ -97,20 +100,20 @@ The types, before any wiring.
 
 Mapping (v1, redeem + admission stages — tightened per review):
 
-| reason | stage | class | actor | retryable | safe_to_retry | safe_to_requote | funds_moved |
-|---|---|---|---|---|---|---|---|
-| `missing_quote` | admission | `new_quote_required` | caller_agent | false | false | true | no |
-| `gate_missing` | admission | `provider_configuration_error` | provider_operator | false | false | false | no |
-| `unknown_quote` | redeem | `new_quote_required` | caller_agent | false | false | true | no |
-| `binding_malformed` | redeem | `caller_configuration_error` | caller_operator | false | false | false | unknown |
-| `binding_rejected` | redeem | `security_violation` | caller_operator | false | false | false | unknown |
-| `payer_record_corrupt` | redeem | `provider_configuration_error` | provider_operator | false | false | false | unknown |
-| `quote_frozen` | redeem | `non_recoverable` | caller_operator | false | false | false | unknown |
-| `not_settled` | redeem | `payment_required` | caller_agent | true | true | true | no |
-| `settlement_pending` | redeem | `automatic_retry` | caller_agent | true | true | true | unknown |
-| `wrong_tool_binding` | redeem | `security_violation` | caller_operator | false | false | false | unknown |
-| `already_redeemed` | redeem | `new_quote_required` | caller_agent | false | false | true | yes |
-| `engine_unavailable` | redeem | `provider_configuration_error` | provider_operator | true | true | true | unknown |
+| reason | stage | class | actor | retryable | safe_to_retry | safe_to_requote | funds_moved | prior_payment |
+|---|---|---|---|---|---|---|---|---|
+| `missing_quote` | admission | `new_quote_required` | caller_agent | false | false | true | no | none |
+| `gate_missing` | admission | `provider_configuration_error` | provider_operator | false | false | false | no | none |
+| `unknown_quote` | redeem | `new_quote_required` | caller_agent | false | false | true | no | none |
+| `binding_malformed` | redeem | `caller_configuration_error` | caller_operator | false | false | false | unknown | unknown |
+| `binding_rejected` | redeem | `security_violation` | caller_operator | false | false | false | unknown | unknown |
+| `payer_record_corrupt` | redeem | `provider_configuration_error` | provider_operator | false | false | false | unknown | unknown |
+| `quote_frozen` | redeem | `non_recoverable` | caller_operator | false | false | false | unknown | unknown |
+| `not_settled` | redeem | `payment_required` | caller_agent | true | true | true | no | none |
+| `settlement_pending` | redeem | `automatic_retry` | caller_agent | true | true | true | unknown | pending |
+| `wrong_tool_binding` | redeem | `security_violation` | caller_operator | false | false | false | unknown | unknown |
+| `already_redeemed` | redeem | `new_quote_required` | caller_agent | false | false | true | yes | consumed |
+| `engine_unavailable` | redeem | `provider_configuration_error` | provider_operator | true | true | true | unknown | unknown |
 
 Row notes (the review's reasoning, kept next to the contract): `binding_malformed` is a client serialization bug — a new quote doesn't fix it (`next_action: fix_payment_client`). `quote_frozen` often signals replay/wrong-chain/reorg — "get a new quote" understates it; typed freeze subreasons (`quote_frozen_replay | _wrong_chain | _reorg | _amount`) are **reserved** pending a typed freeze tag in the store record. `engine_unavailable`'s actor is the provider (the caller can't fix engine availability); retry is permitted but nothing stronger is promised — the scrub can't distinguish transient from broken. `not_settled` vs `settlement_pending`: the record's event chain distinguishes "never paid" (pay the quote, then retry) from "paid, awaiting confidence" (wait and retry after re-verification).
 
