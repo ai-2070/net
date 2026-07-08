@@ -98,7 +98,7 @@ export async function fetchLatestRelease(): Promise<{
   try {
     const res = await fetch(
       `https://api.github.com/repos/${REPO}/releases/latest`,
-      { headers: ghHeaders(), next: { revalidate: 3600 } },
+      { headers: ghHeaders(), cache: "force-cache" },
     );
     if (!res.ok) return null;
     const data = (await res.json()) as GhRelease;
@@ -119,7 +119,7 @@ export async function fetchHeadCommit(): Promise<{
   try {
     const res = await fetch(
       `https://api.github.com/repos/${REPO}/commits/HEAD`,
-      { headers: ghHeaders(), next: { revalidate: 3600 } },
+      { headers: ghHeaders(), cache: "force-cache" },
     );
     if (!res.ok) return null;
     const data = (await res.json()) as GhCommit;
@@ -136,7 +136,7 @@ export async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${REPO}/releases?per_page=100`,
-      { headers: ghHeaders(), next: { revalidate: 3600 } },
+      { headers: ghHeaders(), cache: "force-cache" },
     );
     if (!res.ok) return [];
     const data = (await res.json()) as ReadonlyArray<GhRelease>;
