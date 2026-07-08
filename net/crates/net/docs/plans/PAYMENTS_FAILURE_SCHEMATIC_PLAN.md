@@ -18,6 +18,19 @@
 
 ---
 
+## Status (2026-07-08): **COMPLETE** — all four workstreams landed on `payments-failure-schematic`
+
+| WS | Landed | Commit | Key tests |
+|---|---|---|---|
+| 1 — vocabulary + the object | ✅ | `35c815d77` | `the_golden_wire_shape_is_pinned`, `unknown_reasons_and_extra_fields_are_tolerated`, `the_redeem_denial_vocabulary_is_pinned`, `a_pending_settlement_denies_redemption_as_pending_not_unpaid` |
+| 2 — substrate: error-reply headers | ✅ | `4bd9e6417` | `rpc_error_replies_carry_headers_to_the_caller` (both interop directions) |
+| 3 — producers: render once | ✅ | `6cfa3f151` | `every_redeem_denial_renders_within_the_header_budget`, `security_rows_pin_no_retry_no_requote`, scrub test's schematic assertions, `tool_serve_paid` schematic decoding |
+| 4 — projections | ✅ | `626ff6ba4` | `a_payment_denial_decodes_its_schematic_per_the_discipline_rule`, `a_denied_result_projects_the_schematic_into_structured_content`, `a_denied_outcome_projects_the_failure_schematic` (Python) |
+
+Every acceptance criterion below is met; per-workstream notes record what building actually surfaced (the two load-bearing discoveries: WS-2's "the server half needed nothing", and WS-1's record-lifecycle truth about `unknown_quote` vs `not_settled`). Full suites green: payments 208 (mesh + mcp-gate + http-facilitator), SDK 327, MCP 255, core nrpc integration, Python binding projection tests.
+
+---
+
 ## Ground truth (as researched 2026-07-08)
 
 What exists today, with receipts — the design leans on all four:
@@ -92,11 +105,11 @@ The human message stays the error body, byte-for-byte as today — every existin
 
 The types, before any wiring.
 
-- [ ] `FailureSchematic` (+ `Recovery`) in `net_sdk::tool_payment` — serde struct per the shape above, `TAG_PAYMENT_FAILURE = "net.payment.failure@1"`, `HDR_FAILURE_SCHEMATIC`. The SDK already owns the wire vocabulary (ERR_PAYMENT, header names); this is wire vocabulary, not payment parsing — the "SDK never verifies payments" doctrine holds. Cross-reference the tag from `payments/src/core/versioning.rs` prose so the registry stays discoverable.
-- [ ] `GateDenial { message: String, schematic: FailureSchematic }` in the same module — the new refusal type for both gate traits (WS-3 changes the signatures; the type lands first).
-- [ ] Payments core: promote the redeem-gate strings to `RedeemDenialReason` (`unknown_quote | binding_malformed | binding_rejected | payer_record_corrupt | quote_frozen | not_settled | settlement_pending | wrong_tool_binding | already_redeemed`); `RedeemDecision::Denied` gains the typed reason. **`Display` preserves today's exact strings** — wire messages and every existing assertion stay put — with one review-sanctioned exception: the `not_settled`/`settlement_pending` split (typed at the source: `rec.chain` empty vs non-empty while `billing` is `None`) mints a *new* message for the pending case; the never-paid case keeps today's string verbatim.
-- [ ] Pin the reason↔recovery mapping table (draft below) as committed prose next to the types. It is a **caller-facing contract reviewed like a money-path decision** — agents will branch on it.
-- [ ] Golden JSON fixture for the schematic (the `gen_payments_fixtures.rs` idiom), plus a tolerance test: a schematic with an unknown `reason`/extra fields deserializes fine.
+- [x] `FailureSchematic` (+ `Recovery`) in `net_sdk::tool_payment` — serde struct per the shape above, `TAG_PAYMENT_FAILURE = "net.payment.failure@1"`, `HDR_FAILURE_SCHEMATIC`. The SDK already owns the wire vocabulary (ERR_PAYMENT, header names); this is wire vocabulary, not payment parsing — the "SDK never verifies payments" doctrine holds. Cross-referenced from `payments/src/core/versioning.rs` prose. *(Grew the header codec halves — `to_header_bytes` refuses past the 4096 B budget, `from_header_bytes` is the tolerant consumer — plus a `failure_vocab` value-constant module and, in WS-3, the admission-stage constructors.)*
+- [x] `GateDenial { message: String, schematic: FailureSchematic }` in the same module — the new refusal type for both gate traits (WS-3 changed the signatures; the type landed first).
+- [x] Payments core: promote the redeem-gate strings to `RedeemDenialReason` (`unknown_quote | binding_malformed | binding_rejected | payer_record_corrupt | quote_frozen | not_settled | settlement_pending | wrong_tool_binding | already_redeemed`); `RedeemDecision::Denied` gains the typed reason. **`Display` preserves today's exact strings** — wire messages and every existing assertion stay put — with one review-sanctioned exception: the `not_settled`/`settlement_pending` split (typed at the source: `rec.chain` empty vs non-empty while `billing` is `None`) mints a *new* message for the pending case; the never-paid case keeps today's string verbatim.
+- [x] Pin the reason↔recovery mapping table (tightened per review, below) as committed prose next to the types — it lives as `FailureSchematic`'s doc comment, the caller-facing contract agents branch on. Reviewed pre-build (the tightening rounds above).
+- [x] Golden JSON fixture for the schematic, plus a tolerance test: a schematic with an unknown `reason`/extra fields deserializes fine (extras preserved and re-emitted). *(Landed as unit tests with an inline golden string rather than the `gen_payments_fixtures.rs` idiom — the object is SDK-owned and unsigned, so there are no canonical-bytes/signature fixtures to generate.)*
 
 Mapping (v1, redeem + admission stages — tightened per review):
 
@@ -119,7 +132,7 @@ Row notes (the review's reasoning, kept next to the contract): `binding_malforme
 
 Reserved reasons (documented now, no v1 producer — future surfaces must use these names, per review): `insufficient_funds`, `no_wallet_configured`, `network_not_allowed`, `quote_expired`, `tier_below_required`, `checker_unavailable`, `facilitator_rejected` — the caller-side authoring and pay-path stages of WS-5.
 
-**Acceptance:** the object round-trips through serde with golden bytes; unknown-reason tolerance proven; the mapping table is committed prose; nothing is wired yet and the full suite is untouched.
+**Acceptance:** the object round-trips through serde with golden bytes; unknown-reason tolerance proven; the mapping table is committed prose; nothing is wired yet and the full suite is untouched. ✅ — with one record-lifecycle discovery, pinned in the variant docs and by test: an issued-but-never-attempted quote has **no record** (records are minted at claim time; a released claim removes them), so it denies as `unknown_quote` — `not_settled`'s domain is strictly *incomplete attempts* (mid-claim, or the M3 crash window awaiting TTL reclaim), never "never tried".
 
 ## Workstream 2 — substrate: error replies carry headers
 
@@ -146,12 +159,12 @@ The three edits the wire already permits (`cortex/rpc.rs` + adapter `mesh_rpc.rs
 
 ## Workstream 4 — projections
 
-- [ ] Demand-side MCP gateway: on `RpcError::ServerError`, decode `HDR_FAILURE_SCHEMATIC` **tolerantly** (absent/malformed → behave exactly as today); `GatewayError::Denied` carries `Option<FailureSchematic>`; the shim surfaces it as the error `CallToolResult`'s `structured_content` while `text` stays the human `denied_message`. Kyra's "compact primary + expandable detail", materialized in the field MCP already has.
-- [ ] Python bindings: the outcome JSON gains `"failure": {…schematic…}` beside the existing `error` string when present; the `status` vocabulary is untouched.
-- [ ] Logs: the emission point gains structured `tracing` fields (`reason`, `stage`, `recovery_class`) so operators grep verdicts, not prose.
-- [ ] Tests: end-to-end MCP — a denied paid call yields `is_error: true`, human text, and `structured_content.object == "net.payment.failure@1"`; a legacy provider (no header) yields today's exact behavior; duplicate or malformed schematic headers → schematic ignored, human path intact (the discipline rule); Python round-trip for the `failure` field.
+- [x] Demand-side MCP gateway: on `RpcError::ServerError`, decode `HDR_FAILURE_SCHEMATIC` **tolerantly** (absent/malformed → behave exactly as today); `GatewayError::Denied` carries the optional boxed schematic beside its message (struct variant; `GatewayError::denied()` keeps the common no-schematic construction terse); the shim surfaces it as the error `CallToolResult`'s `structured_content` while `text` stays the human `denied_message`. Kyra's "compact primary + expandable detail", materialized in the field MCP already has.
+- [x] Python bindings: the outcome JSON gains `"failure": {…schematic…}` beside the existing `error` string when present; the `status` vocabulary is untouched.
+- [x] Logs: the emission point gains structured `tracing` fields (`reason`, `stage`, `recovery_class`, `tool_id`) so operators grep verdicts, not prose.
+- [x] Tests: the discipline rule pinned at the gateway (exactly one valid header decodes; duplicates, malformed bytes, and a legacy header-less provider all fall back to today's exact behavior); the shim projection (`structured_content.object == "net.payment.failure@1"`, human text unchanged, `None` without a schematic); Python round-trip for the `failure` field (present with a schematic, absent without).
 
-**Acceptance:** an agent driving the MCP surface can branch on `reason`/`recovery.class` without string-matching prose; every surface degrades gracefully against peers that predate the header.
+**Acceptance:** an agent driving the MCP surface can branch on `reason`/`recovery.class` without string-matching prose; every surface degrades gracefully against peers that predate the header. ✅ — the schematic is a sidecar on every hop: no surface *depends* on it, each merely gets richer when it rides.
 
 ## Workstream 5 — deferred, with entry notes (recorded, not built)
 
