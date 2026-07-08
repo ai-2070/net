@@ -2980,6 +2980,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "pyo3-build-config",
  "serde_json",
+ "tempfile",
  "tokio",
  "zeroize",
 ]
