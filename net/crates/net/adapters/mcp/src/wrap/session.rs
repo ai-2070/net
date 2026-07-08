@@ -725,6 +725,7 @@ impl ServerPublisher {
             scope: config.scope,
             delegation: config.delegation,
             policy: config.policy,
+            payment_admission: config.payment_admission,
             tools: served,
             skipped,
             registration: Registration {
@@ -984,6 +985,12 @@ pub struct LocalPublicationHandle {
     /// Invoke-path policy reused when serving tools that appear on refresh, so
     /// a refreshed tool enforces the same policy as the initial publish.
     policy: Option<Arc<dyn InvokePolicy>>,
+    /// Payment-admission gate reused when serving priced tools that appear on
+    /// refresh, so a re-announced priced tool stays payment-gated — an
+    /// announced price is an enforced price on refresh too, exactly as on the
+    /// initial publish and on [`PublicationHandle::refresh`]. Without this a
+    /// re-appearing priced tool would be discovered as paid while serving free.
+    payment_admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// Tool names skipped because they have no usable id (an empty name).
@@ -1050,7 +1057,14 @@ impl LocalPublicationHandle {
                 )
                 .with_service(tool_id.clone())
                 .with_delegation(self.delegation.clone())
-                .with_policy(self.policy.clone());
+                .with_policy(self.policy.clone())
+                // A re-appearing priced tool re-announces its price, so it must
+                // re-enforce it — mirror the initial publish and
+                // `PublicationHandle::refresh`, never serve an announced price free.
+                .with_payment(
+                    lt.descriptor.pricing_terms.is_some(),
+                    self.payment_admission.clone(),
+                );
                 match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
                     Ok(handle) => {
                         self.handles.insert(tool_id.clone(), handle);

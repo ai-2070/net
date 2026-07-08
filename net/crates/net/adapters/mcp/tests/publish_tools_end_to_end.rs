@@ -784,3 +784,115 @@ async fn publish_tools_pricing_guards_fail_closed() {
         host.shutdown().await.ok();
     }
 }
+
+/// P2 WS-C regression (H1): an announced price is an enforced price on the
+/// **refresh** path too. A priced tool withdrawn and then re-added by
+/// `LocalPublicationHandle::refresh` must still redeem its quote before the
+/// invoker runs — the re-served handler carries the same payment gate as the
+/// initial publish, never serving a re-announced price for free. Before the
+/// fix, the local refresh path rebuilt the handler without `.with_payment`,
+/// so a re-appearing priced tool was discovered as paid but served free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refreshed_priced_local_tool_still_enforces_payment() {
+    let caller = build_mesh(&[0x5Au8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x5Au8; 32]).await);
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+
+    let gate = Arc::new(RecordingAdmission::new());
+    let mut config = WrapConfig::owner_only(hermes_impl(), caller.origin_hash());
+    config.pricing.insert("add".to_string(), TERMS.to_string());
+    config.payment_admission = Some(gate.clone());
+
+    let invoker = Arc::new(LocalTools::default());
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let mut publication = publisher
+        .publish_tools(
+            &local_tools(),
+            invoker as Arc<dyn ToolInvoker>,
+            ctx(),
+            config,
+        )
+        .await
+        .expect("a priced publication with a gate publishes");
+
+    // Churn the inventory: withdraw `add` (refresh to the echo-only set), then
+    // re-add it. The re-served handler must re-enforce the announced price.
+    let echo_only: Vec<Tool> = local_tools().into_iter().filter(|t| t.name == "echo").collect();
+    publication.refresh(&echo_only).await.expect("withdraw add");
+    let delta = publication
+        .refresh(&local_tools())
+        .await
+        .expect("re-add add");
+    assert!(
+        delta.added.iter().any(|t| t == "add"),
+        "add was re-served by the refresh: {delta:?}",
+    );
+
+    let filter = CapabilityFilter::new().require_tag("add");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "caller re-discovers the refreshed priced tool",
+    );
+
+    let add_body = || Bytes::from(serde_json::to_vec(&json!({ "a": 2, "b": 3 })).unwrap());
+
+    // Unpaid after refresh: still refused before the invoker (warm the reply
+    // channel first — a fast rejection can outrace the first subscription).
+    let _ = call_bounded(&caller, b_id, "add", add_body()).await;
+    let err = call_bounded(&caller, b_id, "add", add_body())
+        .await
+        .expect_err("a re-announced priced tool must still refuse an unpaid call");
+    assert!(
+        err.contains("payment quote"),
+        "the refusal names the missing quote: {err}"
+    );
+    assert!(
+        gate.redeemed.lock().unwrap().is_empty(),
+        "nothing was redeemed for an unpaid call after refresh"
+    );
+
+    // Paid after refresh: the quote header rides the call, the gate redeems.
+    let mut paid = Err("never called".to_string());
+    for _ in 0..5 {
+        paid = call_with_headers(
+            &caller,
+            b_id,
+            "add",
+            add_body(),
+            vec![(
+                net_mcp::serve::HDR_PAYMENT_QUOTE.to_string(),
+                b"q-refresh-1".to_vec(),
+            )],
+        )
+        .await;
+        if paid.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reply = paid.expect("the paid call serves after refresh");
+    let result: CallToolResult =
+        serde_json::from_slice(reply.body.as_ref()).expect("decode add result");
+    assert_eq!(result.text(), "5");
+    {
+        let redeemed = gate.redeemed.lock().unwrap();
+        assert!(
+            redeemed
+                .iter()
+                .all(|r| r == &("add".to_string(), "q-refresh-1".to_string(), false)),
+            "every post-refresh redemption was for this tool + quote: {redeemed:?}"
+        );
+    }
+
+    caller.shutdown().await.ok();
+    drop(publication);
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
+}
