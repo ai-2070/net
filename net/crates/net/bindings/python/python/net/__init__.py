@@ -829,6 +829,18 @@ except ImportError:
 else:
     __all__.extend(["AsyncCapabilityGateway", "CapabilityGateway"])
 
+# The outbound HTTP-402 client (pay an external x402 HTTP API through the
+# caller's own spend policy), sync + awaitable duals. Present iff the module
+# was built with the `payments-http` feature (an opt-in that pulls a bundled
+# HTTP/TLS stack — NOT in the default wheel).
+try:
+    from ._net import AsyncPaymentHttpClient, PaymentHttpClient
+except ImportError:
+    # `payments-http` not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(["AsyncPaymentHttpClient", "PaymentHttpClient"])
+
 # Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): a
 # DelegationChain (`root -> machine -> gateway -> subagent`) for
 # capability-invocation attribution, a shared RevocationRegistry, and

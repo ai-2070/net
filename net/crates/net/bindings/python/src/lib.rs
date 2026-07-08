@@ -40,6 +40,12 @@ mod mcp_helpers;
 // (`mcp`), so it is gated on both.
 #[cfg(all(feature = "net", feature = "mcp"))]
 mod capability_gateway;
+// Outbound HTTP-402 client (`PAYMENTS_LANGUAGE_SDKS_PLAN` WS-P2): pay an
+// external x402 HTTP API through the same spend policy as the gateway.
+// Behind `payments-http` (opt-in — it pulls reqwest via
+// `net-payments/http-facilitator`).
+#[cfg(feature = "payments-http")]
+mod payment_http;
 // Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
 // DelegationChain (root → machine → gateway → subagent) + shared
 // RevocationRegistry + child-`Identity` derivation. Thin wrappers over
@@ -3360,6 +3366,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<capability_gateway::PyCapabilityGateway>()?;
         m.add_class::<capability_gateway::PyAsyncCapabilityGateway>()?;
+    }
+    #[cfg(feature = "payments-http")]
+    {
+        m.add_class::<payment_http::PyPaymentHttpClient>()?;
+        m.add_class::<payment_http::PyAsyncPaymentHttpClient>()?;
     }
     #[cfg(feature = "net")]
     {

@@ -2967,6 +2967,7 @@ name = "net-python"
 version = "0.31.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "futures",

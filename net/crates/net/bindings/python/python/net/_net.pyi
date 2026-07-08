@@ -3268,3 +3268,77 @@ class AsyncCapabilityGateway:
         ...
 
     def __repr__(self) -> str: ...
+
+class PaymentHttpClient:
+    """Pay an **external x402 HTTP API** — the outbound two-way door, with
+    the same spend policy, signers, and status vocabulary as
+    :class:`CapabilityGateway`. Present iff the module was built with the
+    ``payments-http`` feature (an opt-in that pulls a bundled HTTP/TLS
+    stack; NOT in the default wheel).
+
+    :meth:`fetch_paid` GETs a URL and, if the server answers ``402``, runs
+    the caller's own spend policy over a local pseudo-quote, signs, and
+    retries — one call authors at most one payment attempt. There is no
+    provider identity and no signed quote on this path: the external
+    server's demand is the commercial fact, and the caller's spend engine
+    (caps, network enablement, approvals) is the entire gate.
+    """
+
+    def __init__(
+        self,
+        payment_policy_path: str,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
+        identity: Optional["Identity"] = None,
+    ) -> None:
+        """Build a client over the shared spend-policy store at
+        ``payment_policy_path`` (**required** — the spend gate). The payment
+        kwargs mirror :class:`CapabilityGateway`: ``payment_profile``
+        (``"production"`` default / ``"dev_test"``),
+        ``payment_unsafe_mock_auto_allow``, and the real-network settlement
+        signer *reference* ``payment_signer_address`` + ``payment_signer``
+        (both or neither — a ``(typed_data_json: str) -> str`` EIP-712
+        callback; key material never crosses the boundary). ``identity`` is
+        an optional payer :class:`Identity` handle; omit it for an ephemeral
+        one (the caller id is bookkeeping on this path — spend is tracked by
+        ``(network, asset, day)``, not by caller)."""
+        ...
+
+    def fetch_paid(self, url: str) -> tuple[str, bytes]:
+        """GET ``url``, paying if the server answers ``402``. Returns
+        ``(status_json, body)``: ``status_json`` is
+        ``{"status": "fetched" | "paid" | "requires_payment_approval" |
+        "denied" | "provider_refused" | "transport_error", ...}`` (``paid``
+        carries the byte-preserved ``settlement`` as base64;
+        ``requires_payment_approval`` carries ``{quote_id, policy_reason,
+        approve_hint}`` and did NOT retry) and ``body`` is the raw response
+        bytes (empty for the non-body outcomes). Never raises for a payment
+        outcome; releases the GIL while in flight."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class AsyncPaymentHttpClient:
+    """Awaitable dual of :class:`PaymentHttpClient` — :meth:`fetch_paid` as
+    a coroutine, resolving to the same ``(status_json, body)`` tuple.
+    Present iff built with the ``payments-http`` feature."""
+
+    def __init__(
+        self,
+        payment_policy_path: str,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
+        identity: Optional["Identity"] = None,
+    ) -> None:
+        """Same as :class:`PaymentHttpClient`."""
+        ...
+
+    async def fetch_paid(self, url: str) -> tuple[str, bytes]:
+        """Awaitable :meth:`PaymentHttpClient.fetch_paid`."""
+        ...
+
+    def __repr__(self) -> str: ...

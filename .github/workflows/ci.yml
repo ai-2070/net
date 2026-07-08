@@ -723,7 +723,10 @@ jobs:
         # default features but this job builds `--no-default-features`, so they
         # must be listed explicitly or `test_publish.py` / `test_a2a.py` fail with
         # `AttributeError: 'NetMesh' object has no attribute ...`.
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,extension-module
+        # `payments-http` (the outbound HTTP-402 client, WS-P2) is an opt-in
+        # NOT in the default wheel — built here so test_payment_http.py's rows
+        # run (they skip cleanly if the class is absent).
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python

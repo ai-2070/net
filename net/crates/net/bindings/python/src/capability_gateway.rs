@@ -89,8 +89,11 @@ fn build_delegation(
 
 /// Validate + unbind the payment-signer callable at construction, so a
 /// non-callable fails here with a clear error instead of on the first
-/// paid invoke.
-fn unbind_signer(signer: Option<Bound<'_, PyAny>>) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+/// paid invoke. `pub(crate)` — the outbound HTTP-402 client
+/// ([`crate::payment_http`]) shares this validation.
+pub(crate) fn unbind_signer(
+    signer: Option<Bound<'_, PyAny>>,
+) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
     match signer {
         Some(callable) if callable.is_callable() => Ok(Some(callable.unbind())),
         Some(_) => Err(PyValueError::new_err(
@@ -467,22 +470,25 @@ struct GatewayState {
 /// `collect` (so validation stays identical across builds) but only the
 /// feature-gated `build_payment_flow` reads them — hence the targeted
 /// dead-code allow; `-D warnings` still guards every other lint.
+///
+/// `pub(crate)` — the outbound HTTP-402 client ([`crate::payment_http`])
+/// shares these kwargs and this validation verbatim.
 #[cfg_attr(not(feature = "payments"), allow(dead_code))]
-struct PaymentConfig {
-    policy_path: String,
-    profile: String,
-    unsafe_mock_auto_allow: bool,
+pub(crate) struct PaymentConfig {
+    pub(crate) policy_path: String,
+    pub(crate) profile: String,
+    pub(crate) unsafe_mock_auto_allow: bool,
     /// The settlement signer *reference*: the payer address plus a
     /// Python callable `(typed_data_json: str) -> str` that forwards
     /// the EIP-712 document to the host's wallet / KMS and returns
     /// the 0x-hex signature. Only the typed document and the
     /// signature ever cross the language boundary — key material
     /// remains unrepresentable here (doctrine 4/7/8).
-    signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    pub(crate) signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
 }
 
 impl PaymentConfig {
-    fn collect(
+    pub(crate) fn collect(
         payment_policy_path: Option<String>,
         payment_profile: Option<String>,
         payment_unsafe_mock_auto_allow: bool,
@@ -624,7 +630,7 @@ fn build_payment_flow(
 /// `spawn_blocking` + `Python::attach` (the blob-store FFI pattern) so
 /// GIL acquisition never stalls the mesh reactor.
 #[cfg(feature = "payments")]
-fn python_external_signer(
+pub(crate) fn python_external_signer(
     address: String,
     callable: pyo3::Py<pyo3::PyAny>,
 ) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
