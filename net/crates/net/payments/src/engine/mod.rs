@@ -1127,18 +1127,36 @@ impl PaymentEngine {
         // never interprets their *meaning* — the checker adapter does;
         // schemes without them thread `None` (unchanged behavior).
         let req_extra = requirements.view().extra.clone();
-        // Reference precedence: the CALLER-SIGNED authorization nonce
-        // (exact-EVM's EIP-3009 `authorization.nonce` — the strongest
-        // per-quote reference, same trust class as `authorization.from`)
-        // wins over the requirements' `invoiceId` (provider-authored,
-        // exact-XRPL's vocabulary). Schemes with neither thread `None`.
-        let reference = payload
-            .view()
-            .payload
-            .get("authorization")
-            .and_then(|a| a.get("nonce"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
+        // Reference precedence — network-family-scoped, because the caller
+        // authors the payload but only the provider authors the
+        // requirements:
+        //
+        // - On eip155 networks the reference is the caller-signed EIP-3009
+        //   `authorization.nonce` (the signature covers it — same trust
+        //   class as `authorization.from`); the eip155 checker binds it to
+        //   the token's `AuthorizationUsed` event.
+        // - Elsewhere the reference is the provider-authored
+        //   `requirements.extra.invoiceId` (exact-XRPL's vocabulary).
+        //
+        // The nonce read is gated to eip155 ON PURPOSE: off-EVM payloads
+        // sign only their wallet blob, not the surrounding JSON, so reading
+        // a caller-supplied `authorization.nonce` on e.g. exact-XRPL would
+        // let a caller override the provider's invoice bind with an
+        // unsigned field. The gate matches the one checker that consumes a
+        // nonce reference (`Eip155Checker`, itself eip155-only). Schemes
+        // with neither thread `None`.
+        let reference = network
+            .starts_with("eip155:")
+            .then(|| {
+                payload
+                    .view()
+                    .payload
+                    .get("authorization")
+                    .and_then(|a| a.get("nonce"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .flatten()
             .or_else(|| {
                 req_extra
                     .as_ref()

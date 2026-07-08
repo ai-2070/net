@@ -513,3 +513,96 @@ async fn the_recorded_settle_payer_reaches_the_checker_when_the_payload_names_no
         "the checker must be asked to bind delivery to the settle-time payer"
     );
 }
+
+/// N-2 regression: on a non-eip155 network the reference threaded to the
+/// checker must be the PROVIDER-authored `invoiceId`, never a
+/// caller-supplied `payload.authorization.nonce`. Off-EVM payloads sign
+/// only their wallet blob (not the surrounding JSON), so a caller who
+/// injects an unsigned `authorization.nonce` must not be able to
+/// override the provider's invoice bind. (On eip155 the nonce is
+/// caller-SIGNED and correctly wins — that path is exercised by the
+/// eip155 checker suite.)
+#[tokio::test]
+async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
+    const PROVIDER_INVOICE: &str = "inv-provider-7";
+    const CALLER_INJECTED_NONCE: &str = "0xdeadbeef-not-the-invoice";
+
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(MockFacilitator::new()),
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine");
+
+    // The provider authors an invoiceId in requirements.extra (exact-XRPL's
+    // vocabulary); MOCK_NETWORK is not eip155.
+    let requirements = X402Carry::author(&PaymentRequirements {
+        scheme: MOCK_SCHEME.into(),
+        network: MOCK_NETWORK.into(),
+        amount: "2500".into(),
+        asset: "musd".into(),
+        pay_to: "mock-provider-settle-addr".into(),
+        max_timeout_seconds: 60,
+        extra: Some(serde_json::json!({ "invoiceId": PROVIDER_INVOICE })),
+    })
+    .expect("author");
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements,
+            NOW,
+            60_000_000_000,
+        )
+        .expect("quote");
+    // The caller smuggles an unsigned `authorization.nonce` into the
+    // opaque payload, hoping to override the invoice bind.
+    let payload = X402Carry::author(&PaymentPayload {
+        x402_version: 2,
+        resource: None,
+        accepted: quote.requirements.view().clone(),
+        payload: serde_json::json!({
+            "mock_authorization": "payer-1",
+            "authorization": { "nonce": CALLER_INJECTED_NONCE },
+        }),
+        extensions: None,
+    })
+    .expect("payload");
+
+    let first = engine
+        .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
+        .await
+        .expect("accept");
+    assert!(
+        matches!(first, PaymentDecision::PendingTier { .. }),
+        "{first:?}"
+    );
+
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Confirmed(3),
+        delivered: Some("2500".into()),
+    }]);
+    let decision = engine
+        .re_verify_with_checker(
+            &quote.quote_id,
+            &checker,
+            VerificationTier::Confirmed(1),
+            NOW + 2,
+        )
+        .await
+        .expect("engine");
+    assert!(matches!(decision, PaymentDecision::Served { .. }), "{decision:?}");
+
+    let queries = checker.queries.lock();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].2.as_ref().and_then(|q| q.reference.as_deref()),
+        Some(PROVIDER_INVOICE),
+        "the provider invoiceId must win; a caller-injected nonce must not override it off-EVM"
+    );
+}
