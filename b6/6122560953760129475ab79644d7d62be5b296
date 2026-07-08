@@ -1,0 +1,24 @@
+net/crates/net/payments/src/core/registry.rs
+  s_2ce1bbf7d954a5::t_d8d356d5ffc77d 167,207-218
+  s_2ce1bbf7d954a5::t_fe0aa5771835b1 219-220
+net/crates/net/payments/tests/exact_xrpl_scheme_flow.rs
+  s_2ce1bbf7d954a5::t_3a471dadec7ea2 1-280
+net/crates/net/payments/src/facilitator/packs.rs
+  s_2ce1bbf7d954a5::t_72727140f58be5 52-60,148-174,187,282-292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b66122560953760129475ab79644d7d62be5b296",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
