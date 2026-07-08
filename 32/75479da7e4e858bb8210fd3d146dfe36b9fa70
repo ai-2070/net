@@ -1,0 +1,27 @@
+net/crates/net/payments/src/facilitator/client.rs
+  s_9154b2b350271d::t_27a363936b56ca 160
+net/crates/net/payments/src/flow/mesh.rs
+  s_9154b2b350271d::t_7be21145fdf643 230
+.github/workflows/ci.yml
+  s_9154b2b350271d::t_48d88aa0f7f48c 973-975
+  s_9154b2b350271d::t_c9b142e51d3865 1659-1668
+  s_9154b2b350271d::t_99ee590cb76c21 950-972
+net/crates/net/payments/src/flow/signer.rs
+  s_9154b2b350271d::t_e9bfbf5ead3ed2 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3275479da7e4e858bb8210fd3d146dfe36b9fa70",
+  "prompts": {},
+  "sessions": {
+    "s_9154b2b350271d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d98fa485-64dd-4080-821b-7d096bd891cb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
