@@ -85,6 +85,7 @@ fn token_balance(index: u64, mint: &str, owner: &str, amount: &str) -> Value {
 fn transfer_tx(amount: u128) -> Value {
     json!({
         "slot": 95,
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -95,6 +96,42 @@ fn transfer_tx(amount: u128) -> Value {
                 token_balance(1, MINT, RECIPIENT, &(1000 + amount).to_string()),
                 token_balance(2, MINT, PAYER, &(50000 - amount).to_string()),
             ],
+        },
+    })
+}
+
+// The fixture's account table: `token_balance(index, …)` indexes into
+// these keys, and the parsed transfer edges name them as source /
+// destination ATAs (N3b attribution).
+const ACCOUNT_KEYS: [&str; 6] = [
+    "FeePayer11111111111111111111111111111111111",
+    "AtaMerchantA11111111111111111111111111111111", // 1: merchant, MINT
+    "AtaPayer111111111111111111111111111111111111", // 2: payer, MINT
+    "AtaMerchantB11111111111111111111111111111111", // 3: merchant, MINT
+    "AtaMerchantOther1111111111111111111111111111", // 4: merchant, other mint
+    "AtaThirdParty1111111111111111111111111111111", // 5: a third party
+];
+
+fn message(instructions: Value) -> Value {
+    json!({
+        "accountKeys": ACCOUNT_KEYS.iter().map(|k| json!({ "pubkey": k })).collect::<Vec<_>>(),
+        "instructions": instructions,
+    })
+}
+
+/// A parsed spl-token `transferChecked` edge.
+fn edge(authority: &str, source_index: usize, dest_index: usize, mint: &str) -> Value {
+    json!({
+        "program": "spl-token",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "parsed": {
+            "type": "transferChecked",
+            "info": {
+                "authority": authority,
+                "source": ACCOUNT_KEYS[source_index],
+                "destination": ACCOUNT_KEYS[dest_index],
+                "mint": mint,
+            },
         },
     })
 }
@@ -234,6 +271,7 @@ async fn delivered_amount_comes_from_token_balance_deltas() {
     // entry) are both handled — and the payer's own debit still binds.
     rpc.set_transaction(json!({
         "slot": 95,
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -327,6 +365,7 @@ async fn an_unrelated_token_account_does_not_poison_the_check() {
     // The old eager parse would turn this into a terminal error.
     rpc.set_transaction(json!({
         "slot": 95,
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -368,6 +407,7 @@ async fn delivered_nets_a_same_owner_debit() {
     // (same mint, same owner) in the same tx; the payer funds it.
     rpc.set_transaction(json!({
         "slot": 95,
+        "transaction": { "message": message(json!([edge(PAYER, 2, 1, MINT)])) },
         "meta": {
             "err": null,
             "preTokenBalances": [
@@ -438,6 +478,143 @@ async fn delivered_amount_binds_to_the_authorized_payer() {
     let twiddled = PAYER.to_lowercase();
     let verdict = checker
         .check(NETWORK, TX, Some(&query_from(&twiddled)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("0"));
+}
+
+/// N3b — per-transfer attribution: the co-sign residual is closed. On
+/// top of the delta binds, the transaction must carry a parseable
+/// spl-token transfer edge payer→merchant; the edge is the attribution,
+/// deltas stay the amount source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attribution_requires_a_payer_to_merchant_transfer_edge() {
+    const THIRD: &str = "ThirdParty1111111111111111111111111111111111";
+    const STRANGER: &str = "SomebodyE1se1111111111111111111111111111111";
+    let rpc = RpcFixture::start().await;
+    let checker = SvmChecker::new(NETWORK, &rpc.endpoint).expect("checker");
+    rpc.set_status(finalized());
+
+    // The co-sign attack: one atomic transaction where the payer's debit
+    // funds a THIRD party while a STRANGER credits the merchant. Both
+    // transaction-level legs hold (payer debited, merchant credited) —
+    // but no payer→merchant edge exists, so nothing is attributed.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "transaction": { "message": message(json!([
+            edge(PAYER, 2, 5, MINT),    // payer → third party
+            edge(STRANGER, 4, 1, MINT), // stranger → merchant
+        ])) },
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+                token_balance(5, MINT, THIRD, "0"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+                token_balance(5, MINT, THIRD, "10000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(
+        delivered.as_deref(),
+        Some("0"),
+        "a payer debit toward a third party must not attribute a stranger's credit"
+    );
+
+    // A CPI settlement: the payer→merchant edge lives in the INNER
+    // instructions (a router program invoked spl-token) — still counts.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "transaction": { "message": message(json!([])) },
+        "meta": {
+            "err": null,
+            "innerInstructions": [
+                { "index": 0, "instructions": [edge(PAYER, 2, 1, MINT)] }
+            ],
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
+
+    // A plain `transfer` (no mint field) resolves the destination's mint
+    // through the balance map — still counts.
+    let mut plain = edge(PAYER, 2, 1, MINT);
+    plain["parsed"]["type"] = json!("transfer");
+    plain["parsed"]["info"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mint");
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "transaction": { "message": message(json!([plain])) },
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
+        .await
+        .expect("check");
+    let ChainVerdict::Included { delivered, .. } = verdict else {
+        panic!("expected Included, got {verdict:?}");
+    };
+    assert_eq!(delivered.as_deref(), Some("10000"));
+
+    // Fail-closed: correct deltas but no parseable instructions at all —
+    // nothing is attributed.
+    rpc.set_transaction(json!({
+        "slot": 95,
+        "transaction": { "message": message(json!([])) },
+        "meta": {
+            "err": null,
+            "preTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "0"),
+                token_balance(2, MINT, PAYER, "50000"),
+            ],
+            "postTokenBalances": [
+                token_balance(1, MINT, RECIPIENT, "10000"),
+                token_balance(2, MINT, PAYER, "40000"),
+            ],
+        },
+    }));
+    let verdict = checker
+        .check(NETWORK, TX, Some(&query_from(PAYER)))
         .await
         .expect("check");
     let ChainVerdict::Included { delivered, .. } = verdict else {

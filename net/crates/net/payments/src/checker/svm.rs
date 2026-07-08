@@ -28,20 +28,23 @@
 //! entirely by a stranger, with the queried payer untouched, sums to an
 //! honest zero.
 //!
-//! Scope of the bind (stated precisely, not overclaimed): the debit leg and
-//! the credit leg are matched at the *transaction* level, not tied to one
-//! source→destination movement. In a single transaction that both debits
-//! the queried payer (to anyone) *and* credits the merchant (from anyone)
-//! the two legs are satisfied independently. Fully attributing the credit
-//! to a payer→merchant transfer would require decoding the SPL transfer
-//! instructions (source/destination/authority), which the balance-delta
-//! model deliberately avoids for CPI-robustness. The residual is narrow:
-//! constructing such a transaction requires the *payer itself* to co-sign
-//! an atomic transaction that pays a third party while a stranger pays the
-//! merchant — i.e. the victim would be the attacker's own accomplice — so
-//! per-transfer attribution is a recorded, deferred hardening, not a live
-//! exploit. The engine turns any shortfall into an amount-mismatch
-//! invalidation.
+//! Scope of the bind — **per-transfer attribution (N3b)**: the debit and
+//! credit legs are no longer matched only at the transaction level. On
+//! top of the balance-delta rules, the parsed instructions (outer and
+//! inner/CPI) must contain at least one spl-token `transfer` /
+//! `transferChecked` **edge from the payer to the merchant** — authority
+//! == payer, destination ATA owned by the recipient, right mint (from
+//! `transferChecked` itself, or resolved through the account-keys ×
+//! token-balances map for plain `transfer`). This closes the co-sign
+//! residual the earlier transaction-level bind recorded (payer debited
+//! toward a third party while a stranger credits the merchant, in one
+//! atomic transaction). Delivered stays delta-derived — the edge is the
+//! *attribution*, never the amount source (deltas remain CPI-robust).
+//! Fail-closed consequence, stated honestly: a settlement whose transfer
+//! the RPC cannot express as a parseable spl-token instruction zeroes
+//! out and the engine invalidates on amount-mismatch — standard
+//! facilitator settlements are plain (possibly CPI-nested) transfers,
+//! which parse.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -217,6 +220,92 @@ fn fold_balances(
     Ok(())
 }
 
+/// Does the transaction contain a parsed spl-token `transfer` /
+/// `transferChecked` edge **from the payer to the merchant** (authority
+/// == `payer`, destination ATA owned by `to`, mint == `token`)? Scans
+/// outer and inner (CPI) instructions; destination ownership and — for
+/// plain `transfer`, which carries no mint — the destination's mint are
+/// resolved through the account-keys × token-balances map. The map is
+/// built leniently (malformed unrelated entries are skipped — the L2
+/// posture): a lenient *bind* can only fail closed, never over-credit.
+fn payer_edge_exists(tx: &Value, payer: &str, to: &str, token: &str) -> bool {
+    let keys: Vec<&str> = tx["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| k["pubkey"].as_str().or(k.as_str()).unwrap_or_default())
+        .collect();
+    let mut ata: std::collections::BTreeMap<&str, (&str, &str)> = std::collections::BTreeMap::new();
+    for entries in [
+        &tx["meta"]["preTokenBalances"],
+        &tx["meta"]["postTokenBalances"],
+    ] {
+        for entry in entries.as_array().into_iter().flatten() {
+            let (Some(index), Some(owner), Some(mint)) = (
+                entry["accountIndex"].as_u64(),
+                entry["owner"].as_str(),
+                entry["mint"].as_str(),
+            ) else {
+                continue;
+            };
+            if let Some(pubkey) = usize::try_from(index).ok().and_then(|i| keys.get(i)) {
+                ata.insert(pubkey, (owner, mint));
+            }
+        }
+    }
+
+    let outer = tx["transaction"]["message"]["instructions"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    let inner = tx["meta"]["innerInstructions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group["instructions"].as_array().into_iter().flatten());
+    for instr in outer.chain(inner) {
+        if !matches!(
+            instr["program"].as_str(),
+            Some("spl-token") | Some("spl-token-2022")
+        ) {
+            continue;
+        }
+        let parsed = &instr["parsed"];
+        if !matches!(
+            parsed["type"].as_str(),
+            Some("transfer") | Some("transferChecked")
+        ) {
+            continue;
+        }
+        let info = &parsed["info"];
+        let authority = info["authority"]
+            .as_str()
+            .or_else(|| info["multisigAuthority"].as_str());
+        if authority != Some(payer) {
+            continue;
+        }
+        let Some((dest_owner, dest_mint)) = info["destination"]
+            .as_str()
+            .and_then(|dest| ata.get(dest).copied())
+        else {
+            continue;
+        };
+        if dest_owner != to {
+            continue;
+        }
+        // `transferChecked` names its mint; plain `transfer` resolves
+        // through the destination's balance entry.
+        let mint_ok = info["mint"]
+            .as_str()
+            .map(|m| m == token)
+            .unwrap_or(dest_mint == token);
+        if mint_ok {
+            return true;
+        }
+    }
+    false
+}
+
 #[async_trait]
 impl ChainChecker for SvmChecker {
     fn reference(&self) -> VerifierRef {
@@ -372,6 +461,17 @@ impl ChainChecker for SvmChecker {
                 // doc for the precise scope and the deferred per-transfer
                 // hardening.)
                 if !payer_debited {
+                    total = 0;
+                }
+                // Per-transfer attribution (N3b): the transaction must
+                // carry a parseable payer→merchant transfer edge — the
+                // co-sign residual (payer debited toward a third party
+                // while a stranger credits the merchant, atomically) no
+                // longer satisfies the bind. Fail-closed: no parseable
+                // edge, no attribution.
+                if total > 0
+                    && !payer_edge_exists(&tx, q.from.as_deref().unwrap_or(""), &q.to, &q.token)
+                {
                     total = 0;
                 }
                 Some(total.to_string())
