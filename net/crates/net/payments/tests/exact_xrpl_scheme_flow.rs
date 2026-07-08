@@ -144,21 +144,26 @@ struct World {
     _dir: tempfile::TempDir,
 }
 
-async fn world(with_signer: bool, rejecting: bool) -> World {
+async fn world(with_signer: bool, rejecting: bool, enable_network: bool) -> World {
     let dir = tempfile::tempdir().expect("tempdir");
     let clock: Arc<dyn Clock> = Arc::new(TestClock);
 
-    // ── the xrpl "pack applied": registry v1 + enabled network ──
+    // ── the xrpl "pack applied": registry v1 + (optionally) the
+    //    enabled network. `enable_network = false` is the default-off
+    //    posture — the network stays out of `allowed_networks`, so a
+    //    real network is unspendable however it is otherwise set up.
     let provider_keys = Arc::new(EntityKeypair::generate());
     let registry = default_registry_v1(provider_keys.entity_id().clone());
     let spend_path = dir.path().join("spend.json");
-    SpendPolicyEngine::new(&spend_path, SpendProfile::Production)
-        .configure(|defaults, _| {
-            defaults.allowed_networks = vec![XRPL_MAINNET.to_string()];
-            defaults.max_per_call = Some(AtomicAmount::from_u128(5_000_000));
-        })
-        .await
-        .expect("configure");
+    if enable_network {
+        SpendPolicyEngine::new(&spend_path, SpendProfile::Production)
+            .configure(|defaults, _| {
+                defaults.allowed_networks = vec![XRPL_MAINNET.to_string()];
+                defaults.max_per_call = Some(AtomicAmount::from_u128(5_000_000));
+            })
+            .await
+            .expect("configure");
+    }
 
     let facilitator = Arc::new(XrplFacilitator {
         payloads: parking_lot::Mutex::new(Vec::new()),
@@ -220,7 +225,7 @@ async fn world(with_signer: bool, rejecting: bool) -> World {
 
 #[tokio::test]
 async fn the_full_exact_xrpl_lifecycle_runs_on_an_enabled_network() {
-    let w = world(true, false).await;
+    let w = world(true, false, true).await;
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
     let CallerDecision::Paid { proof, .. } = decision else {
         panic!("expected Paid on the enabled network, got {decision:?}");
@@ -250,7 +255,7 @@ async fn the_full_exact_xrpl_lifecycle_runs_on_an_enabled_network() {
 
 #[tokio::test]
 async fn without_an_xrpl_signer_the_terms_are_refused_at_selection() {
-    let w = world(false, false).await;
+    let w = world(false, false, true).await;
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
     let CallerDecision::Denied { policy_reason } = decision else {
         panic!("expected Denied without a signer, got {decision:?}");
@@ -269,47 +274,12 @@ async fn without_an_xrpl_signer_the_terms_are_refused_at_selection() {
 /// silently ambient-enables XRPL fails a clearly-named test.
 #[tokio::test]
 async fn xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let clock: Arc<dyn Clock> = Arc::new(TestClock);
-    let provider_keys = Arc::new(EntityKeypair::generate());
-    let registry = default_registry_v1(provider_keys.entity_id().clone());
-    // Default Production policy: `allowed_networks` is empty — no real
-    // network is enabled. (The registry carrying XRP is the asset
-    // allowlist, NOT the enablement switch.)
-    let spend_path = dir.path().join("spend.json");
-    let facilitator = Arc::new(XrplFacilitator {
-        payloads: parking_lot::Mutex::new(Vec::new()),
-        reject: false,
-    });
-    let engine = Arc::new(
-        PaymentEngine::new(
-            provider_keys.clone(),
-            facilitator.clone(),
-            Arc::new(AdmitAll),
-            registry.clone(),
-            dir.path().join("engine.json"),
-        )
-        .expect("engine"),
-    );
-    let terms_json = xrpl_terms(&provider_keys, registry.reference().expect("ref"));
-    let flow = CallerPaymentFlow::new(
-        Arc::new(EntityKeypair::generate()),
-        SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
-        registry,
-        Arc::new(InProcessProvider::new(engine, clock.clone())),
-        clock,
-    )
-    // A wallet IS configured — so settleability is not what holds XRPL
-    // off here; the allowlist is.
-    .with_signer(
-        "xrpl",
-        Arc::new(ExternalXrplSigner::new(
-            "rPayerAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            move |_intent| Box::pin(async move { Ok(SIGNED_BLOB.to_string()) }),
-        )),
-    );
-
-    let decision = flow.run(CAPABILITY, &terms_json).await;
+    // A wallet IS configured (`with_signer`), but the network is NOT
+    // enabled (`enable_network = false`) — so settleability is not what
+    // holds XRPL off; the allowlist is. (The registry carrying XRP is
+    // the asset allowlist, not the enablement switch.)
+    let w = world(true, false, false).await;
+    let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
     let CallerDecision::Denied { policy_reason } = decision else {
         panic!("XRPL must be denied until the network is allowlisted, got {decision:?}");
     };
@@ -320,7 +290,7 @@ async fn xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed() 
         "the denial names the enablement gate: {policy_reason}"
     );
     assert!(
-        facilitator.payloads.lock().is_empty(),
+        w.facilitator.payloads.lock().is_empty(),
         "nothing is signed or sent for an unenabled network"
     );
 }
@@ -330,7 +300,7 @@ async fn xrpl_stays_off_by_default_with_a_wallet_until_the_network_is_allowed() 
 /// the caller's spend reservation.
 #[tokio::test]
 async fn a_bearer_scheme_reject_keeps_the_reservation() {
-    let w = world(true, true).await;
+    let w = world(true, true, true).await;
     let decision = w.flow.run(CAPABILITY, &w.terms_json).await;
     let CallerDecision::Denied { policy_reason } = decision else {
         panic!("expected Denied on a provider reject, got {decision:?}");
