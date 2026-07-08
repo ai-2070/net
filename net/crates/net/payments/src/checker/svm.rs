@@ -482,11 +482,11 @@ impl ChainChecker for SvmChecker {
                 // `from`): the queried payer — guaranteed present by the guard
                 // above — must have spent this mint in this transaction, or
                 // nothing counts *by this quote's payer*. A transfer to the
-                // merchant with the payer untouched is an honest zero. (The
-                // debit and credit legs are matched at the transaction level,
-                // not tied to one source→destination movement — see the module
-                // doc for the precise scope and the deferred per-transfer
-                // hardening.)
+                // merchant with the payer untouched is an honest zero. This is
+                // the coarse first gate; per-transfer attribution (that the
+                // payer→merchant edge itself covers the delivered delta) is
+                // enforced by `payer_edge_amount` immediately below (N3b) — no
+                // longer deferred.
                 if !payer_debited {
                     total = 0;
                 }
