@@ -14,23 +14,18 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::transport::RpcTransport;
 use super::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
 use crate::core::verification::{VerificationTier, VerifierRef};
 
 /// keccak256("Transfer(address,address,uint256)").
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-/// JSON-RPC responses (a receipt with many logs) are bounded but can be
-/// large; cap so a malicious/compromised RPC cannot stream a giant body
-/// within the timeout and exhaust memory.
-const MAX_RPC_BODY: usize = 16 * 1024 * 1024;
-
 /// The JSON-RPC checker for one eip155 network.
 pub struct Eip155Checker {
-    rpc_endpoint: String,
+    transport: RpcTransport,
     network: String,
     final_depth: u64,
-    http: reqwest::Client,
     /// Set once the RPC's `eth_chainId` has been confirmed to match
     /// `network`'s CAIP-2 reference — a swapped/typo'd endpoint (a
     /// testnet URL paired with a mainnet CAIP-2) must never validate a
@@ -51,18 +46,10 @@ impl Eip155Checker {
                 "Eip155Checker got non-eip155 network `{network}`"
             )));
         }
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| CheckerError::terminal(format!("http tls config: {e}")))?;
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| CheckerError::terminal(format!("http client: {e}")))?;
         Ok(Self {
-            rpc_endpoint: rpc_endpoint.into(),
+            transport: RpcTransport::new(rpc_endpoint)?,
             network,
             final_depth: 12,
-            http,
             chain_id_verified: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -96,46 +83,14 @@ impl Eip155Checker {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, CheckerError> {
-        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let response = self
-            .http
-            .post(&self.rpc_endpoint)
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    CheckerError::retryable(e.to_string())
-                } else {
-                    CheckerError::terminal(e.to_string())
-                }
-            })?;
-        let status = response.status();
-        // Bound the body: a hostile RPC could otherwise stream unbounded.
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| CheckerError::retryable(e.to_string()))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > MAX_RPC_BODY {
-                return Err(CheckerError::terminal(format!(
-                    "{method} response exceeded the {MAX_RPC_BODY}-byte cap"
-                )));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        if !status.is_success() {
-            return Err(if status.is_server_error() {
-                CheckerError::retryable(format!("{method} -> {status}"))
-            } else {
-                CheckerError::terminal(format!("{method} -> {status}"))
-            });
-        }
-        let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| CheckerError::terminal(format!("{method} decode: {e}")))?;
+        // JSON-RPC 2.0 envelope: errors ride in a top-level `error` field.
+        let envelope = self
+            .transport
+            .post(
+                method,
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }),
+            )
+            .await?;
         if let Some(error) = envelope.get("error") {
             return Err(CheckerError::terminal(format!(
                 "{method} rpc error: {error}"
@@ -168,7 +123,8 @@ impl Eip155Checker {
             return Err(CheckerError::terminal(format!(
                 "RPC at {} serves chain id {reported}, but the checker is configured for `{}` \
                  (chain {expected}) — refusing to validate against the wrong chain",
-                self.rpc_endpoint, self.network
+                self.transport.endpoint(),
+                self.network
             )));
         }
         self.chain_id_verified.store(true, Ordering::Relaxed);
@@ -208,7 +164,7 @@ impl ChainChecker for Eip155Checker {
     fn reference(&self) -> VerifierRef {
         VerifierRef {
             identity: None,
-            endpoint: format!("independent-chain-check:{}", self.rpc_endpoint),
+            endpoint: format!("independent-chain-check:{}", self.transport.endpoint()),
         }
     }
 

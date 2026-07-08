@@ -21,6 +21,8 @@ pub mod eip155;
 #[cfg(feature = "http-facilitator")]
 pub mod svm;
 #[cfg(feature = "http-facilitator")]
+mod transport;
+#[cfg(feature = "http-facilitator")]
 pub mod xrpl;
 
 /// Checker failure (RPC unreachable, malformed answer). Retryability is
