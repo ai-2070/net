@@ -9,20 +9,24 @@
 
 ## Summary
 
-**Status: findings recorded, none fixed yet.** The N2 native-gate path is correct and wire-compatible; the two headline concerns are both *fail-open format/scheme mismatches* in the N3a/N3b on-chain binds, and one is an attribution gap that shows N3b's "residual closed" claim overreaches. All three affected crates (`net-payments`, `net-mesh-sdk --features tool`, `net-mesh-mcp`) compile clean.
+**Status (2026-07-08): all ten items fixed on `net-payments-gap-2`,** each in its own commit with a regression test where behavior changed. Full `net-payments` suite (96 lib + all integration files, incl. eip155/svm/xrpl checker suites), the SDK `tool_serve_paid` suite, and both gate feature paths (`mesh` + `mcp-gate`) are green; `cargo clippy --lib` and `cargo doc --no-default-features` clean.
 
-| ID | Severity | Title | Verdict | Location |
-| --- | --- | --- | --- | --- |
-| N-1 | HIGH | `is_nonce_hex` demands a `0x` prefix; a bare-hex nonce silently disables the whole N3a `AuthorizationUsed` bind (fail-open) | `[CONFIRMED]` | `checker/eip155.rs:167` |
-| N-2 | MEDIUM | Reference precedence is scheme-blind: a caller-injected `payload.authorization.nonce` overrides the provider `invoiceId` bind on exact-XRPL | `[CONFIRMED]` | `engine/mod.rs:1135` |
-| N-3 | MEDIUM/LOW | `payer_edge_exists` checks edge *existence, not amount* — a zero/dust decoy edge re-opens the co-sign residual N3b claims to close | `[PLAUSIBLE]` | `checker/svm.rs:302` |
-| N-4 | LOW | eip155 nonce bind zeroes genuine settlements when `AuthorizationUsed` is emitted by an address ≠ `q.token` (proxy split / non-standard token) | `[PLAUSIBLE]` | `checker/eip155.rs:266` |
-| N-5 | CLEANUP | `EngineToolPaymentGate::redeem` is a byte-for-byte duplicate of `EnginePaymentAdmission::redeem` (two traits, one mapping) | `[CONFIRMED]` | `flow/mesh.rs:247` |
-| N-6 | CLEANUP | `Cargo.toml` comment states the wrong `AuthorizationUsed` signature (`address,address,bytes32`) on the money path | `[CONFIRMED]` | `payments/Cargo.toml:114` |
-| N-7 | CLEANUP | Dead `q.from.as_deref().unwrap_or("")` obscures the already-guaranteed non-empty-payer invariant | `[CONFIRMED]` | `checker/svm.rs:473` |
-| N-8 | CLEANUP | `payer_edge_exists` rebuilds a full-tx ATA map over all mints/owners, re-walking balances `fold_balances` already folded | `[CONFIRMED]` | `checker/svm.rs:238` |
-| N-9 | CLEANUP | `TRANSFER_TOPIC` is memorized one screen above a helper whose doc claims topics are "never a memorized constant on the money path" | `[CONFIRMED]` | `checker/eip155.rs:22` |
-| N-10 | CLEANUP | Ungated `tool_payment` module doc links to feature-gated items → broken intra-doc links under `--no-default-features` | `[CONFIRMED]` | `sdk/src/tool_payment.rs:26` |
+| ID | Severity | Title | Verdict | Status | Commit | Regression |
+| --- | --- | --- | --- | --- | --- | --- |
+| N-1 | HIGH | `is_nonce_hex` demands a `0x` prefix; a bare-hex nonce silently disables the N3a `AuthorizationUsed` bind (fail-open) | `[CONFIRMED]` | ✅ Fixed | `fa9d4665f` | `bare_hex_nonce_still_binds_to_the_authorization` |
+| N-2 | MEDIUM | Reference precedence is scheme-blind: a caller-injected `payload.authorization.nonce` overrides the provider `invoiceId` bind on exact-XRPL | `[CONFIRMED]` | ✅ Fixed | `c88f3ef38` | `an_injected_nonce_does_not_override_the_provider_invoice_off_evm` |
+| N-3 | MEDIUM/LOW | `payer_edge_exists` checks edge *existence, not amount* — a zero/dust decoy edge re-opens the co-sign residual N3b claims to close | `[PLAUSIBLE]` | ✅ Fixed | `b14e68efa` | dust-decoy row in `attribution_requires_a_payer_to_merchant_transfer_edge` |
+| N-4 | LOW | eip155 nonce bind zeroes genuine settlements when `AuthorizationUsed` is emitted by an address ≠ `q.token` (proxy split / non-standard token) | `[PLAUSIBLE]` | ✅ Documented | `8b5e754d7` | — (intended fail-closed; comment-only) |
+| N-5 | CLEANUP | `EngineToolPaymentGate::redeem` is a byte-for-byte duplicate of `EnginePaymentAdmission::redeem` (two traits, one mapping) | `[CONFIRMED]` | ✅ Fixed | `c435e6ae0` | (existing gate suites) |
+| N-6 | CLEANUP | `Cargo.toml` comment states the wrong `AuthorizationUsed` signature (`address,address,bytes32`) on the money path | `[CONFIRMED]` | ✅ Fixed | `8f5f45d8a` | — (comment-only) |
+| N-7 | CLEANUP | Dead `q.from.as_deref().unwrap_or("")` obscures the already-guaranteed non-empty-payer invariant | `[CONFIRMED]` | ✅ Fixed | `7786fa741` | (existing svm suite) |
+| N-8 | CLEANUP | `payer_edge_exists` rebuilds a full-tx ATA map over all mints/owners, re-walking balances `fold_balances` already folded | `[CONFIRMED]` | ✅ Fixed | `1fda0d180` | (existing svm suite) |
+| N-9 | CLEANUP | `TRANSFER_TOPIC` is memorized one screen above a helper whose doc claims topics are "never a memorized constant on the money path" | `[CONFIRMED]` | ✅ Fixed | `ce2ac28e8` | (existing eip155 suite) |
+| N-10 | CLEANUP | Ungated `tool_payment` module doc links to feature-gated items → broken intra-doc links under `--no-default-features` | `[CONFIRMED]` | ✅ Fixed | `2019a158a` | — (`cargo doc --no-default-features` clean) |
+
+> **N-3 note:** the fix binds attribution to *amount coverage*, not edge existence — `payer_edge_amount` sums the payer→merchant edges (`transferChecked.tokenAmount` / `transfer.amount`, missing ⇒ 0) and the delivery only counts when that sum covers the delivered delta. A zero/dust decoy edge can no longer buy attribution of a stranger-funded credit. The fixtures gained faithful per-edge amounts (the multi-ATA case its second edge). Same complicit-payer framing as before; the *reachable* half is now closed.
+
+> **N-4 note:** no behaviour change — requiring the `AuthorizationUsed` emitter to equal `q.token` is correct and fail-closed for conforming EIP-3009 tokens (proxies like USDC emit under the proxy address, which *is* the quoted asset). Relaxing the emitter would let an unrelated contract's event satisfy the bind, so the resolution is a comment stating the constraint; widen the asset registry, not the check.
 
 **Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic path; `[PLAUSIBLE]` = concrete code citation with a mechanism, trigger depends on config/adversary/token not reproduced end-to-end.
 
@@ -155,10 +159,15 @@ All three legs pass, so `total` stays the stranger-funded delta and is attribute
 
 ---
 
-## Suggested order of work
+## Order of work (executed 2026-07-08)
 
-1. **N-1** — one-line predicate fix + a bare-hex test row. Highest priority: it silently disables a money-path security bind in the fail-open direction.
-2. **N-2** — scheme-gate the nonce read (or correct the trust claim). Bounded by `consumed_transactions` but defeats a documented property.
-3. **N-3** — bind the SVM edge amount, or re-scope the N3b doc claim.
-4. **N-6 / N-7 / N-9 / N-10** — quick correctness-comment / dead-code / doc fixes.
-5. **N-4 / N-5 / N-8** — track for the network-enablement pass and the next refactor.
+All ten landed on `net-payments-gap-2` in the order below; see the Status table for commits.
+
+1. **N-1** — the one-line predicate fix + a bare-hex test row (highest priority: a fail-open on a money-path bind).
+2. **N-2** — scheme-gated the nonce read to eip155 + an off-EVM regression.
+3. **N-3** — bound the SVM edge to *amount coverage* + a dust-decoy regression + faithful fixture amounts.
+4. **N-4 / N-6** — the fail-closed emitter constraint and the `Cargo.toml` signature, comment-only.
+5. **N-5 / N-7 / N-8 / N-9** — single-sourced the engine-redeem mapping, dropped the dead payer fallback, scoped the SVM ATA map to the merchant, and computed the Transfer topic.
+6. **N-10** — de-linked the ungated `tool_payment` module doc.
+
+**Verification:** full `net-payments` suite + SDK `tool_serve_paid` + `mesh`/`mcp-gate` gate paths green; `cargo clippy --lib` and `cargo doc --no-default-features` clean.
