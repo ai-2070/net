@@ -3162,6 +3162,40 @@ class CapabilityGateway:
         structured JSON described above; never raises for a gate outcome."""
         ...
 
+    def approve_payment(self, quote_id: str) -> str:
+        """Approve a held payment quote under operator policy, resolving a
+        prior ``requires_payment_approval`` so the next :meth:`invoke`
+        redeems it. Returns
+        ``{"status":"ok","quote_id":...,"changed":bool}`` (``changed`` is
+        whether the record moved to approved). This is the **operator**
+        surface — the model-reachable :meth:`invoke` only ever *requests*
+        approval; this grants it. Requires the gateway to have been built
+        with ``payment_policy_path`` (else ``{"status":"no_payment_policy"}``)
+        and the ``payments`` build feature (else ``{"status":"unsupported"}``)."""
+        ...
+
+    def reject_payment(self, quote_id: str) -> str:
+        """Reject / remove a payment approval record. Returns
+        ``{"status":"ok","quote_id":...,"changed":bool}`` (``changed`` is
+        whether a record existed), or a structured
+        ``no_payment_policy`` / ``unsupported`` / ``error``."""
+        ...
+
+    def pending_payments(self) -> str:
+        """The quote ids awaiting approval, for a consent UX to render.
+        Returns ``{"status":"ok","pending":[quote_id, ...]}``, or a
+        structured ``no_payment_policy`` / ``unsupported`` / ``error``."""
+        ...
+
+    def spent_today(self, network: str, asset: str) -> str:
+        """Today's reserved spend total for a ``(network, x402 asset)`` pair,
+        as the canonical atomic-amount string. Returns
+        ``{"status":"ok","network":...,"asset":...,"spent":"<atomic>"}``, or a
+        structured ``no_payment_policy`` / ``unsupported`` / ``error``.
+        ``network`` / ``asset`` are the x402 wire values (e.g.
+        ``"mock:net"`` / ``"musd"``), matching the quote's requirements."""
+        ...
+
     def __repr__(self) -> str: ...
 
 class AsyncCapabilityGateway:
@@ -3215,6 +3249,22 @@ class AsyncCapabilityGateway:
 
     async def invoke(self, cap_id: str, arguments_json: str = "{}") -> str:
         """Awaitable :meth:`CapabilityGateway.invoke`."""
+        ...
+
+    async def approve_payment(self, quote_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.approve_payment`."""
+        ...
+
+    async def reject_payment(self, quote_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.reject_payment`."""
+        ...
+
+    async def pending_payments(self) -> str:
+        """Awaitable :meth:`CapabilityGateway.pending_payments`."""
+        ...
+
+    async def spent_today(self, network: str, asset: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.spent_today`."""
         ...
 
     def __repr__(self) -> str: ...

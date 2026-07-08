@@ -232,6 +232,89 @@ def test_async_gateway_accepts_payment_kwargs(mesh, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Operator approval verbs (PAYMENTS_LANGUAGE_SDKS_PLAN WS-P1): approve /
+# reject / pending / spent_today over the shared spend-policy store, so an
+# agent can resolve its own `requires_payment_approval` under operator
+# policy. The store, lock protocol, and Pending->Approved transition are
+# pinned in Rust (SpendPolicyEngine + the binding's do_* driven tests);
+# these assert the Python surface marshals the store round-trip.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def paid_gateway(mesh, tmp_path):
+    try:
+        return CapabilityGateway(
+            mesh,
+            pin_store_path=str(tmp_path / "pins.json"),
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="dev_test",
+        )
+    except ValueError as e:  # noqa: F841
+        pytest.skip("build lacks the payments feature")
+
+
+def test_approval_verbs_round_trip_on_the_shared_store(paid_gateway):
+    # Fresh store: nothing pending, nothing spent today.
+    pending = json.loads(paid_gateway.pending_payments())
+    assert pending["status"] == "ok"
+    assert pending["pending"] == []
+
+    spent = json.loads(paid_gateway.spent_today("mock:net", "musd"))
+    assert spent["status"] == "ok"
+    assert spent["spent"] == "0"
+
+    # Approve a quote id: the record moves to approved (changed), and a
+    # second approve is idempotent.
+    approved = json.loads(paid_gateway.approve_payment("q-1"))
+    assert approved["status"] == "ok"
+    assert approved["quote_id"] == "q-1"
+    assert approved["changed"] is True
+    assert json.loads(paid_gateway.approve_payment("q-1"))["changed"] is False
+
+    # Reject removes it (changed), then a second reject is a no-op.
+    assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is True
+    assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is False
+
+
+def test_approval_verbs_without_policy_path_are_structured(gateway):
+    # A gateway built without payment_policy_path can't approve anything —
+    # a structured `no_payment_policy` (payments build) / `unsupported`
+    # (feature absent), never a raised exception.
+    for raw in (
+        gateway.pending_payments(),
+        gateway.approve_payment("q"),
+        gateway.reject_payment("q"),
+        gateway.spent_today("mock:net", "musd"),
+    ):
+        parsed = json.loads(raw)
+        assert parsed["status"] in {"no_payment_policy", "unsupported"}
+
+
+def test_async_approval_verbs_round_trip(mesh, tmp_path):
+    try:
+        gw = AsyncCapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="dev_test",
+        )
+    except ValueError:
+        pytest.skip("build lacks the payments feature")
+
+    async def body():
+        approved = json.loads(await gw.approve_payment("q-async"))
+        pending = json.loads(await gw.pending_payments())
+        rejected = json.loads(await gw.reject_payment("q-async"))
+        return approved, pending, rejected
+
+    approved, pending, rejected = asyncio.run(body())
+    assert approved["status"] == "ok" and approved["changed"] is True
+    # The approved quote is not *pending* (it's approved), so the list is empty.
+    assert pending["status"] == "ok" and pending["pending"] == []
+    assert rejected["changed"] is True
+
+
+# ---------------------------------------------------------------------------
 # The settlement signer *reference* surface (P1 WS2): the payer address plus
 # a callable that signs EIP-712 typed data. The contract pinned here: the
 # pair is both-or-neither, needs the policy store, must be callable — and

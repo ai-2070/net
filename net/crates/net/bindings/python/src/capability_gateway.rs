@@ -283,6 +283,154 @@ async fn do_invoke(
 }
 
 // ---------------------------------------------------------------------------
+// Operator approval verbs — thin wrappers over `SpendPolicyEngine` on the
+// same shared spend-policy store the flow reserves against, so an agent can
+// resolve its own `requires_payment_approval` under operator policy. The
+// store, lock protocol, and Pending -> Approved transition stay in Rust
+// (doctrine #1: no logic here — these marshal a quote id / pair in and the
+// engine's typed result out as the gateway's status-JSON). Feature-split so
+// a build without `payments` (or a gateway built without
+// `payment_policy_path`) is a loud structured error, never a silent no-op.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "payments")]
+fn spend_engine(path: &str, profile: &str) -> net_payments::policy::spend::SpendPolicyEngine {
+    use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
+    let profile = match profile {
+        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
+        _ => SpendProfile::Production,
+    };
+    SpendPolicyEngine::new(path, profile)
+}
+
+/// `{"status":"no_payment_policy", ...}` — the verb needs the shared
+/// spend-policy store, and this gateway was built without
+/// `payment_policy_path`.
+#[cfg(feature = "payments")]
+fn no_policy_json() -> String {
+    err_json(
+        "no_payment_policy",
+        "no spend policy configured — construct the gateway with payment_policy_path \
+         (the machine-shared spend-policy store) to use the approval verbs",
+    )
+}
+
+#[cfg(feature = "payments")]
+async fn do_approve_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).approve(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_reject_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).reject(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_pending_payments(policy_path: Option<String>, profile: String) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).pending().await {
+        Ok(quotes) => json!({ "status": "ok", "pending": quotes }).to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_spent_today(
+    policy_path: Option<String>,
+    profile: String,
+    network: String,
+    asset: String,
+) -> String {
+    use net_payments::flow::{Clock, SystemClock};
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let now_ns = SystemClock.now_ns();
+    match spend_engine(&path, &profile)
+        .spent_today(&network, &asset, now_ns)
+        .await
+    {
+        Ok(amount) => json!({
+            "status": "ok",
+            "network": network,
+            "asset": asset,
+            "spent": amount.to_canonical_string(),
+        })
+        .to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+/// Without the `payments` build feature the approval verbs are a loud
+/// `unsupported` error, matching the construction-time payment-kwarg guard.
+#[cfg(not(feature = "payments"))]
+fn payments_unsupported_json() -> String {
+    err_json(
+        "unsupported",
+        "this build lacks the `payments` feature; the approval verbs are unavailable",
+    )
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_approve_payment(
+    _policy_path: Option<String>,
+    _profile: String,
+    _quote_id: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_reject_payment(
+    _policy_path: Option<String>,
+    _profile: String,
+    _quote_id: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_pending_payments(_policy_path: Option<String>, _profile: String) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_spent_today(
+    _policy_path: Option<String>,
+    _profile: String,
+    _network: String,
+    _asset: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+// ---------------------------------------------------------------------------
 // Construction + async bridging
 // ---------------------------------------------------------------------------
 
@@ -299,6 +447,15 @@ struct GatewayState {
     /// build feature + payment kwargs). `None` = paid capabilities fail
     /// closed at the gate, per doctrine.
     payment: Option<Arc<dyn net_mcp::serve::PaymentFlow>>,
+    /// The spend-policy store path retained from the payment kwargs, so the
+    /// operator approval verbs (approve/reject/pending/spent_today) open the
+    /// same shared store the flow reserves against. `None` = no
+    /// `payment_policy_path` was supplied; the verbs then return
+    /// `no_payment_policy`.
+    spend_policy_path: Option<String>,
+    /// The spend profile string (`"production"` / `"dev_test"`) the store
+    /// was configured with — carried so a reconstructed engine matches.
+    spend_profile: String,
     /// The mesh's own runtime — where the node's socket + timers live.
     runtime: Arc<Runtime>,
 }
@@ -384,12 +541,20 @@ impl GatewayState {
             // audits this gateway's leaf.
             gateway = gateway.with_delegation(Arc::new(DelegationSigner::new(leaf, chain_bytes)));
         }
+        // Retain the store path + profile before `build_payment_flow`
+        // consumes the config, so the approval verbs can reopen it.
+        let (spend_policy_path, spend_profile) = match &payment_config {
+            Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
+            None => (None, "production".to_string()),
+        };
         let payment = build_payment_flow(sdk_mesh, payment_config)?;
         Ok(Self {
             gateway: Arc::new(gateway),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
             payment,
+            spend_policy_path,
+            spend_profile,
             runtime,
         })
     }
@@ -667,6 +832,53 @@ impl PyCapabilityGateway {
         })
     }
 
+    /// Approve a held payment quote under operator policy, resolving a
+    /// prior `requires_payment_approval` so the next `invoke` redeems it.
+    /// Returns `{"status":"ok","quote_id":...,"changed":bool}` (`changed`
+    /// is whether the record moved to approved), or a structured
+    /// `no_payment_policy` / `error`. Operator surface — the model-reachable
+    /// `invoke` only ever *requests* approval; this grants it.
+    fn approve_payment(&self, py: Python<'_>, quote_id: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        py.detach(move || runtime.block_on(do_approve_payment(path, profile, quote_id)))
+    }
+
+    /// Reject/remove a payment approval record. Returns
+    /// `{"status":"ok","quote_id":...,"changed":bool}` (`changed` is
+    /// whether a record existed), or a structured error.
+    fn reject_payment(&self, py: Python<'_>, quote_id: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        py.detach(move || runtime.block_on(do_reject_payment(path, profile, quote_id)))
+    }
+
+    /// The quote ids awaiting approval, for a consent UX to render. Returns
+    /// `{"status":"ok","pending":[quote_id, ...]}`, or a structured error.
+    fn pending_payments(&self, py: Python<'_>) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        py.detach(move || runtime.block_on(do_pending_payments(path, profile)))
+    }
+
+    /// Today's reserved spend total for a `(network, x402 asset)` pair, as
+    /// the canonical atomic-amount string. Returns
+    /// `{"status":"ok","network":...,"asset":...,"spent":"<atomic>"}`, or a
+    /// structured error.
+    fn spent_today(&self, py: Python<'_>, network: &str, asset: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let network = network.to_string();
+        let asset = asset.to_string();
+        py.detach(move || runtime.block_on(do_spent_today(path, profile, network, asset)))
+    }
+
     fn __repr__(&self) -> String {
         self.state.repr("CapabilityGateway")
     }
@@ -784,6 +996,59 @@ impl PyAsyncCapabilityGateway {
             )
             .await
         });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.approve_payment`.
+    fn approve_payment<'py>(&self, py: Python<'py>, quote_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_approve_payment(path, profile, quote_id).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.reject_payment`.
+    fn reject_payment<'py>(&self, py: Python<'py>, quote_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_reject_payment(path, profile, quote_id).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.pending_payments`.
+    fn pending_payments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_pending_payments(path, profile).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.spent_today`.
+    fn spent_today<'py>(
+        &self,
+        py: Python<'py>,
+        network: &str,
+        asset: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let network = network.to_string();
+        let asset = asset.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_spent_today(path, profile, network, asset).await });
         spawn_bridge(py, join)
     }
 
@@ -1243,5 +1508,87 @@ mod paid_invoke_e2e {
             2,
             "the approved retry served"
         );
+    }
+}
+
+/// The operator approval verbs (WS-P1) drive `SpendPolicyEngine` over the
+/// shared spend-policy store and project its typed results to the gateway's
+/// status-JSON — the exact bodies `approve_payment` / `reject_payment` /
+/// `pending_payments` / `spent_today` wrap. No mesh, no interpreter; a plain
+/// Rust test under `--features payments`.
+#[cfg(all(test, feature = "payments"))]
+mod approval_verbs {
+    use super::*;
+
+    fn policy_path(dir: &tempfile::TempDir) -> String {
+        dir.path()
+            .join("spend-policy.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_verbs_marshal_the_spend_store_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = policy_path(&dir);
+        let profile = "dev_test".to_string();
+
+        // Fresh store: nothing pending, nothing spent today.
+        let v: Value =
+            serde_json::from_str(&do_pending_payments(Some(path.clone()), profile.clone()).await)
+                .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["pending"].as_array().expect("array").len(), 0);
+
+        let v: Value = serde_json::from_str(
+            &do_spent_today(
+                Some(path.clone()),
+                profile.clone(),
+                "mock:net".into(),
+                "musd".into(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["spent"], "0");
+
+        // Approve a quote id: the record moves to approved (changed), and a
+        // second approve is idempotent (no change).
+        let v: Value = serde_json::from_str(
+            &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["quote_id"], "q-1");
+        assert_eq!(v["changed"], true);
+        let v: Value = serde_json::from_str(
+            &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], false, "re-approve is a no-op");
+
+        // Reject removes it (changed), then a second reject is a no-op.
+        let v: Value = serde_json::from_str(
+            &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], true);
+        let v: Value = serde_json::from_str(
+            &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], false, "re-reject is a no-op");
+    }
+
+    #[tokio::test]
+    async fn the_verbs_without_a_policy_path_report_no_payment_policy() {
+        let v: Value = serde_json::from_str(&do_pending_payments(None, "production".into()).await)
+            .expect("json");
+        assert_eq!(v["status"], "no_payment_policy");
+        let v: Value =
+            serde_json::from_str(&do_approve_payment(None, "production".into(), "q".into()).await)
+                .expect("json");
+        assert_eq!(v["status"], "no_payment_policy");
     }
 }

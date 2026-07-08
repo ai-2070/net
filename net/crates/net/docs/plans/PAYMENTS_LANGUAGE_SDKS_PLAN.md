@@ -42,7 +42,7 @@ The demand-side surface every language converges on ("—" = out of scope for th
 | `requires_payment_approval {quote_id, policy_reason, approve_hint}` | ✅ | ✅ | WS-T2 | WS-G | WS-G |
 | `failure` (`net.payment.failure@1`) on denials | ✅ | ✅ | WS-T2 | WS-G | WS-G |
 | Spend-policy config (path, profile, limits) | ✅ | partial (kwargs only) | WS-T2 | WS-G | WS-G |
-| Approval verbs (`approve/reject/pending/spent_today`) | ✅ | WS-P1 | WS-T2 | WS-G | WS-G |
+| Approval verbs (`approve/reject/pending/spent_today`) | ✅ | ✅ | WS-T2 | WS-G | WS-G |
 | Outbound HTTP-402 (`fetch_paid`) | ✅ | WS-P2 | WS-T3 | deferred | deferred |
 | Signer seam: eip155 typed-data callback | ✅ | ✅ | WS-T2 | WS-G | WS-G |
 | Signer seams: svm / xrpl intents | ✅ | WS-P3 | deferred | deferred | deferred |
@@ -68,8 +68,8 @@ The reference surface exists; the work is making it *mirrorable*.
 
 Python is closest to done and unblocks Hermes. Everything lands per the binding's own rules: sync/async duals sharing `do_*` bodies (the `src/README.md` checklist governs), structured JSON-string results, loud `PyValueError` on misuse, stub + `__init__.py` re-export + drift tests.
 
-- [ ] **P0 — stub drift fix**: document the `failure` field in `_net.pyi` (emitted and Rust-tested today, absent from the stub).
-- [ ] **P1 — approval verbs**: `approve_payment(quote_id)` / `reject_payment(quote_id)` / `pending_payments()` / `spent_today(...)` on the gateway (thin wrappers over `SpendPolicyEngine` — the store, lock protocol, and Pending→Approved transition stay in Rust). Today `approve_hint` points at an API Python doesn't have; this closes the loop so an agent can resolve its own `requires_payment_approval` under operator policy.
+- [x] **P0 — stub drift fix**: documented the `failure` field (shape + branch-on-reason contract) in `_net.pyi`'s `CapabilityGateway` invoke-result docstring (the async dual defers to it).
+- [x] **P1 — approval verbs**: `approve_payment(quote_id)` / `reject_payment(quote_id)` / `pending_payments()` / `spent_today(network, asset)` on both gateway classes (sync + async duals sharing feature-split `do_*` bodies), thin wrappers over `SpendPolicyEngine` — the store, lock protocol, and Pending→Approved transition stay in Rust. Retain `payment_policy_path` + profile on the gateway to reopen the shared store; results as status-JSON (`ok` + `changed`/`pending`/`spent`, or structured `no_payment_policy` / `unsupported` / `error`). Closes the `approve_hint` loop: an agent resolves its own `requires_payment_approval` under operator policy. Rust driven tests (`--features payments`) + pytest rows (both duals) + stub entries.
 - [ ] **P2 — HTTP-402 client** (subsumes deferred N4a): `PaymentHttpClient` (+ `AsyncPaymentHttpClient`) over `X402HttpFlow::fetch_paid` — same payment kwargs as the gateway, returns the status-JSON projection of `X402HttpOutcome` (`fetched` / `paid` / `requires_payment_approval` / `denied` / `provider_refused` / `transport_error`), body as bytes. Feature-gated with `http-facilitator`.
 - [ ] **P3 — svm/xrpl signer seams**: `payment_signer_svm` / `payment_signer_xrpl` kwargs mirroring the eip155 contract (typed intent JSON in → signed artifact string out), bridged to `ExternalSvmSigner`/`ExternalXrplSigner` under the same `spawn_blocking` + `Python::attach` pattern. Absent kwarg = that namespace is skipped at selection (existing Rust semantics, no new policy).
 - [ ] Tests: pytest rows per verb (both duals), the no-key-material negative test extended to the new signers, stub-coverage tests pick up the new classes automatically.
