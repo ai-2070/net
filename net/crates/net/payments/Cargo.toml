@@ -56,7 +56,7 @@ hex = "0.4"
 # exact-XRPL invoice binding: InvoiceID = SHA256(invoiceId) (pinned t54
 # scheme). Already in the workspace tree via ed25519-dalek — no new
 # supply chain; a named money-path dependency all the same.
-sha2 = "0.10"
+sha2 = "0.11"
 # Cross-process advisory lock + per-user path resolution for the
 # payment policy store — the exact `sdk/src/pins.rs` regime.
 fs2 = "0.4"
