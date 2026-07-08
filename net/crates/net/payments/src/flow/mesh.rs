@@ -249,16 +249,8 @@ impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), String> {
-        match self
-            .engine
-            .redeem_for_invocation(tool_id, quote_id, binding)
-            .await
-        {
-            Ok(crate::engine::RedeemDecision::Admitted) => Ok(()),
-            Ok(crate::engine::RedeemDecision::Denied { reason }) => Err(reason),
-            // Engine/store failure is fail-closed: never serve on an
-            // unverifiable payment.
-            Err(e) => Err(format!("payment engine unavailable (fail-closed): {e}")),
-        }
+        // Single-sourced with the MCP gate (`mcp_gate::EnginePaymentAdmission`)
+        // so the fail-closed mapping cannot drift — see `flow::redeem_via_engine`.
+        crate::flow::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
     }
 }
