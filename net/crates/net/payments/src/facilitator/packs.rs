@@ -49,6 +49,15 @@ pub const RPC_BASE: &str = "https://mainnet.base.org";
 /// Heavily rate-limited — fine for conformance shapes; production
 /// operators supply their own endpoint in the pack.
 pub const RPC_SOLANA: &str = "https://api.mainnet-beta.solana.com";
+/// The t54 XRPL facilitator (no API keys per its docs — see the
+/// enablement plan's WS-0 pin; the base path is re-verified by the
+/// load-time `/supported` gate and the rung's live run).
+pub const T54_XRPL_FACILITATOR: &str = "https://xrpl-x402.t54.ai";
+/// XRPL mainnet (CAIP-2, pinned-doc convention — unratified upstream).
+pub const NETWORK_XRPL: &str = "xrpl:0";
+/// Public rippled JSON-RPC cluster, for the independent chain checker.
+/// Rate-limited; production operators supply their own endpoint.
+pub const RPC_XRPL: &str = "https://xrplcluster.com";
 
 /// `final`-tier confirmation depth for Base (an OP-stack L2). A dozen L2
 /// blocks (~24s) is *not* L1-backed finality — L2 blocks stay reversible
@@ -136,6 +145,33 @@ pub fn cdp_solana_mainnet(secret_ref: impl Into<String>) -> FacilitatorConfig {
     }
 }
 
+/// Rung 4 — XRPL mainnet via the t54 facilitator, **Mode A: XRP-only**
+/// (RLUSD waits on the IOU amount-domain review — see
+/// `PAYMENTS_XRPL_ENABLEMENT_PLAN.md`). Settleable through the
+/// exact-XRPL seam (`SchemeSigner::sign_xrpl_payment` /
+/// [`ExternalXrplSigner`](crate::flow::signer::ExternalXrplSigner) —
+/// the wallet presigns; without one, accepts[] entries on this network
+/// are honestly refused at selection). Independently checkable via
+/// [`XrplChecker`](crate::checker::xrpl::XrplChecker), so the pack
+/// serves at `confirmed(1)` — satisfied by the checker's deterministic
+/// `Final` (a validated XRPL ledger; the adapter never emits
+/// `Confirmed(n)` and `final_depth` is deliberately absent). t54 is
+/// unauthenticated per its docs (the x402.org posture): no secret ref.
+pub fn t54_xrpl_mainnet() -> FacilitatorConfig {
+    FacilitatorConfig {
+        object: TAG_FACILITATOR_CONFIG.to_string(),
+        endpoint: T54_XRPL_FACILITATOR.to_string(),
+        auth: AuthConfig::None,
+        pairs: vec![SchemePair {
+            scheme: "exact".to_string(),
+            network: NETWORK_XRPL.to_string(),
+        }],
+        rpc_endpoints: BTreeMap::from([(NETWORK_XRPL.to_string(), RPC_XRPL.to_string())]),
+        required_tier: BTreeMap::from([(NETWORK_XRPL.to_string(), VerificationTier::Confirmed(1))]),
+        final_depth: BTreeMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +184,7 @@ mod tests {
             x402_org_base_sepolia(),
             cdp_base_mainnet("cdp-api-key"),
             cdp_solana_mainnet("cdp-api-key"),
+            t54_xrpl_mainnet(),
         ]
     }
 
@@ -242,5 +279,16 @@ mod tests {
         // Deterministic finality: the depth knob is deliberately absent
         // (the SVM checker ignores it either way).
         assert_eq!(solana.final_depth(NETWORK_SOLANA), None);
+
+        // XRPL: same deterministic-finality posture as Solana, open auth
+        // like x402.org (t54 is no-API-keys per its pinned docs).
+        let xrpl = t54_xrpl_mainnet();
+        assert_eq!(xrpl.auth, AuthConfig::None);
+        assert_eq!(
+            xrpl.required_tier(NETWORK_XRPL),
+            VerificationTier::Confirmed(1)
+        );
+        assert!(xrpl.rpc_endpoints.contains_key(NETWORK_XRPL));
+        assert_eq!(xrpl.final_depth(NETWORK_XRPL), None);
     }
 }

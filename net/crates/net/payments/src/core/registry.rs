@@ -164,7 +164,7 @@ pub struct RegistryRef {
 
 /// The P1 default registry: the mock asset plus the survey-verified real
 /// networks — Base Sepolia (the conformance target), Base (the first
-/// real-money target), and Solana SPL-USDC. Network enablement is
+/// real-money target), Solana SPL-USDC, and XRP (XRPL rung, Mode A). Network enablement is
 /// registry entries + facilitator config, never code; participants pin
 /// or override this default.
 pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
@@ -202,6 +202,20 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             decimals: 6,
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Solana SPL)".to_string()),
+            equivalence_class: None,
+        },
+        // XRPL rung, Mode A (XRP-only — RLUSD waits on the IOU
+        // amount-domain review; see PAYMENTS_XRPL_ENABLEMENT_PLAN.md).
+        // The CAIP-2 `xrpl:0` reference is the pinned-doc convention
+        // (unratified upstream), bound through this signed registry
+        // revision. Amounts are drops: 6 decimals, integer grammar.
+        AssetEntry {
+            id: AssetId::parse("xrpl:0/slip44:144")
+                .unwrap_or_else(|_| unreachable!("static xrpl XRP id is valid CAIP-19")),
+            x402_asset: "XRP".to_string(),
+            decimals: 6,
+            symbol: "XRP".to_string(),
+            display_name: Some("XRP (XRP Ledger)".to_string()),
             equivalence_class: None,
         },
     ]);
