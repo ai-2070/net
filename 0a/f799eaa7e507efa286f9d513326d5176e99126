@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/PAYMENTS_XRPL_ENABLEMENT_PLAN.md
+  s_2ce1bbf7d954a5::t_f74228483440a0 18,64-65,75-76,98-103,106-107,113-114,123-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0af799eaa7e507efa286f9d513326d5176e99126",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
