@@ -12,8 +12,9 @@ use net_payments::checker::svm::SvmChecker;
 use net_payments::checker::{ChainChecker, ChainVerdict, TransferQuery};
 use net_payments::core::verification::VerificationTier;
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+
+mod rpc_fixture;
+use rpc_fixture::HttpJsonServer;
 
 const NETWORK: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 /// The full genesis hash the fixture reports — its first 32 characters
@@ -35,78 +36,24 @@ struct RpcFixture {
 
 impl RpcFixture {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let genesis = Arc::new(parking_lot::Mutex::new(Value::String(GENESIS.to_string())));
         let status = Arc::new(parking_lot::Mutex::new(Value::Null));
         let transaction = Arc::new(parking_lot::Mutex::new(Value::Null));
-        let genesis_task = genesis.clone();
-        let status_task = status.clone();
-        let tx_task = transaction.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let genesis = genesis_task.clone();
-                let status = status_task.clone();
-                let transaction = tx_task.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut tmp = [0u8; 4096];
-                    let header_end = loop {
-                        let Ok(n) = stream.read(&mut tmp).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break pos + 4;
-                        }
-                    };
-                    let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                    let content_length: usize = head_text
-                        .lines()
-                        .filter_map(|l| l.split_once(':'))
-                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                        .and_then(|(_, v)| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    let mut body = buf[header_end..].to_vec();
-                    while body.len() < content_length {
-                        let Ok(n) = stream.read(&mut tmp).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        body.extend_from_slice(&tmp[..n]);
-                    }
-                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    let result = match request["method"].as_str() {
-                        Some("getGenesisHash") => genesis.lock().clone(),
-                        Some("getSignatureStatuses") => {
-                            json!({ "context": { "slot": 100 }, "value": [status.lock().clone()] })
-                        }
-                        Some("getTransaction") => transaction.lock().clone(),
-                        _ => Value::Null,
-                    };
-                    let response =
-                        json!({ "jsonrpc": "2.0", "id": request["id"], "result": result })
-                            .to_string();
-                    let head_out = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        response.len()
-                    );
-                    let _ = stream.write_all(head_out.as_bytes()).await;
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
+        let (genesis_r, status_r, tx_r) = (genesis.clone(), status.clone(), transaction.clone());
+        let server = HttpJsonServer::start(move |request| {
+            let result = match request["method"].as_str() {
+                Some("getGenesisHash") => genesis_r.lock().clone(),
+                Some("getSignatureStatuses") => {
+                    json!({ "context": { "slot": 100 }, "value": [status_r.lock().clone()] })
+                }
+                Some("getTransaction") => tx_r.lock().clone(),
+                _ => Value::Null,
+            };
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result })
+        })
+        .await;
         Self {
-            endpoint,
+            endpoint: server.endpoint,
             genesis,
             status,
             transaction,

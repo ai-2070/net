@@ -10,8 +10,9 @@ use net_payments::checker::eip155::Eip155Checker;
 use net_payments::checker::{ChainChecker, ChainVerdict, TransferQuery};
 use net_payments::core::verification::VerificationTier;
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+
+mod rpc_fixture;
+use rpc_fixture::HttpJsonServer;
 
 const TX: &str = "0x1d31c8c8c283f9e5a766a4363b3cd6d34ef2ec89bcbf4b3c1c9b338d9e05d10f";
 const TOKEN: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -28,77 +29,23 @@ struct RpcFixture {
 
 impl RpcFixture {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let receipt = Arc::new(parking_lot::Mutex::new(Value::Null));
         let head = Arc::new(parking_lot::Mutex::new(100u64));
         // Default to Base Sepolia (84532), matching the tests' CAIP-2.
         let chain_id = Arc::new(parking_lot::Mutex::new(84_532u64));
-        let receipt_task = receipt.clone();
-        let head_task = head.clone();
-        let chain_id_task = chain_id.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let receipt = receipt_task.clone();
-                let head = head_task.clone();
-                let chain_id = chain_id_task.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut tmp = [0u8; 2048];
-                    let header_end = loop {
-                        let Ok(n) = stream.read(&mut tmp).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break pos + 4;
-                        }
-                    };
-                    let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                    let content_length: usize = head_text
-                        .lines()
-                        .filter_map(|l| l.split_once(':'))
-                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                        .and_then(|(_, v)| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    let mut body = buf[header_end..].to_vec();
-                    while body.len() < content_length {
-                        let Ok(n) = stream.read(&mut tmp).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        body.extend_from_slice(&tmp[..n]);
-                    }
-                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    let result = match request["method"].as_str() {
-                        Some("eth_getTransactionReceipt") => receipt.lock().clone(),
-                        Some("eth_blockNumber") => json!(format!("0x{:x}", *head.lock())),
-                        Some("eth_chainId") => json!(format!("0x{:x}", *chain_id.lock())),
-                        _ => Value::Null,
-                    };
-                    let response =
-                        json!({ "jsonrpc": "2.0", "id": request["id"], "result": result })
-                            .to_string();
-                    let head_out = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        response.len()
-                    );
-                    let _ = stream.write_all(head_out.as_bytes()).await;
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
+        let (receipt_r, head_r, chain_id_r) = (receipt.clone(), head.clone(), chain_id.clone());
+        let server = HttpJsonServer::start(move |request| {
+            let result = match request["method"].as_str() {
+                Some("eth_getTransactionReceipt") => receipt_r.lock().clone(),
+                Some("eth_blockNumber") => json!(format!("0x{:x}", *head_r.lock())),
+                Some("eth_chainId") => json!(format!("0x{:x}", *chain_id_r.lock())),
+                _ => Value::Null,
+            };
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result })
+        })
+        .await;
         Self {
-            endpoint,
+            endpoint: server.endpoint,
             receipt,
             head,
             chain_id,
