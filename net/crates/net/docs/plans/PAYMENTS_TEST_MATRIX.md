@@ -50,7 +50,7 @@
 
 | Serving path | Free | Priced + gate | Priced, no gate | Replay | Wrong tool |
 |---|---|---|---|---|---|
-| MCP wrap (`publish_server`) | ✅ `wrap_end_to_end::wrap_discover_and_invoke_across_two_nodes` | **M2** | ✅ publish-time guards (1B) | **M2** | **M2** |
+| MCP wrap (`publish_tools`/`publish_server`) | ✅ `wrap_end_to_end::wrap_discover_and_invoke_across_two_nodes` | ✅ `mcp_wrap_paid_e2e::a_wrapped_paid_tool_serves_once_and_only_once_across_the_mesh` (M2, real admission) | ✅ publish-time guards (1B) | ✅ M2 | ✅ M2 |
 | `publish_tools` native | ✅ | ✅ `publish_tools_end_to_end::a_priced_local_tool_enforces_payment_before_the_invoker` + `…::a_refreshed_priced_local_tool_still_enforces_payment` *(scripted gate)* | ✅ 1B guards | ✅ real gate over the wire (M1) | ✅ real gate over the wire (M1) |
 | raw `serve_tool` | ✅ | ❌ refused by design (1B) | ✅ refused | n/a | n/a |
 | `serve_tool_paid` | n/a | ✅ `tool_serve_paid::a_paid_native_tool_redeems_before_the_handler_runs` *(scripted gate)*; real engine gate over the wire: `mesh_paid_capability_e2e` (M1); in-process: `native_tool_gate` | ✅ `MissingPricingTerms` | ✅ M1 + in-process | ✅ M1 + in-process |
@@ -105,11 +105,11 @@ CI home for any of this: **none today** → M4.
 
 **Acceptance:** the brainstorm's ten-step flow in one fn, green in the per-push suite. ✅ — passes in 0.15s; the full payments suite is 211 (was 208).
 
-### M2 — MCP wrap path: paid invoke with the real admission
+### M2 — MCP wrap path: paid invoke with the real admission — ✅ LANDED
 
-- [ ] Wrap-path paid invoke end-to-end with `EnginePaymentAdmission` (not `AdmitAllPayments`): unpaid deny, paid serve, replay deny, wrong-tool deny — over two nodes. Home: `payments/tests/` behind `mcp-gate` (+`mesh`) — the dependency direction makes payments the composition point (`mcp_gate_composition` precedent), avoiding a dev-dep cycle in `net-mesh-mcp`.
+- [x] Wrap-path paid invoke end-to-end with `EnginePaymentAdmission` (not `AdmitAllPayments`): unpaid deny, paid serve, replay deny, wrong-tool deny — over two nodes. Landed as `payments/tests/mcp_wrap_paid_e2e.rs::a_wrapped_paid_tool_serves_once_and_only_once_across_the_mesh` (features `mesh` + `mcp-gate`), the MCP-adapter twin of M1: it drives `ServerPublisher::publish_tools` (two priced tools) + `WrapInvokeHandler` against the real `EnginePaymentAdmission`, paying a real quote through `CallerPaymentFlow` and invoking the wrapped tool over the wire. Home is `payments/tests/` because payments depends on `net-mcp` (mcp-gate) while `net-mcp` must not depend on payments — so the composition can only live here. Build note: RPC routing is by node-id + service name (`publish_tools().await` registers the handler synchronously), so no capability-fold discovery wait is needed; the invoke-retry loop covers only the reply-channel race.
 
-**Acceptance:** the MCP-wrap row of the Tier-2 matrix flips to ✅ with engine receipts.
+**Acceptance:** the MCP-wrap row of the Tier-2 matrix flips to ✅ with engine receipts. ✅ — passes in 0.12s; full payments suite 212 (was 211).
 
 ### M3 — Python gateway: a driven paid invoke
 
