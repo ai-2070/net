@@ -66,7 +66,20 @@ default `1000` = 0.001 USDC).
 **Exit criterion:** all four green in one run; record the settlement
 transaction hash and the printed verification chain here.
 
-- [ ] Run recorded: `tx: ____` · chain: `____` · date: `____`
+**Keyless half executed 2026-07-08** (rungs 1a + 1b, no key required):
+`GET /supported` live — 10 kinds offered including the pinned
+`v2 (exact, eip155:84532)`; the shipped pack passed its load-time gate
+against the live facilitator. Recorded intelligence from the live
+response: x402.org now also advertises `upto` and `batch-settlement` on
+Base Sepolia and `exact` on solana-devnet / algorand / aptos / stellar /
+hedera testnets — the `upto` facilitator-kind leg of the scheme-readiness
+entry criteria (`x402/schemes/mod.rs`) is now live upstream; the pinned-
+spec and amount-policy-review legs still gate it. Remaining for the exit
+criterion: **1c + 1d need `NET_PAYMENTS_LIVE_EVM_KEY`** (testnet-only
+key, Circle-faucet USDC; 1d additionally `NET_PAYMENTS_LIVE_SETTLE=1`) —
+the operator's step, commands in the runbook above.
+
+- [ ] Run recorded (1c+1d): `tx: ____` · chain: `____` · date: `____` · 1a+1b: **2026-07-08 ✅**
 
 ## Rung 2 — Base mainnet (CDP facilitator) · **pack shipped, blocked on rung 1 + credentials**
 
