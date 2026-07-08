@@ -147,7 +147,7 @@ Basis:
   load-time `/supported` gate catches drift loudly, but ToS/auth terms are
   out of band).
 
-- [ ] xrpl seam: `____` · registry entries: `____` · t54 conformance: `____`
+- [x] xrpl seam: **landed 2026-07-08** (`e84641717`, checker `ed461db2c`) · registry entries: **XRP-only, Mode A** (`b66122560`) · t54 conformance: **fixture suite ✅ / live run env-gated, pending at enablement**
 
 Enablement plan: `PAYMENTS_XRPL_ENABLEMENT_PLAN.md` (gate-shaped — its WS-0
 is this rung's spec-pin gate; WS-1..4 instantiate the P2 seam inventory,
