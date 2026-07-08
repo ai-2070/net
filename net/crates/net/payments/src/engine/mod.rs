@@ -205,6 +205,24 @@ impl RedeemDenialReason {
             Self::AlreadyRedeemed => "already_redeemed",
         }
     }
+
+    /// The redaction-safe rendering for the schematic's `message` field.
+    /// Identical to `Display` for every reason whose text is built only
+    /// from typed fields — but `QuoteFrozen`'s `Display` interpolates the
+    /// free-form `freeze_reason` (provider- and facilitator-supplied
+    /// invalidation text), which must not ride the structured header per
+    /// the schematic's redaction contract. That text stays on the human
+    /// error body (`Display`) alone; the schematic carries a generic
+    /// frozen message. When typed freeze subreasons land
+    /// (`quote_frozen_replay | _wrong_chain | _reorg | _amount`), the
+    /// schematic's `reason` narrows and this generic message is replaced
+    /// by the typed rendering.
+    pub fn schematic_message(&self) -> String {
+        match self {
+            Self::QuoteFrozen { .. } => "quote is frozen — nothing serves against it".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// The provider-side invocation gate's verdict

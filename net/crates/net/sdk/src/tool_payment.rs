@@ -227,8 +227,12 @@ pub struct FailureSchematic {
     /// The specific verdict, snake_case. Additive within `@1`;
     /// consumers must tolerate reasons they don't know.
     pub reason: String,
-    /// The human message — same string as the error body, capped at
-    /// [`MAX_SCHEMATIC_MESSAGE_BYTES`] (the body carries it in full).
+    /// The human message — the same string as the error body in the
+    /// common case, capped at [`MAX_SCHEMATIC_MESSAGE_BYTES`] (the body
+    /// carries it in full). Where the body embeds free-form provider- or
+    /// facilitator-supplied text (e.g. a freeze reason), this copy is the
+    /// redaction-safe rendering instead — built only from typed fields,
+    /// per the object's redaction contract.
     pub message: String,
     /// Coarse verdict: may retrying the operation succeed without
     /// changing configuration or user/operator state?
