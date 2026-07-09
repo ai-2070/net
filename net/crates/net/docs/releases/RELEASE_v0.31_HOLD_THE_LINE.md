@@ -2,7 +2,7 @@
 
 *Named after Toto's 1978 debut single — David Paich's piano hook, Steve Lukather's guitar, Bobby Kimball's belt, the AOR staple whose chorus insists "hold the line, love isn't always on time."*
 
-v0.31 is a **boundaries** release. Money, tools, and machine identity all start crossing between machines this cycle — a capability priced and paid across the mesh, a host's tools bridged onto it, a device enrolled into someone's fleet — and every one of those crossings defines a line something must *not* cross back over: a signing key, a credential, an unpaid invocation, a revoked consent, a settlement counted twice, a reorg'd block that already served. The codename is the design brief. Every default here is chosen so the line holds when the other side is hostile, lossy, reorging, or simply — *love isn't always on time* — slow.
+v0.31 is a major release. Money, tools, and machine identity all start crossing between machines this cycle — a capability priced and paid across the mesh, a host's tools bridged onto it, a device enrolled into someone's fleet — and every one of those crossings defines a line something must *not* cross back over: a signing key, a credential, an unpaid invocation, a revoked consent, a settlement counted twice, a reorg'd block that already served.
 
 Four tracks land:
 
