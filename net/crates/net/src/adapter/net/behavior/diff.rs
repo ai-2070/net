@@ -605,7 +605,7 @@ impl DiffEngine {
             new.iter().map(|m| (m.model_id.as_str(), m)).collect();
 
         // Removed models
-        for (id, _) in old_map.iter() {
+        for id in old_map.keys() {
             if !new_map.contains_key(id) {
                 ops.push(DiffOp::RemoveModel((*id).to_string()));
             }
@@ -664,7 +664,7 @@ impl DiffEngine {
             new.iter().map(|t| (t.tool_id.as_str(), t)).collect();
 
         // Removed tools
-        for (id, _) in old_map.iter() {
+        for id in old_map.keys() {
             if !new_map.contains_key(id) {
                 ops.push(DiffOp::RemoveTool((*id).to_string()));
             }
@@ -714,7 +714,7 @@ impl DiffEngine {
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
 
-        for (name, _) in old_runtimes.iter() {
+        for name in old_runtimes.keys() {
             if !new_runtimes.contains_key(name) {
                 ops.push(DiffOp::RemoveRuntime((*name).to_string()));
             }
@@ -740,7 +740,7 @@ impl DiffEngine {
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
 
-        for (name, _) in old_frameworks.iter() {
+        for name in old_frameworks.keys() {
             if !new_frameworks.contains_key(name) {
                 ops.push(DiffOp::RemoveFramework((*name).to_string()));
             }
