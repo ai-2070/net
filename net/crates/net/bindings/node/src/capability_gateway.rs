@@ -30,6 +30,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::{Function, Promise};
 use napi::{Error, Result};
 use napi_derive::napi;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 // The gateway trait's `search`/`describe` are methods on `MeshGateway`; bring
@@ -440,23 +441,62 @@ async fn do_spent_today(
 /// keep consent in-memory (every gated capability then always requires
 /// approval). Every method resolves to a status-JSON string and never rejects
 /// for a gate outcome.
+/// The node-holding handles — both the gateway (via `SdkMesh`) and the payment
+/// flow (via `MeshPaymentChannel` → `SdkMesh`) retain a clone of the mesh node.
+/// [`close`](CapabilityGateway::close) drops them so a JS caller can
+/// deterministically release the node before `NetMesh.shutdown()`.
+struct Live {
+    gateway: Arc<MeshGateway>,
+    /// The caller-side payment flow for paid capabilities. `None` = paid
+    /// capabilities fail closed at the gate, per doctrine.
+    payment: Option<Arc<dyn PaymentFlow>>,
+}
+
 #[napi]
 pub struct CapabilityGateway {
-    gateway: Arc<MeshGateway>,
+    /// The node-holding handles, behind a lock so `close()` can drop them (and
+    /// the retained mesh-node reference) from any thread while methods clone
+    /// out. `None` once closed — a `#[napi]` class is GC-finalized, not
+    /// scope-dropped, so without an explicit release the node clone would keep
+    /// `NetMesh.shutdown()` (which needs sole ownership) failing until GC ran.
+    live: Mutex<Option<Live>>,
     /// Config allowlist + in-memory pins. Empty in this first cut — the shared
-    /// pin store is the source of approvals.
+    /// pin store is the source of approvals. Holds no node reference.
     consent: Arc<ConsentPolicy>,
     /// The machine-shared pin store path, reloaded fresh per call.
     pin_store_path: Option<PathBuf>,
-    /// The caller-side payment flow for paid capabilities (mock-network ready;
-    /// real-network signers are a follow-up). `None` = paid capabilities fail
-    /// closed at the gate, per doctrine.
-    payment: Option<Arc<dyn PaymentFlow>>,
     /// The spend-policy store path + profile, retained so the operator approval
     /// verbs reopen the same store the flow reserves against. `None` path =
     /// no `paymentPolicyPath` supplied; the verbs return `no_payment_policy`.
+    /// Independent of the node, so the verbs keep working after `close()`.
     spend_policy_path: Option<String>,
     spend_profile: String,
+}
+
+/// The live handles cloned out of the lock for one call — the gateway plus the
+/// optional payment flow.
+type LiveHandles = (Arc<MeshGateway>, Option<Arc<dyn PaymentFlow>>);
+
+impl CapabilityGateway {
+    /// Clone the live handles out from behind the lock (so no guard crosses an
+    /// `await`). `None` once [`close`](Self::close) has run.
+    fn live_handles(&self) -> Option<LiveHandles> {
+        self.live
+            .lock()
+            .as_ref()
+            .map(|l| (l.gateway.clone(), l.payment.clone()))
+    }
+}
+
+/// The structured result every live-path method resolves to once the gateway
+/// has been closed — a status, never a throw (consistent with the gate
+/// outcomes).
+fn closed_json() -> String {
+    err_json(
+        "closed",
+        "gateway has been closed — construct a new one (close() releases the \
+         mesh node so NetMesh.shutdown() can run)",
+    )
 }
 
 #[napi]
@@ -532,13 +572,28 @@ impl CapabilityGateway {
         let payment = build_payment_flow(sdk_mesh.clone(), config, signers)?;
 
         Ok(Self {
-            gateway: Arc::new(MeshGateway::new(sdk_mesh)),
+            live: Mutex::new(Some(Live {
+                gateway: Arc::new(MeshGateway::new(sdk_mesh)),
+                payment,
+            })),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
-            payment,
             spend_policy_path,
             spend_profile,
         })
+    }
+
+    /// Release the internal mesh-node reference so the underlying `NetMesh` can
+    /// be `shutdown()` deterministically. A `#[napi]` class is GC-finalized, not
+    /// scope-dropped, so without this the gateway's retained node clone keeps
+    /// `NetMesh.shutdown()` (which needs sole ownership of the node) failing
+    /// until GC runs. Call it before `mesh.shutdown()`. Idempotent; after
+    /// `close()`, `search` / `describe` / `invoke` resolve to a structured
+    /// `closed` status (never a throw). The operator approval verbs still work —
+    /// they reopen the spend-policy store, independent of the node.
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.live.lock().take();
     }
 
     /// The machine-shared pin store path this gateway consults, if any.
@@ -555,7 +610,9 @@ impl CapabilityGateway {
     /// An empty index is `ok` with an empty list — never an error.
     #[napi]
     pub async fn search(&self, query: String) -> Result<String> {
-        let gateway = self.gateway.clone();
+        let Some((gateway, _payment)) = self.live_handles() else {
+            return Ok(closed_json());
+        };
         let consent = self.consent.clone();
         let pin_path = self.pin_store_path.clone();
         Ok(do_search(&gateway, &consent, &pin_path, &query).await)
@@ -570,7 +627,9 @@ impl CapabilityGateway {
             Ok(id) => id,
             Err(e) => return Ok(err_json("invalid_capability_id", e)),
         };
-        let gateway = self.gateway.clone();
+        let Some((gateway, _payment)) = self.live_handles() else {
+            return Ok(closed_json());
+        };
         let consent = self.consent.clone();
         let pin_path = self.pin_store_path.clone();
         Ok(do_describe(&gateway, &consent, &pin_path, id).await)
@@ -600,10 +659,20 @@ impl CapabilityGateway {
                 ))
             }
         };
-        let gateway = self.gateway.clone();
+        // The documented contract is a JSON *object*. A non-object (`null`,
+        // `[]`, `true`, `"..."`) parses but isn't a valid argument shape — a
+        // caller-shape error, not something to forward to the gate.
+        if !args.is_object() {
+            return Ok(err_json(
+                "invalid_arguments",
+                "arguments must be a JSON object",
+            ));
+        }
+        let Some((gateway, payment)) = self.live_handles() else {
+            return Ok(closed_json());
+        };
         let consent = self.consent.clone();
         let pin_path = self.pin_store_path.clone();
-        let payment = self.payment.clone();
         Ok(do_invoke(&gateway, &consent, &pin_path, payment.as_deref(), id, args).await)
     }
 
@@ -694,6 +763,15 @@ mod tests {
             .unwrap();
         assert_eq!(c.profile, "production");
         assert!(!c.unsafe_mock_auto_allow);
+    }
+
+    #[test]
+    fn closed_projection_is_a_structured_status() {
+        // The live-path methods resolve to this after `close()` — a status,
+        // never a throw.
+        let v: Value = serde_json::from_str(&closed_json()).expect("json");
+        assert_eq!(v["status"], "closed");
+        assert!(v["error"].as_str().unwrap().contains("closed"));
     }
 
     #[test]

@@ -111,6 +111,7 @@ mod provider {
 
     use napi::bindgen_prelude::*;
     use napi_derive::napi;
+    use parking_lot::Mutex;
 
     use net::adapter::net::MeshNode;
     use net_mcp::spec::Implementation;
@@ -136,16 +137,28 @@ mod provider {
     /// the provider to keep the wire served.
     ///
     /// Construct with `new PaymentProvider(mesh, statePath, billingLogPath?)`.
+    /// The node-holding state — the mesh node the provider serves over, plus the
+    /// serve handle keeping the quote/pay services registered on it.
+    /// [`close`](PaymentProvider::close) drops both so the node can be released.
+    struct Serving {
+        node: Arc<MeshNode>,
+        /// Keeps the `net.payments.quote/pay` services registered on the node.
+        _serve: PaymentServeHandle,
+    }
+
     #[napi]
     pub struct PaymentProvider {
         engine: Arc<PaymentEngine>,
-        node: Arc<MeshNode>,
         provider_entity_id: Vec<u8>,
         /// The billing stream, when a `billingLogPath` was supplied — for the
-        /// read-only `readBilling` surface.
+        /// read-only `readBilling` surface. Holds no node reference.
         billing: Option<Arc<BillingLog>>,
-        /// Keeps the `net.payments.quote/pay` services registered on the node.
-        _serve: PaymentServeHandle,
+        /// The node + serve handle, behind a lock so `close()` can drop them
+        /// (releasing the node clone + unregistering the quote/pay wire). `None`
+        /// once closed — a `#[napi]` class is GC-finalized, not scope-dropped,
+        /// so without an explicit release the retained node clone would keep
+        /// `NetMesh.shutdown()` (which needs sole ownership) failing until GC ran.
+        serving: Mutex<Option<Serving>>,
     }
 
     #[napi]
@@ -199,11 +212,24 @@ mod provider {
 
             Ok(Self {
                 engine,
-                node,
                 provider_entity_id,
                 billing,
-                _serve: serve,
+                serving: Mutex::new(Some(Serving {
+                    node,
+                    _serve: serve,
+                })),
             })
+        }
+
+        /// Release the mesh node + tear down the quote/pay wire so the underlying
+        /// `NetMesh` can be `shutdown()` deterministically (a `#[napi]` class is
+        /// GC-finalized, not scope-dropped). Call it — plus `stop()`/`withdraw()`
+        /// on any handles from `publishPaidTools` — before `mesh.shutdown()`.
+        /// Idempotent; after `close()`, `publishPaidTools` throws. `readBilling`
+        /// + `providerEntityId` still work (they hold no node reference).
+        #[napi]
+        pub fn close(&self) {
+            let _ = self.serving.lock().take();
         }
 
         /// The node's 32-byte mesh entity id — the provider identity these tools
@@ -280,7 +306,13 @@ mod provider {
             let invoker = build_tool_invoker(handler, opts.handler_timeout_ms)?;
             let pricing: BTreeMap<String, String> = pricing.into_iter().collect();
             let engine = self.engine.clone();
-            let node = self.node.clone();
+            // Clone the live node out from behind the lock (no guard crosses the
+            // future). Closed → nothing to serve over.
+            let Some(node) = self.serving.lock().as_ref().map(|s| s.node.clone()) else {
+                return Err(Error::from_reason(
+                    "payment provider has been closed — construct a new one to publish",
+                ));
+            };
 
             env.spawn_future(async move {
                 let mesh = Arc::new(mesh_over(node));

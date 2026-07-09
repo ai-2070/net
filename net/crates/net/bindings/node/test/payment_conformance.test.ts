@@ -110,6 +110,9 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       permissiveChannels: true,
     })
     let pubHandle: any
+    let pp: any
+    let gw: any
+    let gwNoPay: any
     try {
       // Handshake (caller dials provider) BEFORE start, then start both.
       await handshake(caller, provider)
@@ -117,7 +120,7 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       caller.start()
 
       // Provider prices + serves an echo tool, admitting remote callers.
-      const pp = new PaymentProvider(provider, tmp('prov.state'))
+      pp = new PaymentProvider(provider, tmp('prov.state'))
       const terms = buildPricingTerms(pp.providerEntityId, 'prov/echo', MOCK_REQS)
       pubHandle = await pp.publishPaidTools(
         [ECHO],
@@ -130,7 +133,7 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       expect(pubHandle.serving).toBe(true)
 
       // Caller discovers the priced capability over the mesh.
-      const gw = new CapabilityGateway(caller, null, tmp('caller.policy'), 'production')
+      gw = new CapabilityGateway(caller, null, tmp('caller.policy'), 'production')
       const capId = await discover(gw, 'echo')
 
       // 1) First invoke — Production holds the mock spend for operator approval.
@@ -152,12 +155,17 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       // 4) A caller with NO payment flow: the paid tool is a structured denial
       //    carrying the provider's `net.payment.failure@1` schematic (reason),
       //    never a throw.
-      const gwNoPay = new CapabilityGateway(caller, null)
+      gwNoPay = new CapabilityGateway(caller, null)
       const denied = await invokeUntil(gwNoPay, capId, { message: 'hi' }, ['denied'])
       expect(denied.status).toBe('denied')
       expect(denied.failure?.reason).toBeDefined()
     } finally {
+      // Release every retained node reference (a napi class is GC-finalized,
+      // not scope-dropped) so both shutdowns can run deterministically.
       if (pubHandle) pubHandle.stop()
+      if (gw) gw.close()
+      if (gwNoPay) gwNoPay.close()
+      if (pp) pp.close()
       await provider.shutdown().catch(() => {})
       await caller.shutdown().catch(() => {})
     }

@@ -137,4 +137,19 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
       ).rejects.toThrow()
     })
   }, 20000)
+
+  it('close() releases the node (publishPaidTools then throws; shutdown runs)', async () => {
+    const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
+    mesh.start()
+    const provider = new PaymentProvider(mesh, tmp('close.state'))
+    const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
+    provider.close() // tears down the quote/pay wire + drops the node clone
+    // readBilling has no billing log here → still a structured rejection, not
+    // a node-closed crash (it holds no node reference).
+    await expect(provider.readBilling()).rejects.toThrow()
+    // Publishing after close throws (nothing to serve over).
+    expect(() => provider.publishPaidTools([ECHO], noopHandler, { echo: terms })).toThrow()
+    provider.close() // idempotent
+    await expect(mesh.shutdown()).resolves.toBeUndefined()
+  }, 20000)
 })

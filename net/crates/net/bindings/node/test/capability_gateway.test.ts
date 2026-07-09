@@ -103,8 +103,45 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway', () => {
         expect(typeof parsed).toBe('object')
         expect(parsed.status).toBeDefined()
       }
+      gw.close()
     })
   }, 20000)
+
+  it('non-object arguments are a structured invalid_arguments error', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(mesh)
+      // These parse as valid JSON but are not the documented object shape.
+      for (const bad of ['null', '[]', 'true', '"str"', '42']) {
+        const res = JSON.parse(await gw.invoke('42/echo', bad))
+        expect(res.status).toBe('invalid_arguments')
+      }
+      gw.close()
+    })
+  })
+
+  it('close() makes the live methods resolve to a closed status (idempotent)', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(mesh)
+      gw.close()
+      for (const raw of [
+        await gw.search('x'),
+        await gw.describe('42/echo'),
+        await gw.invoke('42/echo', '{}'),
+      ]) {
+        expect(JSON.parse(raw).status).toBe('closed')
+      }
+      gw.close() // idempotent — no throw
+      // The operator verbs are independent of the node, so they still work.
+      expect(JSON.parse(await gw.pendingPayments()).status).toBe('no_payment_policy')
+    })
+  })
+
+  it('close() releases the node so NetMesh.shutdown() runs deterministically', async () => {
+    const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK })
+    const gw = new CapabilityGateway(mesh)
+    gw.close() // drop the gateway's retained node clone before shutdown
+    await expect(mesh.shutdown()).resolves.toBeUndefined()
+  })
 })
 
 // Payment options + operator approval verbs (B2). The payment decisions are
