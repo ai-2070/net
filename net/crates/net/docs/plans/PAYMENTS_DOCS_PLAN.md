@@ -6,7 +6,9 @@ PII boundary (Doctrines 9), terms-acceptance = signed-evidence-only (Doctrine
 10), the "no HTTP endpoint required" differentiator (Doctrine 11), the
 payments-scoped per-language wording incl. Node-has-no-delegation/A2A (Doctrine
 8), and XRPL demoted from the shipped ladder to enablement-gated (Phase 0 +
-`payments/networks.md`). Sub-plan of
+`payments/networks.md`); plus a follow-on amendment scoping the failure schematic
+to payments only (Doctrine 12) and adding the KYB/sanctions/tax/invoicing/
+fulfillment + shipping non-goals. Sub-plan of
 [`DOCS_STRATEGY_PLAN.md`](DOCS_STRATEGY_PLAN.md), which deliberately **deferred**
 payments docs on 2026-07-04 ("`payments-later.md` … Defer as stubs — Speculative;
 must not imply shipped features"). That deferral is now unblocked: payments has
@@ -108,13 +110,15 @@ and scope constraints below; these gate every page.
    additionally exposes delegation/A2A defaults; Node delegation/A2A are not
    exposed yet and are intentionally out of scope for this payments release**
    (see [`NODE_DELEGATION_A2A_SDK_PLAN.md`](NODE_DELEGATION_A2A_SDK_PLAN.md)).
-9. **No plaintext PII in Net envelopes.** Net Payments does not carry plaintext
-   customer PII in invocation, billing, lifecycle, or failure envelopes.
-   Provider / customer / KYB / billing records live in provider or partner
-   systems. Net may carry **opaque profile references, commitments, and signed
-   acceptance evidence** — never the underlying records. Every envelope example
-   respects this; no page shows a "billing profile" field with plaintext
-   customer data.
+9. **No plaintext customer PII in Net envelopes.** Net payment, billing,
+   lifecycle, and failure objects carry references, commitments, signatures,
+   quote IDs, verification outcomes, and policy decisions — **not** customer tax
+   IDs, billing addresses, shipping addresses, or KYB records. Provider/customer
+   records live in provider or partner systems. If a provider needs commercial
+   identity, Net carries an **opaque reference** (illustratively, a
+   `commercial_profile_ref` — a naming convention, *not* a shipped field today)
+   plus a commitment, never the profile itself. Every envelope example respects
+   this; no page shows a "billing profile" field with plaintext customer data.
 10. **Terms acceptance is signed evidence, not a terms service.** Where terms
     support is documented, it means **signed terms-acceptance evidence and terms
     hashes/IDs** (the `terms_hash` already on the quote envelope). It does **not**
@@ -127,6 +131,15 @@ and scope constraints below; these gate every page.
     invocation/admission envelope. **HTTP 402 is an adapter path for web APIs
     (`http402.md`), not a requirement for Net providers.** No page implies a Net
     provider must run a web server.
+12. **Failure-schematic scope is payment-only.** `net.payment.failure@1` is the
+    schematic for **payment** failures (`code: "payment"`); terms/profile/
+    eligibility and other non-payment admission failures must **not** be shoved
+    into it. The object's `code` family is designed to generalize
+    (`policy`/`approval`/`delegation`) but v1 ships only `payment`, so pages say:
+    *payment failures use `net.payment.failure@1`; non-payment admission failures
+    may use a broader admission-failure vocabulary where implemented.* This plan
+    does not imply Net performs KYB, tax, sanctions, identity, invoicing, or
+    fulfillment.
 
 ---
 
@@ -171,7 +184,7 @@ worldview, start, guides, concepts, payments, sdk, agent-briefs, reference, tuto
 - `spend-policy-and-approvals.md` — the policy engine decides; budgets, delegation inheritance, the operator approval surface; fail-closed default (`spend-policy.md`).
 - `non-custodial-signing.md` — identity keys ≠ settlement keys; `SchemeSigner`; eip155 / svm / xrpl; no raw-bytes path (`signer.md`).
 - `networks.md` — config-not-code; CAIP-2/CAIP-19; the signed asset registry; the network-enablement ladder **stated by go/no-go state, not as one flat "shipped" list**: mock (P0) is fully active; Base Sepolia / Base / Solana are active *as applicable per their pinned enablement state* (seams landed, live conformance/checker gated per rung); **XRPL is built Mode-A (XRP-only) but enablement-gated — do NOT list it as shipped-active** pending the pinned upstream `scheme_exact_xrpl` + live t54 conformance (`networks.md`, [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md), [`PAYMENTS_XRPL_ENABLEMENT_PLAN.md`](PAYMENTS_XRPL_ENABLEMENT_PLAN.md)). Phase 0 records the exact per-rung go/no-go.
-- `failure-schematic.md` — `net.payment.failure@1` beside the human error; reason→recovery mapping; the tolerant predicate (`failure-schematic.md`).
+- `failure-schematic.md` — `net.payment.failure@1` beside the human error; reason→recovery mapping; the tolerant predicate; **its scope is payment failures (`code: "payment"`) — states that non-payment/terms/eligibility failures do not ride this object (Doctrine 12)** (`failure-schematic.md`).
 - `billing.md` — immutable billing events + the stream; what billing is NOT (`billing.md`).
 
 **`guides/`** (Phase 2 — task recipes)
@@ -246,7 +259,11 @@ Verify **against code, not the skill**:
   pricing (deferred — no counter-offer object; that absence is the rule);
   accounts / postpaid / prepaid (Mode E — deferred); inbound HTTP-402 *serving*
   (deferred); **terms handling beyond signed acceptance evidence + hashes/IDs**
-  (Doctrine 10 — reserved). Each is named "reserved/deferred" or omitted.
+  (Doctrine 10 — reserved); the **failure-schematic `code` family beyond
+  `payment`** (`policy`/`approval`/`delegation` — the generalization path, not
+  shipped in v1); and **KYB / tax / sanctions / identity / invoicing /
+  fulfillment** (outside Net entirely — Doctrine 12 + non-goals). Each is named
+  "reserved/deferred/out-of-scope" or omitted.
 - **Data boundary (audit the envelope shapes, not just prose):** confirm no
   invocation / billing / lifecycle / failure envelope carries plaintext customer
   PII — only opaque references, commitments, signed acceptance evidence, and the
@@ -377,6 +394,13 @@ where possible so both stay in sync:
 - **Docs drifting from the skill / code.** The skill moves fast; the code is
   ground truth. Mitigated by the reconciliation table + re-running Phase 0's
   spot-checks before each phase ships.
+- **Customer identity, KYB, sanctions, tax, invoicing, and fulfillment are
+  outside Net.** Net may carry opaque references or signed terms-acceptance
+  evidence, but providers own eligibility checks and legal/customer records. No
+  page implies Net runs any of these.
+- **Shipping is not a Net-level commercial field.** If a capability fulfills
+  physical goods, shipping data belongs in that capability's own input schema or
+  the partner order object — never in a Net payment/billing/lifecycle envelope.
 - **Non-goals:** building payments (shipped; see `PAYMENTS_IMPLEMENTATION_PLAN.md`
   / `PAYMENTS_P1_IMPLEMENTATION_PLAN.md`), an interactive payments demo,
   documenting disputes/RFQ/accounts (reserved), and any change to the
