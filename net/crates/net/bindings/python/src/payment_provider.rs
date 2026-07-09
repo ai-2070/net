@@ -225,8 +225,16 @@ mod provider {
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock));
-            let serve = serve_payments(&sdk_mesh, in_process)
-                .map_err(|e| PyRuntimeError::new_err(format!("serve payments: {e}")))?;
+            // serve_payments registers the quote/pay RPC handlers, which spawn
+            // tasks — so it must run inside the runtime context. The caller's
+            // main thread (e.g. pytest) has no reactor, so enter the mesh's
+            // runtime explicitly (same reason payment_http enters it for reqwest;
+            // else `tokio::spawn` panics "no reactor running").
+            let serve = {
+                let _guard = runtime.enter();
+                serve_payments(&sdk_mesh, in_process)
+            }
+            .map_err(|e| PyRuntimeError::new_err(format!("serve payments: {e}")))?;
 
             Ok(Self {
                 engine,

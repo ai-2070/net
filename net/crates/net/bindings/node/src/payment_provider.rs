@@ -205,10 +205,15 @@ mod provider {
 
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock));
-            // Registers the quote/pay RPC handlers on the node (synchronous — no
-            // ambient runtime needed; the handlers run later on napi's runtime).
-            let serve = serve_payments(&sdk_mesh, in_process)
-                .map_err(|e| Error::from_reason(format!("serve payments: {e}")))?;
+            // serve_payments registers the quote/pay RPC handlers, which spawn
+            // tasks — so it must run inside napi's tokio runtime context. This
+            // `#[napi(constructor)]` runs on the JS thread, which is NOT in that
+            // context, so enter it explicitly (else `tokio::spawn` panics "no
+            // reactor running"). The handlers themselves run later on the runtime.
+            let serve = napi::bindgen_prelude::within_runtime_if_available(|| {
+                serve_payments(&sdk_mesh, in_process)
+            })
+            .map_err(|e| Error::from_reason(format!("serve payments: {e}")))?;
 
             Ok(Self {
                 engine,
