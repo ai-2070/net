@@ -98,11 +98,14 @@ these names): `insufficient_funds`, `no_wallet_configured`,
   back out of a string. Over-budget (>4096 B) → the producer sends the human
   message alone; the schematic is a sidecar, never worth failing a reply over.
 - **Consumers** are **tolerant**: `FailureSchematic::from_header_bytes` returns
-  the schematic only for well-formed JSON tagged `net.payment.failure@1`.
-  Duplicate headers, malformed bytes, invalid UTF-8, a foreign/`@2` tag, or a
-  non-object all read as **absent** — fall back to the human error body, never
-  an error, never a guess. Unknown reasons and extra fields parse fine (the
-  additive-tolerance contract).
+  the schematic only when the bytes **deserialize to the full `FailureSchematic`
+  shape** (a typed `serde` parse — all required fields with the right types,
+  including the nested `Recovery`) **and** the `object` tag is
+  `net.payment.failure@1`. Duplicate headers, malformed bytes, invalid UTF-8, a
+  non-standard JSON number (`Infinity`/`NaN`), a foreign/`@2` tag, a non-object,
+  or a **tagged-but-incomplete/mistyped** object all read as **absent** — fall
+  back to the human error body, never an error, never a guess. Unknown reasons
+  and extra fields parse fine (the additive-tolerance contract).
 
 ## Redaction is contract
 
@@ -135,9 +138,14 @@ never fork between them:
 (generated from the real `FailureSchematic` by `gen_payments_fixtures`) drives
 every language's verifier: a valid case, an unknown-reason + preserved-extras
 case, and the reject cases (foreign `@2` tag, malformed JSON, non-object,
-invalid UTF-8). Each language runs the **same tolerant predicate** — decode
-UTF-8 JSON, accept iff an object tagged `net.payment.failure@1` — so no
-per-language tolerance test can drift (`testing.md`).
+invalid UTF-8, and the structural rejects — tag-only-no-fields, missing
+`recovery`, wrong-typed field, non-standard JSON number). Each language runs the
+**same tolerant predicate**, which is **not tag-only**: decode as strict UTF-8
+JSON (no `Infinity`/`NaN`) and accept iff the value has the full schematic shape
+(required fields + types) **and** is tagged `net.payment.failure@1` — mirroring
+the typed deserialize in `from_header_bytes`, so no per-language tolerance test
+can drift (`testing.md`). Non-Rust verifiers validate the shape, not just the
+tag.
 
 ## Source
 

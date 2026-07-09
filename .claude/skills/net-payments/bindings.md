@@ -119,10 +119,21 @@ client = PaymentHttpClient(
     payment_signer_address=None, payment_signer=None,   # same eip155 seam as the gateway
     identity=None,                       # optional payer Identity handle; ephemeral if omitted
 )
-status_json, body = client.fetch_paid(url)   # (str, bytes): the X402HttpOutcome projection + raw body
+status_json, body = client.fetch_paid(url)   # SYNC — (str, bytes): the X402HttpOutcome projection + raw body
 ```
 
-`fetch_paid` returns `(status_json, body)` — status is
+`AsyncPaymentHttpClient` is the awaitable dual (same constructor); its
+`fetch_paid` is a **coroutine** — `await` it (the `AsyncCapabilityGateway`
+coroutine-dual pattern above), never call it bare:
+
+```python
+from net import AsyncPaymentHttpClient   # same payments-http feature gate
+aclient = AsyncPaymentHttpClient(payment_policy_path, payment_profile="dev_test")
+status_json, body = await aclient.fetch_paid(url)   # coroutine — await required
+```
+
+`fetch_paid` returns `(status_json, body)` (the sync form directly, the async
+form once awaited) — status is
 `fetched | paid | requires_payment_approval | denied | provider_refused |
 transport_error`; `body` is the raw HTTP bytes (empty for the non-body
 outcomes). The HTTP client wires **eip155 only** in v1 (svm/xrpl on this path

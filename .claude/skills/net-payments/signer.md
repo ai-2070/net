@@ -37,8 +37,9 @@ Each method takes a **typed document**, never raw bytes — `sign_typed_data`
 takes the standard `eth_signTypedData_v4` document (domain, types, full
 message); `sign_svm_transfer` takes the `SvmTransferIntent` (amount, mint,
 recipient, fee payer); `sign_xrpl_payment` takes the `XrplPaymentIntent`
-(amount, recipient, invoice binding). **So a policy-bearing signer can inspect
-what it is authorizing** before signing. `sign_typed_data` returns the 65-byte
+(amount, asset, recipient, invoice binding). **So a policy-bearing signer can
+inspect what it is authorizing** — including the settlement asset — before
+signing. `sign_typed_data` returns the 65-byte
 `r‖s‖v` signature as `0x…` hex; `sign_svm_transfer` returns the base64
 partially-signed versioned transaction; `sign_xrpl_payment` returns the hex
 presigned Payment blob. The two blob methods default to a structured refusal,

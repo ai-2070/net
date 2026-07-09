@@ -51,11 +51,22 @@ What the vectors pin:
 - **Failure-schematic tolerance** (`failure_schematic_vectors`) — the
   `net.payment.failure@1` header contract: a valid case, an unknown-reason +
   preserved-extras case, and the reject cases (foreign `@2` tag, malformed JSON,
-  non-object, invalid UTF-8). Every language runs the *same tolerant predicate*
-  (decode UTF-8 JSON, accept iff an object tagged `net.payment.failure@1`), so
-  no per-language tolerance test drifts. Rust decides via the real
-  `FailureSchematic` (a `net-sdk` dev-dep) with byte-stable re-emission; the
-  fixture is generated from that type (`failure-schematic.md`).
+  non-object, invalid UTF-8, **plus the structural rejects**: correct tag with no
+  fields, missing the required `recovery`, a wrong-typed field, and a body with a
+  non-standard JSON number like `Infinity`). Every language runs the *same
+  tolerant predicate* — but it is **not tag-only**: it mirrors
+  `FailureSchematic::from_header_bytes`, which does a full typed `serde`
+  deserialize *before* the tag check. So the predicate is "decode as strict
+  UTF-8 JSON (no `Infinity`/`NaN`) and accept iff the value has the full
+  schematic shape (all required fields with the right types — `object`, `code`,
+  `stage`, `reason`, `message`, `funds_moved`, `prior_payment` strings;
+  `retryable`, `handler_executed` bools; `recovery` an object of `class`/`actor`
+  strings + `safe_to_retry`/`safe_to_requote` bools) **and** `object` == the
+  tag." A tagged-but-incomplete/mistyped object is rejected, same as Rust —
+  non-Rust verifiers must validate the shape, not just the tag, or they drift.
+  Rust decides via the real `FailureSchematic` (a `net-sdk` dev-dep) with
+  byte-stable re-emission; the fixture is generated from that type
+  (`failure-schematic.md`).
 
 Verifier-author notes: envelope keys are ASCII, so default string sort agrees
 with bytewise order (sort by UTF-8 bytes explicitly if a non-ASCII key ever
