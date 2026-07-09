@@ -147,15 +147,10 @@ mod provider {
 
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
-    use serde_json::Value;
     use tokio::runtime::Runtime;
 
     use net::adapter::net::MeshNode;
-    use net_mcp::spec::{Implementation, Tool};
-    use net_mcp::wrap::{
-        CredentialStatus, LoweringContext, OwnerScope, ServerPublisher, Substitutability,
-        ToolInvoker, WrapConfig,
-    };
+    use net_mcp::serve::payment::PaymentAdmission;
     use net_payments::billing::BillingLog;
     use net_payments::core::registry::default_registry_v1;
     use net_payments::engine::{AdmitAll, PaymentEngine};
@@ -164,7 +159,9 @@ mod provider {
     use net_payments::flow::mesh::{serve_payments, PaymentServeHandle};
     use net_payments::flow::{Clock, InProcessProvider, SystemClock};
 
-    use crate::publish::{mesh_over, PyLocalPublicationHandle, PyToolInvoker};
+    // `mesh_over` (constructor) + the publication handle + the shared publish
+    // scaffolding the paid path delegates to.
+    use crate::publish::{mesh_over, mesh_publish_tools_configured, PyLocalPublicationHandle};
 
     /// A paid-capability provider over an embedded `NetMesh` node — the supply
     /// side. Construction stands up one `PaymentEngine` behind the quote/pay
@@ -305,60 +302,43 @@ mod provider {
                      use NetMesh.publish_tools for free tools",
                 ));
             }
-            let mut sdk_tools = Vec::with_capacity(tools.len());
-            for (name, description, schema_json) in &tools {
-                let input_schema: Value = serde_json::from_str(schema_json).map_err(|e| {
-                    PyValueError::new_err(format!(
-                        "tool `{name}`: input_schema is not valid JSON: {e}"
-                    ))
-                })?;
-                sdk_tools.push(Tool {
-                    name: name.clone(),
-                    title: None,
-                    description: description.clone(),
-                    input_schema,
-                    output_schema: None,
-                });
+            // Fail-closed: EVERY tool must be priced. Pricing is looked up by the
+            // original tool name (`lower_tool` does `ctx.pricing.get(&tool.name)`),
+            // and an absent entry publishes that tool FREE — so a forgotten key
+            // would silently leak a paid tool onto the free path, contradicting
+            // this API's paid-only contract. (`ServerPublisher` already rejects
+            // the reverse — pricing keys naming no tool.)
+            let unpriced: Vec<&str> = tools
+                .iter()
+                .filter(|(name, _, _)| !pricing.contains_key(name))
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            if !unpriced.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "publish_paid_tools: {unpriced:?} have no pricing entry (would publish \
+                     free) — every tool needs a net.pricing.terms@1 entry keyed by its \
+                     name, or use NetMesh.publish_tools for free tools"
+                )));
             }
-            let ctx = LoweringContext {
-                server_version: if version.is_empty() {
-                    "0".to_string()
-                } else {
-                    version
-                },
-                credential_status: CredentialStatus::None,
-                substitutability: Substitutability::ProviderLocal,
-                pricing: Default::default(), // pricing rides `config.pricing`
-            };
-            let mesh = Arc::new(mesh_over(self.node.clone()));
-            let owner = owner_origin.unwrap_or_else(|| mesh.origin_hash());
-            let mut config = WrapConfig::owner_only(
-                Implementation {
-                    name: "net-publish".to_string(),
-                    version: "0".to_string(),
-                },
-                owner,
-            );
-            if allow_any_caller {
-                config.scope = OwnerScope::any();
-            }
-            config.pricing = pricing.into_iter().collect();
-            // The gate: redeem quotes against THIS provider's engine — the same
-            // engine the quote/pay wire serves — so a paid tool serves once,
-            // after payment. A priced tool with no gate is a wrap error; here
-            // the gate is always set.
-            config.payment_admission =
-                Some(Arc::new(EnginePaymentAdmission::new(self.engine.clone())));
-
-            let publisher = ServerPublisher::new(mesh);
-            let invoker: Arc<dyn ToolInvoker> = Arc::new(PyToolInvoker { callback });
-            let rt = Arc::clone(&self.runtime);
-            let handle = py
-                .detach(move || {
-                    rt.block_on(publisher.publish_tools(&sdk_tools, invoker, ctx, config))
-                })
-                .map_err(|e| PyRuntimeError::new_err(format!("publish_paid_tools failed: {e}")))?;
-            Ok(PyLocalPublicationHandle::wrap(handle, self.runtime.clone()))
+            // The paid path = the shared publish scaffolding + this provider's
+            // pricing + engine gate. The gate redeems quotes against THIS
+            // provider's engine — the same engine the quote/pay wire serves — so
+            // a paid tool serves once, after payment. (`ServerPublisher` rejects
+            // a priced tool with no gate; here the gate is always set.)
+            let admission: Arc<dyn PaymentAdmission> =
+                Arc::new(EnginePaymentAdmission::new(self.engine.clone()));
+            mesh_publish_tools_configured(
+                py,
+                self.node.clone(),
+                self.runtime.clone(),
+                tools,
+                callback,
+                version,
+                owner_origin,
+                allow_any_caller,
+                pricing.into_iter().collect(),
+                Some(admission),
+            )
         }
     }
 }

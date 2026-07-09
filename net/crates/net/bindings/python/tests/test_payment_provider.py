@@ -141,7 +141,35 @@ def test_read_billing(mesh, tmp_path):
     )
     assert provider.read_billing() == []
 
-    # Without a billing_log_path, reading is a structured error, not a crash.
-    no_log = PaymentProvider(mesh, str(tmp_path / "engine2.json"))
+
+def test_read_billing_without_a_log_is_a_structured_error(mesh, tmp_path):
+    # A SEPARATE mesh fixture (function scope) — each PaymentProvider registers
+    # the net.payments.quote/pay services, and a second on the same node is
+    # rejected (ServeError::AlreadyServing), so the no-log provider needs its own
+    # node. Without a billing_log_path, reading is a structured error, not a crash.
+    no_log = PaymentProvider(mesh, str(tmp_path / "engine.json"))
     with pytest.raises(ValueError):
         no_log.read_billing()
+
+
+def test_publish_paid_tools_fails_closed_on_a_missing_price(mesh, tmp_path):
+    # Every tool must be priced — a forgotten entry would publish that tool FREE,
+    # so it is a fail-closed ValueError, not a silent free leak.
+    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    terms = build_pricing_terms(
+        provider.provider_entity_id, f"{mesh.node_id}/echo", json.dumps(MOCK_REQS)
+    )
+
+    async def cb(_name, _args_json):
+        return "echoed"
+
+    with pytest.raises(ValueError):
+        # Two tools, only one priced → the unpriced `other` would go out free.
+        provider.publish_paid_tools(
+            [
+                ("echo", None, '{"type":"object"}'),
+                ("other", None, '{"type":"object"}'),
+            ],
+            cb,
+            {"echo": terms},
+        )

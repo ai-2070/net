@@ -290,6 +290,24 @@ mod provider {
                      use NetMesh.publishTools for free tools",
                 ));
             }
+            // Fail-closed: EVERY tool must be priced. Pricing is looked up by the
+            // original tool name (`lower_tool` does `ctx.pricing.get(&tool.name)`),
+            // and an absent entry publishes that tool FREE — so a forgotten key
+            // would silently leak a paid tool onto the free path, contradicting
+            // this API's paid-only contract. (`ServerPublisher` already rejects
+            // the reverse — pricing keys naming no tool.)
+            let unpriced: Vec<&str> = tools
+                .iter()
+                .filter(|t| !pricing.contains_key(&t.name))
+                .map(|t| t.name.as_str())
+                .collect();
+            if !unpriced.is_empty() {
+                return Err(Error::from_reason(format!(
+                    "publishPaidTools: {unpriced:?} have no pricing entry (would publish \
+                     free) — every tool needs a net.pricing.terms@1 entry keyed by its \
+                     name, or use NetMesh.publishTools for free tools"
+                )));
+            }
             // Validate + marshal synchronously (before the publish round-trip),
             // then build the invoker on the JS thread — everything after is
             // `Send` state for the future.

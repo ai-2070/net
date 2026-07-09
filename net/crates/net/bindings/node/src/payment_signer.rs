@@ -30,6 +30,18 @@ pub(crate) type SignerTsfn =
 /// Total budget across both stages (JS returning the Promise + the Promise
 /// resolving), matching the blob adapter's async bridge — the worst case is
 /// `SIGNER_TIMEOUT`, not `2×`.
+///
+/// **Timeout is one-sided: it bounds only how long Rust waits, and does NOT
+/// cancel the JS side.** When it fires, this future is dropped and the payment
+/// flow gets a timeout error, but the already-enqueued JS callback keeps running
+/// — a slow wallet may still prompt the user and produce a signature *after* the
+/// gateway returned the timeout. That signature is simply never redeemed here
+/// (the quote isn't paid), so no funds move without a returned signature; but
+/// the wallet prompt / signing effort is not recalled. Treat a signer timeout as
+/// **indeterminate**, not "the wallet did nothing". A cancellation token
+/// (`AbortSignal`) into the JS callback is the future fix if a scheme needs to
+/// abort in-flight wallet work; today the callback should keep its own work
+/// bounded well under this budget.
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Call the JS signer with the typed intent JSON, await its Promise, return the

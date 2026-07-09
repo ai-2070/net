@@ -101,18 +101,21 @@ pub(crate) fn mesh_over(node: Arc<MeshNode>) -> Mesh {
     Mesh::from_node_arc(node, Arc::new(ChannelConfigRegistry::new()), None)
 }
 
-/// Publish `tools` (each `(name, description, input_schema_json)`) on the live
-/// `node`, backed by the Python `callback`. Announces + serves through
-/// `ServerPublisher::publish_tools`; releases the GIL for the async work.
+/// The shared publish scaffolding both the free (`mesh_publish_tools`) and paid
+/// ([`crate::payment_provider`]) paths run: parse the tool descriptors, build
+/// the lowering context + owner-scoped `WrapConfig`, then announce + serve
+/// through `ServerPublisher::publish_tools` (releasing the GIL for the async
+/// work). The two paths differ ONLY in `pricing` + `payment_admission` (empty /
+/// `None` = free) — kept in one place so schema validation, version handling,
+/// scope defaults, and callback wiring can't drift between them.
 ///
-/// `owner_origin` scopes who may invoke: `Some(origin)` admits only that
-/// caller (an `origin_hash`); `None` admits only **this node itself**
-/// (fail-closed — the published tools are backed by an arbitrary local
-/// callback, so nothing is exposed mesh-wide by omission). Admitting every
-/// mesh peer requires the explicit `allow_any_caller` opt-in, which overrides
+/// `owner_origin` scopes who may invoke: `Some(origin)` admits only that caller
+/// (an `origin_hash`); `None` admits only **this node itself** (fail-closed —
+/// the tools are backed by an arbitrary local callback). Admitting every mesh
+/// peer requires the explicit `allow_any_caller` opt-in, which overrides
 /// `owner_origin`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mesh_publish_tools(
+pub(crate) fn mesh_publish_tools_configured(
     py: Python<'_>,
     node: Arc<MeshNode>,
     runtime: Arc<Runtime>,
@@ -121,6 +124,8 @@ pub(crate) fn mesh_publish_tools(
     version: String,
     owner_origin: Option<u64>,
     allow_any_caller: bool,
+    pricing: std::collections::BTreeMap<String, String>,
+    payment_admission: Option<Arc<dyn net_mcp::serve::payment::PaymentAdmission>>,
 ) -> PyResult<PyLocalPublicationHandle> {
     let mut sdk_tools = Vec::with_capacity(tools.len());
     for (name, description, schema_json) in &tools {
@@ -148,8 +153,8 @@ pub(crate) fn mesh_publish_tools(
         // governs consent, not per-tool credential labels.
         credential_status: CredentialStatus::None,
         substitutability: Substitutability::ProviderLocal,
-        // No pricing surface on this binding path — every published tool is
-        // free (paid tools ride the net-payments publish path).
+        // The context stays unpriced on both paths — pricing rides
+        // `config.pricing` below, which `publish_tools` folds into the lowering.
         pricing: Default::default(),
     };
     let client_info = Implementation {
@@ -165,6 +170,8 @@ pub(crate) fn mesh_publish_tools(
     if allow_any_caller {
         config.scope = OwnerScope::any();
     }
+    config.pricing = pricing;
+    config.payment_admission = payment_admission;
 
     let publisher = ServerPublisher::new(mesh);
     let invoker: Arc<dyn ToolInvoker> = Arc::new(PyToolInvoker { callback });
@@ -174,10 +181,36 @@ pub(crate) fn mesh_publish_tools(
         .detach(move || rt.block_on(publisher.publish_tools(&sdk_tools, invoker, ctx, config)))
         .map_err(|e| PyRuntimeError::new_err(format!("publish_tools failed: {e}")))?;
 
-    Ok(PyLocalPublicationHandle {
-        inner: Some(handle),
+    Ok(PyLocalPublicationHandle::wrap(handle, runtime))
+}
+
+/// Publish `tools` (each `(name, description, input_schema_json)`) on the live
+/// `node`, backed by the Python `callback` — the **free** (unpriced) path. Thin
+/// wrapper over [`mesh_publish_tools_configured`] with no pricing + no payment
+/// gate (paid tools ride the `net-payments` publish path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mesh_publish_tools(
+    py: Python<'_>,
+    node: Arc<MeshNode>,
+    runtime: Arc<Runtime>,
+    tools: Vec<(String, Option<String>, String)>,
+    callback: Py<PyAny>,
+    version: String,
+    owner_origin: Option<u64>,
+    allow_any_caller: bool,
+) -> PyResult<PyLocalPublicationHandle> {
+    mesh_publish_tools_configured(
+        py,
+        node,
         runtime,
-    })
+        tools,
+        callback,
+        version,
+        owner_origin,
+        allow_any_caller,
+        std::collections::BTreeMap::new(),
+        None,
+    )
 }
 
 /// A live publication of a node's own local tools (from

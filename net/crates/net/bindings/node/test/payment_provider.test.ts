@@ -113,6 +113,18 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
     })
   }, 20000)
 
+  it('publishPaidTools fail-closes when a tool has no pricing entry', async () => {
+    await withProvider(async (mesh) => {
+      const provider = new PaymentProvider(mesh, tmp('missing.state'))
+      const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
+      const other = { ...ECHO, name: 'other' }
+      // `other` has no pricing entry → it would publish FREE; reject instead.
+      expect(() =>
+        provider.publishPaidTools([ECHO, other], noopHandler, { echo: terms }),
+      ).toThrow()
+    })
+  }, 20000)
+
   it('publishes a priced tool and serves it (handle lifecycle)', async () => {
     await withProvider(async (mesh) => {
       const provider = new PaymentProvider(mesh, tmp('paid.state'))
