@@ -181,7 +181,7 @@ worldview, start, guides, concepts, payments, sdk, agent-briefs, reference, tuto
 - `x402-and-net.md` — envelopes wrap x402; byte-preservation; the two-way door. **Leads with the differentiator (Doctrine 11):** Net-native paid capabilities are announced + invoked over nRPC with x402 material carried as opaque preserved bytes in the invocation/admission envelope — HTTP 402 is an adapter path for web APIs, not a requirement for Net providers (`x402.md`, `object-model.md`).
 - `the-lifecycle.md` — quote → verify → settle → serve → bill (provider) and pricing → spend policy → pay → invoke (caller) (`provider.md`, `caller.md`).
 - `verification-tiers.md` — `observed | confirmed(n) | final`; the independent `ChainChecker`; reorg freeze; the facilitator is not in the trust root (`verification.md`).
-- `spend-policy-and-approvals.md` — the policy engine decides; budgets, delegation inheritance, the operator approval surface; fail-closed default (`spend-policy.md`).
+- `spend-policy-and-approvals.md` — the policy engine decides; budgets (per-call / per-day, allowed networks/assets), the operator approval surface; fail-closed default. **Per-delegation-chain budget inheritance is documented as roadmap (P5), not shipped** (Phase 0 Correction 1) (`spend-policy.md`).
 - `non-custodial-signing.md` — identity keys ≠ settlement keys; `SchemeSigner`; eip155 / svm / xrpl; no raw-bytes path (`signer.md`).
 - `networks.md` — config-not-code; CAIP-2/CAIP-19; the signed asset registry; the network-enablement ladder **stated by go/no-go state, not as one flat "shipped" list**: mock (P0) is fully active; Base Sepolia / Base / Solana are active *as applicable per their pinned enablement state* (seams landed, live conformance/checker gated per rung); **XRPL is built Mode-A (XRP-only) but enablement-gated — do NOT list it as shipped-active** pending the pinned upstream `scheme_exact_xrpl` + live t54 conformance (`networks.md`, [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md), [`PAYMENTS_XRPL_ENABLEMENT_PLAN.md`](PAYMENTS_XRPL_ENABLEMENT_PLAN.md)). Phase 0 records the exact per-rung go/no-go.
 - `failure-schematic.md` — `net.payment.failure@1` beside the human error; reason→recovery mapping; the tolerant predicate; **its scope is payment failures (`code: "payment"`) — states that non-payment/terms/eligibility failures do not ride this object (Doctrine 12)** (`failure-schematic.md`).
@@ -239,8 +239,10 @@ Verify **against code, not the skill**:
 - **Shipped (may be documented):** the quote → verify → settle → serve → bill
   lifecycle (`payments/src/engine/`, `flow/`); tiered verification
   `observed|confirmed(n)|final` + `ChainChecker` + reorg freeze (`checker/`,
-  `verification.md` claims); spend policy + approval verbs + delegation
-  inheritance (`policy/spend.rs`); `net.payment.failure@1` (`sdk/src/tool_payment.rs`);
+  `verification.md` claims); spend policy (budgets + allowed networks/assets) +
+  approval verbs (`policy/spend.rs`) — **NB: per-delegation-chain budget
+  inheritance is forward-looking (P5), NOT shipped; see Phase 0 audit Correction
+  1**; `net.payment.failure@1` (`sdk/src/tool_payment.rs`);
   signers eip155/svm/xrpl via `ExternalSigner` (no raw keys); billing log + stream
   (`billing/`); outbound HTTP-402 (`flow/http402.rs`); SDK surfaces — Rust/Python/
   Node demand+supply, Go verifier-only.
