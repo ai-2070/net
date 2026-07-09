@@ -3411,6 +3411,13 @@ class PaymentProvider:
         price + quote under. Pass it to :func:`build_pricing_terms`."""
         ...
 
+    def read_billing(self) -> List[str]:
+        """The immutable billing events this provider recorded, oldest first —
+        each a ``net.billing.event@1`` JSON string. Read-only (billing is
+        emitted by the engine; this only reads). Requires a ``billing_log_path``
+        at construction, else raises ``ValueError``."""
+        ...
+
     def publish_paid_tools(
         self,
         tools: List[Tuple[str, Optional[str], str]],

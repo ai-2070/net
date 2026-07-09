@@ -155,12 +155,11 @@ admission gate over that same engine.
 
 A provider that charges must see what it charged.
 
-- [ ] Bind `BillingLog` read/stream from Python (`read_all` / a tail iterator,
-  sync + async), returning the immutable `net.billing.event@1` records as JSON
-  strings. Doctrine holds: billing is emitted by the engine; the binding only
-  reads. No mutation surface.
-- [ ] Tests: pytest asserting a paid serve appears as exactly one billing event
-  (idempotent retries republish nothing).
+- [x] `PaymentProvider.read_billing()` over `BillingLog::read_all` (GIL-released,
+  on the mesh runtime) returns the immutable `net.billing.event@1` records as
+  JSON strings, oldest first. Read-only — billing is emitted by the engine; the
+  binding only reads. Requires a `billing_log_path` at construction, else a
+  structured `ValueError`. pytest (empty stream + the no-log guard) + stub.
 
 **Acceptance (Part A):** a Python node can price a tool at publish, serve it
 paid across the mesh (quote → pay → gate → serve → bill) on the same engine, and

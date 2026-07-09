@@ -177,6 +177,9 @@ mod provider {
         node: Arc<MeshNode>,
         runtime: Arc<Runtime>,
         provider_entity_id: Vec<u8>,
+        /// The billing stream, when a `billing_log_path` was supplied — for the
+        /// read-only `read_billing` surface.
+        billing: Option<Arc<BillingLog>>,
         /// Keeps the `net.payments.quote/pay` services registered on the node.
         _serve: PaymentServeHandle,
     }
@@ -209,6 +212,7 @@ mod provider {
             let registry = default_registry_v1(entity_id);
             // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
             // may quote; PAYMENT is the real gate on the serve).
+            let billing = billing_log_path.map(|bp| Arc::new(BillingLog::new(bp)));
             let mut engine = PaymentEngine::new(
                 provider,
                 Arc::new(MockFacilitator::new()),
@@ -217,8 +221,8 @@ mod provider {
                 PathBuf::from(state_path),
             )
             .map_err(|e| PyRuntimeError::new_err(format!("payment engine: {e}")))?;
-            if let Some(bp) = billing_log_path {
-                engine = engine.with_billing_log(Arc::new(BillingLog::new(bp)));
+            if let Some(b) = &billing {
+                engine = engine.with_billing_log(b.clone());
             }
             let engine = Arc::new(engine);
 
@@ -232,6 +236,7 @@ mod provider {
                 node,
                 runtime,
                 provider_entity_id,
+                billing,
                 _serve: serve,
             })
         }
@@ -241,6 +246,34 @@ mod provider {
         #[getter]
         fn provider_entity_id(&self) -> Vec<u8> {
             self.provider_entity_id.clone()
+        }
+
+        /// The immutable billing events this provider recorded, oldest first —
+        /// each a ``net.billing.event@1`` JSON string. Read-only (billing is
+        /// emitted by the engine; this only reads). Requires a
+        /// ``billing_log_path`` at construction, else raises ``ValueError``.
+        /// Releases the GIL while reading.
+        fn read_billing(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+            let Some(billing) = &self.billing else {
+                return Err(PyValueError::new_err(
+                    "no billing log configured — construct PaymentProvider with billing_log_path",
+                ));
+            };
+            let billing = billing.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let events = runtime
+                    .block_on(billing.read_all())
+                    .map_err(|e| PyRuntimeError::new_err(format!("read billing log: {e}")))?;
+                events
+                    .iter()
+                    .map(|e| {
+                        serde_json::to_string(e).map_err(|err| {
+                            PyRuntimeError::new_err(format!("serialize billing event: {err}"))
+                        })
+                    })
+                    .collect()
+            })
         }
 
         /// Publish priced tools, gated by this provider's payment engine. Each

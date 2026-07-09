@@ -130,3 +130,18 @@ def test_publish_paid_tools_serves_a_priced_tool(mesh, tmp_path):
         assert handle.tools, "the priced tool is served"
     finally:
         handle.stop()
+
+
+def test_read_billing(mesh, tmp_path):
+    # A fresh provider with a billing log reads an empty stream (no serves yet).
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        billing_log_path=str(tmp_path / "billing.jsonl"),
+    )
+    assert provider.read_billing() == []
+
+    # Without a billing_log_path, reading is a structured error, not a crash.
+    no_log = PaymentProvider(mesh, str(tmp_path / "engine2.json"))
+    with pytest.raises(ValueError):
+        no_log.read_billing()
