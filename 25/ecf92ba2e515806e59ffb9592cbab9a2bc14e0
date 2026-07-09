@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/payment_http.rs
+  s_2ce1bbf7d954a5::t_b1b037b99a736f 10-13
+  s_2ce1bbf7d954a5::t_1ba620f9d98288 19,28
+  s_2ce1bbf7d954a5::t_e35883474c7dec 107-110,116-121,128-129,133-135,149-150,156-164,168
+  s_2ce1bbf7d954a5::t_b14d50c0774941 165-167
+  s_2ce1bbf7d954a5::t_e10172da80716e 175,194
+net/crates/net/bindings/node/test/payment_http.test.ts
+  s_2ce1bbf7d954a5::t_2d35c7a7e18fc7 45-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "25ecf92ba2e515806e59ffb9592cbab9a2bc14e0",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
