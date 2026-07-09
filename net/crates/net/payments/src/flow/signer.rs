@@ -304,7 +304,7 @@ pub mod dev {
         }
 
         fn derive_address(key: &SigningKey) -> String {
-            let pubkey = key.verifying_key().to_encoded_point(false);
+            let pubkey = key.verifying_key().to_sec1_point(false);
             let hash = keccak(&pubkey.as_bytes()[1..]);
             format!("0x{}", hex::encode(&hash[12..]))
         }
@@ -379,10 +379,9 @@ pub mod dev {
 
         async fn sign_typed_data(&self, typed_data: &Value) -> Result<String, SignerError> {
             let digest = Self::digest(typed_data)?;
-            let (signature, recovery) = self
-                .key
-                .sign_prehash_recoverable(&digest)
-                .map_err(|e| SignerError::new(format!("sign: {e}")))?;
+            // `sign_prehash_recoverable` is infallible in ecdsa 0.17 (k256
+            // 0.14) — it returns the signature and recovery id directly.
+            let (signature, recovery) = self.key.sign_prehash_recoverable(&digest);
             let mut out = Vec::with_capacity(65);
             out.extend_from_slice(&signature.to_bytes());
             // EIP-3009 contracts expect the legacy 27/28 recovery byte.

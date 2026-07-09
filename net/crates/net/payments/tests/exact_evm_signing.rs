@@ -82,7 +82,7 @@ async fn the_dev_signer_signs_recoverably_and_deterministically() {
     let recovery = k256::ecdsa::RecoveryId::from_byte(v - 27).expect("recid");
     let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
         .expect("recover");
-    let pubkey = recovered.to_encoded_point(false);
+    let pubkey = recovered.to_sec1_point(false);
     let hash = {
         use sha3::{Digest, Keccak256};
         let mut hasher = Keccak256::new();
