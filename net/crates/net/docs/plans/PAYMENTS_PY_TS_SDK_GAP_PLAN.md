@@ -241,11 +241,19 @@ Payments ride behind it. Package decision (recorded, unchanged from
 
 ### B3 — Outbound HTTP-402 client
 
-- [ ] `PaymentHttpClient` over `X402HttpFlow::fetch_paid`, same shape as Python's
-  `payment_http.rs`: returns `[statusJson, body]` (status projection + raw
-  bytes). Behind a Node opt-in `payments-http` feature
-  (`net-payments/http-facilitator` — reqwest/rustls, kept out of the default
-  build), mirroring Python.
+- [x] `PaymentHttpClient` over `X402HttpFlow::fetch_paid`, same shape as Python's
+  `payment_http.rs`: `fetchPaid(url)` resolves to `[statusJson, body]` (the
+  `X402HttpOutcome` projection — `fetched` / `paid` (base64 settlement) /
+  `requires_payment_approval` / `denied` / `provider_refused` /
+  `transport_error` — + the raw body as a `Buffer`). `paymentPolicyPath`
+  required; ephemeral payer identity (bookkeeping on this path). Behind a Node
+  opt-in `payments-http` feature (`net-payments/http-facilitator` + `base64`,
+  kept out of the default `.node`; built in the vitest CI job). The flow is
+  built lazily on the first `fetchPaid` (inside the async fn, so reqwest finds
+  napi's reactor — the JS-thread constructor has none) and cached behind a
+  `parking_lot::Mutex` (the `Arc` is cloned out before the await). Rust
+  projection + profile tests + a vitest `transport_error` row. Real-network
+  paid HTTP waits on the shared signer bridge (B2-signers).
 
 ### B4 — Close the `listTools` pricing asymmetry (small, independent)
 

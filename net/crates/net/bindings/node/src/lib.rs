@@ -60,6 +60,10 @@ mod mcp_helpers;
 // embedded NetMesh node) + the caller payment flow. Behind `payments`.
 #[cfg(feature = "payments")]
 mod capability_gateway;
+// The outbound HTTP-402 client (pay an external x402 HTTP API). Behind the
+// opt-in `payments-http` (pulls reqwest via net-payments/http-facilitator).
+#[cfg(feature = "payments-http")]
+mod payment_http;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
 #[cfg(feature = "aggregator")]

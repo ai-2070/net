@@ -158,6 +158,12 @@ mcp = ["consent", "dep:net-mcp"]
 # gate seam, `mesh` for `MeshPaymentChannel` + the SDK mesh surface). Thin per
 # doctrine #1: every payment decision is the Rust flow's; the binding marshals.
 payments = ["mcp", "net", "dep:net-payments"]
+# Outbound HTTP-402 client (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B3):
+# `PaymentHttpClient` over `net-payments::flow::http402::X402HttpFlow`. Kept
+# OUT of the default `.node`: it pulls `net-payments/http-facilitator`
+# (reqwest + rustls + bundled roots), a real size add — an explicit opt-in,
+# mirroring the Python `payments-http`.
+payments-http = ["payments", "net-payments/http-facilitator", "dep:base64"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }
@@ -169,6 +175,10 @@ net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../adapters
 # surface (`MeshPaymentChannel`, `net-sdk/net`+`cortex`); `mcp-gate` the
 # `gated_invoke` payment seam.
 net-payments = { version = "0.31.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
+# The outbound HTTP-402 client base64-encodes the byte-preserved settlement
+# response for audit. Optional + `payments-http`-gated (already in the lock via
+# net-payments).
+base64 = { version = "0.22", optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 # `napi` (runtime) and `napi-derive` MUST move in lockstep: napi-derive
