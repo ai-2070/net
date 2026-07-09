@@ -317,14 +317,21 @@ async fn do_invoke(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "payments")]
-fn spend_engine(path: &str, profile: &str) -> net_payments::policy::spend::SpendPolicyEngine {
+fn spend_engine(
+    path: &str,
+    profile: &str,
+) -> Result<net_payments::policy::spend::SpendPolicyEngine, String> {
     use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
-    // Vocabulary + fallibility live once in core (`SpendProfile::parse`). The
-    // stored profile was validated at construction (`build_payment_flow`), so the
-    // parse cannot fail here; fall back fail-closed to `Production` rather than
-    // silently widening the posture if it somehow does.
-    let profile = SpendProfile::parse(profile).unwrap_or_default();
-    SpendPolicyEngine::new(path, profile)
+    // Vocabulary lives once in core (`SpendProfile::parse`). The profile string
+    // was validated at construction (`build_payment_flow`), so this parse is
+    // expected to succeed — but on the (unreachable) failure we surface a loud
+    // error rather than silently defaulting, honoring parse's no-silent-fallback
+    // contract. Unlike the Node gateway we can't store the parsed `SpendProfile`
+    // in `GatewayState`: `net_payments` is an optional dep and this module
+    // compiles even in a payments-off build, so the retained profile stays a
+    // `String` and is re-parsed here through the one core parser.
+    let profile = SpendProfile::parse(profile).map_err(|e| e.to_string())?;
+    Ok(SpendPolicyEngine::new(path, profile))
 }
 
 /// `{"status":"no_payment_policy", ...}` — the verb needs the shared
@@ -348,7 +355,11 @@ async fn do_approve_payment(
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).approve(&quote_id).await {
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.approve(&quote_id).await {
         Ok(changed) => {
             json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
         }
@@ -365,7 +376,11 @@ async fn do_reject_payment(
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).reject(&quote_id).await {
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.reject(&quote_id).await {
         Ok(changed) => {
             json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
         }
@@ -378,7 +393,11 @@ async fn do_pending_payments(policy_path: Option<String>, profile: String) -> St
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).pending().await {
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.pending().await {
         Ok(quotes) => json!({ "status": "ok", "pending": quotes }).to_string(),
         Err(e) => err_json("error", e),
     }
@@ -396,10 +415,11 @@ async fn do_spent_today(
         return no_policy_json();
     };
     let now_ns = SystemClock.now_ns();
-    match spend_engine(&path, &profile)
-        .spent_today(&network, &asset, now_ns)
-        .await
-    {
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.spent_today(&network, &asset, now_ns).await {
         Ok(amount) => json!({
             "status": "ok",
             "network": network,
@@ -1262,6 +1282,19 @@ mod tests {
             v["approve_hint"],
             "approve quote q-77 via the payments consent API"
         );
+    }
+
+    /// `spend_engine` routes the profile through the one core parser and does
+    /// NOT silently default: an unknown profile is a loud error, never a quiet
+    /// fall back to `Production` (which would contradict `SpendProfile::parse`'s
+    /// no-silent-fallback contract). Construction validates the profile first,
+    /// so this error is unreachable in practice — the test pins that the fallback
+    /// stays fail-loud, not fail-silent.
+    #[test]
+    fn spend_engine_rejects_an_unknown_profile() {
+        assert!(spend_engine("/tmp/net-spend-test", "production").is_ok());
+        assert!(spend_engine("/tmp/net-spend-test", "dev_test").is_ok());
+        assert!(spend_engine("/tmp/net-spend-test", "yolo").is_err());
     }
 
     /// Payment kwargs are validated before any mesh state exists:
