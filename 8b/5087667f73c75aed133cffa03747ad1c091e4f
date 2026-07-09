@@ -1,0 +1,19 @@
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_8145011de91f43::t_564701f1e2351d 1293-1296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8b5087667f73c75aed133cffa03747ad1c091e4f",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
