@@ -193,9 +193,8 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
             "cap_id": id.display(),
             "approve_command": format!("net mcp pin approve {}", id.display()),
             "message": format!(
-                "Capability `{}` requires local approval before it can be invoked. \
-                 Request it with net_request_capability; a human approves it out of \
-                 band via `net mcp pin approve {}`.",
+                "Capability `{}` requires local approval before it can be invoked; \
+                 a human approves it out of band via `net mcp pin approve {}`.",
                 id.display(),
                 id.display(),
             ),
