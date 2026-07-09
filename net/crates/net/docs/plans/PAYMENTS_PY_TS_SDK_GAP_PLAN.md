@@ -226,15 +226,20 @@ Payments ride behind it. Package decision (recorded, unchanged from
   `spentToday` (thin wrappers over `SpendPolicyEngine`, retaining the store path
   + profile on the gateway) — structured `no_payment_policy` without a path.
   Rust config tests + vitest round-trip rows.
-- [ ] **B2-signers (follow-up):** the three signer pairs
-  (`paymentSignerAddress`/`paymentSigner` eip155, `paymentSignerSvm*`,
-  `paymentSignerXrpl*`) bridged via `ThreadsafeFunction<String /*typed intent
-  JSON*/, Promise<String> /*artifact*/>` (the `node/src/blob.rs`
-  `NodeAsyncBlobAdapter` + `await_tsfn_promise` pattern) → `ExternalSigner` /
-  `ExternalSvmSigner` / `ExternalXrplSigner`. Needed only for REAL-network
-  settlement; typed intent in, artifact out; key material unrepresentable; each
-  pair both-or-neither. Split out because the TSFN signer bridge is intricate
-  enough to warrant its own focused pass.
+- [x] **B2-signers:** the three signer pairs (`paymentSignerAddress`/
+  `paymentSigner` eip155, `paymentSignerSvm*`, `paymentSignerXrpl*` — six
+  optional constructor params) bridged via `ThreadsafeFunction<String /*typed
+  intent JSON*/, Promise<String> /*artifact*/>` in `node/src/payment_signer.rs`
+  (the `blob.rs` `NodeAsyncBlobAdapter` + oneshot + total-budget-timeout
+  pattern) → `ExternalSigner` / `ExternalSvmSigner` / `ExternalXrplSigner`,
+  registered on the `CallerPaymentFlow`. Each pair both-or-neither; a signer
+  requires the policy path; all three coexist. Typed intent in, artifact out;
+  key material unrepresentable. The TSFN handle is shared behind an `Arc` (it
+  isn't `Clone`) so each returned future owns it. Lights up **real-network**
+  settlement for the gateway. vitest construction + both-or-neither rows; the
+  sign mechanism itself is pinned by net-payments' `exact_evm_signing` /
+  `exact_svm_scheme_flow` (a real-network signing e2e is a follow-up). The Node
+  HTTP-402 client's eip155 signer can reuse the same module next.
 
 ### B3 — Outbound HTTP-402 client
 

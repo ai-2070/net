@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use napi::bindgen_prelude::{Function, Promise};
 use napi::{Error, Result};
 use napi_derive::napi;
 use serde_json::{json, Value};
@@ -274,16 +275,54 @@ fn parse_profile(profile: &str) -> Result<SpendProfile> {
     }
 }
 
+/// A collected per-scheme signer: `(namespace, signer)`.
+type Signer = (
+    &'static str,
+    Arc<dyn net_payments::flow::signer::SchemeSigner>,
+);
+
+/// Validate a signer pair (both-or-neither) and, when present, convert the JS
+/// callback to a `ThreadsafeFunction` and wrap it in the scheme's external
+/// signer. `build` is the scheme-specific wrapper (eip155 / svm / xrpl).
+fn signer_pair(
+    address: Option<String>,
+    callback: Option<Function<'static, String, Promise<String>>>,
+    namespace: &'static str,
+    kwarg: &str,
+    build: fn(
+        String,
+        crate::payment_signer::SignerTsfn,
+    ) -> Arc<dyn net_payments::flow::signer::SchemeSigner>,
+) -> Result<Option<Signer>> {
+    match (address, callback) {
+        (Some(addr), Some(cb)) => {
+            let tsfn = cb.build_threadsafe_function().build()?;
+            Ok(Some((namespace, build(addr, tsfn))))
+        }
+        (None, None) => Ok(None),
+        _ => Err(Error::from_reason(format!(
+            "gateway: {kwarg} and {kwarg}Address must be provided together \
+             (the address names the payer; the callback signs its typed intent)"
+        ))),
+    }
+}
+
 /// Build the caller payment flow. The payment identity **is the node's mesh
 /// identity** (`mesh.entity_keypair()`, borrowed in-process — nothing crosses
-/// the language boundary). Real (non-mock) networks additionally need a
-/// per-scheme signer (the follow-up); without one, a real-network `accepts[]`
-/// entry is a structured `denied`, never a fallback.
+/// the language boundary). Real (non-mock) networks need a per-scheme
+/// `signer`; without one, a real-network `accepts[]` entry is a structured
+/// `denied`, never a fallback.
 fn build_payment_flow(
     mesh: Arc<SdkMesh>,
     config: Option<PaymentConfig>,
+    signers: Vec<Signer>,
 ) -> Result<Option<Arc<dyn PaymentFlow>>> {
     let Some(config) = config else {
+        if !signers.is_empty() {
+            return Err(Error::from_reason(
+                "gateway: payment signers require paymentPolicyPath (the shared spend-policy store)",
+            ));
+        }
         return Ok(None);
     };
     let profile = parse_profile(&config.profile)?;
@@ -291,13 +330,16 @@ fn build_payment_flow(
     let registry = default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
-    let flow = CallerPaymentFlow::new(
+    let mut flow = CallerPaymentFlow::new(
         caller,
         spend,
         registry,
         Arc::new(MeshPaymentChannel::new(mesh)),
         Arc::new(SystemClock),
     );
+    for (namespace, signer) in signers {
+        flow = flow.with_signer(namespace, signer);
+    }
     Ok(Some(Arc::new(flow)))
 }
 
@@ -420,12 +462,19 @@ pub struct CapabilityGateway {
 #[napi]
 impl CapabilityGateway {
     #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mesh: &NetMesh,
         pin_store_path: Option<String>,
         payment_policy_path: Option<String>,
         payment_profile: Option<String>,
         payment_unsafe_mock_auto_allow: Option<bool>,
+        payment_signer_address: Option<String>,
+        payment_signer: Option<Function<'static, String, Promise<String>>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<Function<'static, String, Promise<String>>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<Function<'static, String, Promise<String>>>,
     ) -> Result<Self> {
         // Reuse the live node + its channel configs so the gateway drives mesh
         // I/O over the same node the caller runs (the `DaemonRuntime::create`
@@ -442,13 +491,45 @@ impl CapabilityGateway {
             payment_profile,
             payment_unsafe_mock_auto_allow.unwrap_or(false),
         )?;
+        // Collect the per-scheme signers (both-or-neither each): JS callbacks
+        // become `ThreadsafeFunction`s wrapped in the external signer. Only the
+        // typed intent + the artifact cross — key material is unrepresentable.
+        let mut signers = Vec::new();
+        for pair in [
+            signer_pair(
+                payment_signer_address,
+                payment_signer,
+                "eip155",
+                "paymentSigner",
+                crate::payment_signer::eip155_signer,
+            )?,
+            signer_pair(
+                payment_signer_svm_address,
+                payment_signer_svm,
+                "solana",
+                "paymentSignerSvm",
+                crate::payment_signer::svm_signer,
+            )?,
+            signer_pair(
+                payment_signer_xrpl_address,
+                payment_signer_xrpl,
+                "xrpl",
+                "paymentSignerXrpl",
+                crate::payment_signer::xrpl_signer,
+            )?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            signers.push(pair);
+        }
         // Retain the store path + profile before `build_payment_flow` consumes
         // the config, so the approval verbs can reopen it.
         let (spend_policy_path, spend_profile) = match &config {
             Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
             None => (None, "production".to_string()),
         };
-        let payment = build_payment_flow(sdk_mesh.clone(), config)?;
+        let payment = build_payment_flow(sdk_mesh.clone(), config, signers)?;
 
         Ok(Self {
             gateway: Arc::new(MeshGateway::new(sdk_mesh)),

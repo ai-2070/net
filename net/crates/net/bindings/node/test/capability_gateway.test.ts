@@ -172,3 +172,78 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway payments', () => {
     })
   })
 })
+
+// Real-network signer seams (B2-signers): each scheme's callback is a
+// `(typedIntentJson: string) => Promise<string>`, invoked only at sign time on
+// a real network. The mechanism (typed intent -> ExternalSigner) is pinned in
+// Rust (net-payments exact_evm_signing / exact_svm_scheme_flow); these assert
+// the Node surface: construction with a signer, and both-or-neither.
+describe.skipIf(!CapabilityGateway)('CapabilityGateway signers', () => {
+  const tmpPolicy = (name: string): string =>
+    `${require('node:os').tmpdir()}/net-gw-sig-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+
+  const eip = async (_typedDataJson: string): Promise<string> => '0xdeadbeef'
+  const svm = async (_intentJson: string): Promise<string> => 'base64tx'
+  const xrpl = async (_intentJson: string): Promise<string> => 'hexblob'
+
+  it('accepts an eip155 signer and keeps free tools structured', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(
+        mesh,
+        null,
+        tmpPolicy('eip'),
+        'production',
+        false,
+        '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
+        eip,
+      )
+      expect(JSON.parse(await gw.search('')).status).toBe('ok')
+    })
+  })
+
+  it('all three signer schemes coexist', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(
+        mesh,
+        null,
+        tmpPolicy('all'),
+        'dev_test',
+        false,
+        '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
+        eip,
+        'So11111111111111111111111111111111111111112',
+        svm,
+        'rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe',
+        xrpl,
+      )
+      expect(JSON.parse(await gw.search('')).status).toBe('ok')
+    })
+  })
+
+  it('a signer address without its callback is a construction error', async () => {
+    await withMesh(async (mesh) => {
+      // eip155 address, no callback.
+      expect(
+        () => new CapabilityGateway(mesh, null, tmpPolicy('half'), 'production', false, '0xpayer'),
+      ).toThrow()
+    })
+  })
+
+  it('a signer requires a policy path', async () => {
+    await withMesh(async (mesh) => {
+      // A signer with no paymentPolicyPath is a construction error.
+      expect(
+        () =>
+          new CapabilityGateway(
+            mesh,
+            null,
+            null,
+            null,
+            null,
+            '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
+            eip,
+          ),
+      ).toThrow()
+    })
+  })
+})

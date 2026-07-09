@@ -60,6 +60,10 @@ mod mcp_helpers;
 // embedded NetMesh node) + the caller payment flow. Behind `payments`.
 #[cfg(feature = "payments")]
 mod capability_gateway;
+// JS signer callbacks bridged into the payments SchemeSigner seam (real-network
+// settlement). Behind `payments`.
+#[cfg(feature = "payments")]
+mod payment_signer;
 // The outbound HTTP-402 client (pay an external x402 HTTP API). Behind the
 // opt-in `payments-http` (pulls reqwest via net-payments/http-facilitator).
 #[cfg(feature = "payments-http")]
