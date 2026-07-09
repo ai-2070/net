@@ -1,0 +1,22 @@
+net/crates/net/docs/misc/PAYMENTS_DOCS_CLAIMS_AUDIT.md
+  s_8145011de91f43::t_290019ee7bfd4d 1-138
+net/crates/net/docs/plans/PAYMENTS_DOCS_PLAN.md
+  s_8145011de91f43::t_e0ee94f36021ea 184
+  s_8145011de91f43::t_3d8489288fc85c 242-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7944c1969c627bd12c88f27881201411a99728b9",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
