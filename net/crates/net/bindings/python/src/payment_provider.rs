@@ -1,9 +1,10 @@
-//! Provider-side payment surface: pricing a capability (and, later, charging
-//! for it). The supply-side counterpart to `capability_gateway.rs` — the
-//! helpers a Python node needs to *be* a paid provider, mirroring the Rust
-//! reference (`sdk/src/tool.rs` pricing + the MCP wrap `payment_admission`
-//! gate). Doctrine #1 holds: authoring/settlement logic is `net-payments`;
-//! this marshals config in and the canonical envelope out.
+//! Provider-side payment surface: pricing a capability + charging for it. The
+//! supply-side counterpart to `capability_gateway.rs` — what a Python node
+//! needs to *be* a paid provider: author `net.pricing.terms@1`
+//! ([`build_pricing_terms`]) and stand up a [`PyPaymentProvider`] that runs one
+//! shared `PaymentEngine` behind the quote/pay wire and gates its priced tools
+//! (the MCP wrap `payment_admission` path). Doctrine #1 holds: the engine +
+//! settlement logic is `net-payments`; this marshals config in.
 
 #![cfg(feature = "payments")]
 
@@ -130,3 +131,204 @@ mod tests {
         assert!(author_pricing_terms([1u8; 32], "prov/echo", bad).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// PaymentProvider — a Python node that PRICES + CHARGES for its own tools.
+// One shared PaymentEngine serves the quote/pay wire AND gates the priced
+// tools (redeem against the same engine). Needs the `publish` feature (the
+// tool-publish building blocks) alongside `payments`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "publish")]
+mod provider {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use pyo3::exceptions::{PyRuntimeError, PyValueError};
+    use pyo3::prelude::*;
+    use serde_json::Value;
+    use tokio::runtime::Runtime;
+
+    use net::adapter::net::MeshNode;
+    use net_mcp::spec::{Implementation, Tool};
+    use net_mcp::wrap::{
+        CredentialStatus, LoweringContext, OwnerScope, ServerPublisher, Substitutability,
+        ToolInvoker, WrapConfig,
+    };
+    use net_payments::billing::BillingLog;
+    use net_payments::core::registry::default_registry_v1;
+    use net_payments::engine::{AdmitAll, PaymentEngine};
+    use net_payments::facilitator::mock::MockFacilitator;
+    use net_payments::flow::mcp_gate::EnginePaymentAdmission;
+    use net_payments::flow::mesh::{serve_payments, PaymentServeHandle};
+    use net_payments::flow::{Clock, InProcessProvider, SystemClock};
+
+    use crate::publish::{mesh_over, PyLocalPublicationHandle, PyToolInvoker};
+
+    /// A paid-capability provider over an embedded `NetMesh` node — the supply
+    /// side. Construction stands up one `PaymentEngine` behind the quote/pay
+    /// wire; :meth:`publish_paid_tools` publishes priced tools gated by that
+    /// same engine, so a quote paid over the wire is the quote the gate
+    /// redeems. Hold the provider to keep the wire served.
+    #[pyclass(name = "PaymentProvider", module = "net._net")]
+    pub struct PyPaymentProvider {
+        engine: Arc<PaymentEngine>,
+        node: Arc<MeshNode>,
+        runtime: Arc<Runtime>,
+        provider_entity_id: Vec<u8>,
+        /// Keeps the `net.payments.quote/pay` services registered on the node.
+        _serve: PaymentServeHandle,
+    }
+
+    #[pymethods]
+    impl PyPaymentProvider {
+        /// Build a provider over a started ``mesh``. ``state_path`` is the
+        /// settlement store file — it holds the replay/idempotency index and
+        /// **must be durable + single-owner** (a temp path loses paid quotes
+        /// across restarts). ``billing_log_path`` optionally records the
+        /// immutable ``net.billing.event@1`` stream.
+        #[new]
+        #[pyo3(signature = (mesh, state_path, billing_log_path=None))]
+        fn new(
+            mesh: &crate::mesh_bindings::NetMesh,
+            state_path: String,
+            billing_log_path: Option<String>,
+        ) -> PyResult<Self> {
+            let node = mesh.node_arc_clone()?;
+            let runtime = mesh.runtime_arc();
+            // The provider payment identity IS the node's mesh identity: quotes
+            // are signed by, and settlement tracked against, the same ed25519
+            // identity peers see on the mesh (matches the pricing terms' provider
+            // + the caller-side payment identity). Borrowed in-process — nothing
+            // crosses the boundary.
+            let sdk_mesh = mesh_over(node.clone());
+            let provider = Arc::new(sdk_mesh.entity_keypair().clone());
+            let entity_id = provider.entity_id().clone();
+            let provider_entity_id = entity_id.as_bytes().to_vec();
+            let registry = default_registry_v1(entity_id);
+            // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
+            // may quote; PAYMENT is the real gate on the serve).
+            let mut engine = PaymentEngine::new(
+                provider,
+                Arc::new(MockFacilitator::new()),
+                Arc::new(AdmitAll),
+                registry,
+                PathBuf::from(state_path),
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("payment engine: {e}")))?;
+            if let Some(bp) = billing_log_path {
+                engine = engine.with_billing_log(Arc::new(BillingLog::new(bp)));
+            }
+            let engine = Arc::new(engine);
+
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock));
+            let serve = serve_payments(&sdk_mesh, in_process)
+                .map_err(|e| PyRuntimeError::new_err(format!("serve payments: {e}")))?;
+
+            Ok(Self {
+                engine,
+                node,
+                runtime,
+                provider_entity_id,
+                _serve: serve,
+            })
+        }
+
+        /// The node's 32-byte mesh entity id — the provider identity these tools
+        /// price + quote under. Pass it to :func:`build_pricing_terms`.
+        #[getter]
+        fn provider_entity_id(&self) -> Vec<u8> {
+            self.provider_entity_id.clone()
+        }
+
+        /// Publish priced tools, gated by this provider's payment engine. Each
+        /// ``tools`` entry is ``(name, description|None, input_schema_json)``;
+        /// ``callback`` is the async invoker; ``pricing`` maps a tool name to
+        /// its ``net.pricing.terms@1`` JSON (from :func:`build_pricing_terms`).
+        /// A priced tool serves only **after** its quote is paid + redeemed
+        /// (at-most-once). Fail-closed: an empty ``pricing`` map is a
+        /// ``ValueError`` (use ``NetMesh.publish_tools`` for free tools); a
+        /// pricing key naming no published tool is a publish error. ``version`` /
+        /// ``owner_origin`` / ``allow_any_caller`` are as on
+        /// ``NetMesh.publish_tools``. Hold the returned handle to keep serving.
+        #[pyo3(signature = (tools, callback, pricing, version=String::new(), owner_origin=None, allow_any_caller=false))]
+        #[allow(clippy::too_many_arguments)]
+        fn publish_paid_tools(
+            &self,
+            py: Python<'_>,
+            tools: Vec<(String, Option<String>, String)>,
+            callback: Py<PyAny>,
+            pricing: HashMap<String, String>,
+            version: String,
+            owner_origin: Option<u64>,
+            allow_any_caller: bool,
+        ) -> PyResult<PyLocalPublicationHandle> {
+            if pricing.is_empty() {
+                return Err(PyValueError::new_err(
+                    "publish_paid_tools requires a non-empty pricing map \
+                     (tool name -> net.pricing.terms@1 JSON from build_pricing_terms); \
+                     use NetMesh.publish_tools for free tools",
+                ));
+            }
+            let mut sdk_tools = Vec::with_capacity(tools.len());
+            for (name, description, schema_json) in &tools {
+                let input_schema: Value = serde_json::from_str(schema_json).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "tool `{name}`: input_schema is not valid JSON: {e}"
+                    ))
+                })?;
+                sdk_tools.push(Tool {
+                    name: name.clone(),
+                    title: None,
+                    description: description.clone(),
+                    input_schema,
+                    output_schema: None,
+                });
+            }
+            let ctx = LoweringContext {
+                server_version: if version.is_empty() {
+                    "0".to_string()
+                } else {
+                    version
+                },
+                credential_status: CredentialStatus::None,
+                substitutability: Substitutability::ProviderLocal,
+                pricing: Default::default(), // pricing rides `config.pricing`
+            };
+            let mesh = Arc::new(mesh_over(self.node.clone()));
+            let owner = owner_origin.unwrap_or_else(|| mesh.origin_hash());
+            let mut config = WrapConfig::owner_only(
+                Implementation {
+                    name: "net-publish".to_string(),
+                    version: "0".to_string(),
+                },
+                owner,
+            );
+            if allow_any_caller {
+                config.scope = OwnerScope::any();
+            }
+            config.pricing = pricing.into_iter().collect();
+            // The gate: redeem quotes against THIS provider's engine — the same
+            // engine the quote/pay wire serves — so a paid tool serves once,
+            // after payment. A priced tool with no gate is a wrap error; here
+            // the gate is always set.
+            config.payment_admission =
+                Some(Arc::new(EnginePaymentAdmission::new(self.engine.clone())));
+
+            let publisher = ServerPublisher::new(mesh);
+            let invoker: Arc<dyn ToolInvoker> = Arc::new(PyToolInvoker { callback });
+            let rt = Arc::clone(&self.runtime);
+            let handle = py
+                .detach(move || {
+                    rt.block_on(publisher.publish_tools(&sdk_tools, invoker, ctx, config))
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("publish_paid_tools failed: {e}")))?;
+            Ok(PyLocalPublicationHandle::wrap(handle, self.runtime.clone()))
+        }
+    }
+}
+
+#[cfg(feature = "publish")]
+pub use provider::PyPaymentProvider;

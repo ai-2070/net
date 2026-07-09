@@ -3379,6 +3379,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "payments")]
     {
         m.add_function(wrap_pyfunction!(payment_provider::build_pricing_terms, m)?)?;
+        #[cfg(feature = "publish")]
+        m.add_class::<payment_provider::PyPaymentProvider>()?;
     }
     #[cfg(feature = "net")]
     {

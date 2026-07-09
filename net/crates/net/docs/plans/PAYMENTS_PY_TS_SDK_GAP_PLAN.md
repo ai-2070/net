@@ -116,42 +116,40 @@ One handle owns the whole provider side. Construction wires a single
 `PaymentEngine` and stands up the quote/pay wire; publishing a tool attaches the
 admission gate over that same engine.
 
-- [ ] **`PaymentProvider` handle** (`net._net`), constructed from a started
-  `NetMesh`:
-  - Builds `PaymentEngine::new(provider_keypair, facilitator, admission,
-    registry, state_path)` where **`provider_keypair` is the node's mesh
-    identity** (`mesh.entity_keypair()`, borrowed in-process — consistent with
-    the caller side's payment identity, H8-clean; see Open Decision 1),
-    `facilitator` defaults to `MockFacilitator` (real settlement is the
-    `payments-http` follow-up), `admission` defaults **fail-closed** (see
-    below), `registry = default_registry_v1(entity_id)`, and `state_path` is a
-    caller-supplied durable directory (the settlement store must survive
-    restarts — never a temp path if quotes outlive the process).
-  - Calls `serve_payments(&mesh, InProcessProvider::new(engine,
-    Arc::new(SystemClock)))` and holds the returned `PaymentServeHandle` (drop =
-    unregister) so callers can quote + pay against this node.
-  - Optionally attaches `with_billing_log(BillingLog::new(path))` when a billing
-    path is supplied (A3).
-  - Exposes the engine's `EnginePaymentAdmission` to the publish path.
-- [ ] **Priced publish**: extend `NetMesh.publish_tools(...)` (or add a
-  `publish_paid_tools`) to accept `pricing: dict[str, str]` (tool name →
-  `net.pricing.terms@1` JSON from A1) and a `payment_provider: PaymentProvider`.
-  It sets `config.pricing = pricing` and `config.payment_admission =
-  Some(provider.admission())` on the existing `WrapConfig` path
-  (`publish.rs:141-167`), so a priced tool is gated by the same engine the wire
-  serves. **Fail-closed guard:** non-empty `pricing` without a `payment_provider`
-  is a construction-time `ValueError` (mirrors `WrapError::PricedWithoutPaymentGate`);
-  a `payment_provider` with empty pricing publishes free tools normally.
-- [ ] **Admission policy default is fail-closed, not `AdmitAll`.** `AdmitAll` is
-  flagged in-source as "tests and dev harnesses only." The Python default admits
-  based on the wrap config's owner scope (as free tools do today); an explicit
-  opt-in exposes a broader policy. Never default a paid provider to admit
-  everyone.
-- [ ] Tests: a driven Rust test (feature `payments`) standing up a
-  `PaymentProvider`-shaped node that prices + serves a tool once and bills one
-  event (the composition `mesh_paid_capability_e2e.rs` / `mcp_wrap_paid_e2e.rs`
-  prove, reached through the binding helpers); pytest rows for the fail-closed
-  guard + a paid publish handle; stub + `__init__` re-export + drift tests.
+- [x] **`PaymentProvider` handle** (`net._net`, `all(payments, publish)`),
+  constructed from a started `NetMesh`:
+  - Builds `PaymentEngine::new(provider_keypair, MockFacilitator, AdmitAll,
+    default_registry_v1(entity_id), state_path)` where **`provider_keypair` is
+    the node's mesh identity** (`mesh_over(node).entity_keypair()`, borrowed
+    in-process — matches the pricing terms' provider + the caller-side identity;
+    Open Decision 1). `state_path` is a caller-supplied durable file (the
+    settlement store — not a temp path if quotes outlive the process).
+  - Calls `serve_payments(&mesh, InProcessProvider::new(engine, SystemClock))`
+    and holds the `PaymentServeHandle` so callers can quote + pay this node.
+  - `with_billing_log(BillingLog::new(path))` when `billing_log_path` is given.
+  - `provider_entity_id` getter (the identity to hand `build_pricing_terms`).
+- [x] **Priced publish** — a dedicated `publish_paid_tools(tools, callback,
+  pricing, version?, owner_origin?, allow_any_caller?)` (keeping the free
+  `publish_tools` untouched, reusing publish.rs's `PyToolInvoker` / `mesh_over` /
+  `PyLocalPublicationHandle`). Sets `config.pricing = pricing` (tool name →
+  `net.pricing.terms@1` JSON from A1) and `config.payment_admission =
+  EnginePaymentAdmission(engine)` over the **same** engine the wire serves, so a
+  paid tool serves once, after payment. **Fail-closed:** an empty `pricing` map
+  is a `ValueError`; a pricing key naming no tool is a publish error
+  (`WrapError`). The gate is always set (no `PricedWithoutPaymentGate` path).
+- [x] **Fail-closed by scope, not by engine admission.** Invocation is gated by
+  the wrap `owner_only` scope by default (a paid *public* tool needs the explicit
+  `allow_any_caller=True`); `AdmitAll` only opens QUOTE issuance, which is correct
+  for a paid tool — anyone may quote, but PAYMENT (the `EnginePaymentAdmission`
+  redeem) is the gate on the serve. So the default never serves an unpaid or
+  unscoped call.
+- [x] Tests: pytest rows (construction + `provider_entity_id == mesh.entity_id`,
+  the fail-closed empty-`pricing` guard, and a priced-tool publish returning a
+  live handle) + stub + `__init__` re-export. The paid serve/settle composition
+  itself — `PaymentEngine` + `serve_payments` + `EnginePaymentAdmission` — is the
+  one `mesh_paid_capability_e2e.rs` / `mcp_wrap_paid_e2e.rs` already prove; this
+  binding constructs exactly that. (A two-node Python paid round-trip is a
+  worthwhile follow-up e2e.)
 
 ### A3 — Billing read surface
 

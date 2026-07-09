@@ -3382,3 +3382,52 @@ def build_pricing_terms(
     Raises ``ValueError`` on a non-32-byte id, malformed JSON, or an empty
     list."""
     ...
+
+class PaymentProvider:
+    """A paid-capability provider over an embedded :class:`NetMesh` node — the
+    supply side of payments (price + charge). Construction stands up one
+    ``PaymentEngine`` behind the quote/pay wire; :meth:`publish_paid_tools`
+    publishes priced tools gated by that same engine, so a quote paid over the
+    wire is the quote the gate redeems (at-most-once, after payment). Present
+    iff the module was built with the ``payments`` **and** ``publish`` features
+    (the default wheel has both). Hold the instance to keep the wire served."""
+
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        state_path: str,
+        billing_log_path: Optional[str] = None,
+    ) -> None:
+        """Build a provider over a started ``mesh``. ``state_path`` is the
+        settlement store file — it holds the replay/idempotency index and
+        **must be durable + single-owner** (a temp path loses paid quotes across
+        restarts). ``billing_log_path`` optionally records the immutable
+        ``net.billing.event@1`` stream."""
+        ...
+
+    @property
+    def provider_entity_id(self) -> bytes:
+        """The node's 32-byte mesh entity id — the provider identity these tools
+        price + quote under. Pass it to :func:`build_pricing_terms`."""
+        ...
+
+    def publish_paid_tools(
+        self,
+        tools: List[Tuple[str, Optional[str], str]],
+        callback: Any,
+        pricing: Dict[str, str],
+        version: str = ...,
+        owner_origin: Optional[int] = ...,
+        allow_any_caller: bool = ...,
+    ) -> "LocalPublicationHandle":
+        """Publish priced tools gated by this provider's payment engine.
+        ``tools`` is a list of ``(name, description|None, input_schema_json)``;
+        ``callback`` is the same async invoker as ``NetMesh.publish_tools``;
+        ``pricing`` maps a tool name to its ``net.pricing.terms@1`` JSON (from
+        :func:`build_pricing_terms`). A priced tool serves only **after** its
+        quote is paid + redeemed. Fail-closed: an empty ``pricing`` map raises
+        ``ValueError`` (use ``NetMesh.publish_tools`` for free tools); a pricing
+        key naming no published tool is a publish error. ``version`` /
+        ``owner_origin`` / ``allow_any_caller`` are as on
+        ``NetMesh.publish_tools``. Hold the returned handle to keep serving."""
+        ...

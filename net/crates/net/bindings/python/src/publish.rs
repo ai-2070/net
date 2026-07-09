@@ -38,8 +38,8 @@ use serde_json::Value;
 /// coroutine runs on the binding's dispatcher loop (see
 /// [`crate::async_bridge::dispatch_handler_coro`]); a raised Python exception
 /// becomes a transport error the demand side surfaces in-band.
-struct PyToolInvoker {
-    callback: Py<PyAny>,
+pub(crate) struct PyToolInvoker {
+    pub(crate) callback: Py<PyAny>,
 }
 
 #[async_trait::async_trait]
@@ -97,7 +97,7 @@ fn py_to_result(obj: &Bound<'_, PyAny>) -> Result<CallToolResult, McpError> {
 /// Wrap a raw node in an SDK `Mesh` sharing the live node (a fresh channel
 /// registry — nRPC dispatch lives on the node; the registry is auxiliary
 /// bookkeeping the served handles keep alive). Mirrors `enrollment::mesh_over`.
-fn mesh_over(node: Arc<MeshNode>) -> Mesh {
+pub(crate) fn mesh_over(node: Arc<MeshNode>) -> Mesh {
     Mesh::from_node_arc(node, Arc::new(ChannelConfigRegistry::new()), None)
 }
 
@@ -192,6 +192,17 @@ pub(crate) fn mesh_publish_tools(
 pub struct PyLocalPublicationHandle {
     inner: Option<LocalPublicationHandle>,
     runtime: Arc<Runtime>,
+}
+
+impl PyLocalPublicationHandle {
+    /// Wrap a fresh `LocalPublicationHandle` — for the paid publish path
+    /// ([`crate::payment_provider`]), which reuses the same handle type.
+    pub(crate) fn wrap(inner: LocalPublicationHandle, runtime: Arc<Runtime>) -> Self {
+        Self {
+            inner: Some(inner),
+            runtime,
+        }
+    }
 }
 
 #[pymethods]

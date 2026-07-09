@@ -59,3 +59,74 @@ def test_bad_input_raises_value_error():
         build_pricing_terms(ENTITY_ID, "prov/echo", "not json")
     with pytest.raises(ValueError):
         build_pricing_terms(b"\x00" * 31, "prov/echo", json.dumps(MOCK_REQS))  # not 32 bytes
+
+
+# ---------------------------------------------------------------------------
+# PaymentProvider (WS-A2): a Python node that prices + charges for its tools.
+# The paid serve/settle composition is pinned in Rust (net-payments
+# mcp_wrap_paid_e2e / mesh_paid_capability_e2e — the same PaymentEngine +
+# serve_payments + EnginePaymentAdmission this binding constructs); these
+# assert the Python surface: construction, the identity it prices under, the
+# priced-publish path, and the fail-closed guard. Needs net + mcp + payments +
+# publish (the default wheel); skips otherwise.
+# ---------------------------------------------------------------------------
+
+NetMesh = _net.__dict__.get("NetMesh")
+PaymentProvider = _net.__dict__.get("PaymentProvider")
+_HAVE_PROVIDER = NetMesh is not None and PaymentProvider is not None
+PSK = "42" * 32
+
+
+@pytest.fixture()
+def mesh():
+    if not _HAVE_PROVIDER:
+        pytest.skip("PaymentProvider not built (needs net+mcp+payments+publish)")
+    m = NetMesh("127.0.0.1:0", PSK)
+    m.start()
+    try:
+        yield m
+    finally:
+        m.shutdown()
+
+
+def test_provider_prices_under_the_node_identity(mesh, tmp_path):
+    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    # The provider prices + quotes under the node's own mesh identity.
+    assert provider.provider_entity_id == mesh.entity_id
+    assert len(provider.provider_entity_id) == 32
+
+
+def test_publish_paid_tools_requires_pricing(mesh, tmp_path):
+    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+
+    async def cb(_name, _args_json):
+        return "ok"
+
+    # An empty pricing map is fail-closed (use publish_tools for free tools).
+    with pytest.raises(ValueError):
+        provider.publish_paid_tools([("echo", None, "{}")], cb, {})
+
+
+def test_publish_paid_tools_serves_a_priced_tool(mesh, tmp_path):
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        billing_log_path=str(tmp_path / "billing.jsonl"),
+    )
+    # The announced price for the "echo" tool, under this node's capability id.
+    capability = f"{mesh.node_id}/echo"
+    terms = build_pricing_terms(provider.provider_entity_id, capability, json.dumps(MOCK_REQS))
+
+    async def cb(_name, _args_json):
+        return "echoed"
+
+    handle = provider.publish_paid_tools(
+        [("echo", "Echo a value.", '{"type":"object"}')],
+        cb,
+        {"echo": terms},
+    )
+    try:
+        # The priced tool is served (its channel-safe id is in the handle).
+        assert handle.tools, "the priced tool is served"
+    finally:
+        handle.stop()

@@ -851,6 +851,17 @@ except ImportError:
 else:
     __all__.append("build_pricing_terms")
 
+# The paid-capability provider (price + charge over a shared PaymentEngine).
+# Present iff built with BOTH `payments` and `publish` (the default wheel has
+# both).
+try:
+    from ._net import PaymentProvider
+except ImportError:
+    # `payments` + `publish` not both compiled in; symbol stays undefined.
+    pass
+else:
+    __all__.append("PaymentProvider")
+
 # Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): a
 # DelegationChain (`root -> machine -> gateway -> subagent`) for
 # capability-invocation attribution, a shared RevocationRegistry, and
