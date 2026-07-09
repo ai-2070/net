@@ -52,7 +52,7 @@ const noopHandler = async (_args: { toolName: string; argumentsJson: string }) =
 async function withProvider(fn: (mesh: any) => Promise<void>): Promise<void> {
   const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
   try {
-    mesh.start()
+    await mesh.start() // async NAPI method — await so the node is up first
     await fn(mesh)
   } finally {
     await mesh.shutdown()
@@ -152,7 +152,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('close() releases the node (publishPaidTools then throws; shutdown runs)', async () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
-    mesh.start()
+    await mesh.start()
     const provider = new PaymentProvider(mesh, tmp('close.state'))
     const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
     provider.close() // tears down the quote/pay wire + drops the node clone

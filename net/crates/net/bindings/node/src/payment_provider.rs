@@ -318,8 +318,14 @@ mod provider {
                 allow_any_caller: None,
                 handler_timeout_ms: None,
             });
-            let owner_origin = parse_owner_origin(opts.owner_origin)?;
             let allow_any_caller = opts.allow_any_caller.unwrap_or(false);
+            // `allowAnyCaller` overrides `ownerOrigin` (the scope becomes
+            // `any()`), so don't validate a value that's about to be ignored.
+            let owner_origin = if allow_any_caller {
+                None
+            } else {
+                parse_owner_origin(opts.owner_origin)?
+            };
             let ctx = local_lowering_context(opts.version);
             let invoker = build_tool_invoker(handler, opts.handler_timeout_ms)?;
             let pricing: BTreeMap<String, String> = pricing.into_iter().collect();

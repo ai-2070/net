@@ -32,7 +32,7 @@ const PSK = '5b'.repeat(32)
 async function withPublishingMesh(fn: (mesh: any) => Promise<void>): Promise<void> {
   const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
   try {
-    mesh.start()
+    await mesh.start() // async NAPI method — await so the node is up before publishing
     await fn(mesh)
   } finally {
     await mesh.shutdown()
@@ -120,4 +120,17 @@ describe.skipIf(!HAS_PUBLISH)('NetMesh.publishTools', () => {
       ).toThrow()
     })
   })
+
+  it('allowAnyCaller overrides an (unused) invalid ownerOrigin', async () => {
+    await withPublishingMesh(async (mesh) => {
+      // allowAnyCaller makes the scope `any()`, so ownerOrigin is ignored — an
+      // invalid value alongside it must NOT be a construction error.
+      const handle = await mesh.publishTools([ECHO], noopHandler, {
+        ownerOrigin: -1n,
+        allowAnyCaller: true,
+      })
+      expect(handle.serving).toBe(true)
+      handle.stop()
+    })
+  }, 20000)
 })

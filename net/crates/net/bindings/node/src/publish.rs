@@ -322,8 +322,15 @@ pub(crate) fn spawn_publish_tools<'env>(
         allow_any_caller: None,
         handler_timeout_ms: None,
     });
-    let owner_origin = parse_owner_origin(opts.owner_origin)?;
     let allow_any_caller = opts.allow_any_caller.unwrap_or(false);
+    // `allowAnyCaller` overrides `ownerOrigin` (the scope becomes `any()`), so
+    // don't validate a value that's about to be ignored — an invalid
+    // `ownerOrigin` alongside `allowAnyCaller: true` is not a caller error.
+    let owner_origin = if allow_any_caller {
+        None
+    } else {
+        parse_owner_origin(opts.owner_origin)?
+    };
     let ctx = local_lowering_context(opts.version);
     let client_info = Implementation {
         name: "net-publish".to_string(),

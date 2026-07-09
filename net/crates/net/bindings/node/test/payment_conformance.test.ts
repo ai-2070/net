@@ -114,10 +114,10 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
     let gw: any
     let gwNoPay: any
     try {
-      // Handshake (caller dials provider) BEFORE start, then start both.
+      // Handshake (caller dials provider) BEFORE start, then start both (async
+      // NAPI methods — await so both nodes are up before publishing/invoking).
       await handshake(caller, provider)
-      provider.start()
-      caller.start()
+      await Promise.all([provider.start(), caller.start()])
 
       // Provider prices + serves an echo tool, admitting remote callers.
       pp = new PaymentProvider(provider, tmp('prov.state'))
