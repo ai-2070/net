@@ -145,8 +145,8 @@ fn err_json(status: &str, msg: impl std::fmt::Display) -> String {
 /// The twin of the Node gateway's `normalize_invoke_args`, so the two surfaces
 /// cannot drift.
 fn normalize_invoke_args(raw: &str) -> Result<Value, String> {
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|e| format!("arguments must be a JSON object: {e}"))?;
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("arguments must be a JSON object: {e}"))?;
     let value = if value.is_null() { json!({}) } else { value };
     if !value.is_object() {
         return Err("arguments must be a JSON object".to_string());

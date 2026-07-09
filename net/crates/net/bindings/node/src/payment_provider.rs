@@ -327,15 +327,7 @@ mod provider {
             let pricing: BTreeMap<String, String> = pricing.into_iter().collect();
             let admission: Arc<dyn net_mcp::serve::payment::PaymentAdmission> =
                 Arc::new(EnginePaymentAdmission::new(self.engine.clone()));
-            spawn_publish_tools(
-                env,
-                node,
-                tools,
-                handler,
-                options,
-                pricing,
-                Some(admission),
-            )
+            spawn_publish_tools(env, node, tools, handler, options, pricing, Some(admission))
         }
     }
 }

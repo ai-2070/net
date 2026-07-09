@@ -82,8 +82,8 @@ fn err_json(status: &str, msg: impl std::fmt::Display) -> String {
 /// The twin of the Python gateway's `normalize_invoke_args`, so the two
 /// surfaces cannot drift.
 fn normalize_invoke_args(raw: &str) -> std::result::Result<Value, String> {
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|e| format!("arguments must be a JSON object: {e}"))?;
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("arguments must be a JSON object: {e}"))?;
     let value = if value.is_null() { json!({}) } else { value };
     if !value.is_object() {
         return Err("arguments must be a JSON object".to_string());
@@ -789,7 +789,9 @@ mod tests {
             .unwrap();
         assert_eq!(c.profile, SpendProfile::DevTest);
         // An unknown profile is a construction error, never a silent fallback.
-        assert!(collect_payment_config(Some("/tmp/p.json".into()), Some("yolo".into()), false).is_err());
+        assert!(
+            collect_payment_config(Some("/tmp/p.json".into()), Some("yolo".into()), false).is_err()
+        );
     }
 
     #[test]
@@ -822,7 +824,10 @@ mod tests {
         assert_eq!(normalize_invoke_args("null").unwrap(), json!({}));
         // Arrays / primitives are a caller-shape error, never forwarded.
         for bad in ["[]", "true", "42", "\"str\""] {
-            assert!(normalize_invoke_args(bad).is_err(), "{bad} must be rejected");
+            assert!(
+                normalize_invoke_args(bad).is_err(),
+                "{bad} must be rejected"
+            );
         }
         // Malformed JSON is also invalid_arguments.
         assert!(normalize_invoke_args("not json").is_err());

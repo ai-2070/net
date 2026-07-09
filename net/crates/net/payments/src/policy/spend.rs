@@ -552,7 +552,10 @@ mod tests {
 
     #[test]
     fn spend_profile_parses_canonical_and_aliases_and_rejects_unknown() {
-        assert_eq!(SpendProfile::parse("production"), Ok(SpendProfile::Production));
+        assert_eq!(
+            SpendProfile::parse("production"),
+            Ok(SpendProfile::Production)
+        );
         for alias in ["dev_test", "dev-test", "devtest"] {
             assert_eq!(SpendProfile::parse(alias), Ok(SpendProfile::DevTest));
         }
@@ -560,6 +563,9 @@ mod tests {
         assert!(SpendProfile::parse("yolo").is_err());
         assert!("prod".parse::<SpendProfile>().is_err());
         // The error names the offending value.
-        assert!(SpendProfile::parse("nope").unwrap_err().to_string().contains("nope"));
+        assert!(SpendProfile::parse("nope")
+            .unwrap_err()
+            .to_string()
+            .contains("nope"));
     }
 }
