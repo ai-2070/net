@@ -90,7 +90,7 @@ webpki-root-certs = { version = "1", optional = true }
 # secp256k1 ECDSA + keccak256, for the DEV signer only
 # (`unsafe-dev-signer`). Production signing is external; these never
 # compile into a default build.
-k256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+k256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa"] }
 sha3 = { version = "0.12", optional = true }
 tracing = "0.1"
 
