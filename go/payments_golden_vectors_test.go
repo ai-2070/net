@@ -310,11 +310,25 @@ func TestPaymentsCanonicalWriterRejectsFloats(t *testing.T) {
 	}
 }
 
+// paymentsOptionalStrOk reports whether an Option<String> field is well-typed:
+// absent or JSON null (both decode to a nil map entry) is fine; any other
+// present type fails the typed serde deserialize, so a present optional is
+// still type-checked.
+func paymentsOptionalStrOk(m map[string]interface{}, k string) bool {
+	v, present := m[k]
+	if !present || v == nil {
+		return true
+	}
+	_, ok := v.(string)
+	return ok
+}
+
 // paymentsHasSchematicShape checks presence + JSON type of every required
-// FailureSchematic field (its non-optional fields; quote_id / tool_id / extra
-// keys stay optional) — the structural half of from_header_bytes (a full typed
-// serde deserialize). A tag-only or mistyped object does not deserialize, so it
-// is not accepted.
+// FailureSchematic field, plus the type of every present optional
+// (quote_id / tool_id / recovery.next_action are Option<String>; extra keys ride
+// serde flatten) — the structural half of from_header_bytes (a full typed serde
+// deserialize). A tag-only, mistyped-required, or mistyped-optional object does
+// not deserialize, so it is not accepted.
 func paymentsHasSchematicShape(obj map[string]interface{}) bool {
 	for _, k := range []string{"object", "code", "stage", "reason", "message", "funds_moved", "prior_payment"} {
 		if _, ok := obj[k].(string); !ok {
@@ -323,6 +337,11 @@ func paymentsHasSchematicShape(obj map[string]interface{}) bool {
 	}
 	for _, k := range []string{"retryable", "handler_executed"} {
 		if _, ok := obj[k].(bool); !ok {
+			return false
+		}
+	}
+	for _, k := range []string{"quote_id", "tool_id"} {
+		if !paymentsOptionalStrOk(obj, k) {
 			return false
 		}
 	}
@@ -340,7 +359,7 @@ func paymentsHasSchematicShape(obj map[string]interface{}) bool {
 			return false
 		}
 	}
-	return true
+	return paymentsOptionalStrOk(rec, "next_action")
 }
 
 // paymentsTolerantParse mirrors FailureSchematic::from_header_bytes: decode the

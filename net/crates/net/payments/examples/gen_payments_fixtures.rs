@@ -326,7 +326,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("schematic is a JSON object")
         .insert("retryable".to_string(), json!("no"));
     let wrong_type_retryable_header = serde_json::to_string(&wrong_type_val)?;
-    // (d) A structurally-complete schematic carrying a NON-STANDARD JSON number
+    // (d) An OPTIONAL typed field present but wrong-typed: `quote_id` is a number
+    // where the schematic types it `Option<String>`. A predicate that checks only
+    // the REQUIRED fields wrongly accepts (quote_id is optional); the full serde
+    // deserialize rejects, so this pins that a *present* optional is still
+    // type-checked across languages.
+    let mut quote_id_wrong_val = serde_json::to_value(&valid_schematic)?;
+    quote_id_wrong_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .insert("quote_id".to_string(), json!(42));
+    let quote_id_wrong_type_header = serde_json::to_string(&quote_id_wrong_val)?;
+    // (e) The same, but nested in `recovery`: `recovery.next_action` is a number
+    // where it is typed `Option<String>`.
+    let mut next_action_wrong_val = serde_json::to_value(&valid_schematic)?;
+    next_action_wrong_val
+        .get_mut("recovery")
+        .and_then(|r| r.as_object_mut())
+        .expect("recovery is a JSON object")
+        .insert("next_action".to_string(), json!(7));
+    let next_action_wrong_type_header = serde_json::to_string(&next_action_wrong_val)?;
+    // (f) A structurally-complete schematic carrying a NON-STANDARD JSON number
     // (`Infinity`). Every strict parser (serde_json, JS `JSON.parse`, Go
     // `encoding/json`) rejects it; only a lax parser (Python's default
     // `json.loads`, which accepts `Infinity`/`NaN`) would wrongly parse it —
@@ -406,7 +426,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         ],
         "failure_schematic_vectors": {
-            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. The optional quote_id/tool_id and recovery.next_action, when present, must be strings (a wrong-typed OPTIONAL fails the deserialize too — a required-fields-only predicate would wrongly accept). Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
             "tag": TAG_PAYMENT_FAILURE,
             "header_name": net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC,
             "cases": [
@@ -485,6 +505,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // string where the schematic requires a bool.
                     "name": "retryable_wrong_type",
                     "header_utf8": wrong_type_retryable_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, all REQUIRED fields present + well-typed, but
+                    // the optional `quote_id` is a number where it is typed
+                    // Option<String>. A required-fields-only predicate wrongly
+                    // accepts; the full serde deserialize rejects.
+                    "name": "optional_quote_id_wrong_type",
+                    "header_utf8": quote_id_wrong_type_header,
+                    "accepted": false,
+                },
+                {
+                    // The same for the optional nested `recovery.next_action`.
+                    "name": "optional_next_action_wrong_type",
+                    "header_utf8": next_action_wrong_type_header,
                     "accepted": false,
                 },
                 {

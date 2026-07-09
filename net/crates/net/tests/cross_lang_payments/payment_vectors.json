@@ -261,7 +261,7 @@
     }
   ],
   "failure_schematic_vectors": {
-    "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+    "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. The optional quote_id/tool_id and recovery.next_action, when present, must be strings (a wrong-typed OPTIONAL fails the deserialize too — a required-fields-only predicate would wrongly accept). Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
     "cases": [
       {
         "accepted": true,
@@ -337,6 +337,16 @@
         "accepted": false,
         "header_utf8": "{\"code\":\"payment\",\"funds_moved\":\"yes\",\"handler_executed\":false,\"message\":\"quote already redeemed — one payment, one serve\",\"object\":\"net.payment.failure@1\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"reason\":\"already_redeemed\",\"recovery\":{\"actor\":\"caller_agent\",\"class\":\"new_quote_required\",\"next_action\":\"request_new_quote\",\"safe_to_requote\":true,\"safe_to_retry\":false},\"retryable\":\"no\",\"stage\":\"redeem\",\"tool_id\":\"paid_echo\"}",
         "name": "retryable_wrong_type"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"code\":\"payment\",\"funds_moved\":\"yes\",\"handler_executed\":false,\"message\":\"quote already redeemed — one payment, one serve\",\"object\":\"net.payment.failure@1\",\"prior_payment\":\"consumed\",\"quote_id\":42,\"reason\":\"already_redeemed\",\"recovery\":{\"actor\":\"caller_agent\",\"class\":\"new_quote_required\",\"next_action\":\"request_new_quote\",\"safe_to_requote\":true,\"safe_to_retry\":false},\"retryable\":false,\"stage\":\"redeem\",\"tool_id\":\"paid_echo\"}",
+        "name": "optional_quote_id_wrong_type"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"code\":\"payment\",\"funds_moved\":\"yes\",\"handler_executed\":false,\"message\":\"quote already redeemed — one payment, one serve\",\"object\":\"net.payment.failure@1\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"reason\":\"already_redeemed\",\"recovery\":{\"actor\":\"caller_agent\",\"class\":\"new_quote_required\",\"next_action\":7,\"safe_to_requote\":true,\"safe_to_retry\":false},\"retryable\":false,\"stage\":\"redeem\",\"tool_id\":\"paid_echo\"}",
+        "name": "optional_next_action_wrong_type"
       },
       {
         "accepted": false,

@@ -79,16 +79,27 @@ function failureHeaderBytes(c: (typeof FAILURE.cases)[number]): Buffer {
 }
 
 // The required-field shape a `FailureSchematic` deserializes into (its
-// non-optional fields; `quote_id` / `tool_id` / extra keys stay optional).
+// non-optional fields). `quote_id` / `tool_id` / `recovery.next_action` are
+// `Option<String>` and extra keys ride `#[serde(flatten)]`.
 const REQUIRED_STR = ['object', 'code', 'stage', 'reason', 'message', 'funds_moved', 'prior_payment']
 const REQUIRED_BOOL = ['retryable', 'handler_executed']
 
-// Presence + JSON type of every required field — the structural half of
-// `from_header_bytes` (a full typed serde deserialize). A tag-only or mistyped
-// object does not deserialize, so it is not accepted.
+// An `Option<String>` field: absent or JSON `null` deserializes to `None`; any
+// other present type (a number, bool, array, object) fails the typed serde
+// deserialize, so a *present* optional is still type-checked.
+function optionalStrOk(obj: Record<string, unknown>, key: string): boolean {
+  const v = obj[key]
+  return v === undefined || v === null || typeof v === 'string'
+}
+
+// Presence + JSON type of every required field, plus the type of every present
+// optional — the structural half of `from_header_bytes` (a full typed serde
+// deserialize). A tag-only, mistyped-required, or mistyped-optional object does
+// not deserialize, so it is not accepted.
 function hasSchematicShape(obj: Record<string, unknown>): boolean {
   if (!REQUIRED_STR.every((k) => typeof obj[k] === 'string')) return false
   if (!REQUIRED_BOOL.every((k) => typeof obj[k] === 'boolean')) return false
+  if (!['quote_id', 'tool_id'].every((k) => optionalStrOk(obj, k))) return false
   const rec = obj.recovery
   if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) return false
   const r = rec as Record<string, unknown>
@@ -96,7 +107,8 @@ function hasSchematicShape(obj: Record<string, unknown>): boolean {
     typeof r.class === 'string' &&
     typeof r.actor === 'string' &&
     typeof r.safe_to_retry === 'boolean' &&
-    typeof r.safe_to_requote === 'boolean'
+    typeof r.safe_to_requote === 'boolean' &&
+    optionalStrOk(r, 'next_action')
   )
 }
 

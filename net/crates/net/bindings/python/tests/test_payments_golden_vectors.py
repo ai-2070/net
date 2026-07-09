@@ -122,29 +122,42 @@ def _failure_header_bytes(case) -> bytes:
 
 
 # The required-field shape a `FailureSchematic` deserializes into (its
-# non-optional fields; `quote_id` / `tool_id` / extra keys stay optional).
+# non-optional fields). `quote_id` / `tool_id` / `recovery.next_action` are
+# ``Option<String>`` and extra keys ride ``#[serde(flatten)]``.
 _REQUIRED_STR = ("object", "code", "stage", "reason", "message", "funds_moved", "prior_payment")
 _REQUIRED_BOOL = ("retryable", "handler_executed")
 _RECOVERY_STR = ("class", "actor")
 _RECOVERY_BOOL = ("safe_to_retry", "safe_to_requote")
 
 
+def _optional_str_ok(obj, key) -> bool:
+    """An ``Option<String>`` field: absent or JSON ``null`` (both -> ``None``)
+    deserializes to ``None``; any other present type fails the typed serde
+    deserialize, so a *present* optional is still type-checked."""
+    v = obj.get(key)
+    return v is None or isinstance(v, str)
+
+
 def _has_schematic_shape(obj) -> bool:
-    """Presence + JSON type of every required field — the structural half of
-    ``from_header_bytes`` (a full typed serde deserialize). A tag-only or
-    mistyped object does NOT deserialize, so it is not accepted. (``bool`` is a
-    subclass of ``int`` in Python but not of ``str``, so the checks don't
-    cross-accept.)"""
+    """Presence + JSON type of every required field, plus the type of every
+    present optional — the structural half of ``from_header_bytes`` (a full
+    typed serde deserialize). A tag-only, mistyped-required, or mistyped-optional
+    object does NOT deserialize, so it is not accepted. (``bool`` is a subclass
+    of ``int`` in Python but not of ``str``, so the checks don't cross-accept.)"""
     if not all(isinstance(obj.get(k), str) for k in _REQUIRED_STR):
         return False
     if not all(isinstance(obj.get(k), bool) for k in _REQUIRED_BOOL):
+        return False
+    if not all(_optional_str_ok(obj, k) for k in ("quote_id", "tool_id")):
         return False
     rec = obj.get("recovery")
     if not isinstance(rec, dict):
         return False
     if not all(isinstance(rec.get(k), str) for k in _RECOVERY_STR):
         return False
-    return all(isinstance(rec.get(k), bool) for k in _RECOVERY_BOOL)
+    if not all(isinstance(rec.get(k), bool) for k in _RECOVERY_BOOL):
+        return False
+    return _optional_str_ok(rec, "next_action")
 
 
 def _reject_non_standard(token):
