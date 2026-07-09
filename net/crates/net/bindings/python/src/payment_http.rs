@@ -115,15 +115,9 @@ fn build_flow(
     identity: Option<&crate::identity::Identity>,
     config: PaymentConfig,
 ) -> PyResult<X402HttpFlow> {
-    let profile = match config.profile.as_str() {
-        "production" => SpendProfile::Production,
-        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown payment_profile {other:?} (expected \"production\" or \"dev_test\")"
-            )))
-        }
-    };
+    // Vocabulary lives once in core (`SpendProfile::parse`).
+    let profile =
+        SpendProfile::parse(&config.profile).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // The payer identity. There is no provider identity on this path and no
     // signed quote (policy runs on a local pseudo-quote), so an ephemeral

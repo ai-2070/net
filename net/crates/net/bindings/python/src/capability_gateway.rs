@@ -320,10 +320,11 @@ async fn do_invoke(
 #[cfg(feature = "payments")]
 fn spend_engine(path: &str, profile: &str) -> net_payments::policy::spend::SpendPolicyEngine {
     use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
-    let profile = match profile {
-        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
-        _ => SpendProfile::Production,
-    };
+    // Vocabulary + fallibility live once in core (`SpendProfile::parse`). The
+    // stored profile was validated at construction (`build_payment_flow`), so the
+    // parse cannot fail here; fall back fail-closed to `Production` rather than
+    // silently widening the posture if it somehow does.
+    let profile = SpendProfile::parse(profile).unwrap_or_default();
     SpendPolicyEngine::new(path, profile)
 }
 
@@ -638,15 +639,10 @@ fn build_payment_flow(
     let Some(config) = config else {
         return Ok(None);
     };
-    let profile = match config.profile.as_str() {
-        "production" => SpendProfile::Production,
-        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown payment_profile {other:?} (expected \"production\" or \"dev_test\")"
-            )))
-        }
-    };
+    // Vocabulary lives once in core (`SpendProfile::parse`), so the node and
+    // python bindings cannot drift on the profile spellings.
+    let profile =
+        SpendProfile::parse(&config.profile).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let caller = Arc::new(mesh.entity_keypair().clone());
     // The v1 default registry (mock + the survey networks). A superset
     // of P0's mock-only default: real networks stay unspendable until

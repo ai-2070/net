@@ -86,13 +86,9 @@ fn outcome_to_result(outcome: X402HttpOutcome) -> (String, Vec<u8>) {
 }
 
 fn parse_profile(profile: &str) -> Result<SpendProfile> {
-    match profile {
-        "production" => Ok(SpendProfile::Production),
-        "dev_test" | "dev-test" | "devtest" => Ok(SpendProfile::DevTest),
-        other => Err(Error::from_reason(format!(
-            "payment-http: unknown paymentProfile {other:?} (expected \"production\" or \"dev_test\")"
-        ))),
-    }
+    // Vocabulary lives once in core (`SpendProfile::parse`); this only adds the
+    // surface prefix to the message.
+    SpendProfile::parse(profile).map_err(|e| Error::from_reason(format!("payment-http: {e}")))
 }
 
 struct HttpConfig {

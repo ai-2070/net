@@ -88,6 +88,48 @@ pub enum SpendProfile {
     DevTest,
 }
 
+/// Error from [`SpendProfile::parse`] — an unrecognized profile string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownSpendProfile(pub String);
+
+impl std::fmt::Display for UnknownSpendProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown payment profile {:?} (expected \"production\" or \"dev_test\")",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownSpendProfile {}
+
+impl SpendProfile {
+    /// Parse the profile string the language bindings accept. Canonical
+    /// spellings are `"production"` and `"dev_test"`; `"dev-test"` / `"devtest"`
+    /// are accepted aliases. Any other value is a caller error — there is
+    /// deliberately **no silent fallback**, so a typo can never quietly widen
+    /// the posture to `DevTest` nor quietly narrow an intended `DevTest` to
+    /// `Production`.
+    ///
+    /// The single source of truth for every binding's `payment_profile` /
+    /// `paymentProfile` kwarg, so the vocabulary cannot drift per language.
+    pub fn parse(s: &str) -> Result<Self, UnknownSpendProfile> {
+        match s {
+            "production" => Ok(Self::Production),
+            "dev_test" | "dev-test" | "devtest" => Ok(Self::DevTest),
+            other => Err(UnknownSpendProfile(other.to_string())),
+        }
+    }
+}
+
+impl std::str::FromStr for SpendProfile {
+    type Err = UnknownSpendProfile;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 /// The structured caller-side gate outcome, mirroring the consent shape.
 /// The gateway surfaces `RequiresPaymentApproval` as
 /// `{status: "requires_payment_approval", quote, policy_reason,
@@ -506,5 +548,18 @@ mod tests {
     fn counter_keys_parse_their_day() {
         assert_eq!(counter_day("11574|mock:net|musd"), Some(11_574));
         assert_eq!(counter_day("garbage"), None);
+    }
+
+    #[test]
+    fn spend_profile_parses_canonical_and_aliases_and_rejects_unknown() {
+        assert_eq!(SpendProfile::parse("production"), Ok(SpendProfile::Production));
+        for alias in ["dev_test", "dev-test", "devtest"] {
+            assert_eq!(SpendProfile::parse(alias), Ok(SpendProfile::DevTest));
+        }
+        // No silent fallback: an unknown profile is an error, never Production.
+        assert!(SpendProfile::parse("yolo").is_err());
+        assert!("prod".parse::<SpendProfile>().is_err());
+        // The error names the offending value.
+        assert!(SpendProfile::parse("nope").unwrap_err().to_string().contains("nope"));
     }
 }

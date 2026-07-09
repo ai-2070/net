@@ -258,42 +258,42 @@ async fn do_invoke(
 // this maps config strings to constructors.
 // ---------------------------------------------------------------------------
 
-/// Payment config collected from the constructor options.
+/// Payment config collected from the constructor options. The profile string is
+/// parsed to a [`SpendProfile`] here, once — the operator verbs and the flow
+/// then share that value, so there is no second (divergent) parse.
 struct PaymentConfig {
     policy_path: String,
-    profile: String,
+    profile: SpendProfile,
     unsafe_mock_auto_allow: bool,
 }
 
 /// A `paymentProfile` / unsafe flag without a `paymentPolicyPath` is a caller
 /// error; the policy path is the shared spend-policy store the flow reserves
-/// against.
+/// against. An unknown `paymentProfile` is a construction error (no silent
+/// fallback — the vocabulary is [`SpendProfile::parse`] in core).
 fn collect_payment_config(
     policy_path: Option<String>,
     profile: Option<String>,
     unsafe_mock_auto_allow: bool,
 ) -> Result<Option<PaymentConfig>> {
     match policy_path {
-        Some(policy_path) => Ok(Some(PaymentConfig {
-            policy_path,
-            profile: profile.unwrap_or_else(|| "production".to_string()),
-            unsafe_mock_auto_allow,
-        })),
+        Some(policy_path) => {
+            let profile = match profile {
+                Some(p) => SpendProfile::parse(&p)
+                    .map_err(|e| Error::from_reason(format!("gateway: {e}")))?,
+                None => SpendProfile::default(),
+            };
+            Ok(Some(PaymentConfig {
+                policy_path,
+                profile,
+                unsafe_mock_auto_allow,
+            }))
+        }
         None if profile.is_some() || unsafe_mock_auto_allow => Err(Error::from_reason(
             "gateway: paymentProfile / paymentUnsafeMockAutoAllow require paymentPolicyPath \
              (the shared spend-policy store)",
         )),
         None => Ok(None),
-    }
-}
-
-fn parse_profile(profile: &str) -> Result<SpendProfile> {
-    match profile {
-        "production" => Ok(SpendProfile::Production),
-        "dev_test" | "dev-test" | "devtest" => Ok(SpendProfile::DevTest),
-        other => Err(Error::from_reason(format!(
-            "gateway: unknown paymentProfile {other:?} (expected \"production\" or \"dev_test\")"
-        ))),
     }
 }
 
@@ -347,10 +347,9 @@ fn build_payment_flow(
         }
         return Ok(None);
     };
-    let profile = parse_profile(&config.profile)?;
     let caller = Arc::new(mesh.entity_keypair().clone());
     let registry = default_registry_v1(caller.entity_id().clone());
-    let spend = SpendPolicyEngine::new(&config.policy_path, profile)
+    let spend = SpendPolicyEngine::new(&config.policy_path, config.profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
     let mut flow = CallerPaymentFlow::new(
         caller,
@@ -366,12 +365,10 @@ fn build_payment_flow(
 }
 
 /// A `SpendPolicyEngine` for the operator verbs, keyed on the same store the
-/// flow reserves against (the unsafe flag doesn't affect these verbs).
-fn spend_engine(path: &str, profile: &str) -> SpendPolicyEngine {
-    let profile = match profile {
-        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
-        _ => SpendProfile::Production,
-    };
+/// flow reserves against (the unsafe flag doesn't affect these verbs). Takes the
+/// already-parsed [`SpendProfile`] the gateway retained at construction — no
+/// re-parse, so the verbs and the flow can never disagree on the profile.
+fn spend_engine(path: &str, profile: SpendProfile) -> SpendPolicyEngine {
     SpendPolicyEngine::new(path, profile)
 }
 
@@ -385,13 +382,13 @@ fn no_policy_json() -> String {
 
 async fn do_approve_payment(
     policy_path: Option<String>,
-    profile: String,
+    profile: SpendProfile,
     quote_id: String,
 ) -> String {
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).approve(&quote_id).await {
+    match spend_engine(&path, profile).approve(&quote_id).await {
         Ok(changed) => {
             json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
         }
@@ -401,13 +398,13 @@ async fn do_approve_payment(
 
 async fn do_reject_payment(
     policy_path: Option<String>,
-    profile: String,
+    profile: SpendProfile,
     quote_id: String,
 ) -> String {
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).reject(&quote_id).await {
+    match spend_engine(&path, profile).reject(&quote_id).await {
         Ok(changed) => {
             json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
         }
@@ -415,11 +412,11 @@ async fn do_reject_payment(
     }
 }
 
-async fn do_pending_payments(policy_path: Option<String>, profile: String) -> String {
+async fn do_pending_payments(policy_path: Option<String>, profile: SpendProfile) -> String {
     let Some(path) = policy_path else {
         return no_policy_json();
     };
-    match spend_engine(&path, &profile).pending().await {
+    match spend_engine(&path, profile).pending().await {
         Ok(quotes) => json!({ "status": "ok", "pending": quotes }).to_string(),
         Err(e) => err_json("error", e),
     }
@@ -427,7 +424,7 @@ async fn do_pending_payments(policy_path: Option<String>, profile: String) -> St
 
 async fn do_spent_today(
     policy_path: Option<String>,
-    profile: String,
+    profile: SpendProfile,
     network: String,
     asset: String,
 ) -> String {
@@ -435,7 +432,7 @@ async fn do_spent_today(
         return no_policy_json();
     };
     let now_ns = SystemClock.now_ns();
-    match spend_engine(&path, &profile)
+    match spend_engine(&path, profile)
         .spent_today(&network, &asset, now_ns)
         .await
     {
@@ -491,7 +488,7 @@ pub struct CapabilityGateway {
     /// no `paymentPolicyPath` supplied; the verbs return `no_payment_policy`.
     /// Independent of the node, so the verbs keep working after `close()`.
     spend_policy_path: Option<String>,
-    spend_profile: String,
+    spend_profile: SpendProfile,
 }
 
 /// The live handles cloned out of the lock for one call — the gateway plus the
@@ -587,8 +584,8 @@ impl CapabilityGateway {
         // Retain the store path + profile before `build_payment_flow` consumes
         // the config, so the approval verbs can reopen it.
         let (spend_policy_path, spend_profile) = match &config {
-            Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
-            None => (None, "production".to_string()),
+            Some(c) => (Some(c.policy_path.clone()), c.profile),
+            None => (None, SpendProfile::default()),
         };
         let payment = build_payment_flow(sdk_mesh.clone(), config, signers)?;
 
@@ -693,7 +690,7 @@ impl CapabilityGateway {
     #[napi]
     pub async fn approve_payment(&self, quote_id: String) -> Result<String> {
         let path = self.spend_policy_path.clone();
-        let profile = self.spend_profile.clone();
+        let profile = self.spend_profile;
         Ok(do_approve_payment(path, profile, quote_id).await)
     }
 
@@ -702,7 +699,7 @@ impl CapabilityGateway {
     #[napi]
     pub async fn reject_payment(&self, quote_id: String) -> Result<String> {
         let path = self.spend_policy_path.clone();
-        let profile = self.spend_profile.clone();
+        let profile = self.spend_profile;
         Ok(do_reject_payment(path, profile, quote_id).await)
     }
 
@@ -711,7 +708,7 @@ impl CapabilityGateway {
     #[napi]
     pub async fn pending_payments(&self) -> Result<String> {
         let path = self.spend_policy_path.clone();
-        let profile = self.spend_profile.clone();
+        let profile = self.spend_profile;
         Ok(do_pending_payments(path, profile).await)
     }
 
@@ -722,7 +719,7 @@ impl CapabilityGateway {
     #[napi]
     pub async fn spent_today(&self, network: String, asset: String) -> Result<String> {
         let path = self.spend_policy_path.clone();
-        let profile = self.spend_profile.clone();
+        let profile = self.spend_profile;
         Ok(do_spent_today(path, profile, network, asset).await)
     }
 }
@@ -770,7 +767,7 @@ mod tests {
         let c = collect_payment_config(Some("/tmp/p.json".into()), None, false)
             .unwrap()
             .unwrap();
-        assert_eq!(c.profile, "production");
+        assert_eq!(c.profile, SpendProfile::Production);
         assert!(!c.unsafe_mock_auto_allow);
     }
 
@@ -784,16 +781,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_profile_rejects_unknown() {
-        assert!(matches!(
-            parse_profile("production"),
-            Ok(SpendProfile::Production)
-        ));
-        assert!(matches!(
-            parse_profile("dev_test"),
-            Ok(SpendProfile::DevTest)
-        ));
-        assert!(parse_profile("yolo").is_err());
+    fn collect_payment_config_parses_the_profile_and_rejects_unknown() {
+        // The profile vocabulary lives in core (SpendProfile::parse); the config
+        // holds the parsed enum, so there is no second (divergent) parse.
+        let c = collect_payment_config(Some("/tmp/p.json".into()), Some("dev_test".into()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.profile, SpendProfile::DevTest);
+        // An unknown profile is a construction error, never a silent fallback.
+        assert!(collect_payment_config(Some("/tmp/p.json".into()), Some("yolo".into()), false).is_err());
     }
 
     #[test]
