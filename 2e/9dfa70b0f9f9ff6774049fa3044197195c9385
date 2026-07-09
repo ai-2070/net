@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/capability_gateway.rs
+  s_8145011de91f43::t_16509275a446e3 85-86,792-794,827-830
+net/crates/net/bindings/node/src/payment_provider.rs
+  s_8145011de91f43::t_16509275a446e3 330
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_8145011de91f43::t_16509275a446e3 148-149
+net/crates/net/payments/src/policy/spend.rs
+  s_8145011de91f43::t_16509275a446e3 555-558,566-569
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e9dfa70b0f9f9ff6774049fa3044197195c9385",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
