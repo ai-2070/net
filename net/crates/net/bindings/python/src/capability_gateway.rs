@@ -1290,6 +1290,10 @@ mod tests {
     /// no-silent-fallback contract). Construction validates the profile first,
     /// so this error is unreachable in practice — the test pins that the fallback
     /// stays fail-loud, not fail-silent.
+    ///
+    /// Gated on `payments`: `spend_engine` has no payments-off variant (unlike
+    /// the `do_*` verbs), so it only exists under the feature.
+    #[cfg(feature = "payments")]
     #[test]
     fn spend_engine_rejects_an_unknown_profile() {
         assert!(spend_engine("/tmp/net-spend-test", "production").is_ok());
