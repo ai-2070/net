@@ -47,19 +47,70 @@ on the consent / invocation path — the kind the golden vectors were built to
 prevent but don't cover, because the vectors pin *wire objects* and not the
 bindings' hand-rolled *status-JSON* projections (PS-6).
 
-| ID | Severity | Title | Verdict |
-| --- | --- | --- | --- |
-| PS-1 | HIGH | Gateway result JSON is snake_case, but the doc-comments (and the rest of the node binding) promise camelCase — a JS consumer following the JSDoc reads `undefined`, a fail-open consent hazard | `[CONFIRMED]` |
-| PS-2 | HIGH | Node `invoke()` rejects JSON `null` arguments, diverging from the SDK's deliberate `null → {}` normalization *and* from the Python twin (which forwards it) | `[CONFIRMED]` |
-| PS-3 | MEDIUM | Failure-schematic golden mirrors (node/python/go) over-accept wrong-typed optional fields vs. the Rust reference, and no fixture exercises the case | `[CONFIRMED]` |
-| PS-4 | LOW | Spend-profile parsing is triplicated per language and one copy fails *open* (unknown → `Production`); currently unreachable but fragile | `[CONFIRMED]` |
-| PS-5 | CLEANUP | Node `publishPaidTools` copy-pastes the whole `spawn_publish_tools` body; Python parameterized one helper instead | `[CONFIRMED]` |
-| PS-6 | ALTITUDE | Status-vocabulary / result-JSON projection is hand-rolled per binding, uncovered by golden vectors — the mechanism behind PS-1..PS-3 and one already-present message drift | `[CONFIRMED]` |
-| PS-7 | LOW | Duplicate-key JSON resolution is unpinned and diverges (Rust first-wins vs. last-wins elsewhere) | `[PLAUSIBLE]` |
+**Status (2026-07-09): all seven items addressed,** each in its own commit with a
+test where behavior changed. Two direction calls were confirmed with the author
+before touching the outward-facing contract: **PS-1 → (A)** snake_case is
+canonical for the gateway status-JSON (node mirrors Python byte-for-byte — the
+"cannot drift" invariant), so PS-1 resolved as a docs fix, not a code change;
+**PS-2 →** normalize `null`/omitted args to `{}` (matching the SDK gate) but keep
+rejecting arrays/primitives, applied symmetrically to both bindings. Full runtime
+verification: `net-payments` (91 lib + integration) + `net-mesh-sdk` tool_payment;
+node 46 lib-unit + 75 binding-vitest + the two-node paid conformance + golden;
+python 81 payment-pytest + golden; go `gofmt` clean (the full go run needs the
+release cdylibs, CI-only).
+
+| ID | Severity | Title | Verdict | Status | Commit |
+| --- | --- | --- | --- | --- | --- |
+| PS-1 | HIGH | Gateway result JSON is snake_case, but the doc-comments (and the rest of the node binding) promise camelCase — a JS consumer following the JSDoc reads `undefined`, a fail-open consent hazard | `[CONFIRMED]` | ✅ Fixed (docs, dir. A) | `04ee794b7` |
+| PS-2 | HIGH | Node `invoke()` rejects JSON `null` arguments, diverging from the SDK's deliberate `null → {}` normalization *and* from the Python twin (which forwards it) | `[CONFIRMED]` | ✅ Fixed | `dcb881b6a` |
+| PS-3 | MEDIUM | Failure-schematic golden mirrors (node/python/go) over-accept wrong-typed optional fields vs. the Rust reference, and no fixture exercises the case | `[CONFIRMED]` | ✅ Fixed | `e38139a6f` |
+| PS-4 | LOW | Spend-profile parsing is triplicated per language and one copy fails *open* (unknown → `Production`); currently unreachable but fragile | `[CONFIRMED]` | ✅ Fixed | `c0f88e607` |
+| PS-5 | CLEANUP | Node `publishPaidTools` copy-pastes the whole `spawn_publish_tools` body; Python parameterized one helper instead | `[CONFIRMED]` | ✅ Fixed | `ad491a2ce` |
+| PS-6 | ALTITUDE | Status-vocabulary / result-JSON projection is hand-rolled per binding, uncovered by golden vectors — the mechanism behind PS-1..PS-3 and one already-present message drift | `[CONFIRMED]` | ✅ Message fixed; projection lift deferred | `d6b14538a` |
+| PS-7 | LOW | Duplicate-key JSON resolution is unpinned and diverges (Rust rejects both orders vs. last-wins elsewhere) | `[CONFIRMED]` | ✅ Pinned + documented | `6acb93986` |
 
 **Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic
-path. `[PLAUSIBLE]` = mechanism is real, trigger is edge/parser-version
-dependent.
+path. PS-7's mechanism was verified empirically during the fix (Rust `serde`
+*rejects* any duplicate-key header in either order — the earlier "first-wins"
+hypothesis was wrong).
+
+---
+
+## Resolution (2026-07-09)
+
+- **PS-1 `04ee794b7`** — Confirmed direction **(A)**: the gateway status-JSON is
+  canonically snake_case (node mirrors Python; the module's own "the two surfaces
+  cannot drift" invariant, and both node test suites already assert it). So the
+  defect was the *docs*: corrected the node method doc-comments and the
+  `bindings.md` node examples to snake_case. Code + tests unchanged; JS method /
+  parameter names stay camelCase (the napi surface).
+- **PS-2 `dcb881b6a`** — One `normalize_invoke_args` helper per binding (twins):
+  `null`/omitted → `{}` (as `gated_invoke` does); arrays/primitives stay a
+  caller-shape `invalid_arguments` error. Node + Python now agree with each other
+  and with the gate. Node Rust unit test on the helper; node vitest + python
+  pytest updated (`null` reaches the provider; `[]`/`true`/`"str"`/`42` rejected).
+- **PS-3 `e38139a6f`** — Added two `accepted:false` golden cases
+  (`optional_quote_id_wrong_type`, `optional_next_action_wrong_type`) and
+  tightened all three mirrors to type-check the `Option<String>` fields when
+  present. Rust source-of-truth already rejected them.
+- **PS-4 `c0f88e607`** — `SpendProfile::parse` (+ `FromStr`) is now the one
+  vocabulary source. Node parses once at construction and stores the enum
+  (removing the second, divergent parse); Python routes both parse sites through
+  core (its field must stay a `String` for the payments-off build).
+- **PS-5 `ad491a2ce`** — `spawn_publish_tools` parameterized with `pricing` +
+  `payment_admission`; the paid path delegates to it (mirroring Python). Verified
+  end-to-end by the two-node paid-lifecycle conformance test.
+- **PS-6 `d6b14538a`** — Fixed the concrete drift: the Python `RequiresApproval`
+  message referenced a nonexistent `net_request_capability` tool; aligned it to
+  Node's accurate wording (byte-identical now). **Deferred follow-up:** lifting
+  the gateway / HTTP status-JSON projections onto the shared `net_payments` core
+  types (so no projection can drift and the golden vectors can pin them) is a
+  larger architectural change than this pass — recommended as a separate task.
+- **PS-7 `6acb93986`** — Empirically established that Rust *rejects* any
+  duplicate-key header (serde errors, both orders); JS/Python/Go collapse
+  duplicates (last-wins). Not pinnable as a cross-language vector, and the serde
+  serializer never emits duplicates, so: pinned Rust's behavior with a unit test
+  and documented the contract for verifier authors in the cross_lang README.
 
 ---
 
@@ -316,26 +367,35 @@ status-JSON shapes.
 **Location:** the four verifiers /
 `net/crates/net/payments/examples/gen_payments_fixtures.rs`.
 
-A header (or envelope) repeating a key resolves **first-wins** under Rust's
-`#[serde(flatten)]` deserializer path but **last-wins** under Go `encoding/json`,
-JS `JSON.parse`, and Python `json.loads`. For the failure-schematic tag check, a
-header like `{"object":"net.payment.failure@1", ..., "object":"net.payment.failure@2"}`
-could accept under Rust (reads `@1`) and reject under the other three (read
-`@2`), or vice-versa depending on order.
+A header repeating a key resolves differently per language. **Verified during
+the fix** (the original "first-wins" hypothesis was wrong): Rust `serde` **rejects
+any duplicate-key header outright, in either order** (`from_header_bytes` → `None`
+→ fall back to the human error) — the safest outcome; Go `encoding/json`, JS
+`JSON.parse`, and Python `json.loads` all silently **collapse** duplicates
+(last-wins) and would accept a header Rust rejects.
 
-Extreme edge case and the exact resolution is parser-version dependent, so this
-is `[PLAUSIBLE]`, not a confirmed live break. **Fix (optional):** add a
-`duplicate_key` fixture case to pin the intended behavior explicitly rather than
-leave it to each parser's default.
+**Resolved:** this can't be a cross-language golden vector (the verdict genuinely
+differs and the three parsers can't reject duplicates without a bespoke parser),
+and it needn't be — the serde serializer never emits duplicate keys, so a
+duplicate-key header is malformed input whose cross-language handling is
+unspecified. Pinned Rust's reject-both behavior with
+`tool_payment::tests::duplicate_keys_are_rejected_in_either_order` and documented
+the contract for verifier authors in the cross_lang README.
 
 ---
 
 ## Recommendation
 
-Fix **PS-1** and **PS-2** before merge — both are silent, cross-language
-behavior differences on the consent / invocation path that no test currently
-catches. **PS-3** and **PS-7** are cheap fixture additions that would have caught
-this class of bug. **PS-4/5/6** are the deeper remedy: move the per-language
-projections and parsers into the shared `net-payments` core so the node and
-python bindings can't drift, and let the golden vectors pin the status-JSON — not
-just the wire objects.
+**All seven addressed (see the Resolution section and the status table).** PS-1
+and PS-2 — the silent cross-language divergences on the consent / invocation path
+— are fixed and covered by tests in both bindings. PS-3/PS-7 added the fixture /
+pinning that catches this class of bug. PS-4 moved the profile vocabulary into
+core; PS-5 collapsed the duplicated node publish path.
+
+**One deferred follow-up (PS-6):** the deeper remedy — moving the per-language
+*status-JSON projections* (gateway `search`/`describe`/`invoke` results, HTTP-402
+outcome, approval-verb shapes) onto shared `net_payments` core types so the
+bindings physically cannot drift, and extending the golden vectors to pin those
+status-JSON shapes (not just the wire objects) — remains open. It is a larger
+architectural change than this pass; recommended as its own task. The concrete
+drift PS-6 cited (the `RequiresApproval` message) is fixed.
