@@ -7,15 +7,16 @@
 //! is `net-payments`; this projects [`X402HttpOutcome`] to a `[statusJson,
 //! body]` pair. Behind the opt-in `payments-http` feature (pulls reqwest).
 //!
-//! **Real-network settlement needs a per-scheme signer** (the same TSFN signer
-//! bridge deferred for the gateway); until then this client covers the
-//! `fetched` / `denied` / `transport_error` / mock paths.
+//! Real-network 402s are settled through the eip155 signer reference
+//! (`paymentSignerAddress` + `paymentSigner`), bridged via
+//! [`crate::payment_signer`]; without one, a real-network demand is a
+//! structured `denied`.
 
 #![cfg(feature = "payments-http")]
 
 use std::sync::Arc;
 
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Function, Promise};
 use napi::{Error, Result};
 use napi_derive::napi;
 use parking_lot::Mutex;
@@ -24,6 +25,7 @@ use serde_json::json;
 use net::adapter::net::identity::EntityKeypair;
 use net_payments::core::registry::default_registry_v1;
 use net_payments::flow::http402::{X402HttpFlow, X402HttpOutcome};
+use net_payments::flow::signer::SchemeSigner;
 use net_payments::flow::SystemClock;
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 
@@ -102,25 +104,35 @@ struct HttpConfig {
 /// Build the outbound flow. The payer identity is ephemeral — there is no
 /// provider identity on this path and no signed quote (policy runs on a local
 /// pseudo-quote), so the caller id is bookkeeping; spend is tracked by
-/// `(network, asset, day)`, not by caller.
-fn build_flow(config: &HttpConfig) -> Result<X402HttpFlow> {
+/// `(network, asset, day)`, not by caller. `signer` (eip155) is registered when
+/// present — real-network 402s need it; a real-network demand with no signer is
+/// a structured `denied`, never a fallback.
+fn build_flow(config: &HttpConfig, signer: Option<Arc<dyn SchemeSigner>>) -> Result<X402HttpFlow> {
     let profile = parse_profile(&config.profile)?;
     let caller = Arc::new(EntityKeypair::generate());
     let registry = default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
-    X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock))
-        .map_err(|e| Error::from_reason(format!("payment-http: http client: {e}")))
+    let mut flow = X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock))
+        .map_err(|e| Error::from_reason(format!("payment-http: http client: {e}")))?;
+    if let Some(signer) = signer {
+        flow = flow.with_signer("eip155", signer);
+    }
+    Ok(flow)
 }
 
 /// GET a URL, paying if the server demands it. Returns `[statusJson, body]`.
 ///
 /// Construct with `paymentPolicyPath` (**required** — the caller's spend policy
 /// is the entire gate for outbound 402), plus optional `paymentProfile` /
-/// `paymentUnsafeMockAutoAllow`.
+/// `paymentUnsafeMockAutoAllow`, and the eip155 settlement signer reference
+/// (`paymentSignerAddress` + `paymentSigner`) for real-network 402s.
 #[napi]
 pub struct PaymentHttpClient {
     config: HttpConfig,
+    /// The eip155 settlement signer, built at construction from the JS callback
+    /// (real-network 402s only). `None` = mock/free paths only.
+    signer: Option<Arc<dyn SchemeSigner>>,
     /// The flow, built lazily on the first `fetchPaid` (inside the async fn, so
     /// reqwest finds napi's reactor at construction — the JS-thread constructor
     /// has no runtime).
@@ -134,17 +146,33 @@ impl PaymentHttpClient {
         payment_policy_path: String,
         payment_profile: Option<String>,
         payment_unsafe_mock_auto_allow: Option<bool>,
+        payment_signer_address: Option<String>,
+        payment_signer: Option<Function<'static, String, Promise<String>>>,
     ) -> Result<Self> {
         let profile = payment_profile.unwrap_or_else(|| "production".to_string());
         // Validate the profile up front (a bad profile is a construction error,
         // not a first-fetch surprise).
         parse_profile(&profile)?;
+        // The eip155 signer reference is both-or-neither; the JS callback
+        // becomes a ThreadsafeFunction wrapped in ExternalSigner (typed intent
+        // in, signature out — key material unrepresentable).
+        let signer = match (payment_signer_address, payment_signer) {
+            (Some(addr), Some(cb)) => Some(crate::payment_signer::eip155_signer(
+                addr,
+                cb.build_threadsafe_function().build()?,
+            )),
+            (None, None) => None,
+            _ => return Err(Error::from_reason(
+                "payment-http: paymentSigner and paymentSignerAddress must be provided together",
+            )),
+        };
         Ok(Self {
             config: HttpConfig {
                 policy_path: payment_policy_path,
                 profile,
                 unsafe_mock_auto_allow: payment_unsafe_mock_auto_allow.unwrap_or(false),
             },
+            signer,
             flow: Mutex::new(None),
         })
     }
@@ -163,7 +191,7 @@ impl PaymentHttpClient {
         let flow = {
             let mut guard = self.flow.lock();
             if guard.is_none() {
-                *guard = Some(Arc::new(build_flow(&self.config)?));
+                *guard = Some(Arc::new(build_flow(&self.config, self.signer.clone())?));
             }
             guard.as_ref().expect("just initialized above").clone()
         };

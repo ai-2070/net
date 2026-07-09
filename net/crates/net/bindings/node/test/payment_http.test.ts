@@ -42,4 +42,24 @@ describe.skipIf(!PaymentHttpClient)('PaymentHttpClient', () => {
     expect(Buffer.isBuffer(body)).toBe(true)
     expect(body.length).toBe(0)
   }, 20000)
+
+  it('accepts an eip155 signer for real-network 402s', async () => {
+    const signer = async (_typedDataJson: string): Promise<string> => '0xdeadbeef'
+    const client = new PaymentHttpClient(
+      tmpPolicy('sig'),
+      'production',
+      false,
+      '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
+      signer,
+    )
+    // The signer is wired but not called for an unreachable (unpaid) fetch.
+    const [statusJson] = await client.fetchPaid(UNREACHABLE)
+    expect(JSON.parse(statusJson).status).toBe('transport_error')
+  }, 20000)
+
+  it('a signer address without its callback is a construction error', () => {
+    expect(
+      () => new PaymentHttpClient(tmpPolicy('half'), 'production', false, '0xpayer'),
+    ).toThrow()
+  })
 })
