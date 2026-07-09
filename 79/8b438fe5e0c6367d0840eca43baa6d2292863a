@@ -1,0 +1,21 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_09_PAYMENTS_SDKS.md
+  s_8145011de91f43::t_7a38c2a8263350 50-70,73-113
+  s_8145011de91f43::t_90b0ebbd58011a 370-383
+  s_8145011de91f43::t_127f38588bc904 389-401
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "798b438fe5e0c6367d0840eca43baa6d2292863a",
+  "prompts": {},
+  "sessions": {
+    "s_8145011de91f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96805a67-4a02-4942-ad40-e539bfe24a47",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
