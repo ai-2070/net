@@ -1,6 +1,12 @@
 # Documentation Strategy — Net Payments (x402-native commercial facts)
 
-**Status:** PROPOSED — not started. Sub-plan of
+**Status:** APPROVED WITH AMENDMENTS (Kyra, 2026-07-09) — not started. The six
+required amendments are folded in: the bounded "commercial facts" definition +
+PII boundary (Doctrines 9), terms-acceptance = signed-evidence-only (Doctrine
+10), the "no HTTP endpoint required" differentiator (Doctrine 11), the
+payments-scoped per-language wording incl. Node-has-no-delegation/A2A (Doctrine
+8), and XRPL demoted from the shipped ladder to enablement-gated (Phase 0 +
+`payments/networks.md`). Sub-plan of
 [`DOCS_STRATEGY_PLAN.md`](DOCS_STRATEGY_PLAN.md), which deliberately **deferred**
 payments docs on 2026-07-04 ("`payments-later.md` … Defer as stubs — Speculative;
 must not imply shipped features"). That deferral is now unblocked: payments has
@@ -38,6 +44,12 @@ whether a reader stops thinking "payment processor."
 - **Lead line:** *x402 moves the money; Net signs the commercial facts around it
   — provider identity, discovery-time pricing, tiered verification, immutable
   billing, and spend policy.*
+- **"Commercial facts" is a bounded term (frozen).** Commercial facts are
+  **references, commitments, signatures, quotes, verification results, policy
+  decisions, and billing events.** They are **not** customer PII, tax records,
+  KYB files, invoices, shipping data, or provider account records. Every page
+  that uses the phrase carries this boundary — otherwise a reader takes
+  "commercial facts" as permission to route billing-profile data through Net.
 - **The negative space is the positioning.** Net Payments does **not** custody
   funds, process payments, issue invoices, determine taxes, or clear
   transactions. Every concept page states which of those it is *not*, up front.
@@ -59,7 +71,8 @@ page re-open a positioning the worldview already froze.
 
 ## Doctrine (non-negotiable constraints)
 
-Lifted from the skill's eight doctrines + `gotchas.md`; these gate every page.
+Lifted from the skill's eight doctrines + `gotchas.md`, plus the data-boundary
+and scope constraints below; these gate every page.
 
 1. **x402 is the wire; Net signs around it.** Net envelopes wrap x402
    structures; they never replace, translate, or re-encode them. Chain specifics
@@ -86,11 +99,34 @@ Lifted from the skill's eight doctrines + `gotchas.md`; these gate every page.
 7. **Honesty pinned to shipped behavior (Phase 0 gate).** No page ships a claim
    the crate doesn't cash. The reserved/deferred surfaces below are named as
    reserved, or omitted — never implied shipped.
-8. **Per-language availability is stated, not hidden.** Rust/Python/Node have a
-   full demand+supply flow; Go is a golden-vector verifier only; there is no C
-   payment flow; and the Rust `net-payments` crate is **not on crates.io**. The
-   SDK pages state this asymmetry the way `DOCS_STRATEGY_PLAN.md` states the Go/C
-   mesh asymmetry — plainly.
+8. **Per-language availability is stated, not hidden — and scoped to payments.**
+   Rust, Python, and Node expose the **paid-capability demand/supply surfaces
+   described here**; Go is a golden-vector verifier only; there is no C payment
+   flow; and the Rust `net-payments` crate is **not on crates.io**. State it the
+   way `DOCS_STRATEGY_PLAN.md` states the Go/C mesh asymmetry — plainly. Do not
+   let a reader infer *every* agent feature exists everywhere: **Python
+   additionally exposes delegation/A2A defaults; Node delegation/A2A are not
+   exposed yet and are intentionally out of scope for this payments release**
+   (see [`NODE_DELEGATION_A2A_SDK_PLAN.md`](NODE_DELEGATION_A2A_SDK_PLAN.md)).
+9. **No plaintext PII in Net envelopes.** Net Payments does not carry plaintext
+   customer PII in invocation, billing, lifecycle, or failure envelopes.
+   Provider / customer / KYB / billing records live in provider or partner
+   systems. Net may carry **opaque profile references, commitments, and signed
+   acceptance evidence** — never the underlying records. Every envelope example
+   respects this; no page shows a "billing profile" field with plaintext
+   customer data.
+10. **Terms acceptance is signed evidence, not a terms service.** Where terms
+    support is documented, it means **signed terms-acceptance evidence and terms
+    hashes/IDs** (the `terms_hash` already on the quote envelope). It does **not**
+    mean Net hosts terms text, validates legal authority, stores customer
+    identity, or adjudicates enforceability. Anything beyond signed evidence +
+    hashes/IDs is reserved.
+11. **Net-native payments do not require an HTTP endpoint.** Net-native paid
+    capabilities are discovered through capability announcements and invoked over
+    nRPC; x402 payment material rides as opaque preserved bytes in the
+    invocation/admission envelope. **HTTP 402 is an adapter path for web APIs
+    (`http402.md`), not a requirement for Net providers.** No page implies a Net
+    provider must run a web server.
 
 ---
 
@@ -127,14 +163,14 @@ worldview, start, guides, concepts, payments, sdk, agent-briefs, reference, tuto
 ### New/changed pages (source skill asset each draws on)
 
 **`payments/`** (Phase 1 — the concept spine)
-- `README.md` — landing: the category line + the object model at a glance + links (`SKILL.md`, `concepts.md`).
-- `what-net-payments-is.md` — the mental model + the eight doctrines + the explicit "what it is NOT" (`concepts.md`, `gotchas.md`).
-- `x402-and-net.md` — envelopes wrap x402; byte-preservation; the two-way door (`x402.md`, `object-model.md`).
+- `README.md` — landing: the category line + the bounded "commercial facts" definition + the "no HTTP endpoint required" differentiator + the object model at a glance + links (`SKILL.md`, `concepts.md`).
+- `what-net-payments-is.md` — the mental model + the eight doctrines + the explicit "what it is NOT" + the PII boundary (`concepts.md`, `gotchas.md`).
+- `x402-and-net.md` — envelopes wrap x402; byte-preservation; the two-way door. **Leads with the differentiator (Doctrine 11):** Net-native paid capabilities are announced + invoked over nRPC with x402 material carried as opaque preserved bytes in the invocation/admission envelope — HTTP 402 is an adapter path for web APIs, not a requirement for Net providers (`x402.md`, `object-model.md`).
 - `the-lifecycle.md` — quote → verify → settle → serve → bill (provider) and pricing → spend policy → pay → invoke (caller) (`provider.md`, `caller.md`).
 - `verification-tiers.md` — `observed | confirmed(n) | final`; the independent `ChainChecker`; reorg freeze; the facilitator is not in the trust root (`verification.md`).
 - `spend-policy-and-approvals.md` — the policy engine decides; budgets, delegation inheritance, the operator approval surface; fail-closed default (`spend-policy.md`).
 - `non-custodial-signing.md` — identity keys ≠ settlement keys; `SchemeSigner`; eip155 / svm / xrpl; no raw-bytes path (`signer.md`).
-- `networks.md` — config-not-code; CAIP-2/CAIP-19; the signed asset registry; the Base Sepolia → Base → Solana → xrpl ladder (`networks.md`, [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md)).
+- `networks.md` — config-not-code; CAIP-2/CAIP-19; the signed asset registry; the network-enablement ladder **stated by go/no-go state, not as one flat "shipped" list**: mock (P0) is fully active; Base Sepolia / Base / Solana are active *as applicable per their pinned enablement state* (seams landed, live conformance/checker gated per rung); **XRPL is built Mode-A (XRP-only) but enablement-gated — do NOT list it as shipped-active** pending the pinned upstream `scheme_exact_xrpl` + live t54 conformance (`networks.md`, [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md), [`PAYMENTS_XRPL_ENABLEMENT_PLAN.md`](PAYMENTS_XRPL_ENABLEMENT_PLAN.md)). Phase 0 records the exact per-rung go/no-go.
 - `failure-schematic.md` — `net.payment.failure@1` beside the human error; reason→recovery mapping; the tolerant predicate (`failure-schematic.md`).
 - `billing.md` — immutable billing events + the stream; what billing is NOT (`billing.md`).
 
@@ -155,7 +191,12 @@ canonical signing regime + idempotency/versioning; `object-model.md`),
 `payment-failure-schematic.md` (the full `@1` contract + tolerance predicate;
 `failure-schematic.md`), `x402-carry.md` (`X402Carry`, requirements/payload/
 settlement views, CAIP; `x402.md`), `payments-status-vocabulary.md` (gateway/HTTP
-status discriminants + `ERR_PAYMENT`).
+status discriminants + `ERR_PAYMENT`), and **`terms-acceptance.md`** — the
+signed-acceptance-evidence boundary (Doctrine 10): `terms_hash` / terms IDs on
+the quote envelope + signed acceptance evidence, with an explicit "not: hosting
+terms text, validating authority, storing identity, adjudicating enforceability"
+note (may instead be a section of `payments-envelopes.md` if it stays short).
+**No reference page shows a plaintext "billing profile" field.**
 
 **`agent-briefs/`** (Phase 4) — `price-and-charge`, `pay-to-invoke`,
 `enable-a-network`: executable-by-agent (Goal / Files / Commands / Expected /
@@ -187,30 +228,47 @@ Verify **against code, not the skill**:
   `observed|confirmed(n)|final` + `ChainChecker` + reorg freeze (`checker/`,
   `verification.md` claims); spend policy + approval verbs + delegation
   inheritance (`policy/spend.rs`); `net.payment.failure@1` (`sdk/src/tool_payment.rs`);
-  networks P0 mock + P1 real ladder (Base Sepolia → Base → Solana → xrpl;
-  [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md), `payments-live.yml`);
   signers eip155/svm/xrpl via `ExternalSigner` (no raw keys); billing log + stream
   (`billing/`); outbound HTTP-402 (`flow/http402.rs`); SDK surfaces — Rust/Python/
   Node demand+supply, Go verifier-only.
+- **Network ladder — record go/no-go per rung, never a flat "shipped" list.**
+  Mock (P0) is fully active. For each real rung (Base Sepolia / Base / Solana /
+  XRPL) record the *pinned enablement state* from
+  [`PAYMENTS_P1_NETWORK_LADDER.md`](PAYMENTS_P1_NETWORK_LADDER.md) +
+  [`PAYMENTS_XRPL_ENABLEMENT_PLAN.md`](PAYMENTS_XRPL_ENABLEMENT_PLAN.md): which
+  have live conformance vs. env-gated pending, which lack a chain checker
+  (serve-tier ceiling), and — specifically — **XRPL is built Mode-A (XRP-only)
+  but enablement-gated (live t54 conformance open; upstream `scheme_exact_xrpl`
+  not yet pinned)**, so it is **not** documented as shipped-active. `payments-live.yml`
+  is the env-gated live path, not proof of default enablement.
 - **Reserved / deferred (MUST NOT be implied shipped):** disputes/refunds
   (`net.payment.dispute@1` is *reserved*; no semantics pre-P5); RFQ / dynamic
   pricing (deferred — no counter-offer object; that absence is the rule);
   accounts / postpaid / prepaid (Mode E — deferred); inbound HTTP-402 *serving*
-  (deferred). Each is named "reserved/deferred" or omitted.
+  (deferred); **terms handling beyond signed acceptance evidence + hashes/IDs**
+  (Doctrine 10 — reserved). Each is named "reserved/deferred" or omitted.
+- **Data boundary (audit the envelope shapes, not just prose):** confirm no
+  invocation / billing / lifecycle / failure envelope carries plaintext customer
+  PII — only opaque references, commitments, signed acceptance evidence, and the
+  `commercial facts` set (Doctrine 9). Any field that could carry a "billing
+  profile" / customer record is a finding: downgrade the copy or file it.
 - **Availability caveats (must be stated on the SDK pages):** `net-payments` is
   **not published to crates.io** (a Rust consumer needs a git/path dep — the
   `crates-v*` release ships only `net-mesh`, `net-mesh-sdk`, `net-mesh-mcp`, and
   the macros); the **seam** (`ToolPaymentGate`, `FailureSchematic`) *does* ship in
   `net-mesh-sdk` (ungated), but the engine does not; `payments-http` is **opt-in**
-  (kept out of the default wheel/.node — it pulls reqwest/rustls).
+  (kept out of the default wheel/.node — it pulls reqwest/rustls); **delegation /
+  A2A are Python-only today** (Node out of scope for this release).
 
 **Acceptance:** every payments claim is backed by a named primitive/test or
 downgraded/removed; no later page asserts an unbacked or reserved capability; the
-per-language availability matrix is written and correct.
+per-language availability matrix, the per-rung network go/no-go, and the PII/terms
+boundaries are written and correct.
 
 **Exit gate:** if any headline claim ("Net settles your payment", "the
-facilitator confirmed finality", "pay from any language") is materially wrong,
-fix the copy (or downgrade the claim) before Phase 1 ships that page.
+facilitator confirmed finality", "pay from any language", "XRPL is live", "carry
+your billing profile through Net") is materially wrong, fix the copy (or
+downgrade the claim) before Phase 1 ships that page.
 
 ### Phase 1 — Concept spine (`payments/`) (~2–3 days)
 
@@ -221,6 +279,9 @@ reconciliation pointer.
 **Acceptance (all must hold):**
 - Every page opens with the reader's commercial problem, and every concept page
   states the relevant "it is NOT" (custody / processing / invoicing / clearing).
+- `README.md` / `what-net-payments-is.md` carry the bounded "commercial facts"
+  definition and the PII boundary (Doctrines 9); `x402-and-net.md` leads with the
+  "no HTTP endpoint required" differentiator (Doctrine 11).
 - `verification-tiers.md` never conflates a facilitator receipt with finality;
   `non-custodial-signing.md` shows the typed-intent seam, no raw key.
 - `failure-schematic.md` documents the tolerant predicate exactly as the four
@@ -292,13 +353,27 @@ where possible so both stay in sync:
 - **Reading like a payment processor (the #1 risk).** Mitigated by the frozen
   category line + the mandatory "it is NOT" block on every concept page +
   Phase 0. If a reader thinks Net custodies funds, the docs failed.
+- **"Commercial facts" read as a data license (PII leak).** The phrase could be
+  taken as permission to route customer/billing-profile/KYB data through Net.
+  Mitigated by the bounded definition (Positioning) + the PII boundary (Doctrine
+  9) + the Phase 0 envelope-shape audit. Provider/customer/KYB records stay in
+  provider/partner systems; Net carries only opaque references + signed evidence.
+- **Terms read as a terms service.** "Terms support" could imply Net hosts /
+  validates / adjudicates terms. Mitigated by Doctrine 10 (signed evidence +
+  hashes/IDs only) + the reserved-beyond-that note.
+- **Overstating the network ladder (esp. XRPL).** Listing XRPL as shipped-active
+  when it is built-but-enablement-gated (or a rung as live when its conformance
+  is env-gated) would write a check the code doesn't cash. Mitigated by the
+  per-rung go/no-go audit in Phase 0 and the ladder wording in `payments/networks.md`.
 - **Implying reserved features.** Disputes/refunds, RFQ/dynamic pricing,
   accounts/postpaid, inbound-402 serving are reserved/deferred — Phase 0 pins
   them; pages name them "reserved", never demo them.
 - **Per-language availability confusion.** A Rust user could `cargo add`
   expecting the payments engine and not find it (net-payments isn't on
   crates.io); a caller could expect the HTTP-402 client in the default package
-  (it's opt-in). Mitigated by the Phase 0 matrix surfaced on every SDK page.
+  (it's opt-in); a reader could assume Node has delegation/A2A because Python
+  does (it doesn't yet). Mitigated by the Phase 0 matrix surfaced on every SDK
+  page + the payments-scoped wording in Doctrine 8.
 - **Docs drifting from the skill / code.** The skill moves fast; the code is
   ground truth. Mitigated by the reconciliation table + re-running Phase 0's
   spot-checks before each phase ships.
