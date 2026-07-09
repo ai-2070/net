@@ -56,6 +56,10 @@ mod meshos;
 // forwarding/keychain internals are never bound).
 #[cfg(feature = "mcp")]
 mod mcp_helpers;
+// The consent-gated capability gateway (search/describe/invoke over an
+// embedded NetMesh node) + the caller payment flow. Behind `payments`.
+#[cfg(feature = "payments")]
+mod capability_gateway;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
 #[cfg(feature = "aggregator")]
@@ -2027,7 +2031,12 @@ mod mesh_bindings {
         /// so the previous "load_node + as_ref + expect" pattern
         /// could panic on a real shutdown race. Surface as a
         /// typed error instead.
-        #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
+        #[cfg(any(
+            feature = "compute",
+            feature = "cortex",
+            feature = "aggregator",
+            feature = "payments"
+        ))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.node.load();
             match guard.as_ref() {
@@ -2042,8 +2051,14 @@ mod mesh_bindings {
         /// auto-registers via the SDK glue without needing
         /// per-binding access. Kept gated on either feature so the
         /// accessor is available if `mesh_rpc` ever needs it.
-        #[cfg(any(feature = "compute", feature = "cortex"))]
-        #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
+        #[cfg(any(feature = "compute", feature = "cortex", feature = "payments"))]
+        #[cfg_attr(
+            all(
+                any(feature = "cortex", feature = "payments"),
+                not(feature = "compute")
+            ),
+            allow(dead_code)
+        )]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }

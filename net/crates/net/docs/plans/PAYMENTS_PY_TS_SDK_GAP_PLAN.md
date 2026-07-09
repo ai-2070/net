@@ -179,32 +179,39 @@ Payments ride behind it. Package decision (recorded, unchanged from
 
 ### B1 — `CapabilityGateway` (the demand core)
 
-- [ ] Add `net-payments` to `node/Cargo.toml` behind a new `payments` feature
-  (`payments = ["mcp", "dep:net-payments"]`, dep features `["mcp-gate","mesh"]`).
-  `net-mcp` is already linked, so `net_mcp::serve::{MeshGateway, gated_invoke,
-  CapabilityGateway, CapabilityDetail, GatedOutcome, GatewayError, CapabilityId,
-  PaymentFlow}` and the `net_mcp::serve` flavors of `ConsentPolicy`/`PinStore`
-  are available.
-- [ ] New `node/src/capability_gateway.rs`: a **single async napi class**
-  `CapabilityGateway` (napi auto-Promises `async fn` — no sync/async split, and
-  **no per-instance runtime field**: Node uses napi's process-wide tokio runtime,
-  unlike Python's per-mesh `Runtime`). Built as `MeshGateway::new(
+- [x] Added `net-payments` to `node/Cargo.toml` behind a new `payments` feature
+  (`payments = ["mcp", "net", "dep:net-payments"]`, dep features
+  `["mcp-gate","mesh"]`; `payments` in `default`). `net-mcp` was already linked,
+  so `net_mcp::serve::{MeshGateway, gated_invoke, CapabilityDetail, GatedOutcome,
+  GatewayError, CapabilityId, PaymentFlow, ConsentPolicy, PinStore}` and
+  `net_sdk::mesh::Mesh` are available; `consent` already pulls `dep:net-sdk`.
+- [x] New `node/src/capability_gateway.rs`: a **single async napi class**
+  `CapabilityGateway` (napi auto-Promises `async fn` — no sync/async split, no
+  per-instance runtime field). Built as `MeshGateway::new(Arc::new(
   SdkMesh::from_node_arc(mesh.node_arc_clone()?, mesh.channel_configs_arc(),
-  None))` — the exact pattern `node/src/compute.rs` already ships. `search` /
-  `describe` / `invoke` return **JSON strings** with the status vocabulary (the
-  binding's convention for discriminated shapes), driving `gated_invoke` +
-  `outcome_to_json` verbatim from Python.
-- [ ] Extend the `node_arc_clone` / `channel_configs_arc` `cfg` gates
-  (`node/src/lib.rs:2031,2047`) to include the new feature.
-- [ ] Errors: outcome statuses are **data (JSON), not throws** — only
-  transport/programming failures throw, via a new `gateway:`-prefixed class in
-  `errors.ts` (matching the `nrpc:`/`consent:` prefix doctrine and
-  `classifyError`). A malformed cap-id / arguments is itself a structured error
-  status, not a throw.
-- [ ] **Runtime check (Open Decision 2):** confirm `MeshGateway` I/O is correct
-  on napi's shared runtime rather than the node's own reactor. The `compute.rs`
-  `DaemonRuntime` precedent already drives node I/O this way under napi, so this
-  is expected to hold — verify it explicitly before B2.
+  None)))` — the `compute.rs`/`DaemonRuntime::create` pattern. `search` /
+  `describe` / `invoke` resolve to **JSON strings** with the status vocabulary,
+  driving `gated_invoke` + a byte-for-byte mirror of Python's `outcome_to_json`
+  (including the `failure` schematic projection on denials). `payment: None` in
+  B1 (a paid capability fails closed as `denied`); the flow arrives in B2. Each
+  method clones the `Arc`s from `&self` before the await (the `PinStore` pattern).
+- [x] Extended the `node_arc_clone` / `channel_configs_arc` `cfg` gates
+  (`node/src/lib.rs`) to include `payments`.
+- [x] Errors: outcome statuses are **data (JSON), not throws** — a malformed
+  cap-id / arguments is a structured `invalid_capability_id` / `invalid_arguments`
+  status, never a throw. The only throw is the constructor on a shut-down mesh,
+  behind a new `gateway:`-prefixed `GatewayError` class in `errors.ts` +
+  `classifyError` branch (matching the `nrpc:`/`cortex:` prefix doctrine).
+- [x] **Runtime (Open Decision 2):** the gateway drives mesh I/O on napi's
+  process-wide runtime, the same way `compute.rs`'s `DaemonRuntime` already does
+  over a shared `MeshNode` — the precedent this leans on (verified at runtime by
+  the vitest e2e in CI).
+- [x] Tests: Rust marshaling tests (denied+schematic projection,
+  requires_payment_approval — green under the `-undefined dynamic_lookup` napi
+  test-link); a vitest e2e (`test/capability_gateway.test.ts`, mirrors the Python
+  gateway basics — empty-mesh search, unreachable-provider structured errors,
+  malformed id/args); `payments` added to the node-tests napi build + the node
+  clippy matrix. napi build regenerates `index.d.ts` with the class.
 
 ### B2 — Payment options + signer seam + approval verbs
 
