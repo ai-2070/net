@@ -55,7 +55,11 @@ async function withProvider(fn: (mesh: any) => Promise<void>): Promise<void> {
     await mesh.start() // async NAPI method — await so the node is up first
     await fn(mesh)
   } finally {
-    await mesh.shutdown()
+    // Best-effort: a PaymentProvider created in `fn` retains a node clone + the
+    // quote/pay serve handle (released deterministically via `provider.close()`,
+    // which the dedicated close test exercises). Swallow a residual-reference
+    // shutdown error rather than throw and crash the worker.
+    await mesh.shutdown().catch(() => {})
   }
 }
 
@@ -143,9 +147,11 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
     await withProvider(async (mesh) => {
       const provider = new PaymentProvider(mesh, tmp('mismatch.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
-      // `nope` names no published tool → publish rejects (the returned Promise).
+      // `echo` is priced (so the fail-closed completeness check passes), but the
+      // extra `nope` key names no published tool → ServerPublisher rejects it
+      // asynchronously (the returned Promise rejects).
       await expect(
-        provider.publishPaidTools([ECHO], noopHandler, { nope: terms }),
+        provider.publishPaidTools([ECHO], noopHandler, { echo: terms, nope: terms }),
       ).rejects.toThrow()
     })
   }, 20000)

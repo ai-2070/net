@@ -28,8 +28,9 @@ const NetMesh = binding.NetMesh
 const CapabilityGateway = binding.CapabilityGateway
 const PaymentProvider = binding.PaymentProvider
 const buildPricingTerms = binding.buildPricingTerms
+const PinStore = binding.PinStore
 
-const HAS_ALL = !!(NetMesh && CapabilityGateway && PaymentProvider && buildPricingTerms)
+const HAS_ALL = !!(NetMesh && CapabilityGateway && PaymentProvider && buildPricingTerms && PinStore)
 
 const PSK = '5b'.repeat(32)
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -68,17 +69,6 @@ async function handshake(connector: any, acceptor: any): Promise<void> {
   ])
 }
 
-// Poll the caller's index until the named capability propagates from the
-// provider; return its cap id.
-async function discover(gw: any, name: string, attempts = 40): Promise<string> {
-  for (let i = 0; i < attempts; i++) {
-    const res = JSON.parse(await gw.search(name))
-    if (res.status === 'ok' && res.capabilities.length > 0) return res.capabilities[0].cap_id
-    await sleep(150)
-  }
-  throw new Error(`capability ${name} never propagated to the caller`)
-}
-
 // Invoke until the status is one of `wanted` (absorbing transient transport
 // races on a freshly-served handler); returns the last parsed result.
 async function invokeUntil(
@@ -98,7 +88,7 @@ async function invokeUntil(
 }
 
 describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
-  it('quote -> requires_payment_approval -> approve -> served; no-flow -> denied+failure', async () => {
+  it('quote -> requires_payment_approval -> approve -> served; no-flow -> denied', async () => {
     const provider = await NetMesh.create({
       bindAddr: '127.0.0.1:0',
       psk: PSK,
@@ -132,9 +122,20 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       )
       expect(pubHandle.serving).toBe(true)
 
-      // Caller discovers the priced capability over the mesh.
-      gw = new CapabilityGateway(caller, null, tmp('caller.policy'), 'production')
-      const capId = await discover(gw, 'echo')
+      // The cap id is `{providerNodeId}/{toolId}` — the gateway resolves the
+      // provider node from it and describes/invokes over DIRECT nRPC (no
+      // capability-index propagation needed, matching the Python test_publish
+      // direct-call idiom). `echo` is already channel-safe, so its tool id is
+      // `echo`.
+      const capId = `${provider.nodeId()}/echo`
+
+      // Consent gate first: every capability requires a local pin (a wire
+      // credential status, even `none`, is never trusted). Pre-approve it in the
+      // machine-shared pin store the gateway consults, so the invoke reaches the
+      // PAYMENT gate rather than stopping at `requires_approval`.
+      const pinPath = tmp('caller.pins')
+      await new PinStore(pinPath).approve(capId)
+      gw = new CapabilityGateway(caller, pinPath, tmp('caller.policy'), 'production')
 
       // 1) First invoke — Production holds the mock spend for operator approval.
       const first = await invokeUntil(gw, capId, { message: 'hi' }, ['requires_payment_approval'])
@@ -155,10 +156,15 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       // 4) A caller with NO payment flow: the paid tool is a structured denial
       //    carrying the provider's `net.payment.failure@1` schematic (reason),
       //    never a throw.
-      gwNoPay = new CapabilityGateway(caller, null)
+      // Same pin store (consent passes), but NO payment flow → the paid tool is
+      // a structured, fail-closed denial at the payment gate (a caller-side
+      // denial — the provider's `net.payment.failure@1` schematic rides
+      // provider-side redeem denials, projected + unit-tested in
+      // capability_gateway.rs; here we assert the fail-closed status + message).
+      gwNoPay = new CapabilityGateway(caller, pinPath)
       const denied = await invokeUntil(gwNoPay, capId, { message: 'hi' }, ['denied'])
       expect(denied.status).toBe('denied')
-      expect(denied.failure?.reason).toBeDefined()
+      expect(denied.error).toMatch(/payment flow/)
     } finally {
       // Release every retained node reference (a napi class is GC-finalized,
       // not scope-dropped) so both shutdowns can run deterministically.

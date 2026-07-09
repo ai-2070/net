@@ -35,7 +35,11 @@ async function withPublishingMesh(fn: (mesh: any) => Promise<void>): Promise<voi
     await mesh.start() // async NAPI method — await so the node is up before publishing
     await fn(mesh)
   } finally {
-    await mesh.shutdown()
+    // Best-effort: `handle.stop()` schedules (doesn't await) the served-service
+    // teardown, so the node clone can still be briefly held when shutdown runs
+    // its `Arc::try_unwrap` — swallow that rather than throw/crash the worker.
+    // Tests that need a clean shutdown use `handle.withdraw()` (awaited teardown).
+    await mesh.shutdown().catch(() => {})
   }
 }
 
