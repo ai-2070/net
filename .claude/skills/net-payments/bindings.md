@@ -207,8 +207,8 @@ const gw = new CapabilityGateway(
   paymentSignerSvmAddress, paymentSignerSvm,           // solana: async (intentJson) => base64 tx
   paymentSignerXrplAddress, paymentSignerXrpl,         // xrpl:   async (intentJson) => hex Payment blob
 )
-await gw.search(query)                    // JSON string; capabilities[] each with requiresApproval
-await gw.describe(capId)                  // JSON string; includes pricingTerms (null = free)
+await gw.search(query)                    // JSON string; capabilities[] each with requires_approval
+await gw.describe(capId)                  // JSON string; includes pricing_terms (null = free)
 await gw.invoke(capId, argumentsJson)     // JSON string; status discriminant (+ failure on denials)
 await gw.approvePayment(quoteId)          // operator verbs — resolve a requires_payment_approval
 await gw.rejectPayment(quoteId); await gw.pendingPayments(); await gw.spentToday(network, asset)

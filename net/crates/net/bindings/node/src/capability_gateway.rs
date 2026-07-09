@@ -606,7 +606,7 @@ impl CapabilityGateway {
 
     /// Search the mesh for capabilities matching `query` (substring over id /
     /// name / description). Resolves to `{"status":"ok","capabilities":[...]}`
-    /// (each row carries `requiresApproval`), or `{"status":"<err>","error":...}`.
+    /// (each row carries `requires_approval`), or `{"status":"<err>","error":...}`.
     /// An empty index is `ok` with an empty list — never an error.
     #[napi]
     pub async fn search(&self, query: String) -> Result<String> {
@@ -619,7 +619,7 @@ impl CapabilityGateway {
     }
 
     /// Describe one capability by its `provider/capability` id. Resolves to a
-    /// JSON string with the full schema + `requiresApproval` + `pricingTerms`,
+    /// JSON string with the full schema + `requires_approval` + `pricing_terms`,
     /// or `{"status":"<err>","error":...}`.
     #[napi]
     pub async fn describe(&self, cap_id: String) -> Result<String> {
@@ -678,7 +678,7 @@ impl CapabilityGateway {
 
     /// Approve a held payment quote under operator policy, resolving a prior
     /// `requires_payment_approval` so the next `invoke` redeems it. Resolves to
-    /// `{"status":"ok","quoteId":...,"changed":bool}`, or a structured
+    /// `{"status":"ok","quote_id":...,"changed":bool}`, or a structured
     /// `no_payment_policy` / `error`. Operator surface — `invoke` only *requests*
     /// approval; this grants it.
     #[napi]
@@ -689,7 +689,7 @@ impl CapabilityGateway {
     }
 
     /// Reject / remove a payment approval record. Resolves to
-    /// `{"status":"ok","quoteId":...,"changed":bool}`, or a structured error.
+    /// `{"status":"ok","quote_id":...,"changed":bool}`, or a structured error.
     #[napi]
     pub async fn reject_payment(&self, quote_id: String) -> Result<String> {
         let path = self.spend_policy_path.clone();
@@ -698,7 +698,7 @@ impl CapabilityGateway {
     }
 
     /// The quote ids awaiting approval, for a consent UX to render. Resolves to
-    /// `{"status":"ok","pending":[quoteId, ...]}`, or a structured error.
+    /// `{"status":"ok","pending":[quote_id, ...]}`, or a structured error.
     #[napi]
     pub async fn pending_payments(&self) -> Result<String> {
         let path = self.spend_policy_path.clone();
