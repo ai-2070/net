@@ -1,0 +1,26 @@
+net/crates/net/payments/src/flow/signer.rs
+  s_dd32abd36f770b::t_8dea7866e873de 307
+  s_dd32abd36f770b::t_a0f4d20f7f6944 382-384
+net/crates/net/payments/tests/exact_evm_signing.rs
+  s_dd32abd36f770b::t_5251f55af50c91 85
+net/crates/net/payments/Cargo.toml
+  s_dd32abd36f770b::t_01b193632fc043 93
+net/crates/net/Cargo.lock
+  s_dd32abd36f770b::t_ca7f4ced999225 359,361,857-862,1010,1012,1014-1018,1076,1193-1202,1260,1312,1314,1316-1317,1320-1321,1378,1380,1384-1385,1388-1389,1499,1501,1503,1773,1775,1778,1900,1902,1904,1952,1954,2365,2367,2369,2372-2374,3466,3604-3628,4077,4079,4081,4282,4284,4287-4289,4532,4619,5820-5830
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0a4e84f34ecc4b21ba7db5c019979ed902cc7fda",
+  "prompts": {},
+  "sessions": {
+    "s_dd32abd36f770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54f0235d-47c5-48e3-bbee-ce6662432c04",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
