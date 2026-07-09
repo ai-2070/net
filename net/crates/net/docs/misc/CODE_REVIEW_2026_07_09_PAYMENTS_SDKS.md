@@ -67,7 +67,7 @@ release cdylibs, CI-only).
 | PS-4 | LOW | Spend-profile parsing is triplicated per language and one copy fails *open* (unknown → `Production`); currently unreachable but fragile | `[CONFIRMED]` | ✅ Fixed | `c0f88e607` |
 | PS-5 | CLEANUP | Node `publishPaidTools` copy-pastes the whole `spawn_publish_tools` body; Python parameterized one helper instead | `[CONFIRMED]` | ✅ Fixed | `ad491a2ce` |
 | PS-6 | ALTITUDE | Status-vocabulary / result-JSON projection is hand-rolled per binding, uncovered by golden vectors — the mechanism behind PS-1..PS-3 and one already-present message drift | `[CONFIRMED]` | ✅ Message fixed; projection lift deferred | `d6b14538a` |
-| PS-7 | LOW | Duplicate-key JSON resolution is unpinned and diverges (Rust rejects both orders vs. last-wins elsewhere) | `[CONFIRMED]` | ✅ Pinned + documented | `6acb93986` |
+| PS-7 | LOW | Duplicate-key JSON resolution is unpinned and diverges (Rust rejects a duplicate *known* field vs. last-wins elsewhere; unknown-key dups collapse everywhere) | `[CONFIRMED]` | ✅ Pinned + documented | `6acb93986` |
 
 **Legend:** `[CONFIRMED]` = reviewer re-read the code and reproduced the logic
 path. PS-7's mechanism was verified empirically during the fix (Rust `serde`
@@ -106,11 +106,15 @@ hypothesis was wrong).
   the gateway / HTTP status-JSON projections onto the shared `net_payments` core
   types (so no projection can drift and the golden vectors can pin them) is a
   larger architectural change than this pass — recommended as a separate task.
-- **PS-7 `6acb93986`** — Empirically established that Rust *rejects* any
-  duplicate-key header (serde errors, both orders); JS/Python/Go collapse
-  duplicates (last-wins). Not pinnable as a cross-language vector, and the serde
-  serializer never emits duplicates, so: pinned Rust's behavior with a unit test
-  and documented the contract for verifier authors in the cross_lang README.
+- **PS-7 `6acb93986`** (test refined in a follow-up commit) — Empirically
+  established the real behavior: Rust *rejects* a duplicate **known** field
+  (serde errors, both orders) but a duplicate **unknown** key collapses into the
+  flattened `extra` map (last-wins) and is accepted — the latter matching
+  JS/Python/Go, so only the known-field case diverges. Not pinnable as a
+  cross-language vector, and the serde serializer never emits duplicates, so:
+  pinned Rust's known-reject / unknown-collapse behavior with a unit test
+  (`duplicate_known_fields_reject_unknown_extras_collapse`) and documented the
+  contract for verifier authors in the cross_lang README.
 
 ---
 
@@ -367,20 +371,25 @@ status-JSON shapes.
 **Location:** the four verifiers /
 `net/crates/net/payments/examples/gen_payments_fixtures.rs`.
 
-A header repeating a key resolves differently per language. **Verified during
-the fix** (the original "first-wins" hypothesis was wrong): Rust `serde` **rejects
-any duplicate-key header outright, in either order** (`from_header_bytes` → `None`
-→ fall back to the human error) — the safest outcome; Go `encoding/json`, JS
-`JSON.parse`, and Python `json.loads` all silently **collapse** duplicates
-(last-wins) and would accept a header Rust rejects.
+A header repeating a key resolves differently per language, and (verified during
+the fix — the original "first-wins" hypothesis was wrong) it also splits on
+**known vs. unknown** keys:
 
-**Resolved:** this can't be a cross-language golden vector (the verdict genuinely
-differs and the three parsers can't reject duplicates without a bespoke parser),
-and it needn't be — the serde serializer never emits duplicate keys, so a
-duplicate-key header is malformed input whose cross-language handling is
-unspecified. Pinned Rust's reject-both behavior with
-`tool_payment::tests::duplicate_keys_are_rejected_in_either_order` and documented
-the contract for verifier authors in the cross_lang README.
+- Duplicate **known** field (`object`, `reason`, …): Rust `serde` **rejects** the
+  header in either order (`from_header_bytes` → `None` → human-error fallback);
+  Go `encoding/json`, JS `JSON.parse`, and Python `json.loads` silently
+  **collapse** it (last-wins) and would accept it. This is the genuine divergence.
+- Duplicate **unknown** key: lands in the `#[serde(flatten)] extra` map, which
+  collapses last-wins in *every* language including Rust — so the four already
+  agree there.
+
+**Resolved:** the known-field case can't be a cross-language golden vector (the
+verdict genuinely differs and the three parsers can't reject without a bespoke
+parser), and it needn't be — the serde serializer never emits duplicate keys, so
+a duplicate-key header is malformed input whose handling is unspecified. Pinned
+Rust's behavior (reject-known / collapse-unknown) with
+`tool_payment::tests::duplicate_known_fields_reject_unknown_extras_collapse` and
+documented the contract for verifier authors in the cross_lang README.
 
 ---
 

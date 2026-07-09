@@ -391,24 +391,46 @@ impl std::fmt::Display for GateDenial {
 mod tests {
     use super::*;
 
-    /// A header with a duplicate key is rejected outright — `serde_json`
-    /// errors on the repeated field (in **either** order), so the tolerant
-    /// parser falls back to the human error. This is the source-of-truth
-    /// behavior; it is deliberately NOT a cross-language golden vector, because
-    /// JS `JSON.parse` / Python `json.loads` / Go `encoding/json` silently
-    /// collapse duplicates (last value wins) and cannot be made to reject
-    /// without a bespoke parser. Producers never emit duplicate keys (the serde
-    /// serializer can't), so a duplicate-key header is malformed input whose
-    /// cross-language handling is unspecified — see the fixture `_note`.
+    /// Duplicate-key handling of the schematic header, pinned as the
+    /// source-of-truth behavior — and it depends on whether the repeated key is
+    /// a **known** field or an unknown extension:
+    ///
+    /// - A duplicate **known** field (`object`, `reason`, …) is rejected
+    ///   outright: `serde_json` errors on the repeated named field in either
+    ///   order, so `from_header_bytes` returns `None` and the caller falls back
+    ///   to the human error.
+    /// - A duplicate **unknown** key lands in the `#[serde(flatten)] extra` map,
+    ///   which does NOT error on repeats — the last value wins and the header is
+    ///   still accepted (the same last-wins the JS / Python / Go JSON parsers
+    ///   give it, so those agree with Rust for unknown-key dups).
+    ///
+    /// The known-field case is deliberately NOT a cross-language golden vector:
+    /// there Rust rejects where JS `JSON.parse` / Python `json.loads` / Go
+    /// `encoding/json` silently collapse (last-wins), and they cannot be made to
+    /// reject without a bespoke parser. Producers never emit duplicate keys (the
+    /// serde serializer can't), so a duplicate-key header is malformed input
+    /// whose cross-language handling is unspecified — see the fixture `_note`.
     #[test]
-    fn duplicate_keys_are_rejected_in_either_order() {
+    fn duplicate_known_fields_reject_unknown_extras_collapse() {
+        // Duplicate KNOWN field (the tag), both orders → rejected.
         let dup_object_a = br#"{"object":"net.payment.failure@1","object":"net.payment.failure@2","code":"payment","stage":"redeem","reason":"x","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
         let dup_object_b = br#"{"object":"net.payment.failure@2","object":"net.payment.failure@1","code":"payment","stage":"redeem","reason":"x","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
         assert!(FailureSchematic::from_header_bytes(dup_object_a).is_none());
         assert!(FailureSchematic::from_header_bytes(dup_object_b).is_none());
-        // A duplicate of a non-tag field is likewise rejected.
+        // A duplicate of another KNOWN field (`reason`) is likewise rejected.
         let dup_reason = br#"{"object":"net.payment.failure@1","code":"payment","stage":"redeem","reason":"x","reason":"y","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
         assert!(FailureSchematic::from_header_bytes(dup_reason).is_none());
+        // A duplicate UNKNOWN key collapses into `extra` (last-wins) and is
+        // ACCEPTED — the flatten map does not reject repeats, matching the other
+        // languages' JSON parsers.
+        let dup_unknown = br#"{"object":"net.payment.failure@1","code":"payment","stage":"redeem","reason":"x","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none","required_amount":"1","required_amount":"2"}"#;
+        let parsed = FailureSchematic::from_header_bytes(dup_unknown)
+            .expect("a duplicate unknown key is accepted");
+        assert_eq!(
+            parsed.extra.get("required_amount"),
+            Some(&serde_json::Value::from("2")),
+            "last value wins for a flattened extra"
+        );
     }
 
     /// The plan's canonical example: `already_redeemed`.
