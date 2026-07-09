@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/src/payment_provider.rs
+  s_2ce1bbf7d954a5::t_aab8fe631c74e4 1-7
+  s_2ce1bbf7d954a5::t_6d1e46e4f873a8 257
+  s_2ce1bbf7d954a5::t_ab32bddd4e0d2d 134-256,258-334
+net/crates/net/bindings/python/tests/test_payment_provider.py
+  s_2ce1bbf7d954a5::t_65d6e47c8503c4 62-132
+net/crates/net/bindings/python/src/lib.rs
+  s_2ce1bbf7d954a5::t_0071850a12e815 3382-3383
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_2ce1bbf7d954a5::t_fd77029862f89a 3385-3433
+net/crates/net/bindings/python/src/publish.rs
+  s_2ce1bbf7d954a5::t_0881a30acac837 41-42
+  s_2ce1bbf7d954a5::t_252336f9b5e5de 100
+  s_2ce1bbf7d954a5::t_158ed845203fc6 197-207
+net/crates/net/bindings/python/python/net/__init__.py
+  s_2ce1bbf7d954a5::t_5cbd896df25ae4 854-864
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_d7712a5d2c8c3f 119-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "05694f52ac06c0f05848d338cc8830323e5984eb",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
