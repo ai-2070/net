@@ -264,11 +264,11 @@ Payments ride behind it. Package decision (recorded, unchanged from
   `watchTools()` already does. Pure read-side; no payments dependency. Pinned by
   the existing camelCase wire-JSON Rust test + a vitest row.
 
-### B5 — Node supply side (prerequisite landed; paid provider still to do)
+### B5 — Node supply side (landed)
 
 Node had **no `publishTools`/`ServerPublisher` binding at all** — pricing at
-publish requires first binding the publish path, then Part A's provider surface.
-Larger than the demand work and not the highlighted gap.
+publish required first binding the publish path, then Part A's provider surface.
+Both now shipped, so Node reaches demand+supply parity with Python.
 
 - [x] **Prerequisite (a) — the free publish path — landed.** `NetMesh.publishTools`
   binds `net_mcp::wrap::ServerPublisher::publish_tools` behind a new Node
@@ -281,13 +281,23 @@ Larger than the demand work and not the highlighted gap.
   since the served tools ride dynamic channels the empty registry would otherwise
   reject with `UnknownChannel`. Ships in `default`; wired into the vitest build +
   the node clippy/FFI-test CI feature sets.
-- [ ] **Paid provider still deferred.** Entry criteria (a) [a Node tool-publish
-  binding] and (b) demand parity (B1–B3) are **both now met**. The remaining work
-  mirrors Part A (pricing at publish via `WrapConfig.pricing` +
-  `EnginePaymentAdmission`, a payment-provider handle over one shared
-  `PaymentEngine`, and a billing read), layering onto the now-bound
-  `publishTools` path — the same `PaymentEngine`/`EnginePaymentAdmission` wiring
-  Python A2 uses.
+- [x] **Paid provider — landed.** `node/src/payment_provider.rs` (behind
+  `payments`, the provider class additionally behind `publish`) mirrors Python
+  A2/A3: `buildPricingTerms(providerEntityId, capability, requirementsJson)`
+  authors canonical `net.pricing.terms@1` (typed over `PricingTerms::new` +
+  `canonical_bytes`, never a raw string), and a `PaymentProvider` class stands up
+  one shared `PaymentEngine` (`MockFacilitator` + `AdmitAll` + `default_registry_v1`)
+  behind `serve_payments` (quote/pay wire), exposes `providerEntityId` (the node's
+  mesh identity) + `readBilling()` (the `net.billing.event@1` stream), and
+  `publishPaidTools(tools, handler, pricing, options?)` layering
+  `WrapConfig.pricing` + an `EnginePaymentAdmission` gate onto the now-shared
+  `publish.rs` building blocks (`build_sdk_tools` / `build_tool_invoker` /
+  `local_lowering_context` / `mesh_over` / `LocalPublicationHandle`). Fail-closed:
+  an empty `pricing` map throws (`WrapError::PricedWithoutPaymentGate` can't
+  arise — the gate is always set). Doctrine #1: every payment decision is the
+  engine's; the binding marshals. Ships in `default`; Rust pricing-author
+  marshaling tests + a vitest provider suite (author / identity / billing read /
+  paid-publish lifecycle / mis-keyed-pricing publish error).
 
 - [ ] Tests (B1–B4): vitest e2e per outcome status (search/describe/invoke,
   approval loop, `failure.reason`, the HTTP-402 statuses); Rust unit tests **only
@@ -322,7 +332,8 @@ seeing a key — and `listTools` reports the price `watchTools` already did.
 2. **B1 → B2 → B3** — the Node demand surface (the long pole; the highlighted
    gap). Gateway first; payment options are mechanical after it.
 3. **A2 → A3** — the Python provider path (price + charge + billing).
-4. **B5** — Node supply, when its entry criteria are met.
+4. **B5** — Node supply (`publishTools` prerequisite → `buildPricingTerms` +
+   `PaymentProvider`). ✅ landed.
 5. **Part C** rides each landing.
 
 ## Non-goals

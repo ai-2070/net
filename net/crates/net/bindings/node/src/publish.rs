@@ -219,8 +219,9 @@ pub(crate) fn mesh_over(node: Arc<MeshNode>) -> SdkMesh {
 }
 
 /// Parse the published tool set into SDK `Tool`s. A bad input schema is a
-/// caller error surfaced up front (before the publish round-trip).
-fn build_sdk_tools(tools: &[PublishToolJs]) -> Result<Vec<Tool>> {
+/// caller error surfaced up front (before the publish round-trip). Reused by
+/// the paid publish path ([`crate::payment_provider`]).
+pub(crate) fn build_sdk_tools(tools: &[PublishToolJs]) -> Result<Vec<Tool>> {
     let mut sdk_tools = Vec::with_capacity(tools.len());
     for t in tools {
         let input_schema: Value = serde_json::from_str(&t.input_schema).map_err(|e| {
@@ -241,8 +242,9 @@ fn build_sdk_tools(tools: &[PublishToolJs]) -> Result<Vec<Tool>> {
 }
 
 /// Resolve a JS `owner_origin` BigInt to a `u64` origin hash. A negative or
-/// out-of-range value is a caller error (origins are unsigned 64-bit).
-fn parse_owner_origin(owner_origin: Option<BigInt>) -> Result<Option<u64>> {
+/// out-of-range value is a caller error (origins are unsigned 64-bit). Reused by
+/// the paid publish path ([`crate::payment_provider`]).
+pub(crate) fn parse_owner_origin(owner_origin: Option<BigInt>) -> Result<Option<u64>> {
     match owner_origin {
         Some(bi) => {
             let (signed, value, lossless) = bi.get_u64();
@@ -257,10 +259,14 @@ fn parse_owner_origin(owner_origin: Option<BigInt>) -> Result<Option<u64>> {
     }
 }
 
-/// Build the free (unpriced) lowering context: local, operator-owned tools; the
-/// in-root federation model governs consent, not per-tool credential labels;
-/// nothing priced (paid tools ride the payment provider path).
-fn free_context(version: Option<String>) -> LoweringContext {
+/// Build the lowering context for locally-published tools: local,
+/// operator-owned tools; the in-root federation model governs consent, not
+/// per-tool credential labels. `ctx.pricing` is always empty here — the free
+/// path prices nothing, and the paid path
+/// ([`crate::payment_provider`]) carries pricing on `WrapConfig.pricing`
+/// instead (both funnel through `publish_tools`, which folds one into the
+/// other). Reused by both call sites so the lowering can't drift.
+pub(crate) fn local_lowering_context(version: Option<String>) -> LoweringContext {
     LoweringContext {
         server_version: match version {
             Some(v) if !v.is_empty() => v,
@@ -270,6 +276,25 @@ fn free_context(version: Option<String>) -> LoweringContext {
         substitutability: Substitutability::ProviderLocal,
         pricing: Default::default(),
     }
+}
+
+/// Build the JS-handler-backed [`ToolInvoker`] — build the `ThreadsafeFunction`
+/// on the JS thread (napi requires it), wrap it in [`NodeToolInvoker`] with the
+/// per-call timeout. Called synchronously (the `Function` is `!Send`); the
+/// resulting `Arc` is `Send` and crosses into the async publish. Reused by the
+/// paid publish path.
+pub(crate) fn build_tool_invoker(
+    handler: Function<'_, ToolInvokeArgs, Promise<ToolCallResultJs>>,
+    handler_timeout_ms: Option<u32>,
+) -> Result<Arc<dyn ToolInvoker>> {
+    let timeout = handler_timeout_ms
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(DEFAULT_TOOL_HANDLER_TIMEOUT);
+    let tsfn: InvokeTsfn = handler.build_threadsafe_function().build()?;
+    Ok(Arc::new(NodeToolInvoker {
+        handler: tsfn,
+        timeout,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -299,24 +324,16 @@ pub(crate) fn spawn_publish_tools<'env>(
     });
     let owner_origin = parse_owner_origin(opts.owner_origin)?;
     let allow_any_caller = opts.allow_any_caller.unwrap_or(false);
-    let timeout = opts
-        .handler_timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_TOOL_HANDLER_TIMEOUT);
-    let ctx = free_context(opts.version);
+    let ctx = local_lowering_context(opts.version);
     let client_info = Implementation {
         name: "net-publish".to_string(),
         version: "0".to_string(),
     };
 
-    // Build the TSFN on the JS thread (napi requires it) and wrap it in the
-    // invoker — key material is unrepresentable, only the typed args + result
-    // cross.
-    let tsfn: InvokeTsfn = handler.build_threadsafe_function().build()?;
-    let invoker: Arc<dyn ToolInvoker> = Arc::new(NodeToolInvoker {
-        handler: tsfn,
-        timeout,
-    });
+    // Build the invoker on the JS thread (the TSFN build napi requires); only
+    // the `Send` `Arc` crosses into the future. Key material is unrepresentable
+    // — only the typed args + result cross.
+    let invoker = build_tool_invoker(handler, opts.handler_timeout_ms)?;
 
     env.spawn_future(async move {
         let mesh = Arc::new(mesh_over(node));
@@ -469,13 +486,13 @@ mod tests {
     }
 
     #[test]
-    fn free_context_defaults_version_and_prices_nothing() {
-        let ctx = free_context(None);
+    fn local_lowering_context_defaults_version_and_prices_nothing() {
+        let ctx = local_lowering_context(None);
         assert_eq!(ctx.server_version, "0");
         assert!(ctx.pricing.is_empty());
-        let ctx = free_context(Some(String::new()));
+        let ctx = local_lowering_context(Some(String::new()));
         assert_eq!(ctx.server_version, "0");
-        let ctx = free_context(Some("2.1".to_string()));
+        let ctx = local_lowering_context(Some("2.1".to_string()));
         assert_eq!(ctx.server_version, "2.1");
         assert!(matches!(ctx.credential_status, CredentialStatus::None));
         assert!(matches!(

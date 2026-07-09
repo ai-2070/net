@@ -74,6 +74,12 @@ mod payment_http;
 // prerequisite for a Node payment provider. Behind `publish`.
 #[cfg(feature = "publish")]
 mod publish;
+// The provider-side payment surface: author `net.pricing.terms@1`
+// (`buildPricingTerms`) + the `PaymentProvider` class (price + charge over one
+// shared PaymentEngine). Behind `payments`; the provider class additionally
+// needs `publish` (the tool-publish building blocks).
+#[cfg(feature = "payments")]
+mod payment_provider;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
 #[cfg(feature = "aggregator")]
