@@ -304,6 +304,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let foreign_header =
         String::from_utf8(foreign_schematic.to_header_bytes().expect("foreign fits"))?;
 
+    // Correct-tag-but-malformed-structure rejects. `from_header_bytes` does a
+    // full typed `serde` deserialize BEFORE the tag check, so a header carrying
+    // the tag yet not matching the schematic shape is rejected — a naive
+    // tag-only predicate would wrongly accept these, so they pin the structural
+    // half of the contract across languages.
+    //
+    // (a) Just the tag, none of the required fields.
+    let tag_only_header = json!({ "object": TAG_PAYMENT_FAILURE }).to_string();
+    // (b) Every field but the required `recovery` object.
+    let mut missing_recovery_val = serde_json::to_value(&valid_schematic)?;
+    missing_recovery_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .remove("recovery");
+    let missing_recovery_header = serde_json::to_string(&missing_recovery_val)?;
+    // (c) A required field present but wrong-typed (`retryable` is a bool).
+    let mut wrong_type_val = serde_json::to_value(&valid_schematic)?;
+    wrong_type_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .insert("retryable".to_string(), json!("no"));
+    let wrong_type_retryable_header = serde_json::to_string(&wrong_type_val)?;
+    // (d) A structurally-complete schematic carrying a NON-STANDARD JSON number
+    // (`Infinity`). Every strict parser (serde_json, JS `JSON.parse`, Go
+    // `encoding/json`) rejects it; only a lax parser (Python's default
+    // `json.loads`, which accepts `Infinity`/`NaN`) would wrongly parse it —
+    // injected into an otherwise-valid body so ONLY the non-standard number,
+    // not a missing/mistyped field, drives the reject.
+    let nonstandard_number_header =
+        valid_header.replacen('{', "{\"nonstandard_number\":Infinity,", 1);
+
     // ---- assemble -------------------------------------------------------
     let vectors = json!({
         "description": "Golden vectors for net-payments envelope canonicalization, signing, and x402 byte-preservation. Rust is the source of truth (payments/tests/payments_golden_vectors.rs); the same file drives bindings/node/test/payments_golden_vectors.test.ts, bindings/python/tests/test_payments_golden_vectors.py, and go/payments_golden_vectors_test.go. Adding a case means updating all four verifiers in lockstep. Regenerate: cargo run -p net-payments --example gen_payments_fixtures",
@@ -375,7 +406,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         ],
         "failure_schematic_vectors": {
-            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate: decode the header bytes as UTF-8 JSON and accept iff the value is an object whose `object` == the tag (mirrors FailureSchematic::from_header_bytes). An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
             "tag": TAG_PAYMENT_FAILURE,
             "header_name": net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC,
             "cases": [
@@ -434,6 +465,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 {
                     "name": "invalid_utf8",
                     "header_base64": BASE64.encode([0xFFu8, 0xFE]),
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, no structure — a tag-only predicate would
+                    // wrongly accept; the full serde deserialize rejects.
+                    "name": "tag_only_no_structure",
+                    "header_utf8": tag_only_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag + every field but the required `recovery`.
+                    "name": "missing_recovery_object",
+                    "header_utf8": missing_recovery_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, all fields present, but `retryable` is a
+                    // string where the schematic requires a bool.
+                    "name": "retryable_wrong_type",
+                    "header_utf8": wrong_type_retryable_header,
+                    "accepted": false,
+                },
+                {
+                    // Structurally complete, but carries `Infinity` — a
+                    // non-standard JSON number a lax parser would accept.
+                    "name": "non_standard_json_number",
+                    "header_utf8": nonstandard_number_header,
                     "accepted": false,
                 },
             ],

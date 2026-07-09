@@ -310,9 +310,43 @@ func TestPaymentsCanonicalWriterRejectsFloats(t *testing.T) {
 	}
 }
 
-// paymentsTolerantParse mirrors FailureSchematic::from_header_bytes:
-// decode the header bytes as UTF-8 JSON, accept iff the value is an object
-// tagged with the schematic tag — else nil (fall back to the human error).
+// paymentsHasSchematicShape checks presence + JSON type of every required
+// FailureSchematic field (its non-optional fields; quote_id / tool_id / extra
+// keys stay optional) — the structural half of from_header_bytes (a full typed
+// serde deserialize). A tag-only or mistyped object does not deserialize, so it
+// is not accepted.
+func paymentsHasSchematicShape(obj map[string]interface{}) bool {
+	for _, k := range []string{"object", "code", "stage", "reason", "message", "funds_moved", "prior_payment"} {
+		if _, ok := obj[k].(string); !ok {
+			return false
+		}
+	}
+	for _, k := range []string{"retryable", "handler_executed"} {
+		if _, ok := obj[k].(bool); !ok {
+			return false
+		}
+	}
+	rec, ok := obj["recovery"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	for _, k := range []string{"class", "actor"} {
+		if _, ok := rec[k].(string); !ok {
+			return false
+		}
+	}
+	for _, k := range []string{"safe_to_retry", "safe_to_requote"} {
+		if _, ok := rec[k].(bool); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// paymentsTolerantParse mirrors FailureSchematic::from_header_bytes: decode the
+// header bytes as strict UTF-8 JSON (Go's encoding/json already rejects
+// Infinity/NaN) and accept iff the value deserializes to the full schematic
+// shape AND carries the tag — else nil (fall back to the human error).
 func paymentsTolerantParse(raw []byte, tag string) map[string]interface{} {
 	if !utf8.Valid(raw) {
 		return nil
@@ -326,6 +360,9 @@ func paymentsTolerantParse(raw []byte, tag string) map[string]interface{} {
 		return nil
 	}
 	if obj["object"] != tag {
+		return nil
+	}
+	if !paymentsHasSchematicShape(obj) {
 		return nil
 	}
 	return obj

@@ -121,15 +121,50 @@ def _failure_header_bytes(case) -> bytes:
     return base64.b64decode(case["header_base64"])
 
 
+# The required-field shape a `FailureSchematic` deserializes into (its
+# non-optional fields; `quote_id` / `tool_id` / extra keys stay optional).
+_REQUIRED_STR = ("object", "code", "stage", "reason", "message", "funds_moved", "prior_payment")
+_REQUIRED_BOOL = ("retryable", "handler_executed")
+_RECOVERY_STR = ("class", "actor")
+_RECOVERY_BOOL = ("safe_to_retry", "safe_to_requote")
+
+
+def _has_schematic_shape(obj) -> bool:
+    """Presence + JSON type of every required field — the structural half of
+    ``from_header_bytes`` (a full typed serde deserialize). A tag-only or
+    mistyped object does NOT deserialize, so it is not accepted. (``bool`` is a
+    subclass of ``int`` in Python but not of ``str``, so the checks don't
+    cross-accept.)"""
+    if not all(isinstance(obj.get(k), str) for k in _REQUIRED_STR):
+        return False
+    if not all(isinstance(obj.get(k), bool) for k in _REQUIRED_BOOL):
+        return False
+    rec = obj.get("recovery")
+    if not isinstance(rec, dict):
+        return False
+    if not all(isinstance(rec.get(k), str) for k in _RECOVERY_STR):
+        return False
+    return all(isinstance(rec.get(k), bool) for k in _RECOVERY_BOOL)
+
+
+def _reject_non_standard(token):
+    """``json.loads`` calls this for ``Infinity`` / ``-Infinity`` / ``NaN`` —
+    Rust's serde_json, JS ``JSON.parse``, and Go ``encoding/json`` all reject
+    these non-standard tokens, so the Python mirror must too (else it would
+    over-accept a header the others reject)."""
+    raise ValueError(f"non-standard JSON constant: {token}")
+
+
 def _tolerant_parse(raw: bytes):
-    """Mirror ``FailureSchematic::from_header_bytes``: decode the header
-    bytes as UTF-8 JSON, accept iff the value is an object tagged with the
-    schematic tag — else ``None`` (fall back to the human error body)."""
+    """Mirror ``FailureSchematic::from_header_bytes``: decode the header bytes
+    as strict UTF-8 JSON (no ``Infinity``/``NaN``) and accept iff the value
+    deserializes to the full schematic shape AND carries the tag — else
+    ``None`` (fall back to the human error body)."""
     try:
-        obj = json.loads(raw.decode("utf-8"))
+        obj = json.loads(raw.decode("utf-8"), parse_constant=_reject_non_standard)
     except (UnicodeDecodeError, ValueError):
         return None
-    if isinstance(obj, dict) and obj.get("object") == FAILURE_TAG:
+    if isinstance(obj, dict) and obj.get("object") == FAILURE_TAG and _has_schematic_shape(obj):
         return obj
     return None
 

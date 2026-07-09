@@ -261,7 +261,7 @@
     }
   ],
   "failure_schematic_vectors": {
-    "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate: decode the header bytes as UTF-8 JSON and accept iff the value is an object whose `object` == the tag (mirrors FailureSchematic::from_header_bytes). An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+    "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
     "cases": [
       {
         "accepted": true,
@@ -322,6 +322,26 @@
         "accepted": false,
         "header_base64": "//4=",
         "name": "invalid_utf8"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"object\":\"net.payment.failure@1\"}",
+        "name": "tag_only_no_structure"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"code\":\"payment\",\"funds_moved\":\"yes\",\"handler_executed\":false,\"message\":\"quote already redeemed — one payment, one serve\",\"object\":\"net.payment.failure@1\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"reason\":\"already_redeemed\",\"retryable\":false,\"stage\":\"redeem\",\"tool_id\":\"paid_echo\"}",
+        "name": "missing_recovery_object"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"code\":\"payment\",\"funds_moved\":\"yes\",\"handler_executed\":false,\"message\":\"quote already redeemed — one payment, one serve\",\"object\":\"net.payment.failure@1\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"reason\":\"already_redeemed\",\"recovery\":{\"actor\":\"caller_agent\",\"class\":\"new_quote_required\",\"next_action\":\"request_new_quote\",\"safe_to_requote\":true,\"safe_to_retry\":false},\"retryable\":\"no\",\"stage\":\"redeem\",\"tool_id\":\"paid_echo\"}",
+        "name": "retryable_wrong_type"
+      },
+      {
+        "accepted": false,
+        "header_utf8": "{\"nonstandard_number\":Infinity,\"object\":\"net.payment.failure@1\",\"code\":\"payment\",\"stage\":\"redeem\",\"reason\":\"already_redeemed\",\"message\":\"quote already redeemed — one payment, one serve\",\"retryable\":false,\"recovery\":{\"class\":\"new_quote_required\",\"actor\":\"caller_agent\",\"safe_to_retry\":false,\"safe_to_requote\":true,\"next_action\":\"request_new_quote\"},\"handler_executed\":false,\"funds_moved\":\"yes\",\"prior_payment\":\"consumed\",\"quote_id\":\"q_fixture\",\"tool_id\":\"paid_echo\"}",
+        "name": "non_standard_json_number"
       }
     ],
     "header_name": "net-failure-schematic",

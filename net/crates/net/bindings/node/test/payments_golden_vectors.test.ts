@@ -78,9 +78,32 @@ function failureHeaderBytes(c: (typeof FAILURE.cases)[number]): Buffer {
     : Buffer.from(c.header_base64!, 'base64')
 }
 
+// The required-field shape a `FailureSchematic` deserializes into (its
+// non-optional fields; `quote_id` / `tool_id` / extra keys stay optional).
+const REQUIRED_STR = ['object', 'code', 'stage', 'reason', 'message', 'funds_moved', 'prior_payment']
+const REQUIRED_BOOL = ['retryable', 'handler_executed']
+
+// Presence + JSON type of every required field — the structural half of
+// `from_header_bytes` (a full typed serde deserialize). A tag-only or mistyped
+// object does not deserialize, so it is not accepted.
+function hasSchematicShape(obj: Record<string, unknown>): boolean {
+  if (!REQUIRED_STR.every((k) => typeof obj[k] === 'string')) return false
+  if (!REQUIRED_BOOL.every((k) => typeof obj[k] === 'boolean')) return false
+  const rec = obj.recovery
+  if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) return false
+  const r = rec as Record<string, unknown>
+  return (
+    typeof r.class === 'string' &&
+    typeof r.actor === 'string' &&
+    typeof r.safe_to_retry === 'boolean' &&
+    typeof r.safe_to_requote === 'boolean'
+  )
+}
+
 // Mirror `FailureSchematic::from_header_bytes`: decode the header bytes as
-// UTF-8 JSON, accept iff the value is an object tagged with the schematic
-// tag — else `null` (fall back to the human error body).
+// strict UTF-8 JSON (JS `JSON.parse` already rejects Infinity/NaN) and accept
+// iff the value deserializes to the full schematic shape AND carries the tag —
+// else `null` (fall back to the human error body).
 function tolerantParse(raw: Buffer): Record<string, unknown> | null {
   let text: string
   try {
@@ -98,7 +121,8 @@ function tolerantParse(raw: Buffer): Record<string, unknown> | null {
     typeof obj === 'object' &&
     obj !== null &&
     !Array.isArray(obj) &&
-    (obj as Record<string, unknown>).object === FAILURE.tag
+    (obj as Record<string, unknown>).object === FAILURE.tag &&
+    hasSchematicShape(obj as Record<string, unknown>)
   ) {
     return obj as Record<string, unknown>
   }
