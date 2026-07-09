@@ -1,0 +1,36 @@
+.claude/skills/net-payments/signer.md
+  s_2ce1bbf7d954a5::t_8fa5d856a586b5 78-82
+  s_2ce1bbf7d954a5::t_d879dcc24972e1 229,231-238
+.claude/skills/net-payments/http402.md
+  s_2ce1bbf7d954a5::t_baf73b4616b9cd 65,67-70,83-86
+  s_2ce1bbf7d954a5::t_bee172b54199b0 87-88
+.claude/skills/net-payments/SKILL.md
+  s_2ce1bbf7d954a5::t_46fd3e46e73d62 3
+  s_2ce1bbf7d954a5::t_da430cb12b695f 86-92
+  s_2ce1bbf7d954a5::t_f437166c609a72 6-7
+  s_2ce1bbf7d954a5::t_04b620d90566f1 44,46
+.claude/skills/net-payments/gotchas.md
+  s_2ce1bbf7d954a5::t_99ed6dce7b64ad 99-116
+.claude/skills/net-payments/bindings.md
+  s_2ce1bbf7d954a5::t_6f41c3f9502e1c 11,13-15,18-21,23-31
+  s_2ce1bbf7d954a5::t_7b12343750b4bb 146,148-150,152-239,241-265
+  s_2ce1bbf7d954a5::t_2e5dd0376de5d8 42
+.claude/skills/net-payments/provider.md
+  s_2ce1bbf7d954a5::t_fe740d9628c6cf 182-183
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "56fc5b987648350256c0cd8da56b252d8b064f99",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
