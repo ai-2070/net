@@ -1,0 +1,22 @@
+net/crates/net/payments/tests/native_tool_gate.rs
+  s_dd32abd36f770b::t_38663cd852b2a0 219
+  s_dd32abd36f770b::t_e520f539fe1482 235
+  s_dd32abd36f770b::t_8f03c3c5d60411 198
+  s_dd32abd36f770b::t_1044194c92b9a0 267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d21a77446cf96aa0a046935da0f858d18fd8765",
+  "prompts": {},
+  "sessions": {
+    "s_dd32abd36f770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54f0235d-47c5-48e3-bbee-ce6662432c04",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
