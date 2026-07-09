@@ -11071,7 +11071,7 @@ impl MeshNode {
         let hex = Self::chain_hex(origin_hash);
         let mut holders: Vec<u64> = self.capability_fold.with_state(|state| {
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            for (_key, entry) in state.entries.iter() {
+            for entry in state.entries.values() {
                 if seen.contains(&entry.node_id) {
                     continue;
                 }

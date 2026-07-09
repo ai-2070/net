@@ -389,7 +389,7 @@ impl SpendPolicyEngine {
                             format!(
                                 "spending {amount} would take today's `{}` total on `{network}` \
                                  to {new_total}, over max_per_day {cap}",
-                                &counter_key.split('|').nth(2).unwrap_or("?")
+                                counter_key.split('|').nth(2).unwrap_or("?")
                             ),
                         );
                     }

@@ -568,24 +568,20 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
                 // already enforced by `parse_poll_request_json`.
                 _ => return None,
             }
-        } else if let Some(obj) = bp_value.as_object() {
+        } else {
+            let obj = bp_value.as_object()?;
             // Object form: `{"Sample": {"rate": N}}` for the
             // sampling mode that has an associated value.
-            if let Some(sample) = obj.get("Sample").or_else(|| obj.get("sample")) {
-                let rate = sample.get("rate").and_then(|v| v.as_u64())?;
-                let rate = u32::try_from(rate).ok()?;
-                if rate == 0 {
-                    // Validated again by `EventBusConfig::validate`,
-                    // but reject earlier so the parser surface
-                    // matches the validator surface.
-                    return None;
-                }
-                crate::config::BackpressureMode::Sample { rate }
-            } else {
+            let sample = obj.get("Sample").or_else(|| obj.get("sample"))?;
+            let rate = sample.get("rate").and_then(|v| v.as_u64())?;
+            let rate = u32::try_from(rate).ok()?;
+            if rate == 0 {
+                // Validated again by `EventBusConfig::validate`,
+                // but reject earlier so the parser surface
+                // matches the validator surface.
                 return None;
             }
-        } else {
-            return None;
+            crate::config::BackpressureMode::Sample { rate }
         };
         builder = builder.backpressure_mode(bp_mode);
     }

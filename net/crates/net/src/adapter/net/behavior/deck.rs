@@ -436,7 +436,7 @@ pub struct DaemonCounts {
 /// is direct field reads.
 fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
     let mut peers = PeerCounts::default();
-    for (_, peer) in snap.peers.iter() {
+    for peer in snap.peers.values() {
         match peer.health {
             Some(super::meshos::PeerHealthSnapshot::Healthy) => peers.healthy += 1,
             Some(super::meshos::PeerHealthSnapshot::Degraded) => peers.degraded += 1,
@@ -445,7 +445,7 @@ fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
         }
     }
     let mut daemons = DaemonCounts::default();
-    for (_, d) in snap.daemons.iter() {
+    for d in snap.daemons.values() {
         match d.lifecycle {
             super::meshos::DaemonLifecycleSnapshot::Running => daemons.running += 1,
             super::meshos::DaemonLifecycleSnapshot::Starting => daemons.starting += 1,

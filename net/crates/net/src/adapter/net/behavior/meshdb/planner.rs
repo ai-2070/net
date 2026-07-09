@@ -936,7 +936,7 @@ where
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         self.capability_fold.with_state(|state| {
             let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            for (_key, entry) in state.entries.iter() {
+            for entry in state.entries.values() {
                 let node_id = entry.node_id;
                 if !visited.insert(node_id) {
                     continue;
