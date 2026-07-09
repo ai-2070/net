@@ -138,9 +138,15 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway', () => {
 
   it('close() releases the node so NetMesh.shutdown() runs deterministically', async () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK })
-    const gw = new CapabilityGateway(mesh)
-    gw.close() // drop the gateway's retained node clone before shutdown
-    await expect(mesh.shutdown()).resolves.toBeUndefined()
+    try {
+      const gw = new CapabilityGateway(mesh)
+      gw.close() // drop the gateway's retained node clone before shutdown
+      await expect(mesh.shutdown()).resolves.toBeUndefined()
+    } finally {
+      // Safety net: tear the node down even if an assertion above threw (a
+      // second shutdown after success is a no-op).
+      await mesh.shutdown().catch(() => {})
+    }
   })
 })
 

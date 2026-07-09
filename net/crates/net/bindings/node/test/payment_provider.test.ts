@@ -152,16 +152,23 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('close() releases the node (publishPaidTools then throws; shutdown runs)', async () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
-    await mesh.start()
-    const provider = new PaymentProvider(mesh, tmp('close.state'))
-    const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
-    provider.close() // tears down the quote/pay wire + drops the node clone
-    // readBilling has no billing log here → still a structured rejection, not
-    // a node-closed crash (it holds no node reference).
-    await expect(provider.readBilling()).rejects.toThrow()
-    // Publishing after close throws (nothing to serve over).
-    expect(() => provider.publishPaidTools([ECHO], noopHandler, { echo: terms })).toThrow()
-    provider.close() // idempotent
-    await expect(mesh.shutdown()).resolves.toBeUndefined()
+    try {
+      await mesh.start()
+      const provider = new PaymentProvider(mesh, tmp('close.state'))
+      const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
+      provider.close() // tears down the quote/pay wire + drops the node clone
+      // readBilling has no billing log here → still a structured rejection, not
+      // a node-closed crash (it holds no node reference).
+      await expect(provider.readBilling()).rejects.toThrow()
+      // Publishing after close throws (nothing to serve over).
+      expect(() => provider.publishPaidTools([ECHO], noopHandler, { echo: terms })).toThrow()
+      provider.close() // idempotent
+      // The release means shutdown resolves (no outstanding node references).
+      await expect(mesh.shutdown()).resolves.toBeUndefined()
+    } finally {
+      // Safety net: tear the node down even if an assertion above threw before
+      // the shutdown ran (a second shutdown after success is a no-op).
+      await mesh.shutdown().catch(() => {})
+    }
   }, 20000)
 })
