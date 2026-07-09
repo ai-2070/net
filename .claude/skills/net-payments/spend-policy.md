@@ -94,6 +94,14 @@ After `approve`, the caller flow's next `run` picks up the held approved quote
 via `approved_quote()` and redeems it — no re-quote. `ApprovalState` is
 `Pending | Approved`; `ApprovalRecord { state, capability, quote_b64 }`.
 
+**Reachable from Python.** These operator verbs are now thin wrappers on
+the `CapabilityGateway`: `approve_payment(quote_id)` / `reject_payment(quote_id)`
+/ `pending_payments()` / `spent_today(network, asset)`, over the *same* shared
+store — closing the `approve_hint` loop so an agent embedding the Python SDK can
+resolve its own `requires_payment_approval` under operator policy without
+leaving Python (`bindings.md`). The store, lock protocol, and transition stay in
+Rust; the binding only marshals the typed result to status-JSON.
+
 **Pinning is capability consent, not spending consent** — a pinned paid tool
 still hits spend policy on every invocation.
 

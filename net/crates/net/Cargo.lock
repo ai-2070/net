@@ -2938,6 +2938,7 @@ version = "0.31.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "futures",
@@ -2948,6 +2949,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
+ "net-payments",
  "parking_lot 0.12.5",
  "postcard",
  "serde_json",
@@ -2992,6 +2994,7 @@ name = "net-python"
 version = "0.31.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "futures",

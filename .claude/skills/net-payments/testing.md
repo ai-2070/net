@@ -15,7 +15,10 @@ truth.**
 | Rust (source of truth) | `payments/tests/payments_golden_vectors.rs` |
 | Node | `bindings/node/test/payments_golden_vectors.test.ts` |
 | Python | `bindings/python/tests/test_payments_golden_vectors.py` |
-| Go | *none* (Go is absent from payments) |
+| Go | `go/payments_golden_vectors_test.go` (repo root, not `bindings/go/`) |
+
+**All four run in lockstep** — adding a case means updating all four. (The
+"Go has no verifier" claim in older notes was wrong; it exists.)
 
 Regenerate the fixture (never hand-edit `payment_vectors.json`):
 
@@ -45,6 +48,25 @@ What the vectors pin:
 - **Unknown-field preservation** — a quote carrying fields no v1 reader knows;
   they sort into canonical position and the signature covers them (stripping
   them breaks verification).
+- **Failure-schematic tolerance** (`failure_schematic_vectors`) — the
+  `net.payment.failure@1` header contract: a valid case, an unknown-reason +
+  preserved-extras case, and the reject cases (foreign `@2` tag, malformed JSON,
+  non-object, invalid UTF-8, **plus the structural rejects**: correct tag with no
+  fields, missing the required `recovery`, a wrong-typed field, and a body with a
+  non-standard JSON number like `Infinity`). Every language runs the *same
+  tolerant predicate* — but it is **not tag-only**: it mirrors
+  `FailureSchematic::from_header_bytes`, which does a full typed `serde`
+  deserialize *before* the tag check. So the predicate is "decode as strict
+  UTF-8 JSON (no `Infinity`/`NaN`) and accept iff the value has the full
+  schematic shape (all required fields with the right types — `object`, `code`,
+  `stage`, `reason`, `message`, `funds_moved`, `prior_payment` strings;
+  `retryable`, `handler_executed` bools; `recovery` an object of `class`/`actor`
+  strings + `safe_to_retry`/`safe_to_requote` bools) **and** `object` == the
+  tag." A tagged-but-incomplete/mistyped object is rejected, same as Rust —
+  non-Rust verifiers must validate the shape, not just the tag, or they drift.
+  Rust decides via the real `FailureSchematic` (a `net-sdk` dev-dep) with
+  byte-stable re-emission; the fixture is generated from that type
+  (`failure-schematic.md`).
 
 Verifier-author notes: envelope keys are ASCII, so default string sort agrees
 with bytewise order (sort by UTF-8 bytes explicitly if a non-ASCII key ever
@@ -89,12 +111,28 @@ The design's acceptance test: **the mock and the HTTP client pass the
   upgrade (`observed` → `confirmed(n)` → `final`) and delivered-amount
   cross-check.
 - `exact_evm_signing.rs` — EIP-3009 typed-data authoring + dev-signer digest.
-- `exact_svm_scheme_flow.rs` — the exact-SVM seam: the paid lifecycle on an
-  enabled solana network (wallet authors the base64 blob), and the structured
-  refusal when no SVM wallet is registered.
+- `exact_svm_scheme_flow.rs` / `exact_xrpl_scheme_flow.rs` — the SVM and XRPL
+  seams: the paid lifecycle on an enabled solana/xrpl network (wallet authors
+  the blob), and the structured refusal when no wallet is registered.
+- `svm_checker.rs` / `xrpl_checker.rs` / `eip155_checker.rs` — the independent
+  per-namespace chain checkers (delivered-amount / invoice-binding cross-check).
+- `native_tool_gate.rs` — `EngineToolPaymentGate` (SDK-native `serve_tool_paid`):
+  redeem-exactly-once, fail-closed store errors, and the failure-schematic
+  denial fields + the typed `tracing` emit (`failure-schematic.md`).
+- `mesh_paid_capability_e2e.rs` — the canonical mega-e2e: a paid capability
+  serves once across two real mesh nodes, discovering pricing over the wire.
+- `mcp_wrap_paid_e2e.rs` — MCP wrap `publish_tools` + real `EnginePaymentAdmission`
+  over two nodes.
 - `adversarial_p1.rs` — facilitator-receipt replay, payload/requirements
   mismatch, CAIP network/asset confusion, amount/decimals per network.
 - `http402_outbound.rs` — the outbound HTTP 402 two-way door.
+
+Python-binding payment tests (driven Rust tests + pytest, in
+`bindings/python/`): `capability_gateway.rs`'s test modules pin the
+`outcome_to_json` projections, the approval-verb store round-trip, and a driven
+paid invoke through the actual demand surface; `tests/test_capability_gateway.py`
++ `tests/test_payment_http.py` are the pytest twins (skip cleanly when a feature
+is absent).
 
 Run the mock-only suite (no HTTP, no signer) — the default build:
 
@@ -111,18 +149,33 @@ cargo test -p net-payments --features mesh                      # two-node mesh 
 cargo test -p net-payments --features mcp-gate                  # gate composition
 ```
 
+The Python-binding payment tests build the extension with the demand-side
+features (they link libpython, so use a feature subset, not the extension-module
+build):
+
+```
+cargo test -p net-python --no-default-features --features net,cortex,consent,mcp,payments             # gateway + approval verbs
+cargo test -p net-python --no-default-features --features net,cortex,consent,mcp,payments,payments-http # + the HTTP-402 client
+```
+
+`payments-http` is an **opt-in** feature (not in the default wheel — it pulls
+reqwest/rustls); the CI python-tests `maturin develop` enables it so
+`test_payment_http.py` runs. Set `CARGO_INCREMENTAL=0` if the incremental cache
+fills the disk on these heavy builds.
+
 ## The key-invariant negative test (per binding)
 
 Doctrine 8 demands a testable invariant: **no binding can accept, return,
 serialize, log, or request raw signing of arbitrary bytes.** Each binding
 carries a negative test proving key material is unrepresentable in its API —
-`SchemeSigner` has no raw-bytes method (the SVM `sign_svm_transfer` also takes
-a typed intent, never bytes), and the Python bridge only ever passes a typed
-`eth_signTypedData_v4` doc + gets a signature back. The Python negative test
-lives in `bindings/python/tests/test_capability_gateway.py` — it pins that no
-gateway kwarg accepts key material, and that the signer kwargs are both-or-
-neither and require the policy store. When you touch a binding's signer
-surface, that negative test must still hold.
+`SchemeSigner` has no raw-bytes method (the SVM `sign_svm_transfer` / XRPL
+`sign_xrpl_payment` also take typed intents, never bytes), and the Python bridge
+only ever passes a typed document (eip155 typed-data / svm / xrpl intent JSON) +
+gets an artifact string back. The Python negative test lives in
+`bindings/python/tests/test_capability_gateway.py` — it pins that **no** gateway
+kwarg accepts key material (extended to the svm/xrpl signer namespaces), and
+that every signer pair is both-or-neither and requires the policy store. When
+you touch a binding's signer surface, that negative test must still hold.
 
 ## Live testnet (env-gated, never in CI)
 

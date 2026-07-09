@@ -19,6 +19,7 @@
 const ERR_CORTEX_PREFIX = 'cortex:'
 const ERR_NETDB_PREFIX = 'netdb:'
 const ERR_NRPC_PREFIX = 'nrpc:'
+const ERR_GATEWAY_PREFIX = 'gateway:'
 
 export class CortexError extends Error {
   constructor(detail?: string) {
@@ -33,6 +34,18 @@ export class NetDbError extends Error {
     super(detail ?? 'netdb error')
     this.name = 'NetDbError'
     Object.setPrototypeOf(this, NetDbError.prototype)
+  }
+}
+
+// The CapabilityGateway throws (rejects) ONLY for transport/programming
+// failures behind a `gateway:` prefix — e.g. the mesh node was shut down at
+// construction. Gate *outcomes* (denied / requires_payment_approval / …) are
+// never thrown: they are the status-JSON string the method resolves to.
+export class GatewayError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? 'capability gateway error')
+    this.name = 'GatewayError'
+    Object.setPrototypeOf(this, GatewayError.prototype)
   }
 }
 
@@ -184,6 +197,9 @@ export function classifyError(e: unknown): unknown {
   }
   if (msg.startsWith(ERR_NRPC_PREFIX)) {
     return classifyRpcError(msg)
+  }
+  if (msg.startsWith(ERR_GATEWAY_PREFIX)) {
+    return new GatewayError(msg)
   }
   return e
 }

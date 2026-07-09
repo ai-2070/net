@@ -44,6 +44,12 @@ pub struct ToolDescriptorJs {
     pub stateless: bool,
     pub streaming: bool,
     pub tags: Vec<String>,
+    /// `net.pricing.terms@1` envelope as canonical JSON when the tool is
+    /// paid; `None` = free. Opaque to the binding (byte-preserved — payment
+    /// semantics live in `net-payments`). Surfaced so `listTools()` reports
+    /// the announced price `watchTools()` already carries; displaying a price
+    /// never implies authorization to spend it.
+    pub pricing_terms: Option<String>,
     pub node_count: u32,
 }
 
@@ -62,6 +68,7 @@ pub fn descriptor_to_js(d: ToolDescriptor) -> ToolDescriptorJs {
         stateless: d.stateless,
         streaming: d.streaming,
         tags: d.tags,
+        pricing_terms: d.pricing_terms,
         node_count: d.node_count,
     }
 }
@@ -296,6 +303,25 @@ mod tests {
         assert_eq!(obj["streaming"], true);
         assert_eq!(obj["inputSchema"], "{\"type\":\"object\"}");
         assert_eq!(obj["pricingTerms"], "{\"object\":\"net.pricing.terms@1\"}");
+    }
+
+    // `listTools()` returns `ToolDescriptorJs` (napi camelCases the fields).
+    // Pin that `descriptor_to_js` copies `pricing_terms` through, so a paid
+    // tool reports its announced price on the LIST path, not only the WATCH
+    // path (`descriptor_to_camel_json`). A plain field-copy struct — no napi
+    // Error / Node handle — so it constructs cleanly under `cargo test`.
+    #[test]
+    fn descriptor_to_js_carries_pricing_terms() {
+        let js = descriptor_to_js(full_descriptor());
+        assert_eq!(
+            js.pricing_terms.as_deref(),
+            Some("{\"object\":\"net.pricing.terms@1\"}"),
+        );
+        // A free tool round-trips as absent (napi omits `None` → JS
+        // `pricingTerms` is `undefined`, matching the optional TS field).
+        let mut free = full_descriptor();
+        free.pricing_terms = None;
+        assert!(descriptor_to_js(free).pricing_terms.is_none());
     }
 
     #[test]

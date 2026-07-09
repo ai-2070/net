@@ -233,6 +233,128 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Terms are unsigned — emit its canonical form directly.
     let terms_canonical = String::from_utf8(canonical_bytes(&terms)?)?;
 
+    // ---- failure schematics (SDK wire object; unsigned) -----------------
+    // The `net.payment.failure@1` header tolerance contract, pinned for
+    // every consumer language. Built from the real `FailureSchematic` so the
+    // bytes ARE what a producer emits; regeneration re-derives them, and any
+    // drift in the type's wire shape shows up as a fixture diff.
+    use net_sdk::tool_payment::{failure_vocab, FailureSchematic, Recovery, TAG_PAYMENT_FAILURE};
+
+    let valid_schematic = FailureSchematic {
+        object: TAG_PAYMENT_FAILURE.to_string(),
+        code: failure_vocab::CODE_PAYMENT.to_string(),
+        stage: failure_vocab::STAGE_REDEEM.to_string(),
+        reason: "already_redeemed".to_string(),
+        message: "quote already redeemed — one payment, one serve".to_string(),
+        retryable: false,
+        recovery: Recovery {
+            class: failure_vocab::CLASS_NEW_QUOTE_REQUIRED.to_string(),
+            actor: failure_vocab::ACTOR_CALLER_AGENT.to_string(),
+            safe_to_retry: false,
+            safe_to_requote: true,
+            next_action: Some("request_new_quote".to_string()),
+        },
+        handler_executed: false,
+        funds_moved: failure_vocab::FUNDS_YES.to_string(),
+        prior_payment: failure_vocab::PRIOR_CONSUMED.to_string(),
+        quote_id: Some("q_fixture".to_string()),
+        tool_id: Some("paid_echo".to_string()),
+        extra: BTreeMap::new(),
+    };
+
+    // A future producer: a reserved reason with no v1 emitter, plus unknown
+    // top-level fields — same `@1` tag, so consumers must accept it and
+    // preserve the extras (the additive-tolerance contract).
+    let mut unknown_schematic = FailureSchematic {
+        object: TAG_PAYMENT_FAILURE.to_string(),
+        code: failure_vocab::CODE_PAYMENT.to_string(),
+        stage: "authoring".to_string(),
+        reason: "insufficient_funds".to_string(),
+        message: "insufficient funds for this quote".to_string(),
+        retryable: true,
+        recovery: Recovery {
+            class: failure_vocab::CLASS_USER_ACTION_REQUIRED.to_string(),
+            actor: failure_vocab::ACTOR_CALLER_USER.to_string(),
+            safe_to_retry: false,
+            safe_to_requote: true,
+            next_action: Some("top_up_wallet".to_string()),
+        },
+        handler_executed: false,
+        funds_moved: failure_vocab::FUNDS_NO.to_string(),
+        prior_payment: failure_vocab::PRIOR_NONE.to_string(),
+        quote_id: None,
+        tool_id: None,
+        extra: BTreeMap::new(),
+    };
+    unknown_schematic
+        .extra
+        .insert("required_amount".to_string(), json!("100000"));
+    unknown_schematic
+        .extra
+        .insert("zz_future".to_string(), json!({"nested": [1, true, null]}));
+
+    // A future MAJOR version — same body, `@2` tag: a consumer must treat it
+    // as absent and fall back to the human error body.
+    let mut foreign_schematic = valid_schematic.clone();
+    foreign_schematic.object = "net.payment.failure@2".to_string();
+
+    let valid_header = String::from_utf8(valid_schematic.to_header_bytes().expect("valid fits"))?;
+    let unknown_header =
+        String::from_utf8(unknown_schematic.to_header_bytes().expect("unknown fits"))?;
+    let foreign_header =
+        String::from_utf8(foreign_schematic.to_header_bytes().expect("foreign fits"))?;
+
+    // Correct-tag-but-malformed-structure rejects. `from_header_bytes` does a
+    // full typed `serde` deserialize BEFORE the tag check, so a header carrying
+    // the tag yet not matching the schematic shape is rejected — a naive
+    // tag-only predicate would wrongly accept these, so they pin the structural
+    // half of the contract across languages.
+    //
+    // (a) Just the tag, none of the required fields.
+    let tag_only_header = json!({ "object": TAG_PAYMENT_FAILURE }).to_string();
+    // (b) Every field but the required `recovery` object.
+    let mut missing_recovery_val = serde_json::to_value(&valid_schematic)?;
+    missing_recovery_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .remove("recovery");
+    let missing_recovery_header = serde_json::to_string(&missing_recovery_val)?;
+    // (c) A required field present but wrong-typed (`retryable` is a bool).
+    let mut wrong_type_val = serde_json::to_value(&valid_schematic)?;
+    wrong_type_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .insert("retryable".to_string(), json!("no"));
+    let wrong_type_retryable_header = serde_json::to_string(&wrong_type_val)?;
+    // (d) An OPTIONAL typed field present but wrong-typed: `quote_id` is a number
+    // where the schematic types it `Option<String>`. A predicate that checks only
+    // the REQUIRED fields wrongly accepts (quote_id is optional); the full serde
+    // deserialize rejects, so this pins that a *present* optional is still
+    // type-checked across languages.
+    let mut quote_id_wrong_val = serde_json::to_value(&valid_schematic)?;
+    quote_id_wrong_val
+        .as_object_mut()
+        .expect("schematic is a JSON object")
+        .insert("quote_id".to_string(), json!(42));
+    let quote_id_wrong_type_header = serde_json::to_string(&quote_id_wrong_val)?;
+    // (e) The same, but nested in `recovery`: `recovery.next_action` is a number
+    // where it is typed `Option<String>`.
+    let mut next_action_wrong_val = serde_json::to_value(&valid_schematic)?;
+    next_action_wrong_val
+        .get_mut("recovery")
+        .and_then(|r| r.as_object_mut())
+        .expect("recovery is a JSON object")
+        .insert("next_action".to_string(), json!(7));
+    let next_action_wrong_type_header = serde_json::to_string(&next_action_wrong_val)?;
+    // (f) A structurally-complete schematic carrying a NON-STANDARD JSON number
+    // (`Infinity`). Every strict parser (serde_json, JS `JSON.parse`, Go
+    // `encoding/json`) rejects it; only a lax parser (Python's default
+    // `json.loads`, which accepts `Infinity`/`NaN`) would wrongly parse it —
+    // injected into an otherwise-valid body so ONLY the non-standard number,
+    // not a missing/mistyped field, drives the reject.
+    let nonstandard_number_header =
+        valid_header.replacen('{', "{\"nonstandard_number\":Infinity,", 1);
+
     // ---- assemble -------------------------------------------------------
     let vectors = json!({
         "description": "Golden vectors for net-payments envelope canonicalization, signing, and x402 byte-preservation. Rust is the source of truth (payments/tests/payments_golden_vectors.rs); the same file drives bindings/node/test/payments_golden_vectors.test.ts, bindings/python/tests/test_payments_golden_vectors.py, and go/payments_golden_vectors_test.go. Adding a case means updating all four verifiers in lockstep. Regenerate: cargo run -p net-payments --example gen_payments_fixtures",
@@ -303,6 +425,112 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "envelope_field": "settlement",
             },
         ],
+        "failure_schematic_vectors": {
+            "_note": "Tolerance contract for the net.payment.failure@1 sidecar header (net-failure-schematic). The schematic is an UNSIGNED SDK wire object (net_sdk::tool_payment::FailureSchematic) rendered beside — never instead of — the human error body. Every consumer applies the SAME tolerant predicate, mirroring FailureSchematic::from_header_bytes: decode the header bytes as strict UTF-8 JSON (no Infinity/NaN) and accept iff the value deserializes to the full schematic shape — an object carrying the required fields with the right types (object,code,stage,reason,message,funds_moved,prior_payment as strings; retryable,handler_executed as bools; recovery as an object of class,actor strings + safe_to_retry,safe_to_requote bools) AND whose `object` == the tag. The optional quote_id/tool_id and recovery.next_action, when present, must be strings (a wrong-typed OPTIONAL fails the deserialize too — a required-fields-only predicate would wrongly accept). Structure matters, not just the tag: a tagged-but-incomplete/mistyped object, or one with a non-standard JSON number, is NOT accepted. An `accepted:false` header MUST fall back to the human error — never an error, never a guess. Each case carries either `header_utf8` (UTF-8 text) or `header_base64` (raw bytes, for the non-UTF-8 case).",
+            "tag": TAG_PAYMENT_FAILURE,
+            "header_name": net_sdk::tool_payment::HDR_FAILURE_SCHEMATIC,
+            "cases": [
+                {
+                    "name": "valid_already_redeemed",
+                    "header_utf8": valid_header,
+                    "accepted": true,
+                    "expect": {
+                        "stage": "redeem",
+                        "reason": "already_redeemed",
+                        "retryable": false,
+                        "funds_moved": "yes",
+                        "prior_payment": "consumed",
+                        "recovery": {
+                            "class": "new_quote_required",
+                            "actor": "caller_agent",
+                            "safe_to_retry": false,
+                            "safe_to_requote": true,
+                        },
+                    },
+                },
+                {
+                    "name": "unknown_reason_and_extra_fields",
+                    "header_utf8": unknown_header,
+                    "accepted": true,
+                    "expect": {
+                        "stage": "authoring",
+                        "reason": "insufficient_funds",
+                        "retryable": true,
+                        "funds_moved": "no",
+                        "prior_payment": "none",
+                        "recovery": {
+                            "class": "user_action_required",
+                            "actor": "caller_user",
+                            "safe_to_retry": false,
+                            "safe_to_requote": true,
+                        },
+                    },
+                    "expect_extra_keys": ["required_amount", "zz_future"],
+                },
+                {
+                    "name": "foreign_major_version_tag",
+                    "header_utf8": foreign_header,
+                    "accepted": false,
+                },
+                {
+                    "name": "malformed_json",
+                    "header_utf8": "{ not json",
+                    "accepted": false,
+                },
+                {
+                    "name": "not_an_object",
+                    "header_utf8": "123",
+                    "accepted": false,
+                },
+                {
+                    "name": "invalid_utf8",
+                    "header_base64": BASE64.encode([0xFFu8, 0xFE]),
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, no structure — a tag-only predicate would
+                    // wrongly accept; the full serde deserialize rejects.
+                    "name": "tag_only_no_structure",
+                    "header_utf8": tag_only_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag + every field but the required `recovery`.
+                    "name": "missing_recovery_object",
+                    "header_utf8": missing_recovery_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, all fields present, but `retryable` is a
+                    // string where the schematic requires a bool.
+                    "name": "retryable_wrong_type",
+                    "header_utf8": wrong_type_retryable_header,
+                    "accepted": false,
+                },
+                {
+                    // Correct tag, all REQUIRED fields present + well-typed, but
+                    // the optional `quote_id` is a number where it is typed
+                    // Option<String>. A required-fields-only predicate wrongly
+                    // accepts; the full serde deserialize rejects.
+                    "name": "optional_quote_id_wrong_type",
+                    "header_utf8": quote_id_wrong_type_header,
+                    "accepted": false,
+                },
+                {
+                    // The same for the optional nested `recovery.next_action`.
+                    "name": "optional_next_action_wrong_type",
+                    "header_utf8": next_action_wrong_type_header,
+                    "accepted": false,
+                },
+                {
+                    // Structurally complete, but carries `Infinity` — a
+                    // non-standard JSON number a lax parser would accept.
+                    "name": "non_standard_json_number",
+                    "header_utf8": nonstandard_number_header,
+                    "accepted": false,
+                },
+            ],
+        },
         "caip_vectors": [
             {"input": "eip155:8453", "kind": "chain", "valid": true},
             {"input": "eip155:84532", "kind": "chain", "valid": true},

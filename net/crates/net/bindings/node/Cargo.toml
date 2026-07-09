@@ -44,6 +44,8 @@ default = [
     "tool",
     "consent",
     "mcp",
+    "publish",
+    "payments",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -150,12 +152,43 @@ consent = ["dep:net-sdk"]
 # only — publishing itself goes through the general SDK path; the
 # forwarding/keychain internals are never bound (bridge doctrine #3).
 mcp = ["consent", "dep:net-mcp"]
+# Publish a node's OWN local tools as mesh capabilities
+# (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B5 prerequisite) — the inverse of `net
+# wrap`, backed by a JS async tool handler. The free (unpriced) publish path;
+# the Node payment provider will layer a `PaymentEngine` on top. Composite:
+# `mcp` (the `net_mcp::wrap::ServerPublisher::publish_tools` surface +
+# `ToolInvoker`), `net` + `net-sdk/net` (the SDK mesh surface `from_node_arc`
+# needs), and `async-trait` for the `ToolInvoker` impl + the TSFN→Promise
+# handler bridge. Mirrors the Python `publish` feature.
+publish = ["mcp", "net", "dep:net-sdk", "net-sdk/net", "dep:async-trait"]
+# Payments (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` Part B): the consent-gated
+# CapabilityGateway (search/describe/invoke over `gated_invoke`) + the caller
+# payment flow (spend policy, signers, approval verbs). `net-mcp` is already
+# linked by `mcp`; this adds the `net-payments` caller flow (`mcp-gate` for the
+# gate seam, `mesh` for `MeshPaymentChannel` + the SDK mesh surface). Thin per
+# doctrine #1: every payment decision is the Rust flow's; the binding marshals.
+payments = ["mcp", "net", "dep:net-payments"]
+# Outbound HTTP-402 client (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B3):
+# `PaymentHttpClient` over `net-payments::flow::http402::X402HttpFlow`. Kept
+# OUT of the default `.node`: it pulls `net-payments/http-facilitator`
+# (reqwest + rustls + bundled roots), a real size add — an explicit opt-in,
+# mirroring the Python `payments-http`.
+payments-http = ["payments", "net-payments/http-facilitator", "dep:base64"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.31.0", path = "../..", default-features = false }
 net-sdk = { package = "net-mesh-sdk", version = "0.31.0", path = "../../sdk", default-features = false, optional = true }
 # The MCP bridge adapter, for the two pure helpers only (feature `mcp`).
 net-mcp = { package = "net-mesh-mcp", version = "0.31.0", path = "../../adapters/mcp", optional = true }
+# The payments caller flow (feature `payments`): the spend engine + gateway
+# payment gate paid capabilities clear through. `mesh` brings the SDK mesh
+# surface (`MeshPaymentChannel`, `net-sdk/net`+`cortex`); `mcp-gate` the
+# `gated_invoke` payment seam.
+net-payments = { version = "0.31.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
+# The outbound HTTP-402 client base64-encodes the byte-preserved settlement
+# response for audit. Optional + `payments-http`-gated (already in the lock via
+# net-payments).
+base64 = { version = "0.22", optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 # `napi` (runtime) and `napi-derive` MUST move in lockstep: napi-derive

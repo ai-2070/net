@@ -1,10 +1,10 @@
 ---
 name: net-payments
-description: "Use this skill when the user is integrating the Net Payments SDK (`net-payments` Rust crate, `net_payments` lib, or the Python `CapabilityGateway` payment surface) — x402-native payments for the Net mesh. Covers pricing a capability at discovery (`net.pricing.terms@1`), issuing signed quotes (`net.payment.quote@1`), the provider-side lifecycle engine (`PaymentEngine`: quote → verify → settle → tiered verification → billing), the caller-side flow (`CallerPaymentFlow` / `ProviderChannel`: pricing → spend policy → payload → pay), facilitators (mock + the real HTTP `verify`/`settle` client, config packs, auth), tiered verification (`observed | confirmed(n) | final`) with the independent on-chain `ChainChecker`, reorg handling, the settlement signer seam (`SchemeSigner` / `ExternalSigner` / `ExternalSvmSigner` — EIP-3009 exact-EVM and SPL exact-SVM `sign_svm_transfer`/`SvmTransferIntent`, keys never cross the boundary), the spend policy engine (budgets, delegation inheritance, `requires_payment_approval`), immutable billing events + the billing stream, network enablement (CAIP-2/CAIP-19, the signed asset registry, Base/Solana/xrpl config-not-code ladder), the outbound HTTP 402 two-way door, and cross-language golden vectors + conformance. Triggers on imports of `net-payments` / `net_payments`; on `x402`, `PaymentEngine`, `PaymentQuote`, `PricingTerms`, `net.payment.*` / `net.billing.* / net.settlement.*`, `X402Carry`, `PaymentRequirements`, `facilitator verify/settle`, `VerificationTier`, `confirmed(n)`, `reorg`, `SchemeSigner`, `ExternalSigner`, `ExternalSvmSigner`, `SvmTransferIntent`, SPL/Solana settlement, `SpendPolicyEngine`, `BillingEvent`, `MeshPaymentChannel`, `serve_payments`, `payment_gate`, `gated_invoke`, `requires_payment_approval`, `CAIP-2`/`CAIP-19`, `AssetRegistry`, `HttpFacilitator`, `x402/base`, `EIP-3009`, HTTP 402; and on phrases like 'price a capability', 'charge for a tool', 'pay to invoke', 'quote a payment', 'pay-before-serve', 'settle on Base/Solana', 'verify a payment on-chain', 'spend limit / budget', 'approve a payment', 'bill for usage', 'pay an x402 API'. This is a small, sharply-bounded slice: Net signs the commercial facts around invocation, it does NOT custody funds, process payments, issue invoices, or move money. Skip for unrelated event-bus / mesh work (that's the `net-event-bus` skill) or for editing payments' own internals unless the task is payments integration."
+description: "Use this skill when the user is integrating the Net Payments SDK (`net-payments` Rust crate, `net_payments` lib, or the Python/Node `CapabilityGateway` + `PaymentProvider` payment surface) — x402-native payments for the Net mesh. Covers pricing a capability at discovery (`net.pricing.terms@1`), issuing signed quotes (`net.payment.quote@1`), the provider-side lifecycle engine (`PaymentEngine`: quote → verify → settle → tiered verification → billing), the caller-side flow (`CallerPaymentFlow` / `ProviderChannel`: pricing → spend policy → payload → pay), facilitators (mock + the real HTTP `verify`/`settle` client, config packs, auth), tiered verification (`observed | confirmed(n) | final`) with the independent on-chain `ChainChecker`, reorg handling, the settlement signer seam (`SchemeSigner` / `ExternalSigner` / `ExternalSvmSigner` / `ExternalXrplSigner` — EIP-3009 exact-EVM, SPL exact-SVM `sign_svm_transfer`/`SvmTransferIntent`, and exact-XRPL `sign_xrpl_payment`/`XrplPaymentIntent`; keys never cross the boundary), the spend policy engine (budgets, delegation inheritance, `requires_payment_approval`), immutable billing events + the billing stream, network enablement (CAIP-2/CAIP-19, the signed asset registry, Base/Solana/xrpl config-not-code ladder), the outbound HTTP 402 two-way door, the machine-actionable failure schematic (`net.payment.failure@1`) that rides denials beside the human error, the multi-language SDK surfaces (Python AND Node/TS both at full demand+supply parity with Rust — `CapabilityGateway`, the paid `PaymentProvider` + `buildPricingTerms`, HTTP-402 client, eip155/svm/xrpl signers, approval verbs, free `publishTools`), and cross-language golden vectors + conformance. Triggers on imports of `net-payments` / `net_payments`; on `x402`, `PaymentEngine`, `PaymentQuote`, `PricingTerms`, `net.payment.*` / `net.billing.* / net.settlement.*`, `X402Carry`, `PaymentRequirements`, `facilitator verify/settle`, `VerificationTier`, `confirmed(n)`, `reorg`, `SchemeSigner`, `ExternalSigner`, `ExternalSvmSigner`, `SvmTransferIntent`, SPL/Solana settlement, `SpendPolicyEngine`, `BillingEvent`, `MeshPaymentChannel`, `serve_payments`, `payment_gate`, `gated_invoke`, `requires_payment_approval`, `CAIP-2`/`CAIP-19`, `AssetRegistry`, `HttpFacilitator`, `x402/base`, `EIP-3009`, HTTP 402; and on phrases like 'price a capability', 'charge for a tool', 'pay to invoke', 'quote a payment', 'pay-before-serve', 'settle on Base/Solana', 'verify a payment on-chain', 'spend limit / budget', 'approve a payment', 'bill for usage', 'pay an x402 API'. This is a small, sharply-bounded slice: Net signs the commercial facts around invocation, it does NOT custody funds, process payments, issue invoices, or move money. Skip for unrelated event-bus / mesh work (that's the `net-event-bus` skill) or for editing payments' own internals unless the task is payments integration."
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
-  skill-version: 1.1.0
-  last-updated: 2026-07-06
+  skill-version: 1.3.0
+  last-updated: 2026-07-09
   net-version: 0.31.0
   x402-spec: "v2 @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
 ---
@@ -41,8 +41,9 @@ Load reference files on demand — do not read them all up front.
 | `spend-policy.md` | When the user wants **limits, budgets, or approvals** — `SpendPolicyEngine`, `SpendLimits`, the fail-closed default posture, the operator approval surface, delegation inheritance. |
 | `networks.md` | When **enabling a network** — CAIP-2/CAIP-19, the signed asset registry, the Base Sepolia → Base → Solana → xrpl ladder, "config, not code," the live testnet runbook. |
 | `billing.md` | When the user wants **usage records / a billing stream** — `BillingLog` (subscribe/read/export), immutability, the lifecycle-hooks doctrine, what billing is NOT. |
-| `http402.md` | When a Net agent **pays an external x402 HTTP API** — the outbound `X402HttpFlow`, the header-only v2 transport, why it's the same objects (the two-way door). |
-| `bindings.md` | When the language matters — the per-language table (only **Rust + Python** have a native flow; Node is read-only pricing; Go is absent), the Python `CapabilityGateway` surface. |
+| `http402.md` | When a Net agent **pays an external x402 HTTP API** — the outbound `X402HttpFlow` + the Python / Node `PaymentHttpClient`, the header-only v2 transport, why it's the same objects (the two-way door). |
+| `failure-schematic.md` | When handling **denials / refusals** — the `net.payment.failure@1` object that rides beside the human error, the reason→recovery mapping, the header discipline, and how each surface (MCP / Python `failure` field / tracing) projects it. |
+| `bindings.md` | When the language matters — the per-language table (**Rust, Python, AND Node** all have a full demand+supply flow; Go is verifier-only), the `CapabilityGateway` (demand) + `PaymentProvider`/`buildPricingTerms` (supply) + HTTP-402 + signer surfaces, and Node's `close()` / `permissiveChannels` gotchas. |
 | `testing.md` | When writing/running tests — cross-language golden vectors, the mock conformance suite, the key-invariant negative test, feature-gated suites, the env-gated live run. |
 | `gotchas.md` | When the user's framing carries a wrong mental model, when migrating, or before merging — the review invariant, "what not to build," the byte-preservation trap, common mistakes. |
 
@@ -82,27 +83,34 @@ carrying a mental model that produces compiling-but-rejected code.
 
 ## Workflow when integrating
 
-1. **Identify the language.** Only **Rust** and **Python** have a native
-   payment flow. **Node** exposes read-only `ToolDescriptor.pricingTerms` at
-   discovery and a golden-vector verifier; **Go** has nothing for payments.
-   Check `bindings.md` before promising a flow.
+1. **Identify the language.** **Rust, Python, AND Node/TS** all have a full
+   native **demand + supply** flow — `CapabilityGateway` (pay to invoke),
+   `PaymentProvider` + `buildPricingTerms` (price + charge), the HTTP-402
+   client, eip155/svm/xrpl signers, approval verbs, and a free `publishTools`
+   path. **Go** has a golden-vector verifier but no flow; no native C payment
+   flow exists. Check `bindings.md` before promising a flow — especially Node's
+   `close()` / `permissiveChannels` requirements.
 2. **Read `concepts.md`** if this is your first invocation this session.
 3. **Which side is the user on?**
    - *Charging for a capability* (provider) → `provider.md`. Price at publish
      (`net.pricing.terms@1`), run the `PaymentEngine` lifecycle, compose the
      `payment_gate` into `gated_invoke`.
    - *Paying to invoke* (caller) → `caller.md`. `CallerPaymentFlow` over a
-     `ProviderChannel`, spend policy, the approval loop.
-   - *Paying an external x402 HTTP API* → `http402.md` (`X402HttpFlow`).
+     `ProviderChannel`, spend policy, the approval loop; branch on the
+     `net.payment.failure@1` schematic that rides a denial (`failure-schematic.md`).
+   - *Paying an external x402 HTTP API* → `http402.md` (`X402HttpFlow` /
+     `PaymentHttpClient`).
 4. **Pick the facilitator.** Default to `MockFacilitator` (the conformance
    backbone) for anything not touching real money; `HttpFacilitator` + a
    config pack for a real network. `facilitator.md`.
 5. **Set the required tier.** Receipt-trust (`observed`) or an independent
    check (`confirmed(n)`/`final` via `ChainChecker`)? `verification.md`.
 6. **Wire the signer** if settling on a real network — `ExternalSigner`
-   (eip155/EIP-3009; key never in Net) or `ExternalSvmSigner` (solana/SPL,
-   intent-in/blob-out), registered per namespace; `DevLocalSigner` for testnet
-   only (behind `unsafe-dev-signer`). `signer.md`.
+   (eip155/EIP-3009; key never in Net), `ExternalSvmSigner` (solana/SPL,
+   intent-in/blob-out), or `ExternalXrplSigner` (xrpl/presigned Payment blob),
+   registered per namespace; `DevLocalSigner` for testnet only (behind
+   `unsafe-dev-signer`). From Python, all three ride the `payment_signer*`
+   kwargs. `signer.md`.
 7. **Configure spend policy** — limits, allowed networks/assets, the approval
    surface. Real networks deny by default. `spend-policy.md`.
 8. **Enabling a new network?** It's config + registry + conformance, never
@@ -115,10 +123,11 @@ carrying a mental model that produces compiling-but-rejected code.
 12. **If you're unsure about an API, read the source — it's ground truth:**
     - Rust core: `net/crates/net/payments/src/` (`engine/`, `flow/`,
       `facilitator/`, `core/`, `x402/`, `policy/`, `checker/`, `billing/`)
+    - Failure schematic (SDK wire object): `net/crates/net/sdk/src/tool_payment.rs`
     - Rust examples/tests: `payments/examples/`, `payments/tests/`
-    - Python surface: `net/crates/net/bindings/python/src/capability_gateway.rs`
+    - Python surface: `net/crates/net/bindings/python/src/capability_gateway.rs`,
+      `payment_http.rs`, and the `_net.pyi` stub
     - Cross-lang vectors: `net/crates/net/tests/cross_lang_payments/`
-    - Plans (built-state record): `net/crates/net/docs/plans/PAYMENTS_*`
 
 ## What this skill deliberately does not cover
 
@@ -134,4 +143,4 @@ carrying a mental model that produces compiling-but-rejected code.
 - **Inbound HTTP 402 serving** — deferred, demand-driven.
 
 If the user asks about these, say where they stand rather than inventing an
-API. The built-state record is in `docs/plans/PAYMENTS_P1_NETWORK_LADDER.md`.
+API.

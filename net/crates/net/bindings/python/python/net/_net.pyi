@@ -3049,7 +3049,17 @@ class CapabilityGateway:
       ``requires_approval`` relay ``approve_command``; on
       ``requires_payment_approval`` relay ``{quote_id, policy_reason,
       approve_hint}`` — spend policy wants a human, the decision resolves
-      through the payments consent surface, and nothing was charged.
+      through the payments consent surface, and nothing was charged. On a
+      payment refusal (usually ``denied``) a ``failure`` object may ride
+      *beside* ``error`` (never instead of it) when the provider attached the
+      ``net.payment.failure@1`` schematic — the machine-actionable verdict:
+      ``{object, code, stage, reason, message, retryable, recovery: {class,
+      actor, safe_to_retry, safe_to_requote, next_action?}, handler_executed,
+      funds_moved, prior_payment, quote_id?, tool_id?, ...}``. Branch on
+      ``failure["reason"]`` / ``failure["recovery"]`` instead of parsing prose;
+      unknown reasons and extra fields are tolerated (the schematic's ``@1``
+      additive-forward-compat contract). Its absence means the refusal carried
+      no schematic — fall back to ``error``.
 
     ``describe`` results additionally carry ``pricing_terms`` (the announced
     ``net.pricing.terms@1`` canonical JSON) when the capability is paid;
@@ -3086,6 +3096,10 @@ class CapabilityGateway:
         payment_unsafe_mock_auto_allow: bool = False,
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
+        payment_signer_svm_address: Optional[str] = None,
+        payment_signer_svm: Optional[Callable[[str], str]] = None,
+        payment_signer_xrpl_address: Optional[str] = None,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Build a gateway over a started ``mesh``. ``pin_store_path`` should
         be the machine-shared pin store so approvals are honored both ways;
@@ -3126,7 +3140,16 @@ class CapabilityGateway:
         key, and the only thing this surface can ask your signer for is a
         logged, typed transfer authorization (never raw bytes). Enablement
         still requires the network in the spend policy's
-        ``allowed_networks`` — the signer is capability, not consent."""
+        ``allowed_networks`` — the signer is capability, not consent.
+
+        Solana and XRPL settlement use the same seam under their own
+        namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
+        (a ``(intent_json: str) -> str`` returning the base64 partially-signed
+        SVM transaction) and ``payment_signer_xrpl_address`` +
+        ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
+        blob). Each pair is both-or-neither; an absent pair means that scheme
+        is simply unavailable. The callable always sees a typed intent JSON,
+        never key material — identical doctrine to the eip155 seam."""
         ...
 
     @property
@@ -3150,6 +3173,40 @@ class CapabilityGateway:
         """Invoke a capability through the consent gate. ``arguments_json`` is
         the tool's own arguments as a JSON object string. Returns the
         structured JSON described above; never raises for a gate outcome."""
+        ...
+
+    def approve_payment(self, quote_id: str) -> str:
+        """Approve a held payment quote under operator policy, resolving a
+        prior ``requires_payment_approval`` so the next :meth:`invoke`
+        redeems it. Returns
+        ``{"status":"ok","quote_id":...,"changed":bool}`` (``changed`` is
+        whether the record moved to approved). This is the **operator**
+        surface — the model-reachable :meth:`invoke` only ever *requests*
+        approval; this grants it. Requires the gateway to have been built
+        with ``payment_policy_path`` (else ``{"status":"no_payment_policy"}``)
+        and the ``payments`` build feature (else ``{"status":"unsupported"}``)."""
+        ...
+
+    def reject_payment(self, quote_id: str) -> str:
+        """Reject / remove a payment approval record. Returns
+        ``{"status":"ok","quote_id":...,"changed":bool}`` (``changed`` is
+        whether a record existed), or a structured
+        ``no_payment_policy`` / ``unsupported`` / ``error``."""
+        ...
+
+    def pending_payments(self) -> str:
+        """The quote ids awaiting approval, for a consent UX to render.
+        Returns ``{"status":"ok","pending":[quote_id, ...]}``, or a
+        structured ``no_payment_policy`` / ``unsupported`` / ``error``."""
+        ...
+
+    def spent_today(self, network: str, asset: str) -> str:
+        """Today's reserved spend total for a ``(network, x402 asset)`` pair,
+        as the canonical atomic-amount string. Returns
+        ``{"status":"ok","network":...,"asset":...,"spent":"<atomic>"}``, or a
+        structured ``no_payment_policy`` / ``unsupported`` / ``error``.
+        ``network`` / ``asset`` are the x402 wire values (e.g.
+        ``"mock:net"`` / ``"musd"``), matching the quote's requirements."""
         ...
 
     def __repr__(self) -> str: ...
@@ -3182,6 +3239,10 @@ class AsyncCapabilityGateway:
         payment_unsafe_mock_auto_allow: bool = False,
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
+        payment_signer_svm_address: Optional[str] = None,
+        payment_signer_svm: Optional[Callable[[str], str]] = None,
+        payment_signer_xrpl_address: Optional[str] = None,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
         ``delegation_chain`` together (both or neither) to sign + attach a
@@ -3207,4 +3268,173 @@ class AsyncCapabilityGateway:
         """Awaitable :meth:`CapabilityGateway.invoke`."""
         ...
 
+    async def approve_payment(self, quote_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.approve_payment`."""
+        ...
+
+    async def reject_payment(self, quote_id: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.reject_payment`."""
+        ...
+
+    async def pending_payments(self) -> str:
+        """Awaitable :meth:`CapabilityGateway.pending_payments`."""
+        ...
+
+    async def spent_today(self, network: str, asset: str) -> str:
+        """Awaitable :meth:`CapabilityGateway.spent_today`."""
+        ...
+
     def __repr__(self) -> str: ...
+
+class PaymentHttpClient:
+    """Pay an **external x402 HTTP API** — the outbound two-way door, with
+    the same spend policy, signers, and status vocabulary as
+    :class:`CapabilityGateway`. Present iff the module was built with the
+    ``payments-http`` feature (an opt-in that pulls a bundled HTTP/TLS
+    stack; NOT in the default wheel).
+
+    :meth:`fetch_paid` GETs a URL and, if the server answers ``402``, runs
+    the caller's own spend policy over a local pseudo-quote, signs, and
+    retries — one call authors at most one payment attempt. There is no
+    provider identity and no signed quote on this path: the external
+    server's demand is the commercial fact, and the caller's spend engine
+    (caps, network enablement, approvals) is the entire gate.
+    """
+
+    def __init__(
+        self,
+        payment_policy_path: str,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
+        identity: Optional["Identity"] = None,
+    ) -> None:
+        """Build a client over the shared spend-policy store at
+        ``payment_policy_path`` (**required** — the spend gate). The payment
+        kwargs mirror :class:`CapabilityGateway`: ``payment_profile``
+        (``"production"`` default / ``"dev_test"``),
+        ``payment_unsafe_mock_auto_allow``, and the real-network settlement
+        signer *reference* ``payment_signer_address`` + ``payment_signer``
+        (both or neither — a ``(typed_data_json: str) -> str`` EIP-712
+        callback; key material never crosses the boundary). ``identity`` is
+        an optional payer :class:`Identity` handle; omit it for an ephemeral
+        one (the caller id is bookkeeping on this path — spend is tracked by
+        ``(network, asset, day)``, not by caller)."""
+        ...
+
+    def fetch_paid(self, url: str) -> tuple[str, bytes]:
+        """GET ``url``, paying if the server answers ``402``. Returns
+        ``(status_json, body)``: ``status_json`` is
+        ``{"status": "fetched" | "paid" | "requires_payment_approval" |
+        "denied" | "provider_refused" | "transport_error", ...}`` (``paid``
+        carries the byte-preserved ``settlement`` as base64;
+        ``requires_payment_approval`` carries ``{quote_id, policy_reason,
+        approve_hint}`` and did NOT retry) and ``body`` is the raw response
+        bytes (empty for the non-body outcomes). Never raises for a payment
+        outcome; releases the GIL while in flight."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class AsyncPaymentHttpClient:
+    """Awaitable dual of :class:`PaymentHttpClient` — :meth:`fetch_paid` as
+    a coroutine, resolving to the same ``(status_json, body)`` tuple.
+    Present iff built with the ``payments-http`` feature."""
+
+    def __init__(
+        self,
+        payment_policy_path: str,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
+        identity: Optional["Identity"] = None,
+    ) -> None:
+        """Same as :class:`PaymentHttpClient`."""
+        ...
+
+    async def fetch_paid(self, url: str) -> tuple[str, bytes]:
+        """Awaitable :meth:`PaymentHttpClient.fetch_paid`."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+def build_pricing_terms(
+    provider_entity_id: bytes,
+    capability: str,
+    requirements_json: str,
+) -> str:
+    """Author the canonical ``net.pricing.terms@1`` JSON that prices a
+    capability — the provider (supply) side of payments. Present iff the
+    module was built with the ``payments`` feature.
+
+    ``provider_entity_id`` is the node's 32-byte mesh entity id
+    (``mesh.entity_id``) — the identity that will issue quotes for these terms;
+    only the public id crosses, never a key. ``capability`` is the
+    ``provider/capability`` display id. ``requirements_json`` is a JSON **array**
+    of x402 ``PaymentRequirements`` objects using the camelCase wire names —
+    ``scheme``, ``network``, ``amount`` (atomic string), ``asset``, ``payTo``,
+    ``maxTimeoutSeconds`` (int), optional ``extra`` — one entry per acceptable
+    ``(scheme, network, asset)``. Returns the canonical, byte-preserved terms
+    string to hand to the priced-publish path or announce at discovery (opaque
+    downstream; displaying a price never implies authorization to spend it).
+    Raises ``ValueError`` on a non-32-byte id, malformed JSON, or an empty
+    list."""
+    ...
+
+class PaymentProvider:
+    """A paid-capability provider over an embedded :class:`NetMesh` node — the
+    supply side of payments (price + charge). Construction stands up one
+    ``PaymentEngine`` behind the quote/pay wire; :meth:`publish_paid_tools`
+    publishes priced tools gated by that same engine, so a quote paid over the
+    wire is the quote the gate redeems (at-most-once, after payment). Present
+    iff the module was built with the ``payments`` **and** ``publish`` features
+    (the default wheel has both). Hold the instance to keep the wire served."""
+
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        state_path: str,
+        billing_log_path: Optional[str] = None,
+    ) -> None:
+        """Build a provider over a started ``mesh``. ``state_path`` is the
+        settlement store file — it holds the replay/idempotency index and
+        **must be durable + single-owner** (a temp path loses paid quotes across
+        restarts). ``billing_log_path`` optionally records the immutable
+        ``net.billing.event@1`` stream."""
+        ...
+
+    @property
+    def provider_entity_id(self) -> bytes:
+        """The node's 32-byte mesh entity id — the provider identity these tools
+        price + quote under. Pass it to :func:`build_pricing_terms`."""
+        ...
+
+    def read_billing(self) -> List[str]:
+        """The immutable billing events this provider recorded, oldest first —
+        each a ``net.billing.event@1`` JSON string. Read-only (billing is
+        emitted by the engine; this only reads). Requires a ``billing_log_path``
+        at construction, else raises ``ValueError``."""
+        ...
+
+    def publish_paid_tools(
+        self,
+        tools: List[Tuple[str, Optional[str], str]],
+        callback: Any,
+        pricing: Dict[str, str],
+        version: str = ...,
+        owner_origin: Optional[int] = ...,
+        allow_any_caller: bool = ...,
+    ) -> "LocalPublicationHandle":
+        """Publish priced tools gated by this provider's payment engine.
+        ``tools`` is a list of ``(name, description|None, input_schema_json)``;
+        ``callback`` is the same async invoker as ``NetMesh.publish_tools``;
+        ``pricing`` maps a tool name to its ``net.pricing.terms@1`` JSON (from
+        :func:`build_pricing_terms`). A priced tool serves only **after** its
+        quote is paid + redeemed. Fail-closed: an empty ``pricing`` map raises
+        ``ValueError`` (use ``NetMesh.publish_tools`` for free tools); a pricing
+        key naming no published tool is a publish error. ``version`` /
+        ``owner_origin`` / ``allow_any_caller`` are as on
+        ``NetMesh.publish_tools``. Hold the returned handle to keep serving."""
+        ...

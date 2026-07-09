@@ -556,7 +556,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
@@ -723,7 +723,10 @@ jobs:
         # default features but this job builds `--no-default-features`, so they
         # must be listed explicitly or `test_publish.py` / `test_a2a.py` fail with
         # `AttributeError: 'NetMesh' object has no attribute ...`.
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,extension-module
+        # `payments-http` (the outbound HTTP-402 client, WS-P2) is an opt-in
+        # NOT in the default wheel — built here so test_payment_http.py's rows
+        # run (they skip cleanly if the class is absent).
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
@@ -1005,7 +1008,7 @@ jobs:
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
             # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,test-helpers,dataforts,nat-traversal,port-mapping
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /
@@ -1136,7 +1139,7 @@ jobs:
         crate:
           - name: node
             path: net/crates/net/bindings/node
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
           - name: python
             path: net/crates/net/bindings/python
             features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments

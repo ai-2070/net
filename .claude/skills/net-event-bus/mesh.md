@@ -64,8 +64,10 @@ async fn main() -> net_sdk::error::Result<()> {
 **Key facts:**
 - `Mesh::builder(bind_addr, &psk)` returns a `MeshBuilder` (`net/crates/net/sdk/src/mesh.rs:341-343`). PSK is `&[u8; 32]` — 32 bytes, not a passphrase.
 - `Mesh::public_key()` (`mesh.rs:348`) returns the Noise static pubkey to share with initiators. `Mesh::node_id()` (`mesh.rs:353`) returns the u64 routing id derived from the entity keypair.
+- `Mesh::local_addr()` (`mesh.rs:385`) returns the node's **actual bound socket address**. Call it when you bind to `:0` (OS-assigned port) — a peer's `connect()` needs the real `ip:port`, not `:0`. Bound in every language: Python `NetMesh.local_addr()` (`bindings/python/src/lib.rs:1402`), Node `NetMesh.localAddr()` (`bindings/node/index.d.ts:2098`).
 - `connect(peer_addr, &peer_pubkey, peer_node_id)` for the initiator side (`mesh.rs:366-377`); `accept(peer_node_id)` for the responder (`mesh.rs:383-386`). Pair them: one side connects, the other accepts. Symmetric "both sides connect" doesn't work — the second handshake collides with the first.
 - `register_channel(ChannelConfig)` (publisher only) + `subscribe_channel(publisher_node_id, &channel)` (subscriber). `publish(&channel, payload, config)` returns a `PublishReport` (`mesh.rs:561-568`). For typed payloads, serialize with serde and pass `Bytes`.
+- **Channel authorization is on by default.** The SDK `Mesh` (`mesh.rs:296`) and the Python/Node `NetMesh` bindings all install a `ChannelConfigRegistry`, so a peer's subscribe to a channel with **no registered config** is rejected (`UnknownChannel`) — `register_channel` adds the config (and nRPC's `serve_rpc` auto-registers its own service channels, so direct RPC needs no manual entry). The escape hatch, for test rigs and dynamic-channel surfaces that don't pre-register, is the bindings' `permissive_channels=True` (Python, `bindings/python/src/lib.rs:1258`) / `permissiveChannels: true` on `NetMesh.create({...})` (Node, `bindings/node/index.d.ts:4744`) — installs no registry, so there's no ACL. Default `false`.
 
 ### TypeScript
 
@@ -124,9 +126,9 @@ node.shutdown()
 ```
 
 **Key facts:**
-- `NetMesh(bind_addr, psk, **kwargs)` is the PyO3 class (`bindings/python/src/lib.rs:1079-1220`). PSK is a 64-char hex string. `identity_seed` is 32 raw bytes.
+- `NetMesh(bind_addr, psk, **kwargs)` is the PyO3 class (`bindings/python/src/lib.rs:1079-1220`). PSK is a 64-char hex string. `identity_seed` is 32 raw bytes; `permissive_channels=True` opts out of the channel-config ACL (see Key facts above).
 - `generate_net_keypair()` (`bindings/python/src/lib.rs:208`) mints a Noise keypair — that's the **transport** keypair, separate from the ed25519 identity. Use `Identity.from_seed(seed)` (`bindings/python/src/identity.rs:170`) for the identity layer.
-- `register_channel`, `subscribe_channel`, `publish`, `find_nodes`, `connect_direct`, `nat_type`, `traversal_stats` are all methods on `NetMesh` (`bindings/python/src/lib.rs:1576+`). The `net_sdk.MeshNode` wrapper does not yet re-export them — reach through to the binding.
+- `register_channel`, `subscribe_channel`, `publish`, `find_nodes`, `connect_direct`, `local_addr`, `nat_type`, `traversal_stats` are all methods on `NetMesh` (`bindings/python/src/lib.rs:1576+`). The `net_sdk.MeshNode` wrapper does not yet re-export them — reach through to the binding.
 
 ---
 

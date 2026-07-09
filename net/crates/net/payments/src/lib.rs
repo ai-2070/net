@@ -40,6 +40,22 @@
 //! - [`policy`] — the locked payment state store (pins pattern) + spend
 //!   policy engine.
 //!
+//! ## Language SDK surfaces — the parity contract
+//!
+//! This crate is the reference surface; every other language (Python, TS,
+//! Go, C) mirrors a subset of it in its own house style, deciding nothing
+//! itself (doctrine: no logic in bindings — bindings build the flow,
+//! marshal arguments, and project results). The per-language parity
+//! matrix in `docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md` is the contract:
+//! a language surface is "done" when its column matches. The failure
+//! schematic (`net_sdk::tool_payment`'s `net.payment.failure@1`) is part
+//! of the surface every language gets; its cross-language tolerance is
+//! pinned by the `failure_schematic_vectors` in
+//! `tests/cross_lang_payments/payment_vectors.json`, verified by the four
+//! golden-vector suites in lockstep (never per-language tests that drift).
+//! The provider engine, the gates, and billing stay in Rust in v1 (one
+//! money-path state machine; non-Rust providers front a Rust daemon).
+//!
 //! Pinned x402 revision for P0 fixtures: `specs/x402-specification-v2.md`
 //! at x402-foundation/x402 commit `087922a5eecc06ea773636b75df205814ba295b5`
 //! (2026-05-29). Fixtures are version-pinned per supported spec revision

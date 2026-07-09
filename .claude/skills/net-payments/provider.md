@@ -179,7 +179,8 @@ For MCP-gateway hosts, the `mcp-gate` feature provides
 `EnginePaymentAdmission::new(Arc<engine>)` (impls `net_mcp::serve::PaymentAdmission`),
 wired via `WrapConfig.payment_admission` — its `redeem` delegates to
 `redeem_for_invocation`, fail-closed. See `caller.md` for the demand side and
-`bindings.md` for the Python gateway surface.
+`bindings.md` for the Python + Node gateway and `PaymentProvider` surfaces (both
+now expose a native `publishPaidTools` over this same engine + admission wiring).
 
 ## Serving over the mesh (cross-machine)
 

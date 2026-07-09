@@ -89,8 +89,11 @@ fn build_delegation(
 
 /// Validate + unbind the payment-signer callable at construction, so a
 /// non-callable fails here with a clear error instead of on the first
-/// paid invoke.
-fn unbind_signer(signer: Option<Bound<'_, PyAny>>) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+/// paid invoke. `pub(crate)` — the outbound HTTP-402 client
+/// ([`crate::payment_http`]) shares this validation.
+pub(crate) fn unbind_signer(
+    signer: Option<Bound<'_, PyAny>>,
+) -> PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
     match signer {
         Some(callable) if callable.is_callable() => Ok(Some(callable.unbind())),
         Some(_) => Err(PyValueError::new_err(
@@ -128,6 +131,27 @@ fn gateway_status(e: &GatewayError) -> &'static str {
 /// A `{status, error}` JSON string.
 fn err_json(status: &str, msg: impl std::fmt::Display) -> String {
     json!({ "status": status, "error": msg.to_string() }).to_string()
+}
+
+/// Parse and normalize the `invoke` arguments string to a JSON *object*.
+///
+/// A JSON `null` (or the default `"{}"`) is a no-argument invocation —
+/// normalized to `{}`, exactly as the SDK's [`gated_invoke`] does at the one
+/// chokepoint every demand-side caller routes through. Arrays and primitives
+/// are still a caller-shape error: the gateway surface requires an object, and
+/// the core does not accept arbitrary-typed args. `Err` carries the human
+/// message for an `invalid_arguments` status.
+///
+/// The twin of the Node gateway's `normalize_invoke_args`, so the two surfaces
+/// cannot drift.
+fn normalize_invoke_args(raw: &str) -> Result<Value, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("arguments must be a JSON object: {e}"))?;
+    let value = if value.is_null() { json!({}) } else { value };
+    if !value.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    Ok(value)
 }
 
 /// Map a describe result to a JSON object, adding the caller-side
@@ -169,9 +193,8 @@ fn outcome_to_json(id: &CapabilityId, outcome: GatedOutcome) -> String {
             "cap_id": id.display(),
             "approve_command": format!("net mcp pin approve {}", id.display()),
             "message": format!(
-                "Capability `{}` requires local approval before it can be invoked. \
-                 Request it with net_request_capability; a human approves it out of \
-                 band via `net mcp pin approve {}`.",
+                "Capability `{}` requires local approval before it can be invoked; \
+                 a human approves it out of band via `net mcp pin approve {}`.",
                 id.display(),
                 id.display(),
             ),
@@ -283,6 +306,175 @@ async fn do_invoke(
 }
 
 // ---------------------------------------------------------------------------
+// Operator approval verbs — thin wrappers over `SpendPolicyEngine` on the
+// same shared spend-policy store the flow reserves against, so an agent can
+// resolve its own `requires_payment_approval` under operator policy. The
+// store, lock protocol, and Pending -> Approved transition stay in Rust
+// (doctrine #1: no logic here — these marshal a quote id / pair in and the
+// engine's typed result out as the gateway's status-JSON). Feature-split so
+// a build without `payments` (or a gateway built without
+// `payment_policy_path`) is a loud structured error, never a silent no-op.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "payments")]
+fn spend_engine(
+    path: &str,
+    profile: &str,
+) -> Result<net_payments::policy::spend::SpendPolicyEngine, String> {
+    use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
+    // Vocabulary lives once in core (`SpendProfile::parse`). The profile string
+    // was validated at construction (`build_payment_flow`), so this parse is
+    // expected to succeed — but on the (unreachable) failure we surface a loud
+    // error rather than silently defaulting, honoring parse's no-silent-fallback
+    // contract. Unlike the Node gateway we can't store the parsed `SpendProfile`
+    // in `GatewayState`: `net_payments` is an optional dep and this module
+    // compiles even in a payments-off build, so the retained profile stays a
+    // `String` and is re-parsed here through the one core parser.
+    let profile = SpendProfile::parse(profile).map_err(|e| e.to_string())?;
+    Ok(SpendPolicyEngine::new(path, profile))
+}
+
+/// `{"status":"no_payment_policy", ...}` — the verb needs the shared
+/// spend-policy store, and this gateway was built without
+/// `payment_policy_path`.
+#[cfg(feature = "payments")]
+fn no_policy_json() -> String {
+    err_json(
+        "no_payment_policy",
+        "no spend policy configured — construct the gateway with payment_policy_path \
+         (the machine-shared spend-policy store) to use the approval verbs",
+    )
+}
+
+#[cfg(feature = "payments")]
+async fn do_approve_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.approve(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_reject_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.reject(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_pending_payments(policy_path: Option<String>, profile: String) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.pending().await {
+        Ok(quotes) => json!({ "status": "ok", "pending": quotes }).to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+#[cfg(feature = "payments")]
+async fn do_spent_today(
+    policy_path: Option<String>,
+    profile: String,
+    network: String,
+    asset: String,
+) -> String {
+    use net_payments::flow::{Clock, SystemClock};
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let now_ns = SystemClock.now_ns();
+    let engine = match spend_engine(&path, &profile) {
+        Ok(e) => e,
+        Err(e) => return err_json("error", e),
+    };
+    match engine.spent_today(&network, &asset, now_ns).await {
+        Ok(amount) => json!({
+            "status": "ok",
+            "network": network,
+            "asset": asset,
+            "spent": amount.to_canonical_string(),
+        })
+        .to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+/// Without the `payments` build feature the approval verbs are a loud
+/// `unsupported` error, matching the construction-time payment-kwarg guard.
+#[cfg(not(feature = "payments"))]
+fn payments_unsupported_json() -> String {
+    err_json(
+        "unsupported",
+        "this build lacks the `payments` feature; the approval verbs are unavailable",
+    )
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_approve_payment(
+    _policy_path: Option<String>,
+    _profile: String,
+    _quote_id: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_reject_payment(
+    _policy_path: Option<String>,
+    _profile: String,
+    _quote_id: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_pending_payments(_policy_path: Option<String>, _profile: String) -> String {
+    payments_unsupported_json()
+}
+
+#[cfg(not(feature = "payments"))]
+async fn do_spent_today(
+    _policy_path: Option<String>,
+    _profile: String,
+    _network: String,
+    _asset: String,
+) -> String {
+    payments_unsupported_json()
+}
+
+// ---------------------------------------------------------------------------
 // Construction + async bridging
 // ---------------------------------------------------------------------------
 
@@ -299,6 +491,15 @@ struct GatewayState {
     /// build feature + payment kwargs). `None` = paid capabilities fail
     /// closed at the gate, per doctrine.
     payment: Option<Arc<dyn net_mcp::serve::PaymentFlow>>,
+    /// The spend-policy store path retained from the payment kwargs, so the
+    /// operator approval verbs (approve/reject/pending/spent_today) open the
+    /// same shared store the flow reserves against. `None` = no
+    /// `payment_policy_path` was supplied; the verbs then return
+    /// `no_payment_policy`.
+    spend_policy_path: Option<String>,
+    /// The spend profile string (`"production"` / `"dev_test"`) the store
+    /// was configured with — carried so a reconstructed engine matches.
+    spend_profile: String,
     /// The mesh's own runtime — where the node's socket + timers live.
     runtime: Arc<Runtime>,
 }
@@ -310,51 +511,84 @@ struct GatewayState {
 /// `collect` (so validation stays identical across builds) but only the
 /// feature-gated `build_payment_flow` reads them — hence the targeted
 /// dead-code allow; `-D warnings` still guards every other lint.
+///
+/// `pub(crate)` — the outbound HTTP-402 client ([`crate::payment_http`])
+/// shares these kwargs and this validation verbatim.
 #[cfg_attr(not(feature = "payments"), allow(dead_code))]
-struct PaymentConfig {
-    policy_path: String,
-    profile: String,
-    unsafe_mock_auto_allow: bool,
-    /// The settlement signer *reference*: the payer address plus a
+pub(crate) struct PaymentConfig {
+    pub(crate) policy_path: String,
+    pub(crate) profile: String,
+    pub(crate) unsafe_mock_auto_allow: bool,
+    /// The eip155 settlement signer *reference*: the payer address plus a
     /// Python callable `(typed_data_json: str) -> str` that forwards
     /// the EIP-712 document to the host's wallet / KMS and returns
     /// the 0x-hex signature. Only the typed document and the
     /// signature ever cross the language boundary — key material
     /// remains unrepresentable here (doctrine 4/7/8).
-    signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    pub(crate) signer: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    /// The solana signer reference: address + `(intent_json: str) -> str`
+    /// returning the base64 partially-signed versioned transaction.
+    pub(crate) signer_svm: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+    /// The xrpl signer reference: address + `(intent_json: str) -> str`
+    /// returning the hex presigned Payment blob.
+    pub(crate) signer_xrpl: Option<(String, pyo3::Py<pyo3::PyAny>)>,
+}
+
+/// Pair an address with its callable: both-or-neither, else a clear caller
+/// error naming the pair.
+#[cfg_attr(not(feature = "payments"), allow(dead_code))]
+fn signer_pair(
+    address: Option<String>,
+    callable: Option<pyo3::Py<pyo3::PyAny>>,
+    kwarg: &str,
+) -> PyResult<Option<(String, pyo3::Py<pyo3::PyAny>)>> {
+    match (address, callable) {
+        (Some(address), Some(callable)) => Ok(Some((address, callable))),
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(format!(
+            "{kwarg} and {kwarg}_address must be provided together \
+             (the address names the payer; the callable signs its typed intent)"
+        ))),
+    }
 }
 
 impl PaymentConfig {
-    fn collect(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect(
         payment_policy_path: Option<String>,
         payment_profile: Option<String>,
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<pyo3::Py<pyo3::PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<pyo3::Py<pyo3::PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<pyo3::Py<pyo3::PyAny>>,
     ) -> PyResult<Option<Self>> {
-        let signer = match (payment_signer_address, payment_signer) {
-            (Some(address), Some(callable)) => Some((address, callable)),
-            (None, None) => None,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "payment_signer and payment_signer_address must be provided together \
-                     (the address names the payer; the callable signs its typed data)",
-                ))
-            }
-        };
+        let signer = signer_pair(payment_signer_address, payment_signer, "payment_signer")?;
+        let signer_svm = signer_pair(
+            payment_signer_svm_address,
+            payment_signer_svm,
+            "payment_signer_svm",
+        )?;
+        let signer_xrpl = signer_pair(
+            payment_signer_xrpl_address,
+            payment_signer_xrpl,
+            "payment_signer_xrpl",
+        )?;
+        let any_signer = signer.is_some() || signer_svm.is_some() || signer_xrpl.is_some();
         match payment_policy_path {
             Some(policy_path) => Ok(Some(Self {
                 policy_path,
                 profile: payment_profile.unwrap_or_else(|| "production".to_string()),
                 unsafe_mock_auto_allow: payment_unsafe_mock_auto_allow,
                 signer,
+                signer_svm,
+                signer_xrpl,
             })),
-            None if payment_profile.is_some()
-                || payment_unsafe_mock_auto_allow
-                || signer.is_some() =>
-            {
+            None if payment_profile.is_some() || payment_unsafe_mock_auto_allow || any_signer => {
                 Err(PyValueError::new_err(
-                    "payment_profile / payment_unsafe_mock_auto_allow / payment_signer \
+                    "payment_profile / payment_unsafe_mock_auto_allow / a payment signer \
                      require payment_policy_path (the shared spend-policy store)",
                 ))
             }
@@ -384,12 +618,20 @@ impl GatewayState {
             // audits this gateway's leaf.
             gateway = gateway.with_delegation(Arc::new(DelegationSigner::new(leaf, chain_bytes)));
         }
+        // Retain the store path + profile before `build_payment_flow`
+        // consumes the config, so the approval verbs can reopen it.
+        let (spend_policy_path, spend_profile) = match &payment_config {
+            Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
+            None => (None, "production".to_string()),
+        };
         let payment = build_payment_flow(sdk_mesh, payment_config)?;
         Ok(Self {
             gateway: Arc::new(gateway),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
             payment,
+            spend_policy_path,
+            spend_profile,
             runtime,
         })
     }
@@ -416,15 +658,10 @@ fn build_payment_flow(
     let Some(config) = config else {
         return Ok(None);
     };
-    let profile = match config.profile.as_str() {
-        "production" => SpendProfile::Production,
-        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown payment_profile {other:?} (expected \"production\" or \"dev_test\")"
-            )))
-        }
-    };
+    // Vocabulary lives once in core (`SpendProfile::parse`), so the node and
+    // python bindings cannot drift on the profile spellings.
+    let profile =
+        SpendProfile::parse(&config.profile).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let caller = Arc::new(mesh.entity_keypair().clone());
     // The v1 default registry (mock + the survey networks). A superset
     // of P0's mock-only default: real networks stay unspendable until
@@ -444,6 +681,12 @@ fn build_payment_flow(
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));
     }
+    if let Some((address, callable)) = config.signer_svm {
+        flow = flow.with_signer("solana", python_svm_signer(address, callable));
+    }
+    if let Some((address, callable)) = config.signer_xrpl {
+        flow = flow.with_signer("xrpl", python_xrpl_signer(address, callable));
+    }
     Ok(Some(Arc::new(flow)))
 }
 
@@ -459,7 +702,7 @@ fn build_payment_flow(
 /// `spawn_blocking` + `Python::attach` (the blob-store FFI pattern) so
 /// GIL acquisition never stalls the mesh reactor.
 #[cfg(feature = "payments")]
-fn python_external_signer(
+pub(crate) fn python_external_signer(
     address: String,
     callable: pyo3::Py<pyo3::PyAny>,
 ) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
@@ -483,6 +726,86 @@ fn python_external_signer(
             })
             .await
             .map_err(|e| SignerError::new(format!("payment signer task: {e}")))?;
+            signed.map_err(SignerError::new)
+        })
+    }))
+}
+
+/// Bridge a Python signing callable into the
+/// [`ExternalSvmSigner`](net_payments::flow::signer::ExternalSvmSigner)
+/// shape (registered under the `solana` namespace).
+///
+/// Same doctrine as the eip155 seam: the callable receives the typed
+/// `SvmTransferIntent` as a JSON string — a policy-bearing wallet inspects
+/// the amount, mint, and recipient it is authorizing — and returns the
+/// base64 partially-signed versioned transaction. No raw-bytes path; the
+/// wallet owns the key + the SPL transaction machinery. `spawn_blocking` +
+/// `Python::attach` so GIL acquisition never stalls the reactor.
+#[cfg(feature = "payments")]
+pub(crate) fn python_svm_signer(
+    address: String,
+    callable: pyo3::Py<pyo3::PyAny>,
+) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
+    use net_payments::flow::signer::{ExternalSvmSigner, SignerError};
+
+    let callable = Arc::new(callable);
+    Arc::new(ExternalSvmSigner::new(address, move |intent| {
+        let callable = callable.clone();
+        Box::pin(async move {
+            let intent_json = serde_json::to_string(&intent)
+                .map_err(|e| SignerError::new(format!("svm transfer intent serialize: {e}")))?;
+            let signed = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<String, String> {
+                    let out = callable
+                        .bind(py)
+                        .call1((intent_json,))
+                        .map_err(|e| format!("svm payment signer raised: {e}"))?;
+                    out.extract::<String>().map_err(|e| {
+                        format!("svm payment signer must return the base64 signed transaction: {e}")
+                    })
+                })
+            })
+            .await
+            .map_err(|e| SignerError::new(format!("svm payment signer task: {e}")))?;
+            signed.map_err(SignerError::new)
+        })
+    }))
+}
+
+/// Bridge a Python signing callable into the
+/// [`ExternalXrplSigner`](net_payments::flow::signer::ExternalXrplSigner)
+/// shape (registered under the `xrpl` namespace).
+///
+/// The callable receives the typed `XrplPaymentIntent` as a JSON string and
+/// returns the hex presigned `Payment` blob. Retry honesty is the wallet's
+/// contract (a same-quote retry re-presents the identical blob); here we
+/// only marshal typed intent in, hex artifact out — no raw-bytes path.
+#[cfg(feature = "payments")]
+pub(crate) fn python_xrpl_signer(
+    address: String,
+    callable: pyo3::Py<pyo3::PyAny>,
+) -> Arc<dyn net_payments::flow::signer::SchemeSigner> {
+    use net_payments::flow::signer::{ExternalXrplSigner, SignerError};
+
+    let callable = Arc::new(callable);
+    Arc::new(ExternalXrplSigner::new(address, move |intent| {
+        let callable = callable.clone();
+        Box::pin(async move {
+            let intent_json = serde_json::to_string(&intent)
+                .map_err(|e| SignerError::new(format!("xrpl payment intent serialize: {e}")))?;
+            let signed = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<String, String> {
+                    let out = callable
+                        .bind(py)
+                        .call1((intent_json,))
+                        .map_err(|e| format!("xrpl payment signer raised: {e}"))?;
+                    out.extract::<String>().map_err(|e| {
+                        format!("xrpl payment signer must return the hex signed Payment blob: {e}")
+                    })
+                })
+            })
+            .await
+            .map_err(|e| SignerError::new(format!("xrpl payment signer task: {e}")))?;
             signed.map_err(SignerError::new)
         })
     }))
@@ -570,7 +893,7 @@ pub struct PyCapabilityGateway {
 #[pymethods]
 impl PyCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
@@ -582,6 +905,10 @@ impl PyCapabilityGateway {
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<Bound<'_, PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         let payment = PaymentConfig::collect(
@@ -590,6 +917,10 @@ impl PyCapabilityGateway {
             payment_unsafe_mock_auto_allow,
             payment_signer_address,
             unbind_signer(payment_signer)?,
+            payment_signer_svm_address,
+            unbind_signer(payment_signer_svm)?,
+            payment_signer_xrpl_address,
+            unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
             state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
@@ -644,14 +975,11 @@ impl PyCapabilityGateway {
             Ok(id) => id,
             Err(e) => return err_json("invalid_capability_id", e),
         };
-        let args: Value = match serde_json::from_str(arguments_json) {
+        // `null`/default `"{}"` normalizes to `{}` (a no-argument invocation, as
+        // the gate does); arrays and primitives are a caller-shape error.
+        let args = match normalize_invoke_args(arguments_json) {
             Ok(v) => v,
-            Err(e) => {
-                return err_json(
-                    "invalid_arguments",
-                    format!("arguments must be a JSON object: {e}"),
-                )
-            }
+            Err(e) => return err_json("invalid_arguments", e),
         };
         let h = self.state.handles();
         let runtime = self.state.runtime.clone();
@@ -665,6 +993,53 @@ impl PyCapabilityGateway {
                 args,
             ))
         })
+    }
+
+    /// Approve a held payment quote under operator policy, resolving a
+    /// prior `requires_payment_approval` so the next `invoke` redeems it.
+    /// Returns `{"status":"ok","quote_id":...,"changed":bool}` (`changed`
+    /// is whether the record moved to approved), or a structured
+    /// `no_payment_policy` / `error`. Operator surface — the model-reachable
+    /// `invoke` only ever *requests* approval; this grants it.
+    fn approve_payment(&self, py: Python<'_>, quote_id: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        py.detach(move || runtime.block_on(do_approve_payment(path, profile, quote_id)))
+    }
+
+    /// Reject/remove a payment approval record. Returns
+    /// `{"status":"ok","quote_id":...,"changed":bool}` (`changed` is
+    /// whether a record existed), or a structured error.
+    fn reject_payment(&self, py: Python<'_>, quote_id: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        py.detach(move || runtime.block_on(do_reject_payment(path, profile, quote_id)))
+    }
+
+    /// The quote ids awaiting approval, for a consent UX to render. Returns
+    /// `{"status":"ok","pending":[quote_id, ...]}`, or a structured error.
+    fn pending_payments(&self, py: Python<'_>) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        py.detach(move || runtime.block_on(do_pending_payments(path, profile)))
+    }
+
+    /// Today's reserved spend total for a `(network, x402 asset)` pair, as
+    /// the canonical atomic-amount string. Returns
+    /// `{"status":"ok","network":...,"asset":...,"spent":"<atomic>"}`, or a
+    /// structured error.
+    fn spent_today(&self, py: Python<'_>, network: &str, asset: &str) -> String {
+        let runtime = self.state.runtime.clone();
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let network = network.to_string();
+        let asset = asset.to_string();
+        py.detach(move || runtime.block_on(do_spent_today(path, profile, network, asset)))
     }
 
     fn __repr__(&self) -> String {
@@ -688,7 +1063,7 @@ pub struct PyAsyncCapabilityGateway {
 #[pymethods]
 impl PyAsyncCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
@@ -700,6 +1075,10 @@ impl PyAsyncCapabilityGateway {
         payment_unsafe_mock_auto_allow: bool,
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
+        payment_signer_svm_address: Option<String>,
+        payment_signer_svm: Option<Bound<'_, PyAny>>,
+        payment_signer_xrpl_address: Option<String>,
+        payment_signer_xrpl: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         let payment = PaymentConfig::collect(
@@ -708,6 +1087,10 @@ impl PyAsyncCapabilityGateway {
             payment_unsafe_mock_auto_allow,
             payment_signer_address,
             unbind_signer(payment_signer)?,
+            payment_signer_svm_address,
+            unbind_signer(payment_signer_svm)?,
+            payment_signer_xrpl_address,
+            unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
             state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
@@ -760,17 +1143,11 @@ impl PyAsyncCapabilityGateway {
             Ok(id) => id,
             Err(e) => return immediate(py, err_json("invalid_capability_id", e)),
         };
-        let args: Value = match serde_json::from_str(arguments_json) {
+        // `null`/default `"{}"` normalizes to `{}` (a no-argument invocation, as
+        // the gate does); arrays and primitives are a caller-shape error.
+        let args = match normalize_invoke_args(arguments_json) {
             Ok(v) => v,
-            Err(e) => {
-                return immediate(
-                    py,
-                    err_json(
-                        "invalid_arguments",
-                        format!("arguments must be a JSON object: {e}"),
-                    ),
-                )
-            }
+            Err(e) => return immediate(py, err_json("invalid_arguments", e)),
         };
         let h = self.state.handles();
         let join = self.state.runtime.spawn(async move {
@@ -784,6 +1161,59 @@ impl PyAsyncCapabilityGateway {
             )
             .await
         });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.approve_payment`.
+    fn approve_payment<'py>(&self, py: Python<'py>, quote_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_approve_payment(path, profile, quote_id).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.reject_payment`.
+    fn reject_payment<'py>(&self, py: Python<'py>, quote_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let quote_id = quote_id.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_reject_payment(path, profile, quote_id).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.pending_payments`.
+    fn pending_payments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_pending_payments(path, profile).await });
+        spawn_bridge(py, join)
+    }
+
+    /// Awaitable :meth:`CapabilityGateway.spent_today`.
+    fn spent_today<'py>(
+        &self,
+        py: Python<'py>,
+        network: &str,
+        asset: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = self.state.spend_policy_path.clone();
+        let profile = self.state.spend_profile.clone();
+        let network = network.to_string();
+        let asset = asset.to_string();
+        let join = self
+            .state
+            .runtime
+            .spawn(async move { do_spent_today(path, profile, network, asset).await });
         spawn_bridge(py, join)
     }
 
@@ -854,6 +1284,19 @@ mod tests {
         );
     }
 
+    /// `spend_engine` routes the profile through the one core parser and does
+    /// NOT silently default: an unknown profile is a loud error, never a quiet
+    /// fall back to `Production` (which would contradict `SpendProfile::parse`'s
+    /// no-silent-fallback contract). Construction validates the profile first,
+    /// so this error is unreachable in practice — the test pins that the fallback
+    /// stays fail-loud, not fail-silent.
+    #[test]
+    fn spend_engine_rejects_an_unknown_profile() {
+        assert!(spend_engine("/tmp/net-spend-test", "production").is_ok());
+        assert!(spend_engine("/tmp/net-spend-test", "dev_test").is_ok());
+        assert!(spend_engine("/tmp/net-spend-test", "yolo").is_err());
+    }
+
     /// Payment kwargs are validated before any mesh state exists:
     /// profile/unsafe/signer without a policy path is a config error,
     /// and a signer address without its callable is incomplete. (The
@@ -861,26 +1304,70 @@ mod tests {
     /// by the pytest twin.)
     #[test]
     fn payment_kwargs_require_the_policy_path() {
-        assert!(PaymentConfig::collect(None, None, false, None, None)
-            .unwrap()
-            .is_none());
-        assert!(PaymentConfig::collect(None, Some("dev_test".into()), false, None, None).is_err());
-        assert!(PaymentConfig::collect(None, None, true, None, None).is_err());
-        // A signer reference is half of a pair: address alone is a
-        // caller error even with a policy path present.
+        // Terse helper: the common all-None-signers call shape.
+        let collect = |path: Option<&str>, profile: Option<&str>, unsafe_flag: bool| {
+            PaymentConfig::collect(
+                path.map(Into::into),
+                profile.map(Into::into),
+                unsafe_flag,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert!(collect(None, None, false).unwrap().is_none());
+        assert!(collect(None, Some("dev_test"), false).is_err());
+        assert!(collect(None, None, true).is_err());
+        // A signer reference is half of a pair: address alone is a caller
+        // error even with a policy path present — for every scheme.
         assert!(PaymentConfig::collect(
             Some("/tmp/p.json".into()),
             None,
             false,
             Some("0xpayer".into()),
-            None
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .is_err());
-        let c = PaymentConfig::collect(Some("/tmp/p.json".into()), None, false, None, None)
-            .unwrap()
-            .unwrap();
+        assert!(PaymentConfig::collect(
+            Some("/tmp/p.json".into()),
+            None,
+            false,
+            None,
+            None,
+            Some("svm-payer".into()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(PaymentConfig::collect(
+            Some("/tmp/p.json".into()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some("r-payer".into()),
+            None,
+        )
+        .is_err());
+        // An svm/xrpl signer without a policy path is a config error too.
+        assert!(
+            PaymentConfig::collect(None, None, false, None, None, None, None, None, None,)
+                .unwrap()
+                .is_none()
+        );
+        let c = collect(Some("/tmp/p.json"), None, false).unwrap().unwrap();
         assert_eq!(c.profile, "production", "fail-closed default profile");
-        assert!(c.signer.is_none());
+        assert!(c.signer.is_none() && c.signer_svm.is_none() && c.signer_xrpl.is_none());
     }
 
     /// A denied outcome projects the provider's failure schematic as a
@@ -1126,6 +1613,8 @@ mod paid_invoke_e2e {
             profile: "dev_test".to_string(),
             unsafe_mock_auto_allow: false,
             signer: None,
+            signer_svm: None,
+            signer_xrpl: None,
         };
         let flow = build_payment_flow(caller_mesh.clone(), Some(config))
             .expect("build the payment flow")
@@ -1243,5 +1732,87 @@ mod paid_invoke_e2e {
             2,
             "the approved retry served"
         );
+    }
+}
+
+/// The operator approval verbs (WS-P1) drive `SpendPolicyEngine` over the
+/// shared spend-policy store and project its typed results to the gateway's
+/// status-JSON — the exact bodies `approve_payment` / `reject_payment` /
+/// `pending_payments` / `spent_today` wrap. No mesh, no interpreter; a plain
+/// Rust test under `--features payments`.
+#[cfg(all(test, feature = "payments"))]
+mod approval_verbs {
+    use super::*;
+
+    fn policy_path(dir: &tempfile::TempDir) -> String {
+        dir.path()
+            .join("spend-policy.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_verbs_marshal_the_spend_store_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = policy_path(&dir);
+        let profile = "dev_test".to_string();
+
+        // Fresh store: nothing pending, nothing spent today.
+        let v: Value =
+            serde_json::from_str(&do_pending_payments(Some(path.clone()), profile.clone()).await)
+                .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["pending"].as_array().expect("array").len(), 0);
+
+        let v: Value = serde_json::from_str(
+            &do_spent_today(
+                Some(path.clone()),
+                profile.clone(),
+                "mock:net".into(),
+                "musd".into(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["spent"], "0");
+
+        // Approve a quote id: the record moves to approved (changed), and a
+        // second approve is idempotent (no change).
+        let v: Value = serde_json::from_str(
+            &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["quote_id"], "q-1");
+        assert_eq!(v["changed"], true);
+        let v: Value = serde_json::from_str(
+            &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], false, "re-approve is a no-op");
+
+        // Reject removes it (changed), then a second reject is a no-op.
+        let v: Value = serde_json::from_str(
+            &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], true);
+        let v: Value = serde_json::from_str(
+            &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
+        )
+        .expect("json");
+        assert_eq!(v["changed"], false, "re-reject is a no-op");
+    }
+
+    #[tokio::test]
+    async fn the_verbs_without_a_policy_path_report_no_payment_policy() {
+        let v: Value = serde_json::from_str(&do_pending_payments(None, "production".into()).await)
+            .expect("json");
+        assert_eq!(v["status"], "no_payment_policy");
+        let v: Value =
+            serde_json::from_str(&do_approve_payment(None, "production".into(), "q".into()).await)
+                .expect("json");
+        assert_eq!(v["status"], "no_payment_policy");
     }
 }

@@ -301,6 +301,103 @@ fn decimals_vectors_hold() {
     }
 }
 
+/// The `net.payment.failure@1` header tolerance contract: the same
+/// bytes every language decides schematic-or-not on. Rust decides
+/// through the real [`FailureSchematic::from_header_bytes`]; the fixture
+/// pins that each other language's tolerant predicate (decode UTF-8 JSON,
+/// accept iff an object tagged with the schematic tag) reaches the same
+/// verdict, plus field access + byte-stable re-emission on the accepted
+/// ones.
+#[test]
+fn failure_schematic_vectors_hold() {
+    use net_sdk::tool_payment::FailureSchematic;
+    let v = vectors();
+    let block = &v["failure_schematic_vectors"];
+    let tag = block["tag"].as_str().expect("tag");
+    for case in block["cases"].as_array().expect("cases array") {
+        let name = case["name"].as_str().expect("name");
+        let bytes = failure_case_bytes(case);
+        let accepted = case["accepted"].as_bool().expect("accepted");
+        let parsed = FailureSchematic::from_header_bytes(&bytes);
+        assert_eq!(
+            parsed.is_some(),
+            accepted,
+            "{name}: tolerance verdict drifted"
+        );
+        let Some(s) = parsed else { continue };
+        assert_eq!(s.object, tag, "{name}: accepted schematic carries the tag");
+
+        // The fixture bytes ARE what a producer emits: re-emission is a
+        // fixed point (utf8 cases — the byte case is always a reject).
+        if let Some(utf8) = case["header_utf8"].as_str() {
+            let re = String::from_utf8(s.to_header_bytes().expect("accepted fits")).unwrap();
+            assert_eq!(re, utf8, "{name}: schematic re-emission drifted");
+        }
+
+        if let Some(expect) = case.get("expect") {
+            assert_eq!(s.stage, expect["stage"].as_str().unwrap(), "{name}: stage");
+            assert_eq!(
+                s.reason,
+                expect["reason"].as_str().unwrap(),
+                "{name}: reason"
+            );
+            assert_eq!(
+                s.retryable,
+                expect["retryable"].as_bool().unwrap(),
+                "{name}: retryable"
+            );
+            assert_eq!(
+                s.funds_moved,
+                expect["funds_moved"].as_str().unwrap(),
+                "{name}: funds_moved"
+            );
+            assert_eq!(
+                s.prior_payment,
+                expect["prior_payment"].as_str().unwrap(),
+                "{name}: prior_payment"
+            );
+            let rec = &expect["recovery"];
+            assert_eq!(
+                s.recovery.class,
+                rec["class"].as_str().unwrap(),
+                "{name}: recovery.class"
+            );
+            assert_eq!(
+                s.recovery.actor,
+                rec["actor"].as_str().unwrap(),
+                "{name}: recovery.actor"
+            );
+            assert_eq!(
+                s.recovery.safe_to_retry,
+                rec["safe_to_retry"].as_bool().unwrap(),
+                "{name}: safe_to_retry"
+            );
+            assert_eq!(
+                s.recovery.safe_to_requote,
+                rec["safe_to_requote"].as_bool().unwrap(),
+                "{name}: safe_to_requote"
+            );
+        }
+        if let Some(keys) = case.get("expect_extra_keys").and_then(|k| k.as_array()) {
+            for k in keys {
+                let k = k.as_str().unwrap();
+                assert!(s.extra.contains_key(k), "{name}: extra key `{k}` preserved");
+            }
+        }
+    }
+}
+
+/// The header bytes a failure-schematic case decides on: `header_utf8`
+/// as UTF-8 text, else `header_base64` decoded (the non-UTF-8 case).
+fn failure_case_bytes(case: &Value) -> Vec<u8> {
+    match case["header_utf8"].as_str() {
+        Some(utf8) => utf8.as_bytes().to_vec(),
+        None => BASE64
+            .decode(case["header_base64"].as_str().expect("header_base64"))
+            .expect("base64 decodes"),
+    }
+}
+
 /// Unknown fields are preserved, sorted into place, and signature-covered.
 #[test]
 fn unknown_fields_are_covered() {

@@ -25,6 +25,10 @@ pub trait SchemeSigner: Send + Sync {
     // DEFAULTED to a structured refusal — a signer registered under the wrong
     // namespace fails closed instead of authoring something it doesn't understand.
     async fn sign_svm_transfer(&self, intent: &SvmTransferIntent) -> Result<String, SignerError>;
+
+    // exact-XRPL: typed Payment intent in, hex presigned Payment blob out.
+    // DEFAULTED to a structured refusal, same as the SVM method.
+    async fn sign_xrpl_payment(&self, intent: &XrplPaymentIntent) -> Result<String, SignerError>;
 }
 pub struct SignerError { pub message: String }   // terminal: nothing retries a signature
 ```
@@ -32,11 +36,14 @@ pub struct SignerError { pub message: String }   // terminal: nothing retries a 
 Each method takes a **typed document**, never raw bytes — `sign_typed_data`
 takes the standard `eth_signTypedData_v4` document (domain, types, full
 message); `sign_svm_transfer` takes the `SvmTransferIntent` (amount, mint,
-recipient, fee payer). **So a policy-bearing signer can inspect what it is
-authorizing** before signing. `sign_typed_data` returns the 65-byte `r‖s‖v`
-signature as `0x…` hex; `sign_svm_transfer` returns the base64 partially-signed
-versioned transaction. `sign_svm_transfer` defaults to a structured refusal, so
-an EVM-only signer under a solana namespace fails closed.
+recipient, fee payer); `sign_xrpl_payment` takes the `XrplPaymentIntent`
+(amount, asset, recipient, invoice binding). **So a policy-bearing signer can
+inspect what it is authorizing** — including the settlement asset — before
+signing. `sign_typed_data` returns the 65-byte
+`r‖s‖v` signature as `0x…` hex; `sign_svm_transfer` returns the base64
+partially-signed versioned transaction; `sign_xrpl_payment` returns the hex
+presigned Payment blob. The two blob methods default to a structured refusal,
+so a signer under the wrong namespace fails closed.
 
 ## `ExternalSigner` — the production shape (the default)
 
@@ -68,7 +75,11 @@ namespace is a structured `Denied`, never a fallback (`caller.md`).
 
 The Python binding bridges a Python callable `(typed_data_json: str) -> str`
 straight into `ExternalSigner` under scheme `eip155` — the key stays on the
-Python side; only the typed doc and the signature cross (`bindings.md`).
+Python side; only the typed doc and the signature cross. The **Node** binding
+bridges the same seam with an **async** callback (`(typedIntentJson) =>
+Promise<string>`) over a `ThreadsafeFunction`→Promise bridge; its per-call
+timeout is one-sided (drops the Rust wait, does NOT cancel the JS callback — a
+signer timeout is indeterminate). Both cover all three schemes (`bindings.md`).
 
 ## `ExternalSvmSigner` — the Solana wallet shape (exact-SVM)
 
@@ -96,6 +107,33 @@ Its `sign_typed_data` is a structured refusal by construction (it authors SVM
 transactions, not EIP-712 docs), mirroring how a plain `ExternalSigner`'s
 `sign_svm_transfer` refuses. Register each signer under the namespace it
 understands.
+
+## `ExternalXrplSigner` — the XRPL wallet shape (exact-XRPL)
+
+The XRPL counterpart, registered under the `xrpl` namespace. The host's
+callback receives the structured `XrplPaymentIntent` and returns the hex
+presigned `Payment` blob. **The wallet owns the key, the XRPL
+canonical-serialization machinery, and the `Sequence` / `LastLedgerSequence`
+bookkeeping — none of which enter Net.**
+
+```rust
+use net_payments::flow::signer::ExternalXrplSigner;
+
+let xrpl = ExternalXrplSigner::new(
+    "rPayerClassicAddress",
+    move |intent: XrplPaymentIntent| Box::pin(async move {
+        // hand `intent` to the wallet; it builds a direct full-amount Payment,
+        // binds the invoice via MemoData/InvoiceID, and returns hex(signed blob)
+        my_wallet.author_xrpl_payment(intent).await.map_err(|e| SignerError::new(e.to_string()))
+    }),
+);
+let flow = CallerPaymentFlow::new(..).with_signer("xrpl", Arc::new(xrpl));
+```
+
+**Retry honesty is the wallet's contract:** a same-quote retry must re-present
+the *identical* blob (never re-sign with a fresh `Sequence`); an expired
+`LastLedgerSequence` means a fresh quote, never a fresh signature on the same
+quote.
 
 ## `DevLocalSigner` — testnet conformance only (feature `unsafe-dev-signer`)
 
@@ -179,20 +217,22 @@ own replay guard.
 ## Namespace status
 
 - **eip155 `exact`** — built (`ExternalSigner` / `DevLocalSigner`, EIP-3009).
-- **solana `exact`** — **built** (landed 2026-07-06): `sign_svm_transfer` +
-  `ExternalSvmSigner`, above. `can_settle` now accepts `eip155 | solana` when a
-  signer is registered for the namespace; serving above `observed` still waits
-  on an SVM chain checker (`networks.md` rung 3).
-- **xrpl (presigned Payment blobs)** — **deferred, blocked on a pinnable
-  shape.** The intent-in/blob-out pattern (the SVM seam) instantiates directly,
-  *but* the pinned x402 spec commit carries `scheme_exact_*.md` for twelve
-  chains and **none for xrpl** — its payload shape is t54-vendor-defined today,
-  and the money path does not couple to unversioned vendor formats. The seam
-  lands when the shape is pinned (an upstream spec PR or versioned t54 docs).
-  See `networks.md` rung 4.
-- **Python signer surface** is *references only* (built): the
-  `payment_signer_address` + `payment_signer` kwargs name an external signer;
-  private key bytes remain unrepresentable, pinned by a negative pytest. The
-  Python gateway wires it under `eip155` only today — solana settlement from
-  Python awaits an SVM-signer wiring in the binding. **TS/Go** have no payment
-  flow, so no signer surface (`bindings.md`).
+- **solana `exact`** — **built**: `sign_svm_transfer` + `ExternalSvmSigner`,
+  above. `can_settle` accepts the namespace when a signer is registered; an
+  independent SVM chain checker (`svm_checker.rs`) lifts serving above
+  `observed` (`networks.md` rung 3).
+- **xrpl `exact`** — **built**: `sign_xrpl_payment` + `ExternalXrplSigner`, the
+  `exact_xrpl` authoring seam (direct full-amount Payment, invoice binding via
+  `MemoData`/`InvoiceID`), the independent `XrplChecker`, and a facilitator pack
+  + registry entry. The earlier "blocked on a pinnable shape" note is stale —
+  the shape was pinned. `networks.md` rung 4.
+- **Python + Node signer surface** is *references only* (built): the
+  `payment_signer(_address)` / `payment_signer_svm(_address)` /
+  `payment_signer_xrpl(_address)` kwargs (Python) and the matching
+  `paymentSigner*` args (Node) name external signers under `eip155` / `solana` /
+  `xrpl` — all three coexist on one gateway; each pair is both-or-neither and
+  requires the policy store; private key bytes remain unrepresentable, pinned by
+  a negative test. Python callbacks are sync callables (`spawn_blocking`); Node
+  callbacks are async (`Promise`). The outbound HTTP-402 client
+  (`PaymentHttpClient`) wires `eip155` only. **Go/C** have no payment flow, so no
+  signer surface (`bindings.md`).

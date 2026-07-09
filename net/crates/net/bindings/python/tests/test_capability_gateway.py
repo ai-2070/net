@@ -103,6 +103,18 @@ def test_malformed_arguments_are_a_structured_error(gateway):
     assert "error" in result
 
 
+def test_null_args_normalize_arrays_and_primitives_reject(gateway):
+    # JSON `null` is a no-argument invocation (normalized to {}, exactly as the
+    # SDK gate does), so it reaches the (unreachable) provider rather than
+    # failing on argument shape — parity with Node and gated_invoke.
+    null_res = json.loads(gateway.invoke("42/echo", "null"))
+    assert null_res["status"] in {"transport_error", "not_found"}, null_res
+    # Arrays and primitives parse but are not the documented object shape.
+    for bad in ("[]", "true", '"str"', "42"):
+        res = json.loads(gateway.invoke("42/echo", bad))
+        assert res["status"] == "invalid_arguments", (bad, res)
+
+
 def test_every_surface_returns_valid_json(gateway):
     # The whole contract: every method hands back a JSON string with a `status`.
     for raw in (
@@ -232,6 +244,89 @@ def test_async_gateway_accepts_payment_kwargs(mesh, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Operator approval verbs (PAYMENTS_LANGUAGE_SDKS_PLAN WS-P1): approve /
+# reject / pending / spent_today over the shared spend-policy store, so an
+# agent can resolve its own `requires_payment_approval` under operator
+# policy. The store, lock protocol, and Pending->Approved transition are
+# pinned in Rust (SpendPolicyEngine + the binding's do_* driven tests);
+# these assert the Python surface marshals the store round-trip.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def paid_gateway(mesh, tmp_path):
+    try:
+        return CapabilityGateway(
+            mesh,
+            pin_store_path=str(tmp_path / "pins.json"),
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="dev_test",
+        )
+    except ValueError as e:  # noqa: F841
+        pytest.skip("build lacks the payments feature")
+
+
+def test_approval_verbs_round_trip_on_the_shared_store(paid_gateway):
+    # Fresh store: nothing pending, nothing spent today.
+    pending = json.loads(paid_gateway.pending_payments())
+    assert pending["status"] == "ok"
+    assert pending["pending"] == []
+
+    spent = json.loads(paid_gateway.spent_today("mock:net", "musd"))
+    assert spent["status"] == "ok"
+    assert spent["spent"] == "0"
+
+    # Approve a quote id: the record moves to approved (changed), and a
+    # second approve is idempotent.
+    approved = json.loads(paid_gateway.approve_payment("q-1"))
+    assert approved["status"] == "ok"
+    assert approved["quote_id"] == "q-1"
+    assert approved["changed"] is True
+    assert json.loads(paid_gateway.approve_payment("q-1"))["changed"] is False
+
+    # Reject removes it (changed), then a second reject is a no-op.
+    assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is True
+    assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is False
+
+
+def test_approval_verbs_without_policy_path_are_structured(gateway):
+    # A gateway built without payment_policy_path can't approve anything —
+    # a structured `no_payment_policy` (payments build) / `unsupported`
+    # (feature absent), never a raised exception.
+    for raw in (
+        gateway.pending_payments(),
+        gateway.approve_payment("q"),
+        gateway.reject_payment("q"),
+        gateway.spent_today("mock:net", "musd"),
+    ):
+        parsed = json.loads(raw)
+        assert parsed["status"] in {"no_payment_policy", "unsupported"}
+
+
+def test_async_approval_verbs_round_trip(mesh, tmp_path):
+    try:
+        gw = AsyncCapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_profile="dev_test",
+        )
+    except ValueError:
+        pytest.skip("build lacks the payments feature")
+
+    async def body():
+        approved = json.loads(await gw.approve_payment("q-async"))
+        pending = json.loads(await gw.pending_payments())
+        rejected = json.loads(await gw.reject_payment("q-async"))
+        return approved, pending, rejected
+
+    approved, pending, rejected = asyncio.run(body())
+    assert approved["status"] == "ok" and approved["changed"] is True
+    # The approved quote is not *pending* (it's approved), so the list is empty.
+    assert pending["status"] == "ok" and pending["pending"] == []
+    assert rejected["changed"] is True
+
+
+# ---------------------------------------------------------------------------
 # The settlement signer *reference* surface (P1 WS2): the payer address plus
 # a callable that signs EIP-712 typed data. The contract pinned here: the
 # pair is both-or-neither, needs the policy store, must be callable — and
@@ -294,10 +389,89 @@ def test_no_payment_kwarg_accepts_key_material(mesh, tmp_path):
     rejected as an unexpected argument — the signer *reference* (address +
     callable) is the only way in, and the callable only ever sees typed
     data."""
-    for kwarg in ("payment_private_key", "payment_secret", "payment_key_bytes"):
+    for kwarg in (
+        "payment_private_key",
+        "payment_secret",
+        "payment_key_bytes",
+        # …extended to the svm/xrpl seams: still no key kwarg anywhere.
+        "payment_signer_svm_key",
+        "payment_signer_xrpl_secret",
+    ):
         with pytest.raises(TypeError):
             CapabilityGateway(
                 mesh,
                 payment_policy_path=str(tmp_path / "payment-policy.json"),
                 **{kwarg: b"\x11" * 32},
             )
+
+
+# ---------------------------------------------------------------------------
+# The svm/xrpl signer seams (PAYMENTS_LANGUAGE_SDKS_PLAN WS-P3): the same
+# reference shape as eip155 under their own namespaces — a payer address plus
+# a `(intent_json: str) -> str` callable (base64 SVM tx / hex XRPL blob out).
+# The contract: each pair is both-or-neither, the callable only ever sees a
+# typed intent (never key material), and all three schemes coexist.
+# ---------------------------------------------------------------------------
+
+
+def test_svm_signer_reference_constructs_a_gateway(mesh, tmp_path):
+    def signer(intent_json: str) -> str:
+        raise AssertionError("never invoked at construction")
+
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_svm_address="So11111111111111111111111111111111111111112",
+            payment_signer_svm=signer,
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"
+
+
+def test_xrpl_signer_reference_constructs_a_gateway(mesh, tmp_path):
+    def signer(intent_json: str) -> str:
+        raise AssertionError("never invoked at construction")
+
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_xrpl_address="rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            payment_signer_xrpl=signer,
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"
+
+
+def test_svm_and_xrpl_signer_pairs_are_both_or_neither(mesh, tmp_path):
+    policy = str(tmp_path / "payment-policy.json")
+    for addr_kw, call_kw in (
+        ("payment_signer_svm_address", "payment_signer_svm"),
+        ("payment_signer_xrpl_address", "payment_signer_xrpl"),
+    ):
+        with pytest.raises(ValueError):
+            CapabilityGateway(mesh, payment_policy_path=policy, **{addr_kw: "addr"})
+        with pytest.raises(ValueError):
+            CapabilityGateway(
+                mesh, payment_policy_path=policy, **{call_kw: lambda t: "sig"}
+            )
+
+
+def test_all_three_signer_schemes_coexist(mesh, tmp_path):
+    try:
+        gw = CapabilityGateway(
+            mesh,
+            payment_policy_path=str(tmp_path / "payment-policy.json"),
+            payment_signer_address="0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            payment_signer=lambda t: "0x",
+            payment_signer_svm_address="So11111111111111111111111111111111111111112",
+            payment_signer_svm=lambda t: "base64tx",
+            payment_signer_xrpl_address="rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            payment_signer_xrpl=lambda t: "hexblob",
+        )
+    except ValueError as e:
+        pytest.skip(f"build lacks the payments feature: {e}")
+    assert json.loads(gw.search(""))["status"] == "ok"

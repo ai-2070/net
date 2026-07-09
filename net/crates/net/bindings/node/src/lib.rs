@@ -17,6 +17,7 @@ mod capability_aggregation;
     feature = "compute",
     feature = "groups",
     feature = "aggregator",
+    feature = "publish",
 ))]
 mod common;
 #[cfg(feature = "compute")]
@@ -56,6 +57,29 @@ mod meshos;
 // forwarding/keychain internals are never bound).
 #[cfg(feature = "mcp")]
 mod mcp_helpers;
+// The consent-gated capability gateway (search/describe/invoke over an
+// embedded NetMesh node) + the caller payment flow. Behind `payments`.
+#[cfg(feature = "payments")]
+mod capability_gateway;
+// JS signer callbacks bridged into the payments SchemeSigner seam (real-network
+// settlement). Behind `payments`.
+#[cfg(feature = "payments")]
+mod payment_signer;
+// The outbound HTTP-402 client (pay an external x402 HTTP API). Behind the
+// opt-in `payments-http` (pulls reqwest via net-payments/http-facilitator).
+#[cfg(feature = "payments-http")]
+mod payment_http;
+// Publish a node's OWN local tools as mesh capabilities (the inverse of `net
+// wrap`), backed by a JS async tool handler. The free publish path + the
+// prerequisite for a Node payment provider. Behind `publish`.
+#[cfg(feature = "publish")]
+mod publish;
+// The provider-side payment surface: author `net.pricing.terms@1`
+// (`buildPricingTerms`) + the `PaymentProvider` class (price + charge over one
+// shared PaymentEngine). Behind `payments`; the provider class additionally
+// needs `publish` (the tool-publish building blocks).
+#[cfg(feature = "payments")]
+mod payment_provider;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
 #[cfg(feature = "aggregator")]
@@ -1113,6 +1137,20 @@ mod mesh_bindings {
         /// Silently ignored when the Rust cdylib was built
         /// without `--features port-mapping`.
         pub try_port_mapping: Option<bool>,
+        /// Opt out of channel authorization: when `true`, no
+        /// `ChannelConfigRegistry` is installed on the node, so
+        /// membership/subscribe requests aren't gated against
+        /// per-channel config (any channel is reachable). Default
+        /// `false` — the registry is installed and unconfigured
+        /// channels are rejected with `UnknownChannel`.
+        ///
+        /// Required for dynamic-channel surfaces whose channels
+        /// aren't pre-registered — notably `publishTools` (the
+        /// served tools + describe service ride dynamically-named
+        /// channels). Mirrors the Python binding's
+        /// `permissive_channels`. Leave `false` for
+        /// production nodes that pre-register their channels.
+        pub permissive_channels: Option<bool>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1443,9 +1481,16 @@ mod mesh_bindings {
                 .map_err(|e| Error::from_reason(format!("MeshNode creation failed: {}", e)))?;
 
             // Install a shared ChannelConfigRegistry so `register_channel`
-            // can insert without needing `&mut NetMesh`.
+            // can insert without needing `&mut NetMesh`. `permissiveChannels`
+            // opts out: no registry on the node → no membership ACL (matching
+            // the Rust integration-test default), which dynamic-channel
+            // surfaces like `publishTools` need. The `NetMesh` keeps the
+            // registry either way — `register_channel` / `channelConfigsArc`
+            // read it; in permissive mode it's just detached from the node.
             let channel_configs = Arc::new(net::adapter::net::ChannelConfigRegistry::new());
-            node.set_channel_configs(channel_configs.clone());
+            if !options.permissive_channels.unwrap_or(false) {
+                node.set_channel_configs(channel_configs.clone());
+            }
             // Always install a TokenCache — channel auth needs
             // somewhere to stash tokens presented on subscribe.
             // Callers that want to pre-seed can use `installToken`
@@ -1465,6 +1510,16 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             Ok(hex::encode(node.public_key()))
+        }
+
+        /// This node's actual bound socket address (`"ip:port"`). With
+        /// `bindAddr: "127.0.0.1:0"` the OS assigns the port; read it here to
+        /// hand to a peer's `connect(...)`. Mirrors the Python `local_addr`.
+        #[napi]
+        pub fn local_addr(&self) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node.local_addr().to_string())
         }
 
         /// Get this node's ID. Returned as `BigInt` so full u64
@@ -2027,7 +2082,13 @@ mod mesh_bindings {
         /// so the previous "load_node + as_ref + expect" pattern
         /// could panic on a real shutdown race. Surface as a
         /// typed error instead.
-        #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
+        #[cfg(any(
+            feature = "compute",
+            feature = "cortex",
+            feature = "aggregator",
+            feature = "payments",
+            feature = "publish"
+        ))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.node.load();
             match guard.as_ref() {
@@ -2042,8 +2103,14 @@ mod mesh_bindings {
         /// auto-registers via the SDK glue without needing
         /// per-binding access. Kept gated on either feature so the
         /// accessor is available if `mesh_rpc` ever needs it.
-        #[cfg(any(feature = "compute", feature = "cortex"))]
-        #[cfg_attr(all(feature = "cortex", not(feature = "compute")), allow(dead_code))]
+        #[cfg(any(feature = "compute", feature = "cortex", feature = "payments"))]
+        #[cfg_attr(
+            all(
+                any(feature = "cortex", feature = "payments"),
+                not(feature = "compute")
+            ),
+            allow(dead_code)
+        )]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }
@@ -2130,6 +2197,61 @@ mod mesh_bindings {
         pub fn has_placement_filter(&self, id: String) -> bool {
             use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
             global_placement_filter_registry().contains(&id)
+        }
+    }
+
+    // =====================================================================
+    // Local tool publishing — a node announces its OWN tools as mesh
+    // capabilities backed by a JS async handler (the inverse of `net wrap`).
+    // Its own `#[napi] impl` block gated on `publish`, for the same
+    // expansion-time reason the AI-tool block below calls out.
+    // =====================================================================
+
+    #[cfg(feature = "publish")]
+    #[napi]
+    impl NetMesh {
+        /// Publish this node's OWN local `tools` as mesh capabilities, backed by
+        /// a JS **async** `handler`. Each tool is
+        /// `{ name, description?, inputSchema }` (`inputSchema` a JSON-object
+        /// string); the `handler` is
+        /// `(args: { toolName, argumentsJson }) => Promise<{ text, isError? }>`,
+        /// called when a consumer invokes a tool — its resolved `text` is the
+        /// tool's output (`isError: true` flags a tool-level failure). A
+        /// consumer discovers + invokes these through the ordinary
+        /// `CapabilityGateway`; no consume-side change.
+        ///
+        /// `options.ownerOrigin` scopes admission: an `originHash` (BigInt)
+        /// admits only that caller; omit it to admit **only this node itself**
+        /// (fail-closed default — the tools are backed by an arbitrary local
+        /// callback). Set `options.allowAnyCaller = true` to explicitly admit
+        /// every mesh peer (overrides `ownerOrigin`; gate invocations yourself).
+        ///
+        /// Resolves to a [`LocalPublicationHandle`](crate::publish::LocalPublicationHandle)
+        /// that must be held to keep the tools published. This node must be
+        /// `start()`ed. (Requires the `publish` feature.)
+        #[napi]
+        pub fn publish_tools<'env>(
+            &self,
+            env: &'env Env,
+            tools: Vec<crate::publish::PublishToolJs>,
+            handler: Function<
+                '_,
+                crate::publish::ToolInvokeArgs,
+                Promise<crate::publish::ToolCallResultJs>,
+            >,
+            options: Option<crate::publish::PublishOptions>,
+        ) -> Result<PromiseRaw<'env, crate::publish::LocalPublicationHandle>> {
+            let node = self.node_arc_clone()?;
+            // Free path: no pricing, no payment gate.
+            crate::publish::spawn_publish_tools(
+                env,
+                node,
+                tools,
+                handler,
+                options,
+                std::collections::BTreeMap::new(),
+                None,
+            )
         }
     }
 
