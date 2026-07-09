@@ -44,6 +44,7 @@ default = [
     "tool",
     "consent",
     "mcp",
+    "publish",
     "payments",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
@@ -151,6 +152,15 @@ consent = ["dep:net-sdk"]
 # only — publishing itself goes through the general SDK path; the
 # forwarding/keychain internals are never bound (bridge doctrine #3).
 mcp = ["consent", "dep:net-mcp"]
+# Publish a node's OWN local tools as mesh capabilities
+# (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B5 prerequisite) — the inverse of `net
+# wrap`, backed by a JS async tool handler. The free (unpriced) publish path;
+# the Node payment provider will layer a `PaymentEngine` on top. Composite:
+# `mcp` (the `net_mcp::wrap::ServerPublisher::publish_tools` surface +
+# `ToolInvoker`), `net` + `net-sdk/net` (the SDK mesh surface `from_node_arc`
+# needs), and `async-trait` for the `ToolInvoker` impl + the TSFN→Promise
+# handler bridge. Mirrors the Python `publish` feature.
+publish = ["mcp", "net", "dep:net-sdk", "net-sdk/net", "dep:async-trait"]
 # Payments (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` Part B): the consent-gated
 # CapabilityGateway (search/describe/invoke over `gated_invoke`) + the caller
 # payment flow (spend policy, signers, approval verbs). `net-mcp` is already

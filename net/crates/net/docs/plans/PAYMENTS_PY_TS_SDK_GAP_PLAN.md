@@ -264,17 +264,30 @@ Payments ride behind it. Package decision (recorded, unchanged from
   `watchTools()` already does. Pure read-side; no payments dependency. Pinned by
   the existing camelCase wire-JSON Rust test + a vitest row.
 
-### B5 — Node supply side (deferred; entry criteria pinned)
+### B5 — Node supply side (prerequisite landed; paid provider still to do)
 
-Node has **no `publishTools`/`ServerPublisher` binding at all** — pricing at
+Node had **no `publishTools`/`ServerPublisher` binding at all** — pricing at
 publish requires first binding the publish path, then Part A's provider surface.
 Larger than the demand work and not the highlighted gap.
 
-- [ ] **Deferred.** Entry criteria: (a) a Node tool-publish binding exists
-  (`publishTools` over `ServerPublisher`), and (b) demand parity (B1–B3) has
-  shipped. When it lands it mirrors Part A (pricing at publish + a payment
-  provider handle + billing read), reusing the same `PaymentEngine`/
-  `EnginePaymentAdmission` wiring.
+- [x] **Prerequisite (a) — the free publish path — landed.** `NetMesh.publishTools`
+  binds `net_mcp::wrap::ServerPublisher::publish_tools` behind a new Node
+  `publish` feature (mirroring the Python `publish` feature), backed by a JS
+  async tool handler bridged into `ToolInvoker` via the proven `blob.rs`
+  TSFN→Promise pattern; returns a `LocalPublicationHandle` (`tools` /
+  `skippedTools` / `serving` / `withdraw` / `stop`). `node/src/publish.rs` reuses
+  `mesh_over` + the handle for the future paid path. A `permissiveChannels` opt-in
+  was added to `MeshOptions` (the Node twin of Python's `permissive_channels`),
+  since the served tools ride dynamic channels the empty registry would otherwise
+  reject with `UnknownChannel`. Ships in `default`; wired into the vitest build +
+  the node clippy/FFI-test CI feature sets.
+- [ ] **Paid provider still deferred.** Entry criteria (a) [a Node tool-publish
+  binding] and (b) demand parity (B1–B3) are **both now met**. The remaining work
+  mirrors Part A (pricing at publish via `WrapConfig.pricing` +
+  `EnginePaymentAdmission`, a payment-provider handle over one shared
+  `PaymentEngine`, and a billing read), layering onto the now-bound
+  `publishTools` path — the same `PaymentEngine`/`EnginePaymentAdmission` wiring
+  Python A2 uses.
 
 - [ ] Tests (B1–B4): vitest e2e per outcome status (search/describe/invoke,
   approval loop, `failure.reason`, the HTTP-402 statuses); Rust unit tests **only
