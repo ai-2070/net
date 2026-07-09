@@ -8,23 +8,27 @@ they never re-implement money logic. This shapes what each language can do.
 **Get the language right first**, then check this table before promising a
 caller flow that doesn't exist in that language.
 
-| Language | Native caller flow | Price at publish | Price at discovery | `requires_payment_approval` | Golden-vector verifier |
+| Language | Native caller flow (demand) | Price + charge at publish (supply) | Price at discovery | `requires_payment_approval` | Golden-vector verifier |
 |---|---|---|---|---|---|
-| **Rust** (`payments/`, `sdk/`, `adapters/mcp/`) | ✅ full | ✅ `tool.rs` `pricing_terms(..)` | ✅ | ✅ `GatedOutcome::RequiresPaymentApproval` | ✅ source of truth |
-| **Python** | ✅ via `CapabilityGateway` | ❌ (no pricing on `tool.py`) | ✅ `describe()` JSON | ✅ `invoke()` JSON | ✅ |
-| **Node / TS** | ❌ | ❌ | ✅ read-only `ToolDescriptor.pricingTerms` | ❌ | ✅ |
+| **Rust** (`payments/`, `sdk/`, `adapters/mcp/`) | ✅ full | ✅ `serve_tool_paid` / MCP wrap `publish_tools` | ✅ | ✅ `GatedOutcome::RequiresPaymentApproval` | ✅ source of truth |
+| **Python** | ✅ via `CapabilityGateway` | ✅ `PaymentProvider` + `build_pricing_terms` | ✅ `describe()` JSON | ✅ `invoke()` JSON | ✅ |
+| **Node / TS** | ✅ via `CapabilityGateway` | ✅ `PaymentProvider` + `buildPricingTerms` | ✅ `listTools`/`watchTools` | ✅ `invoke()` JSON | ✅ |
 | **Go** | ❌ | ❌ | ❌ | ❌ | ✅ (`go/payments_golden_vectors_test.go`) |
 
-Only **Rust and Python** have a native payment flow. Node has pricing as a
-read-only discovery field; Node, Go, and Rust all carry a golden-vector
-verifier (Go's is at the repo root `go/`, not `bindings/go/`).
+**Rust, Python, AND Node** now have a full native **demand + supply** payment
+flow — pay to invoke *and* price + charge for a capability. Only **Go** is
+verifier-only (no flow; its verifier is at the repo root `go/`, not
+`bindings/go/`).
 
-**Built state** (as of 2026-07-08): the full Python demand surface — approval
-verbs, HTTP-402 client, svm/xrpl signers — is done, along with the parity
-matrix pinned in the crate module doc and the cross-language
-`failure_schematic_vectors`. A Node `CapabilityGateway` (the long pole), a
-`bindings/go/payments-ffi` cdylib, and a hand-written `include/net_payments.h`
-are **not built** — don't promise them.
+**Built state** (as of 2026-07-09): Python and Node both reach **demand+supply
+parity with Rust** — gateway (search/describe/invoke, approval verbs, `failure`),
+eip155/svm/xrpl signers, HTTP-402 client, a free `publishTools`/`publish_tools`
+path, and the paid `PaymentProvider` (`buildPricingTerms` + `publishPaidTools` +
+`readBilling`). The wire vocabulary stays single-sourced (`net_sdk::tool_payment`
+/ `net-payments`); the cross-language `failure_schematic_vectors` are the
+executable contract, projected + status-tested per binding. A
+`bindings/go/payments-ffi` cdylib and a hand-written `include/net_payments.h` are
+**not built** — don't promise them.
 
 ## Rust — the whole thing
 
@@ -35,7 +39,7 @@ price setter (`sdk/src/tool.rs`: `ToolMetadataBuilder::pricing_terms(terms_json)
 → `descriptor.pricing_terms`, announced opaquely under
 `pricing_terms_metadata_key(tool_id)`) all live here.
 
-## Python — the only binding with a native flow
+## Python — the demand surface (pay to invoke)
 
 The caller-side flow is exposed through the capability gateway, feature-gated
 `payments` (on by default in the Python build). File:
@@ -139,24 +143,126 @@ transport_error`; `body` is the raw HTTP bytes (empty for the non-body
 outcomes). The HTTP client wires **eip155 only** in v1 (svm/xrpl on this path
 are deferred).
 
-Caveats to remember (state them if the user hits them):
+## Python — the supply surface (price + charge)
 
-- The Python **tool/publish** surface (`net/tool.py`, re-exported by
-  `net_sdk.tool`) has **no pricing field.** Python sees pricing only through
-  `CapabilityGateway.describe()`, never on the publish side. `sdk-py` has no
-  payments module.
+Behind `payments` + the `publish` feature (both on by default). File:
+`bindings/python/src/payment_provider.rs`. A node can now be a *paid provider*,
+not just a caller.
 
-## Node / TS — pricing passthrough on read only
+```python
+from net import build_pricing_terms, PaymentProvider
 
-- **No gateway, no `PaymentFlow`, no `gated_invoke`, no `net-payments`
-  dependency.** `bindings/node/` doesn't register a `capability_gateway`
-  module.
-- **Pricing is a read-only discovery field:** `ToolDescriptor.pricingTerms?:
-  string` (canonical `net.pricing.terms@1` JSON), surfaced by
-  `listTools`/`watchTools`. **The publish side (`ToolOptions`) has no pricing
-  field** — Node can't attach a price through the SDK.
-- **`@net-mesh/payments` does not exist** in this repo — it's referenced only
-  in a doc comment. Don't point a user at it.
+# 1) Author the price. `provider_entity_id` is the node's 32-byte mesh entity id
+#    (the identity that issues quotes); `requirements_json` is a JSON array of
+#    x402 PaymentRequirements (camelCase wire names). Returns canonical,
+#    byte-preserved net.pricing.terms@1.
+terms = build_pricing_terms(provider_entity_id, capability, requirements_json)
+
+# 2) Stand up a provider over a STARTED mesh. state_path is the settlement store
+#    (durable + single-owner). One shared PaymentEngine serves the quote/pay wire
+#    AND gates the priced tools.
+provider = PaymentProvider(mesh, state_path, billing_log_path=None)
+provider.provider_entity_id                 # 32 bytes — pass to build_pricing_terms
+provider.read_billing()                     # [net.billing.event@1 JSON, ...] (needs billing_log_path)
+
+# 3) Publish priced tools, gated by this provider's engine. pricing maps a tool
+#    NAME -> its terms. A priced tool serves once, after payment.
+handle = provider.publish_paid_tools(
+    tools,          # [(name, description|None, input_schema_json), ...]
+    callback,       # async (tool_name, args_json) -> str | (str, bool)
+    pricing,        # {tool_name: net.pricing.terms@1 JSON}  — every tool must be priced
+    version="", owner_origin=None, allow_any_caller=False,
+)
+```
+
+- **Fail-closed:** an empty `pricing` map, or any published tool missing a
+  pricing entry, is a `ValueError` (a missing entry would publish that tool
+  **free**). Use `NetMesh.publish_tools` (free path) for unpriced tools.
+- **Provider identity IS the node's mesh identity** — quotes are signed by, and
+  settlement tracked against, the same ed25519 identity peers see (`caller.md`).
+- **Free publish:** `NetMesh.publish_tools(tools, callback, ...)` publishes a
+  node's own tools *unpriced* (behind `publish`); `publish_paid_tools` layers
+  pricing + the engine gate on the same machinery. A started node built with
+  `permissive_channels=True` is required (the served tools ride dynamic
+  channels).
+
+## Node / TS — full demand + supply (parity with Python)
+
+Node reached parity this cycle. `bindings/node/` now binds the whole surface —
+the gateway (demand), the paid provider (supply), the HTTP-402 client, and the
+free publish path — behind `payments` (default), `publish` (default), and the
+opt-in `payments-http`. Callbacks are **JS async functions returning Promises**
+(not sync callables like Python), and every gate method resolves to a JSON
+**string** (never a throw for a gate outcome).
+
+```ts
+import { CapabilityGateway, PaymentProvider, PaymentHttpClient, buildPricingTerms } from '@net-mesh/core'
+
+// --- Demand: pay to invoke (bindings/node/src/capability_gateway.rs) ---
+const gw = new CapabilityGateway(
+  mesh, pinStorePath ?? null,
+  paymentPolicyPath ?? null, paymentProfile ?? null,   // "production" | "dev_test"
+  paymentUnsafeMockAutoAllow ?? false,
+  paymentSignerAddress, paymentSigner,                 // eip155: async (typedDataJson) => "0x..." (65-byte sig)
+  paymentSignerSvmAddress, paymentSignerSvm,           // solana: async (intentJson) => base64 tx
+  paymentSignerXrplAddress, paymentSignerXrpl,         // xrpl:   async (intentJson) => hex Payment blob
+)
+await gw.search(query)                    // JSON string; capabilities[] each with requiresApproval
+await gw.describe(capId)                  // JSON string; includes pricingTerms (null = free)
+await gw.invoke(capId, argumentsJson)     // JSON string; status discriminant (+ failure on denials)
+await gw.approvePayment(quoteId)          // operator verbs — resolve a requires_payment_approval
+await gw.rejectPayment(quoteId); await gw.pendingPayments(); await gw.spentToday(network, asset)
+gw.close()                                // RELEASE the node clone before mesh.shutdown() (see below)
+
+// --- Supply: price + charge (bindings/node/src/payment_provider.rs) ---
+const terms = buildPricingTerms(providerEntityId /* Buffer, 32B */, capability, requirementsJson)
+const provider = new PaymentProvider(mesh, statePath, billingLogPath /* ? */)
+provider.providerEntityId                 // Buffer (32B); pass to buildPricingTerms
+await provider.readBilling()              // string[] of net.billing.event@1
+const pub = await provider.publishPaidTools(
+  tools,                                  // [{ name, description?, inputSchema }]
+  handler,                                // async ({ toolName, argumentsJson }) => ({ text, isError? })
+  pricing,                                // { [toolName]: termsJson } — every tool must be priced
+  { version?, ownerOrigin?, allowAnyCaller?, handlerTimeoutMs? },
+)
+provider.close()                          // tears down the quote/pay wire + releases the node
+
+// --- Free publish (behind `publish`): NetMesh.publishTools ---
+const handle = await mesh.publishTools(tools, handler, { allowAnyCaller: true })
+handle.serving; handle.tools; await handle.withdraw(); handle.stop()
+
+// --- Outbound HTTP-402 (opt-in `payments-http`): pay an external x402 API ---
+const client = new PaymentHttpClient(paymentPolicyPath, paymentProfile, false, signerAddress, signer)
+const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
+```
+
+Node-specific facts (state them if the user hits them):
+
+- **`invoke` status vocabulary** matches Python: `ok | requires_approval |
+  requires_payment_approval | validation_error | denied | not_found |
+  transport_error | no_daemon | error`. A denial carries a `failure` object
+  (the `net.payment.failure@1` schematic) **only when the provider attached
+  one** — branch on `failure.reason` / `failure.recovery` when present, else the
+  prose (`failure-schematic.md`).
+- **Signers are async** (`(typedIntentJson) => Promise<string>`), bridged to
+  `ExternalSigner`/`ExternalSvmSigner`/`ExternalXrplSigner` via a
+  `ThreadsafeFunction`→Promise seam (the `blob.rs` pattern). Both-or-neither per
+  scheme; requires `paymentPolicyPath`. **One-sided timeout:** a signer timeout
+  drops the Rust wait but does NOT cancel the JS callback — treat it as
+  indeterminate (`signer.md`).
+- **`close()` is mandatory before `NetMesh.shutdown()`.** A `#[napi]` class is
+  GC-finalized, not scope-dropped, so `CapabilityGateway` / `PaymentProvider`
+  retain a node clone that makes `shutdown()`'s `Arc::try_unwrap` fail with
+  "outstanding references" until GC runs. `close()` drops it deterministically;
+  publish handles use `withdraw()` (awaited) / `stop()`.
+- **`permissiveChannels: true`** on `NetMesh.create({...})` (the Node twin of
+  Python's `permissive_channels`) is required for `publishTools` /
+  `publishPaidTools` — the served tools ride dynamically-named channels the
+  default channel-config registry would reject. Default `false`.
+- **`NetMesh.localAddr()`** returns the OS-assigned `ip:port` (for a two-node
+  handshake); `listTools()` now also carries `pricingTerms` (was
+  `watchTools`-only). `@net-mesh/payments` stays a reservable re-export name —
+  everything ships inside `@net-mesh/core`.
 
 ## Go — verifier only, no flow
 

@@ -75,7 +75,11 @@ namespace is a structured `Denied`, never a fallback (`caller.md`).
 
 The Python binding bridges a Python callable `(typed_data_json: str) -> str`
 straight into `ExternalSigner` under scheme `eip155` — the key stays on the
-Python side; only the typed doc and the signature cross (`bindings.md`).
+Python side; only the typed doc and the signature cross. The **Node** binding
+bridges the same seam with an **async** callback (`(typedIntentJson) =>
+Promise<string>`) over a `ThreadsafeFunction`→Promise bridge; its per-call
+timeout is one-sided (drops the Rust wait, does NOT cancel the JS callback — a
+signer timeout is indeterminate). Both cover all three schemes (`bindings.md`).
 
 ## `ExternalSvmSigner` — the Solana wallet shape (exact-SVM)
 
@@ -222,11 +226,13 @@ own replay guard.
   `MemoData`/`InvoiceID`), the independent `XrplChecker`, and a facilitator pack
   + registry entry. The earlier "blocked on a pinnable shape" note is stale —
   the shape was pinned. `networks.md` rung 4.
-- **Python signer surface** is *references only* (built): the
+- **Python + Node signer surface** is *references only* (built): the
   `payment_signer(_address)` / `payment_signer_svm(_address)` /
-  `payment_signer_xrpl(_address)` kwargs name external signers under `eip155` /
-  `solana` / `xrpl` — all three coexist on one gateway; each pair is
-  both-or-neither and requires the policy store; private key bytes remain
-  unrepresentable, pinned by a negative pytest. The outbound HTTP-402 client
-  (`PaymentHttpClient`) wires `eip155` only. **TS/Go** have no payment flow, so
-  no signer surface (`bindings.md`).
+  `payment_signer_xrpl(_address)` kwargs (Python) and the matching
+  `paymentSigner*` args (Node) name external signers under `eip155` / `solana` /
+  `xrpl` — all three coexist on one gateway; each pair is both-or-neither and
+  requires the policy store; private key bytes remain unrepresentable, pinned by
+  a negative test. Python callbacks are sync callables (`spawn_blocking`); Node
+  callbacks are async (`Promise`). The outbound HTTP-402 client
+  (`PaymentHttpClient`) wires `eip155` only. **Go/C** have no payment flow, so no
+  signer surface (`bindings.md`).

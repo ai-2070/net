@@ -62,11 +62,12 @@ The spend-policy surface is identical to `caller.md`: over-cap yields
 `RequiresPaymentApproval`, an operator `approve`s, the next call proceeds. A
 network with no configured signer is `Denied`, never a silent fallback.
 
-## Python — `PaymentHttpClient` (opt-in `payments-http`)
+## Python + Node — `PaymentHttpClient` (opt-in `payments-http`)
 
-The Python demand surface for this flow. Behind an **opt-in `payments-http`
-feature** (it pulls `net-payments/http-facilitator` = reqwest/rustls, kept out
-of the default wheel — `try/except ImportError` before promising it):
+The demand surface for this flow, in **both** Python and Node. Behind an
+**opt-in `payments-http` feature** (it pulls `net-payments/http-facilitator` =
+reqwest/rustls, kept out of the default build — `try/except ImportError` in
+Python / feature-probe in Node before promising it):
 
 ```python
 from net import PaymentHttpClient       # or AsyncPaymentHttpClient
@@ -77,6 +78,12 @@ client = PaymentHttpClient(
     identity=None,                       # optional payer Identity; ephemeral if omitted
 )
 status_json, body = client.fetch_paid(url)   # (str, bytes)
+```
+
+```ts
+// Node — same shape; the eip155 signer callback is async (Promise).
+const client = new PaymentHttpClient(paymentPolicyPath, 'dev_test', false, signerAddress, signer)
+const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
 ```
 
 The status-JSON projects `X402HttpOutcome` to `fetched | paid |

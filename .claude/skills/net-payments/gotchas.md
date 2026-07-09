@@ -96,18 +96,24 @@ they go red (`testing.md`).
 
 ## Language reality checks (before you promise a flow)
 
-- Only **Rust and Python** have a native payment/caller flow. **Node** has
-  read-only `ToolDescriptor.pricingTerms` at discovery and a golden-vector
-  verifier — no flow, no publish-side price setter. **Go** has a golden-vector
-  verifier (`go/payments_golden_vectors_test.go`) but **no flow**. Don't send a
-  user to `@net-mesh/payments` (it doesn't exist) or promise a Node/Go payment
-  flow — neither is built. See `bindings.md`.
-- Python's payment identity is the **node's mesh identity**. It now wires
-  signers under **all three** namespaces — `payment_signer(_address)` (eip155),
-  `payment_signer_svm(_address)` (solana), `payment_signer_xrpl(_address)` (xrpl)
-  — each pair both-or-neither, requiring the policy store; it also exposes the
-  operator approval verbs and an opt-in `PaymentHttpClient`. (The earlier "eip155
-  only / no HTTP-402 wrapper" caveats are stale — those landed.) See `bindings.md`.
+- **Rust, Python, AND Node** have a full native **demand + supply** payment
+  flow — `CapabilityGateway`, `PaymentProvider` + `buildPricingTerms`, the
+  HTTP-402 client, eip155/svm/xrpl signers, approval verbs, and a free
+  `publishTools` path. (The earlier "Node is read-only, no flow, not built"
+  caveat is stale — it all landed.) **Go** has a golden-vector verifier
+  (`go/payments_golden_vectors_test.go`) but **no flow** — for a Go/C payment
+  flow the honest answer is still Rust/Python/Node. `@net-mesh/payments` stays a
+  reservable re-export name; everything ships in `@net-mesh/core`. See
+  `bindings.md`.
+- Both Python and Node bind the payment identity to the **node's mesh
+  identity** and wire signers under **all three** namespaces — eip155 / solana /
+  xrpl, each pair both-or-neither and requiring the policy store. Node's signer
+  callbacks are **async** (`(intentJson) => Promise<string>`); Python's are sync
+  callables on a `spawn_blocking` thread. See `bindings.md`, `signer.md`.
+- **Node-only lifecycle:** a `#[napi]` gateway/provider retains a node clone
+  (GC-finalized, not scope-dropped), so **`close()` before `NetMesh.shutdown()`**
+  or `try_unwrap` fails with "outstanding references"; and `publishTools` needs
+  `permissiveChannels: true` on the node. See `bindings.md`.
 
 ## Dependency direction (don't invert it)
 
