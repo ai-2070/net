@@ -195,7 +195,7 @@ async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
 /// pairs — precise enough to assert the emit site's *structured* fields
 /// by key + value, not a formatted-string substring.
 struct FieldCapture {
-    fields: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    fields: std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>>,
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
@@ -216,7 +216,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
                     .push((field.name().to_string(), format!("{value:?}")));
             }
         }
-        let mut buf = self.fields.lock().unwrap();
+        let mut buf = self.fields.lock();
         event.record(&mut Collector(&mut buf));
     }
 }
@@ -232,7 +232,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
 fn a_redeem_denial_emits_the_typed_tracing_fields() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let fields = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fields = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(FieldCapture {
         fields: fields.clone(),
     });
@@ -264,7 +264,7 @@ fn a_redeem_denial_emits_the_typed_tracing_fields() {
         });
     });
 
-    let captured = fields.lock().unwrap();
+    let captured = fields.lock();
     let has = |k: &str, v: &str| captured.iter().any(|(name, value)| name == k && value == v);
     assert!(
         has("reason", "unknown_quote"),
