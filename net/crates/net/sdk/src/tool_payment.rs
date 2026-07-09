@@ -391,6 +391,26 @@ impl std::fmt::Display for GateDenial {
 mod tests {
     use super::*;
 
+    /// A header with a duplicate key is rejected outright — `serde_json`
+    /// errors on the repeated field (in **either** order), so the tolerant
+    /// parser falls back to the human error. This is the source-of-truth
+    /// behavior; it is deliberately NOT a cross-language golden vector, because
+    /// JS `JSON.parse` / Python `json.loads` / Go `encoding/json` silently
+    /// collapse duplicates (last value wins) and cannot be made to reject
+    /// without a bespoke parser. Producers never emit duplicate keys (the serde
+    /// serializer can't), so a duplicate-key header is malformed input whose
+    /// cross-language handling is unspecified — see the fixture `_note`.
+    #[test]
+    fn duplicate_keys_are_rejected_in_either_order() {
+        let dup_object_a = br#"{"object":"net.payment.failure@1","object":"net.payment.failure@2","code":"payment","stage":"redeem","reason":"x","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
+        let dup_object_b = br#"{"object":"net.payment.failure@2","object":"net.payment.failure@1","code":"payment","stage":"redeem","reason":"x","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
+        assert!(FailureSchematic::from_header_bytes(dup_object_a).is_none());
+        assert!(FailureSchematic::from_header_bytes(dup_object_b).is_none());
+        // A duplicate of a non-tag field is likewise rejected.
+        let dup_reason = br#"{"object":"net.payment.failure@1","code":"payment","stage":"redeem","reason":"x","reason":"y","message":"m","retryable":false,"recovery":{"class":"c","actor":"a","safe_to_retry":false,"safe_to_requote":true},"handler_executed":false,"funds_moved":"no","prior_payment":"none"}"#;
+        assert!(FailureSchematic::from_header_bytes(dup_reason).is_none());
+    }
+
     /// The plan's canonical example: `already_redeemed`.
     fn example() -> FailureSchematic {
         FailureSchematic {

@@ -62,3 +62,15 @@ Pinned revision: `specs/x402-specification-v2.md` in
   sorted keys. Node: recursive writer over `JSON.stringify` string
   escaping. Keep vector strings free of `\b`, `\f`, and U+2028/U+2029,
   where language escapers legitimately differ.
+- **Failure-schematic tolerance** (`failure_schematic_vectors`): each
+  language mirrors `FailureSchematic::from_header_bytes` — a full typed
+  serde deserialize — accepting iff the header carries the tag AND the full
+  schematic shape (required fields + present optionals both type-checked).
+- **Duplicate keys are deliberately not a cross-language vector.** The Rust
+  reference (serde) **rejects** any header with a repeated field, in either
+  order; JS `JSON.parse` / Python `json.loads` / Go `encoding/json` silently
+  collapse duplicates (last value wins) and would need a bespoke parser to
+  reject. Producers never emit duplicate keys (the serde serializer cannot),
+  so a duplicate-key header is malformed input whose cross-language handling
+  is unspecified — do not add a vector that depends on it. Rust's reject-both
+  behavior is pinned by `tool_payment::tests::duplicate_keys_are_rejected_in_either_order`.
