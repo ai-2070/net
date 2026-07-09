@@ -39,6 +39,10 @@ use net_mcp::serve::{
     gated_invoke, CapabilityDetail, CapabilityId, ConsentPolicy, GatedOutcome, GatewayError,
     MeshGateway, PaymentFlow, PinStore,
 };
+use net_payments::core::registry::default_registry_v1;
+use net_payments::flow::mesh::MeshPaymentChannel;
+use net_payments::flow::{CallerPaymentFlow, Clock, SystemClock};
+use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 use net_sdk::mesh::Mesh as SdkMesh;
 
 use crate::NetMesh;
@@ -225,6 +229,164 @@ async fn do_invoke(
 }
 
 // ---------------------------------------------------------------------------
+// Payment flow construction + the operator approval verbs. Mock-network paid
+// capabilities work with no signer; real-network settlement needs the signer
+// seam (a focused follow-up). Doctrine #1: every decision is the Rust flow's;
+// this maps config strings to constructors.
+// ---------------------------------------------------------------------------
+
+/// Payment config collected from the constructor options.
+struct PaymentConfig {
+    policy_path: String,
+    profile: String,
+    unsafe_mock_auto_allow: bool,
+}
+
+/// A `paymentProfile` / unsafe flag without a `paymentPolicyPath` is a caller
+/// error; the policy path is the shared spend-policy store the flow reserves
+/// against.
+fn collect_payment_config(
+    policy_path: Option<String>,
+    profile: Option<String>,
+    unsafe_mock_auto_allow: bool,
+) -> Result<Option<PaymentConfig>> {
+    match policy_path {
+        Some(policy_path) => Ok(Some(PaymentConfig {
+            policy_path,
+            profile: profile.unwrap_or_else(|| "production".to_string()),
+            unsafe_mock_auto_allow,
+        })),
+        None if profile.is_some() || unsafe_mock_auto_allow => Err(Error::from_reason(
+            "gateway: paymentProfile / paymentUnsafeMockAutoAllow require paymentPolicyPath \
+             (the shared spend-policy store)",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn parse_profile(profile: &str) -> Result<SpendProfile> {
+    match profile {
+        "production" => Ok(SpendProfile::Production),
+        "dev_test" | "dev-test" | "devtest" => Ok(SpendProfile::DevTest),
+        other => Err(Error::from_reason(format!(
+            "gateway: unknown paymentProfile {other:?} (expected \"production\" or \"dev_test\")"
+        ))),
+    }
+}
+
+/// Build the caller payment flow. The payment identity **is the node's mesh
+/// identity** (`mesh.entity_keypair()`, borrowed in-process — nothing crosses
+/// the language boundary). Real (non-mock) networks additionally need a
+/// per-scheme signer (the follow-up); without one, a real-network `accepts[]`
+/// entry is a structured `denied`, never a fallback.
+fn build_payment_flow(
+    mesh: Arc<SdkMesh>,
+    config: Option<PaymentConfig>,
+) -> Result<Option<Arc<dyn PaymentFlow>>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let profile = parse_profile(&config.profile)?;
+    let caller = Arc::new(mesh.entity_keypair().clone());
+    let registry = default_registry_v1(caller.entity_id().clone());
+    let spend = SpendPolicyEngine::new(&config.policy_path, profile)
+        .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
+    let flow = CallerPaymentFlow::new(
+        caller,
+        spend,
+        registry,
+        Arc::new(MeshPaymentChannel::new(mesh)),
+        Arc::new(SystemClock),
+    );
+    Ok(Some(Arc::new(flow)))
+}
+
+/// A `SpendPolicyEngine` for the operator verbs, keyed on the same store the
+/// flow reserves against (the unsafe flag doesn't affect these verbs).
+fn spend_engine(path: &str, profile: &str) -> SpendPolicyEngine {
+    let profile = match profile {
+        "dev_test" | "dev-test" | "devtest" => SpendProfile::DevTest,
+        _ => SpendProfile::Production,
+    };
+    SpendPolicyEngine::new(path, profile)
+}
+
+fn no_policy_json() -> String {
+    err_json(
+        "no_payment_policy",
+        "no spend policy configured — construct the gateway with paymentPolicyPath \
+         (the machine-shared spend-policy store) to use the approval verbs",
+    )
+}
+
+async fn do_approve_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).approve(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+async fn do_reject_payment(
+    policy_path: Option<String>,
+    profile: String,
+    quote_id: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).reject(&quote_id).await {
+        Ok(changed) => {
+            json!({ "status": "ok", "quote_id": quote_id, "changed": changed }).to_string()
+        }
+        Err(e) => err_json("error", e),
+    }
+}
+
+async fn do_pending_payments(policy_path: Option<String>, profile: String) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    match spend_engine(&path, &profile).pending().await {
+        Ok(quotes) => json!({ "status": "ok", "pending": quotes }).to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+async fn do_spent_today(
+    policy_path: Option<String>,
+    profile: String,
+    network: String,
+    asset: String,
+) -> String {
+    let Some(path) = policy_path else {
+        return no_policy_json();
+    };
+    let now_ns = SystemClock.now_ns();
+    match spend_engine(&path, &profile)
+        .spent_today(&network, &asset, now_ns)
+        .await
+    {
+        Ok(amount) => json!({
+            "status": "ok",
+            "network": network,
+            "asset": asset,
+            "spent": amount.to_canonical_string(),
+        })
+        .to_string(),
+        Err(e) => err_json("error", e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The gateway class
 // ---------------------------------------------------------------------------
 
@@ -244,29 +406,57 @@ pub struct CapabilityGateway {
     consent: Arc<ConsentPolicy>,
     /// The machine-shared pin store path, reloaded fresh per call.
     pin_store_path: Option<PathBuf>,
-    /// The caller-side payment flow for paid capabilities (wired in B2). `None`
-    /// = paid capabilities fail closed at the gate, per doctrine.
+    /// The caller-side payment flow for paid capabilities (mock-network ready;
+    /// real-network signers are a follow-up). `None` = paid capabilities fail
+    /// closed at the gate, per doctrine.
     payment: Option<Arc<dyn PaymentFlow>>,
+    /// The spend-policy store path + profile, retained so the operator approval
+    /// verbs reopen the same store the flow reserves against. `None` path =
+    /// no `paymentPolicyPath` supplied; the verbs return `no_payment_policy`.
+    spend_policy_path: Option<String>,
+    spend_profile: String,
 }
 
 #[napi]
 impl CapabilityGateway {
     #[napi(constructor)]
-    pub fn new(mesh: &NetMesh, pin_store_path: Option<String>) -> Result<Self> {
+    pub fn new(
+        mesh: &NetMesh,
+        pin_store_path: Option<String>,
+        payment_policy_path: Option<String>,
+        payment_profile: Option<String>,
+        payment_unsafe_mock_auto_allow: Option<bool>,
+    ) -> Result<Self> {
         // Reuse the live node + its channel configs so the gateway drives mesh
         // I/O over the same node the caller runs (the `DaemonRuntime::create`
         // precedent). Identity is `None`: the payment identity is derived from
-        // the node inside the flow (B2), never handed in.
+        // the node inside the flow, never handed in.
         let node = mesh
             .node_arc_clone()
             .map_err(|_| Error::from_reason("gateway: mesh node has been shut down"))?;
         let channel_configs = mesh.channel_configs_arc();
         let sdk_mesh = Arc::new(SdkMesh::from_node_arc(node, channel_configs, None));
+
+        let config = collect_payment_config(
+            payment_policy_path,
+            payment_profile,
+            payment_unsafe_mock_auto_allow.unwrap_or(false),
+        )?;
+        // Retain the store path + profile before `build_payment_flow` consumes
+        // the config, so the approval verbs can reopen it.
+        let (spend_policy_path, spend_profile) = match &config {
+            Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
+            None => (None, "production".to_string()),
+        };
+        let payment = build_payment_flow(sdk_mesh.clone(), config)?;
+
         Ok(Self {
             gateway: Arc::new(MeshGateway::new(sdk_mesh)),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
-            payment: None,
+            payment,
+            spend_policy_path,
+            spend_profile,
         })
     }
 
@@ -335,6 +525,47 @@ impl CapabilityGateway {
         let payment = self.payment.clone();
         Ok(do_invoke(&gateway, &consent, &pin_path, payment.as_deref(), id, args).await)
     }
+
+    /// Approve a held payment quote under operator policy, resolving a prior
+    /// `requires_payment_approval` so the next `invoke` redeems it. Resolves to
+    /// `{"status":"ok","quoteId":...,"changed":bool}`, or a structured
+    /// `no_payment_policy` / `error`. Operator surface — `invoke` only *requests*
+    /// approval; this grants it.
+    #[napi]
+    pub async fn approve_payment(&self, quote_id: String) -> Result<String> {
+        let path = self.spend_policy_path.clone();
+        let profile = self.spend_profile.clone();
+        Ok(do_approve_payment(path, profile, quote_id).await)
+    }
+
+    /// Reject / remove a payment approval record. Resolves to
+    /// `{"status":"ok","quoteId":...,"changed":bool}`, or a structured error.
+    #[napi]
+    pub async fn reject_payment(&self, quote_id: String) -> Result<String> {
+        let path = self.spend_policy_path.clone();
+        let profile = self.spend_profile.clone();
+        Ok(do_reject_payment(path, profile, quote_id).await)
+    }
+
+    /// The quote ids awaiting approval, for a consent UX to render. Resolves to
+    /// `{"status":"ok","pending":[quoteId, ...]}`, or a structured error.
+    #[napi]
+    pub async fn pending_payments(&self) -> Result<String> {
+        let path = self.spend_policy_path.clone();
+        let profile = self.spend_profile.clone();
+        Ok(do_pending_payments(path, profile).await)
+    }
+
+    /// Today's reserved spend total for a `(network, x402 asset)` pair, as the
+    /// canonical atomic-amount string. Resolves to
+    /// `{"status":"ok","network":...,"asset":...,"spent":"<atomic>"}`, or a
+    /// structured error. `network` / `asset` are the x402 wire values.
+    #[napi]
+    pub async fn spent_today(&self, network: String, asset: String) -> Result<String> {
+        let path = self.spend_policy_path.clone();
+        let profile = self.spend_profile.clone();
+        Ok(do_spent_today(path, profile, network, asset).await)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +598,34 @@ mod tests {
         let v: Value = serde_json::from_str(&outcome_to_json(&id, plain)).expect("json");
         assert_eq!(v["status"], "denied");
         assert!(v.get("failure").is_none(), "no schematic, no failure field");
+    }
+
+    #[test]
+    fn payment_config_requires_a_policy_path() {
+        // No payment kwargs → no flow.
+        assert!(collect_payment_config(None, None, false).unwrap().is_none());
+        // Profile / unsafe without a policy path is a caller error.
+        assert!(collect_payment_config(None, Some("dev_test".into()), false).is_err());
+        assert!(collect_payment_config(None, None, true).is_err());
+        // A policy path alone defaults the profile fail-closed.
+        let c = collect_payment_config(Some("/tmp/p.json".into()), None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.profile, "production");
+        assert!(!c.unsafe_mock_auto_allow);
+    }
+
+    #[test]
+    fn parse_profile_rejects_unknown() {
+        assert!(matches!(
+            parse_profile("production"),
+            Ok(SpendProfile::Production)
+        ));
+        assert!(matches!(
+            parse_profile("dev_test"),
+            Ok(SpendProfile::DevTest)
+        ));
+        assert!(parse_profile("yolo").is_err());
     }
 
     #[test]

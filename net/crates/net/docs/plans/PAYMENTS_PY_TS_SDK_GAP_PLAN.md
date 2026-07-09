@@ -215,21 +215,29 @@ Payments ride behind it. Package decision (recorded, unchanged from
 
 ### B2 — Payment options + signer seam + approval verbs
 
-- [ ] Constructor options object mirroring Python's kwargs: `paymentPolicyPath`,
-  `paymentProfile`, `paymentUnsafeMockAutoAllow`, and the three signer pairs
+- [x] Constructor options `paymentPolicyPath` / `paymentProfile` /
+  `paymentUnsafeMockAutoAllow` build a `CallerPaymentFlow` over
+  `SpendPolicyEngine` + `default_registry_v1` + `MeshPaymentChannel` (the Python
+  `build_payment_flow` composition), payment identity = the node's mesh identity.
+  Fail-closed: a profile/unsafe flag without a policy path is a construction
+  error; an unknown profile is a construction error; a paid capability with no
+  flow is `denied`. Mock-network paid capabilities work with no signer.
+- [x] `requires_payment_approval` + the `failure` schematic pass through
+  untouched — the flow (over-cap) yields `requires_payment_approval`, projected
+  by the B1 `outcome_to_json`.
+- [x] Approval verbs `approvePayment` / `rejectPayment` / `pendingPayments` /
+  `spentToday` (thin wrappers over `SpendPolicyEngine`, retaining the store path
+  + profile on the gateway) — structured `no_payment_policy` without a path.
+  Rust config tests + vitest round-trip rows.
+- [ ] **B2-signers (follow-up):** the three signer pairs
   (`paymentSignerAddress`/`paymentSigner` eip155, `paymentSignerSvm*`,
-  `paymentSignerXrpl*`). Builds a `CallerPaymentFlow` over `SpendPolicyEngine` +
-  `default_registry_v1` + `MeshPaymentChannel` (the Python `build_payment_flow`
-  composition), payment identity = the node's mesh identity.
-- [ ] Signer callbacks bridged via `ThreadsafeFunction<String /*typed intent
+  `paymentSignerXrpl*`) bridged via `ThreadsafeFunction<String /*typed intent
   JSON*/, Promise<String> /*artifact*/>` (the `node/src/blob.rs`
-  `NodeAsyncBlobAdapter` pattern is the reference) → `ExternalSigner` /
-  `ExternalSvmSigner` / `ExternalXrplSigner`. Typed intent in, artifact out; key
-  material unrepresentable; each pair both-or-neither, requiring the policy path.
-- [ ] `requires_payment_approval` + the `failure` schematic pass through
-  untouched (the Node golden-vector test already parses the schematic shape).
-- [ ] Approval verbs `approvePayment` / `rejectPayment` / `pendingPayments` /
-  `spentToday` (thin wrappers over `SpendPolicyEngine`, as in Python).
+  `NodeAsyncBlobAdapter` + `await_tsfn_promise` pattern) → `ExternalSigner` /
+  `ExternalSvmSigner` / `ExternalXrplSigner`. Needed only for REAL-network
+  settlement; typed intent in, artifact out; key material unrepresentable; each
+  pair both-or-neither. Split out because the TSFN signer bridge is intricate
+  enough to warrant its own focused pass.
 
 ### B3 — Outbound HTTP-402 client
 

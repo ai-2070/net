@@ -106,3 +106,69 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway', () => {
     })
   }, 20000)
 })
+
+// Payment options + operator approval verbs (B2). The payment decisions are
+// pinned in Rust; these assert the Node surface — construction with the payment
+// options, and the approval-verb store round-trip.
+describe.skipIf(!CapabilityGateway)('CapabilityGateway payments', () => {
+  const tmpPolicy = (name: string): string =>
+    `${require('node:os').tmpdir()}/net-gw-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+
+  it('accepts payment options and keeps free tools structured', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(mesh, null, tmpPolicy('opts'), 'dev_test')
+      expect(JSON.parse(await gw.search('')).status).toBe('ok')
+      const i = JSON.parse(await gw.invoke('42/echo', '{}'))
+      expect(UNREACHABLE).toContain(i.status)
+    })
+  })
+
+  it('paymentProfile without a policy path is a construction error', async () => {
+    await withMesh(async (mesh) => {
+      expect(() => new CapabilityGateway(mesh, null, null, 'dev_test')).toThrow()
+    })
+  })
+
+  it('unknown paymentProfile is a construction error', async () => {
+    await withMesh(async (mesh) => {
+      expect(() => new CapabilityGateway(mesh, null, tmpPolicy('bad'), 'yolo')).toThrow()
+    })
+  })
+
+  it('approval verbs round-trip on the shared store', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(mesh, null, tmpPolicy('verbs'), 'dev_test')
+
+      // Fresh store: nothing pending, nothing spent.
+      const pending = JSON.parse(await gw.pendingPayments())
+      expect(pending.status).toBe('ok')
+      expect(pending.pending).toEqual([])
+      const spent = JSON.parse(await gw.spentToday('mock:net', 'musd'))
+      expect(spent.status).toBe('ok')
+      expect(spent.spent).toBe('0')
+
+      // Approve a quote id: moves to approved (changed), idempotent second call.
+      const approved = JSON.parse(await gw.approvePayment('q-1'))
+      expect(approved.status).toBe('ok')
+      expect(approved.changed).toBe(true)
+      expect(JSON.parse(await gw.approvePayment('q-1')).changed).toBe(false)
+
+      // Reject removes it (changed), then a no-op.
+      expect(JSON.parse(await gw.rejectPayment('q-1')).changed).toBe(true)
+      expect(JSON.parse(await gw.rejectPayment('q-1')).changed).toBe(false)
+    })
+  })
+
+  it('approval verbs without a policy path are structured, not throws', async () => {
+    await withMesh(async (mesh) => {
+      const gw = new CapabilityGateway(mesh)
+      for (const raw of [
+        await gw.pendingPayments(),
+        await gw.approvePayment('q'),
+        await gw.spentToday('mock:net', 'musd'),
+      ]) {
+        expect(JSON.parse(raw).status).toBe('no_payment_policy')
+      }
+    })
+  })
+})
