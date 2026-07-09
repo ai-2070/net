@@ -22,6 +22,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "start",
     "guides",
     "concepts",
+    "payments",
     "sdk",
     "agent-briefs",
     "reference",
@@ -78,6 +79,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "right-and-wrong-use-cases",
       "mcp-vs-net",
       "rest-vs-net",
+    ],
+    payments: [
+      "what-net-payments-is",
+      "x402-and-net",
+      "the-lifecycle",
+      "verification-tiers",
+      "spend-policy-and-approvals",
+      "non-custodial-signing",
+      "networks",
+      "failure-schematic",
+      "billing",
     ],
     start: ["what-is-net", "quickstart", "install"],
     concepts: [
@@ -164,6 +176,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     worldview: "Worldview",
     start: "Start",
     concepts: "Concepts",
+    payments: "Payments",
     guides: "Guides",
     reference: "Reference",
     tutorials: "Tutorials",
@@ -174,6 +187,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "worldview/right-and-wrong-use-cases": "When to Use Net",
     "worldview/mcp-vs-net": "MCP vs Net",
     "worldview/rest-vs-net": "REST vs Net",
+
+    // Payments
+    "payments/what-net-payments-is": "What It Is (and Is Not)",
+    "payments/x402-and-net": "x402 and Net",
+    "payments/the-lifecycle": "The Lifecycle",
+    "payments/verification-tiers": "Verification Tiers",
+    "payments/spend-policy-and-approvals": "Spend Policy & Approvals",
+    "payments/non-custodial-signing": "Non-Custodial Signing",
+    "payments/networks": "Networks",
+    "payments/failure-schematic": "The Failure Schematic",
+    "payments/billing": "Billing",
 
     // Start
     "start/what-is-net": "What is Net?",
