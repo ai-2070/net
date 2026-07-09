@@ -70,6 +70,27 @@ fn err_json(status: &str, msg: impl std::fmt::Display) -> String {
     json!({ "status": status, "error": msg.to_string() }).to_string()
 }
 
+/// Parse and normalize the `invoke` arguments string to a JSON *object*.
+///
+/// A JSON `null` (or an omitted `arguments`, which the caller already mapped to
+/// `{}`) is a no-argument invocation — normalized to `{}`, exactly as the SDK's
+/// [`gated_invoke`] does at the one chokepoint every demand-side caller routes
+/// through. Arrays and primitives are still a caller-shape error: the gateway
+/// surface requires an object, and the core does not accept arbitrary-typed
+/// args. `Err` carries the human message for an `invalid_arguments` status.
+///
+/// The twin of the Python gateway's `normalize_invoke_args`, so the two
+/// surfaces cannot drift.
+fn normalize_invoke_args(raw: &str) -> std::result::Result<Value, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| format!("arguments must be a JSON object: {e}"))?;
+    let value = if value.is_null() { json!({}) } else { value };
+    if !value.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    Ok(value)
+}
+
 /// Load a fresh pin-store snapshot. A read/parse error yields `None` — a broken
 /// store must never *grant* consent (fail closed), matching the shim.
 async fn load_pins(path: &Option<PathBuf>) -> Option<PinStore> {
@@ -650,24 +671,12 @@ impl CapabilityGateway {
             Err(e) => return Ok(err_json("invalid_capability_id", e)),
         };
         let raw = arguments_json.unwrap_or_else(|| "{}".to_string());
-        let args: Value = match serde_json::from_str(&raw) {
+        // `null`/omitted normalizes to `{}` (a no-argument invocation, as the
+        // gate does); arrays and primitives are a caller-shape error.
+        let args = match normalize_invoke_args(&raw) {
             Ok(v) => v,
-            Err(e) => {
-                return Ok(err_json(
-                    "invalid_arguments",
-                    format!("arguments must be a JSON object: {e}"),
-                ))
-            }
+            Err(e) => return Ok(err_json("invalid_arguments", e)),
         };
-        // The documented contract is a JSON *object*. A non-object (`null`,
-        // `[]`, `true`, `"..."`) parses but isn't a valid argument shape — a
-        // caller-shape error, not something to forward to the gate.
-        if !args.is_object() {
-            return Ok(err_json(
-                "invalid_arguments",
-                "arguments must be a JSON object",
-            ));
-        }
         let Some((gateway, payment)) = self.live_handles() else {
             return Ok(closed_json());
         };
@@ -802,5 +811,24 @@ mod tests {
         assert_eq!(v["status"], "requires_payment_approval");
         assert_eq!(v["quote_id"], "q-1");
         assert_eq!(v["cap_id"], "prov/tool");
+    }
+
+    #[test]
+    fn normalize_invoke_args_matches_the_gate_contract() {
+        // An object passes through untouched.
+        assert_eq!(
+            normalize_invoke_args(r#"{"m":1}"#).unwrap(),
+            json!({ "m": 1 })
+        );
+        // A no-argument invocation — omitted (`{}`) or explicit `null` — is `{}`
+        // (the gate normalizes `null` the same way).
+        assert_eq!(normalize_invoke_args("{}").unwrap(), json!({}));
+        assert_eq!(normalize_invoke_args("null").unwrap(), json!({}));
+        // Arrays / primitives are a caller-shape error, never forwarded.
+        for bad in ["[]", "true", "42", "\"str\""] {
+            assert!(normalize_invoke_args(bad).is_err(), "{bad} must be rejected");
+        }
+        // Malformed JSON is also invalid_arguments.
+        assert!(normalize_invoke_args("not json").is_err());
     }
 }

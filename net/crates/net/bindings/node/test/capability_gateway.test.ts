@@ -112,17 +112,23 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway', () => {
     })
   }, 20000)
 
-  it('non-object arguments are a structured invalid_arguments error', async () => {
+  it('null args normalize to a no-arg invoke; arrays & primitives are rejected', async () => {
     await withMesh(async (mesh) => {
       const gw = new CapabilityGateway(mesh)
-      // These parse as valid JSON but are not the documented object shape.
-      for (const bad of ['null', '[]', 'true', '"str"', '42']) {
+      // JSON `null` is a no-argument invocation (normalized to {}, exactly as
+      // the SDK gate does), so it reaches the unreachable provider rather than
+      // failing on argument shape — parity with Python and gated_invoke.
+      const nullRes = JSON.parse(await gw.invoke('42/echo', 'null'))
+      expect(UNREACHABLE).toContain(nullRes.status)
+      // Arrays and primitives parse as valid JSON but are not the documented
+      // object shape — still a structured caller-shape error.
+      for (const bad of ['[]', 'true', '"str"', '42']) {
         const res = JSON.parse(await gw.invoke('42/echo', bad))
         expect(res.status).toBe('invalid_arguments')
       }
       gw.close()
     })
-  })
+  }, 20000)
 
   it('close() makes the live methods resolve to a closed status (idempotent)', async () => {
     await withMesh(async (mesh) => {

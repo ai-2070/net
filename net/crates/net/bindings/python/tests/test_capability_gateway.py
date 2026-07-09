@@ -103,6 +103,18 @@ def test_malformed_arguments_are_a_structured_error(gateway):
     assert "error" in result
 
 
+def test_null_args_normalize_arrays_and_primitives_reject(gateway):
+    # JSON `null` is a no-argument invocation (normalized to {}, exactly as the
+    # SDK gate does), so it reaches the (unreachable) provider rather than
+    # failing on argument shape — parity with Node and gated_invoke.
+    null_res = json.loads(gateway.invoke("42/echo", "null"))
+    assert null_res["status"] in {"transport_error", "not_found"}, null_res
+    # Arrays and primitives parse but are not the documented object shape.
+    for bad in ("[]", "true", '"str"', "42"):
+        res = json.loads(gateway.invoke("42/echo", bad))
+        assert res["status"] == "invalid_arguments", (bad, res)
+
+
 def test_every_surface_returns_valid_json(gateway):
     # The whole contract: every method hands back a JSON string with a `status`.
     for raw in (

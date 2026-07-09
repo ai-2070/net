@@ -133,6 +133,27 @@ fn err_json(status: &str, msg: impl std::fmt::Display) -> String {
     json!({ "status": status, "error": msg.to_string() }).to_string()
 }
 
+/// Parse and normalize the `invoke` arguments string to a JSON *object*.
+///
+/// A JSON `null` (or the default `"{}"`) is a no-argument invocation —
+/// normalized to `{}`, exactly as the SDK's [`gated_invoke`] does at the one
+/// chokepoint every demand-side caller routes through. Arrays and primitives
+/// are still a caller-shape error: the gateway surface requires an object, and
+/// the core does not accept arbitrary-typed args. `Err` carries the human
+/// message for an `invalid_arguments` status.
+///
+/// The twin of the Node gateway's `normalize_invoke_args`, so the two surfaces
+/// cannot drift.
+fn normalize_invoke_args(raw: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| format!("arguments must be a JSON object: {e}"))?;
+    let value = if value.is_null() { json!({}) } else { value };
+    if !value.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    Ok(value)
+}
+
 /// Map a describe result to a JSON object, adding the caller-side
 /// `requires_approval` flag.
 fn detail_to_json(d: &CapabilityDetail, requires_approval: bool) -> String {
@@ -939,14 +960,11 @@ impl PyCapabilityGateway {
             Ok(id) => id,
             Err(e) => return err_json("invalid_capability_id", e),
         };
-        let args: Value = match serde_json::from_str(arguments_json) {
+        // `null`/default `"{}"` normalizes to `{}` (a no-argument invocation, as
+        // the gate does); arrays and primitives are a caller-shape error.
+        let args = match normalize_invoke_args(arguments_json) {
             Ok(v) => v,
-            Err(e) => {
-                return err_json(
-                    "invalid_arguments",
-                    format!("arguments must be a JSON object: {e}"),
-                )
-            }
+            Err(e) => return err_json("invalid_arguments", e),
         };
         let h = self.state.handles();
         let runtime = self.state.runtime.clone();
@@ -1110,17 +1128,11 @@ impl PyAsyncCapabilityGateway {
             Ok(id) => id,
             Err(e) => return immediate(py, err_json("invalid_capability_id", e)),
         };
-        let args: Value = match serde_json::from_str(arguments_json) {
+        // `null`/default `"{}"` normalizes to `{}` (a no-argument invocation, as
+        // the gate does); arrays and primitives are a caller-shape error.
+        let args = match normalize_invoke_args(arguments_json) {
             Ok(v) => v,
-            Err(e) => {
-                return immediate(
-                    py,
-                    err_json(
-                        "invalid_arguments",
-                        format!("arguments must be a JSON object: {e}"),
-                    ),
-                )
-            }
+            Err(e) => return immediate(py, err_json("invalid_arguments", e)),
         };
         let h = self.state.handles();
         let join = self.state.runtime.spawn(async move {
