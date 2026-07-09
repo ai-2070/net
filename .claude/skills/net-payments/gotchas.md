@@ -97,9 +97,11 @@ they go red (`testing.md`).
 ## Language reality checks (before you promise a flow)
 
 - **Rust, Python, AND Node** have a full native **demand + supply** payment
-  flow — `CapabilityGateway`, `PaymentProvider` + `buildPricingTerms`, the
-  HTTP-402 client, eip155/svm/xrpl signers, approval verbs, and a free
-  `publishTools` path. (The earlier "Node is read-only, no flow, not built"
+  flow — `CapabilityGateway`, `PaymentProvider` + `build_pricing_terms` /
+  `buildPricingTerms`, the HTTP-402 client, eip155/svm/xrpl signers, approval
+  verbs, and a free `publish_tools` / `publishTools` path (Python snake_case /
+  Node camelCase; Rust core is `ServerPublisher::publish_tools`). (The earlier
+  "Node is read-only, no flow, not built"
   caveat is stale — it all landed.) **Go** has a golden-vector verifier
   (`go/payments_golden_vectors_test.go`) but **no flow** — for a Go/C payment
   flow the honest answer is still Rust/Python/Node. `@net-mesh/payments` stays a

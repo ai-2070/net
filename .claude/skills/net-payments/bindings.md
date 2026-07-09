@@ -152,18 +152,17 @@ not just a caller.
 ```python
 from net import build_pricing_terms, PaymentProvider
 
-# 1) Author the price. `provider_entity_id` is the node's 32-byte mesh entity id
-#    (the identity that issues quotes); `requirements_json` is a JSON array of
-#    x402 PaymentRequirements (camelCase wire names). Returns canonical,
-#    byte-preserved net.pricing.terms@1.
-terms = build_pricing_terms(provider_entity_id, capability, requirements_json)
-
-# 2) Stand up a provider over a STARTED mesh. state_path is the settlement store
+# 1) Stand up a provider over a STARTED mesh. state_path is the settlement store
 #    (durable + single-owner). One shared PaymentEngine serves the quote/pay wire
-#    AND gates the priced tools.
+#    AND gates the priced tools. It exposes the provider's entity id.
 provider = PaymentProvider(mesh, state_path, billing_log_path=None)
-provider.provider_entity_id                 # 32 bytes — pass to build_pricing_terms
+provider.provider_entity_id                 # 32 bytes — the identity that issues quotes
 provider.read_billing()                     # [net.billing.event@1 JSON, ...] (needs billing_log_path)
+
+# 2) Author the price with the provider's entity id. `requirements_json` is a JSON
+#    array of x402 PaymentRequirements (camelCase wire names). Returns canonical,
+#    byte-preserved net.pricing.terms@1.
+terms = build_pricing_terms(provider.provider_entity_id, capability, requirements_json)
 
 # 3) Publish priced tools, gated by this provider's engine. pricing maps a tool
 #    NAME -> its terms. A priced tool serves once, after payment.
@@ -215,10 +214,11 @@ await gw.rejectPayment(quoteId); await gw.pendingPayments(); await gw.spentToday
 gw.close()                                // RELEASE the node clone before mesh.shutdown() (see below)
 
 // --- Supply: price + charge (bindings/node/src/payment_provider.rs) ---
-const terms = buildPricingTerms(providerEntityId /* Buffer, 32B */, capability, requirementsJson)
 const provider = new PaymentProvider(mesh, statePath, billingLogPath /* ? */)
-provider.providerEntityId                 // Buffer (32B); pass to buildPricingTerms
+provider.providerEntityId                 // Buffer (32B); the identity that issues quotes
 await provider.readBilling()              // string[] of net.billing.event@1
+// Author the price with the provider's own entity id:
+const terms = buildPricingTerms(provider.providerEntityId, capability, requirementsJson)
 const pub = await provider.publishPaidTools(
   tools,                                  // [{ name, description?, inputSchema }]
   handler,                                // async ({ toolName, argumentsJson }) => ({ text, isError? })
