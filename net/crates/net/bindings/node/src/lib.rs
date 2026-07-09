@@ -2242,7 +2242,16 @@ mod mesh_bindings {
             options: Option<crate::publish::PublishOptions>,
         ) -> Result<PromiseRaw<'env, crate::publish::LocalPublicationHandle>> {
             let node = self.node_arc_clone()?;
-            crate::publish::spawn_publish_tools(env, node, tools, handler, options)
+            // Free path: no pricing, no payment gate.
+            crate::publish::spawn_publish_tools(
+                env,
+                node,
+                tools,
+                handler,
+                options,
+                std::collections::BTreeMap::new(),
+                None,
+            )
         }
     }
 

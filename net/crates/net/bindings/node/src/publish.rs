@@ -306,12 +306,21 @@ pub(crate) fn build_tool_invoker(
 /// Build the invoker + config synchronously and spawn the announce/serve work.
 /// The `Function` is `!Send`, so the TSFN is built here (on the JS thread) and
 /// only the `Send` TSFN crosses into the future.
+///
+/// The free path ([`NetMesh::publish_tools`](crate::NetMesh)) and the paid path
+/// ([`crate::payment_provider`]) both funnel through here — they differ ONLY in
+/// `pricing` (empty vs. the per-tool `net.pricing.terms@1`) and
+/// `payment_admission` (`None` vs. the provider's engine gate), which
+/// `publish_tools` folds into the lowering. Keeping one scaffolding means the
+/// owner-scope / `allowAnyCaller` / lowering rules can't drift between the two.
 pub(crate) fn spawn_publish_tools<'env>(
     env: &'env Env,
     node: Arc<MeshNode>,
     tools: Vec<PublishToolJs>,
     handler: Function<'_, ToolInvokeArgs, Promise<ToolCallResultJs>>,
     options: Option<PublishOptions>,
+    pricing: std::collections::BTreeMap<String, String>,
+    payment_admission: Option<Arc<dyn net_mcp::serve::payment::PaymentAdmission>>,
 ) -> Result<PromiseRaw<'env, LocalPublicationHandle>> {
     // Validate + marshal up front so a bad schema / origin rejects immediately
     // rather than inside the Promise.
@@ -351,6 +360,12 @@ pub(crate) fn spawn_publish_tools<'env>(
         if allow_any_caller {
             config.scope = OwnerScope::any();
         }
+        // Free path: `pricing` empty + `payment_admission` None (no-ops).
+        // Paid path: the per-tool terms + the engine gate, which
+        // `publish_tools` folds into the lowering so a priced tool serves only
+        // after payment.
+        config.pricing = pricing;
+        config.payment_admission = payment_admission;
         let publisher = ServerPublisher::new(mesh);
         let handle = publisher
             .publish_tools(&sdk_tools, invoker, ctx, config)

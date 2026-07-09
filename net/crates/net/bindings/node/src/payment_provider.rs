@@ -114,8 +114,6 @@ mod provider {
     use parking_lot::Mutex;
 
     use net::adapter::net::MeshNode;
-    use net_mcp::spec::Implementation;
-    use net_mcp::wrap::{OwnerScope, ServerPublisher, WrapConfig};
     use net_payments::billing::BillingLog;
     use net_payments::core::registry::default_registry_v1;
     use net_payments::engine::{AdmitAll, PaymentEngine};
@@ -125,8 +123,8 @@ mod provider {
     use net_payments::flow::{Clock, InProcessProvider, SystemClock};
 
     use crate::publish::{
-        build_sdk_tools, build_tool_invoker, local_lowering_context, mesh_over, parse_owner_origin,
-        LocalPublicationHandle, PublishOptions, PublishToolJs, ToolCallResultJs, ToolInvokeArgs,
+        mesh_over, spawn_publish_tools, LocalPublicationHandle, PublishOptions, PublishToolJs,
+        ToolCallResultJs, ToolInvokeArgs,
     };
     use crate::NetMesh;
 
@@ -313,28 +311,6 @@ mod provider {
                      name, or use NetMesh.publishTools for free tools"
                 )));
             }
-            // Validate + marshal synchronously (before the publish round-trip),
-            // then build the invoker on the JS thread — everything after is
-            // `Send` state for the future.
-            let sdk_tools = build_sdk_tools(&tools)?;
-            let opts = options.unwrap_or(PublishOptions {
-                version: None,
-                owner_origin: None,
-                allow_any_caller: None,
-                handler_timeout_ms: None,
-            });
-            let allow_any_caller = opts.allow_any_caller.unwrap_or(false);
-            // `allowAnyCaller` overrides `ownerOrigin` (the scope becomes
-            // `any()`), so don't validate a value that's about to be ignored.
-            let owner_origin = if allow_any_caller {
-                None
-            } else {
-                parse_owner_origin(opts.owner_origin)?
-            };
-            let ctx = local_lowering_context(opts.version);
-            let invoker = build_tool_invoker(handler, opts.handler_timeout_ms)?;
-            let pricing: BTreeMap<String, String> = pricing.into_iter().collect();
-            let engine = self.engine.clone();
             // Clone the live node out from behind the lock (no guard crosses the
             // future). Closed → nothing to serve over.
             let Some(node) = self.serving.lock().as_ref().map(|s| s.node.clone()) else {
@@ -342,34 +318,24 @@ mod provider {
                     "payment provider has been closed — construct a new one to publish",
                 ));
             };
-
-            env.spawn_future(async move {
-                let mesh = Arc::new(mesh_over(node));
-                let owner = owner_origin.unwrap_or_else(|| mesh.origin_hash());
-                let mut config = WrapConfig::owner_only(
-                    Implementation {
-                        name: "net-publish".to_string(),
-                        version: "0".to_string(),
-                    },
-                    owner,
-                );
-                if allow_any_caller {
-                    config.scope = OwnerScope::any();
-                }
-                config.pricing = pricing;
-                // The gate: redeem quotes against THIS provider's engine — the
-                // same engine the quote/pay wire serves — so a paid tool serves
-                // once, after payment. A priced tool with no gate is a wrap
-                // error; here the gate is always set.
-                config.payment_admission = Some(Arc::new(EnginePaymentAdmission::new(engine)));
-
-                let publisher = ServerPublisher::new(mesh);
-                let handle = publisher
-                    .publish_tools(&sdk_tools, invoker, ctx, config)
-                    .await
-                    .map_err(|e| Error::from_reason(format!("publishPaidTools failed: {e}")))?;
-                Ok(LocalPublicationHandle::wrap(handle))
-            })
+            // Delegate to the shared free-publish scaffolding (tool marshaling,
+            // owner-scope / `allowAnyCaller` rules, invoker bridge, publication
+            // handle), adding this provider's pricing + engine gate. The gate is
+            // the SAME engine the quote/pay wire serves, so a quote paid over the
+            // wire is the quote the gate redeems (at-most-once). Reusing one
+            // scaffolding means the paid path can't drift from the free path.
+            let pricing: BTreeMap<String, String> = pricing.into_iter().collect();
+            let admission: Arc<dyn net_mcp::serve::payment::PaymentAdmission> =
+                Arc::new(EnginePaymentAdmission::new(self.engine.clone()));
+            spawn_publish_tools(
+                env,
+                node,
+                tools,
+                handler,
+                options,
+                pricing,
+                Some(admission),
+            )
         }
     }
 }
