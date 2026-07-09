@@ -1,0 +1,34 @@
+net/crates/net/docs/plans/PAYMENTS_PY_TS_SDK_GAP_PLAN.md
+  s_2ce1bbf7d954a5::t_4800a993042cf7 244-256
+net/crates/net/bindings/node/src/payment_http.rs
+  s_2ce1bbf7d954a5::t_5514f00adc1332 1-167,169-231
+  s_2ce1bbf7d954a5::t_9df3a01568fa58 168
+.github/workflows/ci.yml
+  s_2ce1bbf7d954a5::t_2eedaf56e89a87 1142
+  s_2ce1bbf7d954a5::t_308b324c61fb45 559
+net/crates/net/bindings/node/Cargo.toml
+  s_2ce1bbf7d954a5::t_d0da509a3d59dc 161-166
+  s_2ce1bbf7d954a5::t_3462d296e5721e 178-181
+net/crates/net/bindings/node/test/payment_http.test.ts
+  s_2ce1bbf7d954a5::t_68f2e43236060c 1-45
+net/crates/net/bindings/node/src/lib.rs
+  s_2ce1bbf7d954a5::t_e28912ba54744b 63-66
+net/crates/net/Cargo.lock
+  s_2ce1bbf7d954a5::t_1f3783f0714f58 2916
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c811c69badbfea6b7abae1ead231a1cc9c3a4512",
+  "prompts": {},
+  "sessions": {
+    "s_2ce1bbf7d954a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18fdae31-20fa-4349-91d0-7ace7316145f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
