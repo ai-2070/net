@@ -314,16 +314,25 @@ seeing a key — and `listTools` reports the price `watchTools` already did.
 
 ## Part C — cross-cutting
 
-- [ ] **One lifecycle-conformance vitest** against the mock facilitator (quote →
-  approval-required → approve → pay → served; denial → `failure.reason`),
-  asserting the same status sequences Python's driven test does — the runtime
-  twin of the golden vectors.
-- [ ] **CI:** add the `payments` feature to the Node build + a payments vitest
-  job; add the Python provider tests (`--features payments`) to the maturin
-  build. The `payments-http` opt-ins ride their own feature line (both languages).
-- [ ] The wire vocabulary stays single-sourced (`net_sdk::tool_payment` /
+- [x] **One lifecycle-conformance vitest** — `test/payment_conformance.test.ts`:
+  a two-node Node paid round-trip (provider prices + charges, caller pays through
+  the gate) asserting the exact status sequence the Rust `flow_end_to_end.rs`
+  drives — quote → `requires_payment_approval` → approve → (retry) served, and a
+  no-flow caller → `denied` carrying `failure.reason`. Uses the `Production`
+  profile (holds every mock spend for approval) + the `test_publish.py` handshake
+  + retry idiom for propagation timing. A new `NetMesh.localAddr` accessor
+  (mirroring Python's `local_addr`) was added — the missing piece for any
+  two-node Node handshake. **CI-validated:** authored against the verified flow
+  semantics + proven handshake pattern, but the vitest suite is the runner (the
+  napi `.node` isn't built in the dev loop).
+- [x] **CI:** the Node build + vitest job carries `payments,payments-http` (+ now
+  `publish`); the Python provider tests ride the maturin build's `payments`
+  feature; the `payments-http` opt-ins are on their own feature line. The node
+  clippy set now also lints the payments modules (was a gap).
+- [x] The wire vocabulary stays single-sourced (`net_sdk::tool_payment` /
   `net-payments`); the `failure_schematic_vectors` remain the executable
-  cross-language contract — no per-binding redefinition.
+  cross-language contract — no per-binding redefinition. Each binding's status
+  projection is additionally Rust-unit-tested per module.
 
 ## Rollout order
 

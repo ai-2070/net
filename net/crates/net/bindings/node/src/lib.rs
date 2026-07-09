@@ -1512,6 +1512,16 @@ mod mesh_bindings {
             Ok(hex::encode(node.public_key()))
         }
 
+        /// This node's actual bound socket address (`"ip:port"`). With
+        /// `bindAddr: "127.0.0.1:0"` the OS assigns the port; read it here to
+        /// hand to a peer's `connect(...)`. Mirrors the Python `local_addr`.
+        #[napi]
+        pub fn local_addr(&self) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node.local_addr().to_string())
+        }
+
         /// Get this node's ID. Returned as `BigInt` so full u64
         /// precision is preserved — keypair-derived node_ids
         /// routinely exceed `Number.MAX_SAFE_INTEGER`.
