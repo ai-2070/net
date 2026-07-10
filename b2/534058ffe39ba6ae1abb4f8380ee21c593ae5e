@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MCP_BRIDGE_STREAMING_PLAN.md
+  s_412b111b5c6fa1::t_a44149ee80cc51 1-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2534058ffe39ba6ae1abb4f8380ee21c593ae5e",
+  "prompts": {},
+  "sessions": {
+    "s_412b111b5c6fa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4c005a75-18a6-40ff-881f-c6206bc1e6bd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
