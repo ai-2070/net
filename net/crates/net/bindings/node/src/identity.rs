@@ -287,16 +287,44 @@ impl Identity {
 
     /// Build a matching SDK-level `Identity` by cloning out the
     /// seed and re-constructing. Used by sibling NAPI modules
-    /// (currently: `compute`'s `DaemonRuntime::spawn`) that feed
-    /// the identity into the SDK's compute surface.
+    /// (`compute`'s `DaemonRuntime::spawn`, the `delegation` /
+    /// `enrollment` surfaces) that feed the identity into the SDK.
     ///
     /// The token cache does NOT carry over — the SDK creates a
     /// fresh `TokenCache` inside its own `Identity`. For
     /// `DaemonRuntime` use this is fine; daemons don't consult
     /// the cache at spawn time.
-    #[cfg(feature = "compute")]
+    #[cfg(any(feature = "compute", feature = "delegation"))]
     pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
         net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
+    }
+
+    /// Wrap a shared `EntityKeypair` Arc in a fresh `Identity` handle
+    /// (fresh token cache). Used by the delegation / enrollment modules
+    /// to hand back opaque child / device identities — the private seed
+    /// stays inside Rust (bridge doctrine H8).
+    #[cfg(feature = "delegation")]
+    pub(crate) fn from_keypair_arc(keypair: Arc<EntityKeypair>) -> Self {
+        Self {
+            keypair,
+            cache: Arc::new(TokenCache::new()),
+        }
+    }
+
+    /// The raw `EntityId` (the 32-byte ed25519 public key), for sibling
+    /// NAPI modules that need the typed id rather than the `Buffer`
+    /// projection of [`Self::entity_id`].
+    #[cfg(feature = "delegation")]
+    pub(crate) fn entity_id_ref(&self) -> &EntityId {
+        self.keypair.entity_id()
+    }
+
+    /// The private 32-byte seed, for the delegation module's
+    /// child-identity KDF. `pub(crate)` and never surfaced to JS —
+    /// the derivation happens inside Rust (H8).
+    #[cfg(feature = "delegation")]
+    pub(crate) fn secret_seed(&self) -> &[u8; 32] {
+        self.keypair.secret_bytes()
     }
 
     /// Clone out the inner `EntityKeypair`. Used by the MeshOS
