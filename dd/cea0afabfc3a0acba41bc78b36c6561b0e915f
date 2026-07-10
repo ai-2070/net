@@ -1,0 +1,64 @@
+net/crates/net/bindings/node/test/delegation.test.ts
+  s_412b111b5c6fa1::t_c9c2827127c786 1-188
+net/crates/net/bindings/node/Cargo.toml
+  s_412b111b5c6fa1::t_795301a232e4d4 49-50
+  s_412b111b5c6fa1::t_9e6dd903d7481d 173-189
+net/crates/net/bindings/node/test/enrollment.test.ts
+  s_412b111b5c6fa1::t_29ea9dc9e13d42 1-243,245-284,286-310
+  s_412b111b5c6fa1::t_2229a0d13af74f 285
+  s_412b111b5c6fa1::t_f676dd6b364c1e 244
+net/crates/net/bindings/node/src/lib.rs
+  s_412b111b5c6fa1::t_6ab344a2588ff6 40-50
+  s_412b111b5c6fa1::t_3aabf8318a4c02 9-13
+  s_412b111b5c6fa1::t_5da6f9a2108cca 26
+net/crates/net/bindings/node/test/a2a.test.ts
+  s_412b111b5c6fa1::t_77354a3075344d 106
+  s_412b111b5c6fa1::t_8a3af53242ebf3 142
+  s_412b111b5c6fa1::t_3ae703d059833e 177-181,193-194
+  s_412b111b5c6fa1::t_977294e1a25dec 1-105,107-141,143-176,182-192,195-201
+net/crates/net/bindings/node/src/a2a.rs
+  s_412b111b5c6fa1::t_8d712f675f9182 171
+  s_412b111b5c6fa1::t_bc109924391633 130-133
+  s_412b111b5c6fa1::t_67f59cf83caf80 163,166-170,172,174,176-177,179-188
+  s_412b111b5c6fa1::t_a6c0b02eabe6a9 1-129,134-162,164-165,173,175,178,189-260
+net/crates/net/bindings/node/package.json
+  s_412b111b5c6fa1::t_118efe2ed87e81 83-85
+.github/workflows/ci.yml
+  s_412b111b5c6fa1::t_0b3f6b159994c2 559
+net/crates/net/bindings/node/src/delegation.rs
+  s_412b111b5c6fa1::t_d3d3b5435632ce 62-65,67
+  s_412b111b5c6fa1::t_bdc48051341206 1-61,66,68-314
+net/crates/net/bindings/node/src/enrollment.rs
+  s_412b111b5c6fa1::t_69dd89b03c412f 1-255,262-657,659-661,668,670-705
+  s_412b111b5c6fa1::t_ab5f21deaaec62 256-261
+  s_412b111b5c6fa1::t_8d8f7c1db9b463 658,662-667,669
+net/crates/net/bindings/node/src/identity.rs
+  s_412b111b5c6fa1::t_03749e2cfe2c3f 290-291,297,302-328
+  s_412b111b5c6fa1::t_8a16748989be5b 329
+net/crates/net/docs/plans/NODE_DELEGATION_A2A_SDK_PLAN.md
+  s_412b111b5c6fa1::t_c67900ce8b520f 102-110
+  s_412b111b5c6fa1::t_5bda6cb8ba3ce5 140-150
+  s_412b111b5c6fa1::t_2c48b71185894c 161-175
+  s_412b111b5c6fa1::t_96776432623f5e 187-199
+  s_412b111b5c6fa1::t_f36baf8f8a8152 119-128
+  s_412b111b5c6fa1::t_638e5b282a8ee3 3-11
+  s_412b111b5c6fa1::t_1f59b18b7c4366 203-228
+  s_412b111b5c6fa1::t_284a127545e6ea 129
+  s_412b111b5c6fa1::t_e38d2d438f8c13 200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ddcea0afabfc3a0acba41bc78b36c6561b0e915f",
+  "prompts": {},
+  "sessions": {
+    "s_412b111b5c6fa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4c005a75-18a6-40ff-881f-c6206bc1e6bd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
