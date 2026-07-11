@@ -11381,22 +11381,29 @@ impl MeshNode {
         // `announce_mu` is released here — the peer broadcast is
         // network I/O and must never hold the announce lock.
 
-        // Fan out to currently-connected peers. Best-effort — a
-        // per-peer send failure is logged and skipped rather than
-        // short-circuiting the broadcast.
+        // Fan out to currently-connected peers.
         let Some(bytes) = to_broadcast else {
             return Ok(());
         };
+        self.broadcast_announcement_bytes(&bytes).await;
+        Ok(())
+    }
+
+    /// Broadcast a serialized `CapabilityAnnouncement` to every
+    /// currently-connected peer. Best-effort — a per-peer send failure
+    /// is logged and skipped rather than short-circuiting the fan-out.
+    /// Shared by the immediate announce path and the RT-1 trailing-edge
+    /// flush so the two can't drift (RT-1 review Finding 14).
+    async fn broadcast_announcement_bytes(&self, bytes: &[u8]) {
         let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
         for addr in peer_addrs {
             if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, bytes)
                 .await
             {
                 tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
             }
         }
-        Ok(())
     }
 
     /// Schedule the trailing-edge announce flush for the current
@@ -11457,20 +11464,7 @@ impl MeshNode {
         let Some(ann) = self.local_announcement.load_full() else {
             return;
         };
-        let bytes = ann.to_bytes();
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
-        for addr in peer_addrs {
-            if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
-                .await
-            {
-                tracing::trace!(
-                    peer = %addr,
-                    error = %e,
-                    "capability: deferred announce send failed"
-                );
-            }
-        }
+        self.broadcast_announcement_bytes(&ann.to_bytes()).await;
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
