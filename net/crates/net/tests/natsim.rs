@@ -24,11 +24,40 @@
 
 use std::process::Command;
 
+/// Locate the `natsim_node` example for the ACTIVE build profile.
+/// This test binary lives at `<target>/<profile>/deps/<name>-<hash>`,
+/// so the example sits two directories up at
+/// `<target>/<profile>/examples/natsim_node` — correct under
+/// `--release`, custom `--profile` names, and `CARGO_TARGET_DIR`
+/// alike. (Cubic round 6: a hardcoded `target/debug/` path made the
+/// no-root guard tests silently skip in release builds; note that
+/// `PROFILE` is a build-script-only env var and is NOT available at
+/// test runtime, hence the current_exe derivation.) The
+/// `NATSIM_NODE_BIN` override mirrors `run_scenario.sh`.
+fn natsim_node_bin() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("NATSIM_NODE_BIN") {
+        return explicit.into();
+    }
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop(); // strip the test-binary filename → deps/
+    p.pop(); // strip deps/ → <profile>/
+    p.push("examples");
+    p.push("natsim_node");
+    p
+}
+
 /// Run one scenario script and return the initiator's outcome JSON.
 /// The script prints the outcome path on its last stdout line.
 fn scenario(name: &str) -> serde_json::Value {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/natsim/run_scenario.sh");
+    // Thread the profile-resolved helper path through sudo (which
+    // strips the environment by default) so the script exercises the
+    // SAME profile's binary as this test run instead of its
+    // debug-path default.
+    let bin = natsim_node_bin();
     let out = Command::new("sudo")
+        .arg("env")
+        .arg(format!("NATSIM_NODE_BIN={}", bin.display()))
         .arg(script)
         .arg(name)
         .output()
@@ -202,15 +231,18 @@ fn setup_rejects_public_b_with_a_natted_b_side() {
 /// first).
 #[test]
 fn helper_rejects_joiner_without_publics() {
-    let bin = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/examples/natsim_node"
-    );
-    if !std::path::Path::new(bin).exists() {
-        eprintln!("natsim_node example not built; skipping");
+    // Profile-aware resolution — under `--release` the example lives
+    // in target/release/examples, and a hardcoded debug path made
+    // this guard silently skip there (cubic round 6).
+    let bin = natsim_node_bin();
+    if !bin.exists() {
+        eprintln!(
+            "natsim_node example not built at {}; skipping",
+            bin.display()
+        );
         return;
     }
-    let out = Command::new(bin)
+    let out = Command::new(&bin)
         .args([
             "joiner",
             "--name",
