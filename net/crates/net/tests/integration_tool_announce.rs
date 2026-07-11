@@ -693,3 +693,54 @@ async fn registry_burst_coalesces_into_one_announce() {
         "a debounced burst must produce exactly one announce call",
     );
 }
+
+/// Handshake with the host started via a bare `start()` FIRST and
+/// then `start_arc()` — the ordering that RT-3 review Finding 7 flags.
+/// `start()` is idempotent, so the second call cannot respawn the
+/// loops; the change-driven announcer (and keep-alive) must therefore
+/// pick up the weak handle `start_arc` installs rather than having
+/// snapshotted `None` at spawn.
+async fn handshake_pair_host_bare_then_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
+    let host_id = host.node_id();
+    let peer_id = peer.node_id();
+    let peer_pub = *peer.public_key();
+    let peer_addr = peer.local_addr();
+    let peer_clone = peer.clone();
+    let accept = tokio::spawn(async move { peer_clone.accept(host_id).await });
+    host.connect(peer_addr, &peer_pub, peer_id)
+        .await
+        .expect("connect failed");
+    accept
+        .await
+        .expect("accept task panicked")
+        .expect("accept failed");
+    // The buggy ordering: bare start first, then start_arc.
+    host.start();
+    host.start_arc();
+    peer.start();
+}
+
+/// RT-3 review Finding 7: a registry mutation after `start()` then
+/// `start_arc()` must still auto-announce. Pre-fix, the change-driven
+/// announcer snapshotted `self_weak` at spawn (during the bare
+/// `start()`, when it was `None`) and parked forever, so the tool
+/// never propagated.
+#[tokio::test]
+async fn registry_change_announces_after_bare_start_then_start_arc() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair_host_bare_then_arc(&host, &peer).await;
+
+    host.tool_registry().insert(descriptor("late_started"));
+
+    let filter = CapabilityFilter::default().require_tag("ai-tool:late_started");
+    assert!(
+        wait_until(
+            || peer.find_nodes_by_filter(&filter).contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the tool — the change-driven announcer parked \
+         because start() ran before start_arc()",
+    );
+}

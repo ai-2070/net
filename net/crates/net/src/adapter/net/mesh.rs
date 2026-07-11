@@ -3043,7 +3043,14 @@ pub struct MeshNode {
     /// through `&self` per-peer sends, so it needs an owned `Arc`). Unset
     /// on a bare [`Self::start`] of a non-`Arc` node, in which case the
     /// loop is a no-op. Set-once.
-    self_weak: std::sync::OnceLock<std::sync::Weak<MeshNode>>,
+    /// Weak self-handle set by [`Self::start_arc`]. Wrapped in `Arc`
+    /// so the `self_weak`-dependent background loops (re-announce
+    /// keep-alive, RT-3 change announcer) can hold the *holder* and
+    /// re-read it each iteration instead of snapshotting it at spawn.
+    /// That makes a bare [`Self::start`] followed by a later
+    /// [`Self::start_arc`] work — the loops pick up the weak once it
+    /// is set, rather than parking forever (RT-3 review Finding 7).
+    self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
     /// Number of `accept()` calls currently awaiting
     /// `handshake_responder`. A simple `started.load(Acquire)`
     /// guard at `accept` entry is a TOCTOU — `start()` could fire
@@ -3535,7 +3542,7 @@ impl MeshNode {
             control_stats: Arc::new(ControlPlaneStats::default()),
             ack_ranges_peer_cache: Arc::new(DashMap::new()),
             started: AtomicBool::new(false),
-            self_weak: std::sync::OnceLock::new(),
+            self_weak: Arc::new(std::sync::OnceLock::new()),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -4466,21 +4473,23 @@ impl MeshNode {
     /// Re-broadcasting needs an owned `Arc` (the per-peer sends go through
     /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start_arc`]
     /// each tick — using a `Weak` (not `Arc`) so the task doesn't keep the
-    /// node alive. A bare [`Self::start`] never set that weak, so the loop is
-    /// a no-op there (`start_arc` is the path that enables re-announce).
+    /// node alive. The loop holds the shared `self_weak` OnceLock (not a
+    /// snapshot) and re-reads it each tick, so a bare [`Self::start`]
+    /// followed by a later [`Self::start_arc`] enables re-announce rather
+    /// than parking the loop forever (RT-3 review Finding 7); until the
+    /// weak is set the tick is a harmless no-op.
     fn spawn_capability_reannounce_loop(&self) -> JoinHandle<()> {
         let interval = self.config.capability_reannounce_interval;
         let min_announce = self.config.min_announce_interval;
-        // `Some` only when the node was started via `start_arc`.
-        let weak = self.self_weak.get().cloned();
+        let self_weak = self.self_weak.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         tokio::spawn(async move {
-            // No owned-`Arc` path (bare start) or disabled → nothing to do.
-            let (Some(weak), false) = (weak, interval == Duration::MAX) else {
+            // Config-disabled → nothing to do (independent of start mode).
+            if interval == Duration::MAX {
                 let _ = shutdown_notify.notified().await;
                 return;
-            };
+            }
             let ttl = capability_reannounce_ttl(interval, min_announce);
             let mut tick = tokio::time::interval(nonzero_interval(interval));
             // Skip the immediate t=0 tick — the initial announce (if any)
@@ -4489,6 +4498,10 @@ impl MeshNode {
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
                     _ = tick.tick() => {
+                        // Re-read the weak each tick: `None` = not started
+                        // via `start_arc` (yet); keep ticking so a later
+                        // `start_arc` enables the loop.
+                        let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
                         let caps = node.user_caps_snapshot();
                         if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
@@ -4518,6 +4531,14 @@ impl MeshNode {
     /// time: registrations made before `start` are the initial
     /// explicit announce's job, same as today.
     ///
+    /// The loop holds the shared `self_weak` OnceLock and re-reads it
+    /// each cycle rather than snapshotting it at spawn, so a bare
+    /// [`Self::start`] followed by a later [`Self::start_arc`] enables
+    /// the announcer instead of parking it forever (RT-3 review
+    /// Finding 7). A change that fires before the weak is set is
+    /// skipped — same outcome as today, the initial explicit
+    /// announce covers pre-`start` registrations.
+    ///
     /// Announce TTL matches the re-announce keep-alive's
     /// (`capability_reannounce_ttl`) so a change-driven entry
     /// survives until the keep-alive refreshes it.
@@ -4525,17 +4546,16 @@ impl MeshNode {
         let debounce = self.config.announce_debounce;
         let reannounce_interval = self.config.capability_reannounce_interval;
         let min_announce = self.config.min_announce_interval;
-        // `Some` only when the node was started via `start_arc`.
-        let weak = self.self_weak.get().cloned();
+        let self_weak = self.self_weak.clone();
         let mut change_rx = self.local_caps_changed.subscribe();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         tokio::spawn(async move {
-            // No owned-`Arc` path (bare start) or disabled → nothing to do.
-            let (Some(weak), false) = (weak, debounce == Duration::MAX) else {
+            // Config-disabled → nothing to do (independent of start mode).
+            if debounce == Duration::MAX {
                 let _ = shutdown_notify.notified().await;
                 return;
-            };
+            }
             // With the keep-alive disabled, fall back to the explicit
             // announce path's default TTL (300 s) rather than
             // `capability_reannounce_ttl(MAX, ..)` saturating to MAX.
@@ -4562,6 +4582,10 @@ impl MeshNode {
                         // announce below. Later bumps get their own
                         // cycle (missed-wakeup-safe generation).
                         let _ = change_rx.borrow_and_update();
+                        // Re-read the weak each cycle: `None` = not
+                        // started via `start_arc` (yet). Skip this
+                        // change; a later `start_arc` enables the loop.
+                        let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { return };
                         let caps = node.user_caps_snapshot();
                         if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
