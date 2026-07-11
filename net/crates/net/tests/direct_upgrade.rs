@@ -427,3 +427,29 @@ async fn single_punch_pair_is_deferred_not_terminal() {
          reclassification can still upgrade it",
     );
 }
+
+/// Review finding #3: the background upgrade loop holds only a Weak
+/// self-ref, so an `Arc<MeshNode>` dropped WITHOUT an explicit
+/// `shutdown()` still runs `Drop` (which sets `shutdown` and tears the
+/// loop down). A strong self-ref captured in the loop task would keep
+/// the node — and its socket and every background task — alive forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_loop_does_not_leak_the_node() {
+    let node = build_upgrading_node().await;
+    node.start_arc(); // spawns the direct-upgrade loop
+                      // Let the loop reach its steady-state `select!` park.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let weak = Arc::downgrade(&node);
+    drop(node); // no shutdown() — rely on Drop to tear things down
+
+    // Drop must win: with a Weak self-ref the strong count hits zero and
+    // the node is freed. A strong self-ref in the loop would pin it and
+    // this poll would time out.
+    let freed = wait_for(Duration::from_secs(5), || weak.upgrade().is_none()).await;
+    assert!(
+        freed,
+        "node should be freed after its last Arc is dropped; the upgrade \
+         loop is holding a strong self-ref",
+    );
+}

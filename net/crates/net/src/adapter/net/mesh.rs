@@ -14935,21 +14935,32 @@ impl MeshNode {
     /// Every tick, find relay-routed peers for which this node is the
     /// lower-id initiator (C1) and whose throttle window has elapsed,
     /// and fire a per-peer [`Self::attempt_direct_upgrade`]. No-op
-    /// unless `MeshNodeConfig::auto_direct_upgrade` is set. Needs an
-    /// `Arc<MeshNode>` (like the classify loop) to drive attempts across
-    /// `.await`s; exits on `shutdown_notify`.
+    /// unless `MeshNodeConfig::auto_direct_upgrade` is set; exits on
+    /// `shutdown_notify`.
+    ///
+    /// The task holds only a [`Weak`] self-ref (upgraded transiently
+    /// per tick), never `Arc::clone(self)`. A strong self-ref held for
+    /// the task's lifetime would stop [`MeshNode::drop`] — the path
+    /// that sets `shutdown` — from ever running for an `Arc<MeshNode>`
+    /// dropped without an explicit `shutdown()`: the loop would then
+    /// spin forever and leak the node, its socket, and every other
+    /// background task. Same `Weak`-then-`upgrade()` contract as
+    /// [`Self::spawn_capability_reannounce_loop`].
     #[cfg(feature = "nat-traversal")]
     pub fn spawn_direct_upgrade_loop(self: &Arc<Self>) -> JoinHandle<()> {
         const SCAN_INTERVAL: Duration = Duration::from_secs(1);
         const ATTEMPT_LEASE: Duration = Duration::from_secs(10);
 
-        let node = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
-            if !node.config.auto_direct_upgrade {
-                return;
+            // Feature off → nothing to do. Transient upgrade only to
+            // read the flag; the strong ref is dropped with the match.
+            match weak.upgrade() {
+                Some(node) if node.config.auto_direct_upgrade => {}
+                _ => return,
             }
             let mut tick = tokio::time::interval(SCAN_INTERVAL);
             tick.tick().await; // skip the immediate tick
@@ -14962,6 +14973,12 @@ impl MeshNode {
                     }
                     _ = tick.tick() => {}
                 }
+
+                // Upgrade transiently for this tick; if the node is
+                // gone, exit. The strong ref lives only across the
+                // synchronous scan below — never across an await — so
+                // it can't keep the node alive past a `drop`.
+                let Some(node) = weak.upgrade() else { break };
 
                 // Snapshot eligible peers without holding a shard guard
                 // across the spawned attempts.
