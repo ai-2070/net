@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_d1773215988bea 13877-13884
+  s_c28bdf38c0df3a::t_06c758ec5f8533 10971-10975
+  s_c28bdf38c0df3a::t_5e9acd795fa46e 13821-13831
+net/crates/net/tests/reflex_override.rs
+  s_c28bdf38c0df3a::t_19dd9d75d13b1b 42,500-561
+  s_c28bdf38c0df3a::t_8469a1a21152f1 562
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "f44276a8e4ffbfa126d395f846603f1cbf1d9053",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
