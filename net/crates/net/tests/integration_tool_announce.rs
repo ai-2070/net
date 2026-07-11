@@ -670,6 +670,10 @@ async fn registry_burst_coalesces_into_one_announce() {
     let peer = build_node().await;
     handshake_pair_host_arc(&host, &peer).await;
 
+    // Assumes this host never `serve_rpc`s: `index_self_with_local_services`
+    // also bumps capability_announce_version without a broadcast, so the
+    // `+1` delta below is an exact announce-call count only for
+    // non-RPC-serving nodes (see the getter's doc, RT-3 review Finding 13).
     let version_before = host.capability_announce_version();
 
     host.tool_registry().insert(descriptor("burst_a"));

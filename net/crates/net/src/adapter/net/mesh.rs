@@ -7824,12 +7824,22 @@ impl MeshNode {
         *self.local_caps_changed.borrow()
     }
 
-    /// Monotonic announce-version counter — the version stamped into
+    /// Monotonic capability-version counter — the version stamped into
     /// the most recent `CapabilityAnnouncement`. Every
     /// `announce_capabilities_with` call bumps it, broadcast and
-    /// rate-limit-coalesced alike, so the delta across a window
-    /// counts announce *calls*. Observability + tests (e.g. proving
-    /// the RT-3 debounce collapses a burst into one announce).
+    /// rate-limit-coalesced alike.
+    ///
+    /// NOTE: this is NOT a pure count of announce *calls*.
+    /// [`Self::index_self_with_local_services`] (invoked by `serve_rpc`
+    /// on the cortex path) also bumps the same counter without a
+    /// broadcast — a "sync, no broadcast" self-index. So on an
+    /// RPC-serving node the delta over a window can exceed the number
+    /// of announces (RT-3 review Finding 13). Tests that treat the
+    /// delta as an announce-call count (e.g. proving the RT-3 debounce
+    /// collapses a burst into one announce) are only exact on nodes
+    /// that never `serve_rpc`. The over-bump is harmless at runtime:
+    /// the counter's only wire role is a monotonic version where
+    /// receivers keep the highest per node_id.
     pub fn capability_announce_version(&self) -> u64 {
         self.capability_version.load(Ordering::Relaxed)
     }
