@@ -1,0 +1,100 @@
+net/crates/net/tests/capability_broadcast.rs
+  s_c28bdf38c0df3a::t_ad6096bae708db 82,86-96
+  s_c28bdf38c0df3a::t_afded1aeeee5ed 800-801,848-950
+  s_c28bdf38c0df3a::t_92915fbb6c39ed 802-847
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_07dadab2b46578 1501-1508
+  s_c28bdf38c0df3a::t_df520c89ee310d 878-883
+  s_c28bdf38c0df3a::t_5f0341ed44f5ef 3999
+  s_c28bdf38c0df3a::t_06987b5aae4ade 8590-8622,8625-8644,8648-8680
+  s_c28bdf38c0df3a::t_c03b1439fe92e8 10890-10911,10913
+  s_c28bdf38c0df3a::t_d61d380b2db2c5 7574-7583
+  s_c28bdf38c0df3a::t_1835d3d940f2a1 3290,3292-3297
+  s_c28bdf38c0df3a::t_e882f998a5d931 1246-1257
+  s_c28bdf38c0df3a::t_4af0a09fc6e96f 2058-2110
+  s_c28bdf38c0df3a::t_67383866d032ac 10873-10881,10884-10889,10912,10914-10917,10919-10920
+  s_c28bdf38c0df3a::t_b8efd35548fdbc 3741-3744,3928-3931
+  s_c28bdf38c0df3a::t_b94e426d1d4ad5 2146,2151-2189,2193-2198
+  s_c28bdf38c0df3a::t_e8816bdb614d1a 5889-5901
+  s_c28bdf38c0df3a::t_cd4e562e01bcd3 3227-3242
+  s_c28bdf38c0df3a::t_525581d1e163a7 2394
+  s_c28bdf38c0df3a::t_1902b1fd994ece 2684-2688
+  s_c28bdf38c0df3a::t_5c5e11ce7ecca3 7572,10940-11006
+  s_c28bdf38c0df3a::t_362c07bd52c725 3312-3313
+  s_c28bdf38c0df3a::t_74b50fab243ea5 2666,2669-2673
+  s_c28bdf38c0df3a::t_37f5c144045e18 4396-4400
+  s_c28bdf38c0df3a::t_ed7b6fcd52e701 13823,13871
+  s_c28bdf38c0df3a::t_0559c1e1a2fbba 3314-3315
+  s_c28bdf38c0df3a::t_ea7f5967413c09 7548-7549,7551,7555-7571
+  s_c28bdf38c0df3a::t_52fc59af0d3097 4548-4550
+  s_c28bdf38c0df3a::t_4371d0a045d870 1386
+  s_c28bdf38c0df3a::t_9ad5269cd7c8fc 2200-2291
+  s_c28bdf38c0df3a::t_0f7c0d2d99c24b 1387
+  s_c28bdf38c0df3a::t_d6d30aeebc7119 2038-2057
+  s_c28bdf38c0df3a::t_4de5fa7f21b5ee 3211-3225
+  s_c28bdf38c0df3a::t_b1a1dda452ea7f 3363-3366
+  s_c28bdf38c0df3a::t_746805d41343e6 7584-7599
+  s_c28bdf38c0df3a::t_fed3dffd021ea6 1258-1270
+  s_c28bdf38c0df3a::t_f6d58199ce6bd1 3139-3150,3161
+  s_c28bdf38c0df3a::t_3d45c8fec06b79 1509-1515
+  s_c28bdf38c0df3a::t_c4bc02165b5731 2674-2683
+  s_c28bdf38c0df3a::t_55160ff2d12034 1493-1500
+  s_c28bdf38c0df3a::t_3b2f09b71ff8af 1225-1229,1231-1245
+  s_c28bdf38c0df3a::t_c2644af2e7db15 1385
+  s_c28bdf38c0df3a::t_948dc013ba5f81 3151-3153,3155-3160
+  s_c28bdf38c0df3a::t_ab04e97ed0fec3 3262-3269
+  s_c28bdf38c0df3a::t_fb5b8b97820c6c 10630,10696
+  s_c28bdf38c0df3a::t_367d516ac61821 4071
+  s_c28bdf38c0df3a::t_e5fb3ad1556e52 2111-2145,2147-2150,2190-2192,2199
+  s_c28bdf38c0df3a::t_9893b19ecd3be8 2689-2697
+  s_c28bdf38c0df3a::t_25a203f9af60b1 54-56
+  s_c28bdf38c0df3a::t_213c08481d19ae 3154,8623-8624,8645-8647
+  s_c28bdf38c0df3a::t_14fe1573061c57 4327-4395,4401-4407
+  s_c28bdf38c0df3a::t_e4f316e207b839 7573
+net/crates/net/docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md
+  s_c28bdf38c0df3a::t_16b647a4624c5d 3-4
+  s_c28bdf38c0df3a::t_5f4010e09337cd 254-308,311-313
+net/crates/net/src/adapter/net/cortex/tool.rs
+  s_c28bdf38c0df3a::t_af7761b003e12b 506-515
+  s_c28bdf38c0df3a::t_68d889d61da90b 531-549,555-565
+  s_c28bdf38c0df3a::t_56b4a2420b3346 682-714
+  s_c28bdf38c0df3a::t_749bce979c1262 577-578,580-587,589
+  s_c28bdf38c0df3a::t_aa7f85d3d8fe81 681
+net/crates/net/tests/event_pingwave.rs
+  s_c28bdf38c0df3a::t_42d89e17ef23d4 104-109,113-115,124-126,128
+  s_c28bdf38c0df3a::t_e354ebf403bd3a 28-29
+  s_c28bdf38c0df3a::t_fa087e5b7e2af9 116-123
+  s_c28bdf38c0df3a::t_14290205bbe364 156
+  s_c28bdf38c0df3a::t_e44c6ccfc24b32 96-101
+  s_c28bdf38c0df3a::t_8b1ab570460afb 110-112
+  s_c28bdf38c0df3a::t_a374e0231968d5 1-27,30-95,102-103,127,129-155,157-171
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_c28bdf38c0df3a::t_a84a0c97c4447c 701-713
+net/crates/net/tests/integration_tool_announce.rs
+  s_c28bdf38c0df3a::t_9e89c849efb892 612-695
+  s_c28bdf38c0df3a::t_2d3091a509685c 581-611
+net/crates/net/tests/three_node_integration.rs
+  s_c28bdf38c0df3a::t_d106d838d6ad42 4601-4605
+net/crates/net/src/adapter/net/behavior/broadcast.rs
+  s_c28bdf38c0df3a::t_50e1e00378c7be 1,3-9,15-46,48-88
+  s_c28bdf38c0df3a::t_fca250adc56d9e 47
+net/crates/net/tests/route_withdraw.rs
+  s_c28bdf38c0df3a::t_e8cb0f319e6190 24
+  s_c28bdf38c0df3a::t_e0125f4d3cdca8 1-23,25-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "99dcde2cd8e850f855b03397dc1bb3c2556e35b3",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
