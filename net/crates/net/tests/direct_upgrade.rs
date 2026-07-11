@@ -52,6 +52,27 @@ async fn build_node() -> Arc<MeshNode> {
     )
 }
 
+/// A node with a short session timeout so that a peer whose traffic is
+/// blocked trips the failure detector (3 × timeout ≈ 1.5 s) within a
+/// couple of seconds — used to drive the `on_failure` cleanup path
+/// deterministically.
+async fn build_fast_fail_node() -> Arc<MeshNode> {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(100))
+        .with_session_timeout(Duration::from_millis(500))
+        .with_handshake(3, Duration::from_secs(2));
+    cfg.socket_buffers = SocketBufferConfig {
+        send_buffer_size: TEST_BUFFER_SIZE,
+        recv_buffer_size: TEST_BUFFER_SIZE,
+    };
+    Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
 /// A node with the background direct-path upgrade enabled.
 async fn build_upgrading_node() -> Arc<MeshNode> {
     Arc::new(
@@ -336,5 +357,73 @@ async fn loop_candidate_filter_enforces_c1_and_relay() {
     assert!(
         !lo.upgrade_is_loop_candidate_for_test(r.node_id()),
         "a directly-connected peer is not an upgrade candidate",
+    );
+}
+
+/// Review finding #2 (growth + reconnect pin): a failed peer's
+/// direct-path upgrade throttle entry is dropped by the failure
+/// detector's `on_failure` callback. Without this the cache grows
+/// without bound under peer churn, and a peer that reconnects under the
+/// same node_id stays pinned to the relay by a stale terminal `done`
+/// from its previous session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_peer_drops_its_upgrade_cache_entry() {
+    let a = build_fast_fail_node().await;
+    let b = build_fast_fail_node().await;
+    connect_pair(&a, &b).await;
+    a.start();
+    b.start();
+    let b_id = b.node_id();
+
+    // Seed A's cache with an entry for B. The pair is direct (localhost),
+    // so the attempt records a terminal entry — the point is only that
+    // *something* is cached for B so we can watch it get dropped.
+    a.attempt_direct_upgrade_for_test(b_id).await;
+    assert!(
+        a.upgrade_cache_contains_for_test(b_id),
+        "attempt should have recorded a throttle entry for B",
+    );
+
+    // Cut B's traffic so A's failure detector marks it Failed; the
+    // on_failure callback must then drop B's throttle entry.
+    a.block_peer(b.local_addr());
+    let ac = a.clone();
+    assert!(
+        wait_for(Duration::from_secs(8), || {
+            !ac.upgrade_cache_contains_for_test(b_id)
+        })
+        .await,
+        "the upgrade throttle entry for B must be dropped when the \
+         failure detector evicts B",
+    );
+}
+
+/// Review finding #2 (SinglePunch pin): a relay-routed `SinglePunch`
+/// pair is *deferred*, not marked terminal `done`. A later NAT
+/// reclassification can flip the pair to `Direct`, so a permanent
+/// `done` would pin the session to the relay for the process's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_punch_pair_is_deferred_not_terminal() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    classify_and_exchange_reflexes(&a, &b).await;
+    establish_relay_session(&a, &r, &b).await;
+    // Let the relay session go quiescent so the attempt clears the C3
+    // busy gate and actually reaches the pair-action classification.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Force A symmetric; B classifies Open on localhost, so
+    // pair_action(Symmetric, Open) = SinglePunch.
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    let b_id = b.node_id();
+
+    a.attempt_direct_upgrade_for_test(b_id).await;
+
+    assert_eq!(
+        a.upgrade_entry_is_done_for_test(b_id),
+        Some(false),
+        "a SinglePunch pair must be deferred (not terminal) so a later \
+         reclassification can still upgrade it",
     );
 }

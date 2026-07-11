@@ -3520,6 +3520,18 @@ impl MeshNode {
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
 
+        // Direct-path upgrade throttle cache (Stage 3) — created here
+        // (not in the struct literal) so the failure callback can drop
+        // a dead peer's entry. Without that drop the cache grows
+        // without bound under peer churn, and a peer that regresses
+        // direct→relay and reconnects under the same node_id stays
+        // pinned to the relay by a stale terminal `done` from its
+        // previous session. Same rationale as `capability_fold` /
+        // `subscriber_chains` above.
+        #[cfg(feature = "nat-traversal")]
+        let upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>> = Arc::new(DashMap::new());
+        #[cfg(feature = "nat-traversal")]
+        let upgrade_cache_failure = upgrade_cache.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -3597,6 +3609,11 @@ impl MeshNode {
                     None,
                 );
             }
+            // Drop the dead peer's direct-path upgrade throttle entry,
+            // in lockstep with the maps above (see the `upgrade_cache`
+            // creation comment).
+            #[cfg(feature = "nat-traversal")]
+            upgrade_cache_failure.remove(&node_id);
         })
         .on_recovery(move |node_id| {
             rp_recovery.on_recovery(node_id);
@@ -3711,7 +3728,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
-            upgrade_cache: Arc::new(DashMap::new()),
+            upgrade_cache,
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 if initial_reflex_override.is_some() {
@@ -14745,11 +14762,22 @@ impl MeshNode {
     /// This landing upgrades **`Direct` pairs** (the peer is directly
     /// reachable at its reflex). Coordinated-punch (`SinglePunch`)
     /// upgrades reuse the same install machinery and are a follow-up;
-    /// `SkipPunch` pairs can never punch. Both are marked terminal so
-    /// the scan loop stops revisiting them.
+    /// `SkipPunch` pairs can never punch. `SkipPunch` is marked
+    /// terminal (`done`) so the scan stops revisiting it, but
+    /// `SinglePunch` is only *deferred*: a later reflex-drift
+    /// reclassification can flip the pair to `Direct`, and a permanent
+    /// `done` would pin the session to the relay for the rest of the
+    /// process's life. The per-peer cache entry is also dropped when
+    /// the peer is evicted (heartbeat sweep), so a session that
+    /// regresses direct→relay and reconnects starts from a clean slate.
     #[cfg(feature = "nat-traversal")]
     async fn attempt_direct_upgrade(&self, peer_id: u64) {
         use super::traversal::classify::{pair_action, PairAction};
+
+        // Re-evaluate a not-yet-upgradable `SinglePunch` pair after
+        // this long, so a NAT reclassification that makes it `Direct`
+        // gets picked up instead of being cached off permanently.
+        const SINGLEPUNCH_RECHECK: Duration = Duration::from_secs(30);
 
         // Snapshot the current session.
         let Some((relay_addr, prior_sid, pubkey, busy)) = self.peers.get(&peer_id).map(|e| {
@@ -14795,8 +14823,16 @@ impl MeshNode {
                     return;
                 }
             },
-            PairAction::SinglePunch | PairAction::SkipPunch => {
+            // `SkipPunch` can never punch — terminal, stop scanning.
+            PairAction::SkipPunch => {
                 self.upgrade_record_done(peer_id);
+                return;
+            }
+            // `SinglePunch` upgrades aren't wired yet, but the pair may
+            // become `Direct` after a reclassification. Defer instead
+            // of marking terminal so the scan revisits it.
+            PairAction::SinglePunch => {
+                self.upgrade_record_defer(peer_id, SINGLEPUNCH_RECHECK);
                 return;
             }
         };
@@ -14875,6 +14911,24 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn upgrade_is_loop_candidate_for_test(&self, peer_id: u64) -> bool {
         self.upgrade_is_loop_candidate(peer_id)
+    }
+
+    /// Test hook: whether the direct-path upgrade throttle cache holds
+    /// an entry for `peer_id`. Pins that a failed peer's entry is
+    /// dropped so the cache can't grow without bound under churn.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_cache_contains_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_cache.contains_key(&peer_id)
+    }
+
+    /// Test hook: the `done` (terminal) flag of `peer_id`'s throttle
+    /// entry, or `None` if there is no entry. `SkipPunch` is terminal
+    /// (`Some(true)`); a deferred `SinglePunch` is not (`Some(false)`).
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_entry_is_done_for_test(&self, peer_id: u64) -> Option<bool> {
+        self.upgrade_cache.get(&peer_id).map(|e| e.done)
     }
 
     /// Spawn the background direct-path upgrade scan loop (Stage 3).
