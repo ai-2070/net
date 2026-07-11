@@ -552,6 +552,8 @@ Kind vocabulary for cross-binding parity (TS / Python / Go map to classes with a
 
 ## Implementation status
 
+> **Follow-up: [`NAT_TRAVERSAL_V2_PLAN.md`](NAT_TRAVERSAL_V2_PLAN.md).** The stages below are done as scoped, but several promises in this document landed narrower than written and are tracked there: the 2026-06-21 review's Findings 4–5 (unsolicited-introduce validation, rendezvous rate-limit budgets, dead `RendezvousRejected`/`RendezvousNoRelay` variants), decision 6's relay-preference routing and decision 9's coordinator auto-selection (unimplemented — `connect_direct` takes a caller-supplied coordinator and ordinary `connect()` never consults the pair-type matrix), decision 11's two IPv6/NAT64 tests and decision 8's symmetric×cone test (absent; all punch tests are loopback-simulated), decision 14's reflex-change / interface-change re-classification triggers (periodic + manual only), the stage-5 stats shape (`punches_failed` / `port_mapping_active` not exposed by any binding), and the `sdk-ts` / `sdk-py` wrapper surface (zero NAT APIs).
+
 Current state against the staging plan:
 
 | Stage | Scope                                       | Status       |
