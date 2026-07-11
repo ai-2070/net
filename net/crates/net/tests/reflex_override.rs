@@ -563,3 +563,82 @@ async fn rate_limit_reset_cancels_pending_deferred_flush() {
         "post-reset announce was not broadcast unconditionally"
     );
 }
+
+/// RT-1 review Finding 12: after a rate-limit-floor reset cancels a
+/// pending flush, a FRESH in-window announce schedules a new deferral
+/// (new `deferral_generation`) that flushes correctly. The task
+/// orphaned by the reset must neither steal the new claim's slot nor
+/// block it. (The bug's direct harm — a few-ms-early broadcast inside
+/// the fresh window — is not observable end-to-end, so this guards the
+/// claim-generation mechanism against breaking the legitimate flush.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferral_after_reset_still_flushes_new_content() {
+    let window = Duration::from_secs(2);
+    let cfg_a = test_config().with_min_announce_interval(window);
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg_a)
+            .await
+            .expect("MeshNode::new"),
+    );
+    let b = build_mesh_plain().await;
+    connect_pair(&a, &b).await;
+    a.start_arc();
+    b.start();
+    let a_id = a.node_id();
+
+    // v1 leading edge; v2 in-window (deferred — this deferral, gen N,
+    // is the one the reset orphans).
+    a.announce_capabilities(CapabilitySet::new().add_tag("gen:v1"))
+        .await
+        .expect("announce v1");
+    a.announce_capabilities(CapabilitySet::new().add_tag("gen:v2"))
+        .await
+        .expect("announce v2");
+
+    // Reset cancels the v2 deferral.
+    a.set_reflex_override("203.0.113.7:4242".parse().unwrap());
+
+    // v3 broadcasts unconditionally (opens a fresh window); wait until
+    // B sees it so the next announce is squarely in-window.
+    a.announce_capabilities(CapabilitySet::new().add_tag("gen:v3"))
+        .await
+        .expect("announce v3");
+    let v3 = CapabilityFilter::new().require_tag("gen:v3");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !b.find_nodes_by_filter(&v3).contains(&a_id) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        b.find_nodes_by_filter(&v3).contains(&a_id),
+        "precondition: B never saw the unconditional v3 broadcast",
+    );
+
+    // v4 is in-window of the fresh window → a NEW deferral (gen N+1).
+    a.announce_capabilities(CapabilitySet::new().add_tag("gen:v4"))
+        .await
+        .expect("announce v4");
+
+    // The fresh deferral must flush v4 at the window end.
+    let v4 = CapabilityFilter::new().require_tag("gen:v4");
+    let deadline = tokio::time::Instant::now() + window + Duration::from_secs(2);
+    let mut saw_v4 = false;
+    while tokio::time::Instant::now() < deadline {
+        if b.find_nodes_by_filter(&v4).contains(&a_id) {
+            saw_v4 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_v4,
+        "the fresh post-reset deferral never flushed — the orphaned \
+         task blocked or stole its claim",
+    );
+
+    // The cancelled v2 deferral must never have leaked to the wire.
+    let v2 = CapabilityFilter::new().require_tag("gen:v2");
+    assert!(
+        !b.find_nodes_by_filter(&v2).contains(&a_id),
+        "cancelled deferral content leaked to a peer",
+    );
+}

@@ -2062,6 +2062,13 @@ struct AnnounceGate {
     /// the *latest* `local_announcement`) instead of spawning
     /// more tasks.
     deferred_scheduled: bool,
+    /// Monotonic id of the current deferral, bumped each time a slot
+    /// is claimed. The spawned flush task captures this at spawn and
+    /// re-checks it before broadcasting, so a task orphaned by a
+    /// rate-limit-floor reset (which clears `deferred_scheduled`)
+    /// cannot later consume a DIFFERENT deferral's claim and fire
+    /// inside a fresh window (RT-1 review Finding 12).
+    deferral_generation: u64,
 }
 
 /// Signal-carrying wrapper around the `nrpc:` local-service set
@@ -3508,6 +3515,7 @@ impl MeshNode {
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
+                deferral_generation: 0,
             })),
             local_announcement: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
@@ -11340,7 +11348,12 @@ impl MeshNode {
                             return Ok(());
                         }
                         gate.deferred_scheduled = true;
-                        Some(min_interval - e)
+                        // New deferral claim → new generation. The
+                        // flush task captures this and re-checks it, so
+                        // a task orphaned by a rate-limit-floor reset
+                        // can't fire against this claim (Finding 12).
+                        gate.deferral_generation = gate.deferral_generation.wrapping_add(1);
+                        Some((min_interval - e, gate.deferral_generation))
                     }
                     _ => {
                         gate.last_broadcast_at = Some(now);
@@ -11348,8 +11361,8 @@ impl MeshNode {
                     }
                 }
             };
-            if let Some(delay) = defer_for {
-                self.spawn_deferred_announce(delay);
+            if let Some((delay, generation)) = defer_for {
+                self.spawn_deferred_announce(delay, generation);
                 None
             } else {
                 Some(ann.to_bytes())
@@ -11382,7 +11395,11 @@ impl MeshNode {
     /// lock and verified `self_weak` is populated; this task holds
     /// only a `Weak<MeshNode>` so a pending flush can't keep a
     /// dropped node alive.
-    fn spawn_deferred_announce(&self, delay: Duration) {
+    ///
+    /// `generation` is the deferral id captured at claim time; the
+    /// flush re-checks it so a task orphaned by a rate-limit-floor
+    /// reset can't fire against a newer claim (Finding 12).
+    fn spawn_deferred_announce(&self, delay: Duration, generation: u64) {
         // Guaranteed `Some` by the gate branch that claimed the
         // deferred slot; release the slot rather than panic if a
         // future caller breaks that invariant.
@@ -11401,21 +11418,25 @@ impl MeshNode {
                 return;
             }
             let Some(node) = weak.upgrade() else { return };
-            node.flush_deferred_announce().await;
+            node.flush_deferred_announce(generation).await;
         });
     }
 
     /// Trailing-edge flush: broadcast the latest `local_announcement`
     /// to all connected peers and open the next rate-limit window.
     /// Runs at most once per scheduled deferral, and only if the
-    /// deferred slot is still claimed — a rate-limit-floor reset
-    /// (`set_reflex_override` / `clear_reflex_override`) cancels the
-    /// slot, turning this into a no-op (the reset's documented
-    /// follow-up announce supersedes the flush).
-    async fn flush_deferred_announce(&self) {
+    /// deferred slot is still claimed BY THIS DEFERRAL — a
+    /// rate-limit-floor reset (`set_reflex_override` /
+    /// `clear_reflex_override`) cancels the slot, and a fresh in-window
+    /// announce re-claims it with a new `deferral_generation`. Either
+    /// way, an orphaned task whose captured `generation` no longer
+    /// matches no-ops instead of broadcasting inside a fresh window
+    /// (Finding 12); the reset's documented follow-up announce
+    /// supersedes the flush.
+    async fn flush_deferred_announce(&self, generation: u64) {
         {
             let mut gate = self.announce_gate.lock();
-            if !gate.deferred_scheduled {
+            if !gate.deferred_scheduled || gate.deferral_generation != generation {
                 return;
             }
             gate.deferred_scheduled = false;
