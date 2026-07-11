@@ -2104,7 +2104,8 @@ mod mesh_bindings {
             feature = "cortex",
             feature = "aggregator",
             feature = "payments",
-            feature = "publish"
+            feature = "publish",
+            feature = "delegation"
         ))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.node.load();
