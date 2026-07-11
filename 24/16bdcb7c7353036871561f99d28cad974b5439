@@ -1,0 +1,34 @@
+net/crates/net/tests/rendezvous_introduce_validation.rs
+  s_d15043c27a0f20::t_f275468218f307 1-369
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md
+  s_d15043c27a0f20::t_04f6b2cf1f7473 96-99
+  s_d15043c27a0f20::t_63b63afac34b87 300-305,310-314
+  s_d15043c27a0f20::t_fc3a44e11cfe3d 45,48-49
+  s_d15043c27a0f20::t_3e7a5de050856b 346-353
+  s_d15043c27a0f20::t_3396757595f451 226-241
+net/crates/net/src/adapter/net/mesh.rs
+  s_d15043c27a0f20::t_7a44dcb1cfdb53 1811-1814
+  s_d15043c27a0f20::t_ec2e2e3259d60f 955-959
+  s_d15043c27a0f20::t_a350d8b1a748e3 2931-2932
+  s_d15043c27a0f20::t_648bef21f2fd3f 4073-4074
+  s_d15043c27a0f20::t_9c7170eaaf9339 2208-2223
+  s_d15043c27a0f20::t_1dedf2af0021ee 5697-5702,5704-5707,5719-5730
+  s_d15043c27a0f20::t_3d742758a9d544 8525-8533
+  s_d15043c27a0f20::t_4d378360ef89d5 8646-8744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2416bdcb7c7353036871561f99d28cad974b5439",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
