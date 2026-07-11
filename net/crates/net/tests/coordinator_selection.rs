@@ -121,27 +121,34 @@ async fn select_prefers_relay_capable_over_lower_id_peer() {
         .await
         .expect("plain peer announce");
 
-    // Poll until A has folded the relay-capable tag — before that,
-    // tier 3 returns the lowest-id peer (the plain one).
+    // Poll until A's pick is *stably* the relay-capable peer. Before
+    // the tag folds, both peers sit in the tier-3 `any` pool and the
+    // random spread can return either — so require many consecutive
+    // relay-peer results, which only hold once tier 2 (a one-element
+    // relay-capable pool → deterministic) is active.
     let relay_id = relay_peer.node_id();
     let a_poll = a.clone();
+    let stable_relay =
+        || (0..20).all(|_| a_poll.select_punch_coordinator(PHANTOM_TARGET) == Some(relay_id));
     assert!(
-        wait_for(Duration::from_secs(3), || {
-            a_poll.select_punch_coordinator(PHANTOM_TARGET) == Some(relay_id)
-        })
-        .await,
-        "A should pick the relay-capable peer as coordinator; got {:?}",
+        wait_for(Duration::from_secs(3), stable_relay).await,
+        "A should stably pick the relay-capable peer as coordinator; got {:?}",
         a.select_punch_coordinator(PHANTOM_TARGET),
     );
-    assert_ne!(
-        a.select_punch_coordinator(PHANTOM_TARGET),
-        Some(plain_peer.node_id()),
-        "must not fall back to the lower-id plain peer once relay-capable is known",
-    );
+    // Tier 2 is active now, so the pick is deterministic (one
+    // relay-capable candidate) — never the plain lower-id peer.
+    for _ in 0..20 {
+        assert_ne!(
+            a.select_punch_coordinator(PHANTOM_TARGET),
+            Some(plain_peer.node_id()),
+            "must not fall back to the lower-id plain peer once relay-capable is known",
+        );
+    }
 }
 
 /// Tier 3: with no `relay-capable` peer, any mutual direct peer is a
-/// valid coordinator. The pick is the lowest node id (deterministic).
+/// valid coordinator. The pick is spread across candidates (not the
+/// lowest id), so the result must be one of the mutual peers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_falls_back_to_any_mutual_peer() {
     let a = build_node().await;
@@ -154,12 +161,54 @@ async fn select_falls_back_to_any_mutual_peer() {
     q2.start();
 
     // No announcements needed — tier 3 scans the live peer table
-    // directly. Lowest id wins.
-    let expected = q1.node_id().min(q2.node_id());
-    assert_eq!(
-        a.select_punch_coordinator(PHANTOM_TARGET),
-        Some(expected),
-        "tier 3 should return the lowest-id mutual peer",
+    // directly. The pick is random within the tier, so it must be one
+    // of the two mutual peers (never self, never the target).
+    let candidates = [q1.node_id(), q2.node_id()];
+    let picked = a
+        .select_punch_coordinator(PHANTOM_TARGET)
+        .expect("tier 3 should yield a mutual coordinator");
+    assert!(
+        candidates.contains(&picked),
+        "tier 3 must return one of the mutual peers; got {picked:#x}",
+    );
+}
+
+/// Review finding #4: the tier-2/3 pick is spread across candidates so
+/// no single peer becomes a coordinator hotspot / SPOF. With several
+/// equally-eligible mutual peers, repeated selections must land on more
+/// than one of them (a deterministic lowest-id pick would return the
+/// same node every time).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn select_spreads_across_equal_candidates() {
+    let a = build_node().await;
+    let peers = [
+        build_node().await,
+        build_node().await,
+        build_node().await,
+        build_node().await,
+    ];
+    for p in &peers {
+        connect_pair(&a, p).await;
+        p.start();
+    }
+    a.start();
+
+    let valid: std::collections::HashSet<u64> = peers.iter().map(|p| p.node_id()).collect();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let picked = a
+            .select_punch_coordinator(PHANTOM_TARGET)
+            .expect("a mutual coordinator should be selected");
+        assert!(
+            valid.contains(&picked),
+            "selection must stay within the mutual-peer set; got {picked:#x}",
+        );
+        seen.insert(picked);
+    }
+    assert!(
+        seen.len() > 1,
+        "coordinator selection should spread across candidates, but every \
+         one of 200 calls returned the same node ({seen:?})",
     );
 }
 

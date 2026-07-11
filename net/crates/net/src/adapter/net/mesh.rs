@@ -13102,9 +13102,11 @@ impl MeshNode {
     ///    with both ends — the highest-probability coordinator, and no
     ///    discovery needed.
     /// 2. **`relay-capable` direct peer.** A mutual direct peer that
-    ///    advertised [`RELAY_CAPABLE_TAG`]. (Deterministic
-    ///    lowest-`node_id` pick for now — random-two-choices load
-    ///    balancing is a future refinement.)
+    ///    advertised [`RELAY_CAPABLE_TAG`]. Picked at random from the
+    ///    tier's candidates (not lowest-`node_id`): a deterministic
+    ///    pick would funnel every requester's punches through one peer,
+    ///    making it a mesh-wide coordinator hotspot and single point of
+    ///    failure.
     /// 3. **Any direct peer.** Best-effort; the chosen peer may lack a
     ///    session with the target, in which case its coordinator
     ///    rejects with `NoSessionWithTarget` and the caller falls back.
@@ -13129,8 +13131,10 @@ impl MeshNode {
 
         // Tiers 2 & 3: scan direct session peers once, bucketing into
         // relay-capable and any. Exclude ourselves and the target.
-        let mut relay_capable_min: Option<u64> = None;
-        let mut any_min: Option<u64> = None;
+        // Collected (not min-reduced) so the pick can be spread across
+        // the tier's candidates — see `spread_pick`.
+        let mut relay_capable: Vec<u64> = Vec::new();
+        let mut any: Vec<u64> = Vec::new();
         for entry in self.peers.iter() {
             let nid = *entry.key();
             if nid == target || nid == self.node_id {
@@ -13155,18 +13159,43 @@ impl MeshNode {
             if !direct {
                 continue;
             }
-            any_min = Some(any_min.map_or(nid, |m| m.min(nid)));
+            any.push(nid);
             let is_relay_capable =
                 super::behavior::fold::capability_tags_for(&self.capability_fold, nid)
                     .iter()
                     .any(|t| t == super::behavior::capability::RELAY_CAPABLE_TAG);
             if is_relay_capable {
-                relay_capable_min = Some(relay_capable_min.map_or(nid, |m| m.min(nid)));
+                relay_capable.push(nid);
             }
         }
 
-        // Tier 2 preferred, tier 3 fallback, else tier 4 (None).
-        relay_capable_min.or(any_min)
+        // Tier 2 preferred, tier 3 fallback, else tier 4 (None). Spread
+        // the pick within the chosen tier so load doesn't concentrate.
+        let pool = if relay_capable.is_empty() {
+            &any
+        } else {
+            &relay_capable
+        };
+        Self::spread_pick(pool)
+    }
+
+    /// Pick one node id from `pool` at random, spread across calls so
+    /// rendezvous-coordination load doesn't concentrate on one peer.
+    /// Uses a freshly-seeded [`RandomState`] hash for per-call entropy
+    /// (the same OS-entropy trick as `adapter::dedup_state`) — cheap,
+    /// dependency-free, and varies both across requesters and across a
+    /// single requester's retries, so no node becomes a coordinator
+    /// hotspot / SPOF. Returns `None` only for an empty pool.
+    ///
+    /// [`RandomState`]: std::collections::hash_map::RandomState
+    #[cfg(feature = "nat-traversal")]
+    fn spread_pick(pool: &[u64]) -> Option<u64> {
+        use std::hash::BuildHasher;
+        if pool.is_empty() {
+            return None;
+        }
+        let salt = std::collections::hash_map::RandomState::new().hash_one(pool.len() as u64);
+        pool.get((salt % pool.len() as u64) as usize).copied()
     }
 
     /// Like [`Self::connect_direct`], but auto-selects the rendezvous
