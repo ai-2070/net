@@ -52,7 +52,7 @@ use super::identity::{
 use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::{
-    RouteWithdrawal, SUBPROTOCOL_CAPABILITY_ANN, SUBPROTOCOL_ROUTE_WITHDRAW,
+    RouteWithdrawal, WithdrawalSeqGate, SUBPROTOCOL_CAPABILITY_ANN, SUBPROTOCOL_ROUTE_WITHDRAW,
 };
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
@@ -881,6 +881,8 @@ struct DispatchCtx {
     route_withdraw_seq: Arc<AtomicU64>,
     /// RT-5: per-dest damping for cascaded withdrawals.
     route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
+    /// RT-5: inbound-withdrawal seq ordering gate.
+    route_withdraw_gate: Arc<WithdrawalSeqGate>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2695,6 +2697,11 @@ pub struct MeshNode {
     /// flap storms without a flood seen-cache (each hop re-authors
     /// its withdrawal, so there is no flood identity to dedup on).
     route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
+    /// Inbound-withdrawal ordering gate: strictly-newer seq per
+    /// (sender, dest). Purged per sender on (re-)handshake and
+    /// dead-peer eviction so a fresh incarnation's reset counter
+    /// isn't mistaken for stale.
+    route_withdraw_gate: Arc<WithdrawalSeqGate>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -3313,6 +3320,7 @@ impl MeshNode {
             event_pingwave_gate,
             route_withdraw_seq,
             route_withdraw_damper,
+            route_withdraw_gate: Arc::new(WithdrawalSeqGate::new()),
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -3798,6 +3806,11 @@ impl MeshNode {
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
         }
         self.session_id_to_node.insert(session_id, peer_node_id);
+        // A fresh session incarnation restarts the peer's
+        // withdrawal seq counter — purge its gate history so its
+        // first post-handshake withdrawals aren't mistaken for
+        // stale (RT-5 ordering gate).
+        self.route_withdraw_gate.forget_sender(peer_node_id);
         match addr_mode {
             AddrInstallMode::DirectOverwrite => {
                 self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -3916,6 +3929,9 @@ impl MeshNode {
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
         }
         self.session_id_to_node.insert(session_id, peer_node_id);
+        // See the matching comment in `install_peer` — fresh
+        // incarnation, fresh withdrawal-seq gate history.
+        self.route_withdraw_gate.forget_sender(peer_node_id);
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
@@ -4548,6 +4564,7 @@ impl MeshNode {
             enable_route_withdraw: self.config.enable_route_withdraw,
             route_withdraw_seq: self.route_withdraw_seq.clone(),
             route_withdraw_damper: self.route_withdraw_damper.clone(),
+            route_withdraw_gate: self.route_withdraw_gate.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -6963,6 +6980,7 @@ impl MeshNode {
         let peer_addrs = self.peer_addrs.clone();
         let session_id_to_node = self.session_id_to_node.clone();
         let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
+        let route_withdraw_gate = self.route_withdraw_gate.clone();
         let failure_detector = self.failure_detector.clone();
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
@@ -7134,8 +7152,11 @@ impl MeshNode {
                             }
                             // Also drop the failure-detector entry so
                             // a later reconnect under the same node_id
-                            // starts from a clean slate.
+                            // starts from a clean slate — and the
+                            // withdrawal-seq gate history for the same
+                            // reason (RT-5 ordering gate).
                             failure_detector.remove(node_id);
+                            route_withdraw_gate.forget_sender(node_id);
                         }
                     }
                     _ = shutdown_notify.notified() => {
@@ -8616,6 +8637,17 @@ impl MeshNode {
         let Some(via_addr) = ctx.peers.get(&from_node).map(|p| p.value().addr) else {
             return;
         };
+        // Ordering gate (cubic review P2): admit only a strictly-
+        // newer seq per (sender, dest), so a delayed / duplicated
+        // OLDER withdrawal can't tear down a route this sender has
+        // since re-withdrawn-and-superseded. Checked after the
+        // peer-resolution guard so only live-session senders write
+        // gate state. Withdraw vs. pingwave re-advertise has no
+        // shared counter; that residual window stays anti-entropy-
+        // repaired (plan §6).
+        if !ctx.route_withdraw_gate.admit(from_node, dest, w.seq) {
+            return;
+        }
         // The sender no longer forwards toward `dest`, so alternates
         // must not be synthesized through it either. Unconditional:
         // the edge can exist even when our routing table points

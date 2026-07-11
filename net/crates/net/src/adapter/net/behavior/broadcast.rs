@@ -32,11 +32,10 @@ pub const SUBPROTOCOL_ROUTE_WITHDRAW: u16 = 0x0C01;
 pub struct RouteWithdrawal {
     /// Node the sender can no longer reach.
     pub dest: u64,
-    /// Sender-local monotonic sequence number. Not currently used
-    /// for ordering on the receive side (a stale withdrawal is
-    /// repaired by the next pingwave / anti-entropy tick); carried
-    /// so a future receiver can order a withdraw/re-advertise race
-    /// without a wire change.
+    /// Sender-local monotonic sequence number. Receivers gate on it
+    /// per `(sender, dest)` via [`WithdrawalSeqGate`] so a delayed /
+    /// duplicated older withdrawal is discarded instead of tearing
+    /// down state the sender has since re-advertised.
     pub seq: u64,
 }
 
@@ -66,9 +65,109 @@ impl RouteWithdrawal {
     }
 }
 
+/// Inbound-withdrawal ordering gate: admit only strictly-newer
+/// `seq`s per authenticated `(sender, dest)` pair, so a delayed or
+/// duplicated OLDER withdrawal can't tear down a route the sender
+/// has since re-advertised (a withdraw/re-withdraw pair reordered
+/// in flight would otherwise apply in the wrong order). Withdraw
+/// vs. pingwave re-advertise has no shared counter — that residual
+/// window is anti-entropy-repaired and out of scope here.
+///
+/// A sender restart resets its seq counter to 0, which this gate
+/// would read as "stale" — callers must [`Self::forget_sender`] on
+/// re-handshake so each session incarnation starts clean.
+#[derive(Debug, Default)]
+pub struct WithdrawalSeqGate {
+    seen: dashmap::DashMap<(u64, u64), u64>,
+}
+
+impl WithdrawalSeqGate {
+    /// Hard bound on tracked pairs. Exceeding it clears the map —
+    /// the cost of forgetting is at worst admitting one stale
+    /// duplicate (repaired by anti-entropy), which beats unbounded
+    /// growth from (peer × dest) churn.
+    const MAX_ENTRIES: usize = 8192;
+
+    /// Empty gate — nothing admitted yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` iff `seq` is strictly newer than the last admitted
+    /// seq for this `(sender, dest)` (or the pair is unseen);
+    /// records it when admitted.
+    pub fn admit(&self, sender: u64, dest: u64, seq: u64) -> bool {
+        if self.seen.len() > Self::MAX_ENTRIES {
+            self.seen.clear();
+        }
+        let mut admitted = false;
+        self.seen
+            .entry((sender, dest))
+            .and_modify(|last| {
+                if seq > *last {
+                    *last = seq;
+                    admitted = true;
+                }
+            })
+            .or_insert_with(|| {
+                admitted = true;
+                seq
+            });
+        admitted
+    }
+
+    /// Drop every entry authored by `sender` — called on
+    /// (re-)handshake and on dead-peer eviction so a fresh session
+    /// incarnation's reset seq counter isn't mistaken for stale.
+    pub fn forget_sender(&self, sender: u64) {
+        self.seen.retain(|(s, _), _| *s != sender);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_gate_admits_strictly_newer_only() {
+        let gate = WithdrawalSeqGate::new();
+        assert!(gate.admit(1, 9, 5), "first sighting admits");
+        assert!(!gate.admit(1, 9, 5), "duplicate seq rejected");
+        assert!(!gate.admit(1, 9, 3), "older seq rejected");
+        assert!(gate.admit(1, 9, 6), "newer seq admits");
+        // Independent pairs don't interfere.
+        assert!(gate.admit(1, 8, 0), "different dest is a fresh pair");
+        assert!(gate.admit(2, 9, 0), "different sender is a fresh pair");
+    }
+
+    #[test]
+    fn seq_gate_forget_sender_resets_only_that_sender() {
+        let gate = WithdrawalSeqGate::new();
+        assert!(gate.admit(1, 9, 10));
+        assert!(gate.admit(2, 9, 10));
+        gate.forget_sender(1);
+        assert!(
+            gate.admit(1, 9, 0),
+            "forgotten sender's reset counter admits again"
+        );
+        assert!(
+            !gate.admit(2, 9, 0),
+            "other senders' history must survive the purge"
+        );
+    }
+
+    #[test]
+    fn seq_gate_survives_overflow_clear() {
+        let gate = WithdrawalSeqGate::new();
+        for dest in 0..=(WithdrawalSeqGate::MAX_ENTRIES as u64) {
+            assert!(gate.admit(1, dest, 1));
+        }
+        // Past the bound the map clears; the gate keeps functioning
+        // (a post-clear duplicate is admitted once — documented
+        // trade-off — then gated again).
+        assert!(gate.admit(1, 0, 1), "post-clear sighting admits");
+        assert!(!gate.admit(1, 0, 1), "gating resumes after the clear");
+    }
 
     #[test]
     fn route_withdrawal_roundtrip() {

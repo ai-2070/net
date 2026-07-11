@@ -558,5 +558,8 @@ async fn rate_limit_reset_cancels_pending_deferred_flush() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(seen, "post-reset announce was not broadcast unconditionally");
+    assert!(
+        seen,
+        "post-reset announce was not broadcast unconditionally"
+    );
 }
