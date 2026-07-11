@@ -47,7 +47,10 @@ fn natsim_node_bin() -> std::path::PathBuf {
 }
 
 /// Run one scenario script and return the initiator's outcome JSON.
-/// The script prints the outcome path on its last stdout line.
+/// The script prints the outcome path on a `NATSIM_OUTCOME_PATH=`
+/// marker line (a bare "last line" is unsafe: the JSON body it
+/// follows ends without a trailing newline, so the path would glue
+/// onto the closing brace).
 fn scenario(name: &str) -> serde_json::Value {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/natsim/run_scenario.sh");
     // Thread the profile-resolved helper path through sudo (which
@@ -70,10 +73,11 @@ fn scenario(name: &str) -> serde_json::Value {
         out.status,
     );
     let path = stdout
-        .trim()
         .lines()
-        .last()
-        .expect("outcome path on last line");
+        .rev()
+        .find_map(|l| l.strip_prefix("NATSIM_OUTCOME_PATH="))
+        .map(str::trim)
+        .expect("NATSIM_OUTCOME_PATH= marker on scenario stdout");
     let bytes = std::fs::read(path).expect("read outcome json");
     serde_json::from_slice(&bytes).expect("parse outcome json")
 }

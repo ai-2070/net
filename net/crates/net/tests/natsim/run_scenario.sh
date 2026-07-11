@@ -2,8 +2,8 @@
 # Orchestrate one natsim scenario end-to-end: provision the
 # namespaces, launch helper nodes inside them, wait for the
 # initiator's verdict, tear everything down, and print the outcome
-# JSON path on the LAST line of stdout (the `tests/natsim.rs`
-# wrappers parse that).
+# JSON path on a `NATSIM_OUTCOME_PATH=` marker line (the
+# `tests/natsim.rs` wrappers parse that).
 #
 #   run_scenario.sh <scenario> [state_dir]
 #
@@ -121,4 +121,10 @@ chmod 644 "$STATE"/*.json "$STATE"/*.log 2>/dev/null || true
 
 echo "natsim scenario=$SCENARIO outcome:"
 cat "$OUTCOME"
-echo "$OUTCOME"
+# Emit the outcome path on its own line with an unambiguous marker.
+# `cat` above prints the JSON verbatim, and serde's `to_vec_pretty`
+# ends the file with `}` and NO trailing newline — so lead with `\n`
+# to guarantee the marker starts a fresh line instead of being glued
+# onto the closing brace. The `tests/natsim.rs` wrapper greps for the
+# `NATSIM_OUTCOME_PATH=` prefix rather than trusting "the last line".
+printf '\nNATSIM_OUTCOME_PATH=%s\n' "$OUTCOME"
