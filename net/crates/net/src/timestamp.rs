@@ -381,10 +381,28 @@ mod tests {
     #[test]
     fn test_raw_to_nanos() {
         let ts_gen = TimestampGenerator::new();
-        let raw = ts_gen.now_raw();
-        let nanos = ts_gen.raw_to_nanos(raw);
-        // Nanos should be a reasonable value (not zero for a non-zero raw)
-        assert!(nanos > 0);
+        // `raw_to_nanos` measures from the generator's construction
+        // baseline. A sample taken in the SAME counter tick as the
+        // baseline converts to exactly 0 — the hardware tick can be
+        // coarser than instruction latency (Apple Silicon's counter
+        // runs at 24 MHz ≈ 41.7 ns/tick), and on fine-grained TSCs a
+        // 1-tick delta can truncate below 1 ns. The old shape
+        // (`assert!(raw_to_nanos(now_raw()) > 0)`) therefore raced
+        // the tick and flaked. Wait — bounded — for the clock to
+        // demonstrably advance past the baseline, then assert the
+        // conversion reports it.
+        let mut nanos = ts_gen.raw_to_nanos(ts_gen.now_raw());
+        for _ in 0..1000 {
+            if nanos > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+            nanos = ts_gen.raw_to_nanos(ts_gen.now_raw());
+        }
+        assert!(
+            nanos > 0,
+            "clock failed to report any advance within ~10ms of construction",
+        );
     }
 
     #[test]

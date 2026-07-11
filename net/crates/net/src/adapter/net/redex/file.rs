@@ -2933,11 +2933,19 @@ mod tests {
     }
 
     /// Phase 3 invariant: the EveryN cadence must NOT block the
-    /// appender. Even at N=1 (fsync-on-every-append semantics) the
-    /// per-call latency stays at page-cache-write cost, not
-    /// fsync-call cost. We approximate this by asserting that 100
-    /// rapid appends complete in well under the time a single fsync
-    /// would take on the slowest plausible disk (~10 ms each).
+    /// appender. Even at N=1 (fsync-on-every-append semantics) an
+    /// `append()` call only pays page-cache-write + notify cost; the
+    /// fsync itself happens on the worker task.
+    ///
+    /// Asserted **deterministically**, not by wall clock: on a
+    /// `current_thread` runtime with no `.await` inside the loop,
+    /// the sync worker cannot be scheduled at all — so if
+    /// `sync_count` is still zero after 100 appends, no append
+    /// performed (or waited on) an fsync inline. The previous shape
+    /// asserted `elapsed < 50ms`, which flaked whenever a loaded CI
+    /// box descheduled the test thread mid-loop; scheduler noise is
+    /// indistinguishable from fsync cost on a wall clock, while the
+    /// sync counter separates them exactly.
     #[cfg(feature = "redex-disk")]
     #[tokio::test(flavor = "current_thread")]
     async fn test_fsync_policy_every_n_does_not_block_appender() {
@@ -2947,22 +2955,26 @@ mod tests {
             &dir,
             super::FsyncPolicy::EveryN(1),
         );
-        let start = std::time::Instant::now();
+        // No await points: the worker task is parked for the whole
+        // loop. Every append must complete regardless — an append
+        // that waited on the (never-running) worker would hang the
+        // test, and an append that fsync'd inline would bump the
+        // sync counter below.
         for i in 0..100u64 {
             f.append(format!("nb-{}", i).as_bytes()).unwrap();
         }
-        let elapsed = start.elapsed();
-        // 100 appends at ~real fsync cost (1–10 ms each on SSD,
-        // 10+ ms on HDD) would be 100ms–1s. Page-cache writes alone
-        // should land well under 50ms even on a slow CI box.
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "100 EveryN(1) appends took {:?} — appender should not block on fsync",
-            elapsed,
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "no fsync may run inside append() — EveryN defers to the worker",
         );
-        // Drain pending notifies so the worker has actually run at
-        // least once before we tear down.
-        let _ = wait_for_sync_count(&f, 1, 50).await;
+        // Let the worker catch up: the 100 parked notifies coalesce
+        // into worker syncs once we finally yield.
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert!(
+            observed >= 1,
+            "the deferred worker sync must eventually run; got {observed}",
+        );
         f.close().unwrap();
     }
 
