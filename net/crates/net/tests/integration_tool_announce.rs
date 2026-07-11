@@ -744,3 +744,53 @@ async fn registry_change_announces_after_bare_start_then_start_arc() {
          because start() ran before start_arc()",
     );
 }
+
+/// RT-3 review Finding 8: a change-driven re-announce re-reads the
+/// CURRENT user-caps baseline rather than overwriting it with a stale
+/// snapshot. An explicit announce's tag and a later tool registration
+/// must therefore BOTH reach peers — pre-fix a snapshot-then-overwrite
+/// re-announce could drop the explicit baseline.
+#[tokio::test]
+async fn change_driven_reannounce_preserves_explicit_baseline() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair_host_arc(&host, &peer).await;
+
+    // Explicit baseline tag.
+    host.announce_capabilities(CapabilitySet::new().add_tag("baseline-keep"))
+        .await
+        .expect("announce baseline");
+    let base_filter = CapabilityFilter::default().require_tag("baseline-keep");
+    assert!(
+        wait_until(
+            || peer
+                .find_nodes_by_filter(&base_filter)
+                .contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the explicit baseline",
+    );
+
+    // Tool registration wakes the change-driven announcer, which
+    // re-announces the CURRENT baseline plus the new tool.
+    host.tool_registry().insert(descriptor("added_tool"));
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:added_tool");
+    assert!(
+        wait_until(
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the change-driven tool announce",
+    );
+    // The baseline tag must survive the re-announce.
+    assert!(
+        peer.find_nodes_by_filter(&base_filter)
+            .contains(&host.node_id()),
+        "the change-driven re-announce dropped the explicit baseline tag \
+         (it overwrote user_caps with a stale snapshot instead of re-reading it)",
+    );
+}

@@ -2772,6 +2772,15 @@ pub struct MeshNode {
     /// never silently dropped until the re-announce keep-alive
     /// (RT-1).
     announce_gate: Arc<parking_lot::Mutex<AnnounceGate>>,
+    /// Serializes the synchronous critical section of
+    /// `announce_from_baseline` — the user-caps read/write, the
+    /// `capability_version` bump, and the `local_announcement` store.
+    /// Without it, two concurrent announces (e.g. the RT-3 loop and an
+    /// explicit call) could clobber each other's baseline or publish
+    /// versions and stored announcements out of order (RT-1/RT-3
+    /// review Findings 8 + 11). Held only across the sync build, never
+    /// across the peer broadcast.
+    announce_mu: parking_lot::Mutex<()>,
     /// Local-origin capability change signal (RT-2). The generation
     /// bumps whenever THIS node's announced surface changes — a
     /// `serve_tool` register/unregister or an nRPC service
@@ -3495,6 +3504,7 @@ impl MeshNode {
                 std::collections::HashSet::new(),
             )),
             seen_announcements: Arc::new(DashMap::new()),
+            announce_mu: parking_lot::Mutex::new(()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
@@ -4503,8 +4513,11 @@ impl MeshNode {
                         // `start_arc` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
-                        let caps = node.user_caps_snapshot();
-                        if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
+                        // Re-announce the CURRENT baseline (None) — do
+                        // not snapshot-and-overwrite, which would
+                        // clobber a concurrent explicit announce
+                        // (Finding 8).
+                        if let Err(e) = node.announce_from_baseline(None, ttl, true).await {
                             tracing::debug!(error = %e, "capability re-announce failed");
                         }
                     }
@@ -4587,8 +4600,11 @@ impl MeshNode {
                         // change; a later `start_arc` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { return };
-                        let caps = node.user_caps_snapshot();
-                        if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
+                        // Re-announce the CURRENT baseline (None) so a
+                        // concurrent explicit announce isn't clobbered
+                        // by a stale snapshot (Finding 8); the merged
+                        // tool/nrpc tags are re-derived inside.
+                        if let Err(e) = node.announce_from_baseline(None, ttl, true).await {
                             tracing::debug!(
                                 error = %e,
                                 "change-driven capability announce failed"
@@ -11049,257 +11065,305 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
-        // Snapshot the caller-supplied baseline so subsequent
-        // `announce_chain` / `withdraw_chain` calls layer their
-        // mutations on top of it without re-augmenting the
-        // nrpc / nat tags that follow.
-        *self.user_caps.write() = Some(caps.clone());
-        // Merge nRPC service registrations as `nrpc:<service>` tags.
-        // Other nodes' capability indexes pick these up, letting
-        // `Mesh::find_service_nodes(name)` resolve us as a server
-        // for the registered services. Local-only state from
-        // `Mesh::serve_rpc`; deduped against existing tags so a
-        // user that pre-tagged manually doesn't get double entries.
-        // Gated on `cortex` because `rpc_local_services` only
-        // exists when the cortex layer (which provides serve_rpc)
-        // is compiled in.
-        #[cfg(feature = "cortex")]
-        let caps = if self.rpc_local_services.is_empty() {
-            caps
-        } else {
-            let mut merged = caps;
-            for svc in self.rpc_local_services.snapshot() {
-                let tag = format!("nrpc:{}", svc.as_str());
-                // Phase A.5.N.2: tags is HashSet<Tag>; insert via
-                // builder so the parsed-tag form lands and dedupes
-                // against existing entries.
-                merged = merged.add_tag(tag);
-            }
-            merged
-        };
+        // Explicit announce: `caps` becomes the new user-caps baseline.
+        self.announce_from_baseline(Some(caps), ttl, sign).await
+    }
 
-        // Merge AI-tool registrations on top of the `nrpc:` tags.
-        // For every tool the SDK's `serve_tool` registered, this
-        // appends:
-        //   - an `ai-tool:<name>` capability tag, so
-        //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
-        //     this host;
-        //   - the typed `ToolCapability` itself (added via
-        //     `CapabilitySet::add_tool`), so the typed views aggregate
-        //     a `Vec<ToolCapability>` across peers in the fold;
-        //   - the description / streaming / tags metadata keys via
-        //     `CapabilitySet::metadata`, mirroring the existing
-        //     `input_schema` / `output_schema` convention so peers
-        //     without the `tool` feature still receive the data and
-        //     just ignore the unknown keys.
-        //
-        // Tool registrations are local to this node, just like
-        // `rpc_local_services`. Drop on the SDK's `ServeHandle`
-        // removes from the registry; the next `announce_capabilities`
-        // reflects the smaller set.
-        #[cfg(feature = "tool")]
-        let caps = if self.tool_registry.is_empty() {
-            caps
-        } else {
-            use crate::adapter::net::behavior::ToolCapability;
-            use crate::adapter::net::cortex::tool::{
-                description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
-                tags_metadata_key,
+    /// Core announce path shared by explicit announces and the
+    /// re-announce loops (RT-3 change-driven + keep-alive).
+    ///
+    /// `new_baseline = Some(caps)` sets a NEW user-caps baseline;
+    /// `None` RE-announces the CURRENT baseline without overwriting
+    /// it — what the keep-alive and RT-3 loops want. Passing `None`
+    /// (instead of snapshotting `user_caps` outside and handing it
+    /// back in) closes the RT-3 clobber TOCTOU: a concurrent explicit
+    /// `announce(Y)` can no longer be overwritten by a re-announce
+    /// that captured the old baseline (RT-3 review Finding 8).
+    ///
+    /// The whole synchronous critical section — baseline read/write,
+    /// the `capability_version` bump, and the `local_announcement`
+    /// store — runs under `announce_mu`, so two concurrent announces
+    /// can't interleave their version and store order and leave the
+    /// lower-version announcement published (RT-1 review Finding 11).
+    /// The guard is released before the async peer broadcast.
+    async fn announce_from_baseline(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+    ) -> Result<(), AdapterError> {
+        // `Some(bytes)` to broadcast after releasing the lock; `None`
+        // when the announce was rate-limit-deferred or coalesced.
+        let to_broadcast = {
+            let _announce_guard = self.announce_mu.lock();
+            // Set a new baseline or re-read the current one — both
+            // under `announce_mu` so a re-announce never clobbers a
+            // concurrent explicit announce's newer baseline. The
+            // baseline lets subsequent `announce_chain` /
+            // `withdraw_chain` calls layer mutations on top without
+            // re-augmenting the nrpc / nat tags that follow.
+            let caps = match new_baseline {
+                Some(caps) => {
+                    *self.user_caps.write() = Some(caps.clone());
+                    caps
+                }
+                None => self.user_caps.read().clone().unwrap_or_default(),
             };
-            let snapshot = self.tool_registry.snapshot();
-            // Reconstruct ToolCapability values from each descriptor's
-            // wire-cheap fields; schemas stay in metadata (the fold
-            // has its own schema-too-large branch) so the typed-cap
-            // payload doesn't bloat.
-            let tools_to_add: Vec<ToolCapability> = snapshot
-                .iter()
-                .map(|descriptor| {
-                    let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
-                        .with_version(&descriptor.version)
-                        .with_estimated_time(descriptor.estimated_time_ms)
-                        .with_stateless(descriptor.stateless);
-                    if let Some(ref schema) = descriptor.input_schema {
-                        cap = cap.with_input_schema(schema.clone());
-                    }
-                    if let Some(ref schema) = descriptor.output_schema {
-                        cap = cap.with_output_schema(schema.clone());
-                    }
-                    for req in &descriptor.requires {
-                        cap = cap.requires(req.clone());
-                    }
-                    cap
-                })
-                .collect();
-            // Single set_tools call; O(N) total instead of the
-            // O(N²) chain of per-tool add_tool invocations.
-            let mut merged = caps.add_tools(tools_to_add);
-            for descriptor in snapshot.iter() {
-                merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
-                // Description + streaming + tags ride the metadata
-                // extensibility hook (same convention input/output
-                // schemas already use). Pre-tool peers receive these
-                // keys and ignore them — no wire-breaking change.
-                if let Some(ref desc) = descriptor.description {
-                    merged = merged
-                        .with_metadata(description_metadata_key(&descriptor.tool_id), desc.clone());
+            // Merge nRPC service registrations as `nrpc:<service>` tags.
+            // Other nodes' capability indexes pick these up, letting
+            // `Mesh::find_service_nodes(name)` resolve us as a server
+            // for the registered services. Local-only state from
+            // `Mesh::serve_rpc`; deduped against existing tags so a
+            // user that pre-tagged manually doesn't get double entries.
+            // Gated on `cortex` because `rpc_local_services` only
+            // exists when the cortex layer (which provides serve_rpc)
+            // is compiled in.
+            #[cfg(feature = "cortex")]
+            let caps = if self.rpc_local_services.is_empty() {
+                caps
+            } else {
+                let mut merged = caps;
+                for svc in self.rpc_local_services.snapshot() {
+                    let tag = format!("nrpc:{}", svc.as_str());
+                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via
+                    // builder so the parsed-tag form lands and dedupes
+                    // against existing entries.
+                    merged = merged.add_tag(tag);
                 }
-                if descriptor.streaming {
-                    merged = merged.with_metadata(
-                        streaming_metadata_key(&descriptor.tool_id),
-                        "1".to_string(),
-                    );
-                }
-                if !descriptor.tags.is_empty() {
-                    merged = merged.with_metadata(
-                        tags_metadata_key(&descriptor.tool_id),
-                        descriptor.tags.join(","),
-                    );
-                }
-                // Pricing terms (net.pricing.terms@1 canonical JSON) ride
-                // the same hook — paid capability = metadata + invocation
-                // policy, not a different kind of tool. The substrate
-                // never parses the value.
-                if let Some(ref terms) = descriptor.pricing_terms {
-                    merged = merged.with_metadata(
-                        pricing_terms_metadata_key(&descriptor.tool_id),
-                        terms.clone(),
-                    );
-                }
-            }
-            merged
-        };
+                merged
+            };
 
-        // STREAM_ACK_BATCHING R-5: advertise transport support for
-        // positive SACK-range ACKs — same auto-augment pattern as the
-        // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
-        // can turn the feature off wire-wide (compliant peers then
-        // never emit ranges to us, and we never emit to anyone).
-        let caps = if self.config.enable_stream_ack_ranges {
-            caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
-        } else {
-            caps
-        };
-
-        let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Piggyback the current NAT classification as a `nat:*`
-        // capability tag so peers can filter-match on NAT type,
-        // and the reflex address on the dedicated announcement
-        // field so peers have a direct-connect candidate without a
-        // separate discovery round-trip. Both are feature-gated on
-        // `nat-traversal` — callers compiled without the feature
-        // emit announcements identical to the pre-traversal format.
-        //
-        // The two reads happen under `traversal_publish_mu` so
-        // the announcement always carries a consistent (class,
-        // reflex) pair. Without the mutex, a concurrent
-        // set/clear/commit could interleave between our reads
-        // and let us publish a torn state — e.g., the new
-        // override's reflex paired with the pre-override NAT
-        // class. The lock is held only for the two atomic reads,
-        // not across the signing or network send.
-        #[cfg(feature = "nat-traversal")]
-        let (caps, reflex_snapshot) = {
-            use super::traversal::classify::NatClass;
-            let _g = self.traversal_publish_mu.lock();
-            let class =
-                NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
-            let reflex = self.reflex_addr.load_full().map(|arc| *arc);
-            // Strip any prior `nat:*` tags before adding the fresh
-            // one so a reclassification doesn't leave a stale tag
-            // behind when the class transitions. Phase A.5.N.2:
-            // `caps.tags` is `HashSet<Tag>` — `nat:*` tags parse
-            // as `Tag::Legacy`, so we render to wire form for
-            // prefix matching.
-            let mut next = caps;
-            next.tags.retain(|t| !t.to_string().starts_with("nat:"));
-            let next = next.add_tag(class.tag().to_string());
-            (next, reflex)
-        };
-
-        let mut ann = CapabilityAnnouncement::new(
-            self.node_id,
-            self.identity.entity_id().clone(),
-            version,
-            caps,
-        )
-        .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
-        #[cfg(feature = "nat-traversal")]
-        {
-            ann = ann.with_reflex_addr(reflex_snapshot);
-        }
-        if sign {
-            ann.sign(&self.identity);
-        }
-
-        // Self-index so local queries see our own caps. Always runs
-        // regardless of rate limit — the self-index reflects the
-        // latest intended announcement.
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
-        let _ = self.capability_fold.apply(fold_ann);
-
-        // Publish as the latest local announcement so future
-        // session-opens push this version to new peers. Also always
-        // runs so late joiners get the latest caps even when we've
-        // rate-limited away the broadcast.
-        self.local_announcement.store(Some(Arc::new(ann.clone())));
-
-        // Origin-side rate limit: within-window calls update the
-        // self-index + `local_announcement` and coalesce into one
-        // trailing-edge flush at window end (RT-1). Pre-fix the
-        // suppressed broadcast was silently dropped, so a change
-        // landing inside the window stayed invisible to peers
-        // until the next explicit call or the 150 s re-announce
-        // keep-alive. At most one flush task is pending at a
-        // time; it broadcasts whatever `local_announcement` holds
-        // when it fires, so N suppressed calls collapse to one
-        // send of the newest version.
-        let now = std::time::Instant::now();
-        let min_interval = self.config.min_announce_interval;
-        let defer_for = {
-            let mut gate = self.announce_gate.lock();
-            let elapsed = gate
-                .last_broadcast_at
-                .map(|t| now.saturating_duration_since(t));
-            match elapsed {
-                Some(e) if e < min_interval => {
-                    // In-window with a flush already pending: that
-                    // flush will pick up the `local_announcement`
-                    // we just stored. Nothing to schedule.
-                    if gate.deferred_scheduled {
-                        return Ok(());
-                    }
-                    // Bare-start node (no `start_arc`): there is no
-                    // owned `Arc` for a flush task to hold — same
-                    // constraint as the re-announce loop. Preserve
-                    // the pre-RT-1 drop semantics (peers see the
-                    // change on the next out-of-window announce or
-                    // the keep-alive).
-                    if self.self_weak.get().is_none() {
-                        tracing::debug!(
-                            "capability: in-window announce not deferred \
-                             (node not started via start_arc)"
+            // Merge AI-tool registrations on top of the `nrpc:` tags.
+            // For every tool the SDK's `serve_tool` registered, this
+            // appends:
+            //   - an `ai-tool:<name>` capability tag, so
+            //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
+            //     this host;
+            //   - the typed `ToolCapability` itself (added via
+            //     `CapabilitySet::add_tool`), so the typed views aggregate
+            //     a `Vec<ToolCapability>` across peers in the fold;
+            //   - the description / streaming / tags metadata keys via
+            //     `CapabilitySet::metadata`, mirroring the existing
+            //     `input_schema` / `output_schema` convention so peers
+            //     without the `tool` feature still receive the data and
+            //     just ignore the unknown keys.
+            //
+            // Tool registrations are local to this node, just like
+            // `rpc_local_services`. Drop on the SDK's `ServeHandle`
+            // removes from the registry; the next `announce_capabilities`
+            // reflects the smaller set.
+            #[cfg(feature = "tool")]
+            let caps = if self.tool_registry.is_empty() {
+                caps
+            } else {
+                use crate::adapter::net::behavior::ToolCapability;
+                use crate::adapter::net::cortex::tool::{
+                    description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+                    tags_metadata_key,
+                };
+                let snapshot = self.tool_registry.snapshot();
+                // Reconstruct ToolCapability values from each descriptor's
+                // wire-cheap fields; schemas stay in metadata (the fold
+                // has its own schema-too-large branch) so the typed-cap
+                // payload doesn't bloat.
+                let tools_to_add: Vec<ToolCapability> = snapshot
+                    .iter()
+                    .map(|descriptor| {
+                        let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
+                            .with_version(&descriptor.version)
+                            .with_estimated_time(descriptor.estimated_time_ms)
+                            .with_stateless(descriptor.stateless);
+                        if let Some(ref schema) = descriptor.input_schema {
+                            cap = cap.with_input_schema(schema.clone());
+                        }
+                        if let Some(ref schema) = descriptor.output_schema {
+                            cap = cap.with_output_schema(schema.clone());
+                        }
+                        for req in &descriptor.requires {
+                            cap = cap.requires(req.clone());
+                        }
+                        cap
+                    })
+                    .collect();
+                // Single set_tools call; O(N) total instead of the
+                // O(N²) chain of per-tool add_tool invocations.
+                let mut merged = caps.add_tools(tools_to_add);
+                for descriptor in snapshot.iter() {
+                    merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
+                    // Description + streaming + tags ride the metadata
+                    // extensibility hook (same convention input/output
+                    // schemas already use). Pre-tool peers receive these
+                    // keys and ignore them — no wire-breaking change.
+                    if let Some(ref desc) = descriptor.description {
+                        merged = merged.with_metadata(
+                            description_metadata_key(&descriptor.tool_id),
+                            desc.clone(),
                         );
-                        return Ok(());
                     }
-                    gate.deferred_scheduled = true;
-                    Some(min_interval - e)
+                    if descriptor.streaming {
+                        merged = merged.with_metadata(
+                            streaming_metadata_key(&descriptor.tool_id),
+                            "1".to_string(),
+                        );
+                    }
+                    if !descriptor.tags.is_empty() {
+                        merged = merged.with_metadata(
+                            tags_metadata_key(&descriptor.tool_id),
+                            descriptor.tags.join(","),
+                        );
+                    }
+                    // Pricing terms (net.pricing.terms@1 canonical JSON) ride
+                    // the same hook — paid capability = metadata + invocation
+                    // policy, not a different kind of tool. The substrate
+                    // never parses the value.
+                    if let Some(ref terms) = descriptor.pricing_terms {
+                        merged = merged.with_metadata(
+                            pricing_terms_metadata_key(&descriptor.tool_id),
+                            terms.clone(),
+                        );
+                    }
                 }
-                _ => {
-                    gate.last_broadcast_at = Some(now);
-                    None
+                merged
+            };
+
+            // STREAM_ACK_BATCHING R-5: advertise transport support for
+            // positive SACK-range ACKs — same auto-augment pattern as the
+            // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
+            // can turn the feature off wire-wide (compliant peers then
+            // never emit ranges to us, and we never emit to anyone).
+            let caps = if self.config.enable_stream_ack_ranges {
+                caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
+            } else {
+                caps
+            };
+
+            let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Piggyback the current NAT classification as a `nat:*`
+            // capability tag so peers can filter-match on NAT type,
+            // and the reflex address on the dedicated announcement
+            // field so peers have a direct-connect candidate without a
+            // separate discovery round-trip. Both are feature-gated on
+            // `nat-traversal` — callers compiled without the feature
+            // emit announcements identical to the pre-traversal format.
+            //
+            // The two reads happen under `traversal_publish_mu` so
+            // the announcement always carries a consistent (class,
+            // reflex) pair. Without the mutex, a concurrent
+            // set/clear/commit could interleave between our reads
+            // and let us publish a torn state — e.g., the new
+            // override's reflex paired with the pre-override NAT
+            // class. The lock is held only for the two atomic reads,
+            // not across the signing or network send.
+            #[cfg(feature = "nat-traversal")]
+            let (caps, reflex_snapshot) = {
+                use super::traversal::classify::NatClass;
+                let _g = self.traversal_publish_mu.lock();
+                let class =
+                    NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
+                let reflex = self.reflex_addr.load_full().map(|arc| *arc);
+                // Strip any prior `nat:*` tags before adding the fresh
+                // one so a reclassification doesn't leave a stale tag
+                // behind when the class transitions. Phase A.5.N.2:
+                // `caps.tags` is `HashSet<Tag>` — `nat:*` tags parse
+                // as `Tag::Legacy`, so we render to wire form for
+                // prefix matching.
+                let mut next = caps;
+                next.tags.retain(|t| !t.to_string().starts_with("nat:"));
+                let next = next.add_tag(class.tag().to_string());
+                (next, reflex)
+            };
+
+            let mut ann = CapabilityAnnouncement::new(
+                self.node_id,
+                self.identity.entity_id().clone(),
+                version,
+                caps,
+            )
+            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+            #[cfg(feature = "nat-traversal")]
+            {
+                ann = ann.with_reflex_addr(reflex_snapshot);
+            }
+            if sign {
+                ann.sign(&self.identity);
+            }
+
+            // Self-index so local queries see our own caps. Always runs
+            // regardless of rate limit — the self-index reflects the
+            // latest intended announcement.
+            let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+            let _ = self.capability_fold.apply(fold_ann);
+
+            // Publish as the latest local announcement so future
+            // session-opens push this version to new peers. Also always
+            // runs so late joiners get the latest caps even when we've
+            // rate-limited away the broadcast.
+            self.local_announcement.store(Some(Arc::new(ann.clone())));
+
+            // Origin-side rate limit: within-window calls update the
+            // self-index + `local_announcement` and coalesce into one
+            // trailing-edge flush at window end (RT-1). Pre-fix the
+            // suppressed broadcast was silently dropped, so a change
+            // landing inside the window stayed invisible to peers
+            // until the next explicit call or the 150 s re-announce
+            // keep-alive. At most one flush task is pending at a
+            // time; it broadcasts whatever `local_announcement` holds
+            // when it fires, so N suppressed calls collapse to one
+            // send of the newest version.
+            let now = std::time::Instant::now();
+            let min_interval = self.config.min_announce_interval;
+            let defer_for = {
+                let mut gate = self.announce_gate.lock();
+                let elapsed = gate
+                    .last_broadcast_at
+                    .map(|t| now.saturating_duration_since(t));
+                match elapsed {
+                    Some(e) if e < min_interval => {
+                        // In-window with a flush already pending: that
+                        // flush will pick up the `local_announcement`
+                        // we just stored. Nothing to schedule.
+                        if gate.deferred_scheduled {
+                            return Ok(());
+                        }
+                        // Bare-start node (no `start_arc`): there is no
+                        // owned `Arc` for a flush task to hold — same
+                        // constraint as the re-announce loop. Preserve
+                        // the pre-RT-1 drop semantics (peers see the
+                        // change on the next out-of-window announce or
+                        // the keep-alive).
+                        if self.self_weak.get().is_none() {
+                            tracing::debug!(
+                                "capability: in-window announce not deferred \
+                             (node not started via start_arc)"
+                            );
+                            return Ok(());
+                        }
+                        gate.deferred_scheduled = true;
+                        Some(min_interval - e)
+                    }
+                    _ => {
+                        gate.last_broadcast_at = Some(now);
+                        None
+                    }
                 }
+            };
+            if let Some(delay) = defer_for {
+                self.spawn_deferred_announce(delay);
+                None
+            } else {
+                Some(ann.to_bytes())
             }
         };
-        if let Some(delay) = defer_for {
-            self.spawn_deferred_announce(delay);
-            return Ok(());
-        }
+        // `announce_mu` is released here — the peer broadcast is
+        // network I/O and must never hold the announce lock.
 
         // Fan out to currently-connected peers. Best-effort — a
         // per-peer send failure is logged and skipped rather than
         // short-circuiting the broadcast.
-        let bytes = ann.to_bytes();
+        let Some(bytes) = to_broadcast else {
+            return Ok(());
+        };
         let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
         for addr in peer_addrs {
             if let Err(e) = self
