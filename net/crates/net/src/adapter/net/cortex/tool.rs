@@ -548,9 +548,11 @@ impl ToolMetadataRegistry {
     }
 
     /// Insert (or replace) the descriptor for `name`. Returns the
-    /// previous entry if one existed — callers can use this for
-    /// duplicate-registration diagnostics (the SDK's `serve_tool`
-    /// rejects duplicate names rather than silently overwriting).
+    /// previous entry if one existed. Registration paths that must
+    /// reject duplicates use [`Self::try_insert`] instead — an
+    /// insert-then-rollback around this method would fire the
+    /// change signal (and expose the attempted descriptor to
+    /// concurrent readers) for a registration that never commits.
     pub fn insert(&self, descriptor: ToolDescriptor) -> Option<ToolDescriptor> {
         let prev = {
             let mut guard = self.inner.lock();
@@ -563,6 +565,31 @@ impl ToolMetadataRegistry {
         // consumer diffs; missing an edge is the failure mode.
         self.signal_changed();
         prev
+    }
+
+    /// Insert only if no descriptor exists for this `tool_id`;
+    /// returns `true` when the insert committed. Atomic under the
+    /// registry lock, so a duplicate registration neither mutates
+    /// the map (concurrent readers never observe the attempted
+    /// descriptor) nor fires the change signal — the RT-2/RT-3
+    /// announcer must only ever publish registrations that
+    /// actually committed. This is the `serve_tool`-path
+    /// registration primitive.
+    pub fn try_insert(&self, descriptor: ToolDescriptor) -> bool {
+        let inserted = {
+            let mut guard = self.inner.lock();
+            if guard.map.contains_key(&descriptor.tool_id) {
+                false
+            } else {
+                guard.map.insert(descriptor.tool_id.clone(), descriptor);
+                guard.snapshot = None;
+                true
+            }
+        };
+        if inserted {
+            self.signal_changed();
+        }
+        inserted
     }
 
     /// Look up the full descriptor for `name`. `None` when the
@@ -710,6 +737,32 @@ mod tests {
         let _ = reg.snapshot();
         let _ = reg.is_empty();
         assert_eq!(generation(), 3, "reads must not signal");
+    }
+
+    #[test]
+    fn try_insert_rejects_duplicates_without_mutation_or_signal() {
+        // RT-2 review follow-up (cubic P1): a rejected duplicate
+        // registration must not mutate the registry (concurrent
+        // readers could observe the attempted descriptor) and must
+        // not fire the change signal (the announcer would publish a
+        // registration that never committed).
+        let signal = std::sync::Arc::new(tokio::sync::watch::channel(0u64).0);
+        let reg = ToolMetadataRegistry::with_change_signal(signal.clone());
+        let generation = || *signal.borrow();
+
+        let original = ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new());
+        assert!(reg.try_insert(original.clone()), "first insert commits");
+        assert_eq!(generation(), 1, "committed insert must signal");
+
+        let mut imposter = ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new());
+        imposter.description = Some("imposter".to_string());
+        assert!(!reg.try_insert(imposter), "duplicate must be rejected");
+        assert_eq!(generation(), 1, "rejected duplicate must not signal");
+        assert_eq!(
+            reg.get("web_search").expect("entry present").description,
+            original.description,
+            "rejected duplicate must not replace the committed descriptor",
+        );
     }
 
     #[test]
