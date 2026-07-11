@@ -155,3 +155,73 @@ async fn disabled_receiver_keeps_route_until_age_out() {
 
     drop(b);
 }
+
+/// Cubic review P1: a withdrawal must not "promote" a relayed
+/// (`connect_via`) session as if it were a direct one. A's peer
+/// entry for C stores the RELAY's address (B) — re-adding it would
+/// re-install exactly the `(C via B)` route the withdrawal just
+/// dropped, making withdrawals a no-op for relayed destinations.
+#[tokio::test]
+async fn withdrawal_is_not_undone_by_relayed_session_promotion() {
+    // A ↔ B direct, B ↔ C direct, then A's session to C is
+    // established THROUGH B (`connect_via`) — A has no direct UDP
+    // path to C in the routing sense (its peer entry for C carries
+    // B's address).
+    let a = build(base_config()).await;
+    let b = build(detector_config()).await;
+    let c = build(base_config()).await;
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let c_id = c.node_id();
+    let b_pub = *b.public_key();
+    let c_pub = *c.public_key();
+    let b_addr = b.local_addr();
+    let c_addr = c.local_addr();
+
+    // Pre-start direct handshakes (accept + connect joined, same
+    // shape as the three_node connect_via tests).
+    let (r1, r2) = tokio::join!(b.accept(a_id), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(b_addr, &b_pub, b_id).await
+    });
+    r1.expect("B accept A");
+    r2.expect("A connect B");
+    let (r1, r2) = tokio::join!(c.accept(b_id), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(c_addr, &c_pub, c_id).await
+    });
+    r1.expect("C accept B");
+    r2.expect("B connect C");
+
+    // Receive loops must run before connect_via.
+    a.start();
+    b.start();
+    c.start();
+
+    a.connect_via(b_addr, &c_pub, c_id)
+        .await
+        .expect("A connect_via B to C");
+    assert_eq!(
+        a.router().routing_table().lookup(c_id),
+        Some(b_addr),
+        "precondition: A routes to C via the relay B",
+    );
+
+    // Kill C. B (tight detector) marks it Failed and floods the
+    // withdrawal; A must drop (C via B) and — the regression — must
+    // NOT re-promote its relayed peer entry for C, whose address IS
+    // the withdrawing relay.
+    c.shutdown().await.expect("shutdown C");
+
+    assert!(
+        wait_until(
+            || a.router().routing_table().lookup(c_id).is_none(),
+            Duration::from_secs(8),
+        )
+        .await,
+        "A still routes to dead C via B — the relayed peer entry was \
+         promoted straight back into the routing table, undoing the \
+         withdrawal",
+    );
+}

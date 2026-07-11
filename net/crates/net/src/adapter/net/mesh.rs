@@ -8639,13 +8639,23 @@ impl MeshNode {
             "route-withdraw: dropped route"
         );
         // Promote an alternate instead of waiting for traffic to
-        // fail: a direct session wins; otherwise synthesize from
-        // the proximity graph through a different first hop.
+        // fail: a DIRECT session wins; otherwise synthesize from
+        // the proximity graph through a different first hop. A
+        // relayed (`connect_via`) peer entry must NOT be promoted
+        // here: its `addr` is the RELAY's address — possibly the
+        // withdrawing sender itself — so promoting it would
+        // re-install exactly the route we just dropped (cubic
+        // review P1). Directness test: only a direct session's
+        // address maps back to `dest` in the reverse index
+        // (`AddrInstallMode::RoutedPreserve` keeps the relay's own
+        // mapping for shared addresses).
         if let Some(peer) = ctx.peers.get(&dest) {
-            ctx.router
-                .routing_table()
-                .add_route(dest, peer.value().addr);
-            return;
+            let addr = peer.value().addr;
+            drop(peer);
+            if ctx.addr_to_node.get(&addr).map(|e| *e.value()) == Some(dest) {
+                ctx.router.routing_table().add_route(dest, addr);
+                return;
+            }
         }
         if let Some(path) = ctx.proximity_graph.path_to(&node_id_to_graph_id(dest)) {
             // path[0] is self, path[1] the first hop; metric mirrors
