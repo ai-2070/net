@@ -554,16 +554,26 @@ impl ToolMetadataRegistry {
     /// change signal (and expose the attempted descriptor to
     /// concurrent readers) for a registration that never commits.
     pub fn insert(&self, descriptor: ToolDescriptor) -> Option<ToolDescriptor> {
-        let prev = {
+        let (prev, changed) = {
             let mut guard = self.inner.lock();
-            guard.snapshot = None;
-            guard.map.insert(descriptor.tool_id.clone(), descriptor)
+            // Only a real change to the announced surface should fire
+            // the signal. A byte-identical re-insert (e.g. an app's
+            // periodic ensure-registered loop) is a no-op: signaling
+            // it would wake the RT-3 announcer into a full mesh-wide
+            // capability broadcast + pingwave flood for zero
+            // information change (RT-2 review Finding 9). Matches
+            // `LocalServiceRegistry::insert`, which already suppresses
+            // idempotent re-serves.
+            let changed = guard.map.get(&descriptor.tool_id) != Some(&descriptor);
+            if changed {
+                guard.snapshot = None;
+            }
+            let prev = guard.map.insert(descriptor.tool_id.clone(), descriptor);
+            (prev, changed)
         };
-        // Insert and replace both change the announced surface
-        // (a replace may carry a new schema/description), so
-        // signal unconditionally. Over-signaling is safe: the
-        // consumer diffs; missing an edge is the failure mode.
-        self.signal_changed();
+        if changed {
+            self.signal_changed();
+        }
         prev
     }
 
@@ -723,12 +733,17 @@ mod tests {
         reg.insert(desc.clone());
         assert_eq!(generation(), 1, "insert must signal");
 
-        reg.insert(desc);
-        assert_eq!(
-            generation(),
-            2,
-            "replace must signal (schema/description may differ)"
-        );
+        // A byte-identical re-insert is a no-op — it must NOT signal
+        // (RT-2 review Finding 9: idempotent re-register would
+        // otherwise trigger a full mesh-wide announce for no change).
+        reg.insert(desc.clone());
+        assert_eq!(generation(), 1, "idempotent re-insert must not signal");
+
+        // A replace that actually changes the descriptor must signal.
+        let mut changed = desc;
+        changed.description = Some("now with a description".to_string());
+        reg.insert(changed);
+        assert_eq!(generation(), 2, "a changed replace must signal");
 
         assert!(reg.remove("web_search").is_some());
         assert_eq!(generation(), 3, "remove of a present tool must signal");
