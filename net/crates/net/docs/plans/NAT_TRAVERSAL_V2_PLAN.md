@@ -193,21 +193,34 @@ Implements decisions 2 and 3.
 
 ## Stage 3 — Auto-punch: coordinator selection + background direct-path upgrade (P1)
 
-Implements decisions 4 and 5.
+Implements decisions 4, 5, and 9.
 
 - `select_punch_coordinator(target) -> Option<NodeId>` implementing the four tiers; `relay-capable` tag reserved + documented in `behavior/capability.rs`.
 - Core + SDK `connect_direct(peer)` overloads (coordinator auto-selected); existing two-arg forms unchanged.
-- Background upgrade task: hooks the post-install path of relay-routed sessions, consults `pair_action` + outcome cache, runs the punch, migrates on success. Config: `auto_direct_upgrade` (default true), `punch_retry_backoff` (negative-cache TTL, default 10 min).
+- Background upgrade task: hooks the post-install path of relay-routed sessions, consults `pair_action` + outcome cache, runs the punch, swaps on success under the decision-9 contract (lower-node-id initiator C1, CAS-guarded install C2, two-sided busy gate C3). Config: `auto_direct_upgrade` (default true), `punch_retry_backoff` (negative-cache TTL, default 10 min), `upgrade_quiescence_window` (default 30 s).
+- `DeferBusy` outcome added to `routed_rotation_outcome` (responder half of C3).
+- Stale `addr_to_node` hygiene on displacement (C4).
 - `RendezvousNoRelay` constructed on tier-4 skip.
-- Stats: `upgrades_attempted / upgrades_succeeded` counters (feeding stage 5's exposure).
+- Stats: `upgrades_attempted / upgrades_succeeded / upgrades_deferred_busy` counters (feeding stage 5's exposure).
 
 **Exit criteria**
 
-- Three-node loopback test: A—R—B with forced Cone×Cone classes and a relay-routed A↔B session → upgrade task punches without any explicit `connect_direct` call; session `peer_addr()` flips to the punched socket; traffic continues uninterrupted across the migration.
+*Upgrade mechanics:*
+
+- Three-node loopback test: A—R—B with forced Cone×Cone classes and a relay-routed A↔B session → upgrade task punches without any explicit `connect_direct` call; session `peer_addr()` flips to the punched socket on **both** ends.
 - Forced Symmetric×Symmetric pair → upgrade never attempts (`punches_attempted` stays 0).
 - Failed punch → relayed session untouched, negative cache honored (second reconnect within TTL does not re-punch), backoff grows on repeat failure.
 - Coordinator selection: with the routing next-hop available it is chosen (tier 1); with it excluded, a `relay-capable`-tagged peer wins over untagged (tier 2); with no candidates, `RendezvousNoRelay` surfaces and `connect()` semantics are unaffected.
 - Kill switch: `auto_direct_upgrade(false)` restores exactly today's behavior.
+
+*Migration-contract acceptance (decision 9 — each maps to a pinned fact or contract item):*
+
+- **Active long-running call across the upgrade (F1/C3):** A issues a long-running nRPC call to B (response deliberately delayed past the upgrade), the upgrade fires and completes mid-call → the call completes successfully with zero errors and no retry, and the response demonstrably arrives over the punched session. Not just "traffic continues after" — the call **spans** the swap.
+- **In-flight response bytes are protected (C3 responder gate):** B is mid-transfer of a large response when A's punched msg1 arrives → `DeferBusy` refuses the rotation, the transfer completes over the relayed session unharmed, and a subsequent upgrade attempt succeeds once quiescent.
+- **Active reliable stream defers the swap (F2/C3 initiator gate):** an open stream with unacked in-flight data on A's side → upgrade defers (`upgrades_deferred_busy` increments), stream completes, upgrade then lands.
+- **Forced swap under load fails closed, not corrupt (F2, gate disabled via test hook):** stale `Stream` handle surfaces `NotConnected`; no partial/corrupted delivery on either end; documents the no-`StreamReset` behavior.
+- **Race determinism (F4/F5/C1/C2):** simultaneous auto-upgrade impulses on both ends → only the lower-node-id end initiates; with a concurrent inbound rotation racing the upgrade's install, the CAS guard aborts the upgrade and both ends verifiably converge on the **same** session (assert matching `session_id` on A and B, bidirectional traffic flows).
+- **Failure atomicity pinned (F6/C5):** punch succeeds, punched-path Noise handshake forced to fail → relayed session still carries traffic, `addr_to_node` gained no punched entry, pending calls unaffected.
 
 ## Stage 4 — NAT simulator harness + missing test matrix (P1)
 
@@ -300,6 +313,8 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 
 - **Responder-budget defaults.** 4 trains / 10 s / 8 concurrent are educated guesses; stage-4's harness plus stage-5 telemetry should confirm they don't clip legitimate fresh-mesh join storms. Revisit after first natsim runs.
 - **Upgrade trigger breadth.** Stage 3 hooks relay-routed session establishment. Should long-lived relayed sessions that predate the feature (or whose first upgrade failed before a network change) get a slow periodic re-try sweep? Leaning no (the outcome cache TTL already allows a retry on reconnect); decide with stage-5 data.
+- **Permanently-busy sessions never upgrade.** The C3 busy gate means a session with a continuous stream (long-lived inference feed) defers indefinitely and stays on the relay. Accepted for this plan (optimization framing); the escape hatches are QUIC-style same-session path migration (decision 9's rejected alternative, the natural V3) or dual-session drain. Revisit if stage-5's `upgrades_deferred_busy` shows a meaningful permanently-deferred population.
+- **`DeferBusy` liveness signal.** C3's responder gate must not block NAT-rebind recovery re-handshakes. The plan keys deferral on recent authenticated inbound; the exact threshold (and its interaction with `session_timeout`) needs pinning during implementation with a dedicated rebind-recovery regression test.
 - **CI runner privileges.** If `sudo` netns provisioning is unavailable on the hosted runners, fall back to a privileged container job. Resolve during stage-4 setup.
 
 ---
@@ -310,12 +325,12 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 |-------|---------|------------|----------|
 | 1 | Introduce validation + doc notes | Small | ~0.5–1 day |
 | 2 | Budgets + `PunchReject` + typed errors ×4 surfaces | Medium | ~2 days |
-| 3 | Selection + upgrade task + cache + bindings | Medium–large | ~3–4 days |
+| 3 | Selection + upgrade task + cache + migration contract (C1–C5) + bindings | Large | ~5–6 days |
 | 4 | netns harness + CI + test matrix | Medium–large | ~3–4 days |
 | 5 | Stats v2 ×4 surfaces + reasons + trigger | Medium | ~2 days |
 | 6 | *(deferred)* | — | — |
 
-Total (stages 1–5): ~10–13 days serial; stages 1–2 are independent of 3–5 and should land first.
+Total (stages 1–5): ~12–15 days serial; stages 1–2 are independent of 3–5 and should land first.
 
 ---
 
