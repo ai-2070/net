@@ -223,9 +223,7 @@ async fn busy_relay_session_defers_then_upgrades() {
     let b_bind = b.local_addr();
 
     // Open an application stream on A's session to B → busy → defer.
-    let session = a
-        .peer_session_for_test(b_id)
-        .expect("A has a session to B");
+    let session = a.peer_session_for_test(b_id).expect("A has a session to B");
     session.get_or_create_stream(0xABCD);
     assert!(session.has_open_streams(), "precondition: session is busy");
 
@@ -255,7 +253,11 @@ async fn busy_relay_session_defers_then_upgrades() {
         Some(b_bind),
         "once quiescent the session should upgrade to the direct path",
     );
-    assert_eq!(a.traversal_stats().upgrades_succeeded, 1, "upgrade succeeded");
+    assert_eq!(
+        a.traversal_stats().upgrades_succeeded,
+        1,
+        "upgrade succeeded"
+    );
 }
 
 /// Failure atomicity (F6/C5): when the upgrade can't proceed (here: the

@@ -571,7 +571,9 @@ async fn coordinator_rate_limits_requests_from_one_requester() {
         Err(TraversalError::RendezvousRejected(kind)) => {
             assert_eq!(kind, "rate-limited", "5th request should be rate-limited");
         }
-        other => panic!("expected RendezvousRejected(rate-limited) on the 5th request, got {other:?}"),
+        other => {
+            panic!("expected RendezvousRejected(rate-limited) on the 5th request, got {other:?}")
+        }
     }
     assert!(
         elapsed < Duration::from_secs(2),

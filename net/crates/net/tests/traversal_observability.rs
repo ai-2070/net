@@ -356,7 +356,8 @@ async fn reannounce_loop_corrects_drifted_reflex_before_publish() {
         corrected,
         "the re-announce tick should reconcile the drift and publish \
          the re-observed reflex; got {:?}",
-        a.local_announcement_for_test().and_then(|ann| ann.reflex_addr),
+        a.local_announcement_for_test()
+            .and_then(|ann| ann.reflex_addr),
     );
     // Tag + reflex shipped together: the same announcement carries
     // the fresh (loopback = open) class tag.

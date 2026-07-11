@@ -4147,7 +4147,10 @@ mod tests {
         };
         fill_traversal_stats_v2(&snap_off, &mut out);
         assert_eq!(out.port_mapping_active, 0);
-        assert_eq!(out.port_mapping_external[0], 0, "empty string when inactive");
+        assert_eq!(
+            out.port_mapping_external[0], 0,
+            "empty string when inactive"
+        );
     }
 
     /// Regression: `parse_modality_cap` must surface unknown

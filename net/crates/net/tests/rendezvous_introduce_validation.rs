@@ -168,7 +168,9 @@ async fn count_datagrams(listener: &UdpSocket, limit: Duration) -> usize {
 /// directly connected). X is the injector — an authenticated session
 /// peer of B — and also the second classification/announcement relay.
 /// Returns `(A, R, B, X)`.
-async fn topology(a: Arc<MeshNode>) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+async fn topology(
+    a: Arc<MeshNode>,
+) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let r = build_node().await;
     let b = build_node().await;
     let x = build_node().await;

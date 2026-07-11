@@ -481,7 +481,10 @@ mod error_kind_tests {
             TraversalError::RendezvousRejected("rate-limited".into()).kind(),
             "rendezvous-rejected",
         );
-        assert_eq!(TraversalError::RendezvousNoRelay.kind(), "rendezvous-no-relay");
+        assert_eq!(
+            TraversalError::RendezvousNoRelay.kind(),
+            "rendezvous-no-relay"
+        );
     }
 
     /// The reason sub-kind rides in the `RendezvousRejected` payload

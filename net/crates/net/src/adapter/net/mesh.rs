@@ -564,8 +564,7 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 /// rendezvous-coordinated punch flow to bind introduce delivery
 /// to the relay the local node sent `PunchRequest` to.
 #[cfg(feature = "nat-traversal")]
-type PendingPunchIntroduces =
-    Arc<DashMap<u64, (u64, u64, oneshot::Sender<PunchIntroduceOutcome>)>>;
+type PendingPunchIntroduces = Arc<DashMap<u64, (u64, u64, oneshot::Sender<PunchIntroduceOutcome>)>>;
 
 /// Waiter map for incoming `PunchAck` messages keyed by the sender
 /// endpoint's `node_id`. Value is `(generation, expected coordinator
@@ -6857,10 +6856,11 @@ impl MeshNode {
                         // session peer could forge a reject and abort a
                         // legitimate in-flight punch (a cheap DoS on the
                         // optimization).
-                        let took = ctx.pending_punch_introduces.remove_if(
-                            &rej.target,
-                            |_, (_gen, expected_coord, _)| *expected_coord == from_node,
-                        );
+                        let took = ctx
+                            .pending_punch_introduces
+                            .remove_if(&rej.target, |_, (_gen, expected_coord, _)| {
+                                *expected_coord == from_node
+                            });
                         if let Some((_, (_gen, _expected, tx))) = took {
                             let _ = tx.send(PunchIntroduceOutcome::Rejected(rej.reason));
                         } else {
@@ -9891,7 +9891,9 @@ impl MeshNode {
         req: super::traversal::rendezvous::PunchRequest,
         ctx: &DispatchCtx,
     ) {
-        use super::traversal::rendezvous::{PunchIntroduce, PunchReject, RejectReason, RendezvousMsg};
+        use super::traversal::rendezvous::{
+            PunchIntroduce, PunchReject, RejectReason, RendezvousMsg,
+        };
 
         // Resolve A's session up-front. We need A's observed wire
         // source address to validate the self-reported reflex, to send
@@ -13072,12 +13074,10 @@ impl MeshNode {
                 continue;
             }
             any_min = Some(any_min.map_or(nid, |m| m.min(nid)));
-            let is_relay_capable = super::behavior::fold::capability_tags_for(
-                &self.capability_fold,
-                nid,
-            )
-            .iter()
-            .any(|t| t == super::behavior::capability::RELAY_CAPABLE_TAG);
+            let is_relay_capable =
+                super::behavior::fold::capability_tags_for(&self.capability_fold, nid)
+                    .iter()
+                    .any(|t| t == super::behavior::capability::RELAY_CAPABLE_TAG);
             if is_relay_capable {
                 relay_capable_min = Some(relay_capable_min.map_or(nid, |m| m.min(nid)));
             }
@@ -13117,9 +13117,7 @@ impl MeshNode {
             PairAction::Direct => self.connect_direct(peer_node_id, peer_pubkey, 0).await,
             PairAction::SinglePunch | PairAction::SkipPunch => {
                 match self.select_punch_coordinator(peer_node_id) {
-                    Some(coord) => {
-                        self.connect_direct(peer_node_id, peer_pubkey, coord).await
-                    }
+                    Some(coord) => self.connect_direct(peer_node_id, peer_pubkey, coord).await,
                     None => {
                         self.traversal_stats.record_rendezvous_no_relay();
                         Err(TraversalError::RendezvousNoRelay)
@@ -14604,11 +14602,14 @@ impl MeshNode {
     /// The attempt's outcome recorder overwrites this.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_lease(&self, peer_id: u64, lease: Duration) {
-        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
-            next_eligible: Instant::now(),
-            failures: 0,
-            done: false,
-        });
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
         e.next_eligible = Instant::now() + lease;
     }
 
@@ -14616,11 +14617,14 @@ impl MeshNode {
     /// upgraded) — stop attempting.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_record_done(&self, peer_id: u64) {
-        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
-            next_eligible: Instant::now(),
-            failures: 0,
-            done: false,
-        });
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
         e.done = true;
     }
 
@@ -14628,11 +14632,14 @@ impl MeshNode {
     /// it as a failure (the session is healthy, just carrying traffic).
     #[cfg(feature = "nat-traversal")]
     fn upgrade_record_defer(&self, peer_id: u64, delay: Duration) {
-        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
-            next_eligible: Instant::now(),
-            failures: 0,
-            done: false,
-        });
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
         e.next_eligible = Instant::now() + delay;
     }
 
@@ -14641,11 +14648,14 @@ impl MeshNode {
     fn upgrade_record_failure(&self, peer_id: u64) {
         const BASE: Duration = Duration::from_secs(2);
         const MAX_SHIFT: u32 = 5; // cap backoff at BASE << 5 = 64 s
-        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
-            next_eligible: Instant::now(),
-            failures: 0,
-            done: false,
-        });
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
         e.failures = e.failures.saturating_add(1);
         let backoff = BASE.saturating_mul(1u32 << e.failures.min(MAX_SHIFT));
         e.next_eligible = Instant::now() + backoff;
@@ -15515,7 +15525,9 @@ impl MeshNode {
                 // removed by the dispatch arm that delivered the
                 // reject; nothing to clean up here.
                 self.traversal_stats.record_punch_rejection();
-                Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
+                Err(TraversalError::RendezvousRejected(
+                    reason.kind().to_string(),
+                ))
             }
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — another request_punch to the
@@ -15569,7 +15581,9 @@ impl MeshNode {
             Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
             Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
                 self.traversal_stats.record_punch_rejection();
-                Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
+                Err(TraversalError::RendezvousRejected(
+                    reason.kind().to_string(),
+                ))
             }
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
@@ -17528,14 +17542,24 @@ mod heartbeat_aead_tests {
         let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
-        node.install_peer(peer_id, relay_addr, relay_keys, AddrInstallMode::RoutedPreserve);
+        node.install_peer(
+            peer_id,
+            relay_addr,
+            relay_keys,
+            AddrInstallMode::RoutedPreserve,
+        );
 
         // A racing rotation installs a DIFFERENT session for the peer
         // (simulated by a plain install). The upgrade below still holds
         // the OLD session_id as its expectation.
         let (raced_keys, _) = make_session_keys();
         let raced_session_id = raced_keys.session_id;
-        node.install_peer(peer_id, relay_addr, raced_keys, AddrInstallMode::RoutedPreserve);
+        node.install_peer(
+            peer_id,
+            relay_addr,
+            raced_keys,
+            AddrInstallMode::RoutedPreserve,
+        );
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
@@ -17551,7 +17575,9 @@ mod heartbeat_aead_tests {
         assert!(!installed, "CAS must refuse when the session_id changed");
         // The raced session survives untouched.
         assert_eq!(
-            node.peers.get(&peer_id).map(|p| p.value().session.session_id()),
+            node.peers
+                .get(&peer_id)
+                .map(|p| p.value().session.session_id()),
             Some(raced_session_id),
             "the racing session must be left intact after a refused CAS",
         );
@@ -17579,7 +17605,12 @@ mod heartbeat_aead_tests {
         let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
-        node.install_peer(peer_id, old_addr, first_keys, AddrInstallMode::DirectOverwrite);
+        node.install_peer(
+            peer_id,
+            old_addr,
+            first_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
         assert_eq!(
             node.addr_to_node.get(&old_addr).map(|e| *e),
             Some(peer_id),
@@ -17598,7 +17629,9 @@ mod heartbeat_aead_tests {
         );
         assert!(installed, "CAS must install when the session_id matches");
         assert_eq!(
-            node.peers.get(&peer_id).map(|p| p.value().session.session_id()),
+            node.peers
+                .get(&peer_id)
+                .map(|p| p.value().session.session_id()),
             Some(punch_session_id),
             "the punched session must replace the old one",
         );
