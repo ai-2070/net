@@ -10968,12 +10968,11 @@ impl MeshNode {
 
     /// Trailing-edge flush: broadcast the latest `local_announcement`
     /// to all connected peers and open the next rate-limit window.
-    /// Runs at most once per scheduled deferral. A rate-limit-floor
-    /// reset (`set_reflex_override` / `clear_reflex_override`)
-    /// between scheduling and firing can make this a duplicate of an
-    /// unconditional broadcast — harmless: every announce call bumps
-    /// `capability_version`, and receivers dedup exact repeats on
-    /// `(node_id, version)` via `seen_announcements`.
+    /// Runs at most once per scheduled deferral, and only if the
+    /// deferred slot is still claimed — a rate-limit-floor reset
+    /// (`set_reflex_override` / `clear_reflex_override`) cancels the
+    /// slot, turning this into a no-op (the reset's documented
+    /// follow-up announce supersedes the flush).
     async fn flush_deferred_announce(&self) {
         {
             let mut gate = self.announce_gate.lock();
@@ -13819,8 +13818,17 @@ impl MeshNode {
         // peers to see the new reflex "right away" still need
         // to call announce themselves; this just makes that
         // call's broadcast step unconditional instead of
-        // coalesced.
-        self.announce_gate.lock().last_broadcast_at = None;
+        // coalesced. Cancel any pending trailing-edge flush in
+        // the same lock (RT-1 review follow-up): the caller's
+        // documented next announce supersedes it, and letting it
+        // fire too would put a second broadcast inside the fresh
+        // window. The parked flush task no-ops when it finds the
+        // slot cleared.
+        {
+            let mut gate = self.announce_gate.lock();
+            gate.last_broadcast_at = None;
+            gate.deferred_scheduled = false;
+        }
     }
 
     /// Drop a previously-installed runtime reflex override. The
@@ -13866,9 +13874,14 @@ impl MeshNode {
         // Same rate-limit reset as `set_reflex_override` — the
         // next `announce_capabilities` call broadcasts
         // unconditionally instead of coalescing against the
-        // previous send. See that method's comment for details
-        // (cubic P2).
-        self.announce_gate.lock().last_broadcast_at = None;
+        // previous send, and a pending trailing-edge flush is
+        // canceled for the same reason. See that method's
+        // comment for details (cubic P2 + RT-1 follow-up).
+        {
+            let mut gate = self.announce_gate.lock();
+            gate.last_broadcast_at = None;
+            gate.deferred_scheduled = false;
+        }
     }
 
     /// Testing / debugging hook: force this node's advertised
