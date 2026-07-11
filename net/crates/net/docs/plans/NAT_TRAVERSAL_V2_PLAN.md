@@ -300,8 +300,8 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 
 | Stage | Scope | Status |
 |-------|-------|--------|
-| 1 | Finding 4 — unsolicited-introduce reflex validation | not started |
-| 2 | Finding 5 — rendezvous budgets, `PunchReject`, typed rejections | not started |
+| 1 | Finding 4 — unsolicited-introduce reflex validation | **done** |
+| 2 | Finding 5 — rendezvous budgets, `PunchReject`, typed rejections | **done** |
 | 3 | Coordinator auto-selection + background direct-path upgrade | not started |
 | 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | not started |
 | 5 | Stats parity, failure reasons, reflex-diff re-classify trigger | not started |

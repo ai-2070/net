@@ -46,7 +46,7 @@ and 5, plus a set of non-blocking minor notes.
 | 2 — `sender_node_id` unvalidated | ✅ **Resolved** (validation moved to receive loop after a cubic-flagged DoS in the first cut) | `fb151b4af` + follow-up | `punch_keepalive.rs::observer_acks_only_on_matching_sender_node_id`, `…::stray_keepalive_with_wrong_sender_does_not_burn_the_observer` |
 | 3 — unbounded `fire_at_ms` | ✅ **Resolved** | `9b56e6d41` | `mesh.rs::keepalive_offset_tests` (4 cases) |
 | 4 — direct unsolicited-introduce reflector | ✅ **Resolved** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 1 | this branch | `rendezvous_introduce_validation.rs` (4 cases) |
-| 5 — rate-limit budgets / `RendezvousRejected` | ⏳ Stage 2 (`NAT_TRAVERSAL_V2_PLAN.md`) | — | — |
+| 5 — rate-limit budgets / `RendezvousRejected` | ✅ **Resolved** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 2 | this branch | `rendezvous_coordinator.rs` (rate-limit + reject), `rendezvous_introduce_validation.rs` (train caps), codec + `error_kind` unit tests |
 
 ### Finding 1 fix — bind `self_reflex` to A's session source IP
 
@@ -274,7 +274,33 @@ fall back to the Finding 5 rate-limit budget rather than firing blind.
 
 ---
 
-## Finding 5 — Rate-limit budgets and `RendezvousRejected` remain unimplemented (Low, Open)
+## Finding 5 — Rate-limit budgets and `RendezvousRejected` (Low)
+
+> **Status: resolved** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 2. Added
+> `RendezvousBudgets`: a coordinator per-requester fixed-window budget on
+> `PunchRequest` (`charge_request`, default 4 / 10 s), a responder per-source
+> budget on unsolicited keep-alive trains (`charge_train`, default 4 / 10 s,
+> replacing Stage 1's temporary cap), and a global concurrent-train ceiling
+> (`try_train_slot` → RAII `TrainSlot` held for the observer's lifetime, default
+> 8). Knobs live on `TraversalConfig` (`punch_budget_window`,
+> `punch_requests_per_window`, `punch_trains_per_window`,
+> `punch_trains_concurrent_max`). A new `PunchReject { target, reason }` wire
+> message (`RendezvousMsg` discriminator `0x04`, `RejectReason`) carries the
+> coordinator's refusal — rate-limited, unknown-target-reflex,
+> no-session-with-target, or reflex-mismatch (Finding 1's previously-silent
+> drop) — back to the requester, whose `request_punch` now resolves
+> *immediately* with `TraversalError::RendezvousRejected(reason)` instead of
+> waiting out `punch_deadline`. The FFI-mapped error code (`ffi/mesh.rs:144-145`)
+> and the Node/Python/Go `traversal_err` mappers, previously dead, are now
+> reachable. Tests: `rendezvous.rs` codec unit tests (`punch_reject_roundtrip`,
+> `…_unknown_reason_decodes_to_unspecified`, `…_wrong_length_rejects`,
+> `reject_reason_kind_strings_are_stable`); `mod.rs::error_kind_tests`;
+> `rendezvous_coordinator.rs` (`coordinator_rate_limits_requests_from_one_requester`
+> + the three former-timeout tests now asserting fast typed rejection);
+> `rendezvous_introduce_validation.rs` (`…_flood_from_one_source_is_capped`,
+> `…_globally_capped_across_sources`). `RendezvousNoRelay` construction lands in
+> Stage 3 (coordinator selection). The original analysis below is retained as the
+> historical record.
 
 Carried forward from Finding 1's mitigation #2 and its "why this is a gap" note;
 still true after this branch:
@@ -344,10 +370,10 @@ a fast, typed failure instead of waiting out `punch_deadline`.
 
 The 2026-06-21 hardening pass landed Finding 1 (mitigation 1), Finding 2, and
 Finding 3. `NAT_TRAVERSAL_V2_PLAN.md` Stage 1 then landed Finding 4 and minor
-notes 1 & 3. Remaining work:
+notes 1 & 3; Stage 2 landed Finding 5 (rendezvous budgets + `PunchReject` +
+typed `RendezvousRejected`).
 
-- **Finding 5** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 2: add the per-requester /
-  per-peer rate-limit budgets (replacing Stage 1's temporary
-  `unsolicited_introduce_rate` cap) and wire `RendezvousRejected` so the
-  FFI-mapped error code stops being dead and the Finding 1 / Finding 4 drops
-  become typed, fast failures.
+**All findings from this review are now resolved.** Remaining NAT-traversal work
+(coordinator auto-selection, background direct-path upgrade + session-migration
+contract, the netns NAT-simulator harness, and stats/observability parity) is
+tracked in `NAT_TRAVERSAL_V2_PLAN.md` Stages 3–5, not here.

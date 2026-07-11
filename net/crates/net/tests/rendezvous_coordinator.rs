@@ -222,10 +222,13 @@ async fn coordinator_fans_out_to_both_endpoints() {
 }
 
 /// Negative path: B never announces its reflex, so R can't
-/// introduce. A's `request_punch` should time out with
-/// `PunchFailed` inside `punch_deadline`.
+/// introduce. Since Stage 2 (Finding 5) the coordinator answers with
+/// a typed `PunchReject { UnknownTargetReflex }` instead of dropping
+/// silently, so A's `request_punch` fails *fast* with
+/// `RendezvousRejected("unknown-target-reflex")` — no `punch_deadline`
+/// wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_punch_times_out_when_target_has_no_cached_reflex() {
+async fn request_punch_rejected_fast_when_target_has_no_cached_reflex() {
     let (a, r, b, _x) = rendezvous_topology().await;
 
     // Only A announces — B stays unclassified so R has no reflex
@@ -243,20 +246,19 @@ async fn request_punch_times_out_when_target_has_no_cached_reflex() {
     let elapsed = start.elapsed();
 
     match result {
-        Err(TraversalError::PunchFailed) => {}
-        other => panic!("expected PunchFailed, got {other:?}"),
+        Err(TraversalError::RendezvousRejected(kind)) => {
+            assert_eq!(
+                kind, "unknown-target-reflex",
+                "reject reason should name the missing target reflex",
+            );
+        }
+        other => panic!("expected RendezvousRejected(unknown-target-reflex), got {other:?}"),
     }
-    // Default `punch_deadline` is 5 s. Must be within that
-    // window — but not too fast, since the coordinator has no
-    // explicit rejection message (stage 3b: silent drop on
-    // missing reflex, A times out).
+    // Fast typed rejection — must resolve well inside `punch_deadline`
+    // (5 s), not wait it out.
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "should wait ~punch_deadline (5s) before failing; elapsed {elapsed:?}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(6),
-        "should not wait much past punch_deadline; elapsed {elapsed:?}",
+        elapsed < Duration::from_secs(2),
+        "typed rejection should be fast; elapsed {elapsed:?}",
     );
 }
 
@@ -288,20 +290,22 @@ async fn request_punch_unknown_relay_fails_fast() {
 /// Regression test for TEST_COVERAGE_PLAN §P1-4 case (a): B
 /// announced at some point, R indexed B's reflex, but B's TTL
 /// expired and R's capability-GC has since evicted B. When A
-/// fires a PunchRequest, R must drop it silently — the
-/// coordinator-side lookup at `capability_index.reflex_addr(b_id)`
-/// returns None once GC has swept, same as if B had never
-/// announced at all. A observes a `PunchFailed` timeout.
+/// fires a PunchRequest, R's coordinator lookup at
+/// `capability_index.reflex_addr(b_id)` returns None once GC has
+/// swept — same as if B had never announced. Since Stage 2
+/// (Finding 5) R answers with a typed
+/// `PunchReject { UnknownTargetReflex }`, so A fails *fast* with
+/// `RendezvousRejected("unknown-target-reflex")`.
 ///
 /// Case (b) — B never announced — is covered by the existing
-/// `request_punch_times_out_when_target_has_no_cached_reflex`
+/// `request_punch_rejected_fast_when_target_has_no_cached_reflex`
 /// above. Case (c) — GC racing the handler itself — isn't
 /// exercised here: the handler + GC operate over DashMap, so
 /// each entry-level read is atomic; a mid-handler eviction can
 /// only cause the same observable outcome as a pre-handler
 /// eviction (this test), not a torn dispatch state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
+async fn request_punch_rejected_fast_when_targets_reflex_was_evicted_by_ttl_gc() {
     let r = build_node().await;
     let a = build_node().await;
     let b = build_node().await;
@@ -361,7 +365,7 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
     );
 
     // A fires a PunchRequest against B. R's coordinator looks up
-    // B's reflex, finds nothing, drops silently. A times out.
+    // B's reflex, finds nothing (evicted), and rejects fast.
     let start = tokio::time::Instant::now();
     let result = a
         .request_punch(r.node_id(), b.node_id(), a.local_addr())
@@ -369,22 +373,22 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
     let elapsed = start.elapsed();
 
     match result {
-        Err(TraversalError::PunchFailed) => {}
-        other => panic!("expected PunchFailed after TTL eviction, got {other:?}"),
+        Err(TraversalError::RendezvousRejected(kind)) => {
+            assert_eq!(kind, "unknown-target-reflex");
+        }
+        other => {
+            panic!("expected RendezvousRejected(unknown-target-reflex) after TTL eviction, got {other:?}")
+        }
     }
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "should wait ~punch_deadline (5s) before failing; elapsed {elapsed:?}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(6),
-        "should not wait much past punch_deadline; elapsed {elapsed:?}",
+        elapsed < Duration::from_secs(2),
+        "typed rejection should be fast; elapsed {elapsed:?}",
     );
 }
 
 /// Anti-reflection guard (code review 2026-06-21, Finding 1): a
 /// `PunchRequest` whose `self_reflex` IP does not match the
-/// requester's session source address must be dropped by the
+/// requester's session source address must be refused by the
 /// coordinator, even when the target's reflex IS cached.
 ///
 /// Without the guard, a malicious A could name an arbitrary victim
@@ -393,11 +397,13 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
 /// would fire its keep-alive train at the victim, turning R + B into
 /// a UDP reflector with A's identity hidden. The guard binds
 /// `self_reflex` to A's observed wire-source IP (only the port may
-/// legitimately differ, under symmetric NAT), so the spoofed request
-/// is dropped and A's `request_punch` times out with `PunchFailed`
-/// inside `punch_deadline`.
+/// legitimately differ, under symmetric NAT). Since Stage 2
+/// (Finding 5) the mismatch is answered with a typed
+/// `PunchReject { ReflexMismatch }`, so A fails *fast* with
+/// `RendezvousRejected("reflex-mismatch")` rather than waiting out
+/// `punch_deadline`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_punch_with_spoofed_self_reflex_ip_is_dropped() {
+async fn request_punch_with_spoofed_self_reflex_ip_is_rejected() {
     let (a, r, b, _x) = rendezvous_topology().await;
 
     // Both classify + announce so R has BOTH reflexes cached — this
@@ -427,7 +433,7 @@ async fn request_punch_with_spoofed_self_reflex_ip_is_dropped() {
     );
 
     // A spoofed self_reflex on a different IP than A's loopback
-    // session source. R must drop the request silently.
+    // session source. R must refuse with a typed reject.
     let spoofed: SocketAddr = "203.0.113.50:9001".parse().unwrap();
     assert_ne!(
         spoofed.ip(),
@@ -440,19 +446,17 @@ async fn request_punch_with_spoofed_self_reflex_ip_is_dropped() {
     let elapsed = start.elapsed();
 
     match result {
-        Err(TraversalError::PunchFailed) => {}
+        Err(TraversalError::RendezvousRejected(kind)) => {
+            assert_eq!(kind, "reflex-mismatch");
+        }
         other => {
-            panic!("expected PunchFailed (coordinator drops spoofed self_reflex), got {other:?}")
+            panic!("expected RendezvousRejected(reflex-mismatch) for spoofed self_reflex, got {other:?}")
         }
     }
-    // Dropped silently → A waits the full punch_deadline (~5s).
+    // Fast typed rejection — must not wait out `punch_deadline`.
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "should wait ~punch_deadline before failing; elapsed {elapsed:?}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(6),
-        "should not wait much past punch_deadline; elapsed {elapsed:?}",
+        elapsed < Duration::from_secs(2),
+        "typed rejection should be fast; elapsed {elapsed:?}",
     );
 }
 
@@ -512,5 +516,65 @@ async fn request_punch_with_port_shifted_self_reflex_is_accepted() {
     assert_eq!(
         b_intro.peer_reflex, port_shifted,
         "B's introduce must carry A's port-shifted self_reflex verbatim",
+    );
+}
+
+/// Coordinator per-requester budget (`NAT_TRAVERSAL_V2_PLAN.md`
+/// Stage 2, Finding 5): a single requester may have at most
+/// `punch_requests_per_window` (default 4 / 10 s) `PunchRequest`s
+/// mediated. The 5th within the window is refused with a typed
+/// `PunchReject { RateLimited }` — A sees `RendezvousRejected`
+/// fast, and R never fans out a 5th introduce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_rate_limits_requests_from_one_requester() {
+    let (a, r, b, _x) = rendezvous_topology().await;
+
+    // Both announce so R has both reflexes cached — isolates the
+    // refusal cause to the budget, not a missing reflex.
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_bind = a.local_addr();
+    let b_bind = b.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && r_for_poll.peer_reflex_addr(a_id) == Some(a_bind)
+        })
+        .await,
+        "R should have both reflexes cached before we fire",
+    );
+
+    // First 4 requests (the default per-window budget) are mediated.
+    for i in 0..4 {
+        let intro = a
+            .request_punch(r.node_id(), b_id, a_bind)
+            .await
+            .unwrap_or_else(|e| panic!("request {i} should be mediated, got {e:?}"));
+        assert_eq!(intro.peer, b_id, "request {i} introduce should name B");
+    }
+
+    // The 5th exceeds the budget → fast typed rejection.
+    let start = tokio::time::Instant::now();
+    let result = a.request_punch(r.node_id(), b_id, a_bind).await;
+    let elapsed = start.elapsed();
+    match result {
+        Err(TraversalError::RendezvousRejected(kind)) => {
+            assert_eq!(kind, "rate-limited", "5th request should be rate-limited");
+        }
+        other => panic!("expected RendezvousRejected(rate-limited) on the 5th request, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "rate-limit rejection should be fast; elapsed {elapsed:?}",
     );
 }

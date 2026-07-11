@@ -353,3 +353,30 @@ pub const SUBPROTOCOL_REFLEX: u16 = 0x0D00;
 ///
 /// See [`rendezvous`] for the state machine.
 pub const SUBPROTOCOL_RENDEZVOUS: u16 = 0x0D01;
+
+#[cfg(test)]
+mod error_kind_tests {
+    use super::*;
+
+    /// The machine-readable `kind()` vocabulary is a stable API the
+    /// SDK bindings map to typed catches. Pin the two rendezvous
+    /// outcomes that Stage 2 (Finding 5) brought to life — they were
+    /// defined-but-never-constructed before, so nothing guarded them.
+    #[test]
+    fn rendezvous_error_kinds_are_stable() {
+        assert_eq!(
+            TraversalError::RendezvousRejected("rate-limited".into()).kind(),
+            "rendezvous-rejected",
+        );
+        assert_eq!(TraversalError::RendezvousNoRelay.kind(), "rendezvous-no-relay");
+    }
+
+    /// The reason sub-kind rides in the `RendezvousRejected` payload
+    /// (via `Display`), so a caller can distinguish rate-limit from
+    /// anti-reflection without a second field.
+    #[test]
+    fn rendezvous_rejected_display_carries_reason() {
+        let e = TraversalError::RendezvousRejected("reflex-mismatch".into());
+        assert_eq!(e.to_string(), "rendezvous-rejected: reflex-mismatch");
+    }
+}

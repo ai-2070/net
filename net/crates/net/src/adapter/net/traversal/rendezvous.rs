@@ -33,7 +33,8 @@
 //! ```
 //!
 //! - `kind` is the discriminator: `0x01 = PunchRequest`,
-//!   `0x02 = PunchIntroduce`, `0x03 = PunchAck`.
+//!   `0x02 = PunchIntroduce`, `0x03 = PunchAck`,
+//!   `0x04 = PunchReject`.
 //! - Addresses are encoded as `family(1) | addr(16) | port(2)` —
 //!   the same 19-byte shape used by the reflex subprotocol, so a
 //!   future migration can share the codec without a wire bump.
@@ -83,6 +84,23 @@
 //! identities during forwarding — this module makes them both
 //! explicit so the coordinator doesn't have to rewrite bytes
 //! mid-flight.
+//!
+//! ## PunchReject body (8 + 1 = 9 bytes)
+//!
+//! ```text
+//! ┌─────────────────┬──────────────┐
+//! │ target (8)      │ reason (1)   │
+//! └─────────────────┴──────────────┘
+//! ```
+//!
+//! `R → A` only. A coordinator that won't mediate a `PunchRequest`
+//! (rate-limited, no cached target reflex, no session with the
+//! target, or a failed anti-reflection check) sends this instead of
+//! a `PunchIntroduce`. `target` echoes the request's target so the
+//! requester resolves the matching pending-introduce waiter (keyed
+//! by target node id); `reason` is a [`RejectReason`]. The requester
+//! surfaces it as [`super::TraversalError::RendezvousRejected`]
+//! immediately, rather than blocking until `punch_deadline`.
 //!
 //! # Keep-alive packet
 //!
@@ -141,6 +159,7 @@ const FAMILY_V6: u8 = 6;
 const KIND_PUNCH_REQUEST: u8 = 0x01;
 const KIND_PUNCH_INTRODUCE: u8 = 0x02;
 const KIND_PUNCH_ACK: u8 = 0x03;
+const KIND_PUNCH_REJECT: u8 = 0x04;
 
 /// Total on-wire size of a `PunchRequest` payload.
 /// `kind(1) + target_node(8) + self_reflex(19) = 28`.
@@ -153,6 +172,10 @@ pub const PUNCH_INTRODUCE_LEN: usize = 1 + 8 + ADDR_LEN + 8;
 /// Total on-wire size of a `PunchAck` payload.
 /// `kind(1) + from_peer(8) + to_peer(8) + punch_id(4) = 21`.
 pub const PUNCH_ACK_LEN: usize = 1 + 8 + 8 + 4;
+
+/// Total on-wire size of a `PunchReject` payload.
+/// `kind(1) + target(8) + reason(1) = 10`.
+pub const PUNCH_REJECT_LEN: usize = 1 + 8 + 1;
 
 /// Two-byte magic prefix identifying a pre-session keep-alive
 /// packet. Chosen to be disjoint from the Net packet `MAGIC`
@@ -253,6 +276,65 @@ pub struct PunchRequest {
     pub self_reflex: SocketAddr,
 }
 
+/// Why a coordinator refused to mediate a `PunchRequest`. Rides a
+/// [`PunchReject`] back to the requester so its `request_punch`
+/// resolves immediately with a typed
+/// [`super::TraversalError::RendezvousRejected`] instead of waiting
+/// out `punch_deadline`. Unknown values decode to
+/// [`RejectReason::Unspecified`] so a future reason code never turns
+/// a reject into a dropped packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RejectReason {
+    /// The coordinator's per-requester `PunchRequest` budget is
+    /// exhausted for the current window.
+    RateLimited = 0x01,
+    /// The coordinator holds no cached reflex for the named target,
+    /// so it cannot introduce the pair.
+    UnknownTargetReflex = 0x02,
+    /// The coordinator has no live session with the named target.
+    NoSessionWithTarget = 0x03,
+    /// The requester's `self_reflex` IP disagreed with its session
+    /// source (anti-reflection guard, Finding 1).
+    ReflexMismatch = 0x04,
+    /// Reason not recognized by this build — treated as a generic
+    /// refusal. Never sent; only produced by [`decode`] for
+    /// forward-compatibility.
+    Unspecified = 0xFF,
+}
+
+impl RejectReason {
+    /// Wire byte.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire byte. Unrecognized values map to
+    /// [`RejectReason::Unspecified`] rather than failing, so a newer
+    /// coordinator's reason code degrades gracefully.
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            0x01 => Self::RateLimited,
+            0x02 => Self::UnknownTargetReflex,
+            0x03 => Self::NoSessionWithTarget,
+            0x04 => Self::ReflexMismatch,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Stable machine-readable sub-kind, embedded in the
+    /// `RendezvousRejected(_)` message string. Never localized.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate-limited",
+            Self::UnknownTargetReflex => "unknown-target-reflex",
+            Self::NoSessionWithTarget => "no-session-with-target",
+            Self::ReflexMismatch => "reflex-mismatch",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
 /// A `PunchIntroduce` payload — R → A and R → B ("here's the
 /// other endpoint's reflex and when to fire").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,9 +378,25 @@ pub struct PunchAck {
     pub punch_id: u32,
 }
 
-/// Decoded rendezvous subprotocol message. The three variants
-/// correspond to the three event-frame payload shapes described in
-/// the module docs. Use [`decode`] to obtain one from raw bytes.
+/// A `PunchReject` payload — R → A ("I won't mediate this punch").
+/// Sent instead of a `PunchIntroduce` so the requester's
+/// `request_punch` resolves immediately with a typed error rather
+/// than blocking until `punch_deadline`. `target` echoes the
+/// `PunchRequest.target` so the requester can resolve the matching
+/// waiter (which is keyed by target node id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchReject {
+    /// The target the rejected `PunchRequest` named — lets the
+    /// requester correlate against its pending-introduce waiter.
+    pub target: u64,
+    /// Why the coordinator refused. Wire-encoded via
+    /// [`RejectReason::as_u8`].
+    pub reason: RejectReason,
+}
+
+/// Decoded rendezvous subprotocol message. The variants correspond
+/// to the event-frame payload shapes described in the module docs.
+/// Use [`decode`] to obtain one from raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendezvousMsg {
     /// A → R: please mediate a punch to `target`.
@@ -308,17 +406,23 @@ pub enum RendezvousMsg {
     /// {A, B} → {A, B}: punch succeeded on my side (sent via
     /// routed-handshake, not the punched path).
     PunchAck(PunchAck),
+    /// R → A: refused to mediate (rate-limit / unknown target /
+    /// anti-reflection). Fast typed failure in place of a silent
+    /// drop + `punch_deadline` timeout.
+    PunchReject(PunchReject),
 }
 
 impl RendezvousMsg {
     /// Encode the message as an event-body `Bytes`. Length is
     /// exactly one of [`PUNCH_REQUEST_LEN`], [`PUNCH_INTRODUCE_LEN`],
-    /// or [`PUNCH_ACK_LEN`] depending on the variant.
+    /// [`PUNCH_ACK_LEN`], or [`PUNCH_REJECT_LEN`] depending on the
+    /// variant.
     pub fn encode(&self) -> Bytes {
         match self {
             RendezvousMsg::PunchRequest(req) => encode_punch_request(req),
             RendezvousMsg::PunchIntroduce(intro) => encode_punch_introduce(intro),
             RendezvousMsg::PunchAck(ack) => encode_punch_ack(ack),
+            RendezvousMsg::PunchReject(rej) => encode_punch_reject(rej),
         }
     }
 }
@@ -389,6 +493,15 @@ fn encode_punch_ack(ack: &PunchAck) -> Bytes {
     buf.freeze()
 }
 
+fn encode_punch_reject(rej: &PunchReject) -> Bytes {
+    let mut buf = BytesMut::with_capacity(PUNCH_REJECT_LEN);
+    buf.put_u8(KIND_PUNCH_REJECT);
+    buf.put_u64(rej.target);
+    buf.put_u8(rej.reason.as_u8());
+    debug_assert_eq!(buf.len(), PUNCH_REJECT_LEN);
+    buf.freeze()
+}
+
 /// Decode a rendezvous payload. Returns `None` on any malformed
 /// input (wrong length for the claimed kind, unknown kind
 /// discriminator, unknown address family byte). Callers drop
@@ -434,6 +547,14 @@ pub fn decode(payload: &[u8]) -> Option<RendezvousMsg> {
                 to_peer,
                 punch_id,
             }))
+        }
+        KIND_PUNCH_REJECT => {
+            if payload.len() != PUNCH_REJECT_LEN {
+                return None;
+            }
+            let target = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+            let reason = RejectReason::from_u8(payload[9]);
+            Some(RendezvousMsg::PunchReject(PunchReject { target, reason }))
         }
         _ => None,
     }
@@ -587,6 +708,66 @@ mod tests {
             }
             other => panic!("expected PunchAck, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn punch_reject_roundtrip() {
+        for reason in [
+            RejectReason::RateLimited,
+            RejectReason::UnknownTargetReflex,
+            RejectReason::NoSessionWithTarget,
+            RejectReason::ReflexMismatch,
+        ] {
+            let rej = PunchReject {
+                target: 0xDEAD_BEEF_0000_1234,
+                reason,
+            };
+            let encoded = RendezvousMsg::PunchReject(rej).encode();
+            assert_eq!(encoded.len(), PUNCH_REJECT_LEN);
+            match decode(&encoded) {
+                Some(RendezvousMsg::PunchReject(out)) => assert_eq!(out, rej),
+                other => panic!("expected PunchReject, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn punch_reject_unknown_reason_decodes_to_unspecified() {
+        // A reason byte this build doesn't recognize must still decode
+        // as a reject (never a dropped packet) so a newer coordinator's
+        // reason code degrades gracefully.
+        let mut payload = vec![0u8; PUNCH_REJECT_LEN];
+        payload[0] = KIND_PUNCH_REJECT;
+        payload[9] = 0x7E; // unknown reason
+        match decode(&payload) {
+            Some(RendezvousMsg::PunchReject(out)) => {
+                assert_eq!(out.reason, RejectReason::Unspecified);
+            }
+            other => panic!("expected PunchReject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_reject_wrong_length_rejects() {
+        // Kind byte says reject but the body is short — must decode
+        // as None, never panic.
+        let mut payload = vec![0u8; PUNCH_REJECT_LEN - 1];
+        payload[0] = KIND_PUNCH_REJECT;
+        assert!(decode(&payload).is_none());
+    }
+
+    #[test]
+    fn reject_reason_kind_strings_are_stable() {
+        assert_eq!(RejectReason::RateLimited.kind(), "rate-limited");
+        assert_eq!(
+            RejectReason::UnknownTargetReflex.kind(),
+            "unknown-target-reflex"
+        );
+        assert_eq!(
+            RejectReason::NoSessionWithTarget.kind(),
+            "no-session-with-target"
+        );
+        assert_eq!(RejectReason::ReflexMismatch.kind(), "reflex-mismatch");
     }
 
     #[test]

@@ -564,16 +564,8 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 /// rendezvous-coordinated punch flow to bind introduce delivery
 /// to the relay the local node sent `PunchRequest` to.
 #[cfg(feature = "nat-traversal")]
-type PendingPunchIntroduces = Arc<
-    DashMap<
-        u64,
-        (
-            u64,
-            u64,
-            oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-        ),
-    >,
->;
+type PendingPunchIntroduces =
+    Arc<DashMap<u64, (u64, u64, oneshot::Sender<PunchIntroduceOutcome>)>>;
 
 /// Waiter map for incoming `PunchAck` messages keyed by the sender
 /// endpoint's `node_id`. Value is `(generation, expected coordinator
@@ -590,6 +582,129 @@ type PendingPunchAcks = Arc<
         ),
     >,
 >;
+
+/// Outcome delivered to a `request_punch` waiter. The rendezvous
+/// coordinator either mediates (an introduce arrives) or refuses (a
+/// reject arrives). Both resolve the same pending-introduce waiter so
+/// the requester unblocks in one place; a timeout is still the third
+/// outcome, handled by `request_punch` itself.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Clone, Copy)]
+enum PunchIntroduceOutcome {
+    /// The coordinator mediated: here's the counterpart's reflex.
+    Introduce(super::traversal::rendezvous::PunchIntroduce),
+    /// The coordinator refused with a typed reason.
+    Rejected(super::traversal::rendezvous::RejectReason),
+}
+
+/// Rendezvous abuse budgets (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2,
+/// closing review Finding 5). Three independent limiters:
+///
+/// - `requests` — coordinator per-requester fixed-window budget on
+///   `PunchRequest`, keyed by the requester's `node_id`.
+/// - `trains` — responder per-source fixed-window budget on
+///   keep-alive trains scheduled from *unsolicited* introduces, keyed
+///   by the introducing peer's `node_id`. (Replaces Stage 1's
+///   temporary `unsolicited_introduce_rate` cap.)
+/// - `concurrent_trains` — global count of outstanding unsolicited
+///   trains, capped so a Sybil set of sources each under its per-source
+///   budget can't multiply the aggregate.
+///
+/// Both windowed maps use the same lazy fixed-window scheme as the
+/// subscribe-auth throttle: a `(count, window_start)` pair per key,
+/// reset on the first charge past the window end.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Default)]
+struct RendezvousBudgets {
+    requests: DashMap<u64, (u32, Instant)>,
+    trains: DashMap<u64, (u32, Instant)>,
+    concurrent_trains: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl RendezvousBudgets {
+    /// Charge one unit against a fixed-window map. Returns `true` (and
+    /// records the charge) when `key` is under `max` for the current
+    /// window; `false` when exhausted. `max == 0` disables the limit.
+    fn charge(map: &DashMap<u64, (u32, Instant)>, key: u64, window: Duration, max: u32) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let mut entry = map.entry(key).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+        if now.duration_since(*window_start) >= window {
+            *count = 0;
+            *window_start = now;
+        }
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Coordinator side: charge a `PunchRequest` from `requester`.
+    fn charge_request(&self, requester: u64, window: Duration, max: u32) -> bool {
+        Self::charge(&self.requests, requester, window, max)
+    }
+
+    /// Responder side: charge an unsolicited keep-alive train from
+    /// `source`.
+    fn charge_train(&self, source: u64, window: Duration, max: u32) -> bool {
+        Self::charge(&self.trains, source, window, max)
+    }
+
+    /// Try to reserve one of the `max` global concurrent-train slots.
+    /// Returns an RAII [`TrainSlot`] that releases the slot on drop, or
+    /// `None` when the ceiling is reached. `max == 0` disables the
+    /// ceiling (always grants an untracked slot).
+    fn try_train_slot(self: &Arc<Self>, max: usize) -> Option<TrainSlot> {
+        use std::sync::atomic::Ordering;
+        if max == 0 {
+            return Some(TrainSlot { budgets: None });
+        }
+        // Compare-and-swap loop: only claim a slot if we stay ≤ max.
+        let mut cur = self.concurrent_trains.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match self.concurrent_trains.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(TrainSlot {
+                        budgets: Some(self.clone()),
+                    })
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+/// RAII reservation for one global unsolicited-train slot. Holding it
+/// keeps the slot counted; dropping it (when the punch scheduler's
+/// observer task ends) releases the slot. `budgets == None` is the
+/// disabled-ceiling case — nothing to release.
+#[cfg(feature = "nat-traversal")]
+struct TrainSlot {
+    budgets: Option<Arc<RendezvousBudgets>>,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Drop for TrainSlot {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budgets {
+            b.concurrent_trains
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
 
 /// Cancellation-safe rollback for a freshly registered peer
 /// session + addr map + routing entry.
@@ -967,11 +1082,10 @@ struct DispatchCtx {
             ),
         >,
     >,
-    /// Temporary per-source cap on unsolicited `PunchIntroduce`
-    /// messages. See the matching field doc on `MeshNode`
-    /// (`unsolicited_introduce_rate`).
+    /// Rendezvous abuse budgets. See the matching field doc on
+    /// `MeshNode` (`rendezvous_budgets`).
     #[cfg(feature = "nat-traversal")]
-    unsolicited_introduce_rate: Arc<DashMap<u64, (u32, Instant)>>,
+    rendezvous_budgets: Arc<RendezvousBudgets>,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
     /// since `TraversalConfig` is `Clone` and small. The dispatch
@@ -2643,22 +2757,12 @@ pub struct MeshNode {
             ),
         >,
     >,
-    /// Fixed-window rate cap on *unsolicited* `PunchIntroduce`
-    /// messages, keyed by the introducing session peer's `node_id`.
-    /// The value is `(count-in-window, window-start)`.
-    ///
-    /// This is a **temporary** guard for review Finding 4: it gates
-    /// the case where an unsolicited introduce names a counterpart
-    /// for whom we have no cached reflex to validate against (see
-    /// [`Self::unsolicited_introduce_permitted`]). Without it, an
-    /// authenticated session peer could name a nonexistent
-    /// counterpart id — forcing the no-cached-reflex path — and
-    /// steer an unbounded volume of our keep-alive trains at an
-    /// attacker-chosen address. Stage 2 (`NAT_TRAVERSAL_V2_PLAN.md`
-    /// Finding 5) replaces this with the full per-source /
-    /// per-requester rendezvous budget + typed `RendezvousRejected`.
+    /// Rendezvous abuse budgets (coordinator per-requester,
+    /// responder per-source, global concurrent-train ceiling) —
+    /// `NAT_TRAVERSAL_V2_PLAN.md` Stage 2, closing review Finding 5.
+    /// See [`RendezvousBudgets`].
     #[cfg(feature = "nat-traversal")]
-    unsolicited_introduce_rate: Arc<DashMap<u64, (u32, Instant)>>,
+    rendezvous_budgets: Arc<RendezvousBudgets>,
     /// Single-flight gate for the classification sweep.
     /// [`Self::reclassify_nat`] sets this on entry and clears it on
     /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
@@ -3504,7 +3608,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
-            unsolicited_introduce_rate: Arc::new(DashMap::new()),
+            rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 if initial_reflex_override.is_some() {
@@ -4821,7 +4925,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             punch_observers: self.punch_observers.clone(),
             #[cfg(feature = "nat-traversal")]
-            unsolicited_introduce_rate: self.unsolicited_introduce_rate.clone(),
+            rendezvous_budgets: self.rendezvous_budgets.clone(),
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
@@ -6470,9 +6574,12 @@ impl MeshNode {
                             // to the coordinator we recorded when we
                             // sent the PunchRequest. Complete the
                             // waiter (unblocks `request_punch`) and
-                            // fire our own keep-alive train.
-                            let _ = tx.send(intro);
-                            Self::schedule_punch(from_node, intro, ctx);
+                            // fire our own keep-alive train. Initiator
+                            // trains aren't budget-gated — they're
+                            // self-initiated and self-limited by the
+                            // connect_direct flow (no train slot).
+                            let _ = tx.send(PunchIntroduceOutcome::Introduce(intro));
+                            Self::schedule_punch(from_node, intro, ctx, None);
                             continue;
                         }
                         if ctx.pending_punch_introduces.contains_key(&intro.peer) {
@@ -6494,12 +6601,16 @@ impl MeshNode {
                         // supplied and, unguarded, would steer our
                         // keep-alive train at an attacker-named victim
                         // (review Finding 4). Validate it against the
-                        // counterpart's cached signed reflex before
-                        // firing.
-                        if !Self::unsolicited_introduce_permitted(&intro, from_node, ctx) {
+                        // counterpart's cached signed reflex and charge
+                        // the responder budgets before firing; the
+                        // returned slot is held for the train's
+                        // lifetime (Finding 5).
+                        let Some(slot) =
+                            Self::unsolicited_introduce_permitted(&intro, from_node, ctx)
+                        else {
                             continue;
-                        }
-                        Self::schedule_punch(from_node, intro, ctx);
+                        };
+                        Self::schedule_punch(from_node, intro, ctx, Some(slot));
                     }
                     rendezvous::RendezvousMsg::PunchAck(ack) => {
                         if ack.to_peer == ctx.local_node_id {
@@ -6542,6 +6653,35 @@ impl MeshNode {
                             // original sender, which is what the
                             // recipient correlates on.
                             Self::forward_punch_ack(ack, ctx);
+                        }
+                    }
+                    rendezvous::RendezvousMsg::PunchReject(rej) => {
+                        // Requester side: the coordinator refused to
+                        // mediate. Resolve the pending-introduce waiter
+                        // (keyed by the target we named) with the typed
+                        // reason so `request_punch` fails fast instead
+                        // of waiting out `punch_deadline`.
+                        //
+                        // Bind to the recorded coordinator, exactly like
+                        // the introduce path: only the relay we sent the
+                        // PunchRequest to may reject it. Otherwise any
+                        // session peer could forge a reject and abort a
+                        // legitimate in-flight punch (a cheap DoS on the
+                        // optimization).
+                        let took = ctx.pending_punch_introduces.remove_if(
+                            &rej.target,
+                            |_, (_gen, expected_coord, _)| *expected_coord == from_node,
+                        );
+                        if let Some((_, (_gen, _expected, tx))) = took {
+                            let _ = tx.send(PunchIntroduceOutcome::Rejected(rej.reason));
+                        } else {
+                            tracing::trace!(
+                                from = from_node,
+                                target = rej.target,
+                                reason = rej.reason.kind(),
+                                "rendezvous: PunchReject with no matching waiter / \
+                                 non-coordinator sender; dropping"
+                            );
                         }
                     }
                 }
@@ -9562,7 +9702,73 @@ impl MeshNode {
         req: super::traversal::rendezvous::PunchRequest,
         ctx: &DispatchCtx,
     ) {
-        use super::traversal::rendezvous::{PunchIntroduce, RendezvousMsg};
+        use super::traversal::rendezvous::{PunchIntroduce, PunchReject, RejectReason, RendezvousMsg};
+
+        // Resolve A's session up-front. We need A's observed wire
+        // source address to validate the self-reported reflex, to send
+        // A its `PunchIntroduce`, and to send A a typed `PunchReject`
+        // on any refusal. If A isn't in our peer table we can't
+        // coordinate — and can't reject either — so just drop.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+
+        // Helper: send A a typed `PunchReject` so its `request_punch`
+        // fails fast (Finding 5) instead of blocking until
+        // `punch_deadline`. `target` echoes the request so A resolves
+        // the matching waiter. Best-effort — a failed send just
+        // degrades to the old timeout behavior. `Fn` (clones its Arcs
+        // per call) so the several refusal branches below can each
+        // reach it.
+        let reject_session = a_session.clone();
+        let reject_socket = ctx.socket.clone();
+        let reject_target = req.target;
+        let send_reject = move |reason: RejectReason| {
+            let session = reject_session.clone();
+            let socket = reject_socket.clone();
+            let body = RendezvousMsg::PunchReject(PunchReject {
+                target: reject_target,
+                reason,
+            })
+            .encode();
+            tokio::spawn(async move {
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session
+                        .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                    stream.next_tx_seq()
+                };
+                let events = vec![body];
+                let packet = builder.build_subprotocol(
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                );
+                let _ = socket.send_to(&packet, a_addr).await;
+            });
+        };
+
+        // Coordinator per-requester budget (Finding 5). Over budget →
+        // fast typed rejection, no fan-out.
+        if !ctx.rendezvous_budgets.charge_request(
+            from_node,
+            ctx.traversal_config.punch_budget_window,
+            ctx.traversal_config.punch_requests_per_window,
+        ) {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "rendezvous: PunchRequest over per-requester budget; rejecting",
+            );
+            send_reject(RejectReason::RateLimited);
+            return;
+        }
 
         // 1. Resolve B's reflex address. A's self-reported reflex
         //    (carried on the request) is the fallback when the
@@ -9578,21 +9784,9 @@ impl MeshNode {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 target = format!("{:#x}", req.target),
-                "rendezvous: no cached reflex for target; dropping PunchRequest",
+                "rendezvous: no cached reflex for target; rejecting PunchRequest",
             );
-            return;
-        };
-
-        // Resolve A's session up-front. We need A's observed wire
-        // source address both to validate the self-reported reflex
-        // (immediately below) and, later, to send A its
-        // `PunchIntroduce`. If A isn't in our peer table we can't
-        // coordinate at all.
-        let Some((a_addr, a_session)) = ctx
-            .peers
-            .get(&from_node)
-            .map(|e| (e.value().addr, e.value().session.clone()))
-        else {
+            send_reject(RejectReason::UnknownTargetReflex);
             return;
         };
 
@@ -9606,10 +9800,9 @@ impl MeshNode {
         // hidden. Bind the self-report to A's actual session source
         // IP: a genuine A is reachable at `a_addr`, so its real
         // reflex shares that IP — only the port can differ, under
-        // symmetric NAT. A mismatched IP is a spoofed target; drop
-        // silently, exactly like any other coordinator-side drop, and
-        // A's `connect_direct` falls back to the relay on its
-        // timeout.
+        // symmetric NAT. A mismatched IP is a spoofed target; reject
+        // (fast typed failure) and A's `connect_direct` falls back to
+        // the relay.
         //
         // Assumption: A is a *direct* session peer of R, so `a_addr`
         // is A's own wire source. In the normal rendezvous topology A
@@ -9625,8 +9818,9 @@ impl MeshNode {
                 claimed = %req.self_reflex,
                 session_src = %a_addr,
                 "rendezvous: PunchRequest self_reflex IP != session source; \
-                 dropping (anti-reflection)",
+                 rejecting (anti-reflection)",
             );
+            send_reject(RejectReason::ReflexMismatch);
             return;
         }
 
@@ -9670,10 +9864,9 @@ impl MeshNode {
         })
         .encode();
 
-        // Look up B's session. If B isn't in our peer table we
-        // can't introduce — stage 5 SDK surface will map this to
-        // `RendezvousNoRelay` on A's side via the `connect_direct`
-        // timeout. (A's session was resolved up-front, above.)
+        // Look up B's session. If B isn't in our peer table we can't
+        // introduce — reject with `NoSessionWithTarget` so A fails
+        // fast. (A's session was resolved up-front, above.)
         let Some((b_addr, b_session)) = ctx
             .peers
             .get(&req.target)
@@ -9682,8 +9875,9 @@ impl MeshNode {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 target = format!("{:#x}", req.target),
-                "rendezvous: target peer not directly connected; dropping",
+                "rendezvous: target peer not directly connected; rejecting",
             );
+            send_reject(RejectReason::NoSessionWithTarget);
             return;
         };
 
@@ -9756,78 +9950,80 @@ impl MeshNode {
     ///   a trickle. Stage 2 replaces this cap with the full rendezvous
     ///   responder budget + typed `RendezvousRejected`.
     ///
-    /// Returns `true` to proceed to [`Self::schedule_punch`], `false`
-    /// to drop silently (answering an attacker is pure information
-    /// leak; the legitimate responder path re-arrives on the next
-    /// introduce once the counterpart's announcement folds in).
+    /// Returns `Some(slot)` — a reserved global concurrent-train slot,
+    /// held for the punch's lifetime — to proceed to
+    /// [`Self::schedule_punch`]; `None` to drop silently (answering an
+    /// attacker is pure information leak, and no requester is waiting
+    /// on the responder path; the legitimate responder re-arrives on
+    /// the next introduce once the counterpart's announcement folds
+    /// in).
+    ///
+    /// Beyond the Stage 1 IP validation, this charges the Stage 2
+    /// responder budgets (Finding 5): a per-source fixed-window cap on
+    /// how many unsolicited trains one introducing peer can trigger,
+    /// plus a global concurrent-train ceiling so a Sybil source set
+    /// can't multiply the aggregate.
     #[cfg(feature = "nat-traversal")]
     fn unsolicited_introduce_permitted(
         intro: &super::traversal::rendezvous::PunchIntroduce,
         from_node: u64,
         ctx: &DispatchCtx,
-    ) -> bool {
-        match super::behavior::fold::reflex_addr_for(&ctx.capability_fold, intro.peer) {
-            Some(cached) => {
-                if intro.peer_reflex.ip() != cached.ip() {
-                    tracing::trace!(
-                        from = from_node,
-                        counterpart = intro.peer,
-                        claimed = %intro.peer_reflex,
-                        announced = %cached,
-                        "rendezvous: unsolicited PunchIntroduce peer_reflex IP != \
-                         announced reflex; dropping (anti-reflection, Finding 4)"
-                    );
-                    return false;
-                }
-                true
-            }
-            None => {
-                // No signed reflex to validate against. Fall back to
-                // the temporary per-source cap (Finding 4 residual;
-                // Stage 2 formalizes this as a budget).
-                let ok = Self::unsolicited_introduce_rate_ok(
-                    from_node,
-                    &ctx.unsolicited_introduce_rate,
+    ) -> Option<TrainSlot> {
+        // 1. Anti-reflection (Finding 4): if we hold a signed reflex
+        //    for the claimed counterpart, the introduce's peer_reflex
+        //    must share its IP (symmetric NAT may shift the port, never
+        //    the public IP).
+        if let Some(cached) =
+            super::behavior::fold::reflex_addr_for(&ctx.capability_fold, intro.peer)
+        {
+            if intro.peer_reflex.ip() != cached.ip() {
+                tracing::trace!(
+                    from = from_node,
+                    counterpart = intro.peer,
+                    claimed = %intro.peer_reflex,
+                    announced = %cached,
+                    "rendezvous: unsolicited PunchIntroduce peer_reflex IP != \
+                     announced reflex; dropping (anti-reflection, Finding 4)"
                 );
-                if !ok {
-                    tracing::trace!(
-                        from = from_node,
-                        counterpart = intro.peer,
-                        "rendezvous: unsolicited PunchIntroduce for uncached \
-                         counterpart exceeded per-source cap; dropping"
-                    );
-                }
-                ok
+                return None;
             }
         }
-    }
 
-    /// Fixed-window rate check for [`Self::unsolicited_introduce_permitted`].
-    /// Returns `true` and charges one unit when the introducing peer
-    /// (`from_node`) is under the per-window cap; `false` when it has
-    /// exhausted the window. Window resets lazily on first check past
-    /// its end. Temporary — Stage 2 replaces it with the rendezvous
-    /// budget engine.
-    #[cfg(feature = "nat-traversal")]
-    fn unsolicited_introduce_rate_ok(
-        from_node: u64,
-        rate: &DashMap<u64, (u32, Instant)>,
-    ) -> bool {
-        const WINDOW: Duration = Duration::from_secs(10);
-        const MAX_PER_WINDOW: u32 = 4;
+        // 2. Per-source responder budget (Finding 5). Applies to every
+        //    unsolicited train — cached-match and uncached alike — so a
+        //    peer can't flood introduces even at a legitimate target.
+        let window = ctx.traversal_config.punch_budget_window;
+        if !ctx.rendezvous_budgets.charge_train(
+            from_node,
+            window,
+            ctx.traversal_config.punch_trains_per_window,
+        ) {
+            tracing::trace!(
+                from = from_node,
+                counterpart = intro.peer,
+                "rendezvous: unsolicited PunchIntroduce over per-source train \
+                 budget; dropping"
+            );
+            return None;
+        }
 
-        let now = Instant::now();
-        let mut entry = rate.entry(from_node).or_insert((0, now));
-        let (count, window_start) = entry.value_mut();
-        if now.duration_since(*window_start) >= WINDOW {
-            *count = 0;
-            *window_start = now;
+        // 3. Global concurrent-train ceiling (Finding 5). The slot is
+        //    released when the punch scheduler's observer task ends.
+        match ctx
+            .rendezvous_budgets
+            .try_train_slot(ctx.traversal_config.punch_trains_concurrent_max)
+        {
+            Some(slot) => Some(slot),
+            None => {
+                tracing::trace!(
+                    from = from_node,
+                    counterpart = intro.peer,
+                    "rendezvous: unsolicited PunchIntroduce over global concurrent-train \
+                     ceiling; dropping"
+                );
+                None
+            }
         }
-        if *count >= MAX_PER_WINDOW {
-            return false;
-        }
-        *count += 1;
-        true
     }
 
     /// Endpoint-side: schedule the keep-alive train + observer
@@ -9852,11 +10048,18 @@ impl MeshNode {
     /// Best-effort throughout: a failed send at any step is
     /// logged-and-skipped. Rendezvous is an optimization (plan
     /// framing); routed-handshake is always the safety net.
+    ///
+    /// `train_slot` is the responder budget's global concurrent-train
+    /// reservation (`Some` for an unsolicited train, `None` for an
+    /// initiator's own train, which isn't budget-gated). It is moved
+    /// into the observer task so the slot stays counted until the
+    /// punch resolves or times out, then released on drop.
     #[cfg(feature = "nat-traversal")]
     fn schedule_punch(
         coordinator_node_id: u64,
         intro: super::traversal::rendezvous::PunchIntroduce,
         ctx: &DispatchCtx,
+        train_slot: Option<TrainSlot>,
     ) {
         use super::traversal::rendezvous::{encode_keepalive, Keepalive, PunchAck, RendezvousMsg};
 
@@ -9940,6 +10143,11 @@ impl MeshNode {
         // for cleanup so the map-eviction race against a
         // replacement observer is handled in one place.
         tokio::spawn(async move {
+            // Hold the concurrent-train slot (if any) for the whole
+            // observer lifetime — it releases on drop when this task
+            // ends, so `concurrent_trains` reflects trains that are
+            // still plausibly live (≤ punch_deadline).
+            let _train_slot = train_slot;
             // The receive loop only fires this observer for a
             // keep-alive whose `sender_node_id` matches `peer` (the
             // expected id was stored alongside the oneshot at insert
@@ -14566,9 +14774,14 @@ impl MeshNode {
     ///   active session.
     /// - [`super::traversal::TraversalError::Transport`] on a socket-level send
     ///   failure.
+    /// - [`super::traversal::TraversalError::RendezvousRejected`] if the
+    ///   coordinator refused with a typed `PunchReject` (rate-limited, no
+    ///   cached target reflex, no session with the target, or the
+    ///   anti-reflection check failed). This resolves *immediately* — no
+    ///   `punch_deadline` wait — and carries the reason sub-kind.
     /// - [`super::traversal::TraversalError::PunchFailed`] if the coordinator
-    ///   doesn't introduce within [`super::traversal::TraversalConfig::punch_deadline`]
-    ///   (likely: R has no cached reflex for `target`).
+    ///   neither introduced nor rejected within
+    ///   [`super::traversal::TraversalConfig::punch_deadline`].
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
@@ -14627,7 +14840,14 @@ impl MeshNode {
 
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(intro)) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
+                // Coordinator refused with a typed reason — fast,
+                // non-timeout failure (Finding 5). The waiter was
+                // removed by the dispatch arm that delivered the
+                // reject; nothing to clean up here.
+                Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
+            }
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — another request_punch to the
                 // same target replaced our sender. Don't touch the
@@ -14674,7 +14894,10 @@ impl MeshNode {
             .insert(counterpart, (gen, coordinator, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(intro)) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
+                Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
+            }
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces

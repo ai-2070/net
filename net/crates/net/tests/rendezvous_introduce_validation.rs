@@ -367,3 +367,85 @@ async fn unsolicited_introduce_flood_from_one_source_is_capped() {
         "at least the first introduce must punch (control against a vacuous cap); got {got}",
     );
 }
+
+/// The global concurrent-train ceiling engages across *distinct*
+/// sources: three session peers, each under its own per-source budget
+/// (4 / window), collectively exceed the global ceiling (8), so only
+/// the ceiling's worth of trains are admitted — a Sybil source set
+/// can't multiply the aggregate. (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2,
+/// Finding 5.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsolicited_trains_are_globally_capped_across_sources() {
+    // Responder B plus three independent injectors, each with its own
+    // session to B.
+    let b = build_node().await;
+    let x1 = build_node().await;
+    let x2 = build_node().await;
+    let x3 = build_node().await;
+    connect_pair(&x1, &b).await;
+    connect_pair(&x2, &b).await;
+    connect_pair(&x3, &b).await;
+    b.start();
+    x1.start();
+    x2.start();
+    x3.start();
+
+    let b_addr = b.local_addr();
+
+    // One distinct victim listener per introduce. Distinct
+    // `peer_reflex` addresses matter: the punch-observer map is keyed
+    // by `peer_reflex`, so a shared victim would let each new introduce
+    // evict (and instantly complete) the prior observer, releasing its
+    // slot before the next arrives — the trains would never overlap and
+    // the ceiling would never bind. With distinct victims each train
+    // holds its slot for `punch_deadline` (the victim never answers),
+    // so all 12 genuinely contend for the 8 global slots at once.
+    let mut victims = Vec::new();
+    for _ in 0..12 {
+        victims.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    }
+
+    // 3 sources × 4 introduces = 12, all under the per-source cap (4),
+    // so the per-source budget admits every one — only the global
+    // ceiling (8) can gate them.
+    let fire_at = now_unix_ms();
+    let mut idx = 0usize;
+    for (src_i, x) in [&x1, &x2, &x3].iter().enumerate() {
+        for j in 0..4u64 {
+            let victim_addr = victims[idx].local_addr().unwrap();
+            inject_introduce(
+                x,
+                b_addr,
+                PunchIntroduce {
+                    peer: 0xC0DE_0000_0000_0000 | ((src_i as u64) << 8) | j,
+                    peer_reflex: victim_addr,
+                    fire_at_ms: fire_at,
+                },
+            )
+            .await;
+            idx += 1;
+        }
+    }
+
+    // Let the admitted trains land (keep-alives fire at 0/100/250 ms).
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Count how many victims received a train. The global ceiling caps
+    // this at 8; a rejected introduce never reaches the keep-alive
+    // sender, so its victim stays silent.
+    let mut trains = 0;
+    for v in &victims {
+        if train_fired(v, Duration::from_millis(50)).await {
+            trains += 1;
+        }
+    }
+    assert!(
+        trains <= 8,
+        "global concurrent ceiling should admit at most 8 trains; got {trains}",
+    );
+    assert!(
+        trains >= 4,
+        "several trains should be admitted across sources (control against a \
+         vacuous ceiling); got {trains}",
+    );
+}
