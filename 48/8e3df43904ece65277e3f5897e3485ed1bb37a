@@ -1,0 +1,42 @@
+net/crates/net/sdk/src/mesh.rs
+  s_d15043c27a0f20::t_7cba528eb33054 1315-1318
+web/src/content/docs/guides/nat-and-traversal.md
+  s_d15043c27a0f20::t_8eed3174b34b52 74
+net/crates/net/src/adapter/net/traversal/mod.rs
+  s_d15043c27a0f20::t_800e605df73e71 74-80
+  s_d15043c27a0f20::t_59c01908c7067a 553-580
+net/crates/net/bindings/python/src/lib.rs
+  s_d15043c27a0f20::t_7cba528eb33054 2689-2693
+go/net.h
+  s_d15043c27a0f20::t_7cba528eb33054 642-646
+net/crates/net/bindings/node/src/lib.rs
+  s_d15043c27a0f20::t_8eed3174b34b52 256-263,2506-2511
+net/crates/net/src/ffi/mesh.rs
+  s_d15043c27a0f20::t_e538018f68303a 795-821,846-848,1136-1138,1171-1173
+  s_d15043c27a0f20::t_b159eb5b924bdd 4083-4117
+  s_d15043c27a0f20::t_4774011c53e4cf 1259-1263
+net/crates/net/docs/plans/NAT_TRAVERSAL_V2_PLAN.md
+  s_d15043c27a0f20::t_8eed3174b34b52 366
+net/crates/net/include/net.go.h
+  s_d15043c27a0f20::t_7cba528eb33054 657-661
+go/mesh.go
+  s_d15043c27a0f20::t_8eed3174b34b52 421-427
+net/crates/net/src/adapter/net/mesh.rs
+  s_d15043c27a0f20::t_31f3a8def26ab3 11824-11830
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "488e3df43904ece65277e3f5897e3485ed1bb37a",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
