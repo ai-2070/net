@@ -13093,6 +13093,26 @@ impl MeshNode {
         self.traversal_stats.snapshot()
     }
 
+    /// Whether the session to `peer_id` reachable at `addr` is
+    /// **relay-routed** rather than direct. Signal: `addr_to_node[addr]`
+    /// — the node owning that transport address — is someone *other
+    /// than* `peer_id` (a relay), or the address isn't registered at
+    /// all. A direct session's address is owned by the peer itself. An
+    /// unknown address counts as relayed — the conservative default
+    /// that makes the upgrade loop re-examine it and coordinator
+    /// selection exclude it. Single source of truth for the
+    /// relayed-vs-direct test shared by [`Self::select_punch_coordinator`],
+    /// [`Self::attempt_direct_upgrade`], and
+    /// [`Self::upgrade_is_loop_candidate`], so the three can't drift
+    /// apart on the default or the ownership rule.
+    #[cfg(feature = "nat-traversal")]
+    fn is_relayed_peer(&self, peer_id: u64, addr: &SocketAddr) -> bool {
+        self.addr_to_node
+            .get(addr)
+            .map(|owner| *owner != peer_id)
+            .unwrap_or(true)
+    }
+
     /// Pick a rendezvous coordinator for a punch to `target`, without
     /// the caller having to name one (`NAT_TRAVERSAL_V2_PLAN.md`
     /// decision 5). Four tiers, graceful degradation:
@@ -13140,23 +13160,14 @@ impl MeshNode {
             if nid == target || nid == self.node_id {
                 continue;
             }
-            // Only genuinely DIRECT peers qualify (cubic P2): the
-            // peer table also holds relay-routed sessions, whose
-            // `addr` is the relay's — the ownership test below is
-            // the same relayed-vs-direct signal the upgrade loop
-            // uses. A routed "coordinator" is doubly wrong: our
-            // PunchRequest would go to the relay's address (where
-            // the relay's own session can't decrypt it), and even
-            // if it arrived, the coordinator's anti-reflection
-            // guard compares our claimed reflex against the address
-            // it reaches US at — a relay's address for a routed
-            // pair — and would reject the legitimate request.
-            let direct = self
-                .addr_to_node
-                .get(&entry.value().addr)
-                .map(|owner| *owner == nid)
-                .unwrap_or(false);
-            if !direct {
+            // Only genuinely DIRECT peers qualify (cubic P2): the peer
+            // table also holds relay-routed sessions whose `addr` is the
+            // relay's. A routed "coordinator" is doubly wrong — our
+            // PunchRequest would land at the relay's address (whose
+            // session can't decrypt it), and even if it arrived, the
+            // coordinator's anti-reflection guard would reject the
+            // routed pair anyway.
+            if self.is_relayed_peer(nid, &entry.value().addr) {
                 continue;
             }
             any.push(nid);
@@ -14821,15 +14832,9 @@ impl MeshNode {
             return;
         };
 
-        // Still relay-routed? `addr_to_node[addr] != peer_id` is the
-        // relay signal; if it already maps to the peer the session is
-        // direct — nothing to do.
-        let relayed = self
-            .addr_to_node
-            .get(&relay_addr)
-            .map(|n| *n != peer_id)
-            .unwrap_or(true);
-        if !relayed {
+        // Still relay-routed? A direct session is already on the best
+        // path — nothing to upgrade.
+        if !self.is_relayed_peer(peer_id, &relay_addr) {
             self.upgrade_record_done(peer_id);
             return;
         }
@@ -14922,12 +14927,7 @@ impl MeshNode {
             return false;
         };
         // Relay-routed only — a direct session has nothing to upgrade.
-        let relayed = self
-            .addr_to_node
-            .get(&addr)
-            .map(|n| *n != peer_id)
-            .unwrap_or(true);
-        if !relayed {
+        if !self.is_relayed_peer(peer_id, &addr) {
             return false;
         }
         self.upgrade_should_attempt(peer_id)
