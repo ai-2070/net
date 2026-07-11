@@ -199,12 +199,13 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
 
     // Stronger assertion: the behavioral consequence. A fires a
     // PunchRequest through R asking to punch to B. Coordinator
-    // looks up B's reflex, gets None (index evicted), and — since
-    // Stage 2 (Finding 5) — sends a typed `PunchReject` so A fails
-    // fast with `unknown-target-reflex` instead of burning the full
-    // `punch_deadline`. Same outcome as "B never announced": the
-    // reject reason itself proves the index no longer serves B's
-    // stale reflex.
+    // looks up B's reflex, gets None (index evicted), and sends a
+    // typed `PunchReject` so A fails fast with
+    // `unknown-target-reflex` instead of burning the full
+    // `punch_deadline` (the rendezvous fast-fail contract — see
+    // `docs/plans/NAT_TRAVERSAL_V2_PLAN.md`). Same outcome as "B
+    // never announced": the reject reason itself proves the index
+    // no longer serves B's stale reflex.
     let start = tokio::time::Instant::now();
     let result = a.request_punch(r.node_id(), b_id, a.local_addr()).await;
     let elapsed = start.elapsed();

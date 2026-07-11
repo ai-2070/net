@@ -580,3 +580,95 @@ async fn coordinator_rate_limits_requests_from_one_requester() {
         "rate-limit rejection should be fast; elapsed {elapsed:?}",
     );
 }
+
+/// A `PunchReject` whose `punch_id` doesn't match the pending
+/// waiter's is IGNORED — the waiter keeps waiting for its own
+/// answer (cubic P2). Without the id echo, a delayed reject for an
+/// earlier concurrent request to the same target would fail the
+/// replacement request; `target` alone is not a unique correlation
+/// key.
+///
+/// Setup: R silently drops the punch fan-out (partition filter on
+/// B), so A's waiter stays pending. R — the *legitimately bound*
+/// coordinator, so the sender check passes — then sends a
+/// hand-crafted reject with a punch_id A never minted. A must NOT
+/// fail fast with `RendezvousRejected`; it waits out the deadline
+/// and times out (`PunchFailed`), and the stale reject is not
+/// counted in `punch_rejections`.
+///
+/// Timing budget: ~punch_deadline (5 s default).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_punch_id_reject_does_not_fail_the_pending_request() {
+    use net::adapter::net::traversal::rendezvous::{PunchReject, RejectReason, RendezvousMsg};
+    use net::adapter::net::traversal::SUBPROTOCOL_RENDEZVOUS;
+
+    let (a, r, b, _x) = rendezvous_topology().await;
+
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_bind = a.local_addr();
+    let b_bind = b.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(a_id) == Some(a_bind)
+                && r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+        })
+        .await,
+        "R should see both reflexes",
+    );
+
+    // Silent drop: R passes every reject branch but drops the
+    // fan-out at the partition check — A's waiter stays pending.
+    r.block_peer(b_bind);
+
+    let a_task = a.clone();
+    let r_id = r.node_id();
+    let request = tokio::spawn(async move { a_task.request_punch(r_id, b_id, a_bind).await });
+
+    // Let the request land and the waiter install, then have R —
+    // the bound coordinator — send a reject with a punch_id that A
+    // never minted (ids start at 1 and count up; u32::MAX is
+    // unreachable in this test's lifetime).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stale = RendezvousMsg::PunchReject(PunchReject {
+        target: b_id,
+        punch_id: u32::MAX,
+        reason: RejectReason::RateLimited,
+    })
+    .encode();
+    let a_addr_from_r = r.peer_addr(a_id).expect("R has A's addr");
+    r.send_subprotocol(a_addr_from_r, SUBPROTOCOL_RENDEZVOUS, &stale)
+        .await
+        .expect("stale reject send");
+
+    let start = tokio::time::Instant::now();
+    let result = request.await.expect("request task panicked");
+    match result {
+        Err(TraversalError::PunchFailed) => {}
+        other => {
+            panic!("a stale-punch_id reject must be ignored (waiter times out); got {other:?}",)
+        }
+    }
+    // It waited out the deadline rather than fast-failing on the
+    // stale reject (300ms of the deadline elapsed pre-join).
+    assert!(
+        start.elapsed() >= Duration::from_secs(3),
+        "must not resolve early on the stale reject",
+    );
+
+    let stats = a.traversal_stats();
+    assert_eq!(
+        stats.punch_rejections, 0,
+        "a stale reject must not count as a rejection",
+    );
+    assert_eq!(stats.punch_timeouts, 1, "the wait timed out normally");
+}

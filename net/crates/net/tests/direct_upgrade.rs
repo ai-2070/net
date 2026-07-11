@@ -253,6 +253,13 @@ async fn busy_relay_session_defers_then_upgrades() {
         Some(b_bind),
         "once quiescent the session should upgrade to the direct path",
     );
+    // Attempt/success stay in lockstep: the earlier deferral counted
+    // as neither, the quiescent retry as exactly one of each.
+    assert_eq!(
+        a.traversal_stats().upgrades_attempted,
+        1,
+        "one upgrade attempt (the deferral was not an attempt)"
+    );
     assert_eq!(
         a.traversal_stats().upgrades_succeeded,
         1,

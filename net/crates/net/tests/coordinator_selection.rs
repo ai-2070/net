@@ -242,3 +242,70 @@ async fn connect_direct_auto_open_pair_needs_no_coordinator() {
         "Direct auto path resolves on B's reflex",
     );
 }
+
+/// Relay-routed peer-table entries are NEVER coordinator candidates
+/// (cubic P2). A session reached via a relay has the relay's address
+/// in its `PeerInfo` — a `PunchRequest` sent there can't even reach
+/// the peer (the relay's own session can't decrypt it), and the
+/// peer's anti-reflection guard would reject the request anyway
+/// (it reaches us via a relay address, not our reflex).
+///
+/// Deterministic in both directions: P is `relay-capable` and would
+/// win tier 2 outright pre-fix (regardless of node-id ordering);
+/// post-fix P is excluded as routed and the only direct peer R wins
+/// tier 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_peer_is_never_a_coordinator_candidate() {
+    let a = build_node().await;
+    let r = build_node().await;
+    let p = build_node().await;
+    // A—R and P—R direct; A and P never connect directly.
+    connect_pair(&a, &r).await;
+    connect_pair(&p, &r).await;
+    a.start();
+    r.start();
+    p.start();
+
+    // P advertises relay-capable; the announcement crosses R into
+    // A's index. P has a single peer so classification no-ops and
+    // its announcement carries no reflex — poll the fold's entry
+    // presence instead (the tags ride the same announcement).
+    p.announce_capabilities(CapabilitySet::new().with_relay_capable())
+        .await
+        .expect("P announce");
+    let p_id = p.node_id();
+    let a_poll = a.clone();
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            a_poll.test_capability_fold_has(p_id)
+        })
+        .await,
+        "P's announcement should reach A's index via R",
+    );
+
+    // Give A a relay-routed session to P through R.
+    let r_bind = r.local_addr();
+    let p_pub = *p.public_key();
+    a.connect_via(r_bind, &p_pub, p_id)
+        .await
+        .expect("relay-routed connect_via");
+    assert_eq!(
+        a.peer_addr(p_id),
+        Some(r_bind),
+        "precondition: A's session to P rides the relay",
+    );
+
+    // Selection for an unrelated target must skip routed P — even
+    // though P is relay-capable (tier 2) — and land on direct R.
+    let selected = a.select_punch_coordinator(PHANTOM_TARGET);
+    assert_ne!(
+        selected,
+        Some(p_id),
+        "a relay-routed peer must never be selected as coordinator",
+    );
+    assert_eq!(
+        selected,
+        Some(r.node_id()),
+        "the only direct peer (R) should win tier 3",
+    );
+}

@@ -560,11 +560,18 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
 /// Waiter map for incoming `PunchIntroduce` messages keyed by the
 /// counterpart endpoint's `node_id`. Value is `(generation,
-/// expected coordinator node id, oneshot sender)`. Used by the
-/// rendezvous-coordinated punch flow to bind introduce delivery
-/// to the relay the local node sent `PunchRequest` to.
+/// expected coordinator node id, punch_id, oneshot sender)`. Used
+/// by the rendezvous-coordinated punch flow to bind introduce
+/// delivery to the relay the local node sent `PunchRequest` to.
+/// `punch_id` is the wire correlation token the request carried —
+/// a `PunchReject` resolves the waiter only when it echoes the
+/// same id (cubic P2: `target` alone conflates concurrent
+/// requests; a delayed reject for a superseded request must not
+/// fail its replacement). Waiters installed without a request
+/// (`await_punch_introduce`) hold the never-minted sentinel `0`.
 #[cfg(feature = "nat-traversal")]
-type PendingPunchIntroduces = Arc<DashMap<u64, (u64, u64, oneshot::Sender<PunchIntroduceOutcome>)>>;
+type PendingPunchIntroduces =
+    Arc<DashMap<u64, (u64, u64, u32, oneshot::Sender<PunchIntroduceOutcome>)>>;
 
 /// Waiter map for incoming `PunchAck` messages keyed by the sender
 /// endpoint's `node_id`. Value is `(generation, expected coordinator
@@ -2816,6 +2823,17 @@ pub struct MeshNode {
     /// (`connect_direct` + `request_punch` both affected).
     #[cfg(feature = "nat-traversal")]
     next_waiter_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Wire correlation tokens for outbound `PunchRequest`s.
+    /// Distinct from `next_waiter_gen` (a local-only guard): this
+    /// value rides the wire and is echoed by `PunchReject` so the
+    /// requester can tell a reject for ITS request from a delayed
+    /// reject for a superseded concurrent request to the same
+    /// target (cubic P2). Starts at 1 — `0` is the reserved
+    /// no-request sentinel used by `await_punch_introduce`
+    /// waiters. u32 wraparound is harmless: collisions would need
+    /// two in-flight requests 2^32 mints apart.
+    #[cfg(feature = "nat-traversal")]
+    next_punch_id: Arc<std::sync::atomic::AtomicU32>,
     /// Keep-alive observers for in-progress punches, keyed by
     /// the `SocketAddr` we're watching for inbound traffic (the
     /// counterpart's `peer_reflex`). The value pairs the expected
@@ -3684,6 +3702,8 @@ impl MeshNode {
             pending_punch_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "nat-traversal")]
+            next_punch_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             #[cfg(feature = "nat-traversal")]
             nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
@@ -6753,10 +6773,10 @@ impl MeshNode {
                         // and was silently dropped.
                         let took = ctx
                             .pending_punch_introduces
-                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _)| {
+                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _pid, _)| {
                                 *expected_coord == from_node
                             });
-                        if let Some((_, (_gen, _expected, tx))) = took {
+                        if let Some((_, (_gen, _expected, _pid, tx))) = took {
                             // Initiator role: we asked for this punch,
                             // so the introduce is trusted — it's bound
                             // to the coordinator we recorded when we
@@ -6856,20 +6876,36 @@ impl MeshNode {
                         // session peer could forge a reject and abort a
                         // legitimate in-flight punch (a cheap DoS on the
                         // optimization).
-                        let took = ctx
-                            .pending_punch_introduces
-                            .remove_if(&rej.target, |_, (_gen, expected_coord, _)| {
-                                *expected_coord == from_node
-                            });
-                        if let Some((_, (_gen, _expected, tx))) = took {
+                        //
+                        // ALSO require the punch_id echo to match the
+                        // waiter's (cubic P2): two concurrent
+                        // request_punch calls to the same target replace
+                        // each other's waiter, and a delayed reject for
+                        // the superseded request must not fail its
+                        // replacement. A mismatched id leaves the waiter
+                        // in place — the replacement request gets its
+                        // own answer (or its own timeout). Introduces
+                        // deliberately stay id-free: a late introduce
+                        // carries equally-valid reflex data for the
+                        // replacement request, so conflation is benign
+                        // there (full ack/introduce correlation is the
+                        // deferred stage-6 punch_id work).
+                        let took = ctx.pending_punch_introduces.remove_if(
+                            &rej.target,
+                            |_, (_gen, expected_coord, pid, _)| {
+                                *expected_coord == from_node && *pid == rej.punch_id
+                            },
+                        );
+                        if let Some((_, (_gen, _expected, _pid, tx))) = took {
                             let _ = tx.send(PunchIntroduceOutcome::Rejected(rej.reason));
                         } else {
                             tracing::trace!(
                                 from = from_node,
                                 target = rej.target,
+                                punch_id = rej.punch_id,
                                 reason = rej.reason.kind(),
                                 "rendezvous: PunchReject with no matching waiter / \
-                                 non-coordinator sender; dropping"
+                                 non-coordinator sender / stale punch_id; dropping"
                             );
                         }
                     }
@@ -9918,11 +9954,16 @@ impl MeshNode {
         let reject_session = a_session.clone();
         let reject_socket = ctx.socket.clone();
         let reject_target = req.target;
+        // Echo the request's correlation token so A's waiter can
+        // tell this reject answers THIS request, not a superseded
+        // concurrent one to the same target (cubic P2).
+        let reject_punch_id = req.punch_id;
         let send_reject = move |reason: RejectReason| {
             let session = reject_session.clone();
             let socket = reject_socket.clone();
             let body = RendezvousMsg::PunchReject(PunchReject {
                 target: reject_target,
+                punch_id: reject_punch_id,
                 reason,
             })
             .encode();
@@ -13073,6 +13114,25 @@ impl MeshNode {
             if nid == target || nid == self.node_id {
                 continue;
             }
+            // Only genuinely DIRECT peers qualify (cubic P2): the
+            // peer table also holds relay-routed sessions, whose
+            // `addr` is the relay's — the ownership test below is
+            // the same relayed-vs-direct signal the upgrade loop
+            // uses. A routed "coordinator" is doubly wrong: our
+            // PunchRequest would go to the relay's address (where
+            // the relay's own session can't decrypt it), and even
+            // if it arrived, the coordinator's anti-reflection
+            // guard compares our claimed reflex against the address
+            // it reaches US at — a relay's address for a routed
+            // pair — and would reject the legitimate request.
+            let direct = self
+                .addr_to_node
+                .get(&entry.value().addr)
+                .map(|owner| *owner == nid)
+                .unwrap_or(false);
+            if !direct {
+                continue;
+            }
             any_min = Some(any_min.map_or(nid, |m| m.min(nid)));
             let is_relay_capable =
                 super::behavior::fold::capability_tags_for(&self.capability_fold, nid)
@@ -15494,16 +15554,30 @@ impl MeshNode {
         let gen = self
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Wire correlation token, echoed by any PunchReject this
+        // request draws. Skip the reserved 0 sentinel on wrap.
+        let punch_id = {
+            let mut id = self
+                .next_punch_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if id == 0 {
+                id = self
+                    .next_punch_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            id
+        };
         // Bind to the relay we're sending PunchRequest to — only
         // that node is authorized to send the matching introduce
         // back. Without this, any session peer could forge a
         // PunchIntroduce for `target` and complete this oneshot
         // with attacker-chosen reflex data.
         self.pending_punch_introduces
-            .insert(target, (gen, relay, tx));
+            .insert(target, (gen, relay, punch_id, tx));
 
         let body = RendezvousMsg::PunchRequest(PunchRequest {
             target,
+            punch_id,
             self_reflex,
         })
         .encode();
@@ -15512,7 +15586,7 @@ impl MeshNode {
             .await
         {
             self.pending_punch_introduces
-                .remove_if(&target, |_, (g, _, _)| *g == gen);
+                .remove_if(&target, |_, (g, _, _, _)| *g == gen);
             return Err(TraversalError::Transport(e.to_string()));
         }
 
@@ -15539,7 +15613,7 @@ impl MeshNode {
             }
             Err(_elapsed) => {
                 self.pending_punch_introduces
-                    .remove_if(&target, |_, (g, _, _)| *g == gen);
+                    .remove_if(&target, |_, (g, _, _, _)| *g == gen);
                 self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
@@ -15575,7 +15649,7 @@ impl MeshNode {
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending_punch_introduces
-            .insert(counterpart, (gen, coordinator, tx));
+            .insert(counterpart, (gen, coordinator, 0, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
@@ -15588,7 +15662,7 @@ impl MeshNode {
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces
-                    .remove_if(&counterpart, |_, (g, _, _)| *g == gen);
+                    .remove_if(&counterpart, |_, (g, _, _, _)| *g == gen);
                 self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
