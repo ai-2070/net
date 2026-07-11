@@ -981,6 +981,27 @@ impl NetSession {
     pub fn stream_count(&self) -> usize {
         self.streams.len()
     }
+
+    /// `true` if any application stream is currently open on this
+    /// session. Control-plane traffic rides a separate sequence space
+    /// and is not counted. Used by the NAT-traversal direct-path
+    /// upgrade's busy gate (`NAT_TRAVERSAL_V2_PLAN.md` C3): a session
+    /// carrying live streams must not be swapped out from under them.
+    pub fn has_open_streams(&self) -> bool {
+        !self.streams.is_empty()
+    }
+
+    /// `true` if any stream on this session has unacked in-flight
+    /// reliable data (a non-empty retransmit window). Walks the live
+    /// streams and short-circuits on the first with pending packets.
+    /// Companion to [`Self::has_open_streams`] for the upgrade busy
+    /// gate — swapping the session would drop this in-flight data with
+    /// no retransmit on the new session.
+    pub fn has_unacked(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|entry| entry.value().with_reliability(|r| r.has_pending()))
+    }
 }
 
 impl std::fmt::Debug for NetSession {

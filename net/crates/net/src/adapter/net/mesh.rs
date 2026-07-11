@@ -818,6 +818,17 @@ enum RoutedRotationOutcome {
     /// static must wait for its existing session to time out before
     /// the new keys are accepted.
     RefuseFresh,
+    /// A same-static re-handshake arrived (would normally rotate),
+    /// but the existing session is **live and busy** — it has open
+    /// application streams or unacked in-flight reliable data. Swapping
+    /// now would drop that in-flight state with no retransmit on the
+    /// new session (`NAT_TRAVERSAL_V2_PLAN.md` C3, responder half).
+    /// Refuse like `RefuseFresh` (drop msg1); the initiator's upgrade
+    /// fails cleanly and retries, and the relay-routed session stays
+    /// intact. Bounded: once the session goes quiescent — or idle past
+    /// `session_timeout`, so a genuinely dead path recovering after a
+    /// NAT rebind isn't blocked — a later re-handshake rotates.
+    DeferBusy,
     /// No conflict (or the existing session has timed out). The
     /// caller should construct a fresh session and insert it under
     /// the same entry guard.
@@ -849,6 +860,20 @@ fn routed_rotation_outcome(
         // ephemeral.
         if existing.last_initiator_ephemeral.as_ref() == Some(new_ephemeral) {
             return RoutedRotationOutcome::DropReplay;
+        }
+        // Legitimate re-handshake. Normally rotates — but if the
+        // existing session is live (not idle past `session_timeout`)
+        // and busy (open streams or unacked in-flight data), defer:
+        // swapping now would drop that in-flight state (C3). Keying
+        // liveness on `is_timed_out` bounds the deferral to
+        // `session_timeout` — a genuinely dead path (e.g. the peer's
+        // NAT rebound) stops delivering inbound, times out, and the
+        // next re-handshake rotates, so recovery is never blocked
+        // for longer than a fresh-static rotation would be.
+        let live = !existing.session.is_timed_out(session_timeout);
+        let busy = existing.session.has_open_streams() || existing.session.has_unacked();
+        if live && busy {
+            return RoutedRotationOutcome::DeferBusy;
         }
         return RoutedRotationOutcome::AcceptRotation;
     }
@@ -4036,6 +4061,11 @@ impl MeshNode {
     /// route + peer entry + reverse address index. The
     /// `addr_mode` determines how `addr_to_node` is touched —
     /// see [`AddrInstallMode`] for the rationale per caller.
+    ///
+    /// Unconditional last-writer-wins: any existing session for the
+    /// peer is replaced. For the compare-and-swap variant used by the
+    /// NAT-traversal direct-path upgrade, see
+    /// [`Self::install_peer_cas`].
     fn install_peer(
         &self,
         peer_node_id: u64,
@@ -4043,6 +4073,37 @@ impl MeshNode {
         keys: SessionKeys,
         addr_mode: AddrInstallMode,
     ) {
+        // `None` expected → unconditional install; always returns true.
+        self.install_peer_cas(peer_node_id, peer_addr, keys, addr_mode, None);
+    }
+
+    /// Peer-install with an optional compare-and-swap against the
+    /// current session_id (`NAT_TRAVERSAL_V2_PLAN.md` C2).
+    ///
+    /// When `expected_prior_session_id` is `Some(sid)`, the install
+    /// proceeds only if the peer's current session_id equals `sid` —
+    /// i.e. nothing replaced the session since the caller observed it.
+    /// A background direct-path upgrade uses this so that a racing
+    /// inbound rotation (which the upgrade's handshake didn't know
+    /// about) wins and is NOT clobbered — the last-writer-wins
+    /// nondeterminism is removed from the upgrade path specifically.
+    /// The check + insert are atomic under the DashMap entry's shard
+    /// write lock.
+    ///
+    /// Returns `true` if the session was installed, `false` if the CAS
+    /// check failed (the caller should treat its upgrade as lost and
+    /// leave the current session — typically the working relay path —
+    /// intact).
+    fn install_peer_cas(
+        &self,
+        peer_node_id: u64,
+        peer_addr: SocketAddr,
+        keys: SessionKeys,
+        addr_mode: AddrInstallMode,
+        expected_prior_session_id: Option<u64>,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -4054,19 +4115,42 @@ impl MeshNode {
         // PeerInfo so we can populate the reverse index
         // (PERF_AUDIT §2.4).
         let session_id = session.session_id();
+        let new_entry = PeerInfo {
+            node_id: peer_node_id,
+            addr: peer_addr,
+            session,
+            remote_static_pub,
+            // Initiator-side: replay-guard is a responder-side
+            // concern, leave empty.
+            last_initiator_ephemeral: None,
+        };
+
+        // CAS + insert atomically under the entry's shard write lock.
+        // On a failed CAS we mutate nothing (no route, no reverse
+        // index) and bail, so a lost upgrade leaves the working
+        // session untouched.
+        let displaced: Option<PeerInfo> = match self.peers.entry(peer_node_id) {
+            Entry::Occupied(mut occ) => {
+                if let Some(expected) = expected_prior_session_id {
+                    if occ.get().session.session_id() != expected {
+                        return false;
+                    }
+                }
+                Some(occ.insert(new_entry))
+            }
+            Entry::Vacant(vac) => {
+                if expected_prior_session_id.is_some() {
+                    // CAS expected a prior session, but it's gone (torn
+                    // down). Abort rather than resurrect a session the
+                    // upgrade didn't intend to create.
+                    return false;
+                }
+                vac.insert(new_entry);
+                None
+            }
+        };
+
         self.router.add_route(peer_node_id, peer_addr);
-        let displaced = self.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: peer_addr,
-                session,
-                remote_static_pub,
-                // Initiator-side: replay-guard is a
-                // responder-side concern, leave empty.
-                last_initiator_ephemeral: None,
-            },
-        );
         self.peer_addrs.insert(peer_node_id, peer_addr);
         // Old direct address of a re-handshaking peer, captured
         // before `displaced` is consumed below (RT-5: address
@@ -4082,9 +4166,19 @@ impl MeshNode {
         // forever. Eviction before insert keeps the fresh mapping
         // even in the (cryptographically improbable) case where
         // the new handshake derived the same session_id.
-        if let Some(old) = displaced {
+        if let Some(old) = &displaced {
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
+            // displaced session's stale reverse-addr mapping when its
+            // addr differs from the new one (a relay→direct swap leaves
+            // the old relay addr behind otherwise). Guard on ownership
+            // so we never evict an entry another peer legitimately owns
+            // (e.g. a shared relay addr).
+            if old.addr != peer_addr {
+                self.addr_to_node
+                    .remove_if(&old.addr, |_, n| *n == peer_node_id);
+            }
         }
         self.session_id_to_node.insert(session_id, peer_node_id);
         // A fresh session incarnation restarts the peer's
@@ -4120,6 +4214,7 @@ impl MeshNode {
                 self.addr_to_node.entry(peer_addr).or_insert(peer_node_id);
             }
         }
+        true
     }
 
     /// Accept a connection from a peer. Performs Noise NKpsk0 as responder.
@@ -5637,6 +5732,17 @@ impl MeshNode {
                              session is still within session_timeout. New keys \
                              can be installed once the live session has gone \
                              silent for at least session_timeout (rotation gate)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::DeferBusy => {
+                        tracing::debug!(
+                            peer_node_id,
+                            "routed handshake: deferring key rotation — existing \
+                             session is live and busy (open streams / unacked \
+                             in-flight data). Swapping now would drop that state; \
+                             the initiator retries once the session is quiescent \
+                             (direct-path upgrade C3 busy gate)"
                         );
                         return;
                     }
@@ -16935,6 +17041,108 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// Direct-path upgrade C2: `install_peer_cas` refuses to overwrite
+    /// when the peer's current session_id no longer matches the one
+    /// the upgrade observed — a racing handshake won, and clobbering it
+    /// is exactly the F5 nondeterminism the CAS removes. The working
+    /// session is left intact.
+    #[tokio::test]
+    async fn install_peer_cas_refuses_on_session_id_mismatch() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Cu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0xAB_CD_EF_01u64;
+        let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
+        let (relay_keys, _) = make_session_keys();
+        let relay_session_id = relay_keys.session_id;
+        node.install_peer(peer_id, relay_addr, relay_keys, AddrInstallMode::RoutedPreserve);
+
+        // A racing rotation installs a DIFFERENT session for the peer
+        // (simulated by a plain install). The upgrade below still holds
+        // the OLD session_id as its expectation.
+        let (raced_keys, _) = make_session_keys();
+        let raced_session_id = raced_keys.session_id;
+        node.install_peer(peer_id, relay_addr, raced_keys, AddrInstallMode::RoutedPreserve);
+
+        // Upgrade tries to install a punched session but expects the
+        // pre-race session_id → CAS must refuse.
+        let punched_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let (punch_keys, _) = make_session_keys();
+        let installed = node.install_peer_cas(
+            peer_id,
+            punched_addr,
+            punch_keys,
+            AddrInstallMode::DirectOverwrite,
+            Some(relay_session_id),
+        );
+        assert!(!installed, "CAS must refuse when the session_id changed");
+        // The raced session survives untouched.
+        assert_eq!(
+            node.peers.get(&peer_id).map(|p| p.value().session.session_id()),
+            Some(raced_session_id),
+            "the racing session must be left intact after a refused CAS",
+        );
+        assert!(
+            !node.addr_to_node.contains_key(&punched_addr),
+            "a refused CAS must not touch addr_to_node",
+        );
+    }
+
+    /// C2 happy path: when the observed session_id still matches,
+    /// `install_peer_cas` installs the new (punched) session and the
+    /// C4 hygiene removes the displaced relay addr's stale reverse
+    /// mapping.
+    #[tokio::test]
+    async fn install_peer_cas_installs_and_cleans_stale_addr_on_match() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Du8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x11_22_33_44u64;
+        // Direct install so addr_to_node[old_addr] = peer_id (a
+        // stale mapping the swap should clean up).
+        let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let (first_keys, _) = make_session_keys();
+        let first_session_id = first_keys.session_id;
+        node.install_peer(peer_id, old_addr, first_keys, AddrInstallMode::DirectOverwrite);
+        assert_eq!(
+            node.addr_to_node.get(&old_addr).map(|e| *e),
+            Some(peer_id),
+            "precondition: old addr maps to the peer",
+        );
+
+        let new_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let (punch_keys, _) = make_session_keys();
+        let punch_session_id = punch_keys.session_id;
+        let installed = node.install_peer_cas(
+            peer_id,
+            new_addr,
+            punch_keys,
+            AddrInstallMode::DirectOverwrite,
+            Some(first_session_id),
+        );
+        assert!(installed, "CAS must install when the session_id matches");
+        assert_eq!(
+            node.peers.get(&peer_id).map(|p| p.value().session.session_id()),
+            Some(punch_session_id),
+            "the punched session must replace the old one",
+        );
+        assert_eq!(
+            node.addr_to_node.get(&new_addr).map(|e| *e),
+            Some(peer_id),
+            "the new addr must map to the peer",
+        );
+        assert!(
+            !node.addr_to_node.contains_key(&old_addr),
+            "C4: the displaced addr's stale reverse mapping must be removed",
+        );
+    }
+
     /// PERF_AUDIT §2.8 regression — the grant-path fast path must
     /// be SELF-PRIMING: a fallback resolution publishes the node id
     /// onto the session so the next packet takes the tier-1 atomic
@@ -17310,6 +17518,60 @@ mod heartbeat_aead_tests {
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
             routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
+            RoutedRotationOutcome::AcceptRotation,
+        );
+    }
+
+    /// Direct-path upgrade C3 (responder half): a same-static
+    /// re-handshake that would normally rotate is DEFERRED when the
+    /// existing session is live and busy (an open application stream),
+    /// so an in-flight transfer isn't dropped by the swap.
+    #[test]
+    fn routed_rotation_outcome_defers_while_session_busy() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        // Open an application stream → the session is now "busy".
+        session.get_or_create_stream(1);
+        assert!(session.has_open_streams(), "precondition: session is busy");
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+        };
+        // Same static, fresh ephemeral, live (30 s timeout) + busy.
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_secs(30)),
+            RoutedRotationOutcome::DeferBusy,
+        );
+    }
+
+    /// The DeferBusy liveness bound: a busy session that has gone idle
+    /// past `session_timeout` rotates anyway (AcceptRotation), so a
+    /// genuinely dead path — e.g. the peer recovering after a NAT
+    /// rebind — is never blocked by stale "busy" state.
+    #[test]
+    fn routed_rotation_outcome_accepts_busy_session_past_timeout() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        session.get_or_create_stream(1);
+        assert!(session.has_open_streams(), "precondition: session is busy");
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+        };
+        // Let the session go idle past a 1 ms timeout — not live.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_millis(1)),
             RoutedRotationOutcome::AcceptRotation,
         );
     }

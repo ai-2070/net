@@ -118,6 +118,17 @@ pub struct TraversalStats {
     port_mapping_external: ArcSwapOption<std::net::SocketAddr>,
     /// Count of successful renewal ticks since install.
     port_mapping_renewals: AtomicU64,
+    /// Background direct-path upgrades started (a relay-routed
+    /// session for which the pair matrix and outcome cache elected
+    /// to attempt a punch). `NAT_TRAVERSAL_V2_PLAN.md` Stage 3.
+    upgrades_attempted: AtomicU64,
+    /// Upgrades that landed a direct session (the relay-routed
+    /// session was replaced by the punched path).
+    upgrades_succeeded: AtomicU64,
+    /// Upgrades deferred because the session was busy (open streams
+    /// / unacked in-flight data) at swap time — the C3 busy gate.
+    /// Deferred upgrades retry later; they are not failures.
+    upgrades_deferred_busy: AtomicU64,
 }
 
 /// Consistent point-in-time view of the [`TraversalStats`]
@@ -149,6 +160,15 @@ pub struct TraversalStatsSnapshot {
     /// Cumulative count of successful renewal ticks since the
     /// current mapping was installed. Resets on a fresh install.
     pub port_mapping_renewals: u64,
+    /// Background direct-path upgrades started (Stage 3). See
+    /// [`TraversalStats`] for the field semantics.
+    pub upgrades_attempted: u64,
+    /// Upgrades that replaced a relay-routed session with a punched
+    /// direct session.
+    pub upgrades_succeeded: u64,
+    /// Upgrades deferred by the C3 busy gate (retried later; not a
+    /// failure).
+    pub upgrades_deferred_busy: u64,
 }
 
 impl TraversalStats {
@@ -170,6 +190,9 @@ impl TraversalStats {
             port_mapping_active: self.port_mapping_active.load(Ordering::Relaxed),
             port_mapping_external: self.port_mapping_external.load_full().map(|arc| *arc),
             port_mapping_renewals: self.port_mapping_renewals.load(Ordering::Relaxed),
+            upgrades_attempted: self.upgrades_attempted.load(Ordering::Relaxed),
+            upgrades_succeeded: self.upgrades_succeeded.load(Ordering::Relaxed),
+            upgrades_deferred_busy: self.upgrades_deferred_busy.load(Ordering::Relaxed),
         }
     }
 
@@ -190,6 +213,28 @@ impl TraversalStats {
     /// punch-failed.
     pub(crate) fn record_relay_fallback(&self) {
         self.relay_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `upgrades_attempted`. Called when a background direct-path
+    /// upgrade begins its punch (Stage 3).
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_upgrade_attempt(&self) {
+        self.upgrades_attempted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `upgrades_succeeded`. Called when an upgrade replaces the
+    /// relay-routed session with a punched direct session.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_upgrade_success(&self) {
+        self.upgrades_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `upgrades_deferred_busy`. Called when the C3 busy gate
+    /// defers an upgrade because the session had open streams / unacked
+    /// data at swap time.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_upgrade_deferred_busy(&self) {
+        self.upgrades_deferred_busy.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a freshly-installed port mapping. Flips
