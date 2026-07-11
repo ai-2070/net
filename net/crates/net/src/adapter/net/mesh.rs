@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwapOption;
 use std::sync::Arc;
@@ -883,6 +883,11 @@ struct DispatchCtx {
     route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
     /// RT-5: inbound-withdrawal seq ordering gate.
     route_withdraw_gate: Arc<WithdrawalSeqGate>,
+    /// RT-5: count of dispatch-path cascade tasks currently in
+    /// flight, capped at `MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES` so a
+    /// distinct-dest withdrawal storm can't pin the receive loop
+    /// (Finding 4).
+    route_withdraw_cascades_inflight: Arc<AtomicUsize>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2208,6 +2213,18 @@ const EVENT_PINGWAVE_RESEND_DELAY: Duration = Duration::from_millis(50);
 /// someone else's.
 const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
 
+/// RT-5 review Finding 4: ceiling on concurrently in-flight
+/// dispatch-path cascade tasks. The per-dest damper bounds same-dest
+/// re-floods, but a peer that forges pingwaves for many distinct
+/// fake origins (installing `(fake_dest via attacker)` routes) then
+/// withdraws them would otherwise drive one full-graph `path_to`
+/// scan + cascade flood per dest. Cascades run off the receive loop
+/// on spawned tasks; this caps how many run at once. Over the cap the
+/// route is still dropped and anti-entropy repairs the missing
+/// alternate/cascade, so the only cost of the bound is slower
+/// convergence under a cascade storm — never a correctness loss.
+const MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES: usize = 64;
+
 /// RT-5 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): flood a
 /// poison-reverse [`RouteWithdrawal`] — "`dest` is unreachable via
 /// ME" — to every connected peer except `dest` itself and
@@ -2216,10 +2233,13 @@ const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
 /// closure (which runs before `Self` exists in `MeshNode::new`) and
 /// the dispatch-path cascade share one implementation.
 ///
-/// Packets are built synchronously per peer (the packet pool is
-/// thread-local; each ride the peer's encrypted session like any
-/// subprotocol frame) and the sends run on a spawned task so sync
-/// callers never block on socket I/O.
+/// The caller only snapshots the target peers' `(addr, session)`
+/// pairs synchronously (cheap `Arc` clones); the per-peer AEAD
+/// packet build AND the sends both run on the spawned task, so a
+/// sync caller — the failure-detector callback or the dispatch-path
+/// cascade on the single receive loop — never blocks on encryption
+/// or socket I/O (RT-5 review Finding 4; mirrors
+/// `forward_capability_announcement`, which also builds in-task).
 fn spawn_route_withdrawal_flood(
     seq_counter: &Arc<AtomicU64>,
     damper: &Arc<DashMap<u64, std::time::Instant>>,
@@ -2253,14 +2273,10 @@ fn spawn_route_withdrawal_flood(
         damper.retain(|_, t| now.saturating_duration_since(*t) < ROUTE_WITHDRAW_DAMP_WINDOW);
     }
 
-    let payload = RouteWithdrawal {
-        dest,
-        seq: seq_counter.fetch_add(1, Ordering::Relaxed),
-    }
-    .to_bytes();
-    let events = vec![Bytes::copy_from_slice(&payload)];
-    let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
-    let mut sends: Vec<(Bytes, SocketAddr)> = Vec::new();
+    // Snapshot targets (Arc clones only) — cheap even at high peer
+    // counts. The withdrawal's own `seq` is authored once here so
+    // every peer sees the same value (per-dest ordering gate input).
+    let mut targets: Vec<(SocketAddr, Arc<NetSession>)> = Vec::new();
     for entry in peers.iter() {
         let peer_id = *entry.key();
         if peer_id == dest || Some(peer_id) == exclude {
@@ -2270,24 +2286,32 @@ fn spawn_route_withdrawal_flood(
         if partition_filter.contains(&addr) {
             continue;
         }
-        let session = &entry.value().session;
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
-        let mut builder = session.thread_local_pool().get();
-        let packet = builder.build_subprotocol(
-            stream_id,
-            seq,
-            &events,
-            PacketFlags::NONE,
-            SUBPROTOCOL_ROUTE_WITHDRAW,
-        );
-        sends.push((packet, addr));
+        targets.push((addr, entry.value().session.clone()));
     }
-    if sends.is_empty() {
+    if targets.is_empty() {
         return;
     }
+    let payload = RouteWithdrawal {
+        dest,
+        seq: seq_counter.fetch_add(1, Ordering::Relaxed),
+    }
+    .to_bytes();
+    let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
     let socket = socket.clone();
     tokio::spawn(async move {
-        for (packet, addr) in sends {
+        let events = [Bytes::copy_from_slice(&payload)];
+        for (addr, session) in targets {
+            let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+            let packet = {
+                let mut builder = session.thread_local_pool().get();
+                builder.build_subprotocol(
+                    stream_id,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    SUBPROTOCOL_ROUTE_WITHDRAW,
+                )
+            };
             let _ = socket.send_to(&packet, addr).await;
         }
     });
@@ -2704,6 +2728,11 @@ pub struct MeshNode {
     /// dead-peer eviction so a fresh incarnation's reset counter
     /// isn't mistaken for stale.
     route_withdraw_gate: Arc<WithdrawalSeqGate>,
+    /// In-flight dispatch-path cascade tasks (RT-5 review Finding 4).
+    /// Shared into `DispatchCtx`; caps how many `path_to`+cascade
+    /// tasks run at once so a distinct-dest withdrawal storm can't
+    /// pin the receive loop.
+    route_withdraw_cascades_inflight: Arc<AtomicUsize>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -3323,6 +3352,7 @@ impl MeshNode {
             route_withdraw_seq,
             route_withdraw_damper,
             route_withdraw_gate: Arc::new(WithdrawalSeqGate::new()),
+            route_withdraw_cascades_inflight: Arc::new(AtomicUsize::new(0)),
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -4606,6 +4636,7 @@ impl MeshNode {
             route_withdraw_seq: self.route_withdraw_seq.clone(),
             route_withdraw_damper: self.route_withdraw_damper.clone(),
             route_withdraw_gate: self.route_withdraw_gate.clone(),
+            route_withdraw_cascades_inflight: self.route_withdraw_cascades_inflight.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -8701,6 +8732,50 @@ impl MeshNode {
         )
     }
 
+    /// Try to install a proximity-graph alternate route to `dest`
+    /// whose first hop is a live, direct peer other than the
+    /// withdrawing `from_node`. Returns true iff a route was
+    /// installed. Runs the O(E) `path_to` scan, so callers invoke it
+    /// off the receive loop (RT-5 review Finding 4).
+    #[allow(clippy::too_many_arguments)]
+    fn try_promote_graph_alternate(
+        proximity_graph: &ProximityGraph,
+        router: &NetRouter,
+        peer_addrs: &DashMap<u64, SocketAddr>,
+        addr_to_node: &DashMap<SocketAddr, u64>,
+        failure_detector: &FailureDetector,
+        dest: u64,
+        from_node: u64,
+        via_addr: SocketAddr,
+    ) -> bool {
+        let Some(path) = proximity_graph.path_to(&node_id_to_graph_id(dest)) else {
+            return false;
+        };
+        // path[0] is self, path[1] the first hop.
+        let Some(first_hop) = path.get(1).map(graph_id_to_node_id) else {
+            return false;
+        };
+        if first_hop == from_node {
+            return false;
+        }
+        let Some(addr) = peer_addrs.get(&first_hop).map(|a| *a.value()) else {
+            return false;
+        };
+        // Same LIVE + DIRECT gate as the direct path, keyed on the
+        // first hop — a relayed or Failed first hop must fall through
+        // to the cascade.
+        if !Self::promotable_direct_hop(addr_to_node, failure_detector, first_hop, addr, via_addr) {
+            return false;
+        }
+        // Metric mirrors the pingwave-install convention (hops beyond
+        // the first + 2): here path.len()-2 intermediate hops + 2.
+        let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
+        router
+            .routing_table()
+            .add_route_with_metric(dest, addr, metric);
+        true
+    }
+
     /// RT-5 receive side: the session peer `from_node` declared it
     /// no longer forwards toward `dest`. Drop exactly our
     /// `(dest, next_hop = from_node)` route and the matching
@@ -8798,46 +8873,61 @@ impl MeshNode {
                 return;
             }
         }
-        if let Some(path) = ctx.proximity_graph.path_to(&node_id_to_graph_id(dest)) {
-            // path[0] is self, path[1] the first hop; metric mirrors
-            // the pingwave-install convention (hops beyond the first
-            // + 2), here path.len()-2 intermediate hops + 2.
-            if let Some(first_hop) = path.get(1).map(graph_id_to_node_id) {
-                if first_hop != from_node {
-                    if let Some(addr) = ctx.peer_addrs.get(&first_hop).map(|a| *a.value()) {
-                        // Same LIVE + DIRECT gate as above, keyed on
-                        // the first hop — a relayed or Failed first
-                        // hop must fall through to the cascade.
-                        if Self::promotable_direct_hop(
-                            &ctx.addr_to_node,
-                            &ctx.failure_detector,
-                            first_hop,
-                            addr,
-                            via_addr,
-                        ) {
-                            let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
-                            ctx.router
-                                .routing_table()
-                                .add_route_with_metric(dest, addr, metric);
-                            return;
-                        }
-                    }
-                }
-            }
+        // No direct alternate. What remains — the O(E) proximity-
+        // graph `path_to` scan for a relayed alternate, and (if none)
+        // the cascade flood — is the expensive tail a forged-origin
+        // withdrawal storm would use to pin the single receive loop.
+        // Move it onto a bounded spawned task so the dispatch loop
+        // returns now, and cap concurrency so the storm can't spawn
+        // unboundedly (RT-5 review Finding 4). The route is already
+        // dropped; if we shed this task under load, anti-entropy
+        // repairs the alternate/cascade.
+        let inflight = ctx.route_withdraw_cascades_inflight.clone();
+        if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES {
+            inflight.fetch_sub(1, Ordering::AcqRel);
+            tracing::debug!(
+                dest = format!("{:#x}", dest),
+                "route-withdraw: cascade shed (over in-flight cap); anti-entropy repairs"
+            );
+            return;
         }
-        // No alternate: we just lost our last route to dest —
-        // cascade our own withdrawal so upstream nodes stop routing
-        // through us. Split horizon: never back toward the peer
-        // that told us.
-        spawn_route_withdrawal_flood(
-            &ctx.route_withdraw_seq,
-            &ctx.route_withdraw_damper,
-            &ctx.socket,
-            &ctx.peers,
-            &ctx.partition_filter,
-            dest,
-            Some(from_node),
-        );
+        let proximity_graph = ctx.proximity_graph.clone();
+        let router = ctx.router.clone();
+        let peer_addrs = ctx.peer_addrs.clone();
+        let addr_to_node = ctx.addr_to_node.clone();
+        let failure_detector = ctx.failure_detector.clone();
+        let route_withdraw_seq = ctx.route_withdraw_seq.clone();
+        let route_withdraw_damper = ctx.route_withdraw_damper.clone();
+        let socket = ctx.socket.clone();
+        let peers = ctx.peers.clone();
+        let partition_filter = ctx.partition_filter.clone();
+        tokio::spawn(async move {
+            let promoted = Self::try_promote_graph_alternate(
+                &proximity_graph,
+                &router,
+                &peer_addrs,
+                &addr_to_node,
+                &failure_detector,
+                dest,
+                from_node,
+                via_addr,
+            );
+            if !promoted {
+                // No alternate: cascade our own withdrawal so upstream
+                // nodes stop routing through us. Split horizon: never
+                // back toward the peer that told us.
+                spawn_route_withdrawal_flood(
+                    &route_withdraw_seq,
+                    &route_withdraw_damper,
+                    &socket,
+                    &peers,
+                    &partition_filter,
+                    dest,
+                    Some(from_node),
+                );
+            }
+            inflight.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
