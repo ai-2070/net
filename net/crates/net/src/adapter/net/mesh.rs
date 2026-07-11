@@ -3792,6 +3792,11 @@ impl MeshNode {
             },
         );
         self.peer_addrs.insert(peer_node_id, peer_addr);
+        // Old direct address of a re-handshaking peer, captured
+        // before `displaced` is consumed below (RT-5: address
+        // migration for multi-hop routes, see the DirectOverwrite
+        // arm).
+        let displaced_addr = displaced.as_ref().map(|d| d.addr);
         // PERF_AUDIT §2.4: reverse-index update. Routed-local
         // dispatch reads this in O(1) instead of scanning peers
         // for a matching session_id. If this insert replaced an
@@ -3813,6 +3818,26 @@ impl MeshNode {
         self.route_withdraw_gate.forget_sender(peer_node_id);
         match addr_mode {
             AddrInstallMode::DirectOverwrite => {
+                // Re-handshake from a NEW direct address (NAT
+                // rebind): repoint any multi-hop routes still
+                // carrying this peer's previous address, and drop
+                // the stale reverse-index entry. Equal-metric
+                // pingwave refreshes never rewrite an installed
+                // `next_hop`, so without this migration those routes
+                // keep the old address forever and address-keyed ops
+                // — notably the RT-5 withdrawal match
+                // (`remove_route_if_next_hop_is`) — silently miss
+                // them, degrading withdrawals to age-out for this
+                // peer (RT-5 review Finding 6).
+                if let Some(old_addr) = displaced_addr {
+                    if old_addr != peer_addr {
+                        self.router
+                            .routing_table()
+                            .migrate_next_hop(old_addr, peer_addr);
+                        self.addr_to_node
+                            .remove_if(&old_addr, |_, n| *n == peer_node_id);
+                    }
+                }
                 self.addr_to_node.insert(peer_addr, peer_node_id);
             }
             AddrInstallMode::RoutedPreserve => {
@@ -3921,6 +3946,20 @@ impl MeshNode {
         self.addr_to_node.insert(peer_addr, peer_node_id);
 
         self.peer_addrs.insert(peer_node_id, peer_addr);
+        // Re-handshake from a new direct address: migrate multi-hop
+        // routes off the peer's previous address and drop its stale
+        // reverse-index entry — see the matching comment in
+        // `install_peer`'s DirectOverwrite arm (RT-5 review
+        // Finding 6).
+        if let Some(old_addr) = displaced.as_ref().map(|d| d.addr) {
+            if old_addr != peer_addr {
+                self.router
+                    .routing_table()
+                    .migrate_next_hop(old_addr, peer_addr);
+                self.addr_to_node
+                    .remove_if(&old_addr, |_, n| *n == peer_node_id);
+            }
+        }
         // PERF_AUDIT §2.4: evict the displaced session's reverse-
         // index entry before installing the fresh one — see the
         // matching comment in `install_peer`.

@@ -583,6 +583,33 @@ impl RoutingTable {
         removed
     }
 
+    /// Rewrite every route whose `next_hop` is `old` to point at
+    /// `new`, refreshing `updated_at` so the migrated entries aren't
+    /// immediately swept. Returns the number of entries migrated.
+    ///
+    /// Called when a peer re-handshakes from a new address (NAT
+    /// rebind): multi-hop routes learned through that peer still
+    /// carry its previous address as `next_hop`, and — because
+    /// equal-metric refreshes deliberately never overwrite an
+    /// installed `next_hop` — nothing else would ever repoint them.
+    /// Without this migration, address-keyed operations such as
+    /// [`Self::remove_route_if_next_hop_is`] (used by the RT-5 route
+    /// withdrawal receive path) silently miss those entries.
+    pub fn migrate_next_hop(&self, old: SocketAddr, new: SocketAddr) -> usize {
+        if old == new {
+            return 0;
+        }
+        let mut migrated = 0;
+        for mut entry in self.routes.iter_mut() {
+            if entry.next_hop == old {
+                entry.next_hop = new;
+                entry.updated_at = Instant::now();
+                migrated += 1;
+            }
+        }
+        migrated
+    }
+
     /// Look up next hop for destination.
     ///
     /// Returns `None` for stale routes — an entry whose `updated_at` is
@@ -1172,6 +1199,39 @@ mod tests {
             "equal-metric pingwave must not overwrite an installed \
              route's next_hop (security: prevents address poisoning)"
         );
+    }
+
+    /// RT-5 review Finding 6: a peer re-handshaking from a new
+    /// address must be able to repoint multi-hop routes that still
+    /// carry its old address, so address-keyed withdrawal matching
+    /// keeps working (equal-metric refreshes never rewrite next_hop,
+    /// so `migrate_next_hop` is the only path that repoints them).
+    #[test]
+    fn migrate_next_hop_repoints_matching_routes_only() {
+        let table = RoutingTable::new(0x1111);
+        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+
+        table.add_route(0xAAA, old); // via the re-handshaking peer
+        table.add_route(0xBBB, old); // also via it
+        table.add_route(0xCCC, other); // unrelated — must be untouched
+
+        let migrated = table.migrate_next_hop(old, new);
+        assert_eq!(migrated, 2, "exactly the two old-addr routes migrate");
+        assert_eq!(table.lookup(0xAAA), Some(new));
+        assert_eq!(table.lookup(0xBBB), Some(new));
+        assert_eq!(
+            table.lookup(0xCCC),
+            Some(other),
+            "unrelated route untouched"
+        );
+
+        // Post-migration, an address-keyed withdrawal match against
+        // the NEW address now succeeds where it previously missed.
+        assert!(table.remove_route_if_next_hop_is(0xAAA, new));
+        // A no-op migration (old == new) changes nothing.
+        assert_eq!(table.migrate_next_hop(new, new), 0);
     }
 
     /// Staleness: `lookup` must return `None` for entries whose
