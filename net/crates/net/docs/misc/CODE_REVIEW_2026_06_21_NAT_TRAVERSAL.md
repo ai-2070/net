@@ -42,9 +42,11 @@ and 5, plus a set of non-blocking minor notes.
 
 | Finding | Status | Commit | Test |
 |---|---|---|---|
-| 1 — UDP reflector | ⚠️ **Partially resolved** — coordinator path closed; direct path still open (Finding 4) | `b54329d88` | `rendezvous_coordinator.rs::request_punch_with_spoofed_self_reflex_ip_is_dropped`, `…_port_shifted_self_reflex_is_accepted` |
+| 1 — UDP reflector | ✅ **Resolved** — coordinator path (`b54329d88`) + direct path (Stage 1, see Finding 4) | `b54329d88` | `rendezvous_coordinator.rs::request_punch_with_spoofed_self_reflex_ip_is_dropped`, `…_port_shifted_self_reflex_is_accepted` |
 | 2 — `sender_node_id` unvalidated | ✅ **Resolved** (validation moved to receive loop after a cubic-flagged DoS in the first cut) | `fb151b4af` + follow-up | `punch_keepalive.rs::observer_acks_only_on_matching_sender_node_id`, `…::stray_keepalive_with_wrong_sender_does_not_burn_the_observer` |
 | 3 — unbounded `fire_at_ms` | ✅ **Resolved** | `9b56e6d41` | `mesh.rs::keepalive_offset_tests` (4 cases) |
+| 4 — direct unsolicited-introduce reflector | ✅ **Resolved** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 1 | this branch | `rendezvous_introduce_validation.rs` (4 cases) |
+| 5 — rate-limit budgets / `RendezvousRejected` | ⏳ Stage 2 (`NAT_TRAVERSAL_V2_PLAN.md`) | — | — |
 
 ### Finding 1 fix — bind `self_reflex` to A's session source IP
 
@@ -91,9 +93,10 @@ clamping and panic-freedom.
 
 ## Finding 1 — Rendezvous is an unauthenticated UDP reflector to attacker-chosen addresses (Medium)
 
-> **Status: partially resolved** (`b54329d88`) — coordinator path closed; the
-> direct unsolicited-introduce path is still open and is now tracked as
-> Finding 4. The original analysis below is retained as the historical record.
+> **Status: resolved** — coordinator path closed in `b54329d88`; the direct
+> unsolicited-introduce path (tracked as Finding 4) closed in
+> `NAT_TRAVERSAL_V2_PLAN.md` Stage 1. The original analysis below is retained as
+> the historical record.
 
 The punch responder fires UDP keep-alives at a **wire-supplied** address with no
 validation and no rate limit.
@@ -220,7 +223,22 @@ Clamp `base_lead` to a small multiple of `TraversalConfig::punch_fire_lead`
 
 ---
 
-## Finding 4 — Residual: the *direct* unsolicited `PunchIntroduce` reflector is still open (Low–Medium, Open)
+## Finding 4 — Residual: the *direct* unsolicited `PunchIntroduce` reflector (Low–Medium)
+
+> **Status: resolved** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 1. The
+> unsolicited (no-waiter) dispatch branch now gates every introduce through
+> `Mesh::unsolicited_introduce_permitted` before it reaches `schedule_punch`:
+> when a signed reflex for `intro.peer` is cached, the introduce's
+> `peer_reflex` must share its IP (only the port may differ, for symmetric
+> NAT) or the introduce is dropped; when no reflex is cached, a temporary
+> per-source fixed-window cap (`unsolicited_introduce_rate`, 4 / 10 s keyed by
+> the introducing session peer) admits only a trickle so an attacker naming a
+> nonexistent counterpart can't flood. Stage 2 replaces the temporary cap with
+> the full rendezvous responder budget + typed `RendezvousRejected`. Tests:
+> `tests/rendezvous_introduce_validation.rs` — `…_mismatched_ip_fires_no_train`
+> (drop), `…_port_shifted_same_ip_fires_train` (accept), `…_uncached_counterpart_still_punches`
+> (legitimate race), `…_flood_from_one_source_is_capped` (cap). The original
+> analysis below is retained as the historical record.
 
 Surfaced during the 2026-06-21 verification pass. Finding 1's fix guards the
 **coordinator-mediated** path only; the **direct** path from Finding 1's
@@ -279,23 +297,21 @@ a fast, typed failure instead of waiting out `punch_deadline`.
 
 ## Minor notes (non-blocking)
 
-1. **The Finding 1 guard assumes A is a *direct* session peer of R.**
-   `PeerInfo::addr` is the *relay's* address for relay-reached peers
-   (`mesh.rs:1130-1132`). If R ever reaches requester A via a relay, the guard
-   compares `self_reflex.ip()` against the relay IP and drops a legitimate
-   request → relay fallback. Correctness-preserving, and A↔R is direct in the
-   normal rendezvous topology, but the guard comment should state the
-   assumption.
+1. ✅ **Resolved (Stage 1).** The Finding 1 guard's direct-session assumption is
+   now stated in the `handle_punch_request` guard comment. (Was: the guard
+   compares `self_reflex.ip()` against `PeerInfo::addr`, which is the relay's
+   address for relay-reached peers — correctness-preserving since A↔R is direct
+   in the normal topology, but undocumented.) The same IP-only rationale is
+   mirrored in the new unsolicited-introduce guard.
 2. **IP-only binding has two acknowledged edges.** (a) IPv4-mapped-IPv6 or
    multi-public-IP CGNAT pools can drop a valid A (→ relay fallback); (b) under
    CGNAT a malicious A can still name `self_reflex = <shared IP>:<co-tenant port>`
    and reflect at a co-tenant behind the same public IP. Both are inherent to
-   "bind IP, allow any port for symmetric NAT" and are accepted tradeoffs.
-3. **Doc nit in `keepalive_send_offsets`.** Its comment says the clamp "bounds
-   the sender task's lifetime to the observer's." Because the `+100/+250 ms`
-   spacing is applied *after* the clamp, at the clamp extreme the sender outlives
-   the observer by up to 250 ms. Harmless (still bounded, panic-free), but
-   "to within ~250 ms of the observer's" would be exact.
+   "bind IP, allow any port for symmetric NAT" and are accepted tradeoffs. The
+   Stage 1 unsolicited-introduce guard inherits edge (b) identically.
+3. ✅ **Resolved (Stage 1).** The `keepalive_send_offsets` doc now says the clamp
+   bounds the sender task's lifetime "to within ~250 ms of the observer's",
+   accounting for the post-clamp `+100/+250 ms` spacing.
 
 ---
 
@@ -327,12 +343,11 @@ a fast, typed failure instead of waiting out `punch_deadline`.
 ## Suggested follow-up
 
 The 2026-06-21 hardening pass landed Finding 1 (mitigation 1), Finding 2, and
-Finding 3. Remaining work, in priority order:
+Finding 3. `NAT_TRAVERSAL_V2_PLAN.md` Stage 1 then landed Finding 4 and minor
+notes 1 & 3. Remaining work:
 
-- **Finding 4** — close the direct unsolicited-introduce reflector by validating
-  `intro.peer_reflex` against the cached announced reflex of `intro.peer`.
-- **Finding 5** — add the per-requester / per-peer rate-limit budgets and wire
-  `RendezvousRejected` so the FFI-mapped error code stops being dead and the
-  Finding 1 drop becomes a typed, fast failure.
-- **Minor notes 1 & 3** — tighten the guard comment (direct-session assumption)
-  and the `keepalive_send_offsets` lifetime-bound wording.
+- **Finding 5** — `NAT_TRAVERSAL_V2_PLAN.md` Stage 2: add the per-requester /
+  per-peer rate-limit budgets (replacing Stage 1's temporary
+  `unsolicited_introduce_rate` cap) and wire `RendezvousRejected` so the
+  FFI-mapped error code stops being dead and the Finding 1 / Finding 4 drops
+  become typed, fast failures.

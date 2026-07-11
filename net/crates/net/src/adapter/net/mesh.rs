@@ -967,6 +967,11 @@ struct DispatchCtx {
             ),
         >,
     >,
+    /// Temporary per-source cap on unsolicited `PunchIntroduce`
+    /// messages. See the matching field doc on `MeshNode`
+    /// (`unsolicited_introduce_rate`).
+    #[cfg(feature = "nat-traversal")]
+    unsolicited_introduce_rate: Arc<DashMap<u64, (u32, Instant)>>,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
     /// since `TraversalConfig` is `Clone` and small. The dispatch
@@ -1888,7 +1893,10 @@ impl Drop for SweepGuard<'_> {
 ///   keep-alive sender task — which holds a socket handle + payload
 ///   — for that whole duration, with `start + offset` risking an
 ///   `Instant` overflow. Clamping bounds the sender task's lifetime
-///   to the observer's.
+///   to within ~250 ms of the observer's: the `+100/+250 ms` spacing
+///   below is applied *after* the clamp, so at the clamp extreme the
+///   last keep-alive fires at `deadline + 250 ms` — still bounded and
+///   panic-free, just not exactly co-terminous with the observer.
 /// - **floored at zero** by the saturating subtraction — a lead in
 ///   the past (clock skew, slow path) collapses to "fire
 ///   immediately."
@@ -2635,6 +2643,22 @@ pub struct MeshNode {
             ),
         >,
     >,
+    /// Fixed-window rate cap on *unsolicited* `PunchIntroduce`
+    /// messages, keyed by the introducing session peer's `node_id`.
+    /// The value is `(count-in-window, window-start)`.
+    ///
+    /// This is a **temporary** guard for review Finding 4: it gates
+    /// the case where an unsolicited introduce names a counterpart
+    /// for whom we have no cached reflex to validate against (see
+    /// [`Self::unsolicited_introduce_permitted`]). Without it, an
+    /// authenticated session peer could name a nonexistent
+    /// counterpart id — forcing the no-cached-reflex path — and
+    /// steer an unbounded volume of our keep-alive trains at an
+    /// attacker-chosen address. Stage 2 (`NAT_TRAVERSAL_V2_PLAN.md`
+    /// Finding 5) replaces this with the full per-source /
+    /// per-requester rendezvous budget + typed `RendezvousRejected`.
+    #[cfg(feature = "nat-traversal")]
+    unsolicited_introduce_rate: Arc<DashMap<u64, (u32, Instant)>>,
     /// Single-flight gate for the classification sweep.
     /// [`Self::reclassify_nat`] sets this on entry and clears it on
     /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
@@ -3479,6 +3503,8 @@ impl MeshNode {
             nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            unsolicited_introduce_rate: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 if initial_reflex_override.is_some() {
@@ -4794,6 +4820,8 @@ impl MeshNode {
             pending_punch_acks: self.pending_punch_acks.clone(),
             #[cfg(feature = "nat-traversal")]
             punch_observers: self.punch_observers.clone(),
+            #[cfg(feature = "nat-traversal")]
+            unsolicited_introduce_rate: self.unsolicited_introduce_rate.clone(),
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
@@ -6437,8 +6465,17 @@ impl MeshNode {
                                 *expected_coord == from_node
                             });
                         if let Some((_, (_gen, _expected, tx))) = took {
+                            // Initiator role: we asked for this punch,
+                            // so the introduce is trusted — it's bound
+                            // to the coordinator we recorded when we
+                            // sent the PunchRequest. Complete the
+                            // waiter (unblocks `request_punch`) and
+                            // fire our own keep-alive train.
                             let _ = tx.send(intro);
-                        } else if ctx.pending_punch_introduces.contains_key(&intro.peer) {
+                            Self::schedule_punch(from_node, intro, ctx);
+                            continue;
+                        }
+                        if ctx.pending_punch_introduces.contains_key(&intro.peer) {
                             // A waiter exists but the coordinator
                             // mismatched. Drop without completing
                             // and without scheduling a punch — this
@@ -6448,6 +6485,18 @@ impl MeshNode {
                                 target = intro.peer,
                                 "rendezvous: PunchIntroduce from non-coordinator session peer; dropping"
                             );
+                            continue;
+                        }
+                        // Unsolicited introduce — the responder role
+                        // (B never called `request_punch`), or a
+                        // forged direct introduce from an authenticated
+                        // session peer. `intro.peer_reflex` is wire-
+                        // supplied and, unguarded, would steer our
+                        // keep-alive train at an attacker-named victim
+                        // (review Finding 4). Validate it against the
+                        // counterpart's cached signed reflex before
+                        // firing.
+                        if !Self::unsolicited_introduce_permitted(&intro, from_node, ctx) {
                             continue;
                         }
                         Self::schedule_punch(from_node, intro, ctx);
@@ -9561,6 +9610,15 @@ impl MeshNode {
         // silently, exactly like any other coordinator-side drop, and
         // A's `connect_direct` falls back to the relay on its
         // timeout.
+        //
+        // Assumption: A is a *direct* session peer of R, so `a_addr`
+        // is A's own wire source. In the normal rendezvous topology A
+        // reaches its chosen coordinator directly, so this holds. If R
+        // ever reached A via a relay, `PeerInfo::addr` would be the
+        // relay's address and this guard would compare A's self-report
+        // against the relay IP and drop a legitimate request — but
+        // that only costs the optimization (A falls back to the
+        // relay), never correctness.
         if req.self_reflex.ip() != a_addr.ip() {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
@@ -9671,6 +9729,105 @@ impl MeshNode {
             );
             let _ = socket_b.send_to(&packet, b_addr).await;
         });
+    }
+
+    /// Gate an *unsolicited* `PunchIntroduce` (one with no local
+    /// waiter — the responder role, or a forged direct introduce)
+    /// before it drives a keep-alive train. Closes review Finding 4:
+    /// without this, any authenticated session peer could ship us a
+    /// forged introduce naming a victim's `ip:port` as `peer_reflex`,
+    /// and we would fire our keep-alive train there — turning this
+    /// node into a UDP reflector with the forger's identity hidden.
+    ///
+    /// Validation mirrors the coordinator-side anti-reflection guard
+    /// in [`Self::handle_punch_request`]:
+    ///
+    /// - If we hold a *cached, signed* reflex for the claimed
+    ///   counterpart (`intro.peer`, from its capability announcement),
+    ///   the introduce's `peer_reflex` must share that IP. Only the
+    ///   port may legitimately differ — a symmetric NAT rebinds the
+    ///   port per-destination but never the public IP. A mismatched IP
+    ///   is a spoofed target; drop.
+    /// - If no reflex is cached yet (fresh counterpart, announcement
+    ///   not yet folded — a legitimate race on a young mesh), we have
+    ///   nothing to validate against. Admit only through a
+    ///   conservative fixed-window per-source cap so a peer that names
+    ///   a nonexistent counterpart (to force this branch) gets at most
+    ///   a trickle. Stage 2 replaces this cap with the full rendezvous
+    ///   responder budget + typed `RendezvousRejected`.
+    ///
+    /// Returns `true` to proceed to [`Self::schedule_punch`], `false`
+    /// to drop silently (answering an attacker is pure information
+    /// leak; the legitimate responder path re-arrives on the next
+    /// introduce once the counterpart's announcement folds in).
+    #[cfg(feature = "nat-traversal")]
+    fn unsolicited_introduce_permitted(
+        intro: &super::traversal::rendezvous::PunchIntroduce,
+        from_node: u64,
+        ctx: &DispatchCtx,
+    ) -> bool {
+        match super::behavior::fold::reflex_addr_for(&ctx.capability_fold, intro.peer) {
+            Some(cached) => {
+                if intro.peer_reflex.ip() != cached.ip() {
+                    tracing::trace!(
+                        from = from_node,
+                        counterpart = intro.peer,
+                        claimed = %intro.peer_reflex,
+                        announced = %cached,
+                        "rendezvous: unsolicited PunchIntroduce peer_reflex IP != \
+                         announced reflex; dropping (anti-reflection, Finding 4)"
+                    );
+                    return false;
+                }
+                true
+            }
+            None => {
+                // No signed reflex to validate against. Fall back to
+                // the temporary per-source cap (Finding 4 residual;
+                // Stage 2 formalizes this as a budget).
+                let ok = Self::unsolicited_introduce_rate_ok(
+                    from_node,
+                    &ctx.unsolicited_introduce_rate,
+                );
+                if !ok {
+                    tracing::trace!(
+                        from = from_node,
+                        counterpart = intro.peer,
+                        "rendezvous: unsolicited PunchIntroduce for uncached \
+                         counterpart exceeded per-source cap; dropping"
+                    );
+                }
+                ok
+            }
+        }
+    }
+
+    /// Fixed-window rate check for [`Self::unsolicited_introduce_permitted`].
+    /// Returns `true` and charges one unit when the introducing peer
+    /// (`from_node`) is under the per-window cap; `false` when it has
+    /// exhausted the window. Window resets lazily on first check past
+    /// its end. Temporary — Stage 2 replaces it with the rendezvous
+    /// budget engine.
+    #[cfg(feature = "nat-traversal")]
+    fn unsolicited_introduce_rate_ok(
+        from_node: u64,
+        rate: &DashMap<u64, (u32, Instant)>,
+    ) -> bool {
+        const WINDOW: Duration = Duration::from_secs(10);
+        const MAX_PER_WINDOW: u32 = 4;
+
+        let now = Instant::now();
+        let mut entry = rate.entry(from_node).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+        if now.duration_since(*window_start) >= WINDOW {
+            *count = 0;
+            *window_start = now;
+        }
+        if *count >= MAX_PER_WINDOW {
+            return false;
+        }
+        *count += 1;
+        true
     }
 
     /// Endpoint-side: schedule the keep-alive train + observer
