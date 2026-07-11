@@ -4822,6 +4822,13 @@ impl MeshNode {
                         // `start_arc` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
+                        // Decision 8, trigger 2: if the observed
+                        // reflex drifted from the published one since
+                        // the last announce, run one classification
+                        // sweep first so tag + reflex ship together.
+                        // No drift → no sweep (cadence guard).
+                        #[cfg(feature = "nat-traversal")]
+                        node.reclassify_if_reflex_drifted().await;
                         // Re-announce the CURRENT baseline (None) — do
                         // not snapshot-and-overwrite, which would
                         // clobber a concurrent explicit announce
@@ -13113,7 +13120,10 @@ impl MeshNode {
                     Some(coord) => {
                         self.connect_direct(peer_node_id, peer_pubkey, coord).await
                     }
-                    None => Err(TraversalError::RendezvousNoRelay),
+                    None => {
+                        self.traversal_stats.record_rendezvous_no_relay();
+                        Err(TraversalError::RendezvousNoRelay)
+                    }
                 }
             }
         }
@@ -13473,6 +13483,12 @@ impl MeshNode {
                     Err(_) => {
                         self.pending_punch_acks
                             .remove_if(&peer_node_id, |_, (g, _, _)| *g == ack_gen);
+                        // Ack-wait deadline elapsed: the introduce
+                        // arrived but the counterpart's PunchAck never
+                        // did — the punch's one timeout for this flow
+                        // (the introduce wait resolved Ok, so
+                        // `request_punch` didn't count one).
+                        self.traversal_stats.record_punch_timeout();
                         let id = connect_via_coordinator(coord).await?;
                         self.traversal_stats.record_relay_fallback();
                         Ok(id)
@@ -15315,6 +15331,63 @@ impl MeshNode {
         }
     }
 
+    /// Reflex-diff re-classification trigger
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` decision 8, trigger 2). Called by
+    /// the capability re-announce loop before each periodic announce:
+    /// if the currently-observed reflex differs from the one in the
+    /// last *published* announcement, run exactly one classification
+    /// sweep first so the `nat:*` tag and the reflex field ship
+    /// together — a reflex that drifted since the last sweep (probe /
+    /// punch activity, gateway reboot) usually means the class is
+    /// stale too.
+    ///
+    /// Returns `true` iff a sweep ran. Deliberately conservative —
+    /// all of these skip (no sweep, `false`):
+    /// - an active reflex override (it pins `(class, reflex)`; the
+    ///   sweep would be short-circuited anyway),
+    /// - no prior published announcement (the initial announce path
+    ///   owns the first pair),
+    /// - no current observation (`reflex_addr = None` — the classify
+    ///   loop owns first population; announcing `None` is honest),
+    /// - observed == published (the no-flap cadence guard: steady
+    ///   state must not add sweeps to the re-announce tick).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_if_reflex_drifted(&self) -> bool {
+        use std::sync::atomic::Ordering as AtOrd;
+        if self.reflex_override_active.load(AtOrd::Acquire) {
+            return false;
+        }
+        let Some(published) = self.local_announcement.load_full() else {
+            return false;
+        };
+        let Some(observed) = self.reflex_addr() else {
+            return false;
+        };
+        if published.reflex_addr == Some(observed) {
+            return false;
+        }
+        self.reclassify_nat().await;
+        true
+    }
+
+    /// Testing hook: overwrite the observed reflex WITHOUT the
+    /// override pin (unlike [`Self::set_reflex_override`], which pins
+    /// `(class, reflex)` and short-circuits the classifier). Lets
+    /// tests simulate a between-announce reflex drift — something a
+    /// real deployment gets from probe/punch observations after a
+    /// gateway reboot, and loopback can never produce naturally —
+    /// so the reflex-diff trigger has something to reconcile. Runs
+    /// under `traversal_publish_mu` like every multi-field traversal
+    /// write.
+    #[cfg(feature = "nat-traversal")]
+    #[doc(hidden)]
+    pub fn set_reflex_for_test(&self, addr: SocketAddr) {
+        let _g = self.traversal_publish_mu.lock();
+        self.reflex_addr.store(Some(Arc::new(addr)));
+    }
+
     /// Testing / debugging hook: force this node's advertised
     /// `NatClass` without running the probe sweep. On loopback
     /// every node classifies as `Open`, which means the pair-type
@@ -15441,17 +15514,21 @@ impl MeshNode {
                 // non-timeout failure (Finding 5). The waiter was
                 // removed by the dispatch arm that delivered the
                 // reject; nothing to clean up here.
+                self.traversal_stats.record_punch_rejection();
                 Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
             }
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — another request_punch to the
                 // same target replaced our sender. Don't touch the
-                // map: the replacement owns the entry now.
+                // map: the replacement owns the entry now. Not a
+                // timeout — no reason counter (stage 5): the
+                // superseding call does its own accounting.
                 Err(TraversalError::PunchFailed)
             }
             Err(_elapsed) => {
                 self.pending_punch_introduces
                     .remove_if(&target, |_, (g, _, _)| *g == gen);
+                self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -15491,12 +15568,14 @@ impl MeshNode {
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
             Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
+                self.traversal_stats.record_punch_rejection();
                 Err(TraversalError::RendezvousRejected(reason.kind().to_string()))
             }
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces
                     .remove_if(&counterpart, |_, (g, _, _)| *g == gen);
+                self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
         }

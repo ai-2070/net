@@ -129,6 +129,20 @@ pub struct TraversalStats {
     /// / unacked in-flight data) at swap time — the C3 busy gate.
     /// Deferred upgrades retry later; they are not failures.
     upgrades_deferred_busy: AtomicU64,
+    /// Punch flows that gave up on a deadline (Stage 5, decision 7):
+    /// the coordinator neither introduced nor rejected within
+    /// `punch_deadline`, or the introduce arrived but the
+    /// counterpart's `PunchAck` never did. One increment per flow —
+    /// a single punch can time out on at most one of its waits.
+    punch_timeouts: AtomicU64,
+    /// Punch flows refused by a typed `PunchReject` (rate-limited,
+    /// unknown target reflex, no session with target, reflex
+    /// mismatch). Fast failures — no deadline was consumed.
+    punch_rejections: AtomicU64,
+    /// Punch-needing pairs skipped because no rendezvous coordinator
+    /// candidate existed (`select_punch_coordinator` tier 4). The
+    /// caller stays on the routed path.
+    rendezvous_no_relay: AtomicU64,
 }
 
 /// Consistent point-in-time view of the [`TraversalStats`]
@@ -169,6 +183,25 @@ pub struct TraversalStatsSnapshot {
     /// Upgrades deferred by the C3 busy gate (retried later; not a
     /// failure).
     pub upgrades_deferred_busy: u64,
+    /// **Derived**: `punches_attempted - punches_succeeded` — punches
+    /// whose coordinator mediation succeeded but that didn't land a
+    /// direct session. Computed at snapshot time; a punch in flight
+    /// at the observation instant counts as failed until it resolves
+    /// (the same cross-counter skew the struct doc already accepts).
+    pub punches_failed: u64,
+    /// Punch flows that gave up on a deadline. A **cause counter**,
+    /// not a partition of [`Self::punches_failed`]: an introduce-wait
+    /// timeout happens *before* the attempt is counted (no wire
+    /// mediation happened), so `punch_timeouts` can exceed
+    /// `punches_failed`.
+    pub punch_timeouts: u64,
+    /// Punch flows refused by a typed `PunchReject`. Cause counter —
+    /// rejections happen before mediation, so they don't contribute
+    /// to `punches_attempted` / `punches_failed`.
+    pub punch_rejections: u64,
+    /// Punch-needing pairs skipped for lack of any coordinator
+    /// candidate. Cause counter; the caller stayed on the routed path.
+    pub rendezvous_no_relay: u64,
 }
 
 impl TraversalStats {
@@ -183,9 +216,11 @@ impl TraversalStats {
     /// synchronization primitives, and cross-counter skew at
     /// observation time is meaningless.
     pub fn snapshot(&self) -> TraversalStatsSnapshot {
+        let punches_attempted = self.punches_attempted.load(Ordering::Relaxed);
+        let punches_succeeded = self.punches_succeeded.load(Ordering::Relaxed);
         TraversalStatsSnapshot {
-            punches_attempted: self.punches_attempted.load(Ordering::Relaxed),
-            punches_succeeded: self.punches_succeeded.load(Ordering::Relaxed),
+            punches_attempted,
+            punches_succeeded,
             relay_fallbacks: self.relay_fallbacks.load(Ordering::Relaxed),
             port_mapping_active: self.port_mapping_active.load(Ordering::Relaxed),
             port_mapping_external: self.port_mapping_external.load_full().map(|arc| *arc),
@@ -193,6 +228,13 @@ impl TraversalStats {
             upgrades_attempted: self.upgrades_attempted.load(Ordering::Relaxed),
             upgrades_succeeded: self.upgrades_succeeded.load(Ordering::Relaxed),
             upgrades_deferred_busy: self.upgrades_deferred_busy.load(Ordering::Relaxed),
+            // Derived, saturating: `succeeded` is bumped a beat after
+            // `attempted` on the success path, so a racing read could
+            // otherwise underflow.
+            punches_failed: punches_attempted.saturating_sub(punches_succeeded),
+            punch_timeouts: self.punch_timeouts.load(Ordering::Relaxed),
+            punch_rejections: self.punch_rejections.load(Ordering::Relaxed),
+            rendezvous_no_relay: self.rendezvous_no_relay.load(Ordering::Relaxed),
         }
     }
 
@@ -235,6 +277,32 @@ impl TraversalStats {
     #[cfg(feature = "nat-traversal")]
     pub(crate) fn record_upgrade_deferred_busy(&self) {
         self.upgrades_deferred_busy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `punch_timeouts`. Called when a punch flow's deadline
+    /// elapses — the introduce wait in `request_punch` /
+    /// `await_punch_introduce`, or the ack wait in `connect_direct`'s
+    /// `SinglePunch` arm. Oneshot-cancelled waits (superseded by a
+    /// concurrent call to the same target) are NOT timeouts and don't
+    /// count.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_punch_timeout(&self) {
+        self.punch_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `punch_rejections`. Called when a pending punch waiter
+    /// resolves with a typed `PunchReject` from the coordinator.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_punch_rejection(&self) {
+        self.punch_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `rendezvous_no_relay`. Called when a punch-needing pair
+    /// is skipped because `select_punch_coordinator` found no
+    /// candidate (tier 4).
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn record_rendezvous_no_relay(&self) {
+        self.rendezvous_no_relay.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a freshly-installed port mapping. Flips
@@ -423,5 +491,55 @@ mod error_kind_tests {
     fn rendezvous_rejected_display_carries_reason() {
         let e = TraversalError::RendezvousRejected("reflex-mismatch".into());
         assert_eq!(e.to_string(), "rendezvous-rejected: reflex-mismatch");
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod stats_snapshot_tests {
+    use super::*;
+
+    /// `punches_failed` is derived at snapshot time — mediated
+    /// attempts minus successes — and the reason counters are
+    /// independent cause counters, not a partition of it (Stage 5,
+    /// decision 7).
+    #[test]
+    fn punches_failed_derives_and_reason_counters_are_independent() {
+        let stats = TraversalStats::new();
+        let zero = stats.snapshot();
+        assert_eq!(zero.punches_failed, 0);
+        assert_eq!(zero.punch_timeouts, 0);
+        assert_eq!(zero.punch_rejections, 0);
+        assert_eq!(zero.rendezvous_no_relay, 0);
+
+        // 3 mediated attempts, 1 landed → 2 derived failures.
+        stats.record_punch_attempt();
+        stats.record_punch_attempt();
+        stats.record_punch_attempt();
+        stats.record_punch_success();
+        // Cause events: one ack-wait timeout (contributes to a
+        // derived failure) plus one pre-mediation rejection and one
+        // no-relay skip (which do NOT — no attempt was counted).
+        stats.record_punch_timeout();
+        stats.record_punch_rejection();
+        stats.record_rendezvous_no_relay();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.punches_attempted, 3);
+        assert_eq!(snap.punches_succeeded, 1);
+        assert_eq!(snap.punches_failed, 2, "derived: attempted - succeeded");
+        assert_eq!(snap.punch_timeouts, 1);
+        assert_eq!(snap.punch_rejections, 1);
+        assert_eq!(snap.rendezvous_no_relay, 1);
+    }
+
+    /// The derivation saturates: a success recorded between the two
+    /// counter loads (the racing-read window the snapshot doc
+    /// documents) must not underflow to u64::MAX.
+    #[test]
+    fn punches_failed_saturates_instead_of_underflowing() {
+        let stats = TraversalStats::new();
+        // Degenerate ordering: success without a recorded attempt.
+        stats.record_punch_success();
+        assert_eq!(stats.snapshot().punches_failed, 0, "saturating_sub");
     }
 }

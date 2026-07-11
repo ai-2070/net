@@ -199,23 +199,31 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
 
     // Stronger assertion: the behavioral consequence. A fires a
     // PunchRequest through R asking to punch to B. Coordinator
-    // looks up B's reflex, gets None (index evicted), drops
-    // silently. A times out with PunchFailed — the same outcome
-    // as "B never announced" (see §P1-4 test).
+    // looks up B's reflex, gets None (index evicted), and — since
+    // Stage 2 (Finding 5) — sends a typed `PunchReject` so A fails
+    // fast with `unknown-target-reflex` instead of burning the full
+    // `punch_deadline`. Same outcome as "B never announced": the
+    // reject reason itself proves the index no longer serves B's
+    // stale reflex.
     let start = tokio::time::Instant::now();
     let result = a.request_punch(r.node_id(), b_id, a.local_addr()).await;
     let elapsed = start.elapsed();
 
     match result {
-        Err(TraversalError::PunchFailed) => {}
+        Err(TraversalError::RendezvousRejected(reason)) => {
+            assert_eq!(
+                reason, "unknown-target-reflex",
+                "the reject reason should prove the eviction",
+            );
+        }
         other => panic!(
-            "expected PunchFailed after peer death (R has no reflex \
-             for evicted B), got {other:?}",
+            "expected fast RendezvousRejected(unknown-target-reflex) \
+             after peer death (R's index evicted B), got {other:?}",
         ),
     }
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "A should wait ~punch_deadline (5s) before failing (silent \
-         drop on R's side, no explicit rejection); elapsed {elapsed:?}",
+        elapsed < Duration::from_secs(4),
+        "typed rejection must resolve well inside punch_deadline \
+         (Finding 5's fast-fail contract); elapsed {elapsed:?}",
     );
 }
