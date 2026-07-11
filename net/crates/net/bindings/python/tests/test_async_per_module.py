@@ -167,13 +167,46 @@ def test_async_blob_round_trip(tmp_path) -> None:
     adapter_id = "tx-5-blob"
     register_filesystem_blob_adapter(adapter_id, str(tmp_path))
 
+    # The filesystem adapter accepts only `file:` URIs (its
+    # accepted-schemes gate applies on BOTH publish and resolve).
     async def _run() -> bytes:
-        encoded = await async_blob_publish(adapter_id, "tx5/sample", b"hello")
+        encoded = await async_blob_publish(adapter_id, "file:tx5/sample", b"hello")
         return await async_blob_resolve(adapter_id, encoded)
 
     try:
         out = asyncio.run(_run())
         assert out == b"hello"
+    finally:
+        unregister_blob_adapter(adapter_id)
+
+
+def test_async_blob_publish_rejects_unaccepted_scheme(tmp_path) -> None:
+    """Publishing through the file adapter with a URI it can't
+    later resolve (scheme-less, or a foreign scheme) fails fast with
+    ``BlobError`` instead of minting a poisoned ref. Regression for
+    the publish/resolve scheme-gate asymmetry this file's round-trip
+    test originally tripped over (its bare ``tx5/sample`` URI stored
+    fine, then could never be resolved)."""
+    try:
+        from net._net import (
+            BlobError,
+            async_blob_publish,
+            register_filesystem_blob_adapter,
+            unregister_blob_adapter,
+        )
+    except ImportError:
+        pytest.skip("dataforts feature not built into this wheel")
+
+    adapter_id = "tx-5-blob-scheme"
+    register_filesystem_blob_adapter(adapter_id, str(tmp_path))
+
+    async def _run(uri: str) -> None:
+        await async_blob_publish(adapter_id, uri, b"hello")
+
+    try:
+        for bad_uri in ("tx5/sample", "s3://attacker/key"):
+            with pytest.raises(BlobError, match="scheme not supported"):
+                asyncio.run(_run(bad_uri))
     finally:
         unregister_blob_adapter(adapter_id)
 
