@@ -46,7 +46,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Validate BEFORE touching any namespace, so a typo'd mode fails
+# loudly instead of silently building a cone topology (everything
+# unrecognized used to fall through to the cone masquerade).
+for mode in "$NAT_A" "$NAT_B"; do
+  case "$mode" in
+    cone|symmetric|none) ;;
+    *) echo "invalid NAT mode: '$mode' (want cone|symmetric|none)" >&2; exit 2 ;;
+  esac
+done
+# --public-b replaces side B's NAT'd joiner with a public address on
+# the bridge; combining it with a NAT'd B would build a contradictory
+# topology (both a public B address AND a private NAT'd B namespace).
+if [[ "$PUBLIC_B" == 1 && "$NAT_B" != "none" ]]; then
+  echo "--public-b requires --nat-b none (got --nat-b $NAT_B)" >&2
+  exit 2
+fi
+
 WAN=nsim_wan
+
+# `ip netns add` registers namespaces at /var/run/netns/<name>;
+# used to guard optional per-gateway steps (a side with NAT mode
+# `none` never creates its gateway namespace).
+netns_exists() { [[ -e "/var/run/netns/$1" ]]; }
 
 ip netns add "$WAN"
 ip -n "$WAN" link set lo up
@@ -104,19 +126,30 @@ one_side a 10.99.0.2 192.168.101 "$NAT_A"
 one_side b 10.99.0.3 192.168.102 "$NAT_B"
 
 if [[ "$DROP_DIRECT" == 1 ]]; then
-  # Drop UDP routed straight between the two public mappings, on both
-  # gateways' forward hooks. Traffic via R (10.99.0.10) / X (.11) is
-  # untouched, so introduce/ack forwarding and the routed fallback
-  # keep working — only the direct trains + punched path die.
-  ip netns exec nsim_gwa nft -f - <<'EOF'
+  # Drop UDP routed straight between the two sides' public addresses,
+  # on each gateway's forward hook. Traffic via R (10.99.0.10) /
+  # X (.11) is untouched, so introduce/ack forwarding and the routed
+  # fallback keep working — only the direct trains + punched path die.
+  #
+  # A side with NAT mode `none` has no gateway namespace (cubic P1:
+  # this used to `ip netns exec` unconditionally and crash under
+  # `set -e`). Guard each install on the namespace existing; a
+  # one-sided drop still kills the punch — the other side's observer
+  # never sees a train, so no ack is ever emitted — and kills direct
+  # handshakes in that direction.
+  if netns_exists nsim_gwa; then
+    ip netns exec nsim_gwa nft -f - <<'EOF'
 table ip filter {
   chain forward {
     type filter hook forward priority 0; policy accept;
     ip daddr 10.99.0.3 meta l4proto udp drop
+    ip daddr 10.99.0.12 meta l4proto udp drop
   }
 }
 EOF
-  ip netns exec nsim_gwb nft -f - <<'EOF'
+  fi
+  if netns_exists nsim_gwb; then
+    ip netns exec nsim_gwb nft -f - <<'EOF'
 table ip filter {
   chain forward {
     type filter hook forward priority 0; policy accept;
@@ -124,6 +157,11 @@ table ip filter {
   }
 }
 EOF
+  fi
+  if ! netns_exists nsim_gwa && ! netns_exists nsim_gwb; then
+    echo "--drop-direct with no NAT gateway on either side has nothing to drop" >&2
+    exit 2
+  fi
 fi
 
 echo "natsim: topology up (nat_a=$NAT_A nat_b=$NAT_B drop_direct=$DROP_DIRECT public_b=$PUBLIC_B)"

@@ -149,3 +149,91 @@ fn natsim_relay_session_upgrades_to_direct() {
         "upgraded session must sit on B's public addr, got {addr}",
     );
 }
+
+// =========================================================================
+// Configuration-validation guards (no root, no netns — run anywhere
+// the suite compiles). These pin the harness's fail-loudly behavior
+// from the cubic round-3 review: misconfiguration must exit 2 with a
+// clear message BEFORE any namespace is touched, never silently
+// build the wrong topology (or crash mid-provision under `set -e`).
+// =========================================================================
+
+/// Run setup.sh with the given args as a plain user. Validation
+/// happens before any privileged command, so these paths need no
+/// sudo.
+fn setup_sh(args: &[&str]) -> std::process::Output {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/natsim/setup.sh");
+    Command::new("bash")
+        .arg(script)
+        .args(args)
+        .output()
+        .expect("spawn setup.sh")
+}
+
+#[test]
+fn setup_rejects_unknown_nat_mode_before_touching_namespaces() {
+    // The typo case the review called out: "symmetricc" used to fall
+    // through to cone masquerade silently.
+    let out = setup_sh(&["--nat-b", "symmetricc"]);
+    assert_eq!(out.status.code(), Some(2), "invalid mode must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid NAT mode"),
+        "must name the problem; got: {stderr}",
+    );
+}
+
+#[test]
+fn setup_rejects_public_b_with_a_natted_b_side() {
+    // --public-b puts B on the bridge; a NAT'd B namespace alongside
+    // it would be a contradictory topology.
+    let out = setup_sh(&["--public-b"]);
+    assert_eq!(out.status.code(), Some(2), "conflicting config must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--public-b requires --nat-b none"),
+        "must name the conflict; got: {stderr}",
+    );
+}
+
+/// The helper binary refuses a joiner with no publics (upgrade mode
+/// used to panic on `public_infos[0]`). Needs the built example;
+/// skips when it isn't present (the natsim CI job always builds it
+/// first).
+#[test]
+fn helper_rejects_joiner_without_publics() {
+    let bin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/target/debug/examples/natsim_node"
+    );
+    if !std::path::Path::new(bin).exists() {
+        eprintln!("natsim_node example not built; skipping");
+        return;
+    }
+    let out = Command::new(bin)
+        .args([
+            "joiner",
+            "--name",
+            "a",
+            "--bind",
+            "127.0.0.1:0",
+            "--state",
+            "/tmp",
+            "--target",
+            "b",
+            "--mode",
+            "upgrade",
+        ])
+        .output()
+        .expect("spawn natsim_node");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "joiner without --publics must exit 2, not panic",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --publics"),
+        "must name the missing flag; got: {stderr}",
+    );
+}

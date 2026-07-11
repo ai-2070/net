@@ -25,7 +25,13 @@ CRATE_DIR="$(cd "$HERE/../.." && pwd)"
 BIN="${NATSIM_NODE_BIN:-$CRATE_DIR/target/debug/examples/natsim_node}"
 STATE="${2:-$(mktemp -d /tmp/natsim.XXXXXX)}"
 mkdir -p "$STATE"
-chmod 777 "$STATE"
+# Root-only while the run is live (helpers all run as root inside
+# their namespaces; mktemp's 700 default is right — a 777 dir under
+# /tmp would hand any local user write access and a symlink surface,
+# cubic P3). Relaxed to read-only for others at the end, so the
+# non-root `cargo test` wrapper can read the outcome file this
+# script's last stdout line points at.
+chmod 700 "$STATE"
 
 [[ -x "$BIN" ]] || {
   echo "natsim: helper not built: $BIN (cargo build --example natsim_node --features net,nat-traversal)" >&2
@@ -106,6 +112,12 @@ if [[ ! -s "$OUTCOME" ]]; then
   tail -n 40 "$STATE"/*.log >&2 || true
   exit 1
 fi
+
+# Open the artifacts read-only to non-root (no write bit anywhere)
+# so the invoking `cargo test` process can read the outcome path
+# printed below, and a human can inspect the helper logs.
+chmod 755 "$STATE"
+chmod 644 "$STATE"/*.json "$STATE"/*.log 2>/dev/null || true
 
 echo "natsim scenario=$SCENARIO outcome:"
 cat "$OUTCOME"

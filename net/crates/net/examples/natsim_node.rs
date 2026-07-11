@@ -280,6 +280,14 @@ mod natsim {
             .get("publics")
             .map(|s| s.split(',').map(str::to_string).collect())
             .unwrap_or_default();
+        // A joiner without publics can't dial, classify, or (in
+        // upgrade mode) name a relay — `public_infos[0]` below would
+        // panic on an empty list (cubic P2). Fail the configuration
+        // loudly instead.
+        if publics.is_empty() {
+            eprintln!("natsim_node: joiner requires --publics with at least one public node");
+            std::process::exit(2);
+        }
         let auto_upgrade = flags.contains_key("auto-upgrade");
         let target = flags.get("target").cloned();
         let mode = flags.get("mode").cloned().unwrap_or_else(|| "wait".into());
