@@ -303,9 +303,46 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 | 1 | Finding 4 — unsolicited-introduce reflex validation | **done** |
 | 2 | Finding 5 — rendezvous budgets, `PunchReject`, typed rejections | **done** |
 | 3 | Coordinator auto-selection + background direct-path upgrade | **done** (see landing notes) |
-| 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | not started (deliberately sequenced after 5 — macOS dev box; the harness is Linux-only) |
+| 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | **landed, pending first CI run** (see landing notes) |
 | 5 | Stats parity, failure reasons, reflex-diff re-classify trigger | **done** (see landing notes) |
 | 6 | Surface completion (sdk-ts / sdk-py / CLI / punch_id / interface events) | **deferred** |
+
+**Stage 4 landing notes.** Landed after Stage 5 (macOS dev box; the
+harness is Linux-only and was authored blind — the loopback halves are
+verified locally, the netns halves await their first CI run).
+
+- **Loopback half (verified on macOS):** `tests/nat_matrix.rs` adds the
+  two missing matrix tests — symmetric×cone attempts exactly once
+  (`punches_attempted == 1`, `relay_fallbacks == 1`, `punch_timeouts ==
+  1`, bounded duration; failure injected via the partition filter
+  starving the responder's ack) and the pre-announced-reflex test (a
+  fresh joiner *cannot* probe the target — `probe_reflex` is
+  `PeerNotReachable` without a session — so the announcement is
+  structurally the punch's only reflex source, and the session lands on
+  exactly the announced address).
+- **netns half:** `tests/natsim/` (setup/teardown/run_scenario scripts +
+  README), `examples/natsim_node.rs` (file-coordinated helper roles:
+  keygen/public/joiner), `tests/natsim.rs` (`#[ignore]`d, Linux-only
+  wrappers asserting outcome + stats deltas), and
+  `.github/workflows/natsim.yml` (traversal-touching PRs + nightly +
+  manual). Cone = plain `masquerade persistent`, symmetric =
+  `masquerade fully-random`; R and X are two distinct public IPs so the
+  classifier's cone/symmetric discrimination is real.
+- Five scenarios wired: cone×cone punch, symmetric×cone exactly-once,
+  symmetric×symmetric skip, dropped-keep-alives fallback-within-deadline,
+  and the Stage 3 relay→direct upgrade (topology adjusted to shipped
+  behavior: the upgrade handles `Direct` pairs, so B plays a public
+  peer and the NAT'd joiner is forced to the lower node id via `keygen`
+  ordering to satisfy C1).
+- **Deferred from the original Stage 4 scope:** the two
+  parent-decision-11 IPv6 scenarios (dual-stack direct, NAT64/464XLAT —
+  the latter needs tayga/jool in the runner image). Documented in the
+  natsim README; the per-side gateway-namespace shape accommodates both.
+- The C1 lower-id-initiates rule means a relay session whose lower-id
+  end is the *unreachable-direction* peer never upgrades (observed while
+  designing the upgrade scenario). Accepted for now — the punch-capable
+  upgrade follow-up (SinglePunch arm) dissolves it — but worth a note in
+  any V3 session-migration design.
 
 **Stage 5 landing notes.**
 
