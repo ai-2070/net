@@ -4060,6 +4060,132 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 mod tests {
     use super::*;
 
+    /// ABI parity between the Rust `#[repr(C)] NetTraversalStatsV2` and
+    /// the hand-maintained C header `include/net.go.h`. The Go guard
+    /// `go/header_parity_test.go` compares the two C headers against
+    /// each other, but nothing checked either against the Rust struct —
+    /// so a field reordered / retyped / added on one side but not the
+    /// other is silent cgo ABI corruption (Go reads at the wrong
+    /// offsets) with no compile error and no test failure (review #5).
+    #[cfg(feature = "nat-traversal")]
+    mod traversal_stats_abi {
+        use super::super::NetTraversalStatsV2;
+        use std::mem::{align_of, offset_of, size_of};
+
+        /// Byte offset of a struct field by its C name. `offset_of!`
+        /// needs a literal field ident, so this match is the one
+        /// hand-maintained seam: a renamed or removed field fails to
+        /// compile here until it's updated.
+        fn rust_offset(name: &str) -> Option<usize> {
+            Some(match name {
+                "punches_attempted" => offset_of!(NetTraversalStatsV2, punches_attempted),
+                "punches_succeeded" => offset_of!(NetTraversalStatsV2, punches_succeeded),
+                "punches_failed" => offset_of!(NetTraversalStatsV2, punches_failed),
+                "relay_fallbacks" => offset_of!(NetTraversalStatsV2, relay_fallbacks),
+                "punch_timeouts" => offset_of!(NetTraversalStatsV2, punch_timeouts),
+                "punch_rejections" => offset_of!(NetTraversalStatsV2, punch_rejections),
+                "rendezvous_no_relay" => offset_of!(NetTraversalStatsV2, rendezvous_no_relay),
+                "upgrades_attempted" => offset_of!(NetTraversalStatsV2, upgrades_attempted),
+                "upgrades_succeeded" => offset_of!(NetTraversalStatsV2, upgrades_succeeded),
+                "upgrades_deferred_busy" => offset_of!(NetTraversalStatsV2, upgrades_deferred_busy),
+                "port_mapping_renewals" => offset_of!(NetTraversalStatsV2, port_mapping_renewals),
+                "port_mapping_active" => offset_of!(NetTraversalStatsV2, port_mapping_active),
+                "port_mapping_external" => offset_of!(NetTraversalStatsV2, port_mapping_external),
+                _ => return None,
+            })
+        }
+
+        /// (size, align) of a C scalar/array type as spelled in the
+        /// header. Panics on an unrecognized type so a newly-introduced
+        /// field type forces this table to be extended.
+        fn c_type_layout(ctype: &str) -> (usize, usize) {
+            match ctype {
+                "uint64_t" => (8, 8),
+                "uint8_t" => (1, 1),
+                "char[64]" => (64, 1),
+                other => panic!("unhandled C type in net_traversal_stats_v2_t: {other:?}"),
+            }
+        }
+
+        fn round_up(off: usize, align: usize) -> usize {
+            off.div_ceil(align) * align
+        }
+
+        /// Ordered `(ctype, name)` fields of the anonymous
+        /// `net_traversal_stats_v2_t` struct body. `char x[64]` folds
+        /// to ctype `char[64]`, name `x`.
+        fn parse_header_fields(header: &str) -> Vec<(String, String)> {
+            let end = header
+                .find("} net_traversal_stats_v2_t;")
+                .expect("stats typedef present in header");
+            let open = header[..end].rfind('{').expect("struct open brace");
+            let mut fields = Vec::new();
+            for line in header[open + 1..end].lines() {
+                let line = line.trim();
+                if line.is_empty()
+                    || line.starts_with("//")
+                    || line.starts_with('*')
+                    || line.starts_with("/*")
+                {
+                    continue;
+                }
+                let decl = line.trim_end_matches(';').trim();
+                let (ctype, name_arr) = decl
+                    .rsplit_once(char::is_whitespace)
+                    .expect("field decl shaped `type name`");
+                let (ctype, name_arr) = (ctype.trim(), name_arr.trim());
+                if let Some((name, arr)) = name_arr.split_once('[') {
+                    fields.push((format!("{ctype}[{arr}"), name.to_string()));
+                } else {
+                    fields.push((ctype.to_string(), name_arr.to_string()));
+                }
+            }
+            fields
+        }
+
+        #[test]
+        fn c_header_layout_matches_rust_repr_c() {
+            let header =
+                std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/net.go.h"))
+                    .expect("read include/net.go.h");
+            let fields = parse_header_fields(&header);
+            assert_eq!(
+                fields.len(),
+                13,
+                "expected 13 fields in net_traversal_stats_v2_t, parsed {fields:?}",
+            );
+
+            // Recompute the C struct layout with C alignment rules and
+            // cross-check every field offset against the Rust struct.
+            // Catches reorder (offsets shift), retype (offset/size
+            // shift), and add/remove (size or name-resolution mismatch).
+            let mut off = 0usize;
+            let mut align = 1usize;
+            for (ctype, name) in &fields {
+                let (sz, al) = c_type_layout(ctype);
+                off = round_up(off, al);
+                align = align.max(al);
+                let rust = rust_offset(name)
+                    .unwrap_or_else(|| panic!("header field `{name}` has no Rust struct field"));
+                assert_eq!(
+                    rust, off,
+                    "field `{name}`: Rust offset {rust} != C offset {off}"
+                );
+                off += sz;
+            }
+            assert_eq!(
+                size_of::<NetTraversalStatsV2>(),
+                round_up(off, align),
+                "net_traversal_stats_v2_t total size drift (Rust vs C header)",
+            );
+            assert_eq!(
+                align_of::<NetTraversalStatsV2>(),
+                align,
+                "net_traversal_stats_v2_t alignment drift (Rust vs C header)",
+            );
+        }
+    }
+
     /// Regression for a cubic-flagged P2: Go-supplied JSON values
     /// wider than u16::MAX silently wrapped via `as u16` in
     /// `gpu_info_from_json` / `accelerator_from_json` /
