@@ -1,0 +1,37 @@
+net/crates/net/docs/plans/NODE_DELEGATION_A2A_SDK_PLAN.md
+  s_412b111b5c6fa1::t_399c2fa6a3e980 175-186
+net/crates/net/bindings/node/src/delegation.rs
+  s_412b111b5c6fa1::t_0158546bc3a07f 157-168
+net/crates/net/bindings/node/src/a2a.rs
+  s_412b111b5c6fa1::t_2a0f7c45a06f09 64-66
+  s_412b111b5c6fa1::t_9b602d3d0f59e9 99-100
+  s_412b111b5c6fa1::t_e8bd0cfa96cf26 52-63,67-76
+  s_412b111b5c6fa1::t_cb9c0fd55f40f1 151-165
+  s_412b111b5c6fa1::t_fc5440115f825e 218-221,231,235-239,243-246
+  s_412b111b5c6fa1::t_315ad9c280eba9 20-25
+  s_412b111b5c6fa1::t_8687731fe405a9 98,103,150,172,217
+net/crates/net/bindings/node/test/a2a.test.ts
+  s_412b111b5c6fa1::t_4b25ac81e84a95 167-198
+net/crates/net/bindings/node/src/enrollment.rs
+  s_412b111b5c6fa1::t_6834780674cac0 57-66
+  s_412b111b5c6fa1::t_47b69d6b670f15 431,434-437
+  s_412b111b5c6fa1::t_dc0b9ae3ecc2e7 530-532,540-543
+  s_412b111b5c6fa1::t_aafabe9380d0e8 411-414
+  s_412b111b5c6fa1::t_732df5c5e6bbe5 445-448,454-457,469-472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "073abea104a2aea7090bd80137aa6977d81975ad",
+  "prompts": {},
+  "sessions": {
+    "s_412b111b5c6fa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4c005a75-18a6-40ff-881f-c6206bc1e6bd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
