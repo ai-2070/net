@@ -25,9 +25,16 @@ var (
 	blockCommentRe = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	lineCommentRe  = regexp.MustCompile(`//[^\n]*`)
 	fnDeclRe       = regexp.MustCompile(`(?s)\b(net_\w+)\s*\(([^;{)]*(?:\([^)]*\))?[^;{)]*)\)\s*;`)
-	constRe        = regexp.MustCompile(`\b(NET_\w+)\s*=\s*(-?\w+)`)
-	typedefRe      = regexp.MustCompile(`}\s*(\w+_t)\s*;`)
-	whitespaceRe   = regexp.MustCompile(`\s+`)
+	// Enum-style constants: `NET_X = <value>` inside enum blocks.
+	constRe = regexp.MustCompile(`\b(NET_\w+)\s*=\s*(-?\w+)`)
+	// Preprocessor-style constants: `#define NET_X <value>`
+	// (cubic round 4: NET_STREAM_* / NET_COMPUTE_* live as defines
+	// and were invisible to the guard). Valueless guards like
+	// `#define NET_SDK_H` are deliberately NOT matched — include
+	// guards aren't part of the constant surface.
+	defineConstRe = regexp.MustCompile(`(?m)^\s*#define\s+(NET_\w+)\s+(-?\w+)\s*$`)
+	typedefRe     = regexp.MustCompile(`}\s*(\w+_t)\s*;`)
+	whitespaceRe  = regexp.MustCompile(`\s+`)
 )
 
 type headerSurface struct {
@@ -55,6 +62,9 @@ func parseHeader(t *testing.T, path string) headerSurface {
 		s.fns[m[1]] = args
 	}
 	for _, m := range constRe.FindAllStringSubmatch(src, -1) {
+		s.consts[m[1]] = m[2]
+	}
+	for _, m := range defineConstRe.FindAllStringSubmatch(src, -1) {
 		s.consts[m[1]] = m[2]
 	}
 	for _, m := range typedefRe.FindAllStringSubmatch(src, -1) {
@@ -86,6 +96,15 @@ func TestHeaderParityWithCrateHeader(t *testing.T) {
 
 	if len(goHeader.fns) == 0 || len(crate.fns) == 0 {
 		t.Fatal("header parser matched zero declarations — parser regressed")
+	}
+	// Pin the #define pass specifically: NET_STREAM_TIMEOUT exists as
+	// a define (not an enum member) in both headers, so its absence
+	// here means the define regex regressed and define-style drift
+	// would go unchecked again.
+	for name, surf := range map[string]headerSurface{"go/net.h": goHeader, "include/net.go.h": crate} {
+		if _, ok := surf.consts["NET_STREAM_TIMEOUT"]; !ok {
+			t.Fatalf("%s: define-style constants not parsed (NET_STREAM_TIMEOUT missing)", name)
+		}
 	}
 
 	if miss := onlyIn(crate.fns, goHeader.fns); len(miss) > 0 {
