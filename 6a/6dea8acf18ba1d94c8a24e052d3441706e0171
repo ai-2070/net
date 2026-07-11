@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d15043c27a0f20::t_56e42619349603 565,6088-6092,8806-8808,11836-11839,11879,13364-13371,13379-13386,13394-13401,13410-13417,14273-14275,14329-14331,16191-16196,16203-16208,16224-16226,16254-16259,16278-16280
+net/crates/net/src/adapter/net/traversal/mod.rs
+  s_d15043c27a0f20::t_56e42619349603 484-487
+net/crates/net/tests/traversal_observability.rs
+  s_d15043c27a0f20::t_56e42619349603 359-360
+net/crates/net/tests/rendezvous_introduce_validation.rs
+  s_d15043c27a0f20::t_56e42619349603 171-173
+net/crates/net/tests/rendezvous_coordinator.rs
+  s_d15043c27a0f20::t_56e42619349603 574-576
+net/crates/net/tests/direct_upgrade.rs
+  s_d15043c27a0f20::t_56e42619349603 226,256-260
+net/crates/net/src/ffi/mesh.rs
+  s_d15043c27a0f20::t_56e42619349603 4150-4153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "6a6dea8acf18ba1d94c8a24e052d3441706e0171",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
