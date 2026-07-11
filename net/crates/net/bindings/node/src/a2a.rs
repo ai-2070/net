@@ -17,6 +17,12 @@
 //! own abort plumbing; the wire-visible contract (state = `cancelled`, no
 //! result served) holds regardless.
 //!
+//! **Deadline.** Each task's JS Promise must settle within
+//! `ServeA2aOptions.handlerTimeoutMs` (default 1 hour; `0` disables) or the
+//! task records a `Failed` terminal state — a wedged event loop or a
+//! never-settling handler must not strand an accepted task in `Running`
+//! forever.
+//!
 //! **H8.** Only task briefs (prompt + Datafort context refs) and result refs
 //! cross — never keys.
 
@@ -43,6 +49,31 @@ fn a2a_err(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("a2a: {msg}"))
 }
 
+/// Default budget for one task-executor call (JS returning the Promise +
+/// the Promise settling), against a single deadline. A2A tasks are long
+/// jobs by design — cooperative cancellation is the primary control — but
+/// a wedged Node event loop or a never-settling Promise must not strand
+/// an accepted task in `Running` forever (the registry would retain it
+/// indefinitely and requesters would poll a task that can no longer end).
+/// Past the deadline the task records a `Failed` terminal state. Genuinely
+/// longer jobs override via `ServeA2aOptions.handlerTimeoutMs`.
+const DEFAULT_TASK_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Optional knobs for [`NetMesh::serve_a2a`].
+// `js_name` pinned like `serveA2a` / `A2aServeHandle`: napi's auto-camelCase
+// would emit `ServeA2AOptions`.
+#[napi(object, js_name = "ServeA2aOptions")]
+pub struct ServeA2aOptions {
+    /// Per-task budget in milliseconds for the JS executor to settle its
+    /// Promise (the handler returning the Promise + that Promise
+    /// resolving, one deadline across both). Default `3600000` (1 hour).
+    /// Past it the task records a `Failed` terminal state. Pass `0` to
+    /// disable the deadline entirely (Python-binding parity, where
+    /// cancellation is the only control) — a wedged event loop then leaves
+    /// the task `Running` until a requester cancels it.
+    pub handler_timeout_ms: Option<u32>,
+}
+
 /// The brief handed to the JS task executor.
 #[napi(object)]
 pub struct TaskBriefJs {
@@ -64,9 +95,12 @@ type ExecutorTsfn = ThreadsafeFunction<TaskBriefJs, Promise<String>, TaskBriefJs
 
 /// A [`TaskExecutor`] backed by a JS **async** callback. A mesh-side cancel
 /// trips the select below; the registry records `Cancelled` and the JS
-/// handler's result (if it ever resolves) is discarded.
+/// handler's result (if it ever resolves) is discarded. `timeout` bounds
+/// how long the JS side may take to settle (`None` = unbounded, the
+/// explicit `handlerTimeoutMs: 0` opt-out).
 struct NodeTaskExecutor {
     callback: ExecutorTsfn,
+    timeout: Option<std::time::Duration>,
 }
 
 #[async_trait::async_trait]
@@ -113,13 +147,29 @@ impl TaskExecutor for NodeTaskExecutor {
             }
         };
 
+        // One deadline across both JS stages (handler returning the
+        // Promise + the Promise settling) — a timed-out task records a
+        // `Failed` terminal state instead of sitting in `Running` forever.
+        let bounded = async {
+            match self.timeout {
+                Some(t) => match tokio::time::timeout(t, js_result).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "a2a task handler did not settle within {} ms",
+                        t.as_millis()
+                    )),
+                },
+                None => js_result.await,
+            }
+        };
+
         // `biased` polls the JS result first so an already-resolved result
         // beats a simultaneous cancel. On cancel the future drops — the JS
         // work itself cannot be aborted (see the module docs), but its
         // result is discarded and the registry records `Cancelled`.
         tokio::select! {
             biased;
-            r = js_result => r,
+            r = bounded => r,
             _ = cancel.cancelled() => Err("cancelled".to_string()),
         }
     }
@@ -164,6 +214,11 @@ impl NetMesh {
     /// to keep accepting tasks; call `handle.stop()` before `shutdown()`.
     /// This node must be `start()`ed. (Requires the `a2a` feature.)
     ///
+    /// `options.handlerTimeoutMs` bounds how long the executor may take to
+    /// settle each task's Promise (default 1 hour; `0` disables) — past the
+    /// deadline the task records a `Failed` terminal state instead of
+    /// staying `Running` forever behind a wedged event loop.
+    ///
     /// Sync setup (the `Function` is `!Send`, so the TSFN is built on the
     /// JS thread), then `spawn_future` for the registration — the SDK's
     /// `serve_rpc` spawns a response-drainer task, which needs the tokio
@@ -173,13 +228,22 @@ impl NetMesh {
         &self,
         env: &'env Env,
         executor: Function<'_, TaskBriefJs, Promise<String>>,
+        options: Option<ServeA2aOptions>,
     ) -> Result<PromiseRaw<'env, A2aServeHandle>> {
         let node = self.node_arc_clone()?;
         let tsfn: ExecutorTsfn = executor.build_threadsafe_function().build()?;
+        let timeout = match options.and_then(|o| o.handler_timeout_ms) {
+            Some(0) => None, // explicit opt-out: cancellation is the only control
+            Some(ms) => Some(std::time::Duration::from_millis(u64::from(ms))),
+            None => Some(DEFAULT_TASK_HANDLER_TIMEOUT),
+        };
         env.spawn_future(async move {
             let mesh = mesh_over(node, None);
             let registry = TaskRegistry::new();
-            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor { callback: tsfn });
+            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor {
+                callback: tsfn,
+                timeout,
+            });
             let handles = mesh
                 .serve_a2a(registry, executor)
                 .map_err(|e| a2a_err(format!("serveA2a failed: {e}")))?;

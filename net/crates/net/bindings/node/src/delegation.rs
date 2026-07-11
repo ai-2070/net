@@ -154,10 +154,18 @@ impl RevocationRegistry {
     /// (or the `NET_MESH_REVOCATION_STORE` override) for `path`.
     #[napi]
     pub async fn load_from_store(&self, path: String) -> Result<()> {
-        let store = RevocationStore::load(&path)
-            .map_err(|e| delegation_err(format!("revocation store: {e}")))?;
-        store.apply_to(&self.inner);
-        Ok(())
+        // `spawn_blocking`: the read/parse is synchronous file IO on a
+        // caller-selected path — done inline it would occupy a napi tokio
+        // worker for the duration, starving unrelated async binding work.
+        let registry = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let store = RevocationStore::load(&path)
+                .map_err(|e| delegation_err(format!("revocation store: {e}")))?;
+            store.apply_to(&registry);
+            Ok(())
+        })
+        .await
+        .map_err(|e| delegation_err(format!("revocation store load task: {e}")))?
     }
 }
 

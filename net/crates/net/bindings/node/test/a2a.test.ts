@@ -164,6 +164,38 @@ describe.skipIf(!HAS_A2A)('a2a', () => {
     }
   }, 25_000)
 
+  it('a never-settling executor records a failed terminal state at the deadline', async () => {
+    // The wedged-event-loop / hung-agent shape: the handler's Promise never
+    // settles. The configured deadline records `failed` instead of leaving
+    // the task `running` (and retained in the registry) forever.
+    const executor = await meshUnstarted()
+    const requester = await meshUnstarted()
+    let handle: { stop(): void } | undefined
+    try {
+      await handshake(requester, executor)
+      await executor.start()
+      await requester.start()
+
+      handle = await executor.serveA2a(() => new Promise<string>(() => {}), {
+        handlerTimeoutMs: 500,
+      })
+      const execId = executor.nodeId()
+
+      const taskId = await submitRetry(requester, execId, 'hang forever', [])
+      const rec = await waitState(requester, execId, taskId, 'failed')
+      expect(rec.state.error).toContain('did not settle within 500 ms')
+
+      // Terminal: a late cancel is a no-op, and the state stays failed.
+      expect(await requester.cancelTask(execId, taskId)).toBe(false)
+      const after = JSON.parse(await requester.taskStatus(execId, taskId))
+      expect(after.state.state).toBe('failed')
+    } finally {
+      handle?.stop()
+      await requester.shutdown().catch(() => {})
+      await executor.shutdown().catch(() => {})
+    }
+  }, 25_000)
+
   it('completes a task with an artifact ref', async () => {
     const executor = await meshUnstarted()
     const requester = await meshUnstarted()

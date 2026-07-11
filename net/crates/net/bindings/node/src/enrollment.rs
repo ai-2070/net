@@ -54,6 +54,16 @@ fn enroll_err(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("enrollment: {msg}"))
 }
 
+/// Run synchronous store IO on the blocking pool — done inline in an
+/// `async fn` it would occupy a napi tokio worker for the duration,
+/// starving unrelated async binding work. The Node analog of the Python
+/// binding's `py.detach` on these same facade methods.
+async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| enroll_err(format!("store task: {e}")))
+}
+
 /// Rebuild a JS `Identity` handle from an SDK identity — the keypair `Arc`
 /// is shared; a fresh token cache is attached. The private seed stays in
 /// Rust.
@@ -398,9 +408,10 @@ impl OperatorEnrollment {
     ) -> Result<DelegationChain> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
         let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
-        let enrollment = self
-            .inner
-            .approve(&request.inner, ttl, depth)
+        let inner = self.inner.clone();
+        let request = request.inner.clone();
+        let enrollment = off_thread(move || inner.approve(&request, ttl, depth))
+            .await?
             .map_err(enroll_err)?;
         Ok(DelegationChain::from_inner(enrollment.chain))
     }
@@ -417,13 +428,13 @@ impl OperatorEnrollment {
         request_bytes: Buffer,
         grant_ttl_seconds: u32,
         max_depth: Option<u8>,
-    ) -> Buffer {
+    ) -> Result<Buffer> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
         let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
-        Buffer::from(
-            self.inner
-                .handle_join_request(request_bytes.as_ref(), ttl, depth),
-        )
+        let inner = self.inner.clone();
+        let bytes = request_bytes.as_ref().to_vec();
+        let out = off_thread(move || inner.handle_join_request(&bytes, ttl, depth)).await?;
+        Ok(Buffer::from(out))
     }
 
     /// Revoke a device: raise its revocation floor (kills all current
@@ -431,13 +442,19 @@ impl OperatorEnrollment {
     #[napi]
     pub async fn revoke(&self, device: Buffer) -> Result<()> {
         let id = entity_id_from_buffer(&device)?;
-        self.inner.revoke(&id).map_err(enroll_err)
+        let inner = self.inner.clone();
+        off_thread(move || inner.revoke(&id))
+            .await?
+            .map_err(enroll_err)
     }
 
     /// The enrolled devices in the inventory.
     #[napi]
     pub async fn devices(&self) -> Result<Vec<DeviceRecord>> {
-        let records = self.inner.devices().map_err(enroll_err)?;
+        let inner = self.inner.clone();
+        let records = off_thread(move || inner.devices())
+            .await?
+            .map_err(enroll_err)?;
         Ok(records
             .into_iter()
             .map(|inner| DeviceRecord { inner })
@@ -449,7 +466,10 @@ impl OperatorEnrollment {
     #[napi]
     pub async fn forget(&self, device: Buffer) -> Result<bool> {
         let id = entity_id_from_buffer(&device)?;
-        self.inner.forget(&id).map_err(enroll_err)
+        let inner = self.inner.clone();
+        off_thread(move || inner.forget(&id))
+            .await?
+            .map_err(enroll_err)
     }
 
     /// Outstanding (minted, unredeemed, unexpired at `now` unix-secs)
@@ -507,7 +527,9 @@ impl DeviceEnrollment {
     /// saved yet; rejects on a corrupt file.
     #[napi]
     pub async fn load(path: String) -> Result<Option<DeviceEnrollment>> {
-        let loaded = SdkDeviceEnrollment::load(&path).map_err(enroll_err)?;
+        let loaded = off_thread(move || SdkDeviceEnrollment::load(&path))
+            .await?
+            .map_err(enroll_err)?;
         Ok(loaded.map(|inner| Self { inner }))
     }
 
@@ -515,7 +537,10 @@ impl DeviceEnrollment {
     /// renewal.
     #[napi]
     pub async fn save(&self, path: String) -> Result<()> {
-        self.inner.save(&path).map_err(enroll_err)
+        let inner = self.inner.clone();
+        off_thread(move || inner.save(&path))
+            .await?
+            .map_err(enroll_err)
     }
 
     /// The device's opaque `Identity` handle (its private seed stays in

@@ -172,6 +172,18 @@ Port the device-lifecycle facade + value types:
 > flips and stays `cancelled`, no result served) is what the tests pin.
 > JS names pinned with `js_name` (`serveA2a`, `A2aServeHandle`) — napi's
 > auto-camelCase would emit `serveA2A` / `A2AServeHandle`.
+>
+> **Review follow-up (cubic, 2026-07-11):** `serveA2a` gained
+> `ServeA2aOptions.handlerTimeoutMs` (default 1 hour, `0` disables — the
+> Python-parity opt-out), one deadline across the handler returning its
+> Promise and that Promise settling. Past it the task records a `Failed`
+> terminal state, so a wedged event loop / never-settling Promise can no
+> longer strand an accepted task in `Running` (and in the registry) forever;
+> pinned by a never-settling-executor vitest case. And every store-IO facade
+> method (`OperatorEnrollment.approve/handleJoinRequest/revoke/devices/
+> forget`, `DeviceEnrollment.load/save`, `RevocationRegistry.loadFromStore`)
+> now runs its synchronous file IO under `tokio::task::spawn_blocking` so a
+> slow or large store can't starve a napi runtime worker.
 
 ### WS-4 — TS types + tests
 
