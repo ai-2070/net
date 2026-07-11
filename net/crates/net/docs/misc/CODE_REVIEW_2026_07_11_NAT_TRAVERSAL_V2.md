@@ -71,6 +71,45 @@ sign-off.
 
 ---
 
+## Resolution status — 2026-07-12 fix pass (branch `nat-traversal-improvements`)
+
+All nine actionable findings are fixed, each in its own commit with tests
+where the behavior is observable. Full suite green: lib unit tests
+(4582 passed), plus the NAT integration suites (`direct_upgrade`,
+`coordinator_selection`, `rendezvous_coordinator`,
+`rendezvous_introduce_validation`, `nat_matrix`, `traversal_observability`,
+`peer_death_clears_capability_index`) and the SDK `mesh_nat_traversal` suite.
+
+| # | Status | Commit | Test |
+|---|---|---|---|
+| 1 | ✅ Fixed | `aad3ff4c1` | `NATSIM_OUTCOME_PATH=` marker parsed by `tests/natsim.rs` (verified standalone) |
+| 2 | ✅ Fixed | `d524d96fe` | `failed_peer_drops_its_upgrade_cache_entry`, `single_punch_pair_is_deferred_not_terminal` |
+| 3 | ✅ Fixed | `9585e1d51` | `upgrade_loop_does_not_leak_the_node` |
+| 4 | ✅ Fixed | `27e92b51e` | `select_spreads_across_equal_candidates` (+ updated tier-2/3 tests) |
+| 5 | ✅ Fixed | `159dc69cc` | `go/header_parity_test.go` struct-field parity + `ffi::mesh` `c_header_layout_matches_rust_repr_c` |
+| 6 | ✅ Fixed | `3c88f885d` | covered by the coordinator/upgrade suites (refactor, no behavior change) |
+| 7 | ✅ Fixed | `67eb8e417` | `nodes_with_capability_tag_filters_the_batch` |
+| 8 | ✅ Fixed | `67eb8e417` | covered by `direct_upgrade` (candidate filter behavior unchanged) |
+| 9 | ✅ Fixed | `67eb8e417` | covered by `rendezvous_coordinator` (reject-path behavior unchanged) |
+| 10 | ➖ No change | — | Documented by-design tradeoff; bounded by the responder budgets. |
+
+Design decisions worth noting:
+
+- **#2** — the cache entry is dropped in the failure-detector `on_failure`
+  callback (alongside `capability_fold` / `subscriber_chains`), not the
+  slow heartbeat sweep, so it's fast and testable. `done` is reserved for
+  `SkipPunch`; `SinglePunch` defers (`SINGLEPUNCH_RECHECK = 30s`).
+- **#3** — followed the `spawn_capability_reannounce_loop` `Weak`-then-
+  `upgrade()` pattern rather than a strong `Arc::clone(self)`, so `Drop`
+  wins the refcount race.
+- **#4** — spread via a freshly-seeded `RandomState` hash (the crate's own
+  `dedup_state` OS-entropy trick), dependency-free; tier 1 (routing
+  next-hop) stays deterministic.
+- **#5** — closed both seams: C↔C (Go guard, struct fields) and Rust↔C
+  (offset-level cross-check via `offset_of!`).
+
+---
+
 ### 1 — 🔴 The natsim Stage-4 harness is broken at the outcome-parse step
 
 **Files:** `examples/natsim_node.rs:414-415`, `tests/natsim/run_scenario.sh`
