@@ -1,0 +1,35 @@
+net/crates/net/tests/peer_death_clears_capability_index.rs
+  s_d15043c27a0f20::t_279b880343799b 202-207,213-218,220-221,225-227
+net/crates/net/tests/traversal_observability.rs
+  s_d15043c27a0f20::t_f4b40612f7ecae 1-364,366-368
+  s_d15043c27a0f20::t_e6e43e9ef15c5c 365
+net/crates/net/src/adapter/net/traversal/mod.rs
+  s_d15043c27a0f20::t_5f87ab91085586 132-145
+  s_d15043c27a0f20::t_dd969c29bb0a52 186-204
+  s_d15043c27a0f20::t_4b676a7e8fb54d 496-545
+  s_d15043c27a0f20::t_a11f6ab8d93131 282-307
+  s_d15043c27a0f20::t_2d558d9d06713e 219-220,222-223,231-237
+net/crates/net/src/adapter/net/mesh.rs
+  s_d15043c27a0f20::t_ab8e13fecc5c87 14079-14135
+  s_d15043c27a0f20::t_658b04af992818 12245-12250
+  s_d15043c27a0f20::t_98a992a2c1f899 4179-4185
+  s_d15043c27a0f20::t_dba1f8f2bd3c8f 14262,14268-14270,14276
+  s_d15043c27a0f20::t_964454b9b72e77 14316,14323
+  s_d15043c27a0f20::t_f564642b1f37bc 11882-11885
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "a6df4c04e26047c8fc6328298b7a72c794f5c1d0",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
