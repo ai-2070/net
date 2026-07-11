@@ -39,6 +39,8 @@ typedef enum {
     NET_ERR_INT_OVERFLOW = -9,
     /* Stream handle does not belong to the supplied node. */
     NET_ERR_MISMATCHED_HANDLES = -10,
+    /* CString::new interior NUL — see include/net.h for rationale. */
+    NET_ERR_INTERIOR_NUL = -11,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
      * `netdb` + `redex-disk` features on). Codes below -99 so they
@@ -933,6 +935,25 @@ int      net_predicate_redact_metadata_keys(const char* report_json,
                                             const char* keys_json,
                                             char** out_redacted_json,
                                             size_t* out_redacted_len);
+
+/* CR-8: same redaction over a wire-format trace tree (output of
+ * net_predicate_evaluate_with_trace). Walks the tree and rewrites
+ * every `label` matching the metadata-clause shapes; preserves
+ * children order and `result` fields.
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - trace_json — wire-format ClauseTrace (`{"label", "result",
+ *     "children": [...]}` recursively).
+ *   - keys_json  — `["api_key", "secret_token"]`.
+ *
+ * Output: *out_redacted_json/_len — same wire shape, free with
+ * `net_free_string`. Idempotent.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_redact_trace_metadata_keys(const char* trace_json,
+                                                  const char* keys_json,
+                                                  char** out_redacted_json,
+                                                  size_t* out_redacted_len);
 
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of
