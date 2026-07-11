@@ -687,6 +687,23 @@ impl RendezvousBudgets {
     }
 }
 
+/// Per-peer throttle for the background direct-path upgrade
+/// (`NAT_TRAVERSAL_V2_PLAN.md` Stage 3). Prevents a pathological pair
+/// from re-punching on every scan: a failure backs off exponentially, a
+/// success stops further attempts (the session is now direct), and a
+/// busy-defer retries after a short delay.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Clone, Copy)]
+struct UpgradeCacheEntry {
+    /// Earliest instant a fresh attempt is allowed.
+    next_eligible: Instant,
+    /// Consecutive failures — drives the exponential backoff.
+    failures: u32,
+    /// Once a direct session is established there is nothing left to
+    /// upgrade; stop attempting.
+    done: bool,
+}
+
 /// RAII reservation for one global unsolicited-train slot. Holding it
 /// keeps the slot counted; dropping it (when the punch scheduler's
 /// observer task ends) releases the slot. `budgets == None` is the
@@ -1503,6 +1520,29 @@ pub struct MeshNodeConfig {
     /// Default: `false`.
     #[cfg(feature = "port-mapping")]
     pub try_port_mapping: bool,
+
+    /// Enable the background **direct-path upgrade**
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` Stage 3): once a session to a peer
+    /// is established via a relay, opportunistically re-handshake over
+    /// a direct/punched path and migrate the session, cutting relay
+    /// hops out of the data plane.
+    ///
+    /// **Optimization, not correctness.** The data plane never waits on
+    /// the upgrade — traffic rides the relay until (and unless) a direct
+    /// path is established, then migrates transparently. The swap is
+    /// guarded by the migration contract: only the lower-node-id end
+    /// initiates (no crossing-handshake race), the install is
+    /// compare-and-swap'd against a racing rotation, and a session with
+    /// open streams / unacked in-flight data defers rather than dropping
+    /// that state.
+    ///
+    /// **Default `false`.** This is new session-migration behavior; the
+    /// flag exists so it can be enabled per-deployment (and by the
+    /// integration tests) and validated against the real-NAT harness
+    /// (Stage 4) before any consideration of flipping the default.
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub auto_direct_upgrade: bool,
 }
 
 impl MeshNodeConfig {
@@ -1546,7 +1586,20 @@ impl MeshNodeConfig {
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
+            #[cfg(feature = "nat-traversal")]
+            auto_direct_upgrade: false,
         }
+    }
+
+    /// Enable the background direct-path upgrade. See
+    /// [`MeshNodeConfig::auto_direct_upgrade`] for semantics and the
+    /// migration-safety guarantees.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn with_auto_direct_upgrade(mut self, enabled: bool) -> Self {
+        self.auto_direct_upgrade = enabled;
+        self
     }
 
     /// Set the reflex override — the public `SocketAddr` this
@@ -2788,6 +2841,10 @@ pub struct MeshNode {
     /// See [`RendezvousBudgets`].
     #[cfg(feature = "nat-traversal")]
     rendezvous_budgets: Arc<RendezvousBudgets>,
+    /// Per-peer throttle for the background direct-path upgrade
+    /// (Stage 3). See [`UpgradeCacheEntry`].
+    #[cfg(feature = "nat-traversal")]
+    upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>>,
     /// Single-flight gate for the classification sweep.
     /// [`Self::reclassify_nat`] sets this on entry and clears it on
     /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
@@ -3635,6 +3692,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
+            upgrade_cache: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 if initial_reflex_override.is_some() {
                     super::traversal::classify::NatClass::Open.as_u8()
@@ -3794,6 +3853,15 @@ impl MeshNode {
     /// the source node by its `node_id`.
     pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
         self.peers.get(&node_id).map(|e| e.value().addr)
+    }
+
+    /// Test/debug accessor for the live [`NetSession`] to a peer.
+    /// Integration tests use it to drive session-level state (e.g. open
+    /// a stream to make a session "busy" for the upgrade C3 gate).
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
+        self.peers.get(&node_id).map(|e| e.value().session.clone())
     }
 
     /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
@@ -4520,6 +4588,14 @@ impl MeshNode {
         // existing weak is equally valid, so ignore the result.
         let _ = self.self_weak.set(Arc::downgrade(self));
         self.start();
+        // Background direct-path upgrade scan loop (Stage 3). The loop
+        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
+        // unconditionally is cheap; keeping it here means any Arc-held
+        // node started via `start_arc` gets upgrades when enabled.
+        // Detached like the other lifecycle loops — it exits on
+        // `shutdown_notify`.
+        #[cfg(feature = "nat-traversal")]
+        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -14447,6 +14523,321 @@ impl MeshNode {
         );
 
         Ok(dest_node_id)
+    }
+
+    /// Handshake to `target_addr` and install the resulting session
+    /// with a compare-and-swap against `expected_prior_session_id`
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` C2). Same retrying handshake as
+    /// [`Self::connect_via`], but the install proceeds only if the
+    /// peer's current session_id still matches — so a background
+    /// direct-path upgrade never clobbers a racing rotation.
+    ///
+    /// Returns `Ok(true)` if the session was installed, `Ok(false)` if
+    /// the CAS lost (a racing handshake won — the caller leaves the
+    /// current session, typically the working relay path, intact), or
+    /// `Err` on handshake failure (nothing was mutated, so the relay
+    /// session is likewise untouched).
+    #[cfg(feature = "nat-traversal")]
+    async fn connect_via_cas(
+        &self,
+        target_addr: SocketAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+        expected_prior_session_id: u64,
+        addr_mode: AddrInstallMode,
+    ) -> Result<bool, AdapterError> {
+        let mut attempt = 0;
+        let keys = loop {
+            attempt += 1;
+            match self
+                .try_connect_via_once(target_addr, dest_pubkey, dest_node_id)
+                .await
+            {
+                Ok(keys) => break keys,
+                Err(e) if attempt < self.config.handshake_retries => {
+                    tracing::debug!(attempt, error = %e, "upgrade handshake retry");
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        Ok(self.install_peer_cas(
+            dest_node_id,
+            target_addr,
+            keys,
+            addr_mode,
+            Some(expected_prior_session_id),
+        ))
+    }
+
+    // ── Background direct-path upgrade (Stage 3) ─────────────────────────
+
+    /// `true` if a fresh upgrade attempt for `peer_id` is allowed right
+    /// now — no cache entry, or an entry that isn't `done` and whose
+    /// backoff/defer window has elapsed.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_should_attempt(&self, peer_id: u64) -> bool {
+        match self.upgrade_cache.get(&peer_id) {
+            None => true,
+            Some(e) => !e.done && Instant::now() >= e.next_eligible,
+        }
+    }
+
+    /// Lease an attempt: push `next_eligible` out so the scan loop won't
+    /// re-spawn a second attempt for this peer while one is in flight.
+    /// The attempt's outcome recorder overwrites this.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_lease(&self, peer_id: u64, lease: Duration) {
+        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
+            next_eligible: Instant::now(),
+            failures: 0,
+            done: false,
+        });
+        e.next_eligible = Instant::now() + lease;
+    }
+
+    /// Record a terminal outcome: the session is direct (or can't be
+    /// upgraded) — stop attempting.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_done(&self, peer_id: u64) {
+        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
+            next_eligible: Instant::now(),
+            failures: 0,
+            done: false,
+        });
+        e.done = true;
+    }
+
+    /// Record a busy-defer: retry after a short delay, without counting
+    /// it as a failure (the session is healthy, just carrying traffic).
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_defer(&self, peer_id: u64, delay: Duration) {
+        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
+            next_eligible: Instant::now(),
+            failures: 0,
+            done: false,
+        });
+        e.next_eligible = Instant::now() + delay;
+    }
+
+    /// Record a failed attempt: exponential backoff on the retry.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_failure(&self, peer_id: u64) {
+        const BASE: Duration = Duration::from_secs(2);
+        const MAX_SHIFT: u32 = 5; // cap backoff at BASE << 5 = 64 s
+        let mut e = self.upgrade_cache.entry(peer_id).or_insert(UpgradeCacheEntry {
+            next_eligible: Instant::now(),
+            failures: 0,
+            done: false,
+        });
+        e.failures = e.failures.saturating_add(1);
+        let backoff = BASE.saturating_mul(1u32 << e.failures.min(MAX_SHIFT));
+        e.next_eligible = Instant::now() + backoff;
+    }
+
+    /// Attempt a single background direct-path upgrade of a
+    /// relay-routed session to `peer_id` (`NAT_TRAVERSAL_V2_PLAN.md`
+    /// Stage 3). Best-effort throughout: on any failure the working
+    /// relay session is left intact (the whole feature is an
+    /// optimization). Enforces the migration contract:
+    ///
+    /// - **C3 initiator busy gate:** if the local session has open
+    ///   streams or unacked in-flight data, defer — a swap would drop
+    ///   it. Retried once quiescent.
+    /// - **C2 CAS install:** the punched session installs only if the
+    ///   peer's session_id hasn't changed since we snapshotted it, so a
+    ///   racing inbound rotation wins instead of being clobbered.
+    ///
+    /// (C1 — only the lower-node-id end initiates — is enforced by the
+    /// scan loop before this is called.)
+    ///
+    /// This landing upgrades **`Direct` pairs** (the peer is directly
+    /// reachable at its reflex). Coordinated-punch (`SinglePunch`)
+    /// upgrades reuse the same install machinery and are a follow-up;
+    /// `SkipPunch` pairs can never punch. Both are marked terminal so
+    /// the scan loop stops revisiting them.
+    #[cfg(feature = "nat-traversal")]
+    async fn attempt_direct_upgrade(&self, peer_id: u64) {
+        use super::traversal::classify::{pair_action, PairAction};
+
+        // Snapshot the current session.
+        let Some((relay_addr, prior_sid, pubkey, busy)) = self.peers.get(&peer_id).map(|e| {
+            let v = e.value();
+            (
+                v.addr,
+                v.session.session_id(),
+                v.remote_static_pub,
+                v.session.has_open_streams() || v.session.has_unacked(),
+            )
+        }) else {
+            return;
+        };
+
+        // Still relay-routed? `addr_to_node[addr] != peer_id` is the
+        // relay signal; if it already maps to the peer the session is
+        // direct — nothing to do.
+        let relayed = self
+            .addr_to_node
+            .get(&relay_addr)
+            .map(|n| *n != peer_id)
+            .unwrap_or(true);
+        if !relayed {
+            self.upgrade_record_done(peer_id);
+            return;
+        }
+
+        // C3 initiator busy gate.
+        if busy {
+            self.traversal_stats.record_upgrade_deferred_busy();
+            self.upgrade_record_defer(peer_id, Duration::from_secs(1));
+            return;
+        }
+
+        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_id));
+        let target_addr = match action {
+            PairAction::Direct => match self.peer_reflex_addr(peer_id) {
+                Some(addr) => addr,
+                // No cached reflex yet — retry with backoff once the
+                // peer's announcement lands.
+                None => {
+                    self.upgrade_record_failure(peer_id);
+                    return;
+                }
+            },
+            PairAction::SinglePunch | PairAction::SkipPunch => {
+                self.upgrade_record_done(peer_id);
+                return;
+            }
+        };
+
+        // Guard against "upgrading" to the very path we're already on.
+        if target_addr == relay_addr {
+            self.upgrade_record_done(peer_id);
+            return;
+        }
+
+        self.traversal_stats.record_upgrade_attempt();
+        match self
+            .connect_via_cas(
+                target_addr,
+                &pubkey,
+                peer_id,
+                prior_sid,
+                AddrInstallMode::DirectOverwrite,
+            )
+            .await
+        {
+            Ok(true) => {
+                self.traversal_stats.record_upgrade_success();
+                self.upgrade_record_done(peer_id);
+            }
+            // CAS lost to a racing rotation, or handshake failed — the
+            // existing session is untouched. Back off and re-evaluate;
+            // if the race made the session direct, the next attempt's
+            // relayed-check marks it done.
+            Ok(false) | Err(_) => {
+                self.upgrade_record_failure(peer_id);
+            }
+        }
+    }
+
+    /// Test hook: drive a single [`Self::attempt_direct_upgrade`]
+    /// synchronously, bypassing the background scan loop's timing so
+    /// integration tests are deterministic under parallel load. The
+    /// caller is responsible for the C1 lower-node-id check the loop
+    /// normally enforces.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub async fn attempt_direct_upgrade_for_test(&self, peer_id: u64) {
+        self.attempt_direct_upgrade(peer_id).await;
+    }
+
+    /// Whether the scan loop should consider `peer_id` for a background
+    /// upgrade this tick: the local node is the lower-id initiator (C1),
+    /// the session is relay-routed (not already direct), and the
+    /// per-peer throttle window has elapsed.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_is_loop_candidate(&self, peer_id: u64) -> bool {
+        // C1: only the lower-node-id end initiates.
+        if self.node_id >= peer_id {
+            return false;
+        }
+        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr) else {
+            return false;
+        };
+        // Relay-routed only — a direct session has nothing to upgrade.
+        let relayed = self
+            .addr_to_node
+            .get(&addr)
+            .map(|n| *n != peer_id)
+            .unwrap_or(true);
+        if !relayed {
+            return false;
+        }
+        self.upgrade_should_attempt(peer_id)
+    }
+
+    /// Test hook for [`Self::upgrade_is_loop_candidate`] — lets
+    /// integration tests assert the C1 / relay-routed filter
+    /// deterministically without racing the loop's cadence.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_is_loop_candidate_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_is_loop_candidate(peer_id)
+    }
+
+    /// Spawn the background direct-path upgrade scan loop (Stage 3).
+    /// Every tick, find relay-routed peers for which this node is the
+    /// lower-id initiator (C1) and whose throttle window has elapsed,
+    /// and fire a per-peer [`Self::attempt_direct_upgrade`]. No-op
+    /// unless `MeshNodeConfig::auto_direct_upgrade` is set. Needs an
+    /// `Arc<MeshNode>` (like the classify loop) to drive attempts across
+    /// `.await`s; exits on `shutdown_notify`.
+    #[cfg(feature = "nat-traversal")]
+    pub fn spawn_direct_upgrade_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+        const ATTEMPT_LEASE: Duration = Duration::from_secs(10);
+
+        let node = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            if !node.config.auto_direct_upgrade {
+                return;
+            }
+            let mut tick = tokio::time::interval(SCAN_INTERVAL);
+            tick.tick().await; // skip the immediate tick
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = shutdown_notify.notified() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                    }
+                    _ = tick.tick() => {}
+                }
+
+                // Snapshot eligible peers without holding a shard guard
+                // across the spawned attempts.
+                let candidates: Vec<u64> = node
+                    .peers
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .filter(|&peer_id| node.upgrade_is_loop_candidate(peer_id))
+                    .collect();
+
+                for peer_id in candidates {
+                    // Lease before spawning so the next scan doesn't
+                    // double-fire while this attempt is in flight.
+                    node.upgrade_lease(peer_id, ATTEMPT_LEASE);
+                    let n = node.clone();
+                    tokio::spawn(async move {
+                        n.attempt_direct_upgrade(peer_id).await;
+                    });
+                }
+            }
+        })
     }
 
     /// Connect to a peer by node id, using the routing table to pick the

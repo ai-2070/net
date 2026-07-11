@@ -302,10 +302,43 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 |-------|-------|--------|
 | 1 | Finding 4 — unsolicited-introduce reflex validation | **done** |
 | 2 | Finding 5 — rendezvous budgets, `PunchReject`, typed rejections | **done** |
-| 3 | Coordinator auto-selection + background direct-path upgrade | not started |
+| 3 | Coordinator auto-selection + background direct-path upgrade | **done** (see landing notes) |
 | 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | not started |
 | 5 | Stats parity, failure reasons, reflex-diff re-classify trigger | not started |
 | 6 | Surface completion (sdk-ts / sdk-py / CLI / punch_id / interface events) | **deferred** |
+
+**Stage 3 landing notes.** Landed in two commits — 3a (coordinator
+auto-selection) and 3b (migration-contract primitives + background upgrade).
+Deviations from the plan as written, all deliberate:
+
+- **`auto_direct_upgrade` defaults to `false`**, not `true`. This is new
+  live session-migration behavior; the flag exists so it can be enabled
+  per-deployment and validated against the Stage 4 real-NAT harness before any
+  consideration of flipping the default. The migration contract (C1–C4) is in
+  place to make it safe when enabled.
+- **The upgrade currently handles `Direct` pairs** (peer reachable at its
+  reflex). The coordinated-punch (`SinglePunch`) upgrade reuses the same
+  install machinery (`connect_via_cas` + `request_punch`) and is a follow-up;
+  `SkipPunch` pairs can never punch. Both non-Direct cases are marked terminal
+  so the scan loop stops revisiting them.
+- **Trigger is a periodic scan loop** (`spawn_direct_upgrade_loop`, 1 s cadence,
+  spawned by `start_arc` when enabled) rather than a strictly post-install hook
+  — lower-risk (no edits to the `connect_via` / `handle_routed_handshake`
+  install sites) and naturally handles both relay-session directions plus retry
+  via the outcome cache. Latency to upgrade (≤ a couple of seconds) is
+  consistent with the "traffic rides the relay meanwhile" framing.
+- **`connect_direct_auto` binding parity**: added to core + Rust SDK; the
+  Node/Python/Go wrappers for the auto variant and the `auto_direct_upgrade`
+  flag fold into Stage 5's binding-surface pass.
+- **Contract coverage**: C1 (lower-id initiator) + relay-routed + throttle
+  filter is unit/integration-tested via `upgrade_is_loop_candidate`; C2 (CAS
+  install) and C4 (addr hygiene) by `install_peer_cas` unit tests; C3 by the
+  `routed_rotation_outcome` DeferBusy unit tests (responder) and the
+  `busy_relay_session_defers_then_upgrades` integration test (initiator); C5
+  failure-atomicity by `failed_upgrade_leaves_relay_session_intact`. The full
+  nRPC-call-spanning-swap acceptance test is deferred to the Stage 4 natsim
+  harness (a unary call survives a swap by design — F1 — and an active
+  stream defers it — C3, tested here).
 
 ---
 
