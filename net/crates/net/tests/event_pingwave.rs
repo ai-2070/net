@@ -11,26 +11,26 @@
 
 #![cfg(feature = "net")]
 
+mod common;
+use common::*;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-
-const TEST_BUFFER_SIZE: usize = 256 * 1024;
-const PSK: [u8; 32] = [0x42u8; 32];
+use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 fn slow_heartbeat_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut cfg = MeshNodeConfig::new(addr, PSK)
+    let mut cfg = MeshNodeConfig::new(addr, CHAOS_PSK)
         // The periodic pingwave tick sits 30 s out — far past every
         // assertion deadline below.
         .with_heartbeat_interval(Duration::from_secs(30))
         .with_session_timeout(Duration::from_secs(120))
         .with_handshake(3, Duration::from_secs(2));
     cfg.socket_buffers = SocketBufferConfig {
-        send_buffer_size: TEST_BUFFER_SIZE,
-        recv_buffer_size: TEST_BUFFER_SIZE,
+        send_buffer_size: CHAOS_BUFFER_SIZE,
+        recv_buffer_size: CHAOS_BUFFER_SIZE,
     };
     cfg
 }
@@ -39,46 +39,29 @@ async fn build_node() -> Arc<MeshNode> {
     build_node_with(|cfg| cfg).await
 }
 
+/// Closure-convenience builder over the slow-heartbeat config; the
+/// node construction itself delegates to `common::build_node_with`
+/// (shadowed here by this same-named helper — call it via its full
+/// path).
 async fn build_node_with<F>(tweak: F) -> Arc<MeshNode>
 where
     F: FnOnce(MeshNodeConfig) -> MeshNodeConfig,
 {
-    let cfg = tweak(slow_heartbeat_config());
-    let keypair = EntityKeypair::generate();
-    Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
+    common::build_node_with(tweak(slow_heartbeat_config())).await
 }
 
-/// Handshake two nodes (A initiator, B responder) and `start()`
-/// both. `start` is idempotent, so re-handshaking an already-started
-/// node is fine.
+/// `common::connect_pair` (connect + accept) plus the `start()` calls.
+/// A initiator, B responder; `start` is idempotent, so re-handshaking
+/// an already-started node is fine.
 async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
-    let a_id = a.node_id();
-    let b_id = b.node_id();
-    let b_pub = *b.public_key();
-    let b_addr = b.local_addr();
-
-    let b_clone = b.clone();
-    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
-    a.connect(b_addr, &b_pub, b_id)
-        .await
-        .expect("connect failed");
-    accept
-        .await
-        .expect("accept task panicked")
-        .expect("accept failed");
+    connect_pair(a, b).await;
     a.start();
     b.start();
 }
 
-async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    cond()
+/// Cond-first arg-order adapter over `common::poll_until`.
+async fn wait_until<F: FnMut() -> bool>(cond: F, timeout: Duration) -> bool {
+    poll_until(timeout, cond).await
 }
 
 /// The RT-4 core claim: when A joins B, a node C two hops away

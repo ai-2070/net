@@ -157,6 +157,22 @@ pub async fn await_condition<F: FnMut() -> bool>(limit: Duration, description: &
     }
 }
 
+/// Bool-returning variant of [`await_condition`]: poll `check` every
+/// 25 ms up to `limit`, returning whether it ever held. Use this when
+/// the caller wants to branch on the outcome — e.g. print diagnostics
+/// before asserting, or assert the *negative* (a route that must NOT
+/// appear). [`await_condition`] panics on timeout; this reports.
+pub async fn poll_until<F: FnMut() -> bool>(limit: Duration, mut check: F) -> bool {
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < limit {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    check()
+}
+
 /// Wait for `observer.failure_detector()` to mark `target_id`
 /// as `NodeStatus::Failed`. Drives the detector on each poll
 /// iteration (via `check_all()`) because production-config

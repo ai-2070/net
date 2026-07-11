@@ -16,25 +16,25 @@
 
 #![cfg(feature = "net")]
 
+mod common;
+use common::*;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
 use net::adapter::Adapter;
-
-const TEST_BUFFER_SIZE: usize = 256 * 1024;
-const PSK: [u8; 32] = [0x42u8; 32];
 
 fn base_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut cfg = MeshNodeConfig::new(addr, PSK)
+    let mut cfg = MeshNodeConfig::new(addr, CHAOS_PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(10))
         .with_handshake(3, Duration::from_secs(2));
     cfg.socket_buffers = SocketBufferConfig {
-        send_buffer_size: TEST_BUFFER_SIZE,
-        recv_buffer_size: TEST_BUFFER_SIZE,
+        send_buffer_size: CHAOS_BUFFER_SIZE,
+        recv_buffer_size: CHAOS_BUFFER_SIZE,
     };
     cfg
 }
@@ -45,49 +45,28 @@ fn detector_config() -> MeshNodeConfig {
     base_config().with_session_timeout(Duration::from_secs(1))
 }
 
-async fn build(cfg: MeshNodeConfig) -> Arc<MeshNode> {
-    let keypair = EntityKeypair::generate();
-    Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
-}
-
-/// Initiator must be the already-started node (see event_pingwave.rs).
+/// `common::connect_pair` (connect + accept) plus the `start()` calls
+/// these tests need. The started node MUST be the initiator — a running
+/// dispatch loop owns the socket, so a post-start `accept` never sees
+/// the handshake packets.
 async fn handshake(initiator: &Arc<MeshNode>, acceptor: &Arc<MeshNode>) {
-    let i_id = initiator.node_id();
-    let a_id = acceptor.node_id();
-    let a_pub = *acceptor.public_key();
-    let a_addr = acceptor.local_addr();
-
-    let acc = acceptor.clone();
-    let accept = tokio::spawn(async move { acc.accept(i_id).await });
-    initiator
-        .connect(a_addr, &a_pub, a_id)
-        .await
-        .expect("connect failed");
-    accept
-        .await
-        .expect("accept task panicked")
-        .expect("accept failed");
+    connect_pair(initiator, acceptor).await;
     initiator.start();
     acceptor.start();
 }
 
-async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    cond()
+/// Cond-first arg-order adapter over `common::poll_until`, so the poll
+/// loop lives in one place (a CI-cadence tweak reaches every test).
+async fn wait_until<F: FnMut() -> bool>(cond: F, timeout: Duration) -> bool {
+    poll_until(timeout, cond).await
 }
 
 /// Build the C ↔ B ↔ A chain and wait until C has the pingwave-
 /// learned `(A via B)` route. Returns (a, b, c).
 async fn chain(c_cfg: MeshNodeConfig) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
-    let a = build(base_config()).await;
-    let b = build(detector_config()).await;
-    let c = build(c_cfg).await;
+    let a = build_node_with(base_config()).await;
+    let b = build_node_with(detector_config()).await;
+    let c = build_node_with(c_cfg).await;
 
     handshake(&b, &c).await;
     handshake(&b, &a).await;
@@ -167,9 +146,9 @@ async fn withdrawal_is_not_undone_by_relayed_session_promotion() {
     // established THROUGH B (`connect_via`) — A has no direct UDP
     // path to C in the routing sense (its peer entry for C carries
     // B's address).
-    let a = build(base_config()).await;
-    let b = build(detector_config()).await;
-    let c = build(base_config()).await;
+    let a = build_node_with(base_config()).await;
+    let b = build_node_with(detector_config()).await;
+    let c = build_node_with(base_config()).await;
 
     let a_id = a.node_id();
     let b_id = b.node_id();
