@@ -835,6 +835,41 @@ pub fn capability_tags_for_all(
 
 /// Shared implementation: union the publisher's tag set across
 /// every class entry it owns. Callers hold the state read lock.
+/// Of `node_ids`, those advertising `tag` in their folded capability
+/// set — computed under a single `with_state` lock, with no per-node
+/// tag-`Vec` allocation. Coordinator selection filters its direct-peer
+/// candidates by [`RELAY_CAPABLE_TAG`] this way, instead of taking the
+/// fold lock and materializing a full tag union once per candidate
+/// (a `1 + N`-lock, `N`-allocation pattern).
+pub fn nodes_with_capability_tag(
+    fold: &super::Fold<CapabilityFold>,
+    node_ids: &[NodeId],
+    tag: &str,
+) -> std::collections::HashSet<NodeId> {
+    fold.with_state(|state| {
+        node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| node_has_tag(state, *node_id, tag))
+            .collect()
+    })
+}
+
+/// Whether `node_id` advertises `tag` in any of its folded class
+/// entries. Non-allocating — walks the publisher's `by_node` reverse
+/// index and short-circuits on the first match.
+fn node_has_tag(state: &FoldState<CapabilityFold>, node_id: NodeId, tag: &str) -> bool {
+    let Some(keys) = state.by_node.get(&node_id) else {
+        return false;
+    };
+    keys.iter().any(|key| {
+        state
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.payload.tags.iter().any(|t| t == tag))
+    })
+}
+
 fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<String> {
     let Some(keys) = state.by_node.get(&node_id) else {
         return Vec::new();
@@ -1791,6 +1826,87 @@ mod tests {
         let fold = new_fold();
         let batched = super::capability_tags_for_all(&fold);
         assert!(batched.is_empty());
+    }
+
+    #[test]
+    fn nodes_with_capability_tag_filters_the_batch() {
+        const RELAY_CAPABLE_TAG: &str =
+            crate::adapter::net::behavior::capability::RELAY_CAPABLE_TAG;
+        // A and C advertise `relay-capable`; B does not. C carries it
+        // on a *second* class entry only, so the union walk must see
+        // it. Querying a mix (incl. an absent node id D) returns
+        // exactly the matching subset.
+        let fold = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let kp_c = EntityKeypair::generate();
+        fold.apply(sign_cap(
+            &kp_a,
+            0xA,
+            1,
+            0x100,
+            vec!["gpu", RELAY_CAPABLE_TAG],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("a");
+        fold.apply(sign_cap(
+            &kp_b,
+            0xB,
+            1,
+            0x100,
+            vec!["cpu-only"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("b");
+        fold.apply(sign_cap(
+            &kp_c,
+            0xC,
+            1,
+            0x100,
+            vec!["gpu"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("c-100");
+        fold.apply(sign_cap(
+            &kp_c,
+            0xC,
+            1,
+            0x200,
+            vec![RELAY_CAPABLE_TAG],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("c-200");
+
+        let mut got: Vec<u64> =
+            super::nodes_with_capability_tag(&fold, &[0xA, 0xB, 0xC, 0xD], RELAY_CAPABLE_TAG)
+                .into_iter()
+                .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![0xA, 0xC],
+            "only A and C advertise the tag (D is absent)"
+        );
+
+        // Batch predicate agrees with the per-node union helper.
+        for nid in [0xA, 0xB, 0xC] {
+            let via_union = super::capability_tags_for(&fold, nid)
+                .iter()
+                .any(|t| t == RELAY_CAPABLE_TAG);
+            let via_batch =
+                super::nodes_with_capability_tag(&fold, &[nid], RELAY_CAPABLE_TAG).contains(&nid);
+            assert_eq!(
+                via_union, via_batch,
+                "batch vs union disagree for 0x{nid:x}"
+            );
+        }
+
+        // Empty query → empty result.
+        assert!(super::nodes_with_capability_tag(&fold, &[], RELAY_CAPABLE_TAG).is_empty());
     }
 
     #[test]

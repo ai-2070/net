@@ -9965,19 +9965,20 @@ impl MeshNode {
         // fails fast (Finding 5) instead of blocking until
         // `punch_deadline`. `target` echoes the request so A resolves
         // the matching waiter. Best-effort — a failed send just
-        // degrades to the old timeout behavior. `Fn` (clones its Arcs
-        // per call) so the several refusal branches below can each
-        // reach it.
-        let reject_session = a_session.clone();
-        let reject_socket = ctx.socket.clone();
+        // degrades to the old timeout behavior. Borrows `a_session` /
+        // `ctx.socket` and clones only when actually invoked, so the
+        // common successful-mediation path (no reject fires) pays no
+        // Arc refcount bumps. Its last call precedes A_session's move
+        // into the introduce spawn below, so the borrow is released in
+        // time (NLL).
         let reject_target = req.target;
         // Echo the request's correlation token so A's waiter can
         // tell this reject answers THIS request, not a superseded
         // concurrent one to the same target (cubic P2).
         let reject_punch_id = req.punch_id;
-        let send_reject = move |reason: RejectReason| {
-            let session = reject_session.clone();
-            let socket = reject_socket.clone();
+        let send_reject = |reason: RejectReason| {
+            let session = a_session.clone();
+            let socket = ctx.socket.clone();
             let body = RendezvousMsg::PunchReject(PunchReject {
                 target: reject_target,
                 punch_id: reject_punch_id,
@@ -13149,11 +13150,10 @@ impl MeshNode {
             }
         }
 
-        // Tiers 2 & 3: scan direct session peers once, bucketing into
-        // relay-capable and any. Exclude ourselves and the target.
+        // Tiers 2 & 3: collect the direct mutual peers (excluding self
+        // and the target), then split into relay-capable and any.
         // Collected (not min-reduced) so the pick can be spread across
         // the tier's candidates — see `spread_pick`.
-        let mut relay_capable: Vec<u64> = Vec::new();
         let mut any: Vec<u64> = Vec::new();
         for entry in self.peers.iter() {
             let nid = *entry.key();
@@ -13171,23 +13171,28 @@ impl MeshNode {
                 continue;
             }
             any.push(nid);
-            let is_relay_capable =
-                super::behavior::fold::capability_tags_for(&self.capability_fold, nid)
-                    .iter()
-                    .any(|t| t == super::behavior::capability::RELAY_CAPABLE_TAG);
-            if is_relay_capable {
-                relay_capable.push(nid);
-            }
         }
+        // Relay-capable subset, resolved in ONE fold lock for the whole
+        // candidate batch — the prior code took the fold lock and
+        // allocated a tag `Vec` for every candidate just to test one tag.
+        let relay_capable_set = super::behavior::fold::nodes_with_capability_tag(
+            &self.capability_fold,
+            &any,
+            super::behavior::capability::RELAY_CAPABLE_TAG,
+        );
 
         // Tier 2 preferred, tier 3 fallback, else tier 4 (None). Spread
         // the pick within the chosen tier so load doesn't concentrate.
-        let pool = if relay_capable.is_empty() {
-            &any
+        if !relay_capable_set.is_empty() {
+            let relay_capable: Vec<u64> = any
+                .iter()
+                .copied()
+                .filter(|nid| relay_capable_set.contains(nid))
+                .collect();
+            Self::spread_pick(&relay_capable)
         } else {
-            &relay_capable
-        };
-        Self::spread_pick(pool)
+            Self::spread_pick(&any)
+        }
     }
 
     /// Pick one node id from `pool` at random, spread across calls so
@@ -14919,13 +14924,22 @@ impl MeshNode {
     /// per-peer throttle window has elapsed.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_is_loop_candidate(&self, peer_id: u64) -> bool {
+        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr) else {
+            return false;
+        };
+        self.upgrade_is_loop_candidate_at(peer_id, addr)
+    }
+
+    /// As [`Self::upgrade_is_loop_candidate`] but with the peer's
+    /// session `addr` already in hand — lets the scan loop test each
+    /// peer straight from the `peers` iterator entry instead of doing a
+    /// redundant `peers.get` shard-lookup on the map it is iterating.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: SocketAddr) -> bool {
         // C1: only the lower-node-id end initiates.
         if self.node_id >= peer_id {
             return false;
         }
-        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr) else {
-            return false;
-        };
         // Relay-routed only — a direct session has nothing to upgrade.
         if !self.is_relayed_peer(peer_id, &addr) {
             return false;
@@ -15010,12 +15024,16 @@ impl MeshNode {
                 let Some(node) = weak.upgrade() else { break };
 
                 // Snapshot eligible peers without holding a shard guard
-                // across the spawned attempts.
+                // across the spawned attempts. Test each peer straight
+                // from the iterator entry (id + addr in hand) so the
+                // filter doesn't re-`get` the map it's iterating.
                 let candidates: Vec<u64> = node
                     .peers
                     .iter()
+                    .filter(|entry| {
+                        node.upgrade_is_loop_candidate_at(*entry.key(), entry.value().addr)
+                    })
                     .map(|entry| *entry.key())
-                    .filter(|&peer_id| node.upgrade_is_loop_candidate(peer_id))
                     .collect();
 
                 for peer_id in candidates {
