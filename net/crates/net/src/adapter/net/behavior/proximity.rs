@@ -693,11 +693,6 @@ impl ProximityGraph {
         Some(pw)
     }
 
-    /// Insert or refresh an edge. If the edge already exists, EWMA the
-    /// latency sample into `latency_us` (α = 1/8) and bump
-    /// `last_updated`. `sample_us == 0` means "no latency info" (e.g.
-    /// the self → peer edge added at session setup); leave the
-    /// existing latency alone in that case.
     /// Remove one directed edge (RT-5,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Called when a peer
     /// withdraws its route toward `to`: the `(peer, to)` edge is what
@@ -711,6 +706,11 @@ impl ProximityGraph {
         removed
     }
 
+    /// Insert or refresh an edge. If the edge already exists, EWMA the
+    /// latency sample into `latency_us` (α = 1/8) and bump
+    /// `last_updated`. `sample_us == 0` means "no latency info" (e.g.
+    /// the self → peer edge added at session setup); leave the
+    /// existing latency alone in that case.
     fn insert_or_update_edge(&self, from: NodeId, to: NodeId, sample_us: u64) {
         let mut edge_inserted = false;
         self.edges
