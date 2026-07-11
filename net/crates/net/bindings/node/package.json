@@ -80,9 +80,9 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator",
-    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator",
-    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,test-helpers",
+    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a",
+    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a",
+    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,test-helpers",
     "build:ts": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build:ts && napi prepublish -t npm",
     "test": "vitest run",

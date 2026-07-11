@@ -1,7 +1,14 @@
 # Implementation Plan: Node/TS delegation + A2A surface (Hermes parity)
 
-**Status: DEFERRED — not scheduled.** Written 2026-07-09 to capture scope; no
-code landed. Pick up when the Node SDK's Hermes surface is prioritized.
+**Status: LANDED 2026-07-10** (branch `node-hermes-parity`). Written 2026-07-09
+to capture scope; implemented the next day. All four workstreams shipped:
+`delegation` + `a2a` features (in `default` and the release/CI build matrices),
+the three napi modules (`delegation.rs` ~300 lines, `enrollment.rs` ~660,
+`a2a.rs` ~250), all 13 `NetMesh` methods, and three vitest suites mirroring the
+Python twins — 12 delegation + 14 enrollment (incl. live join + renewal over
+real UDP loopback) + 3 a2a, full node suite green (508 passed), clippy and
+`cargo doc -D warnings` clean, `typecheck:tests` clean. Implementation notes
+and resolved decisions are recorded inline below (search "Landed").
 
 **Implements:** the last Node/TS gap versus Python in the Hermes surface —
 delegated agent identity (`delegation`), device enrollment (rides the
@@ -92,6 +99,15 @@ Two structural facts (mirroring the payments gap plan):
   `--no-default-features --features net,cortex,…` — **must add `delegation,a2a`**
   there or the new suites won't compile/run.
 
+> **Status: WS-0 landed 2026-07-10.** Features added exactly as specified and
+> to `default`; `delegation,a2a` added to the ci.yml vitest-job feature list
+> AND (release-matrix explicitness, requested in review) to all three
+> `package.json` build scripts. One extra seam: `mod common`'s cfg gate gained
+> `feature = "delegation"` so the new modules reuse the canonical
+> `common::bigint_u64` BigInt→u64 validation instead of growing a duplicate
+> (`delegation::u64_arg` wraps it to name the offending argument). The sdk-ts
+> CI job's feature list is untouched — the TS SDK layer has no Hermes surface.
+
 ### WS-1 — `delegation.rs` (~300 lines)
 
 Port, as `#[napi]` classes / functions:
@@ -99,6 +115,17 @@ Port, as `#[napi]` classes / functions:
 - `RevocationRegistry` (open at a store path; check/revoke) + `default_revocation_store_path() -> Option<String>`
 - `DelegationChain` (root → machine → gateway → subagent; the handle + its accessors)
 - `NetMesh` methods: `rendezvousString()`, `join(...)`, `renew(...)`.
+
+> **Status: WS-1 landed 2026-07-10.** As specified, plus the conventions the
+> rest of the port reuses: u64s cross as `BigInt` (the `TokenInfo` precedent),
+> TTL/window knobs as `number` (u32, the `handlerTimeoutMs` precedent);
+> `TokenError`s map through the existing `identity::token_err_for` so the
+> `token: <kind>` discriminators stay single-sourced;
+> `GATEWAY_DELEGATION_CHANNEL` exports as a real `#[napi] pub const`.
+> `Identity` gained three `pub(crate)` seams (`from_keypair_arc`,
+> `entity_id_ref`, `secret_seed`, all `delegation`-gated; `to_sdk_identity`'s
+> cfg widened) — the H8 audit point: the seed accessor is crate-internal and
+> feeds only the Rust-side KDF; JS still sees handles only.
 
 ### WS-2 — `enrollment.rs` (~690 lines — the largest)
 
@@ -110,6 +137,17 @@ Port the device-lifecycle facade + value types:
 - `EnrollmentServeHandle` (**needs `stop()`/`close()`** — retains the node)
 - `NetMesh.serveEnrollmentAuto(...)`.
 
+> **Status: WS-2 landed 2026-07-10.** As specified. Store-touching facade
+> methods (`approve`, `handleJoinRequest`, `revoke`, `devices`, `forget`,
+> `DeviceEnrollment.load/save`, `RevocationRegistry.loadFromStore`) are napi
+> `async fn`s so file IO rides a tokio worker instead of the JS thread — the
+> Node analog of the Python binding's `py.detach`. **The one real deviation
+> from the survey's assumption:** napi sync methods have NO tokio runtime
+> context (the substrate's `serve_rpc` spawns a response drainer →
+> "no reactor running" panic, caught by the live vitest test on first run), so
+> `serveEnrollmentAuto` is an `async fn` resolving to the handle — the same
+> reason the Python binding wraps serve registration in `runtime.enter()`.
+
 ### WS-3 — `a2a.rs` (~200 lines)
 
 - `NodeTaskExecutor`: the `net_sdk::a2a::TaskExecutor` impl backed by a JS async
@@ -119,6 +157,33 @@ Port the device-lifecycle facade + value types:
 - `A2aServeHandle` (**needs `stop()`/`close()`**).
 - `NetMesh` methods: `serveA2a(executor, …)`, `submitTask(nodeId, taskJson)`,
   `taskStatus(nodeId, taskId)`, `cancelTask(nodeId, taskId)`.
+
+> **Status: WS-3 landed 2026-07-10.** The executor callback is
+> `(brief: TaskBriefJs) => Promise<string>` (a typed `#[napi(object)]` brief,
+> not positional args or JSON blobs); submit takes
+> `(targetNodeId, prompt, contextRefs?, tags?)` mirroring the Python
+> signature. `serveA2a` is the `publish.rs` "sync setup, async continuation"
+> shape — TSFN built on the JS thread (the `Function` is `!Send`), then
+> `env.spawn_future` for the registration (same no-reactor constraint as
+> WS-2) — resolving to the handle. **The one-sided-cancellation note became a
+> documented divergence:** Python cancels the executor's *coroutine*; a JS
+> Promise can't be aborted from outside, so a cancel discards the handler's
+> eventual result and records `Cancelled` — the wire-visible contract (state
+> flips and stays `cancelled`, no result served) is what the tests pin.
+> JS names pinned with `js_name` (`serveA2a`, `A2aServeHandle`) — napi's
+> auto-camelCase would emit `serveA2A` / `A2AServeHandle`.
+>
+> **Review follow-up (cubic, 2026-07-11):** `serveA2a` gained
+> `ServeA2aOptions.handlerTimeoutMs` (default 1 hour, `0` disables — the
+> Python-parity opt-out), one deadline across the handler returning its
+> Promise and that Promise settling. Past it the task records a `Failed`
+> terminal state, so a wedged event loop / never-settling Promise can no
+> longer strand an accepted task in `Running` (and in the registry) forever;
+> pinned by a never-settling-executor vitest case. And every store-IO facade
+> method (`OperatorEnrollment.approve/handleJoinRequest/revoke/devices/
+> forget`, `DeviceEnrollment.load/save`, `RevocationRegistry.loadFromStore`)
+> now runs its synchronous file IO under `tokio::task::spawn_blocking` so a
+> slow or large store can't starve a napi runtime worker.
 
 ### WS-4 — TS types + tests
 
@@ -131,25 +196,48 @@ Port the device-lifecycle facade + value types:
   link-arg=-undefined -C link-arg=dynamic_lookup"`). Build the `.node` with the
   new features and run the vitest suites end-to-end.
 
+> **Status: WS-4 landed 2026-07-10.** `index.d.ts` regenerated (it is
+> gitignored — each build regenerates it) and every shape verified; the three
+> vitest suites mirror the Python twins test-for-test, with the a2a "zombie
+> coroutine" case adapted to assert the JS contract (state stays `cancelled`
+> past the handler's completion point) per the WS-3 divergence. No new Rust
+> unit tests: the modules' only pure logic is the one-line `u64_arg` wrapper
+> over the already-tested `common::bigint_u64`. Full verification: 29 new
+> tests green, whole node suite 508 passed, clippy clean (one
+> `wrong_self_convention` allow on `JoinOutcome.intoChain`, same as Python),
+> `cargo doc -D warnings` clean, both typechecks clean (two pre-existing
+> vitest typecheck errors — the `cross_lang_compat` `RawMeshRpc` stub missing
+> the bidi-streaming members, an implicit-any in `deck.test.ts` — fixed in
+> passing).
+
 ---
 
-## Open decisions
+## Open decisions (all resolved 2026-07-10)
 
-1. **Enrollment scope.** In Python `enrollment` rides the `delegation` gate (no
-   separate feature) and is the biggest piece (688 lines). Options: (a) mirror —
-   `delegation` pulls enrollment too (full parity, one gate); (b) split
-   enrollment behind its own feature and land delegation + a2a first. Recommend
-   (a) for parity unless a smaller first cut is wanted.
-2. **Async duals.** Python exposes coroutine duals (`AsyncNetMesh`); Node's napi
-   `async fn` already returns a Promise, so most methods are single-form. Confirm
-   no separate async class is needed (the `serve_*` handles are the only
-   long-lived pieces).
-3. **Handle `close()` semantics.** Decide `stop()` (drop, unregister) vs awaited
-   `withdraw()` (re-announce then stop) per serve handle, matching the Rust
-   handle's capabilities and the `LocalPublicationHandle` precedent.
-4. **`Identity` non-custodial boundary.** Confirm `derive_child_identity` returns
-   only a handle and never exposes seed/secret bytes across the boundary (audit
-   against the existing `identity.rs` surface).
+1. **Enrollment scope.** ~~Options (a)/(b)~~ **Resolved: (a), mirror.**
+   Enrollment rides the `delegation` gate exactly as in Python — one gate, full
+   parity in one cut.
+2. **Async duals.** **Resolved: no separate async class.** napi `async fn` =
+   Promise covers everything single-form. The nuance discovered in
+   implementation runs the other way: several methods that are *sync* in
+   Python had to become async in Node — store-IO facade methods (off the JS
+   thread) and the serve registrations (napi sync calls have no tokio runtime
+   context; the substrate's `serve_rpc` spawns a drainer task and panics with
+   "no reactor running" otherwise). `serveEnrollmentAuto` is a plain
+   `async fn`; `serveA2a` is sync TSFN setup + `env.spawn_future` (its
+   `Function` arg is `!Send`) — both resolve to their handles.
+3. **Handle `close()` semantics.** **Resolved: `stop()`** (drop, unregister) +
+   a `serving` getter on both `EnrollmentServeHandle` and `A2aServeHandle`,
+   mirroring the Python handles one-for-one. No awaited `withdraw()`: the
+   underlying SDK `ServeHandle`s have no re-announce path (that is a
+   `LocalPublicationHandle`/announcement concept; these are plain nRPC service
+   registrations).
+4. **`Identity` non-custodial boundary.** **Resolved: holds.**
+   `deriveChildIdentity` derives inside Rust (`derive_child_seed` over a
+   `pub(crate)` seed accessor) and returns a handle built by the new
+   `Identity::from_keypair_arc`; `DeviceEnrollment.device` shares the keypair
+   `Arc` with a fresh token cache. No new JS-visible byte path beyond the
+   pre-existing explicit `Identity.toBytes()` persistence escape hatch.
 
 ## Test matrix (target)
 

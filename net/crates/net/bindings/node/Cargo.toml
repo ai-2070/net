@@ -46,6 +46,8 @@ default = [
     "mcp",
     "publish",
     "payments",
+    "delegation",
+    "a2a",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -168,6 +170,23 @@ publish = ["mcp", "net", "dep:net-sdk", "net-sdk/net", "dep:async-trait"]
 # gate seam, `mesh` for `MeshPaymentChannel` + the SDK mesh surface). Thin per
 # doctrine #1: every payment decision is the Rust flow's; the binding marshals.
 payments = ["mcp", "net", "dep:net-payments"]
+# Delegated agent identity + device enrollment (`NODE_DELEGATION_A2A_SDK_PLAN.md`
+# WS-1/WS-2, Hermes V2 Phases 1+3): `deriveChildIdentity`, `RevocationRegistry`,
+# `DelegationChain`, and the invite → join → approve enrollment surface
+# (`OperatorEnrollment`, `DeviceEnrollment`, `NetMesh.join` / `renew` /
+# `serveEnrollmentAuto`). Thin wrappers over `net_sdk::{delegation, revocation,
+# enrollment, operator, devices, mesh_enroll}` — mirrors the Python `delegation`
+# feature exactly (enrollment shares the gate; same SDK sub-features: `net` for
+# the mesh surface `from_node_arc` needs, `cortex` for the nRPC the live
+# join/renew/serve bridge rides).
+delegation = ["net", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
+# Agent-to-agent task handoff (`NODE_DELEGATION_A2A_SDK_PLAN.md` WS-3, Hermes V2
+# Phase 3): `NetMesh.serveA2a` backed by a JS async task executor +
+# submit/status/cancel by node id. Thin wrappers over `net_sdk::{a2a, mesh_a2a}`.
+# Composite: `delegation` (the `net` + `net-sdk/net,cortex` mesh surface
+# `net_sdk::mesh_a2a` needs) and `cortex` (the nRPC substrate + `async-trait`
+# for the `TaskExecutor` impl). Mirrors the Python `a2a` feature.
+a2a = ["delegation", "cortex"]
 # Outbound HTTP-402 client (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B3):
 # `PaymentHttpClient` over `net-payments::flow::http402::X402HttpFlow`. Kept
 # OUT of the default `.node`: it pulls `net-payments/http-facilitator`

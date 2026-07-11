@@ -329,7 +329,7 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
         q.recent(100);
         const raw = q.collect();
         if (raw.length > 0) {
-          parsed = raw.map((s) => JSON.parse(s) as Record<string, unknown>);
+          parsed = raw.map((s: string) => JSON.parse(s) as Record<string, unknown>);
           break;
         }
         await new Promise((r) => setTimeout(r, 50));

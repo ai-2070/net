@@ -124,6 +124,24 @@ class LoopbackHandlerRpc implements RawMeshRpc {
   cancelCall(_token: bigint): void {
     throw new Error('cancellation not exercised by cross-lang compat')
   }
+  callClientStream(): Promise<never> {
+    throw new Error('client-streaming not exercised by cross-lang compat')
+  }
+  serveClientStream(): ServeHandle {
+    throw new Error('client-streaming not exercised by cross-lang compat')
+  }
+  callDuplex(): Promise<never> {
+    throw new Error('duplex not exercised by cross-lang compat')
+  }
+  serveDuplex(): ServeHandle {
+    throw new Error('duplex not exercised by cross-lang compat')
+  }
+  setObserver(): void {
+    throw new Error('observer not exercised by cross-lang compat')
+  }
+  metricsSnapshot(): never {
+    throw new Error('metrics not exercised by cross-lang compat')
+  }
   private dispatch(service: string, reqBytes: Buffer): Buffer {
     if (service !== fixture.service) {
       throw new Error(`nrpc:no_route: unknown service ${service}`)

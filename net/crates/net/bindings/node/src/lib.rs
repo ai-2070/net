@@ -6,6 +6,11 @@
 // single security unit — they share `adapter::net`'s subprotocol
 // dispatch and operate together at runtime, so gating each module
 // separately would only enable combinations that aren't meaningful.
+// Agent-to-agent task handoff (Hermes V2 Phase 3): `NetMesh.serveA2a` backed
+// by a JS async task executor + submit/status/cancel by node id. Thin wrappers
+// over `net_sdk::{a2a, mesh_a2a}`; gated on `a2a` (delegation + cortex).
+#[cfg(feature = "a2a")]
+mod a2a;
 #[cfg(feature = "dataforts")]
 mod blob;
 #[cfg(feature = "net")]
@@ -18,6 +23,7 @@ mod capability_aggregation;
     feature = "groups",
     feature = "aggregator",
     feature = "publish",
+    feature = "delegation",
 ))]
 mod common;
 #[cfg(feature = "compute")]
@@ -31,6 +37,17 @@ mod compute;
 mod consent;
 #[cfg(feature = "cortex")]
 mod cortex;
+// Delegated agent identity (Hermes Phase 3): `DelegationChain` +
+// `RevocationRegistry` + child-identity derivation. Thin wrappers over
+// `net_sdk::delegation`; needs the SDK's `net` feature.
+#[cfg(feature = "delegation")]
+mod delegation;
+// Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
+// + the operator device-lifecycle facade. Thin wrappers over
+// `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
+// SDK surface, mirroring the Python binding).
+#[cfg(feature = "delegation")]
+mod enrollment;
 #[cfg(feature = "net")]
 mod gang;
 #[cfg(feature = "groups")]
@@ -2087,7 +2104,8 @@ mod mesh_bindings {
             feature = "cortex",
             feature = "aggregator",
             feature = "payments",
-            feature = "publish"
+            feature = "publish",
+            feature = "delegation"
         ))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.node.load();
