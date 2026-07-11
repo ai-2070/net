@@ -169,3 +169,44 @@ async fn max_gap_disables_event_pingwaves() {
          unexpected flood",
     );
 }
+
+/// RT-4 review Finding 10: an event pingwave that lands INSIDE the
+/// min-gap window is coalesced into a trailing-edge emission at the
+/// window's end, not silently dropped. Pre-fix the leading-edge-only
+/// gate dropped in-window events, so an absorbed topology change
+/// waited for the heartbeat tick. Observable via the origin's
+/// `pingwaves_sent` counter: a second in-window session-open produces
+/// one more emission after the gap elapses.
+#[tokio::test]
+async fn in_gap_event_pingwave_emits_on_trailing_edge() {
+    let gap = Duration::from_millis(2000);
+    let a = build_node_with(|cfg| cfg.with_event_pingwave_min_gap(gap)).await;
+    let b = build_node().await;
+    let c = build_node().await;
+
+    // A initiates BOTH sessions so every emission is A's own. The
+    // first connect is the leading edge (immediate); the second,
+    // well within the 2s gap, is absorbed and must re-emit at the
+    // trailing edge.
+    handshake(&a, &b).await;
+    handshake(&a, &c).await;
+
+    // Let the leading-edge rounds finish. The trailing edge is still
+    // ~2s out (measured from the leading edge), so the counter here
+    // reflects only the leading edge.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_leading = a.proximity_graph().stats().pingwaves_sent;
+    assert!(after_leading >= 1, "leading-edge emission never happened");
+
+    // The trailing-edge catch-up must fire — pre-fix the in-window
+    // second event was dropped and this counter would never move.
+    let bumped = wait_until(
+        || a.proximity_graph().stats().pingwaves_sent > after_leading,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        bumped,
+        "in-window event pingwave was dropped — no trailing-edge emission",
+    );
+}

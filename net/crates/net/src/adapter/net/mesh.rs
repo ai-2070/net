@@ -2127,77 +2127,150 @@ impl LocalServiceRegistry {
 /// `Self` exists in `MeshNode::new`; both it and
 /// [`MeshNode::emit_event_pingwave`] share this one implementation.
 ///
-/// Gated by `min_gap` against the shared `gate` timestamp: events
-/// inside the gap are absorbed (the pingwave carries whole-node
-/// state, and the heartbeat tick remains the anti-entropy floor
-/// that repairs anything coalesced away). `Duration::MAX` disables.
-/// The sends run on a spawned task so callers — including sync
-/// callbacks — never block on socket I/O.
+/// Gated by `min_gap` against the shared `gate`: the first event in a
+/// window emits immediately (leading edge); events inside the window
+/// are coalesced into ONE trailing-edge emission scheduled for the
+/// window's end, so an absorbed topology change still converges at
+/// flood speed instead of waiting for the heartbeat tick (RT-4 review
+/// Finding 10 — the pre-fix leading-edge-only gate silently dropped
+/// in-window events, the same pattern RT-1 fixed for announces). The
+/// heartbeat tick remains the anti-entropy floor. `Duration::MAX`
+/// disables.
+///
+/// `resend` requests the second flood round that closes the
+/// session-open bookkeeping race (below); only the direct
+/// `connect`/`accept` session-open callers pass `true`. Recovery and
+/// change-announce emissions pass `false` — the race can't occur for
+/// them (the peer is already registered), so a second mesh-wide flood
+/// would be pure duplicate traffic. The sends run on a spawned task
+/// so callers — including sync callbacks — never block on socket I/O.
 fn spawn_event_pingwave(
-    gate: &parking_lot::Mutex<Option<std::time::Instant>>,
+    gate: &Arc<parking_lot::Mutex<EventPingwaveGate>>,
     min_gap: Duration,
     proximity_graph: &Arc<ProximityGraph>,
     socket: &Arc<NetSocket>,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     partition_filter: &PartitionFilter,
+    resend: bool,
 ) {
     if min_gap == Duration::MAX {
         return;
     }
-    {
-        let mut last = gate.lock();
-        let now = std::time::Instant::now();
-        if last.is_some_and(|t| now.saturating_duration_since(t) < min_gap) {
-            return;
-        }
-        *last = Some(now);
+    enum Action {
+        EmitNow,
+        Defer(Duration),
+        Coalesced,
     }
-    let proximity_graph = proximity_graph.clone();
-    let socket = socket.clone();
-    let peers = peers.clone();
-    let filter = partition_filter.clone();
-    tokio::spawn(async move {
-        // Two rounds, fresh pingwave (fresh seq) each. Round 1 is
-        // the flood-speed path. Round 2 exists because a session-
-        // open emission races the OTHER side's post-handshake
-        // bookkeeping: the responder finishes its handshake on the
-        // initiator's final message and emits immediately, but the
-        // initiator installs the `addr_to_node` entry only after
-        // sending that message — on a fast link round 1 can arrive
-        // before the entry exists and be dropped by the DV
-        // unregistered-source gate (`mesh.rs` pingwave dispatch,
-        // rule 4). The re-flood lands after the bookkeeping has
-        // settled; the fresh seq keeps receivers that processed
-        // round 1 from dedup-dropping round 2's refresh. Peers are
-        // re-snapshotted so a peer installed between rounds is
-        // covered too.
-        for round in 0..2u8 {
-            if round > 0 {
-                tokio::time::sleep(EVENT_PINGWAVE_RESEND_DELAY).await;
+    let now = std::time::Instant::now();
+    let action = {
+        let mut g = gate.lock();
+        match g.last_emit {
+            Some(t) if now.saturating_duration_since(t) < min_gap => {
+                if g.deferred_scheduled {
+                    Action::Coalesced
+                } else {
+                    g.deferred_scheduled = true;
+                    Action::Defer(min_gap - now.saturating_duration_since(t))
+                }
             }
-            let pw_bytes = proximity_graph
-                .create_pingwave(HealthStatus::Healthy)
-                .to_bytes();
-            // Snapshot before awaiting — same shard-guard
-            // discipline as the heartbeat loop's send pass.
-            let targets: Vec<SocketAddr> = peers
-                .iter()
-                .filter_map(|e| {
-                    let addr = e.value().addr;
-                    if filter.contains(&addr) {
-                        None
-                    } else {
-                        Some(addr)
-                    }
-                })
-                .collect();
-            for addr in targets {
-                // Raw UDP, unencrypted — same as the heartbeat
-                // tick's pingwave emission; topology is public.
-                let _ = socket.send_to(&pw_bytes, addr).await;
+            _ => {
+                g.last_emit = Some(now);
+                Action::EmitNow
             }
         }
-    });
+    };
+    match action {
+        Action::Coalesced => {}
+        Action::EmitNow => {
+            // Leading edge: `resend` callers send two rounds.
+            let rounds = if resend { 2 } else { 1 };
+            tokio::spawn(flood_event_pingwave_rounds(
+                rounds,
+                proximity_graph.clone(),
+                socket.clone(),
+                peers.clone(),
+                partition_filter.clone(),
+            ));
+        }
+        Action::Defer(delay) => {
+            // Trailing edge: one coalesced catch-up round at window
+            // end. No second round — by the time this fires (≥
+            // min_gap after the leading edge) any post-handshake
+            // bookkeeping has long settled.
+            let gate = gate.clone();
+            let proximity_graph = proximity_graph.clone();
+            let socket = socket.clone();
+            let peers = peers.clone();
+            let filter = partition_filter.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                {
+                    let mut g = gate.lock();
+                    g.deferred_scheduled = false;
+                    g.last_emit = Some(std::time::Instant::now());
+                }
+                flood_event_pingwave_rounds(1, proximity_graph, socket, peers, filter).await;
+            });
+        }
+    }
+}
+
+/// Flood `rounds` fresh (fresh-seq) event pingwaves to every
+/// non-partitioned connected peer, re-snapshotting peers each round.
+/// Round 2 (when requested) exists because a session-open emission
+/// races the OTHER side's post-handshake bookkeeping: the responder
+/// finishes its handshake on the initiator's final message and emits
+/// immediately, but the initiator installs the `addr_to_node` entry
+/// only after sending that message — on a fast link round 1 can
+/// arrive before the entry exists and be dropped by the DV
+/// unregistered-source gate. The re-flood lands after the bookkeeping
+/// has settled; the fresh seq keeps receivers that processed round 1
+/// from dedup-dropping round 2's refresh.
+async fn flood_event_pingwave_rounds(
+    rounds: u8,
+    proximity_graph: Arc<ProximityGraph>,
+    socket: Arc<NetSocket>,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    filter: PartitionFilter,
+) {
+    for round in 0..rounds {
+        if round > 0 {
+            tokio::time::sleep(EVENT_PINGWAVE_RESEND_DELAY).await;
+        }
+        let pw_bytes = proximity_graph
+            .create_pingwave(HealthStatus::Healthy)
+            .to_bytes();
+        // Snapshot before awaiting — same shard-guard discipline as
+        // the heartbeat loop's send pass.
+        let targets: Vec<SocketAddr> = peers
+            .iter()
+            .filter_map(|e| {
+                let addr = e.value().addr;
+                if filter.contains(&addr) {
+                    None
+                } else {
+                    Some(addr)
+                }
+            })
+            .collect();
+        for addr in targets {
+            // Raw UDP, unencrypted — same as the heartbeat tick's
+            // pingwave emission; topology is public.
+            let _ = socket.send_to(&pw_bytes, addr).await;
+        }
+    }
+}
+
+/// Leading-edge + trailing-edge gate for event pingwaves (RT-4).
+#[derive(Default)]
+struct EventPingwaveGate {
+    /// When the most recent pingwave actually emitted (leading edge
+    /// of the current `event_pingwave_min_gap` window).
+    last_emit: Option<std::time::Instant>,
+    /// A trailing-edge catch-up emission is already scheduled for the
+    /// end of the current window; further in-window events coalesce
+    /// into it instead of scheduling more tasks.
+    deferred_scheduled: bool,
 }
 
 /// Settle delay before an event pingwave's second flood round —
@@ -2713,7 +2786,7 @@ pub struct MeshNode {
     /// (RT-4). Shared with the failure-detector `on_recovery`
     /// closure; compared against `config.event_pingwave_min_gap`
     /// so churn storms coalesce instead of flooding.
-    event_pingwave_gate: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    event_pingwave_gate: Arc<parking_lot::Mutex<EventPingwaveGate>>,
     /// Monotonic sequence for outbound route withdrawals (RT-5).
     /// Shared with the failure-detector `on_failure` closure.
     route_withdraw_seq: Arc<AtomicU64>,
@@ -3178,8 +3251,8 @@ impl MeshNode {
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
         let partition_filter: PartitionFilter = Arc::new(dashmap::DashSet::new());
-        let event_pingwave_gate: Arc<parking_lot::Mutex<Option<std::time::Instant>>> =
-            Arc::new(parking_lot::Mutex::new(None));
+        let event_pingwave_gate: Arc<parking_lot::Mutex<EventPingwaveGate>> =
+            Arc::new(parking_lot::Mutex::new(EventPingwaveGate::default()));
         let event_pingwave_min_gap = config.event_pingwave_min_gap;
         let event_pingwave_gate_recovery = event_pingwave_gate.clone();
         let proximity_graph_recovery = proximity_graph.clone();
@@ -3289,6 +3362,8 @@ impl MeshNode {
                 &socket_recovery,
                 &peers_recovery,
                 &partition_filter_recovery,
+                // Recovery: no session-open race, so no second round.
+                false,
             );
         });
 
@@ -3793,8 +3868,9 @@ impl MeshNode {
         self.push_local_announcement(peer_addr).await;
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
-        // flood speed, not on the next heartbeat tick.
-        self.emit_event_pingwave();
+        // flood speed, not on the next heartbeat tick. Session open
+        // races the peer's post-handshake bookkeeping, so resend.
+        self.emit_event_pingwave(true);
 
         Ok(peer_node_id)
     }
@@ -4027,8 +4103,9 @@ impl MeshNode {
         self.push_local_announcement(peer_addr).await;
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
-        // flood speed, not on the next heartbeat tick.
-        self.emit_event_pingwave();
+        // flood speed, not on the next heartbeat tick. Session open
+        // races the peer's post-handshake bookkeeping, so resend.
+        self.emit_event_pingwave(true);
 
         Ok((peer_addr, peer_node_id))
     }
@@ -4496,8 +4573,10 @@ impl MeshNode {
                         // RT-4: piggyback an event pingwave so the
                         // fresh capability_hash / capability_version
                         // reach multi-hop nodes one flood earlier
-                        // than the announcement propagates.
-                        node.emit_event_pingwave();
+                        // than the announcement propagates. Not a
+                        // session open — no bookkeeping race — so a
+                        // single round, no resend.
+                        node.emit_event_pingwave(false);
                     }
                     _ = shutdown_notify.notified() => return,
                 }
@@ -7712,7 +7791,13 @@ impl MeshNode {
     /// Called on topology changes (session open, recovery, a
     /// change-driven announce) so routing converges at flood speed;
     /// the heartbeat tick remains the anti-entropy floor.
-    fn emit_event_pingwave(&self) {
+    ///
+    /// `resend` requests the second flood round that closes the
+    /// session-open bookkeeping race — pass `true` only from
+    /// `connect`/`accept`, where the race exists. Other topology
+    /// events (change-driven announce) pass `false` to avoid a
+    /// duplicate mesh-wide flood.
+    fn emit_event_pingwave(&self, resend: bool) {
         spawn_event_pingwave(
             &self.event_pingwave_gate,
             self.config.event_pingwave_min_gap,
@@ -7720,6 +7805,7 @@ impl MeshNode {
             &self.socket,
             &self.peers,
             &self.partition_filter,
+            resend,
         );
     }
 
