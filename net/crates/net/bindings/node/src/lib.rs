@@ -265,20 +265,53 @@ pub struct PollOptions {
 #[cfg(feature = "nat-traversal")]
 #[napi(object)]
 pub struct TraversalStats {
-    /// Number of hole-punch attempts the pair-type matrix
-    /// elected to initiate. Bumps once per attempt, whether the
+    /// Number of hole-punch attempts whose coordinator mediation
+    /// succeeded. Bumps once per mediated attempt, whether the
     /// punch eventually succeeds or falls back.
     pub punches_attempted: BigInt,
     /// Subset of attempts that produced a direct session.
     /// Always `<= punchesAttempted`; the difference is the
     /// punch-failure rate.
     pub punches_succeeded: BigInt,
+    /// **Derived** at snapshot time: `punchesAttempted -
+    /// punchesSucceeded` (a punch in flight counts as failed
+    /// until it resolves).
+    pub punches_failed: BigInt,
     /// Number of `connect_direct` resolutions that stayed on
     /// the routed-handshake path — matrix-skipped pairs plus
     /// punch-failed attempts. Every `connect_direct` that
     /// doesn't establish a directly-punched session increments
     /// this counter.
     pub relay_fallbacks: BigInt,
+    /// Punch flows that gave up on a deadline. Failure *cause*
+    /// counter — includes pre-mediation introduce-wait timeouts,
+    /// so not a partition of `punchesFailed`.
+    pub punch_timeouts: BigInt,
+    /// Punch flows refused by a typed coordinator reject
+    /// (rate-limited / unknown target reflex / no session with
+    /// target / reflex mismatch). Cause counter.
+    pub punch_rejections: BigInt,
+    /// Punch-needing pairs skipped because no rendezvous
+    /// coordinator candidate existed. Cause counter; the caller
+    /// stayed on the routed path.
+    pub rendezvous_no_relay: BigInt,
+    /// Background direct-path upgrades started.
+    pub upgrades_attempted: BigInt,
+    /// Upgrades that replaced a relay-routed session with a
+    /// punched direct session.
+    pub upgrades_succeeded: BigInt,
+    /// Upgrades deferred because the session was busy (open
+    /// streams / unacked data). Retried later; not failures.
+    pub upgrades_deferred_busy: BigInt,
+    /// `true` while a UPnP / NAT-PMP / PCP port mapping is
+    /// installed on the operator's router.
+    pub port_mapping_active: bool,
+    /// Mapped external `"ip:port"`, or `null` when no mapping is
+    /// active.
+    pub port_mapping_external: Option<String>,
+    /// Successful renewal ticks since the current mapping was
+    /// installed. Resets on a fresh install.
+    pub port_mapping_renewals: BigInt,
 }
 
 /// Convert the core `NatClass` enum to the stable string form
@@ -1154,6 +1187,20 @@ mod mesh_bindings {
         /// Silently ignored when the Rust cdylib was built
         /// without `--features port-mapping`.
         pub try_port_mapping: Option<bool>,
+        /// Enable the background direct-path upgrade: once a
+        /// session to a peer is established via a relay, the mesh
+        /// opportunistically re-handshakes over a direct path and
+        /// migrates the session, cutting relay hops out of the
+        /// data plane. The swap is guarded by a migration
+        /// contract (lower-id initiator, compare-and-swap
+        /// install, busy-session deferral) so in-flight work is
+        /// never dropped.
+        ///
+        /// **Optimization, not correctness** — traffic rides the
+        /// relay until (and unless) a direct path lands. Default
+        /// `false`. Silently ignored when the binding was built
+        /// without `--features nat-traversal`.
+        pub auto_direct_upgrade: Option<bool>,
         /// Opt out of channel authorization: when `true`, no
         /// `ChannelConfigRegistry` is installed on the node, so
         /// membership/subscribe requests aren't gated against
@@ -1476,6 +1523,10 @@ mod mesh_bindings {
             if options.try_port_mapping == Some(true) {
                 config = config.with_try_port_mapping(true);
             }
+            #[cfg(feature = "nat-traversal")]
+            if options.auto_direct_upgrade == Some(true) {
+                config = config.with_auto_direct_upgrade(true);
+            }
 
             let identity = match options.identity_seed {
                 Some(seed) => {
@@ -1606,11 +1657,17 @@ mod mesh_bindings {
         /// Declared `async` so napi-rs invokes it with an active
         /// tokio runtime — `MeshNode::start()` spawns background
         /// tasks via `tokio::spawn` and panics outside a reactor.
+        ///
+        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// the Arc-scoped lifecycle loops run too: periodic
+        /// capability re-announce (with the reflex-diff
+        /// re-classify trigger) and — when `autoDirectUpgrade`
+        /// is set — the background direct-path upgrade.
         #[napi]
         pub async fn start(&self) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            node.start();
+            node.start_arc();
             Ok(())
         }
 
@@ -2437,11 +2494,13 @@ mod mesh_bindings {
             Ok(())
         }
 
-        /// Cumulative NAT-traversal counters for this mesh.
-        /// Object shape: `{ punchesAttempted, punchesSucceeded,
-        /// relayFallbacks }` — all u64 bigints, monotonic, never
-        /// reset. Useful for telemetry on punch success rate and
-        /// relay load.
+        /// Cumulative NAT-traversal counters for this mesh — the
+        /// full stage-5 snapshot: punch attempt/success/derived-
+        /// failure counts, the three failure-cause counters
+        /// (timeouts / rejections / no-relay), background-upgrade
+        /// activity, and port-mapping state. Counters are
+        /// monotonic and never reset. Useful for telemetry on
+        /// punch success rate and relay load.
         #[napi]
         pub fn traversal_stats(&self) -> Result<TraversalStats> {
             let guard = self.load_node()?;
@@ -2450,7 +2509,17 @@ mod mesh_bindings {
             Ok(TraversalStats {
                 punches_attempted: BigInt::from(snap.punches_attempted),
                 punches_succeeded: BigInt::from(snap.punches_succeeded),
+                punches_failed: BigInt::from(snap.punches_failed),
                 relay_fallbacks: BigInt::from(snap.relay_fallbacks),
+                punch_timeouts: BigInt::from(snap.punch_timeouts),
+                punch_rejections: BigInt::from(snap.punch_rejections),
+                rendezvous_no_relay: BigInt::from(snap.rendezvous_no_relay),
+                upgrades_attempted: BigInt::from(snap.upgrades_attempted),
+                upgrades_succeeded: BigInt::from(snap.upgrades_succeeded),
+                upgrades_deferred_busy: BigInt::from(snap.upgrades_deferred_busy),
+                port_mapping_active: snap.port_mapping_active,
+                port_mapping_external: snap.port_mapping_external.map(|a| a.to_string()),
+                port_mapping_renewals: BigInt::from(snap.port_mapping_renewals),
             })
         }
 
@@ -2495,6 +2564,39 @@ mod mesh_bindings {
             let peer_id = crate::common::bigint_u64(peer_node_id)?;
             let coord_id = crate::common::bigint_u64(coordinator)?;
             node.connect_direct(peer_id, &pubkey, coord_id)
+                .await
+                .map_err(traversal_err)?;
+            Ok(())
+        }
+
+        /// Like `connectDirect`, but auto-selects the rendezvous
+        /// coordinator: the relay currently forwarding to the
+        /// peer, then a `relay-capable` mutual peer, then any
+        /// mutual peer.
+        ///
+        /// **Optimization, not correctness.** Punch-needing pairs
+        /// with no coordinator candidate reject with
+        /// `traversal: rendezvous-no-relay` — the caller simply
+        /// stays on the routed path, which is always available.
+        #[napi]
+        pub async fn connect_direct_auto(
+            &self,
+            peer_node_id: BigInt,
+            peer_public_key: Buffer,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let pubkey_bytes: &[u8] = peer_public_key.as_ref();
+            if pubkey_bytes.len() != 32 {
+                return Err(Error::from_reason(format!(
+                    "peer_public_key must be 32 bytes, got {}",
+                    pubkey_bytes.len()
+                )));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(pubkey_bytes);
+            let peer_id = crate::common::bigint_u64(peer_node_id)?;
+            node.connect_direct_auto(peer_id, &pubkey)
                 .await
                 .map_err(traversal_err)?;
             Ok(())

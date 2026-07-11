@@ -1217,6 +1217,7 @@ mod mesh_bindings {
             subnet_policy=None,
             reflex_override=None,
             try_port_mapping=None,
+            auto_direct_upgrade=None,
             permissive_channels=None,
         ))]
         #[allow(clippy::too_many_arguments)]
@@ -1245,6 +1246,14 @@ mod mesh_bindings {
             // not correctness — silently ignored when the cdylib
             // was built without `--features port-mapping`.
             try_port_mapping: Option<bool>,
+            // auto_direct_upgrade: enable the background
+            // direct-path upgrade — relay-routed sessions are
+            // opportunistically re-handshaked over a direct path
+            // and migrated (guarded by the migration contract so
+            // in-flight work is never dropped). Optimization,
+            // not correctness; default False. Silently ignored
+            // when built without `--features nat-traversal`.
+            auto_direct_upgrade: Option<bool>,
             // permissive_channels: opt out of the strict
             // `ChannelConfigRegistry` install. When True, no
             // registry is set on the MeshNode, so the substrate's
@@ -1314,6 +1323,12 @@ mod mesh_bindings {
             // above — thin wheels accept the kwarg and ignore it.
             #[cfg(not(feature = "port-mapping"))]
             let _ = try_port_mapping;
+            #[cfg(feature = "nat-traversal")]
+            if auto_direct_upgrade == Some(true) {
+                config = config.with_auto_direct_upgrade(true);
+            }
+            #[cfg(not(feature = "nat-traversal"))]
+            let _ = auto_direct_upgrade;
 
             let runtime = Arc::new(
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
@@ -1466,13 +1481,22 @@ mod mesh_bindings {
         }
 
         /// Start the receive loop and heartbeats.
+        ///
+        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// the Arc-scoped lifecycle loops run too: periodic
+        /// capability re-announce (with the reflex-diff
+        /// re-classify trigger) and — when `auto_direct_upgrade`
+        /// is set — the background direct-path upgrade.
         fn start(&self) -> PyResult<()> {
-            let node = self.get_node()?;
+            let node = self
+                .node
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
             // `MeshNode::start` uses `tokio::spawn` internally, so
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
             let _guard = self.runtime.enter();
-            node.start();
+            node.start_arc();
             Ok(())
         }
 
@@ -2645,11 +2669,25 @@ mod mesh_bindings {
             Ok(())
         }
 
-        /// Cumulative NAT-traversal counters. Returns a dict:
-        /// `{"punches_attempted": int, "punches_succeeded": int,
-        /// "relay_fallbacks": int}`. Monotonic — counters never
-        /// reset. Useful for telemetry on punch success rate
-        /// and relay load. Requires the `nat-traversal` build.
+        /// Cumulative NAT-traversal counters — the full stage-5
+        /// snapshot. Returns a dict with:
+        ///
+        /// - `punches_attempted` / `punches_succeeded` /
+        ///   `punches_failed` (derived: attempted - succeeded) /
+        ///   `relay_fallbacks` — punch outcome counters,
+        /// - `punch_timeouts` / `punch_rejections` /
+        ///   `rendezvous_no_relay` — failure *cause* counters
+        ///   (include pre-mediation failures; not a partition of
+        ///   `punches_failed`),
+        /// - `upgrades_attempted` / `upgrades_succeeded` /
+        ///   `upgrades_deferred_busy` — background direct-path
+        ///   upgrade activity,
+        /// - `port_mapping_active` (bool) /
+        ///   `port_mapping_external` (str | None) /
+        ///   `port_mapping_renewals` — port-mapping state.
+        ///
+        /// Counters are monotonic and never reset. Requires the
+        /// `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn traversal_stats<'py>(
             &self,
@@ -2660,7 +2698,20 @@ mod mesh_bindings {
             let d = pyo3::types::PyDict::new(py);
             d.set_item("punches_attempted", snap.punches_attempted)?;
             d.set_item("punches_succeeded", snap.punches_succeeded)?;
+            d.set_item("punches_failed", snap.punches_failed)?;
             d.set_item("relay_fallbacks", snap.relay_fallbacks)?;
+            d.set_item("punch_timeouts", snap.punch_timeouts)?;
+            d.set_item("punch_rejections", snap.punch_rejections)?;
+            d.set_item("rendezvous_no_relay", snap.rendezvous_no_relay)?;
+            d.set_item("upgrades_attempted", snap.upgrades_attempted)?;
+            d.set_item("upgrades_succeeded", snap.upgrades_succeeded)?;
+            d.set_item("upgrades_deferred_busy", snap.upgrades_deferred_busy)?;
+            d.set_item("port_mapping_active", snap.port_mapping_active)?;
+            d.set_item(
+                "port_mapping_external",
+                snap.port_mapping_external.map(|a| a.to_string()),
+            )?;
+            d.set_item("port_mapping_renewals", snap.port_mapping_renewals)?;
             Ok(d)
         }
 
@@ -2707,6 +2758,46 @@ mod mesh_bindings {
             py.detach(move || {
                 runtime
                     .block_on(node.connect_direct(peer_node_id, &pubkey, coordinator))
+                    .map_err(traversal_py_err)?;
+                Ok(())
+            })
+        }
+
+        /// Like `connect_direct`, but auto-selects the rendezvous
+        /// coordinator: the relay currently forwarding to the
+        /// peer, then a `relay-capable` mutual peer, then any
+        /// mutual peer.
+        ///
+        /// **Optimization, not correctness.** Punch-needing pairs
+        /// with no coordinator candidate raise `RuntimeError`
+        /// with `traversal: rendezvous-no-relay` — the caller
+        /// simply stays on the routed path, which is always
+        /// available. Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        #[pyo3(signature = (peer_node_id, peer_public_key))]
+        fn connect_direct_auto(
+            &self,
+            py: Python<'_>,
+            peer_node_id: u64,
+            peer_public_key: &str,
+        ) -> PyResult<()> {
+            let pubkey_bytes = hex::decode(peer_public_key)
+                .map_err(|e| PyValueError::new_err(format!("invalid hex: {}", e)))?;
+            if pubkey_bytes.len() != 32 {
+                return Err(PyValueError::new_err("public key must be 32 bytes"));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&pubkey_bytes);
+
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(node.connect_direct_auto(peer_node_id, &pubkey))
                     .map_err(traversal_py_err)?;
                 Ok(())
             })
@@ -3010,11 +3101,15 @@ mod mesh_bindings {
 
         /// Start the receive loop + heartbeats. Sync — internal
         /// `tokio::spawn`, no network round-trip.
+        ///
+        /// `start_arc`, matching the sync `NetMesh.start`: enables
+        /// the Arc-scoped lifecycle loops (periodic re-announce +
+        /// the opt-in background direct-path upgrade).
         fn start(&self) -> PyResult<()> {
             let handle = crate::async_bridge::runtime()
                 .ok_or_else(|| PyRuntimeError::new_err("async bridge not initialized"))?;
             let _guard = handle.enter();
-            self.node.start();
+            self.node.start_arc();
             Ok(())
         }
 

@@ -302,7 +302,7 @@ net_mesh_shutdown(mesh);
 | Family | Functions | Purpose |
 |--------|-----------|---------|
 | Lifecycle | `net_mesh_new`, `net_mesh_shutdown`, `net_mesh_start`, `net_mesh_public_key_hex`, `net_mesh_entity_id` | Create / start / tear down a mesh node. |
-| Connections | `net_mesh_connect`, `net_mesh_accept`, `net_mesh_connect_direct` | Establish encrypted peer sessions. |
+| Connections | `net_mesh_connect`, `net_mesh_accept`, `net_mesh_connect_direct`, `net_mesh_connect_direct_auto` | Establish encrypted peer sessions. |
 | Streams | `net_mesh_open_stream`, `net_mesh_send`, `net_mesh_send_with_retry`, `net_mesh_send_blocking`, `net_mesh_stream_stats`, `net_mesh_recv_shard` | Per-peer ordered byte streams. |
 | Channels | `net_mesh_register_channel`, `net_mesh_subscribe_channel`, `net_mesh_subscribe_channel_with_token`, `net_mesh_unsubscribe_channel`, `net_mesh_publish` | Topic-based pub/sub over the mesh. |
 | Capabilities | `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped` | Capability discovery + scored placement. |
@@ -312,7 +312,7 @@ net_mesh_shutdown(mesh);
 | Predicate debug session | `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`, `net_predicate_redact_metadata_keys` | Stateless debug helpers (Phase 9d). Single-eval clause trace; corpus-wide per-clause aggregation; host-side label redaction. Cross-binding contracts pinned by `tests/cross_lang_capability/predicate_trace.json`, `predicate_debug_report.json`, `predicate_debug_report_redacted.json`. |
 | Daemon capability authoring | `net_compute_set_daemon_caps_dispatcher` | Optional per-daemon `required` / `optional` `CapabilitySet` declaration; without it daemons advertise empty sets (back-compat). See "Daemon capability authoring (Phase 6)" below. |
 | Custom placement filters | `net_compute_set_placement_filter_dispatcher`, `net_compute_register_placement_filter`, `net_compute_unregister_placement_filter`, `net_compute_has_placement_filter` | Plug a host-language predicate into `StandardPlacement.custom_filter_id` — substrate calls back per candidate. See "Custom placement-filter callback (Phase 7)" below. |
-| NAT traversal | `net_mesh_nat_type`, `net_mesh_reflex_addr`, `net_mesh_peer_nat_type`, `net_mesh_probe_reflex`, `net_mesh_reclassify_nat`, `net_mesh_traversal_stats`, `net_mesh_set_reflex_override`, `net_mesh_clear_reflex_override` | Optional optimization — routed-handshake fallback always works. |
+| NAT traversal | `net_mesh_nat_type`, `net_mesh_reflex_addr`, `net_mesh_peer_nat_type`, `net_mesh_probe_reflex`, `net_mesh_reclassify_nat`, `net_mesh_traversal_stats`, `net_mesh_traversal_stats_v2`, `net_mesh_set_reflex_override`, `net_mesh_clear_reflex_override` | Optional optimization — routed-handshake fallback always works. |
 
 ### Scoped capability discovery
 

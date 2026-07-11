@@ -303,9 +303,40 @@ Captured for completeness; **not scheduled**. Unblock when a concrete consumer a
 | 1 | Finding 4 — unsolicited-introduce reflex validation | **done** |
 | 2 | Finding 5 — rendezvous budgets, `PunchReject`, typed rejections | **done** |
 | 3 | Coordinator auto-selection + background direct-path upgrade | **done** (see landing notes) |
-| 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | not started |
-| 5 | Stats parity, failure reasons, reflex-diff re-classify trigger | not started |
+| 4 | netns NAT-simulator harness + IPv6/NAT64 + symmetric×cone tests | not started (deliberately sequenced after 5 — macOS dev box; the harness is Linux-only) |
+| 5 | Stats parity, failure reasons, reflex-diff re-classify trigger | **done** (see landing notes) |
 | 6 | Surface completion (sdk-ts / sdk-py / CLI / punch_id / interface events) | **deferred** |
+
+**Stage 5 landing notes.**
+
+- The full snapshot is 13 fields, not the plan's "10" (the estimate predated
+  Stage 3's three upgrade counters): 4 punch outcomes (incl. derived
+  `punches_failed`), 3 failure causes, 3 upgrade counters, 3 port-mapping
+  fields. The cause counters are documented as *not* a partition of
+  `punches_failed` — rejections and introduce-wait timeouts happen before
+  mediation is counted.
+- FFI v2 is a single `#[repr(C)] NetTraversalStatsV2` out-struct
+  (`net_traversal_stats_v2_t`) rather than 13 out-params; the v1 3-out-param
+  call stays ABI-stable. `include/net.go.h` and the hand-maintained sibling
+  `go/net.h` both carry the declarations (they had already drifted apart —
+  candidate for a future single-source generator).
+- Binding parity pins land per surface: Rust SDK
+  (`pre_classification_state_is_unknown`, field-by-name), Go
+  (`traversal_stats_test.go` via the real C ABI), Node
+  (`test/traversal_stats.test.ts`; napi maps `Option::None` → absent
+  property, so `portMappingExternal` is `undefined` not `null`), Python
+  (`tests/test_traversal_stats.py`, 13-key dict + `.pyi` stub entries).
+- `connect_direct_auto` + `auto_direct_upgrade` now exist on all five
+  surfaces (core, FFI, Rust SDK builder, Node, Python, Go config).
+- **Node/Python `start()` now calls `start_arc()`** (previously bare
+  `start()`), matching the FFI and Rust SDK. This closes a real parity gap —
+  without it the re-announce loop (and therefore the reflex-diff trigger and
+  the upgrade loop) never ran for Node/Python nodes. Full Node (507) /
+  Python / Go suites pass with the change.
+- Reflex-diff trigger: `reclassify_if_reflex_drifted()` compares the observed
+  reflex against the last *published* announcement's and runs at most one
+  sweep per re-announce tick; skips under an active override, before the
+  first announce, with no observation, or with no drift.
 
 **Stage 3 landing notes.** Landed in two commits — 3a (coordinator
 auto-selection) and 3b (migration-contract primitives + background upgrade).

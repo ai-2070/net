@@ -630,6 +630,10 @@ class NetMesh:
         require_signed_capabilities: Optional[bool] = None,
         subnet: Optional[List[int]] = None,
         subnet_policy: Optional[dict] = None,
+        reflex_override: Optional[str] = None,
+        try_port_mapping: Optional[bool] = None,
+        auto_direct_upgrade: Optional[bool] = None,
+        permissive_channels: Optional[bool] = None,
     ) -> None:
         """Construct a new mesh node.
 
@@ -903,6 +907,37 @@ class NetMesh:
         ``require_models``, ``require_tools``, ``min_memory_gb``,
         ``require_gpu``, ``gpu_vendor``, ``min_vram_gb``,
         ``min_context_length``, ``require_modalities``."""
+        ...
+
+    # -- NAT traversal (requires the `nat-traversal` build) ---------
+    def traversal_stats(self) -> dict:
+        """Cumulative NAT-traversal counters — the full stage-5
+        snapshot. Keys: ``punches_attempted``,
+        ``punches_succeeded``, ``punches_failed`` (derived),
+        ``relay_fallbacks``, ``punch_timeouts``,
+        ``punch_rejections``, ``rendezvous_no_relay``,
+        ``upgrades_attempted``, ``upgrades_succeeded``,
+        ``upgrades_deferred_busy``, ``port_mapping_active``
+        (bool), ``port_mapping_external`` (str | None),
+        ``port_mapping_renewals``. Monotonic; never reset."""
+        ...
+
+    def connect_direct(
+        self, peer_node_id: int, peer_public_key: str, coordinator: int
+    ) -> None:
+        """Establish a session via the rendezvous path with
+        ``coordinator`` mediating. Optimization, not correctness —
+        always resolves (punch-failed falls back to the routed
+        handshake); inspect :meth:`traversal_stats` to distinguish
+        outcomes."""
+        ...
+
+    def connect_direct_auto(self, peer_node_id: int, peer_public_key: str) -> None:
+        """Like :meth:`connect_direct`, but auto-selects the
+        rendezvous coordinator. Raises ``RuntimeError`` with
+        ``traversal: rendezvous-no-relay`` when a punch-needing
+        pair has no coordinator candidate — the caller stays on
+        the routed path."""
         ...
 
 class BackpressureError(Exception):

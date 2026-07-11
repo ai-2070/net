@@ -444,6 +444,13 @@ struct MeshNewConfig {
     /// without `--features port-mapping`.
     #[serde(default)]
     try_port_mapping: bool,
+    /// Enable the background direct-path upgrade: relay-routed
+    /// sessions are opportunistically re-handshaked over a direct
+    /// path and migrated (Stage 3; optimization, not correctness —
+    /// traffic rides the relay until the swap). Silently ignored
+    /// when the cdylib is built without `--features nat-traversal`.
+    #[serde(default)]
+    auto_direct_upgrade: bool,
 }
 
 /// FFI handle for a [`MeshNode`].
@@ -567,6 +574,13 @@ pub unsafe extern "C" fn net_mesh_new(
     // Same drop-on-the-floor pattern as reflex_override above.
     #[cfg(not(feature = "port-mapping"))]
     let _ = cfg.try_port_mapping;
+    #[cfg(feature = "nat-traversal")]
+    if cfg.auto_direct_upgrade {
+        node_cfg = node_cfg.with_auto_direct_upgrade(true);
+    }
+    // Same drop-on-the-floor pattern as reflex_override above.
+    #[cfg(not(feature = "nat-traversal"))]
+    let _ = cfg.auto_direct_upgrade;
 
     let identity = match cfg.identity_seed_hex {
         Some(seed_hex) => {
@@ -1120,6 +1134,146 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
     }
 }
 
+/// Like `net_mesh_connect_direct`, but auto-selects the rendezvous
+/// coordinator (routing next-hop → `relay-capable` mutual peer →
+/// any mutual peer). Punch-needing pairs with no candidate fail
+/// with `NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY` — the caller stays
+/// on the routed path; connectivity is never at risk.
+///
+/// `peer_pubkey_hex` is the peer's 32-byte Noise static public
+/// key as a 64-char hex string.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_connect_direct_auto(
+    handle: *mut MeshNodeHandle,
+    peer_node_id: u64,
+    peer_pubkey_hex: *const c_char,
+) -> c_int {
+    if handle.is_null() || peer_pubkey_hex.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let pk_bytes = match hex::decode(pk_s) {
+        Ok(b) => b,
+        Err(_) => return NET_ERR_MESH_HANDSHAKE,
+    };
+    if pk_bytes.len() != 32 {
+        return NET_ERR_MESH_HANDSHAKE;
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+
+    let node = h.inner.clone();
+    match block_on(async move { node.connect_direct_auto(peer_node_id, &pk).await }) {
+        Ok(_) => 0,
+        Err(e) => traversal_err_to_code(&e),
+    }
+}
+
+/// Full traversal-stats snapshot for `net_mesh_traversal_stats_v2`.
+/// `#[repr(C)]` — field order, widths, and the 64-byte address
+/// buffer are ABI; matched by `net_traversal_stats_v2_t` in
+/// `include/net.go.h`. Extend only by appending a new versioned
+/// struct + call, never by mutating this one.
+#[repr(C)]
+pub struct NetTraversalStatsV2 {
+    /// Punches whose `PunchRequest` was successfully mediated.
+    pub punches_attempted: u64,
+    /// Mediated punches that produced a direct session.
+    pub punches_succeeded: u64,
+    /// Derived: `punches_attempted - punches_succeeded` (saturating).
+    pub punches_failed: u64,
+    /// `connect_direct` calls that resolved on the routed path.
+    pub relay_fallbacks: u64,
+    /// Punch flows that gave up on a deadline (cause counter).
+    pub punch_timeouts: u64,
+    /// Punch flows refused by a typed `PunchReject` (cause counter).
+    pub punch_rejections: u64,
+    /// Punch-needing pairs skipped with no coordinator candidate.
+    pub rendezvous_no_relay: u64,
+    /// Background direct-path upgrades started (Stage 3).
+    pub upgrades_attempted: u64,
+    /// Upgrades that replaced a relay session with a direct one.
+    pub upgrades_succeeded: u64,
+    /// Upgrades deferred by the C3 busy gate (retried; not failures).
+    pub upgrades_deferred_busy: u64,
+    /// Successful renewal ticks since the current mapping installed.
+    pub port_mapping_renewals: u64,
+    /// 1 when a port mapping is currently installed, else 0.
+    pub port_mapping_active: u8,
+    /// NUL-terminated `"ip:port"` of the mapped external address;
+    /// empty string when no mapping is active. 64 bytes covers the
+    /// longest textual form (`[v6]:65535` ≤ 54 chars).
+    pub port_mapping_external: [c_char; 64],
+}
+
+/// Copy a core snapshot into the C-ABI v2 struct. Factored out of
+/// the extern fn so the field mapping (and the external-address
+/// string encoding) is unit-testable without a live node.
+#[cfg(feature = "nat-traversal")]
+fn fill_traversal_stats_v2(
+    snap: &crate::adapter::net::traversal::TraversalStatsSnapshot,
+    out: &mut NetTraversalStatsV2,
+) {
+    out.punches_attempted = snap.punches_attempted;
+    out.punches_succeeded = snap.punches_succeeded;
+    out.punches_failed = snap.punches_failed;
+    out.relay_fallbacks = snap.relay_fallbacks;
+    out.punch_timeouts = snap.punch_timeouts;
+    out.punch_rejections = snap.punch_rejections;
+    out.rendezvous_no_relay = snap.rendezvous_no_relay;
+    out.upgrades_attempted = snap.upgrades_attempted;
+    out.upgrades_succeeded = snap.upgrades_succeeded;
+    out.upgrades_deferred_busy = snap.upgrades_deferred_busy;
+    out.port_mapping_renewals = snap.port_mapping_renewals;
+    out.port_mapping_active = u8::from(snap.port_mapping_active);
+    out.port_mapping_external = [0; 64];
+    if let Some(addr) = snap.port_mapping_external {
+        let s = addr.to_string();
+        // Truncation guard: leave the final byte as NUL. `[v6]:port`
+        // tops out ≤ 54 chars, so this never actually truncates —
+        // the guard exists so a future address form degrades to a
+        // clipped string rather than an unterminated buffer.
+        let n = s.len().min(63);
+        for (dst, src) in out.port_mapping_external[..n].iter_mut().zip(s.as_bytes()) {
+            *dst = *src as c_char;
+        }
+    }
+}
+
+/// Fill `out` with the complete traversal-stats snapshot — the
+/// stage-5 v2 surface. The v1 3-out-param
+/// `net_mesh_traversal_stats` stays ABI-stable for compiled
+/// consumers; new callers should prefer this one.
+///
+/// Counters are monotonic; `punches_failed` is derived at snapshot
+/// time. Returns `0` on success.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_traversal_stats_v2(
+    handle: *mut MeshNodeHandle,
+    out: *mut NetTraversalStatsV2,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let snap = h.inner.traversal_stats();
+    fill_traversal_stats_v2(&snap, unsafe { &mut *out });
+    0
+}
+
 /// Install a runtime reflex override. `external` is a
 /// UTF-8 / null-terminated `"ip:port"` string. Forces `nat_type`
 /// to `"open"` and `reflex_addr` to `external` immediately;
@@ -1261,6 +1415,25 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
     _peer_node_id: u64,
     _peer_pubkey_hex: *const c_char,
     _coordinator: u64,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_connect_direct_auto(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _peer_pubkey_hex: *const c_char,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_traversal_stats_v2(
+    _handle: *mut MeshNodeHandle,
+    _out: *mut NetTraversalStatsV2,
 ) -> c_int {
     NET_ERR_TRAVERSAL_UNSUPPORTED
 }
@@ -3901,6 +4074,82 @@ mod tests {
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
     }
 
+    /// The v2 stats fill maps every core-snapshot field into the
+    /// C-ABI struct, encodes the external address as a
+    /// NUL-terminated string, and leaves the buffer empty when no
+    /// mapping is active. Pins the field mapping so an added core
+    /// field that's forgotten here shows up as a compile error
+    /// (struct literal) or a failing assert (value).
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn traversal_stats_v2_fill_maps_all_fields() {
+        use crate::adapter::net::traversal::TraversalStatsSnapshot;
+
+        let snap = TraversalStatsSnapshot {
+            punches_attempted: 1,
+            punches_succeeded: 2,
+            relay_fallbacks: 3,
+            port_mapping_active: true,
+            port_mapping_external: Some("203.0.113.5:4321".parse().unwrap()),
+            port_mapping_renewals: 4,
+            upgrades_attempted: 5,
+            upgrades_succeeded: 6,
+            upgrades_deferred_busy: 7,
+            punches_failed: 8,
+            punch_timeouts: 9,
+            punch_rejections: 10,
+            rendezvous_no_relay: 11,
+        };
+        let mut out = NetTraversalStatsV2 {
+            punches_attempted: 0,
+            punches_succeeded: 0,
+            punches_failed: 0,
+            relay_fallbacks: 0,
+            punch_timeouts: 0,
+            punch_rejections: 0,
+            rendezvous_no_relay: 0,
+            upgrades_attempted: 0,
+            upgrades_succeeded: 0,
+            upgrades_deferred_busy: 0,
+            port_mapping_renewals: 0,
+            port_mapping_active: 0,
+            port_mapping_external: [0x7F; 64], // poisoned: fill must clear
+        };
+        fill_traversal_stats_v2(&snap, &mut out);
+
+        assert_eq!(out.punches_attempted, 1);
+        assert_eq!(out.punches_succeeded, 2);
+        assert_eq!(out.relay_fallbacks, 3);
+        assert_eq!(out.port_mapping_renewals, 4);
+        assert_eq!(out.upgrades_attempted, 5);
+        assert_eq!(out.upgrades_succeeded, 6);
+        assert_eq!(out.upgrades_deferred_busy, 7);
+        assert_eq!(out.punches_failed, 8);
+        assert_eq!(out.punch_timeouts, 9);
+        assert_eq!(out.punch_rejections, 10);
+        assert_eq!(out.rendezvous_no_relay, 11);
+        assert_eq!(out.port_mapping_active, 1);
+        let s: String = out
+            .port_mapping_external
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, "203.0.113.5:4321");
+        // NUL-terminated within the buffer.
+        assert!(out.port_mapping_external.iter().any(|&c| c == 0));
+
+        // Inactive mapping → empty string, active = 0.
+        let snap_off = TraversalStatsSnapshot {
+            port_mapping_active: false,
+            port_mapping_external: None,
+            ..snap
+        };
+        fill_traversal_stats_v2(&snap_off, &mut out);
+        assert_eq!(out.port_mapping_active, 0);
+        assert_eq!(out.port_mapping_external[0], 0, "empty string when inactive");
+    }
+
     /// Regression: `parse_modality_cap` must surface unknown
     /// modality strings as `None`, not silently fall back to
     /// `Modality::Text`. Pre-fix a typo in announce-capabilities
@@ -4577,6 +4826,20 @@ mod nat_traversal_stub_tests {
     fn connect_direct_stub_returns_unsupported() {
         // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
         let code = unsafe { net_mesh_connect_direct(ptr::null_mut(), 0, ptr::null(), 0) };
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn connect_direct_auto_stub_returns_unsupported() {
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_connect_direct_auto(ptr::null_mut(), 0, ptr::null()) };
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn traversal_stats_v2_stub_returns_unsupported() {
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_traversal_stats_v2(ptr::null_mut(), ptr::null_mut()) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 

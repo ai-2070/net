@@ -120,6 +120,8 @@ pub struct MeshBuilder {
     reflex_override: Option<SocketAddr>,
     #[cfg(feature = "port-mapping")]
     try_port_mapping: bool,
+    #[cfg(feature = "nat-traversal")]
+    auto_direct_upgrade: bool,
 }
 
 impl MeshBuilder {
@@ -141,6 +143,8 @@ impl MeshBuilder {
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
+            #[cfg(feature = "nat-traversal")]
+            auto_direct_upgrade: false,
         })
     }
 
@@ -259,6 +263,24 @@ impl MeshBuilder {
         self
     }
 
+    /// Enable the background direct-path upgrade: once a session
+    /// to a peer is established via a relay, the mesh
+    /// opportunistically re-handshakes over a direct path and
+    /// migrates the session, cutting relay hops out of the data
+    /// plane. The swap is guarded by the migration contract
+    /// (lower-id initiator, compare-and-swap install, busy-session
+    /// deferral) so in-flight work is never dropped.
+    ///
+    /// **Optimization, not correctness** — traffic rides the relay
+    /// until (and unless) a direct path lands. Off by default.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn auto_direct_upgrade(mut self, enabled: bool) -> Self {
+        self.auto_direct_upgrade = enabled;
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
         // Use the caller's identity if one was set, otherwise mint an
@@ -287,6 +309,10 @@ impl MeshBuilder {
         #[cfg(feature = "port-mapping")]
         if self.try_port_mapping {
             config = config.with_try_port_mapping(true);
+        }
+        #[cfg(feature = "nat-traversal")]
+        if self.auto_direct_upgrade {
+            config = config.with_auto_direct_upgrade(true);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;
