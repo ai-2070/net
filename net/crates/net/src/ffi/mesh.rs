@@ -792,6 +792,33 @@ pub unsafe extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *m
     }
     0
 }
+/// Parse a NUL-terminated 64-char-hex peer public key into its
+/// 32-byte form. Shared by every `net_mesh_connect*` entry point so
+/// the validation rules and error codes can't drift apart between
+/// wrappers (cubic P2). Error codes match what the wrappers
+/// historically returned inline: `InvalidUtf8` for a non-UTF-8 C
+/// string, `NET_ERR_MESH_HANDSHAKE` for bad hex or a wrong-length
+/// key.
+///
+/// # Safety
+///
+/// `peer_pubkey_hex` must be a valid, NUL-terminated C string
+/// pointer (callers null-check before invoking).
+unsafe fn parse_peer_pubkey_hex(peer_pubkey_hex: *const c_char) -> Result<[u8; 32], c_int> {
+    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
+        return Err(NetError::InvalidUtf8.into());
+    };
+    let pk_bytes = match hex::decode(pk_s) {
+        Ok(b) => b,
+        Err(_) => return Err(NET_ERR_MESH_HANDSHAKE),
+    };
+    if pk_bytes.len() != 32 {
+        return Err(NET_ERR_MESH_HANDSHAKE);
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+    Ok(pk)
+}
 
 /// Connect (initiator). Blocks until the handshake completes.
 #[unsafe(no_mangle)]
@@ -816,18 +843,10 @@ pub unsafe extern "C" fn net_mesh_connect(
         Ok(a) => a,
         Err(_) => return NET_ERR_MESH_HANDSHAKE,
     };
-    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
-        return NetError::InvalidUtf8.into();
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
     };
-    let pk_bytes = match hex::decode(pk_s) {
-        Ok(b) => b,
-        Err(_) => return NET_ERR_MESH_HANDSHAKE,
-    };
-    if pk_bytes.len() != 32 {
-        return NET_ERR_MESH_HANDSHAKE;
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pk_bytes);
 
     let node = h.inner.clone();
     match block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
@@ -1114,18 +1133,10 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
-        return NetError::InvalidUtf8.into();
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
     };
-    let pk_bytes = match hex::decode(pk_s) {
-        Ok(b) => b,
-        Err(_) => return NET_ERR_MESH_HANDSHAKE,
-    };
-    if pk_bytes.len() != 32 {
-        return NET_ERR_MESH_HANDSHAKE;
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pk_bytes);
 
     let node = h.inner.clone();
     match block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
@@ -1157,18 +1168,10 @@ pub unsafe extern "C" fn net_mesh_connect_direct_auto(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
-        return NetError::InvalidUtf8.into();
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
     };
-    let pk_bytes = match hex::decode(pk_s) {
-        Ok(b) => b,
-        Err(_) => return NET_ERR_MESH_HANDSHAKE,
-    };
-    if pk_bytes.len() != 32 {
-        return NET_ERR_MESH_HANDSHAKE;
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pk_bytes);
 
     let node = h.inner.clone();
     match block_on(async move { node.connect_direct_auto(peer_node_id, &pk).await }) {
@@ -1253,8 +1256,11 @@ fn fill_traversal_stats_v2(
 /// `net_mesh_traversal_stats` stays ABI-stable for compiled
 /// consumers; new callers should prefer this one.
 ///
-/// Counters are monotonic; `punches_failed` is derived at snapshot
-/// time. Returns `0` on success.
+/// Base counters are monotonic; two fields are exempt from delta
+/// math: `punches_failed` is derived at snapshot time
+/// (`attempted - succeeded`) and can decrease when an in-flight
+/// punch lands, and `port_mapping_renewals` resets on each fresh
+/// mapping install. Returns `0` on success.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_traversal_stats_v2(
@@ -4072,6 +4078,41 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// The shared pubkey parser behind every `net_mesh_connect*`
+    /// entry point: valid 64-char hex round-trips; non-hex, wrong
+    /// length, and non-UTF-8 inputs return the exact codes the
+    /// wrappers historically produced inline. One implementation =
+    /// the three wrappers can't drift apart (cubic P2).
+    #[test]
+    fn parse_peer_pubkey_hex_accepts_valid_and_rejects_malformed() {
+        use std::ffi::CString;
+
+        let valid = CString::new("ab".repeat(32)).unwrap();
+        // SAFETY: valid NUL-terminated pointer for the call's lifetime.
+        let parsed = unsafe { parse_peer_pubkey_hex(valid.as_ptr()) };
+        assert_eq!(parsed, Ok([0xABu8; 32]), "64-char hex round-trips");
+
+        let bad_hex = CString::new("zz".repeat(32)).unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(bad_hex.as_ptr()) };
+        assert_eq!(err, Err(NET_ERR_MESH_HANDSHAKE), "non-hex rejects");
+
+        let short = CString::new("abcd").unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(short.as_ptr()) };
+        assert_eq!(err, Err(NET_ERR_MESH_HANDSHAKE), "wrong length rejects");
+
+        // Valid CString bytes, invalid UTF-8 → the UTF-8 code.
+        let non_utf8 = CString::new(vec![0xFFu8, 0xFEu8]).unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(non_utf8.as_ptr()) };
+        assert_eq!(
+            err,
+            Err(NetError::InvalidUtf8.into()),
+            "non-UTF-8 C string rejects with the UTF-8 code",
+        );
     }
 
     /// The v2 stats fill maps every core-snapshot field into the

@@ -13062,8 +13062,13 @@ impl MeshNode {
     /// snapshot.
     ///
     /// See [`super::traversal::TraversalStatsSnapshot`] for the
-    /// field semantics. Counters are monotonic and never reset;
-    /// callers that want deltas should subtract snapshots.
+    /// field semantics. The base counters are monotonic and never
+    /// reset, so deltas between snapshots are safe — with two
+    /// exceptions: `punches_failed` is DERIVED at snapshot time
+    /// (`attempted - succeeded`) and can decrease when an in-flight
+    /// punch lands, and `port_mapping_renewals` resets to zero on
+    /// each fresh mapping install. Compute rates from the base
+    /// counters, not the derived/resettable fields.
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]

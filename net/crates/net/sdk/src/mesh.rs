@@ -1312,7 +1312,10 @@ impl Mesh {
 
     /// Cumulative counters for this mesh's NAT-traversal
     /// activity: punch attempts, successful punches, and relay
-    /// fallbacks. Monotonic — counters never reset. Useful for
+    /// fallbacks. Base counters are monotonic and never reset
+    /// (`punches_failed` is derived and can decrease while a punch
+    /// is in flight; `port_mapping_renewals` resets on each fresh
+    /// install — difference only the base counters). Useful for
     /// diagnostics + telemetry (success rate, relay load
     /// trends).
     ///

@@ -253,9 +253,14 @@ pub struct PollOptions {
 }
 
 /// Cumulative NAT-traversal counters surfaced via
-/// `NetMesh.traversalStats()`. All counters are monotonic u64s
-/// and never reset — subtract snapshots for deltas. Exposed as
-/// BigInt because JavaScript numbers can't round-trip full u64.
+/// `NetMesh.traversalStats()`. Base counters are monotonic u64s
+/// and never reset — subtract snapshots for deltas — with two
+/// exemptions: `punchesFailed` is derived at snapshot time
+/// (`attempted - succeeded`) and can decrease when an in-flight
+/// punch lands, and `portMappingRenewals` resets to zero on each
+/// fresh mapping install. Difference only the base counters for
+/// rates. Exposed as BigInt because JavaScript numbers can't
+/// round-trip full u64.
 ///
 /// Framing reminder (plan §5): NAT traversal is an optimization,
 /// not a connectivity requirement. `relay_fallbacks` isn't a
@@ -2498,9 +2503,12 @@ mod mesh_bindings {
         /// full stage-5 snapshot: punch attempt/success/derived-
         /// failure counts, the three failure-cause counters
         /// (timeouts / rejections / no-relay), background-upgrade
-        /// activity, and port-mapping state. Counters are
-        /// monotonic and never reset. Useful for telemetry on
-        /// punch success rate and relay load.
+        /// activity, and port-mapping state. Base counters are
+        /// monotonic and never reset (`punchesFailed` is derived
+        /// and can decrease while a punch is in flight;
+        /// `portMappingRenewals` resets on a fresh install —
+        /// difference only the base counters). Useful for
+        /// telemetry on punch success rate and relay load.
         #[napi]
         pub fn traversal_stats(&self) -> Result<TraversalStats> {
             let guard = self.load_node()?;

@@ -639,8 +639,11 @@ typedef struct {
 } net_traversal_stats_v2_t;
 
 /* Fill `out` with the complete traversal snapshot. Returns 0 on
- * success. Monotonic counters; see the struct comment for the
- * derived / cause-counter semantics. */
+ * success. Base counters are monotonic; `punches_failed` is
+ * derived (`attempted - succeeded`) and can decrease while a
+ * punch is in flight, and `port_mapping_renewals` resets on each
+ * fresh install — difference only the base counters for rates.
+ * See the struct comment for the cause-counter semantics. */
 int      net_mesh_traversal_stats_v2(net_meshnode_t* handle,
                                      net_traversal_stats_v2_t* out);
 

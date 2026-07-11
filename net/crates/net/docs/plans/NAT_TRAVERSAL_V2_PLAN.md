@@ -363,7 +363,7 @@ verified locally, the netns halves await their first CI run).
   (`test/traversal_stats.test.ts`; napi maps `Option::None` → absent
   property, so `portMappingExternal` is `undefined` not `null`), Python
   (`tests/test_traversal_stats.py`, 13-key dict + `.pyi` stub entries).
-- `connect_direct_auto` + `auto_direct_upgrade` now exist on all five
+- `connect_direct_auto` + `auto_direct_upgrade` now exist on all six
   surfaces (core, FFI, Rust SDK builder, Node, Python, Go config).
 - **Node/Python `start()` now calls `start_arc()`** (previously bare
   `start()`), matching the FFI and Rust SDK. This closes a real parity gap —

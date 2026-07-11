@@ -2686,8 +2686,11 @@ mod mesh_bindings {
         ///   `port_mapping_external` (str | None) /
         ///   `port_mapping_renewals` — port-mapping state.
         ///
-        /// Counters are monotonic and never reset. Requires the
-        /// `nat-traversal` build.
+        /// Base counters are monotonic and never reset;
+        /// `punches_failed` is derived and can decrease while a
+        /// punch is in flight, and `port_mapping_renewals` resets
+        /// on each fresh install — difference only the base
+        /// counters for rates. Requires the `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn traversal_stats<'py>(
             &self,

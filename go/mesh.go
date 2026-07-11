@@ -418,9 +418,13 @@ func (m *MeshNode) Start() error {
 // as ErrTraversalUnsupported from the shared-library stubs.
 
 // TraversalStats is the snapshot returned by
-// MeshNode.TraversalStats(). All counters are monotonic u64 —
-// they never reset, so callers that want deltas should subtract
-// successive snapshots.
+// MeshNode.TraversalStats(). Base counters are monotonic u64 —
+// they never reset, so callers that want deltas can subtract
+// successive snapshots. Two fields are exempt from delta math:
+// PunchesFailed is derived at snapshot time (attempted −
+// succeeded) and can decrease when an in-flight punch lands, and
+// PortMappingRenewals resets to zero on each fresh mapping
+// install. Difference only the base counters for rates.
 //
 //   - PunchesAttempted: the coordinator successfully mediated a
 //     punch introduction. Increments per mediated attempt.

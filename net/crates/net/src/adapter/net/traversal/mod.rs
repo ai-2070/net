@@ -71,8 +71,13 @@ use arc_swap::ArcSwapOption;
 
 /// Counters tracking traversal decisions + outcomes. Exposed via
 /// [`crate::adapter::net::MeshNode::traversal_stats`]. Every
-/// counter is monotonic; resetting isn't supported because the
-/// values are only meaningful cumulatively.
+/// **stored** counter is monotonic; resetting isn't supported
+/// because the values are only meaningful cumulatively. Two
+/// snapshot fields are exempt from that guarantee and from delta
+/// math: `punches_failed` is derived at snapshot time
+/// (`attempted - succeeded`) and can decrease when an in-flight
+/// punch lands, and `port_mapping_renewals` resets to zero on each
+/// fresh mapping install.
 ///
 /// The three punch/fallback counters partition all
 /// `connect_direct` outcomes:
@@ -544,5 +549,33 @@ mod stats_snapshot_tests {
         // Degenerate ordering: success without a recorded attempt.
         stats.record_punch_success();
         assert_eq!(stats.snapshot().punches_failed, 0, "saturating_sub");
+    }
+
+    /// The documented delta-math exemption is real behavior, not a
+    /// doc nicety (cubic P2): `punches_failed` DECREASES across
+    /// snapshots when an in-flight punch lands, because it's derived
+    /// at snapshot time rather than stored. Pins the non-monotonic
+    /// shape so nobody "restores" a blanket monotonic guarantee to
+    /// the docs (or naively differences the field for rates) without
+    /// tripping here.
+    #[test]
+    fn punches_failed_can_decrease_across_snapshots() {
+        let stats = TraversalStats::new();
+        stats.record_punch_attempt();
+        let mid = stats.snapshot();
+        assert_eq!(
+            mid.punches_failed, 1,
+            "an in-flight attempt reads as failed until it resolves",
+        );
+        stats.record_punch_success();
+        let after = stats.snapshot();
+        assert!(
+            after.punches_failed < mid.punches_failed,
+            "the same punch resolving must DECREASE the derived field \
+             ({} -> {})",
+            mid.punches_failed,
+            after.punches_failed,
+        );
+        assert_eq!(after.punches_failed, 0);
     }
 }
