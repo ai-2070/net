@@ -44,7 +44,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
-use super::failure::{FailureDetector, FailureDetectorConfig};
+use super::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
 use super::identity::{
     EntityId, EntityKeypair, PermissionToken, RevocationRegistry, TokenCache, TokenChain,
     TokenScope,
@@ -8608,6 +8608,38 @@ impl MeshNode {
         let _ = router.try_route(channel_id, event);
     }
 
+    /// True iff `hop` is a safe next-hop to promote a route through
+    /// on the withdrawal path (RT-5): a genuinely-direct, live
+    /// session whose address is not the withdrawing sender's.
+    ///
+    /// `addr` is the address recorded for `hop` (its `PeerInfo.addr`
+    /// or `peer_addrs` entry); `via_addr` is the withdrawing peer's
+    /// session address. Rejects (a) a hop the failure detector marks
+    /// Failed/Suspected — the retained-Failed-peer maps would
+    /// otherwise let us install an un-displaceable metric-1 route to
+    /// a dead peer; (b) a relayed hop, whose `addr` is the relay's
+    /// and does not map back to `hop` in the reverse index; and (c)
+    /// any hop whose address equals the withdrawing sender's, which
+    /// would re-install exactly the route we just dropped.
+    fn promotable_direct_hop(
+        addr_to_node: &DashMap<SocketAddr, u64>,
+        failure_detector: &FailureDetector,
+        hop: u64,
+        addr: SocketAddr,
+        via_addr: SocketAddr,
+    ) -> bool {
+        if addr == via_addr {
+            return false;
+        }
+        if addr_to_node.get(&addr).map(|e| *e.value()) != Some(hop) {
+            return false;
+        }
+        !matches!(
+            failure_detector.status(hop),
+            NodeStatus::Failed | NodeStatus::Suspected
+        )
+    }
+
     /// RT-5 receive side: the session peer `from_node` declared it
     /// no longer forwards toward `dest`. Drop exactly our
     /// `(dest, next_hop = from_node)` route and the matching
@@ -8672,19 +8704,35 @@ impl MeshNode {
         );
         // Promote an alternate instead of waiting for traffic to
         // fail: a DIRECT session wins; otherwise synthesize from
-        // the proximity graph through a different first hop. A
-        // relayed (`connect_via`) peer entry must NOT be promoted
-        // here: its `addr` is the RELAY's address — possibly the
-        // withdrawing sender itself — so promoting it would
-        // re-install exactly the route we just dropped (cubic
-        // review P1). Directness test: only a direct session's
-        // address maps back to `dest` in the reverse index
-        // (`AddrInstallMode::RoutedPreserve` keeps the relay's own
-        // mapping for shared addresses).
+        // the proximity graph through a different first hop.
+        //
+        // Two properties every promotion must hold, or it does more
+        // harm than the age-out it replaces:
+        //
+        //  - LIVE: `peers` / `addr_to_node` / `peer_addrs` retain
+        //    Failed peers for transient-partition recovery (see the
+        //    note in the failure-detector closure), so a naive
+        //    promotion resurrects a metric-1 route to a dead peer
+        //    that no higher-metric pingwave can ever displace — a
+        //    black hole until the age-out sweep. Gate on the failure
+        //    detector: never promote a hop it considers Failed or
+        //    Suspected.
+        //  - DIRECT and not the sender: a relayed (`connect_via`)
+        //    peer entry records the RELAY's address — possibly the
+        //    withdrawing sender itself — so promoting it would
+        //    re-install exactly the route we just dropped. Only a
+        //    direct session's address maps back to the hop in the
+        //    reverse index.
         if let Some(peer) = ctx.peers.get(&dest) {
             let addr = peer.value().addr;
             drop(peer);
-            if ctx.addr_to_node.get(&addr).map(|e| *e.value()) == Some(dest) {
+            if Self::promotable_direct_hop(
+                &ctx.addr_to_node,
+                &ctx.failure_detector,
+                dest,
+                addr,
+                via_addr,
+            ) {
                 ctx.router.routing_table().add_route(dest, addr);
                 return;
             }
@@ -8696,11 +8744,22 @@ impl MeshNode {
             if let Some(first_hop) = path.get(1).map(graph_id_to_node_id) {
                 if first_hop != from_node {
                     if let Some(addr) = ctx.peer_addrs.get(&first_hop).map(|a| *a.value()) {
-                        let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
-                        ctx.router
-                            .routing_table()
-                            .add_route_with_metric(dest, addr, metric);
-                        return;
+                        // Same LIVE + DIRECT gate as above, keyed on
+                        // the first hop — a relayed or Failed first
+                        // hop must fall through to the cascade.
+                        if Self::promotable_direct_hop(
+                            &ctx.addr_to_node,
+                            &ctx.failure_detector,
+                            first_hop,
+                            addr,
+                            via_addr,
+                        ) {
+                            let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
+                            ctx.router
+                                .routing_table()
+                                .add_route_with_metric(dest, addr, metric);
+                            return;
+                        }
                     }
                 }
             }
@@ -15456,6 +15515,105 @@ mod fold_publisher_helpers_tests {
                 as super::super::behavior::fold::FoldKind>::KIND_ID
             }),
             "capability fold registered in default router"
+        );
+    }
+}
+
+#[cfg(test)]
+mod route_withdrawal_promotion_tests {
+    //! RT-5 review Findings 1 & 2: the withdrawal receive path must
+    //! not promote an alternate that is (a) a peer the failure
+    //! detector considers dead — `peers`/`addr_to_node`/`peer_addrs`
+    //! retain Failed peers for transient-partition recovery, so a
+    //! naive promotion resurrects an un-displaceable metric-1 route
+    //! to a dead peer; (b) a relayed hop, whose recorded address is
+    //! the relay's and does not map back to the hop; or (c) any hop
+    //! whose address is the withdrawing sender's own, which would
+    //! reinstall exactly the route the withdrawal just dropped.
+    use super::*;
+    use crate::adapter::net::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// A detector whose nodes go Failed after a hair of real time so
+    /// the test can drive a specific `NodeStatus` deterministically.
+    fn detector() -> FailureDetector {
+        FailureDetector::with_config(FailureDetectorConfig {
+            timeout: Duration::from_millis(1),
+            miss_threshold: 1,
+            suspicion_threshold: 1,
+            cleanup_interval: Duration::from_secs(60),
+        })
+    }
+
+    #[test]
+    fn healthy_direct_hop_is_promotable() {
+        let hop = 0xA1;
+        let hop_addr = addr(4001);
+        let via_addr = addr(4099);
+        let a2n = DashMap::new();
+        a2n.insert(hop_addr, hop);
+        let fd = detector();
+        fd.heartbeat(hop, hop_addr); // Healthy
+        assert!(MeshNode::promotable_direct_hop(
+            &a2n, &fd, hop, hop_addr, via_addr
+        ));
+    }
+
+    #[test]
+    fn failed_hop_is_not_promotable() {
+        // Finding 2: dead-but-retained peer must not be resurrected.
+        let hop = 0xA2;
+        let hop_addr = addr(4002);
+        let via_addr = addr(4099);
+        let a2n = DashMap::new();
+        a2n.insert(hop_addr, hop);
+        let fd = detector();
+        fd.heartbeat(hop, hop_addr);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(fd.check_all(), vec![hop], "precondition: hop is Failed");
+        assert_eq!(fd.status(hop), NodeStatus::Failed);
+        assert!(
+            !MeshNode::promotable_direct_hop(&a2n, &fd, hop, hop_addr, via_addr),
+            "a Failed hop must never be promoted (un-displaceable metric-1 black hole)"
+        );
+    }
+
+    #[test]
+    fn relayed_hop_is_not_promotable() {
+        // Finding 1: a relayed hop's recorded addr is the relay's and
+        // does not map back to the hop in addr_to_node.
+        let hop = 0xA3;
+        let relay_addr = addr(4003);
+        let via_addr = addr(4099);
+        let a2n = DashMap::new();
+        // relay_addr maps to some OTHER node (the relay), not `hop`.
+        a2n.insert(relay_addr, 0xBEEF);
+        let fd = detector();
+        fd.heartbeat(hop, relay_addr); // hop itself is Healthy
+        assert!(
+            !MeshNode::promotable_direct_hop(&a2n, &fd, hop, relay_addr, via_addr),
+            "a relayed hop (addr maps to the relay, not the hop) must not be promoted"
+        );
+    }
+
+    #[test]
+    fn hop_at_the_withdrawing_addr_is_not_promotable() {
+        // Finding 1: never reinstall through the withdrawing sender's
+        // own address — that is the route we just dropped.
+        let hop = 0xA4;
+        let via_addr = addr(4004);
+        let a2n = DashMap::new();
+        a2n.insert(via_addr, hop);
+        let fd = detector();
+        fd.heartbeat(hop, via_addr);
+        assert!(
+            !MeshNode::promotable_direct_hop(&a2n, &fd, hop, via_addr, via_addr),
+            "promoting the withdrawing sender's own address reinstalls the dropped route"
         );
     }
 }
