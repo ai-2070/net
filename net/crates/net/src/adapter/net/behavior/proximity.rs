@@ -698,6 +698,19 @@ impl ProximityGraph {
     /// `last_updated`. `sample_us == 0` means "no latency info" (e.g.
     /// the self → peer edge added at session setup); leave the
     /// existing latency alone in that case.
+    /// Remove one directed edge (RT-5,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Called when a peer
+    /// withdraws its route toward `to`: the `(peer, to)` edge is what
+    /// `path_to` would otherwise keep using to synthesize alternates
+    /// through the withdrawn hop. Removing an absent edge is a no-op.
+    pub fn remove_edge(&self, from: NodeId, to: NodeId) -> bool {
+        let removed = self.edges.remove(&(from, to)).is_some();
+        if removed {
+            self.num_edges.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
     fn insert_or_update_edge(&self, from: NodeId, to: NodeId, sample_us: u64) {
         let mut edge_inserted = false;
         self.edges

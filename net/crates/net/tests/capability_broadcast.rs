@@ -79,11 +79,21 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// Poll `cond` on `node` every 25ms for up to 2s; returns `true` on
 /// match. Callers use this instead of a fixed `sleep` so slow CI
 /// boxes don't flake.
-async fn wait_until<F>(node: &Arc<MeshNode>, mut cond: F) -> bool
+async fn wait_until<F>(node: &Arc<MeshNode>, cond: F) -> bool
 where
     F: FnMut(&MeshNode) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    wait_until_for(node, Duration::from_secs(2), cond).await
+}
+
+/// `wait_until` with a caller-chosen deadline — for conditions gated
+/// on a configured window (e.g. the RT-1 trailing-edge flush) rather
+/// than the fixed 2s.
+async fn wait_until_for<F>(node: &Arc<MeshNode>, timeout: Duration, mut cond: F) -> bool
+where
+    F: FnMut(&MeshNode) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if cond(node) {
             return true;
@@ -785,5 +795,156 @@ async fn signed_announcement_with_mismatched_node_id_entity_id_is_rejected() {
         "attacker's session got TOFU-pinned to victim's entity_id via a \
          binding-mismatched announcement — forwarder / sender can impersonate \
          the victim for channel-auth purposes",
+    );
+}
+
+// =========================================================================
+// RT-2 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): echo-storm tripwire.
+// The local-caps change signal must bump ONLY on local-origin
+// mutations. If an inbound peer announcement ever bumps it, a
+// change-driven announcer (RT-3) subscribed to the signal would
+// re-announce on every peer announcement — a mesh-wide feedback
+// loop. This test is the hard gate for wiring RT-3.
+// =========================================================================
+
+#[tokio::test]
+async fn inbound_announcements_do_not_bump_local_caps_generation() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+
+    let before = b.local_caps_generation();
+
+    a.announce_capabilities(CapabilitySet::new().add_tag("echo-probe"))
+        .await
+        .expect("announce");
+    let filter = CapabilityFilter::new().require_tag("echo-probe");
+    let a_id = a.node_id();
+    assert!(
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
+        "B never received A's announcement",
+    );
+
+    assert_eq!(
+        b.local_caps_generation(),
+        before,
+        "an inbound peer announcement bumped the LOCAL caps generation — \
+         a change-driven announcer subscribed to this signal would echo \
+         every peer announcement back to the mesh",
+    );
+
+    // A's own announce is a local-origin publication of its baseline,
+    // not a registry mutation — it must not bump A's signal either
+    // (announce is the OUTPUT of the signal's consumer, not an input;
+    // bumping here would make RT-3 self-retrigger).
+    assert_eq!(
+        a.local_caps_generation(),
+        0,
+        "announce_capabilities itself must not bump the local-caps signal",
+    );
+}
+
+// =========================================================================
+// RT-1 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): trailing-edge announce
+// rate limiter. An announce landing inside `min_announce_interval`
+// must coalesce into one flush at window end — pre-RT-1 it was
+// silently dropped until the next out-of-window announce or the
+// 150 s re-announce keep-alive.
+// =========================================================================
+
+/// The window is sized so the leading-edge delivery wait (2 s cap,
+/// typically <100 ms on loopback) cannot overrun it and turn the
+/// "in-window" announce into an out-of-window one.
+#[tokio::test]
+async fn in_window_announce_flushes_at_window_end() {
+    let window = Duration::from_secs(3);
+    let a = build_node_with(|cfg| cfg.with_min_announce_interval(window)).await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+    // The flush task holds a `Weak<MeshNode>` — same constraint as
+    // the re-announce loop, so upgrade the bare `start()` from
+    // `handshake` to `start_arc`. Idempotent.
+    a.start_arc();
+
+    let a_id = a.node_id();
+
+    // Leading edge: first announce broadcasts immediately.
+    a.announce_capabilities(CapabilitySet::new().add_tag("rt1:v1"))
+        .await
+        .expect("first announce");
+    let v1 = CapabilityFilter::new().require_tag("rt1:v1");
+    assert!(
+        wait_until(&b, |n| n.find_nodes_by_filter(&v1).contains(&a_id)).await,
+        "B never saw the leading-edge announcement",
+    );
+
+    // In-window: withheld from the wire (nothing was sent, so B
+    // can't know it), but scheduled for the trailing-edge flush.
+    a.announce_capabilities(CapabilitySet::new().add_tag("rt1:v2"))
+        .await
+        .expect("second announce");
+    let v2 = CapabilityFilter::new().require_tag("rt1:v2");
+    assert!(
+        !b.find_nodes_by_filter(&v2).contains(&a_id),
+        "in-window announce hit the wire immediately — rate limit gone",
+    );
+
+    // The flush fires when the window (measured from the leading
+    // edge) elapses; poll past it with CI slack.
+    assert!(
+        wait_until_for(&b, window + Duration::from_secs(2), |n| {
+            n.find_nodes_by_filter(&v2).contains(&a_id)
+        })
+        .await,
+        "suppressed announce was never flushed at the window end",
+    );
+}
+
+/// A burst of in-window announces collapses into ONE flush carrying
+/// the newest capability set — the flush reads `local_announcement`
+/// at fire time, so intermediates never hit the wire.
+#[tokio::test]
+async fn in_window_burst_coalesces_to_newest() {
+    let window = Duration::from_millis(1200);
+    let a = build_node_with(|cfg| cfg.with_min_announce_interval(window)).await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+    a.start_arc();
+
+    let a_id = a.node_id();
+
+    // Leading edge + three suppressed announces, back-to-back so
+    // the burst is guaranteed in-window (no delivery wait between).
+    a.announce_capabilities(CapabilitySet::new().add_tag("burst:v1"))
+        .await
+        .expect("announce v1");
+    for tag in ["burst:v2", "burst:v3", "burst:v4"] {
+        a.announce_capabilities(CapabilitySet::new().add_tag(tag))
+            .await
+            .expect("burst announce");
+    }
+
+    let v2 = CapabilityFilter::new().require_tag("burst:v2");
+    let v3 = CapabilityFilter::new().require_tag("burst:v3");
+    let v4 = CapabilityFilter::new().require_tag("burst:v4");
+    let deadline = tokio::time::Instant::now() + window + Duration::from_secs(2);
+    let mut saw_newest = false;
+    while tokio::time::Instant::now() < deadline {
+        // v2/v3 were never broadcast — only the flush's read of the
+        // newest `local_announcement` (v4) may ever reach B.
+        assert!(
+            !b.find_nodes_by_filter(&v2).contains(&a_id)
+                && !b.find_nodes_by_filter(&v3).contains(&a_id),
+            "an intermediate suppressed announcement hit the wire",
+        );
+        if b.find_nodes_by_filter(&v4).contains(&a_id) {
+            saw_newest = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_newest,
+        "the newest suppressed announcement was never flushed",
     );
 }

@@ -1,6 +1,7 @@
 # Real-Time Routing & Capability Discovery Plan
 
-Status: draft
+Status: RT-1..RT-5 implemented (2026-07-11); RT-6 (remote watch stream) and
+RT-7 (docs) open
 Owner: TBD
 Related: `POLLING_TO_EVENT_DRIVEN_SDK_PLAN.md` (predecessor — made *local*
 watch surfaces push), `CAPABILITY_BROADCAST_PLAN.md` (the announcement
@@ -250,33 +251,66 @@ exactly as today.
 
 ## 5. Slices
 
-- **RT-1 — trailing-edge announce limiter (A-3).** Self-contained fix in
-  `announce_capabilities_with`; no new config. Test: two announces 1 s
-  apart with a 10 s window → second content is on peers by `t ≈ 10 s`,
-  not 150 s.
-- **RT-2 — local-caps change signal (A-1).** `watch<u64>` + single bump
-  helper; unit test that inbound peer announcements do **not** bump it
-  (the echo-storm tripwire).
-- **RT-3 — change-driven announcer loop (A-2).** Depends RT-1, RT-2.
-  Integration test: `serve_tool` on A with no explicit announce → visible
-  in B's `watch_tools` within `announce_debounce + min_announce_interval`
-  slack (pin well under 1 s with test-tight knobs); 20-tool burst → one
-  broadcast.
-- **RT-4 — event-triggered pingwaves (B).** Emission sites + min-gap.
-  Three-node test: C learns a route to A within one flood of the A–B
-  session opening, not the next 5 s tick.
-- **RT-5 — `SUBPROTOCOL_ROUTE_WITHDRAW` (B′).** New message + receive
-  path (drop `(dest, via=sender)` route + edge, reroute, cascade
-  re-flood) + emission on Failed/eviction. Three-node test: kill A;
-  after B detects the failure, C's route via B is gone within one flood
-  (vs 90 s), and traffic re-routes if an alternate exists. Mixed-version
-  test: old node ignores the subprotocol and still ages out.
-- **RT-6 — nRPC streaming remote watch + Go binding cutover (C).**
+- **RT-1 — trailing-edge announce limiter (A-3).** ✅ DONE. As built: the
+  timestamp gate became `AnnounceGate { last_broadcast_at,
+  deferred_scheduled }` under one mutex; an in-window announce schedules
+  one flush task (weak-`Arc`, needs `start_arc` — bare-start nodes keep
+  the old drop semantics) that re-broadcasts the latest
+  `local_announcement` at window end. Duplicates after a rate-limit-floor
+  reset are receiver-deduped by `(node_id, version)`. Tests:
+  `in_window_announce_flushes_at_window_end`,
+  `in_window_burst_coalesces_to_newest` (capability_broadcast.rs).
+- **RT-2 — local-caps change signal (A-1).** ✅ DONE. As built: one shared
+  `watch::Sender<u64>` injected into the mutation-owning registries
+  (`ToolMetadataRegistry::with_change_signal`, new
+  `LocalServiceRegistry` wrapper for `rpc_local_services`) so a mutation
+  site can't forget to fire — same reasoning as `Fold::signal_changed`.
+  Surface: `subscribe_local_caps_changes` / `local_caps_generation`.
+  Echo tripwire (`inbound_announcements_do_not_bump_local_caps_generation`)
+  also pins that `announce_capabilities` itself does not bump.
+- **RT-3 — change-driven announcer loop (A-2).** ✅ DONE.
+  `spawn_capability_announce_on_change_loop`, `announce_debounce`
+  (default 100 ms, `Duration::MAX` disables), TTL matches the
+  re-announce keep-alive's. Runs only under `start_arc` (captures
+  `self_weak` at spawn — call `start_arc` FIRST; a bare `start()`
+  followed by `start_arc` leaves the loop parked). Tests:
+  `registry_change_announces_without_explicit_call`,
+  `registry_burst_coalesces_into_one_announce` (proved via the new
+  `capability_announce_version` counter).
+- **RT-4 — event-triggered pingwaves (B).** ✅ DONE. Emission on
+  connect/accept session open, failure-detector recovery, and after each
+  change-driven announce; `event_pingwave_min_gap` (default 250 ms,
+  `Duration::MAX` disables). **Divergence: each event emits TWO flood
+  rounds** (fresh seq each, 50 ms apart, peers re-snapshotted) — round 1
+  of a responder-side session-open emission can reach the initiator
+  before its post-handshake `addr_to_node` bookkeeping lands and be
+  dropped by the DV unregistered-source gate; the re-flood closes that
+  race. Tests: `new_session_installs_multihop_route_at_flood_speed`,
+  `max_gap_disables_event_pingwaves` (event_pingwave.rs, heartbeat
+  parked at 30 s so only the flood can explain the route).
+- **RT-5 — `SUBPROTOCOL_ROUTE_WITHDRAW` (B′).** ✅ DONE. `0x0C01`,
+  16-byte `RouteWithdrawal { dest, seq }` payload riding the encrypted
+  subprotocol path (session-authenticated; `via` is always the resolved
+  sender, never a wire field). Emission from the failure detector's
+  `on_failure` (dead-peer eviction emission was dropped as redundant —
+  the Failed transition already fired). Receive: drop
+  `(dest, next_hop = sender)` via the existing
+  `remove_route_if_next_hop_is`, drop the `(sender → dest)` proximity
+  edge (new `ProximityGraph::remove_edge`), promote an alternate
+  (direct session, else `path_to` through a different first hop), else
+  cascade own withdrawal with split horizon; 1 s per-dest damping
+  instead of a seen-cache (each hop re-authors). `enable_route_withdraw`
+  (default true) gates emit + receive. Tests:
+  `failed_peer_routes_are_withdrawn_mesh_wide`,
+  `disabled_receiver_keeps_route_until_age_out` (route_withdraw.rs —
+  receiver's sweep parked at 30 s so the flood is the only possible
+  cause).
+- **RT-6 — nRPC streaming remote watch + Go binding cutover (C).** OPEN.
   Depends RT-3 for end-to-end value, technically independent. Includes
   the overflow/resync contract test.
-- **RT-7 — docs.** Replace the `discover.md` poll loop with `watchTools`;
-  document the new knobs and the push-plus-anti-entropy model in
-  `TRANSPORT.md` / `BEHAVIOR.md`.
+- **RT-7 — docs.** OPEN. Replace the `discover.md` poll loop with
+  `watchTools`; document the new knobs and the push-plus-anti-entropy
+  model in `TRANSPORT.md` / `BEHAVIOR.md`.
 
 Dependency order: RT-1 → RT-2 → RT-3; RT-4 and RT-5 independent of the
 announce track (RT-5 benefits from RT-4's recovery pingwave); RT-6, RT-7

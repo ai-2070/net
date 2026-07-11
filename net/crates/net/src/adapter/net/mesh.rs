@@ -51,7 +51,9 @@ use super::identity::{
 };
 use super::pool::PacketBuilder;
 
-use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
+use super::behavior::broadcast::{
+    RouteWithdrawal, SUBPROTOCOL_CAPABILITY_ANN, SUBPROTOCOL_ROUTE_WITHDRAW,
+};
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
@@ -873,6 +875,12 @@ struct DispatchCtx {
     proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
     partition_filter: PartitionFilter,
+    /// RT-5: honor + cascade inbound route withdrawals.
+    enable_route_withdraw: bool,
+    /// RT-5: seq for cascaded withdrawals this node re-authors.
+    route_withdraw_seq: Arc<AtomicU64>,
+    /// RT-5: per-dest damping for cascaded withdrawals.
+    route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -1214,10 +1222,52 @@ pub struct MeshNodeConfig {
     /// [`MeshNode::announce_capabilities`] broadcasts from this
     /// origin. Calls within the window coalesce: the local index
     /// and `local_announcement` are updated so self-queries + late-
-    /// joiner session-open pushes reflect the latest caps, but the
-    /// network broadcast is skipped. Rate-limits apps that
-    /// re-announce in tight loops.
+    /// joiner session-open pushes reflect the latest caps, and one
+    /// trailing-edge flush re-broadcasts the newest announcement at
+    /// window end (RT-1; needs [`MeshNode::start_arc`], else the
+    /// in-window broadcast is dropped as before). Rate-limits apps
+    /// that re-announce in tight loops.
     pub min_announce_interval: Duration,
+    /// Debounce window for the change-driven announcer (RT-3,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). When a local
+    /// capability mutation fires the RT-2 change signal — a
+    /// `serve_tool` register/unregister or nRPC service
+    /// register/deregister — the announcer waits this long for the
+    /// burst to settle, then broadcasts once. A service registering
+    /// 20 tools at startup produces one announcement, not 20.
+    ///
+    /// `Duration::MAX` disables the announcer (capability changes
+    /// then propagate only via explicit
+    /// [`MeshNode::announce_capabilities`] calls, session-open
+    /// pushes, and the re-announce keep-alive). Like the keep-alive
+    /// loop, the announcer runs only for nodes started via
+    /// [`MeshNode::start_arc`]. Default 100 ms.
+    pub announce_debounce: Duration,
+    /// Minimum gap between event-triggered pingwaves (RT-4,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Topology changes —
+    /// session open, failure-detector recovery, a change-driven
+    /// capability announce — emit a pingwave immediately instead of
+    /// waiting for the next heartbeat tick, so remote routing
+    /// tables converge at flood speed. This gap coalesces churn
+    /// storms: events inside the gap are silently absorbed (the
+    /// pingwave carries whole-node state, and the heartbeat tick
+    /// remains the anti-entropy floor that repairs anything
+    /// missed). `Duration::MAX` disables event pingwaves entirely.
+    /// Default 250 ms.
+    pub event_pingwave_min_gap: Duration,
+    /// Emit + honor poison-reverse route withdrawals (RT-5,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN,
+    /// `SUBPROTOCOL_ROUTE_WITHDRAW`). When the failure detector
+    /// marks a direct peer Failed, this node floods "that peer is
+    /// unreachable via me"; receivers drop exactly their
+    /// `(dest, next_hop = sender)` route, promote an alternate when
+    /// one exists, and cascade their own withdrawal when none does.
+    /// Convergence after failure detection drops from the
+    /// `3 × session_timeout` age-out to one flood. `false` restores
+    /// pre-RT-5 behavior on both the emit and receive side (an
+    /// un-upgraded node degrades the same way by dropping the
+    /// unknown subprotocol). Default `true`.
+    pub enable_route_withdraw: bool,
     /// Period between `TokenCache` expiry sweeps. A subscriber
     /// whose token expires mid-subscription is evicted from the
     /// [`SubscriberRoster`] and revoked from the [`AuthGuard`]
@@ -1332,6 +1382,9 @@ impl MeshNodeConfig {
             subnet_policy: None,
             default_visibility: Visibility::Global,
             min_announce_interval: Duration::from_secs(10),
+            announce_debounce: Duration::from_millis(100),
+            event_pingwave_min_gap: Duration::from_millis(250),
+            enable_route_withdraw: true,
             token_sweep_interval: Duration::from_secs(30),
             max_auth_failures_per_window: 16,
             auth_failure_window: Duration::from_secs(60),
@@ -1434,6 +1487,29 @@ impl MeshNodeConfig {
     /// announcement broadcasts. See [`Self::min_announce_interval`].
     pub fn with_min_announce_interval(mut self, interval: Duration) -> Self {
         self.min_announce_interval = interval;
+        self
+    }
+
+    /// Set the change-driven announcer's debounce window. See
+    /// [`Self::announce_debounce`]. `Duration::MAX` disables the
+    /// announcer.
+    pub fn with_announce_debounce(mut self, debounce: Duration) -> Self {
+        self.announce_debounce = debounce;
+        self
+    }
+
+    /// Set the minimum gap between event-triggered pingwaves. See
+    /// [`Self::event_pingwave_min_gap`]. `Duration::MAX` disables
+    /// event pingwaves.
+    pub fn with_event_pingwave_min_gap(mut self, gap: Duration) -> Self {
+        self.event_pingwave_min_gap = gap;
+        self
+    }
+
+    /// Enable/disable poison-reverse route withdrawals. See
+    /// [`Self::enable_route_withdraw`].
+    pub fn with_route_withdraw(mut self, enable: bool) -> Self {
+        self.enable_route_withdraw = enable;
         self
     }
 
@@ -1959,6 +2035,260 @@ enum AddrInstallMode {
     RoutedPreserve,
 }
 
+/// Origin-side capability-announce rate-limit state
+/// (REALTIME_ROUTING_AND_DISCOVERY_PLAN RT-1). One mutex guards
+/// both fields so the broadcast-or-defer decision and the
+/// deferred-slot claim are atomic: without that, two concurrent
+/// in-window announces could both schedule a trailing-edge flush,
+/// or a flush could race a fresh announce and double-send.
+struct AnnounceGate {
+    /// When the most recent outbound announcement broadcast
+    /// actually hit the wire (leading edge of the rate-limit
+    /// window). `None` = never broadcast, or reset by the
+    /// reflex-override paths to force the next call through.
+    last_broadcast_at: Option<std::time::Instant>,
+    /// A trailing-edge flush task is scheduled for the end of the
+    /// current window. While set, further in-window announces
+    /// coalesce into that pending flush (which always broadcasts
+    /// the *latest* `local_announcement`) instead of spawning
+    /// more tasks.
+    deferred_scheduled: bool,
+}
+
+/// Signal-carrying wrapper around the `nrpc:` local-service set
+/// (RT-2). `serve_rpc` inserts and `ServeHandle::drop` removes
+/// through the shared `Arc`, so the local-caps change signal has to
+/// live inside the collection — a call-site bump could be forgotten
+/// by the next registration path (same reasoning as
+/// `Fold::signal_changed` and `ToolMetadataRegistry`).
+#[cfg(feature = "cortex")]
+pub(super) struct LocalServiceRegistry {
+    set: dashmap::DashSet<String>,
+    change_signal: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+#[cfg(feature = "cortex")]
+impl LocalServiceRegistry {
+    fn new(change_signal: Arc<tokio::sync::watch::Sender<u64>>) -> Self {
+        Self {
+            set: dashmap::DashSet::new(),
+            change_signal,
+        }
+    }
+
+    /// Insert a service name. Bumps the local-caps generation only
+    /// when the name is new — an idempotent re-serve is not a
+    /// capability change and must not wake the announcer.
+    pub(super) fn insert(&self, service: String) -> bool {
+        let inserted = self.set.insert(service);
+        if inserted {
+            self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
+        }
+        inserted
+    }
+
+    /// Remove a service name. Bumps only when it was present.
+    pub(super) fn remove(&self, service: &str) -> Option<String> {
+        let removed = self.set.remove(service);
+        if removed.is_some() {
+            self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
+        }
+        removed
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Cloned name list for the announce-path tag merge. Announces
+    /// are rare relative to lookups; the allocation keeps the
+    /// DashSet's guard types out of the public surface.
+    pub(super) fn snapshot(&self) -> Vec<String> {
+        self.set.iter().map(|s| s.clone()).collect()
+    }
+}
+
+/// RT-4 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): emit one origin
+/// pingwave to every connected peer NOW — outside the heartbeat
+/// tick — so a topology change propagates at flood speed instead of
+/// waiting up to `heartbeat_interval` per hop.
+///
+/// Free function (not a `MeshNode` method) because the
+/// failure-detector `on_recovery` callback needs to emit before
+/// `Self` exists in `MeshNode::new`; both it and
+/// [`MeshNode::emit_event_pingwave`] share this one implementation.
+///
+/// Gated by `min_gap` against the shared `gate` timestamp: events
+/// inside the gap are absorbed (the pingwave carries whole-node
+/// state, and the heartbeat tick remains the anti-entropy floor
+/// that repairs anything coalesced away). `Duration::MAX` disables.
+/// The sends run on a spawned task so callers — including sync
+/// callbacks — never block on socket I/O.
+fn spawn_event_pingwave(
+    gate: &parking_lot::Mutex<Option<std::time::Instant>>,
+    min_gap: Duration,
+    proximity_graph: &Arc<ProximityGraph>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    partition_filter: &PartitionFilter,
+) {
+    if min_gap == Duration::MAX {
+        return;
+    }
+    {
+        let mut last = gate.lock();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.saturating_duration_since(t) < min_gap) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let proximity_graph = proximity_graph.clone();
+    let socket = socket.clone();
+    let peers = peers.clone();
+    let filter = partition_filter.clone();
+    tokio::spawn(async move {
+        // Two rounds, fresh pingwave (fresh seq) each. Round 1 is
+        // the flood-speed path. Round 2 exists because a session-
+        // open emission races the OTHER side's post-handshake
+        // bookkeeping: the responder finishes its handshake on the
+        // initiator's final message and emits immediately, but the
+        // initiator installs the `addr_to_node` entry only after
+        // sending that message — on a fast link round 1 can arrive
+        // before the entry exists and be dropped by the DV
+        // unregistered-source gate (`mesh.rs` pingwave dispatch,
+        // rule 4). The re-flood lands after the bookkeeping has
+        // settled; the fresh seq keeps receivers that processed
+        // round 1 from dedup-dropping round 2's refresh. Peers are
+        // re-snapshotted so a peer installed between rounds is
+        // covered too.
+        for round in 0..2u8 {
+            if round > 0 {
+                tokio::time::sleep(EVENT_PINGWAVE_RESEND_DELAY).await;
+            }
+            let pw_bytes = proximity_graph
+                .create_pingwave(HealthStatus::Healthy)
+                .to_bytes();
+            // Snapshot before awaiting — same shard-guard
+            // discipline as the heartbeat loop's send pass.
+            let targets: Vec<SocketAddr> = peers
+                .iter()
+                .filter_map(|e| {
+                    let addr = e.value().addr;
+                    if filter.contains(&addr) {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                })
+                .collect();
+            for addr in targets {
+                // Raw UDP, unencrypted — same as the heartbeat
+                // tick's pingwave emission; topology is public.
+                let _ = socket.send_to(&pw_bytes, addr).await;
+            }
+        }
+    });
+}
+
+/// Settle delay before an event pingwave's second flood round —
+/// long enough for the remote side's post-handshake bookkeeping to
+/// land (microseconds in practice), short enough to stay firmly
+/// "flood speed" next to the multi-second heartbeat tick.
+const EVENT_PINGWAVE_RESEND_DELAY: Duration = Duration::from_millis(50);
+
+/// RT-5: a node re-floods its own withdrawal of the same dest at
+/// most once per this window. Cascades and flaps are bounded by it;
+/// there is no flood seen-cache because each hop re-authors its own
+/// withdrawal ("dest unreachable via ME") rather than forwarding
+/// someone else's.
+const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
+
+/// RT-5 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): flood a
+/// poison-reverse [`RouteWithdrawal`] — "`dest` is unreachable via
+/// ME" — to every connected peer except `dest` itself and
+/// `exclude` (split horizon toward the peer we learned the loss
+/// from). Free function so the failure-detector `on_failure`
+/// closure (which runs before `Self` exists in `MeshNode::new`) and
+/// the dispatch-path cascade share one implementation.
+///
+/// Packets are built synchronously per peer (the packet pool is
+/// thread-local; each ride the peer's encrypted session like any
+/// subprotocol frame) and the sends run on a spawned task so sync
+/// callers never block on socket I/O.
+fn spawn_route_withdrawal_flood(
+    seq_counter: &Arc<AtomicU64>,
+    damper: &Arc<DashMap<u64, std::time::Instant>>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    partition_filter: &PartitionFilter,
+    dest: u64,
+    exclude: Option<u64>,
+) {
+    let now = std::time::Instant::now();
+    let mut fresh = false;
+    damper
+        .entry(dest)
+        .and_modify(|t| {
+            if now.saturating_duration_since(*t) >= ROUTE_WITHDRAW_DAMP_WINDOW {
+                *t = now;
+                fresh = true;
+            }
+        })
+        .or_insert_with(|| {
+            fresh = true;
+            now
+        });
+    if !fresh {
+        return;
+    }
+    // Opportunistic bound: the damper only grows with distinct
+    // withdrawn dests; a churn storm across many dests still can't
+    // grow it past this sweep.
+    if damper.len() > 1024 {
+        damper.retain(|_, t| now.saturating_duration_since(*t) < ROUTE_WITHDRAW_DAMP_WINDOW);
+    }
+
+    let payload = RouteWithdrawal {
+        dest,
+        seq: seq_counter.fetch_add(1, Ordering::Relaxed),
+    }
+    .to_bytes();
+    let events = vec![Bytes::copy_from_slice(&payload)];
+    let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
+    let mut sends: Vec<(Bytes, SocketAddr)> = Vec::new();
+    for entry in peers.iter() {
+        let peer_id = *entry.key();
+        if peer_id == dest || Some(peer_id) == exclude {
+            continue;
+        }
+        let addr = entry.value().addr;
+        if partition_filter.contains(&addr) {
+            continue;
+        }
+        let session = &entry.value().session;
+        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let mut builder = session.thread_local_pool().get();
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            PacketFlags::NONE,
+            SUBPROTOCOL_ROUTE_WITHDRAW,
+        );
+        sends.push((packet, addr));
+    }
+    if sends.is_empty() {
+        return;
+    }
+    let socket = socket.clone();
+    tokio::spawn(async move {
+        for (packet, addr) in sends {
+            let _ = socket.send_to(&packet, addr).await;
+        }
+    });
+}
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -2061,7 +2391,7 @@ pub struct MeshNode {
     /// so other nodes' capability indexes can find this node via
     /// `Mesh::find_service_nodes(name)`.
     #[cfg(feature = "cortex")]
-    rpc_local_services: Arc<dashmap::DashSet<String>>,
+    rpc_local_services: Arc<LocalServiceRegistry>,
     /// Local-only registry of AI-tool descriptors for every
     /// `serve_tool` registration on this node. Drives the
     /// auto-merge in [`announce_capabilities_with`] (adds the
@@ -2333,12 +2663,38 @@ pub struct MeshNode {
     /// ann.node_id` on the direct path, so there's only one peer
     /// that can produce one).
     seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
-    /// Timestamp of the most recent outbound capability-announcement
-    /// broadcast from this origin. Compared against
+    /// Origin-side announce rate-limit state. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
     /// call; within-window calls coalesce to a local self-index
-    /// update without a network broadcast.
-    last_announce_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    /// update plus one trailing-edge flush at window end, so a
+    /// rate-limited change is delayed by at most one window —
+    /// never silently dropped until the re-announce keep-alive
+    /// (RT-1).
+    announce_gate: Arc<parking_lot::Mutex<AnnounceGate>>,
+    /// Local-origin capability change signal (RT-2). The generation
+    /// bumps whenever THIS node's announced surface changes — a
+    /// `serve_tool` register/unregister or an nRPC service
+    /// register/deregister — and never on inbound peer
+    /// announcements (those land in `capability_fold`, which this
+    /// signal deliberately does not watch). That local-only
+    /// property is what makes it safe to drive a change-driven
+    /// announcer without echo storms. Subscribe via
+    /// [`Self::subscribe_local_caps_changes`].
+    local_caps_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Timestamp of the most recent event-triggered pingwave
+    /// (RT-4). Shared with the failure-detector `on_recovery`
+    /// closure; compared against `config.event_pingwave_min_gap`
+    /// so churn storms coalesce instead of flooding.
+    event_pingwave_gate: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    /// Monotonic sequence for outbound route withdrawals (RT-5).
+    /// Shared with the failure-detector `on_failure` closure.
+    route_withdraw_seq: Arc<AtomicU64>,
+    /// Per-dest damping for outbound route withdrawals (RT-5):
+    /// this node re-floods its own withdrawal of the same dest at
+    /// most once per `ROUTE_WITHDRAW_DAMP_WINDOW`. Bounds cascade /
+    /// flap storms without a flood seen-cache (each hop re-authors
+    /// its withdrawal, so there is no flood identity to dedup on).
+    route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -2780,6 +3136,29 @@ impl MeshNode {
         let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
             Arc::new(DashMap::new());
         let subscriber_chains_failure = subscriber_chains.clone();
+        // RT-4: event-pingwave gate + the clones the `on_recovery`
+        // closure captures (it runs before `Self` exists, so it
+        // can't call `emit_event_pingwave`).
+        let partition_filter: PartitionFilter = Arc::new(dashmap::DashSet::new());
+        let event_pingwave_gate: Arc<parking_lot::Mutex<Option<std::time::Instant>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let event_pingwave_min_gap = config.event_pingwave_min_gap;
+        let event_pingwave_gate_recovery = event_pingwave_gate.clone();
+        let proximity_graph_recovery = proximity_graph.clone();
+        let socket_recovery = socket.clone();
+        let peers_recovery = peers.clone();
+        let partition_filter_recovery = partition_filter.clone();
+        // RT-5: route-withdrawal state + the clones the `on_failure`
+        // closure captures.
+        let route_withdraw_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>> = Arc::new(DashMap::new());
+        let enable_route_withdraw = config.enable_route_withdraw;
+        let route_withdraw_seq_failure = route_withdraw_seq.clone();
+        let route_withdraw_damper_failure = route_withdraw_damper.clone();
+        let socket_failure = socket.clone();
+        let peers_failure = peers.clone();
+        let partition_filter_failure = partition_filter.clone();
+
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -2829,8 +3208,38 @@ impl MeshNode {
             // them — so without this they leak for the node's lifetime,
             // and a reused `node_id` could re-validate a stale chain.
             subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
+            // RT-5: tell the mesh this peer is unreachable via us —
+            // receivers drop their `(node_id, via=us)` routes within
+            // one flood instead of waiting for the 3× session_timeout
+            // age-out sweep.
+            if enable_route_withdraw {
+                spawn_route_withdrawal_flood(
+                    &route_withdraw_seq_failure,
+                    &route_withdraw_damper_failure,
+                    &socket_failure,
+                    &peers_failure,
+                    &partition_filter_failure,
+                    node_id,
+                    None,
+                );
+            }
         })
-        .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
+        .on_recovery(move |node_id| {
+            rp_recovery.on_recovery(node_id);
+            // RT-4: a healed partition is a topology change — tell
+            // the mesh at flood speed instead of waiting for the
+            // next heartbeat tick. The recovered peer's OWN
+            // pingwaves resume on its heartbeats; this one refreshes
+            // routes THROUGH us for third parties.
+            spawn_event_pingwave(
+                &event_pingwave_gate_recovery,
+                event_pingwave_min_gap,
+                &proximity_graph_recovery,
+                &socket_recovery,
+                &peers_recovery,
+                &partition_filter_recovery,
+            );
+        });
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
         let pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>> =
@@ -2849,6 +3258,14 @@ impl MeshNode {
         // probing to discover what they already know.
         #[cfg(feature = "nat-traversal")]
         let initial_reflex_override = config.reflex_override;
+
+        // Local-origin capability change signal (RT-2). One shared
+        // sender, injected into every local registry whose mutations
+        // change what `announce_capabilities` would emit — the
+        // registries fire it internally so a mutation path can't
+        // forget to. Inbound peer announcements never touch these
+        // registries, so the signal is echo-safe by construction.
+        let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
         Ok(Self {
             identity,
@@ -2870,9 +3287,14 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_reply_subscriptions: Arc::new(dashmap::DashMap::new()),
             #[cfg(feature = "cortex")]
-            rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
-            tool_registry: Arc::new(crate::adapter::net::cortex::tool::ToolMetadataRegistry::new()),
+            tool_registry: Arc::new(
+                crate::adapter::net::cortex::tool::ToolMetadataRegistry::with_change_signal(
+                    local_caps_changed.clone(),
+                ),
+            ),
+            local_caps_changed,
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             #[cfg(feature = "cortex")]
@@ -2887,7 +3309,10 @@ impl MeshNode {
             proximity_graph,
             reroute_policy,
             peer_addrs,
-            partition_filter: Arc::new(dashmap::DashSet::new()),
+            partition_filter,
+            event_pingwave_gate,
+            route_withdraw_seq,
+            route_withdraw_damper,
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -2935,7 +3360,10 @@ impl MeshNode {
                 std::collections::HashSet::new(),
             )),
             seen_announcements: Arc::new(DashMap::new()),
-            last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
+            announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
+                last_broadcast_at: None,
+                deferred_scheduled: false,
+            })),
             local_announcement: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
@@ -3310,6 +3738,10 @@ impl MeshNode {
         self.proximity_graph.on_pingwave(pw, peer_addr);
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
         self.push_local_announcement(peer_addr).await;
+        // RT-4: a new session is a topology change - flood our
+        // pingwave now so third parties learn the new edge at
+        // flood speed, not on the next heartbeat tick.
+        self.emit_event_pingwave();
 
         Ok(peer_node_id)
     }
@@ -3493,6 +3925,10 @@ impl MeshNode {
 
         // See the matching comment in `connect`.
         self.push_local_announcement(peer_addr).await;
+        // RT-4: a new session is a topology change - flood our
+        // pingwave now so third parties learn the new edge at
+        // flood speed, not on the next heartbeat tick.
+        self.emit_event_pingwave();
 
         Ok((peer_addr, peer_node_id))
     }
@@ -3560,6 +3996,7 @@ impl MeshNode {
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
+        let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the
@@ -3631,6 +4068,7 @@ impl MeshNode {
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(capability_reannounce_handle);
+            tasks.push(capability_announce_on_change_handle);
             tasks.push(fold_generation_gc_handle);
             tasks.push(token_sweep_handle);
             #[cfg(feature = "port-mapping")]
@@ -3886,6 +4324,87 @@ impl MeshNode {
         })
     }
 
+    /// Spawn the change-driven capability announcer (RT-3,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Parks on the RT-2
+    /// local-caps change signal; on a bump it waits
+    /// `announce_debounce` for the burst to settle, marks the
+    /// latest generation seen, and broadcasts once via the normal
+    /// announce path (so the RT-1 rate limiter + trailing-edge
+    /// flush still apply). Capability changes made after `start`
+    /// thus propagate mesh-wide without an explicit
+    /// `announce_capabilities` call.
+    ///
+    /// The signal fires only on LOCAL-origin mutations (see
+    /// `subscribe_local_caps_changes`) — inbound peer announcements
+    /// never wake this loop, which is what prevents a mesh-wide
+    /// echo storm. The `changed()` subscription is taken at spawn
+    /// time: registrations made before `start` are the initial
+    /// explicit announce's job, same as today.
+    ///
+    /// Announce TTL matches the re-announce keep-alive's
+    /// (`capability_reannounce_ttl`) so a change-driven entry
+    /// survives until the keep-alive refreshes it.
+    fn spawn_capability_announce_on_change_loop(&self) -> JoinHandle<()> {
+        let debounce = self.config.announce_debounce;
+        let reannounce_interval = self.config.capability_reannounce_interval;
+        let min_announce = self.config.min_announce_interval;
+        // `Some` only when the node was started via `start_arc`.
+        let weak = self.self_weak.get().cloned();
+        let mut change_rx = self.local_caps_changed.subscribe();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            // No owned-`Arc` path (bare start) or disabled → nothing to do.
+            let (Some(weak), false) = (weak, debounce == Duration::MAX) else {
+                let _ = shutdown_notify.notified().await;
+                return;
+            };
+            // With the keep-alive disabled, fall back to the explicit
+            // announce path's default TTL (300 s) rather than
+            // `capability_reannounce_ttl(MAX, ..)` saturating to MAX.
+            let ttl = if reannounce_interval == Duration::MAX {
+                Duration::from_secs(300)
+            } else {
+                capability_reannounce_ttl(reannounce_interval, min_announce)
+            };
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    changed = change_rx.changed() => {
+                        if changed.is_err() {
+                            // Sender dropped — node is gone.
+                            return;
+                        }
+                        // Debounce: let the burst settle so N rapid
+                        // registrations coalesce into one broadcast.
+                        tokio::select! {
+                            _ = tokio::time::sleep(debounce) => {}
+                            _ = shutdown_notify.notified() => return,
+                        }
+                        // Mark everything that landed during the
+                        // debounce as seen — it's covered by the
+                        // announce below. Later bumps get their own
+                        // cycle (missed-wakeup-safe generation).
+                        let _ = change_rx.borrow_and_update();
+                        let Some(node) = weak.upgrade() else { return };
+                        let caps = node.user_caps_snapshot();
+                        if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
+                            tracing::debug!(
+                                error = %e,
+                                "change-driven capability announce failed"
+                            );
+                        }
+                        // RT-4: piggyback an event pingwave so the
+                        // fresh capability_hash / capability_version
+                        // reach multi-hop nodes one flood earlier
+                        // than the announcement propagates.
+                        node.emit_event_pingwave();
+                    }
+                    _ = shutdown_notify.notified() => return,
+                }
+            }
+        })
+    }
+
     /// Spawn the fold-generation GC loop. Walks
     /// [`Self::fold_generations`] on a [`FOLD_GENERATION_GC_INTERVAL`]
     /// cadence and evicts entries whose `last_touched_us` is
@@ -4026,6 +4545,9 @@ impl MeshNode {
             socket: self.socket.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
+            enable_route_withdraw: self.config.enable_route_withdraw,
+            route_withdraw_seq: self.route_withdraw_seq.clone(),
+            route_withdraw_damper: self.route_withdraw_damper.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -5360,6 +5882,19 @@ impl MeshNode {
             // the membership branch above.
             for payload in events {
                 Self::handle_capability_announcement(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // Route withdrawal (RT-5): poison-reverse "dest unreachable
+        // via the sender". Session-authenticated by construction —
+        // the `via` leg is `from_node`, resolved from the decrypting
+        // session, never a wire field. Each event is independent
+        // and idempotent, so iterating the frame is safe.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_ROUTE_WITHDRAW {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_route_withdrawal(&payload, from_node, ctx);
             }
             return;
         }
@@ -7010,10 +7545,56 @@ impl MeshNode {
     /// Registry of nRPC services this node currently serves.
     /// `mesh_rpc::serve_rpc` adds entries; `ServeHandle::Drop`
     /// removes them. `announce_capabilities` reads this to
-    /// auto-merge `nrpc:<service>` tags.
+    /// auto-merge `nrpc:<service>` tags. Mutations bump the
+    /// local-caps change signal (RT-2) from inside the registry.
     #[cfg(feature = "cortex")]
-    pub(super) fn rpc_local_services_arc(&self) -> Arc<dashmap::DashSet<String>> {
+    pub(super) fn rpc_local_services_arc(&self) -> Arc<LocalServiceRegistry> {
         self.rpc_local_services.clone()
+    }
+
+    /// Subscribe to the local-origin capability change signal
+    /// (RT-2). The generation bumps on every mutation of this
+    /// node's OWN announced surface — `serve_tool`
+    /// register/unregister, nRPC service register/deregister —
+    /// and never on inbound peer announcements. `watch<u64>`
+    /// generation counter, so a subscriber that was busy during a
+    /// bump still observes it on the next `changed()` (missed-
+    /// wakeup-safe, same contract as `Fold::subscribe_changes`).
+    pub fn subscribe_local_caps_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.local_caps_changed.subscribe()
+    }
+
+    /// Current local-caps generation — cheap staleness check for
+    /// consumers that poll opportunistically instead of holding a
+    /// receiver.
+    pub fn local_caps_generation(&self) -> u64 {
+        *self.local_caps_changed.borrow()
+    }
+
+    /// Monotonic announce-version counter — the version stamped into
+    /// the most recent `CapabilityAnnouncement`. Every
+    /// `announce_capabilities_with` call bumps it, broadcast and
+    /// rate-limit-coalesced alike, so the delta across a window
+    /// counts announce *calls*. Observability + tests (e.g. proving
+    /// the RT-3 debounce collapses a burst into one announce).
+    pub fn capability_announce_version(&self) -> u64 {
+        self.capability_version.load(Ordering::Relaxed)
+    }
+
+    /// RT-4: emit an event-triggered pingwave to all connected
+    /// peers, rate-limited by `config.event_pingwave_min_gap`.
+    /// Called on topology changes (session open, recovery, a
+    /// change-driven announce) so routing converges at flood speed;
+    /// the heartbeat tick remains the anti-entropy floor.
+    fn emit_event_pingwave(&self) {
+        spawn_event_pingwave(
+            &self.event_pingwave_gate,
+            self.config.event_pingwave_min_gap,
+            &self.proximity_graph,
+            &self.socket,
+            &self.peers,
+            &self.partition_filter,
+        );
     }
 
     /// Local-only tool-descriptor registry. SDK-side `serve_tool`
@@ -8004,6 +8585,97 @@ impl MeshNode {
         // return `Err(event)`; both shapes are "drop silently"
         // here — reliable-stream / heartbeat cycle recovers.
         let _ = router.try_route(channel_id, event);
+    }
+
+    /// RT-5 receive side: the session peer `from_node` declared it
+    /// no longer forwards toward `dest`. Drop exactly our
+    /// `(dest, next_hop = from_node)` route and the matching
+    /// proximity edge, promote an alternate when one exists, and
+    /// cascade our own withdrawal when it does not.
+    fn handle_route_withdrawal(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        if !ctx.enable_route_withdraw {
+            return;
+        }
+        let Some(w) = RouteWithdrawal::from_bytes(payload) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "route-withdraw: malformed payload dropped"
+            );
+            return;
+        };
+        let dest = w.dest;
+        // Nonsense guards: a withdrawal about ourselves (we always
+        // reach ourselves) or about the sender itself (liveness of
+        // the direct link is the failure detector's verdict, not
+        // the peer's own claim to poison).
+        if dest == ctx.local_node_id || dest == from_node {
+            return;
+        }
+        // The `via` leg is the sender's session address — resolved
+        // locally, never taken from the wire.
+        let Some(via_addr) = ctx.peers.get(&from_node).map(|p| p.value().addr) else {
+            return;
+        };
+        // The sender no longer forwards toward `dest`, so alternates
+        // must not be synthesized through it either. Unconditional:
+        // the edge can exist even when our routing table points
+        // elsewhere.
+        ctx.proximity_graph
+            .remove_edge(node_id_to_graph_id(from_node), node_id_to_graph_id(dest));
+        // Drop exactly (dest, next_hop == sender). If our route to
+        // dest goes elsewhere, nothing changed for us and the
+        // cascade stops here — that scoping is what makes the
+        // whole scheme loop-safe.
+        if !ctx
+            .router
+            .routing_table()
+            .remove_route_if_next_hop_is(dest, via_addr)
+        {
+            return;
+        }
+        tracing::debug!(
+            dest = format!("{:#x}", dest),
+            via = format!("{:#x}", from_node),
+            "route-withdraw: dropped route"
+        );
+        // Promote an alternate instead of waiting for traffic to
+        // fail: a direct session wins; otherwise synthesize from
+        // the proximity graph through a different first hop.
+        if let Some(peer) = ctx.peers.get(&dest) {
+            ctx.router
+                .routing_table()
+                .add_route(dest, peer.value().addr);
+            return;
+        }
+        if let Some(path) = ctx.proximity_graph.path_to(&node_id_to_graph_id(dest)) {
+            // path[0] is self, path[1] the first hop; metric mirrors
+            // the pingwave-install convention (hops beyond the first
+            // + 2), here path.len()-2 intermediate hops + 2.
+            if let Some(first_hop) = path.get(1).map(graph_id_to_node_id) {
+                if first_hop != from_node {
+                    if let Some(addr) = ctx.peer_addrs.get(&first_hop).map(|a| *a.value()) {
+                        let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
+                        ctx.router
+                            .routing_table()
+                            .add_route_with_metric(dest, addr, metric);
+                        return;
+                    }
+                }
+            }
+        }
+        // No alternate: we just lost our last route to dest —
+        // cascade our own withdrawal so upstream nodes stop routing
+        // through us. Split horizon: never back toward the peer
+        // that told us.
+        spawn_route_withdrawal_flood(
+            &ctx.route_withdraw_seq,
+            &ctx.route_withdraw_damper,
+            &ctx.socket,
+            &ctx.peers,
+            &ctx.partition_filter,
+            dest,
+            Some(from_node),
+        );
     }
 
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
@@ -9955,7 +10627,7 @@ impl MeshNode {
         let baseline = self.user_caps_snapshot();
         let merged = {
             let mut m = baseline;
-            for svc in self.rpc_local_services.iter() {
+            for svc in self.rpc_local_services.snapshot() {
                 m = m.add_tag(format!("nrpc:{}", svc.as_str()));
             }
             m
@@ -10021,7 +10693,7 @@ impl MeshNode {
             caps
         } else {
             let mut merged = caps;
-            for svc in self.rpc_local_services.iter() {
+            for svc in self.rpc_local_services.snapshot() {
                 let tag = format!("nrpc:{}", svc.as_str());
                 // Phase A.5.N.2: tags is HashSet<Tag>; insert via
                 // builder so the parsed-tag form lands and dedupes
@@ -10198,22 +10870,54 @@ impl MeshNode {
         self.local_announcement.store(Some(Arc::new(ann.clone())));
 
         // Origin-side rate limit: within-window calls update the
-        // self-index + `local_announcement` but skip the network
-        // broadcast. Callers that want to force an immediate
-        // re-broadcast should lower `min_announce_interval` on
-        // `MeshNodeConfig`.
+        // self-index + `local_announcement` and coalesce into one
+        // trailing-edge flush at window end (RT-1). Pre-fix the
+        // suppressed broadcast was silently dropped, so a change
+        // landing inside the window stayed invisible to peers
+        // until the next explicit call or the 150 s re-announce
+        // keep-alive. At most one flush task is pending at a
+        // time; it broadcasts whatever `local_announcement` holds
+        // when it fires, so N suppressed calls collapse to one
+        // send of the newest version.
         let now = std::time::Instant::now();
         let min_interval = self.config.min_announce_interval;
-        let should_broadcast = {
-            let mut last = self.last_announce_at.lock();
-            let elapsed = last.map(|t| now.saturating_duration_since(t));
-            let can_send = elapsed.is_none_or(|e| e >= min_interval);
-            if can_send {
-                *last = Some(now);
+        let defer_for = {
+            let mut gate = self.announce_gate.lock();
+            let elapsed = gate
+                .last_broadcast_at
+                .map(|t| now.saturating_duration_since(t));
+            match elapsed {
+                Some(e) if e < min_interval => {
+                    // In-window with a flush already pending: that
+                    // flush will pick up the `local_announcement`
+                    // we just stored. Nothing to schedule.
+                    if gate.deferred_scheduled {
+                        return Ok(());
+                    }
+                    // Bare-start node (no `start_arc`): there is no
+                    // owned `Arc` for a flush task to hold — same
+                    // constraint as the re-announce loop. Preserve
+                    // the pre-RT-1 drop semantics (peers see the
+                    // change on the next out-of-window announce or
+                    // the keep-alive).
+                    if self.self_weak.get().is_none() {
+                        tracing::debug!(
+                            "capability: in-window announce not deferred \
+                             (node not started via start_arc)"
+                        );
+                        return Ok(());
+                    }
+                    gate.deferred_scheduled = true;
+                    Some(min_interval - e)
+                }
+                _ => {
+                    gate.last_broadcast_at = Some(now);
+                    None
+                }
             }
-            can_send
         };
-        if !should_broadcast {
+        if let Some(delay) = defer_for {
+            self.spawn_deferred_announce(delay);
             return Ok(());
         }
 
@@ -10231,6 +10935,73 @@ impl MeshNode {
             }
         }
         Ok(())
+    }
+
+    /// Schedule the trailing-edge announce flush for the current
+    /// rate-limit window (RT-1). The caller has already claimed the
+    /// deferred slot (`deferred_scheduled = true`) under the gate
+    /// lock and verified `self_weak` is populated; this task holds
+    /// only a `Weak<MeshNode>` so a pending flush can't keep a
+    /// dropped node alive.
+    fn spawn_deferred_announce(&self, delay: Duration) {
+        // Guaranteed `Some` by the gate branch that claimed the
+        // deferred slot; release the slot rather than panic if a
+        // future caller breaks that invariant.
+        let Some(weak) = self.self_weak.get().cloned() else {
+            self.announce_gate.lock().deferred_scheduled = false;
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_notify.notified() => return,
+            }
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(node) = weak.upgrade() else { return };
+            node.flush_deferred_announce().await;
+        });
+    }
+
+    /// Trailing-edge flush: broadcast the latest `local_announcement`
+    /// to all connected peers and open the next rate-limit window.
+    /// Runs at most once per scheduled deferral. A rate-limit-floor
+    /// reset (`set_reflex_override` / `clear_reflex_override`)
+    /// between scheduling and firing can make this a duplicate of an
+    /// unconditional broadcast — harmless: every announce call bumps
+    /// `capability_version`, and receivers dedup exact repeats on
+    /// `(node_id, version)` via `seen_announcements`.
+    async fn flush_deferred_announce(&self) {
+        {
+            let mut gate = self.announce_gate.lock();
+            if !gate.deferred_scheduled {
+                return;
+            }
+            gate.deferred_scheduled = false;
+            gate.last_broadcast_at = Some(std::time::Instant::now());
+        }
+        // `local_announcement` is stored before the gate on every
+        // announce path, so a scheduled flush always finds it.
+        let Some(ann) = self.local_announcement.load_full() else {
+            return;
+        };
+        let bytes = ann.to_bytes();
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        for addr in peer_addrs {
+            if let Err(e) = self
+                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+                .await
+            {
+                tracing::trace!(
+                    peer = %addr,
+                    error = %e,
+                    "capability: deferred announce send failed"
+                );
+            }
+        }
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
@@ -13049,7 +13820,7 @@ impl MeshNode {
         // to call announce themselves; this just makes that
         // call's broadcast step unconditional instead of
         // coalesced.
-        *self.last_announce_at.lock() = None;
+        self.announce_gate.lock().last_broadcast_at = None;
     }
 
     /// Drop a previously-installed runtime reflex override. The
@@ -13097,7 +13868,7 @@ impl MeshNode {
         // unconditionally instead of coalescing against the
         // previous send. See that method's comment for details
         // (cubic P2).
-        *self.last_announce_at.lock() = None;
+        self.announce_gate.lock().last_broadcast_at = None;
     }
 
     /// Testing / debugging hook: force this node's advertised

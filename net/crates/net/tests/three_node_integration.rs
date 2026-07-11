@@ -4598,6 +4598,11 @@ async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
         MeshNodeConfig::new(addr, psk)
             .with_heartbeat_interval(Duration::from_millis(500))
             .with_session_timeout(Duration::from_secs(10))
+            // This test counts pingwaves inside a fixed window and
+            // predates RT-4's session-open event pingwaves — turn
+            // those off so the window only sees heartbeat-tick
+            // pingwaves, which is what the parse-guard legs assume.
+            .with_event_pingwave_min_gap(Duration::MAX)
     };
     let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
     let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
