@@ -1,0 +1,43 @@
+net/crates/net/docs/plans/NAT_TRAVERSAL_V2_PLAN.md
+  s_d15043c27a0f20::t_a93e7463fe3f05 306
+  s_d15043c27a0f20::t_4609c10fb2197d 310-345
+  s_d15043c27a0f20::t_6c818e65d839a1 346
+net/crates/net/tests/natsim/teardown.sh
+  s_d15043c27a0f20::t_ff77e9ae4c2ed8 1-8
+net/crates/net/tests/nat_matrix.rs
+  s_d15043c27a0f20::t_d02b35929c9ede 1-128,130-286
+  s_d15043c27a0f20::t_56e42619349603 129
+net/crates/net/tests/natsim.rs
+  s_d15043c27a0f20::t_56e42619349603 43-47,140-143
+  s_d15043c27a0f20::t_b8d7284267d3c1 1-42,48-139,144-151
+net/crates/net/tests/natsim/setup.sh
+  s_d15043c27a0f20::t_26ac113b22d65c 1-129
+net/crates/net/tests/natsim/README.md
+  s_d15043c27a0f20::t_3889f0054b3b70 1-87
+.github/workflows/natsim.yml
+  s_d15043c27a0f20::t_a183be010900b8 1-69
+net/crates/net/examples/natsim_node.rs
+  s_d15043c27a0f20::t_f4f3d4eb83454a 315,414,433-437
+  s_d15043c27a0f20::t_5a6b4bd5c5b90b 1-26,38,55-57,61,74,76-77,88,98-100,115,123,131,137-139,144,148,156,163,166-167,170,183,185,189-191,202,205,223,252,261,271,438
+  s_d15043c27a0f20::t_56e42619349603 27,39-54,58-60,62-73,75,78-87,89-97,101-114,116-122,124-130,132-136,140-143,145-147,149-155,157-162,164-165,168-169,171-182,184,186-188,192-201,203-204,206-222,224-251,253-260,262-270,272-314,316-413,415-432
+  s_d15043c27a0f20::t_06068140cb96f5 28-37
+net/crates/net/tests/natsim/run_scenario.sh
+  s_d15043c27a0f20::t_c2bb0592697e97 1-46,48-53,55-86,88-89,91-95,97-112
+  s_d15043c27a0f20::t_14e604aebac36f 47,54,87,90,96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "678910e5dc3390e032fad8d79762c081d8f60f28",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
