@@ -3250,7 +3250,20 @@ impl MeshNode {
             // receivers drop their `(node_id, via=us)` routes within
             // one flood instead of waiting for the 3× session_timeout
             // age-out sweep.
-            if enable_route_withdraw {
+            //
+            // ...but ONLY when we have no genuine alternate path to
+            // it (RT-5 review Finding 5). If the proximity graph
+            // still offers a topological alternate — the peer is
+            // reachable through another of our peers, i.e. this is a
+            // partial or transient failure of our direct link, not a
+            // node death — then "unreachable via me" is false:
+            // flooding it would poison working routes to a live node,
+            // and the origin-scoped recovery pingwave can't repair
+            // third parties' routes. In that case we stay quiet and
+            // let `rp_failure.on_failure` reroute us locally; a true
+            // node death still emits, because no peer then has a path
+            // to it (the chain case that RT-5 targets).
+            if enable_route_withdraw && !rp_failure.has_graph_path_alternate(node_id) {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,
                     &route_withdraw_damper_failure,

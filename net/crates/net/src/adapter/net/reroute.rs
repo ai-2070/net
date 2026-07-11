@@ -229,6 +229,36 @@ impl ReroutePolicy {
         None
     }
 
+    /// True iff the proximity graph offers a *genuine* topological
+    /// alternate path to `node_id` — a `path_to(node_id)` whose first
+    /// non-`node_id` hop is a directly-connected peer of ours.
+    ///
+    /// Deliberately WITHOUT the "any direct peer" fallback that
+    /// [`Self::find_graph_alternate_for`] ends with: a best-effort
+    /// guess is not evidence that `node_id` is actually reachable. Used
+    /// to decide whether to emit a poison-reverse route withdrawal for
+    /// a just-failed direct peer (RT-5 review Finding 5). When a
+    /// genuine alternate exists, the peer is still reachable through
+    /// another of our peers — a partial/transient failure of our direct
+    /// link, not a node death — so "unreachable via me" would be false
+    /// and the flood would poison working routes to a live node. A true
+    /// node death leaves no such path (nothing else reaches it either),
+    /// so the withdrawal still fires for the chain case RT-5 targets.
+    pub fn has_graph_path_alternate(&self, node_id: u64) -> bool {
+        let Some(graph) = self.proximity_graph.as_ref() else {
+            return false;
+        };
+        let Some(path) = graph.path_to(&node_id_to_graph_id(node_id)) else {
+            return false;
+        };
+        // path[0] is self; a qualifying intermediate hop reaches
+        // `node_id` without our (failed) direct link.
+        path.iter().skip(1).any(|hop| {
+            let nid = graph_id_to_node_id(hop);
+            nid != node_id && self.peer_addrs.contains_key(&nid)
+        })
+    }
+
     /// Called when the failure detector marks a peer as recovered.
     ///
     /// Restores original routes that were rerouted when this peer failed.
@@ -554,5 +584,76 @@ mod tests {
         // C route unchanged
         assert_eq!(rt.lookup(0x6666).unwrap(), addr_c);
         assert_eq!(policy.active_reroutes(), 2);
+    }
+
+    // RT-5 review Finding 5: `has_graph_path_alternate` gates whether
+    // the failure detector emits a poison-reverse withdrawal for a
+    // just-failed peer. It must report a GENUINE topological alternate
+    // (reachable via another direct peer) and must NOT count
+    // direct-only reachability or the "any direct peer" fallback.
+    use super::super::behavior::proximity::{EnhancedPingwave, ProximityConfig};
+
+    #[test]
+    fn has_graph_path_alternate_true_when_reachable_via_another_peer() {
+        const SELF: u64 = 0x1111;
+        const X: u64 = 0x2222; // direct peer, intermediate hop
+        const DEST: u64 = 0x3333; // "failed" node, reachable via X
+
+        let peers = Arc::new(DashMap::new());
+        let x_addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        peers.insert(X, x_addr);
+
+        let graph = Arc::new(ProximityGraph::new(
+            node_id_to_graph_id(SELF),
+            ProximityConfig::default(),
+        ));
+        // Origin=DEST forwarded by direct peer X → edges self→X and
+        // X→DEST, so path_to(DEST) = [self, X, DEST].
+        let pw = EnhancedPingwave::new(node_id_to_graph_id(DEST), 1, 3);
+        graph.on_pingwave_from(pw, node_id_to_graph_id(X), x_addr);
+
+        let policy = ReroutePolicy::new(make_routing_table(), peers).with_proximity_graph(graph);
+        assert!(
+            policy.has_graph_path_alternate(DEST),
+            "DEST is reachable via direct peer X — a genuine alternate"
+        );
+        assert!(
+            !policy.has_graph_path_alternate(0x9999),
+            "a node with no path has no alternate"
+        );
+    }
+
+    #[test]
+    fn has_graph_path_alternate_false_when_only_direct() {
+        const SELF: u64 = 0x1111;
+        const DEST: u64 = 0x3333;
+
+        let peers = Arc::new(DashMap::new());
+        let dest_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        peers.insert(DEST, dest_addr);
+
+        let graph = Arc::new(ProximityGraph::new(
+            node_id_to_graph_id(SELF),
+            ProximityConfig::default(),
+        ));
+        // Origin=DEST forwarded directly by DEST (from_node == origin)
+        // → only the self→DEST edge, path_to(DEST) = [self, DEST].
+        let pw = EnhancedPingwave::new(node_id_to_graph_id(DEST), 1, 3);
+        graph.on_pingwave_from(pw, node_id_to_graph_id(DEST), dest_addr);
+
+        let policy = ReroutePolicy::new(make_routing_table(), peers).with_proximity_graph(graph);
+        assert!(
+            !policy.has_graph_path_alternate(DEST),
+            "only-direct reachability is NOT an alternate — the withdrawal must fire"
+        );
+    }
+
+    #[test]
+    fn has_graph_path_alternate_false_without_graph() {
+        let policy = ReroutePolicy::new(make_routing_table(), Arc::new(DashMap::new()));
+        assert!(
+            !policy.has_graph_path_alternate(0x3333),
+            "no proximity graph → no alternate signal"
+        );
     }
 }
