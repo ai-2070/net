@@ -12839,6 +12839,104 @@ impl MeshNode {
         self.traversal_stats.snapshot()
     }
 
+    /// Pick a rendezvous coordinator for a punch to `target`, without
+    /// the caller having to name one (`NAT_TRAVERSAL_V2_PLAN.md`
+    /// decision 5). Four tiers, graceful degradation:
+    ///
+    /// 1. **Routing next-hop.** For a relay-reached target, the peer
+    ///    currently forwarding to it demonstrably has live sessions
+    ///    with both ends — the highest-probability coordinator, and no
+    ///    discovery needed.
+    /// 2. **`relay-capable` direct peer.** A mutual direct peer that
+    ///    advertised [`RELAY_CAPABLE_TAG`]. (Deterministic
+    ///    lowest-`node_id` pick for now — random-two-choices load
+    ///    balancing is a future refinement.)
+    /// 3. **Any direct peer.** Best-effort; the chosen peer may lack a
+    ///    session with the target, in which case its coordinator
+    ///    rejects with `NoSessionWithTarget` and the caller falls back.
+    /// 4. **None.** No candidate — the caller surfaces
+    ///    `RendezvousNoRelay` and stays on the routed path.
+    ///
+    /// Never fails a connection: a `None` here only means the punch
+    /// optimization isn't attempted, never that the peer is
+    /// unreachable.
+    #[cfg(feature = "nat-traversal")]
+    pub fn select_punch_coordinator(&self, target: u64) -> Option<u64> {
+        // Tier 1: the relay currently forwarding to the target. Only
+        // yields a distinct node for a relay-reached target — for a
+        // direct peer the next hop is the target itself (excluded).
+        if let Some(next_hop) = self.router.routing_table().lookup(target) {
+            if let Some(nid) = self.addr_to_node.get(&next_hop).map(|e| *e.value()) {
+                if nid != target && nid != self.node_id && self.peers.contains_key(&nid) {
+                    return Some(nid);
+                }
+            }
+        }
+
+        // Tiers 2 & 3: scan direct session peers once, bucketing into
+        // relay-capable and any. Exclude ourselves and the target.
+        let mut relay_capable_min: Option<u64> = None;
+        let mut any_min: Option<u64> = None;
+        for entry in self.peers.iter() {
+            let nid = *entry.key();
+            if nid == target || nid == self.node_id {
+                continue;
+            }
+            any_min = Some(any_min.map_or(nid, |m| m.min(nid)));
+            let is_relay_capable = super::behavior::fold::capability_tags_for(
+                &self.capability_fold,
+                nid,
+            )
+            .iter()
+            .any(|t| t == super::behavior::capability::RELAY_CAPABLE_TAG);
+            if is_relay_capable {
+                relay_capable_min = Some(relay_capable_min.map_or(nid, |m| m.min(nid)));
+            }
+        }
+
+        // Tier 2 preferred, tier 3 fallback, else tier 4 (None).
+        relay_capable_min.or(any_min)
+    }
+
+    /// Like [`Self::connect_direct`], but auto-selects the rendezvous
+    /// coordinator via [`Self::select_punch_coordinator`] instead of
+    /// taking one from the caller — the ergonomic entry point for
+    /// "just give me the best path to this peer."
+    ///
+    /// - `Direct` pairs don't need a coordinator (the peer is publicly
+    ///   reachable), so this delegates straight through.
+    /// - `SinglePunch` / `SkipPunch` pairs need one; if no candidate
+    ///   exists, returns [`super::traversal::TraversalError::RendezvousNoRelay`]
+    ///   — the tier-4 skip. The caller stays on the routed-handshake
+    ///   path (connectivity is never at risk; the punch is the
+    ///   optimization).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct_auto(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+    ) -> Result<u64, super::traversal::TraversalError> {
+        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::TraversalError;
+
+        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_node_id));
+        match action {
+            // Direct pairs ignore the coordinator entirely; pass a
+            // sentinel `0` — the Direct arm never reads it.
+            PairAction::Direct => self.connect_direct(peer_node_id, peer_pubkey, 0).await,
+            PairAction::SinglePunch | PairAction::SkipPunch => {
+                match self.select_punch_coordinator(peer_node_id) {
+                    Some(coord) => {
+                        self.connect_direct(peer_node_id, peer_pubkey, coord).await
+                    }
+                    None => Err(TraversalError::RendezvousNoRelay),
+                }
+            }
+        }
+    }
+
     /// Establish a direct session to `peer_node_id`, using the
     /// pair-type matrix (plan §3) to decide between a direct
     /// handshake, a rendezvous-coordinated single-shot punch, or

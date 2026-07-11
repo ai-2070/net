@@ -1259,6 +1259,31 @@ impl Mesh {
         Ok(())
     }
 
+    /// Like [`Self::connect_direct`], but auto-selects the rendezvous
+    /// coordinator instead of taking one — the ergonomic entry point.
+    /// Prefers the relay currently forwarding to `peer_node_id`, then a
+    /// `relay-capable` mutual peer, then any mutual peer.
+    ///
+    /// **Optimization, not correctness.** If no coordinator is
+    /// available for a pair that needs a punch, fails with an
+    /// `SdkError::Traversal` whose `kind` is `rendezvous-no-relay` —
+    /// the caller simply stays on the routed-handshake path, which is
+    /// always available. `Direct` pairs need no coordinator and always
+    /// proceed.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct_auto(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+    ) -> Result<()> {
+        self.node
+            .connect_direct_auto(peer_node_id, peer_pubkey)
+            .await?;
+        Ok(())
+    }
+
     /// Cumulative counters for this mesh's NAT-traversal
     /// activity: punch attempts, successful punches, and relay
     /// fallbacks. Monotonic — counters never reset. Useful for

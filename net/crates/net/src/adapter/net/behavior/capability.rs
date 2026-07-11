@@ -642,6 +642,15 @@ pub const TAG_SCOPE_SUBNET_LOCAL: &str = "scope:subnet-local";
 /// callers can spell their intent.
 pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
 
+/// Reserved tag advertising a node as a NAT-traversal rendezvous
+/// coordinator / relay (`NAT_TRAVERSAL_V2_PLAN.md` decision 5, parent
+/// decision 13). A plain legacy tag (no reserved cross-axis prefix),
+/// set via [`CapabilitySet::with_relay_capable`]. Advisory: it marks
+/// willingness, never obligation — coordinator selection prefers a
+/// peer carrying it, and every node still enforces its own rendezvous
+/// budgets.
+pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
+
 /// Resolved scope of a capability announcement, derived from the
 /// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
 /// Pure derivation — never stored, recomputed on each query via
@@ -970,6 +979,21 @@ impl CapabilitySet {
             self.tags.insert(t);
         }
         self
+    }
+
+    /// Advertise this node as **relay-capable** — willing to serve as
+    /// a NAT-traversal rendezvous coordinator (and, by the same tag,
+    /// a data-plane forwarder). Peers that want to hole-punch prefer a
+    /// `relay-capable` mutual peer as the coordinator over an arbitrary
+    /// one (see `MeshNode::select_punch_coordinator`,
+    /// `NAT_TRAVERSAL_V2_PLAN.md` decision 5 / parent decision 13).
+    ///
+    /// Opt-in and advisory: the tag never obligates the node to
+    /// forward or coordinate — every node still enforces its own rate
+    /// limits and can decline. Emits the reserved [`RELAY_CAPABLE_TAG`]
+    /// legacy tag; idempotent.
+    pub fn with_relay_capable(self) -> Self {
+        self.add_tag(RELAY_CAPABLE_TAG)
     }
 
     /// Add a typed `BlobCapability` projection. Emits the matching
