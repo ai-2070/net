@@ -15,10 +15,17 @@ pub const SUBPROTOCOL_CAPABILITY_ANN: u16 = 0x0C00;
 
 /// Subprotocol id for [`RouteWithdrawal`] packets (RT-5,
 /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Same 0x0C family as the
-/// capability announcement — both are mesh-state broadcasts. Nodes
-/// that predate this id drop the packets at subprotocol dispatch and
-/// keep their pre-RT-5 behavior (routes age out via `sweep_stale`),
-/// which is the designed mixed-version degradation.
+/// capability announcement — both are mesh-state broadcasts.
+///
+/// Mixed-version degradation: a node that does not know this id
+/// drops the packet at the dispatch loop's unknown-subprotocol guard
+/// (`mesh.rs`, just before the standard event path) and keeps its
+/// pre-RT-5 behavior — routes age out via `sweep_stale`. Note that
+/// guard is itself an RT-5-era addition: binaries built *before it*
+/// had no catch-all and would instead mis-handle an unknown
+/// subprotocol frame as an opaque application event. A true
+/// mixed-version deployment therefore needs peers new enough to have
+/// the guard, not merely new enough to have this constant.
 pub const SUBPROTOCOL_ROUTE_WITHDRAW: u16 = 0x0C01;
 
 /// Poison-reverse route withdrawal: the SENDER declares "I no longer

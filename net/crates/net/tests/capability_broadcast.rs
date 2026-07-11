@@ -948,3 +948,47 @@ async fn in_window_burst_coalesces_to_newest() {
         "the newest suppressed announcement was never flushed",
     );
 }
+
+// =========================================================================
+// RT-5 review Finding 3: unknown-subprotocol forward-compat guard.
+// A frame carrying a subprotocol id this build does not know must be
+// dropped at the dispatch loop's guard, not mis-parsed as application
+// events. The pre-fix fall-through created a receive-side stream (and
+// charged credit / emitted a StreamWindow grant); the guard leaves no
+// trace — observable here as the absence of a receive-side stream for
+// the unknown id.
+// =========================================================================
+
+#[tokio::test]
+async fn unknown_subprotocol_is_dropped_not_surfaced_as_events() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake(&a, &b).await;
+    let a_id = a.node_id();
+    let b_addr = b.local_addr();
+
+    // An id no handler claims — well outside every allocated range.
+    const UNKNOWN_SUBPROTOCOL: u16 = 0xFE00;
+    a.send_subprotocol(b_addr, UNKNOWN_SUBPROTOCOL, b"\x01\x02\x03\x04")
+        .await
+        .expect("send unknown subprotocol");
+
+    // Positive control: a real capability announce sent AFTER the
+    // unknown frame. Once B has processed it, the single receive loop
+    // has necessarily drained past the earlier unknown frame too — so
+    // a missing stream below means "dropped", not "still in flight".
+    a.announce_capabilities(CapabilitySet::new().add_tag("post-unknown"))
+        .await
+        .expect("announce");
+    let filter = CapabilityFilter::new().require_tag("post-unknown");
+    assert!(
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
+        "positive control: B never processed A's later capability announce",
+    );
+
+    assert!(
+        b.stream_stats(a_id, UNKNOWN_SUBPROTOCOL as u64).is_none(),
+        "unknown subprotocol created a receive-side stream — it fell \
+         through to the application event path instead of being dropped",
+    );
+}

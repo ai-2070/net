@@ -1266,9 +1266,11 @@ pub struct MeshNodeConfig {
     /// one exists, and cascade their own withdrawal when none does.
     /// Convergence after failure detection drops from the
     /// `3 × session_timeout` age-out to one flood. `false` restores
-    /// pre-RT-5 behavior on both the emit and receive side (an
-    /// un-upgraded node degrades the same way by dropping the
-    /// unknown subprotocol). Default `true`.
+    /// pre-RT-5 behavior on both the emit and receive side: a node
+    /// with this disabled — like a peer new enough to have the
+    /// dispatch-loop unknown-subprotocol guard — drops inbound
+    /// withdrawals cleanly and ages routes out instead. Default
+    /// `true`.
     pub enable_route_withdraw: bool,
     /// Period between `TokenCache` expiry sweeps. A subscriber
     /// whose token expires mid-subscription is evicted from the
@@ -6317,6 +6319,26 @@ impl MeshNode {
                     }
                 }
             }
+            return;
+        }
+
+        // Forward-compat guard: the event plane is `subprotocol_id
+        // == 0`; every control subprotocol above carries a non-zero
+        // id and `return`s once handled. A non-zero id that reaches
+        // here is a subprotocol this build does not know — a newer
+        // peer's future subprotocol, or one behind a disabled
+        // feature. Drop it rather than mis-parsing its opaque payload
+        // as application events (which would charge credit, emit a
+        // StreamWindow grant, and surface undecodable `StoredEvent`s
+        // to app consumers). This is the "old node silently ignores
+        // an unknown subprotocol" degradation the RT-5 docs promise;
+        // it just was never enforced (RT-5 review Finding 3).
+        if parsed.header.subprotocol_id != 0 {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                subprotocol_id = format!("{:#06x}", parsed.header.subprotocol_id),
+                "dispatch: unknown subprotocol id dropped (forward-compat)"
+            );
             return;
         }
 
