@@ -845,15 +845,38 @@ mod tests {
 
     #[test]
     fn unknown_address_family_rejects() {
-        // Build an otherwise-valid PunchRequest payload but with
-        // an unknown address-family byte (neither 4 nor 6). Must
-        // decode as None, not panic or produce a garbage addr.
-        let mut payload = vec![0u8; PUNCH_REQUEST_LEN];
-        payload[0] = KIND_PUNCH_REQUEST;
-        // target = 0 (bytes 1..9 left at 0)
-        // address family at byte 9 — set to invalid
-        payload[9] = 7;
-        assert!(decode(&payload).is_none());
+        // Start from a fully-VALID encoded PunchRequest and corrupt
+        // only the address-family byte (offset 13: after kind(1) +
+        // target(8) + punch_id(4)). Decode must reject; restoring
+        // the byte must decode again — proving the family byte is
+        // the one field under test.
+        //
+        // Cubic round 5: after the punch_id insertion shifted the
+        // address block from offset 9 to 13, this test kept writing
+        // its "invalid family" at offset 9 — by then the punch_id's
+        // first byte, where 7 is perfectly valid — and only passed
+        // because the zero-initialized byte at 13 happened to be an
+        // invalid family too. Building from a valid encode removes
+        // the offset assumption entirely.
+        let valid = RendezvousMsg::PunchRequest(PunchRequest {
+            target: 0x0102_0304_0506_0708,
+            punch_id: 7,
+            self_reflex: sa("192.0.2.7:9001"),
+        })
+        .encode();
+        let mut payload = valid.to_vec();
+        assert_eq!(payload[13], FAMILY_V4, "family byte lives at offset 13");
+        payload[13] = 7; // neither FAMILY_V4 nor FAMILY_V6
+        assert!(
+            decode(&payload).is_none(),
+            "an unknown address family must reject, not produce a garbage addr",
+        );
+        payload[13] = FAMILY_V4;
+        assert!(
+            decode(&payload).is_some(),
+            "restoring the family byte must decode again — it was the only \
+             malformed field",
+        );
     }
 
     #[test]
