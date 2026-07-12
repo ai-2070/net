@@ -28,7 +28,7 @@ If you want to query across multiple CortEX adapters as one handle, see **NetDB*
 | "I want to react to changes in derived state" | `adapter.changes()` (`u64` per applied seq) or `changes_with_lag()` |
 | "Tasks list / memories list with status filters" | `Tasks` / `Memories` adapters directly |
 | "Fast restart with hot state" | `adapter.snapshot()` → persist bytes; `CortexAdapter::open_from_snapshot(bytes)` on startup |
-| "Read my own write deterministically" | `tasks.create(...)` returns a `WriteToken`; `tasks.wait_for_token(token, deadline)` (see `dataforts.md` § Read-your-writes) |
+| "Read my own write deterministically" | `tasks.create(...)` returns the RedEX **seq**; `tasks.wait_for_seq(seq)` — or wrap the seq in a `WriteToken` for `wait_for_token(token, deadline)` (see `dataforts.md` § Read-your-writes) |
 
 ---
 
@@ -47,9 +47,12 @@ let tasks = Tasks::open(
     RedexFileConfig::new().with_persistent(true),
 )?;
 
-// Ingest — fold runs asynchronously, returns a WriteToken
-let result = tasks.create(1, "first", net::now_ns())?;
-let _ = tasks.complete(1, net::now_ns())?;
+// Ingest — the fold runs asynchronously; `create` returns the RedEX seq.
+// `now_ns` is a wall-clock nanosecond stamp you supply.
+let now_ns = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
+let seq = tasks.create(1, "first", now_ns)?;
+let _ = tasks.complete(1, now_ns)?;
 
 // Read the in-memory state
 {
@@ -62,8 +65,10 @@ let _ = tasks.complete(1, net::now_ns())?;
     println!("{} pending", pending.len());
 }
 
-// Wait for the fold to apply your write deterministically
-tasks.wait_for_token(result.token, std::time::Duration::from_millis(250)).await?;
+// Wait for the fold to apply your write deterministically (read-your-writes).
+// Simplest is to wait on the seq `create` returned. For a deadline or the
+// origin-bound WriteToken primitive, see `dataforts.md` § Read-your-writes.
+let _ = tasks.wait_for_seq(seq).await;
 
 // React to changes
 let mut changes = tasks.as_cortex().changes();
@@ -96,16 +101,17 @@ tasks = Tasks.open(
     persistent=True,
 )
 
-result = tasks.create(1, 'first', now_ns())
+seq = tasks.create(1, 'first', now_ns())
 tasks.complete(1, now_ns())
 
 state = tasks.state()  # snapshot dict view
 pending = state.find_many(status=TaskStatus.PENDING)
 print(len(pending), 'pending')
 
-# RYW
-tasks.wait_for_token(result.token, deadline_ms=250)
-# deadline_ms=0 is a non-blocking poll (raises CortexError if not yet applied)
+# RYW — block until the fold has applied your write
+tasks.wait_for_seq(seq)
+# For a deadline / the WriteToken primitive: tasks.wait_for_token(token, deadline_ms=250)
+# (deadline_ms=0 is a non-blocking poll — raises CortexError if not yet applied)
 
 # Changes
 for seq in tasks.watch():

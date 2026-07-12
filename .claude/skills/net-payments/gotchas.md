@@ -76,12 +76,12 @@ they go red (`testing.md`).
 - **Facilitator trust:** don't put a facilitator in the trust root for
   anything above `observed`. If policy needs `confirmed(n)`/`final`, wire a
   `ChainChecker` — otherwise the tier is unreachable and every settlement is
-  unservable. (Solana is settleable at `observed` via the exact-SVM seam, but
-  its pack deliberately omits `required_tier` because **no SVM checker exists
-  yet** — it can't serve above receipt trust. That's honest, not a bug.)
-- **Promising a tier with no checker** is worse than serving at `observed` —
-  the Solana pack deliberately omits `required_tier` rather than claim a tier
-  it can't deliver.
+  unservable. (Both Solana and XRPL now ship an independent checker —
+  `SvmChecker` and `XrplChecker` — so their packs serve `Confirmed(1)`, not
+  receipt trust. A namespace with a settlement seam but *no* checker still can't
+  serve above `observed`; that's the constraint, not a bug.)
+- **Promising a tier with no checker** is worse than serving at `observed` — a
+  pack must not set a `required_tier` its namespace has no checker to back.
 - **Real-network entry with no signer** is a structured `Denied`, never a
   fallback to a different network/asset. Don't add a fallback "to be helpful."
 - **Retries:** `accept_payment` is idempotent by `{caller, provider,

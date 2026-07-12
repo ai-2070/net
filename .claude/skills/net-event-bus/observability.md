@@ -113,13 +113,22 @@ The reliable-stream retransmit window has a bounded number of slots. If the tx-c
 
 ### NAT traversal — `mesh.traversal_stats() -> TraversalStatsSnapshot`
 
-Source: `net/crates/net/src/adapter/net/traversal/mod.rs:108-152`. Returned snapshot is `Copy`.
+Source: `net/crates/net/src/adapter/net/traversal/mod.rs:156-210` (the returned `TraversalStatsSnapshot`; the internal atomics it's built from are `:108-152`).
+
+The NAT-Traversal V2 work grew this from three counters to **13 fields** — effectiveness, failure-cause counters, background-upgrade counters, and port-mapping status:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `punches_attempted` | `u64` | Punches the matrix mediated through the coordinator. Pre-wire fast-fails do not contribute. |
 | `punches_succeeded` | `u64` | Attempts that produced a direct (non-relayed) session. |
+| `punches_failed` | `u64` | **Derived** at snapshot time (`attempted − succeeded`); a punch in flight counts as failed until it resolves, so this field is *not* monotonic. |
 | `relay_fallbacks` | `u64` | `connect_direct` calls that ended on the routed-handshake path — only counted after the routed path actually succeeded. |
+| `punch_timeouts` | `u64` | **Cause** counter: punch flows that gave up on a deadline. Can exceed `punches_failed` (an introduce-wait timeout fires before an attempt is even counted). |
+| `punch_rejections` | `u64` | **Cause** counter: punch flows refused by a typed `PunchReject` (rate-limited, unknown target, no session, reflex mismatch). |
+| `rendezvous_no_relay` | `u64` | **Cause** counter: punch-needing pairs skipped for want of any coordinator candidate — the caller stayed routed. |
+| `upgrades_attempted` | `u64` | Background direct-path upgrades started (a relay-routed session the runtime tries to re-punch into a direct one). |
+| `upgrades_succeeded` | `u64` | Upgrades that replaced the relay-routed session with a punched direct one. |
+| `upgrades_deferred_busy` | `u64` | Upgrades postponed because the session had open streams / unacked data. Retried later; not a failure. |
 | `port_mapping_active` | `bool` | A UPnP/PCP port mapping is currently installed and being advertised. |
 | `port_mapping_external` | `Option<SocketAddr>` | The mapped external address while active. |
 | `port_mapping_renewals` | `u64` | Successful renewals since the current install. Resets on fresh install. |
@@ -128,8 +137,9 @@ Useful derived metrics:
 
 - **Effectiveness** = `punches_succeeded / punches_attempted`
 - **Fallback rate** = `relay_fallbacks / (punches_succeeded + relay_fallbacks)`
+- **Reclaim rate** = `upgrades_succeeded / upgrades_attempted` — how often a relayed session is later re-punched into a direct one in the background.
 
-A non-zero fallback rate is **not a problem**. It means the routed-handshake path won — the connection still works, just one extra hop. Alert only if fallback rate is climbing while effectiveness is dropping (worsening NAT environment).
+A non-zero fallback rate is **not a problem**. It means the routed-handshake path won — the connection still works, just one extra hop. Alert only if fallback rate is climbing while effectiveness is dropping (worsening NAT environment); when it is, the cause counters (`punch_timeouts` / `punch_rejections` / `rendezvous_no_relay`) tell you which failure mode dominates.
 
 ### Failure detector / route table
 
@@ -139,7 +149,7 @@ Source: `net/crates/net/src/adapter/net/failure.rs` and `route.rs`.
 - `RecoveryStats` (`failure.rs:730-741`) — `reroutes`, `retries`, `dropped`, `queued`, `avg_recovery_ms`.
 - `AggregateStats` (`route.rs:716-727`) — `routes`, `streams`, `packets_in`, `packets_out`, `packets_dropped`. Route-table size and aggregate forwarding counters.
 
-These are not all wired to every binding — for cross-SDK consumption, scrape via the FFI helpers (`net_mesh_traversal_stats` is the only one with a stable C entry today; for the rest, read via the Rust handle).
+These are not all wired to every binding — for cross-SDK consumption, scrape via the FFI helpers. Traversal stats have **two** stable C entries: `net_mesh_traversal_stats` (the legacy three-field view) and `net_mesh_traversal_stats_v2` (the full `net_traversal_stats_v2_t` struct, with parity across FFI / Go / Node / Python). The other mesh-stats groups (failure / recovery / aggregate) have no C entry yet — read those via the Rust handle.
 
 ---
 

@@ -219,8 +219,8 @@ own replay guard.
 - **eip155 `exact`** — built (`ExternalSigner` / `DevLocalSigner`, EIP-3009).
 - **solana `exact`** — **built**: `sign_svm_transfer` + `ExternalSvmSigner`,
   above. `can_settle` accepts the namespace when a signer is registered; an
-  independent SVM chain checker (`svm_checker.rs`) lifts serving above
-  `observed` (`networks.md` rung 3).
+  independent SVM chain checker (`checker/svm.rs`, `SvmChecker`) lifts serving
+  above `observed` (`networks.md` rung 3).
 - **xrpl `exact`** — **built**: `sign_xrpl_payment` + `ExternalXrplSigner`, the
   `exact_xrpl` authoring seam (direct full-amount Payment, invoice binding via
   `MemoData`/`InvoiceID`), the independent `XrplChecker`, and a facilitator pack

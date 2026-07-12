@@ -68,7 +68,7 @@ There is no fuzzy match, no range, no regex. If you need range/regex, fold over 
 In Rust, build filters with the `Filter` enum or the `FilterBuilder` fluent helper:
 
 ```rust
-use net::{Filter, FilterBuilder};
+use net::{consumer::FilterBuilder, Filter};
 use serde_json::json;
 
 // Direct

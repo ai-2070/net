@@ -150,7 +150,7 @@ For both, **avoid hard-coded ports** — assign port 0 and read back the bound a
 
 ## What not to test
 
-- **Don't test the SDK.** Net's own test suite (1,173 unit + 1,476 integration tests in the Rust core, plus SDK smoke tests) covers the SDK. Test *your application's behavior* against the SDK, not the SDK itself.
+- **Don't test the SDK.** Net's own test suite (thousands of unit + integration tests in the Rust core, plus SDK smoke tests) covers the SDK. Test *your application's behavior* against the SDK, not the SDK itself.
 - **Don't mock the bus.** Use the real SDK with memory transport. Mocking pub/sub leads to tests that pass but ship broken integrations — exactly the failure mode the SDK's "small enough to use everywhere" property is designed to prevent.
 - **Don't assert on timestamps.** They're nanosecond-resolution and machine-dependent. Assert on ordering and content, not absolute time.
 - **Don't assert on shard IDs.** Shard assignment is hash-based and may change between SDK versions.

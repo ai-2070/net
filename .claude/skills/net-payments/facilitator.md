@@ -133,9 +133,11 @@ pub struct FacilitatorConfig {   // net.payment.facilitator_config@1
     pub pairs: Vec<SchemePair>,                        // allowed (scheme, network)
     pub rpc_endpoints: BTreeMap<String, String>,       // per-network checker RPC
     pub required_tier: BTreeMap<String, VerificationTier>, // per-network default tier policy
+    pub final_depth: BTreeMap<String, u64>,            // per-network depth at which Confirmed rolls to Final
 }
 config.validate_against(&SupportedResponse)?;   // ConfigError::Unsupported {scheme, network, endpoint}
 config.required_tier(network) -> VerificationTier;  // default Observed
+config.final_depth(network) -> Option<u64>;         // None = no roll-to-final policy for that network
 config.networks() -> Vec<String>;
 ```
 
@@ -145,9 +147,11 @@ Well-known packs are **data-only constructors** — the "config, not code" proof
 ```rust
 packs::x402_org_base_sepolia()               // testnet, open auth, (exact, eip155:84532), serve Confirmed(1)
 packs::cdp_base_mainnet(secret_ref)          // Base mainnet, CDP endpoint, (exact, eip155:8453)
-packs::cdp_solana_mainnet(secret_ref)        // settleable via the exact-SVM seam; serves at `observed` only (no SVM checker yet)
+packs::cdp_solana_mainnet(secret_ref)        // Solana, CDP endpoint, exact-SVM seam, serve Confirmed(1) via SvmChecker
+packs::t54_xrpl_mainnet()                    // XRPL, t54.ai open-auth facilitator, exact-XRPL seam, serve Confirmed(1) via XrplChecker
 ```
 
 Endpoint/network/RPC constants live in `packs` (`X402_ORG_FACILITATOR`,
-`CDP_FACILITATOR`, `NETWORK_BASE_SEPOLIA`, `NETWORK_BASE`, `NETWORK_SOLANA`,
-`RPC_BASE_SEPOLIA`, `RPC_BASE`).
+`CDP_FACILITATOR`, `T54_XRPL_FACILITATOR`, `NETWORK_BASE_SEPOLIA`, `NETWORK_BASE`,
+`NETWORK_SOLANA`, `NETWORK_XRPL`, `RPC_BASE_SEPOLIA`, `RPC_BASE`, `RPC_SOLANA`,
+`RPC_XRPL`).

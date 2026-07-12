@@ -31,13 +31,13 @@ Per-node speculative caching of in-scope chains observed via the tail-subscripti
 | Field | Default | What it does |
 |---|---|---|
 | `scopes` | `[]` | Scope-label filter (e.g. `region:us`, `env:prod`). Only inbound events whose chain caps include a matching scope tag are admission-eligible. Empty = no scope filter. |
-| `proximity_max_rtt` | `200 ms` | Proximity-axis gate — events from peers with RTT > this aren't admission-eligible. `None` skips the gate. |
+| `proximity_max_rtt` | `200 ms` | Proximity-axis gate — events from peers with RTT > this aren't admission-eligible. It's a plain `Duration`, not an `Option`; a **zero** value is *rejected* by config validation (`greedy proximity_max_rtt must be non-zero`), not a way to disable the gate. |
 | `per_channel_cap_bytes` | `100 MiB` | Per-channel storage cap. Events that would push a channel over this size evict-then-admit (LRU within the channel). |
 | `total_cap_bytes` | `10 GiB` | Cluster-cap — total bytes across all cached channels. Triggers cluster-level eviction (cold channels evict whole). |
 | `bandwidth_budget_fraction` | `0.25` | Share of measured NIC peak the cache is allowed to consume. Token-bucket gated; over-budget admits bump a counter and reject the event. |
 | `nic_peak_bytes_per_s` | `None` (→ 125 MB/s = 1 Gbps) | Operator override of the NIC-peak probe. Set explicitly on > 1 Gbps NICs. |
-| `intent_match` | `Disabled` | Capability-preference axis. `MatchAnyAdvertised` only admits chains whose `intent:<label>` is in the local node's advertised intent set. |
-| `colocation_policy` | `Ignore` | Colocation axis. `SoftPreference` raises admission preference; `StrictRequired` rejects events whose colocation target isn't already cached locally. |
+| `intent_match` | `AnyOfLocalCapabilities` | Capability-preference axis. `IntentMatchPolicy` is `Disabled` \| `AnyOfLocalCapabilities` \| `Strict`; `GreedyConfig::default()` sets `AnyOfLocalCapabilities` (admit chains whose `intent:<label>` the local node has capability for). `Strict` requires the registry's declared capabilities; `Disabled` passes the axis. There is no `MatchAnyAdvertised`. |
+| `colocation_policy` | `SoftPreference` | Colocation axis. `ColocationPolicy` is `Ignore` \| `SoftPreference` \| `StrictRequired`; `GreedyConfig::default()` sets `SoftPreference` (raises admission preference). `StrictRequired` rejects events whose colocation target isn't already cached locally; `Ignore` disables the axis. |
 | `observer_inflight_cap` | `1024` | `tokio::sync::Semaphore` size on the observe fan-out. Saturation drops events and bumps `dataforts_greedy_observer_dropped_overloaded`. |
 
 ### Wire-up
@@ -181,22 +181,22 @@ Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter
 ### Wire-up
 
 ```rust
-use net::adapter::net::dataforts::{
-    register_filesystem_blob_adapter, publish_blob, resolve_payload, BlobRef,
-};
+use net::adapter::net::dataforts::{FileSystemAdapter, publish_blob, resolve_payload};
 
-register_filesystem_blob_adapter("local", "/var/blobs")?;
-let blob_ref = publish_blob("local", "local://obj/payload-1", &large_payload).await?;
-// blob_ref now rides events as the addressable reference.
+// The FS adapter accepts only `file:` URIs (accepted_schemes() == ["file"]);
+// publish enforces that gate, so a `local://` URI errors with UnsupportedScheme.
+let adapter = FileSystemAdapter::new("fs", "/var/blobs");
+let encoded = publish_blob(&adapter, "file:obj/payload-1", &large_payload).await?;
+// `encoded` is the addressable reference bytes that ride events as the payload.
 
-let payload = resolve_payload(&blob_ref).await?;
+let payload = resolve_payload(&encoded, &adapter).await?;
 ```
 
 ```python
 from net import register_filesystem_blob_adapter, blob_publish, blob_resolve
 
 register_filesystem_blob_adapter('local', '/var/blobs')
-blob_ref = blob_publish('local', 'local://obj/payload-1', large_payload)
+blob_ref = blob_publish('local', 'file:obj/payload-1', large_payload)   # FS adapter accepts only file: URIs
 payload = blob_resolve(blob_ref)
 ```
 
@@ -204,7 +204,7 @@ payload = blob_resolve(blob_ref)
 import { registerFilesystemBlobAdapter, blobPublish, blobResolve } from '@net-mesh/core';
 
 registerFilesystemBlobAdapter('local', '/var/blobs');
-const blobRef = await blobPublish('local', 'local://obj/payload-1', largePayload);
+const blobRef = await blobPublish('local', 'file:obj/payload-1', largePayload);  // FS adapter accepts only file: URIs
 const payload = await blobResolve(blobRef);
 ```
 
@@ -298,7 +298,7 @@ The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to
 
 ## Phase 5 — Read-your-writes
 
-Every successful `Tasks::create` / `Memories::insert` / etc. returns a `WriteToken { origin_hash, seq }`. Pass it to `wait_for_token(token, deadline)` and the call blocks until the local fold has actually applied that sequence number — not just folded it. A producer reads its own write through the cache deterministically; no busy-poll, no time-window heuristic.
+Every successful `Tasks::create` / `Memories::insert` / etc. returns the RedEX **seq** (a `u64`). The simplest read-your-writes wait is `wait_for_seq(seq)` — it blocks until the local fold has actually *applied* that sequence number, not just folded it. When you need a deadline or the origin-bound token primitive, wrap the seq in a `WriteToken { origin_hash, seq }` and call `wait_for_token(token, deadline)`. Either way, a producer reads its own write through the cache deterministically; no busy-poll, no time-window heuristic.
 
 This piece composes with `cortex.md` — the WriteToken is what flows out of every CortEX write; the wait_for_token call is what reads block on.
 
@@ -306,40 +306,39 @@ This piece composes with `cortex.md` — the WriteToken is what flows out of eve
 
 ```rust
 pub struct WriteToken {
-    pub(crate) version: u8,
-    pub(crate) origin_hash: u64,
-    pub(crate) seq: u64,
+    pub origin_hash: u64,
+    pub seq: u64,
 }
 ```
 
-Fields are `pub(crate)`; the public constructor is `#[doc(hidden)]`. `FromStr` is gated behind `#[cfg(test)]` / `wire-debug`. **Tokens are unforgeable only against the adapter that issued them** — origin-bound. A token claiming `origin_hash = X` passed to an adapter whose `origin_hash = Y` rejects with `WaitForTokenError::WrongOrigin`.
+Fields are `pub` — build one with a struct literal, or `WriteToken::new(origin_hash, seq)` (a `#[doc(hidden)]` constructor). `impl FromStr` is available unconditionally; there is no `version` field. **Tokens are unforgeable only against the adapter that issued them** — origin-bound. A token claiming `origin_hash = X` passed to an adapter whose `origin_hash = Y` rejects with `WaitForTokenError::WrongOrigin`.
 
 ### Wire-up
 
 ```rust
 let tasks = Tasks::open(redex, channel, origin_hash, cfg)?;
-let result = tasks.create(1, "first", net::now_ns())?;
-tasks.wait_for_token(result.token, std::time::Duration::from_millis(250)).await?;
+let seq = tasks.create(1, "first", now_ns)?;      // now_ns: u64 wall-clock nanoseconds
+let _ = tasks.wait_for_seq(seq).await;            // block until the fold applied it
 // State now reflects the create — read tasks.state() safely.
+// For a deadline, wrap the seq: wait_for_token(WriteToken { origin_hash, seq }, dur).
 ```
 
 ```python
-result = tasks.create(1, 'first', now_ns())
-tasks.wait_for_token(result.token, deadline_ms=250)
-# deadline_ms=0 is a non-blocking poll
+seq = tasks.create(1, 'first', now_ns())
+tasks.wait_for_seq(seq)
+# For a deadline: tasks.wait_for_token(token, deadline_ms=250)  (deadline_ms=0 = non-blocking poll)
 ```
 
 ```ts
-const result = tasks.create(1n, 'first', BigInt(now()));
-await tasks.waitForToken(result.token, 250);
-// deadlineMs === 0 is a non-blocking poll
+const seq = tasks.create(1n, 'first', BigInt(now()));
+await tasks.waitForSeq(seq);
+// For a deadline: await tasks.waitForToken(token, 250);  (deadlineMs === 0 = non-blocking poll)
 ```
 
 ```go
-result, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano()))
-if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /* … */ }
-// PollForToken — non-blocking
-// WaitForTokenContext — Go context, but cancellation isn't propagated into the FFI wait
+seq, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano()))
+if err := tasks.WaitForSeq(seq, 250*time.Millisecond); err != nil { /* … */ }
+// Go's RYW is seq-based — the binding has no WriteToken type or WaitForToken.
 ```
 
 ### Operational notes
@@ -348,14 +347,14 @@ if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /
 - **`FoldStopped` is a real error.** When `running == false` (fold task crashed under `FoldErrorPolicy::Stop`), the wait surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` rather than resolving every pending RYW wait with a silent `Ok(())`.
 - **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled.
 - **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (`ryw_inflight_cap`, non-FIFO).
-- **Go context cancellation isn't propagated into the FFI wait.** `WaitForTokenContext(ctx, token)` accepts a Go `context.Context` but cancellation doesn't preempt the blocking FFI call — use it for ergonomics, not sub-deadline cancellation.
+- **Go's RYW surface is seq-based.** `WaitForSeq(seq, timeout)` is the only wait — the Go binding exposes no `WriteToken` type and no context-aware variant, so there's no cancellation knob beyond the `timeout` argument.
 
 ---
 
 ## Common gotchas
 
 - **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built artifacts ship with the feature enabled.
-- **Greedy admission rejection has six reasons** (`AdmitRejectReason::{Scope, Proximity, Intent, Colocation, Capacity, Bandwidth}`). Each has its own Prometheus counter — disambiguate "why isn't this chain being cached?" by checking which counter bumped.
+- **Greedy admission rejection has five reasons** (`AdmitRejectReason::{Scope, Intent, Colocation, Capacity, Bandwidth}`) — there is no `Proximity` variant. Each has its own Prometheus counter — disambiguate "why isn't this chain being cached?" by checking which counter bumped.
 - **Gravity without greedy is allowed.** A node with `enable_gravity_for_greedy` but no `enable_greedy_dataforts` is the "drift-only" quadrant — already-placed replicas emit heat, but the node doesn't speculatively cache.
 - **`Redex::greedy_cache_for(channel) -> Option<RedexFile>`** returns the cache file if greedy admitted that chain; the caller falls back to a network fetch / substrate read path on `None`. The substrate doesn't auto-route reads through the cache — it's an explicit lookup.
 - **Blob refs aren't transactionally tied to the bus.** A `BlobRef` riding on a published event references bytes that the adapter must have stored *before* the event was published; if the consumer reads the event before the adapter persists the bytes, `blob_resolve` fails until the persist completes.
