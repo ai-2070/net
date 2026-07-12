@@ -112,6 +112,11 @@ interests travel up the actual routing tree
   observers never see the origin's handshake).
 - Coalescing discipline: the RT-1 trailing-edge gate and RT-4
   event-pingwave leading+trailing shape.
+- Frame packing: subprotocol frames natively carry multiple events —
+  `PacketBuilder::build_subprotocol` takes `&[Bytes]` and dispatch
+  iterates `EventFrame::read_events` (the capability-announcement and
+  withdrawal branches already do) — so relay-side batching of several
+  attestation keys into one packet needs no new wire format (§4.4).
 - Feature negotiation precedent: `ACK_RANGES_CAPABILITY_TAG` — a
   capability tag gating a wire feature per peer (§4.10 uses the same
   mechanism).
@@ -290,14 +295,51 @@ interest.
 interests), independent of the number of watchers *behind* each
 branch. It is not "globally O(1)".
 
+**Relay delivery: store, pack, down-sample.** Because attestations
+are origin-signed, self-contained, and latest-wins, a relay is a
+*cache with a schedule*, not a synchronous forwarder — it holds the
+latest attestation per `ReadinessKey` and:
+
+- **packs**: multiple keys bound for the same downstream coalesce
+  into one multi-event subprotocol frame per flush (native
+  `EventFrame` support, §2);
+- **down-samples**: each downstream is delivered the latest
+  attestation per key at its OWN `max_observation_staleness`, not at
+  the strictest upstream cadence — min-dominance governs what flows
+  *up*; per-subscriber schedules govern what flows *down*;
+- **never holds a status edge**: Ready ↔ NotReady (and
+  ProviderUnknown) transitions flush immediately; only same-key
+  continuity heartbeats may wait, and the hold window is bounded by
+  the downstream's S;
+- **warm-starts late joiners**: a newly registered downstream
+  immediately receives the cached latest attestation per matching
+  key; the continuity window (below) runs from that delivery. The
+  optimism exposure is one continuity window — identical to the
+  delay power a forwarder already has, so no new trust surface.
+
+The relay never alters bytes (signature-protected); down-sampling
+means intentional same-key seq gaps at looser watchers, so seq gaps
+MUST NOT be treated as a loss signal anywhere.
+
 ### 4.5 Freshness by cadence continuity, not clocks
 
-No wall-clock validation. The attestation carries `promised_cadence`;
-consumers apply the failure detector's own rule: no strictly-newer
-admitted seq within `k × promised_cadence` (k = 3 default) →
-observation expires to Unknown. Composes per hop without time sync; a
-staleness bound a path cannot physically meet degrades to Unknown at
-the consumer — honest, not wrong.
+No wall-clock validation. The attestation carries `promised_cadence`
+and the consumer knows its own requested staleness; the continuity
+rule (the failure detector's own trick) is: no strictly-newer
+admitted seq within
+
+```
+k × max(promised_cadence, own max_observation_staleness)   (k = 3)
+```
+
+→ observation expires to Unknown. The `max` term is load-bearing
+under relay down-sampling (§4.4): a looser watcher is delivered at
+its own S, so keying the window off `promised_cadence` alone would
+false-Unknown every down-sampled subscriber. Each consumer's window
+uses only values it requested or received signed — nothing
+relay-asserted. Composes per hop without time sync; a staleness bound
+a path cannot physically meet degrades to Unknown at the consumer —
+honest, not wrong.
 
 ### 4.6 Ordering across restarts: incarnation-scoped sequences
 
@@ -440,7 +482,12 @@ The fallback loses coalescing, never correctness.
   9. **test:** one downstream expires while another keeps
      refreshing — derived aggregates shrink, survivor unaffected;
   10. **test:** old-relay path → explicit non-coalesced fallback
-      selection (or Unknown), never silent breakage.
+      selection (or Unknown), never silent breakage;
+  11. **test:** relay down-sampling — a looser watcher delivered at
+      its own S is never false-Unknowned (the `k × max(cadence, S)`
+      window, §4.5), a status edge is never held for a batch window,
+      and a late joiner warm-starts from the relay's cached
+      attestation.
 - **SI-1 — wire types + gates.** Codecs + signing for the SI-0-frozen
   shapes; incarnation-scoped seq gate. Includes the **signature-cost
   benchmark**: sign CPU at cadence floor, verify CPU at realistic
@@ -451,12 +498,17 @@ The fallback loses coalescing, never correctness.
   aggregates, trailing-edge upstream propagation, caps.
 - **SI-3 — origin emitter.** Constraint resolution/validation,
   per-interest predicate evaluation, cadence + status-edge emission.
-- **SI-4 — relay forwarding + overlay application.** Identical-bytes
-  fan-down, admission gate, cadence-continuity expiry, fold-overlay
-  apply. Flagship three-node test: two watchers behind one relay — X's
-  send count tracks branches not watchers; the consumer observes via
-  fold queries/change signal; Unknown within k × cadence of silence
-  (heartbeat parked out of the window, RT-4/RT-5 test discipline).
+- **SI-4 — relay delivery + overlay application.** Store-and-forward
+  cache, multi-event frame packing, per-downstream down-sampling,
+  immediate-edge flush, admission gate, continuity expiry,
+  fold-overlay apply. Flagship three-node test: two watchers with
+  different S behind one relay — X's send count tracks branches not
+  watchers, the strict watcher sees full cadence while the loose one
+  is delivered at its own S (packet-count asserted), a status edge
+  reaches both immediately, and the consumer observes via fold
+  queries/change signal with Unknown inside its own continuity window
+  on silence (heartbeat parked out of the window, RT-4/RT-5 test
+  discipline).
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation-change / generation-change → Unknown + re-registration;
   rides the route_withdraw harness.
@@ -496,6 +548,15 @@ SI-4; SI-7 last.
 - **Signing cost is unproven at cadence.** SI-1's benchmark gates the
   cadence floor default; if signing dominates, the floor rises before
   any batching design is considered.
+- **Down-sampling makes same-key seq gaps normal.** No layer may
+  treat an attestation seq gap as loss or reorder evidence — the gate
+  is strictly-newer-wins, nothing more. A future "gap detector" would
+  false-alarm on every down-sampled subscriber.
+- **Warm-start optimism is bounded, not zero.** A cached handoff can
+  be up to one continuity window stale before the first live delivery
+  corrects it — the same exposure as a relay delaying live traffic,
+  but it should stay stated (a consumer needing proof-fresh evidence
+  at join time must wait for its first in-window live attestation).
 - **Cross-plane ordering.** An attestation and a pingwave/withdrawal
   about the same provider share no counter; the strictest signal wins
   (Unknown for scheduling) and anti-entropy repairs — same posture as
