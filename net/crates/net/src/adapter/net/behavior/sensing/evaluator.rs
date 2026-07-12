@@ -177,11 +177,15 @@ pub const fn check_cadence(
 pub struct SensingCounters {
     /// Every constraint rejection (any [`ConstraintError`]).
     pub invalid_constraints: AtomicU64,
-    /// The security-relevant subset: protocol-invalid input — for
-    /// SI-0, exactly the digest mismatches (plan §4.4).
+    /// The security-relevant subset: protocol-invalid input —
+    /// constraint digest mismatches (plan §4.4) and wire scope
+    /// claims the session does not back (plan §4.10).
     pub protocol_invalid: AtomicU64,
     /// Structured cadence refusals issued.
     pub cadence_refusals: AtomicU64,
+    /// Scope-validation refusals (plan §4.10) — every
+    /// [`super::scope::ScopeError`], security-relevant or not.
+    pub scope_refusals: AtomicU64,
 }
 
 impl SensingCounters {

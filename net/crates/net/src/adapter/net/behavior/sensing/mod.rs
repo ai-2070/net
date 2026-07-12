@@ -32,7 +32,12 @@ pub mod delivery;
 pub mod evaluator;
 pub mod identity;
 pub mod incarnation;
+pub mod negotiation;
+pub mod scope;
 pub mod table;
+
+pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
+pub use scope::{validate_subscriber_scope, ScopeError};
 
 pub use controller::{
     population_is_boundable, project_aggregate, resolve_candidates, AggregateView, BranchView,
