@@ -92,13 +92,24 @@ if [[ "$PUBLIC_B" == 1 ]]; then
   launch nsim_wan b joiner --name b --bind 10.99.0.12:7002 --state "$STATE" \
     --publics r,x --auto-upgrade "${SEED_ARGS_B[@]}"
 else
-  launch nsim_b b joiner --name b --bind 0.0.0.0:7002 --state "$STATE" \
+  # Bind the concrete LAN IP (192.168.102.2), NOT 0.0.0.0. The
+  # classifier's Open check does port-only matching on a wildcard bind
+  # (classify.rs Finding B3), so a port-preserving cone NAT
+  # (`masquerade persistent` keeps the source port) reflects back
+  # `10.99.0.3:7002`, whose port matches the bind port, and the node
+  # misclassifies as Open instead of Cone. A concrete bind IP forces
+  # the full `reflex.ip() == bind.ip()` comparison, which the NAT'd
+  # public IP fails → Cone, as the scenario expects. (Symmetric dodges
+  # this because `fully-random` scrambles the port.)
+  launch nsim_b b joiner --name b --bind 192.168.102.2:7002 --state "$STATE" \
     --publics r,x "${SEED_ARGS_B[@]}"
 fi
 
 A_EXTRA=(--target b --mode "$MODE")
 [[ "$MODE" == upgrade ]] && A_EXTRA+=(--auto-upgrade)
-launch nsim_a a joiner --name a --bind 0.0.0.0:7001 --state "$STATE" \
+# Concrete LAN IP (192.168.101.2), not 0.0.0.0 — see the B side above
+# for why a wildcard bind misclassifies a port-preserving cone NAT.
+launch nsim_a a joiner --name a --bind 192.168.101.2:7001 --state "$STATE" \
   --publics r,x "${A_EXTRA[@]}" "${SEED_ARGS_A[@]}"
 
 # Wait for the initiator's verdict.
