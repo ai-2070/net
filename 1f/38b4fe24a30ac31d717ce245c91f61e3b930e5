@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_c146b7ba5584bd 1-27
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_1203923443d37c 100-104
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_c28bdf38c0df3a::t_b28ac830dc3d77 61
+net/crates/net/src/adapter/net/behavior/sensing/identity.rs
+  s_c28bdf38c0df3a::t_98039b1d58403d 1-217,222-591,594-690,692-716
+  s_c28bdf38c0df3a::t_52d468a6713cfc 218-221,592-593,691
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "1f38b4fe24a30ac31d717ce245c91f61e3b930e5",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
