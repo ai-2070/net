@@ -15,20 +15,26 @@ for t in &tools {
 }
 ```
 
-Folding is asynchronous — an announcement takes a moment to propagate. Poll until
-the tool you expect appears rather than assuming it's there on the first line:
+Folding is asynchronous — an announcement takes a moment to propagate — but you
+don't poll for it. `watch_tools` returns a `futures::Stream` of `ToolListChange`
+events, pushed the moment the capability fold mutates (an idle mesh costs zero
+periodic work). Take a `list_tools` baseline first; the stream emits only changes
+after subscription:
 
 ```rust
-use std::time::{Duration, Instant};
-let deadline = Instant::now() + Duration::from_secs(3);
-while Instant::now() < deadline && agent.list_tools(None).len() < 1 {
-    tokio::time::sleep(Duration::from_millis(20)).await;
+use futures::StreamExt;
+
+for t in agent.list_tools(None) { /* baseline */ }
+
+let mut watch = agent.watch_tools(None, None); // event-driven; no timer
+while let Some(change) = watch.next().await {
+    println!("{change:?}"); // added / removed / publisher-count change
 }
 ```
 
-For a long-running agent, prefer the push-based subscription `agent.watch_tools(..)`
-over a poll loop — it yields tool changes as they fold in, instead of re-scanning on
-a timer. The poll above is fine for a one-shot wait at startup.
+The second argument is an optional staleness ceiling (a safety-net re-diff at
+least every `Duration`), **not** a poll rate — pass `None` for pure event-driven
+behavior. Dropping the stream (or calling `cancel`) stops the substrate task.
 
 Tool descriptors lower to provider tool-call formats — e.g.
 `net_sdk::tool::formats::openai::to_openai_tool(&t)` produces an entry you can drop
@@ -52,9 +58,8 @@ let nodes: Vec<u64> = mesh.find_nodes(&filter);   // not async — returns node 
 ```
 
 `find_best_node` returns a single highest-scoring node for a weighted requirement,
-and `find_nodes_scoped` narrows to a tenant/region/subnet pool. Announcements reach
-every **directly-connected** peer (and self-index locally) — multi-hop propagation
-is deferred, so a match is a direct neighbour, not a node several hops away.
+and `find_nodes_scoped` narrows to a tenant/region/subnet pool. Announcements
+propagate multi-hop (bounded by a hop count), so a match can be several hops away.
 Richer predicates (numeric, semver, AND/OR/NOT) and the CLI equivalent
 (`net cap query --tag …`) are in [Capabilities](/docs/concepts/capabilities).
 

@@ -1,7 +1,7 @@
 # Real-Time Routing & Capability Discovery Plan
 
-Status: RT-1..RT-5 implemented (2026-07-11); RT-6 (remote watch stream) and
-RT-7 (docs) open
+Status: RT-1..RT-5 implemented (2026-07-11); RT-7 (docs) done
+(2026-07-12); RT-6 (remote watch stream) open
 Owner: TBD
 Related: `POLLING_TO_EVENT_DRIVEN_SDK_PLAN.md` (predecessor — made *local*
 watch surfaces push), `CAPABILITY_BROADCAST_PLAN.md` (the announcement
@@ -308,9 +308,16 @@ exactly as today.
 - **RT-6 — nRPC streaming remote watch + Go binding cutover (C).** OPEN.
   Depends RT-3 for end-to-end value, technically independent. Includes
   the overflow/resync contract test.
-- **RT-7 — docs.** OPEN. Replace the `discover.md` poll loop with
-  `watchTools`; document the new knobs and the push-plus-anti-entropy
-  model in `TRANSPORT.md` / `BEHAVIOR.md`.
+- **RT-7 — docs.** ✅ DONE (2026-07-12). All four SDK `discover.md`
+  poll loops (typescript/python/go/rust) replaced with the
+  event-driven watch surfaces (baseline via list, then pushed
+  `ToolListChange`s; interval documented as a staleness ceiling, not
+  a poll rate); `TRANSPORT.md` §Routing gained the RT-4/RT-5
+  paragraphs (event pingwaves incl. the two-round divergence,
+  withdrawal semantics + knobs); `BEHAVIOR.md` gained the
+  "Real-time propagation: push + anti-entropy" section with the knob
+  table and the invariant statement (timers guarantee convergence,
+  pushes only make it faster).
 
 Dependency order: RT-1 → RT-2 → RT-3; RT-4 and RT-5 independent of the
 announce track (RT-5 benefits from RT-4's recovery pingwave); RT-6, RT-7

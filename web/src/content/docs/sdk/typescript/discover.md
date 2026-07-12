@@ -17,32 +17,35 @@ ids are 64-bit, so they're BigInt in JS — see
 [Payload interop](/docs/reference/capability-schema) for the u64/BigInt edge).
 `findNodesScoped(filter, scope)` narrows to a tenant/region/subnet pool.
 
-Announcements reach every **directly-connected** peer (the announcing node also
-self-indexes) — multi-hop propagation is deferred, so a match is a direct neighbour,
-not a node several hops away. Discovery is **advisory** — it tells you who *can*,
-with no exclusivity.
+Announcements propagate multi-hop (bounded by a hop count), so a match can be a
+node several hops away, not just a direct neighbor. Discovery is **advisory** — it
+tells you who *can*, with no exclusivity.
 
 ## List tools
 
 After a peer serves tools, they fold into your local index. Folding is
-asynchronous, so poll until the tool you expect appears rather than assuming it's
-there on the first call:
+asynchronous — don't poll for it: take a `listTools` baseline, then subscribe with
+`watchTools` and react to pushed changes. The watch is event-driven off the
+capability fold's change signal — a `ToolListChange` arrives the moment a tool is
+added, removed, or its publisher count changes, and an idle mesh costs zero
+periodic work:
 
 ```typescript
-import { listTools } from '@net-mesh/sdk';
+import { listTools, watchTools } from '@net-mesh/sdk';
 
-const deadline = Date.now() + 3_000;
-while (Date.now() < deadline && listTools(node).length < 1) {
-  await new Promise((r) => setTimeout(r, 20));
-}
 for (const t of listTools(node)) {
-  console.log(`${t.toolId} v${t.version}  tags=${t.tags}`);
+  console.log(`${t.toolId} v${t.version}  tags=${t.tags}`); // baseline
+}
+
+const controller = new AbortController();
+for await (const change of watchTools(node, { signal: controller.signal })) {
+  console.log(change); // pushed on fold mutation — no timer, no re-diff
 }
 ```
 
-For a long-running agent, prefer the push-based `watchTools(node)` subscription
-(from `@net-mesh/sdk`) over a poll loop — it delivers tool changes as they fold in.
-The poll above is fine for a one-shot wait at startup.
+`options.intervalMs` is a client-side staleness ceiling (a safety-net re-diff at
+least that often), **not** a poll rate — leave it unset for pure event-driven
+behavior.
 
 Tool descriptors lower to provider tool-call formats (e.g. an OpenAI `tools` array
 entry) via the `openai` helpers, so a discovered tool feeds straight into a

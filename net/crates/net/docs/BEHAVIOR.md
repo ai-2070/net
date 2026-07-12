@@ -94,6 +94,24 @@ let peers = mesh.find_nodes_by_filter_scoped(
 
 The `Visibility` enum on `ChannelConfig` is a separate concept — channel visibility is a *routing* concern enforced by `SubnetGateway::should_forward`. Capability scope is a *discovery* concern. They can be combined (a `SubnetLocal` channel that publishes only to subnet-local capability matches) but neither implies the other.
 
+### Real-time propagation: push + anti-entropy (RT-1..RT-5)
+
+Discovery is **push-driven with timer-based repair**, never timer-driven with push as an afterthought (`docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md`):
+
+- **Change-driven announcements.** Local capability mutations (serve/stop-serve a tool, capability set changes) fire a dedicated local-changes signal (`local_caps_changed`, a `watch` generation counter — deliberately separate from the fold-wide signal so inbound peer announcements can never echo into a local re-announce). A debounced announcer loop (`announce_debounce`, default 100 ms) coalesces bursts and broadcasts once; `min_announce_interval` (10 s) stays as the rate ceiling but is **trailing-edge-safe** — an announce absorbed inside the window re-broadcasts at window end (`AnnounceGate`), so the last change always propagates. `capability_reannounce_interval` (150 s) is thereby demoted from "the propagation latency" to a pure anti-entropy/TTL keep-alive.
+- **Event pingwaves + route withdrawal** make route birth and death event-driven at the transport layer — see `TRANSPORT.md` §Routing for RT-4/RT-5 details and knobs (`event_pingwave_min_gap`, `enable_route_withdraw`).
+- **Watching instead of polling.** `MeshNode::watch_tools` (and every binding's `watchTools` / `watch_tools` / `WatchTools`) parks on the fold change signal and pushes `ToolListChange` deltas the moment the fold mutates; the optional interval is a staleness-ceiling re-diff, not a poll rate. An idle mesh does zero periodic discovery work beyond the anti-entropy floor.
+
+The invariant: timers (heartbeat pingwave tick, reannounce keep-alive, sweeps) guarantee *eventual* convergence even under loss; pushes only ever make it *faster*. A mesh with every RT knob disabled behaves exactly as the pre-RT design.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `announce_debounce` | 100 ms | coalescing window for change-driven announcements |
+| `event_pingwave_min_gap` | 250 ms | per-node floor between event-triggered pingwaves (`Duration::MAX` disables) |
+| `enable_route_withdraw` | `true` | emit + honor `SUBPROTOCOL_ROUTE_WITHDRAW` |
+| `min_announce_interval` | 10 s | unchanged ceiling; trailing-edge-safe |
+| `capability_reannounce_interval` | 150 s | unchanged; anti-entropy/TTL keep-alive only |
+
 ## Capability Diffs (CAP-DIFF)
 
 `DiffEngine` computes minimal diffs when capabilities change, avoiding full re-announcement.

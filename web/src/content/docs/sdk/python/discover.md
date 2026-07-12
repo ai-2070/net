@@ -1,26 +1,26 @@
 # Python — Discover Capabilities
 
-List the tools a node can see on the mesh with `list_tools`:
+List the tools a node can see on the mesh with `list_tools`, and react to changes
+with `watch_tools`:
 
 ```python
-import time
-from net_sdk import list_tools
+from net_sdk import list_tools, watch_tools
 
 # `node` is a MeshNode handshaked with a peer that served tools.
-deadline = time.monotonic() + 3.0
-while time.monotonic() < deadline and len(list_tools(node)) < 1:
-    time.sleep(0.02)          # folding is asynchronous — poll until it appears
-
-for t in list_tools(node):
+for t in list_tools(node):                      # baseline snapshot
     print(t.tool_id, "v" + str(t.version), "tags=", t.tags)
+
+async for change in watch_tools(node):          # pushed on fold mutation
+    print(change)  # a tool was added, removed, or its publisher count changed
 ```
 
-Folding is asynchronous — an announcement takes a moment to propagate, so poll
-until the tool you expect appears rather than assuming it's there on the first
-call. For a long-running agent, prefer the push-based `watch_tools(node)`
-subscription over this poll loop. Announcements reach every **directly-connected**
-peer (the announcing node also self-indexes) — multi-hop propagation is deferred, so
-a tool comes from a direct neighbour, not a node several hops away.
+Folding is asynchronous — an announcement takes a moment to propagate — but you
+don't poll for it: the watch is event-driven off the capability fold's change
+signal, so a `ToolListChange` arrives the moment the fold mutates and an idle mesh
+costs zero periodic work. The optional `interval=` is a staleness ceiling (a
+safety-net re-diff at least that often), **not** a poll rate. Announcements
+propagate multi-hop (bounded by a hop count), so a tool can come from a node
+several hops away.
 
 Tool descriptors lower to provider tool-call formats via the `openai` helpers, so a
 discovered tool feeds straight into a chat-completion request.
