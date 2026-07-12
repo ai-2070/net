@@ -2,10 +2,11 @@
 
 Status: v4.2 — capability interests rendezvous at the RedEX-elected
 scope sensing leader (review 6, 2026-07-12); provider-specific
-sensing stays on the provider-targeted wire. SI-0 items 1–23
-as-built; items 24–31 (rendezvous/failover) in progress. SI-1 and
-wire-id allocation remain BLOCKED until the rendezvous/failover
-tests pass and the gate map (a)–(q) is signed off
+sensing stays on the provider-targeted wire. SI-0 spike COMPLETE
+in-tree: items 1–31 as-built (rendezvous/failover items 24–31 in
+`behavior::sensing::rendezvous`, 2026-07-12), pending review
+sign-off. SI-1 and wire-id allocation remain BLOCKED until the gate
+map (a)–(q) is signed off
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -220,9 +221,10 @@ Unchanged from v3 except as noted:
   hop-by-hop continuity rule (`delivery.rs`), the Layer-1 controller
   — candidate resolution, bounded exploration, budget checks, local
   result-mode aggregates (`controller.rs`), owner-root scope
-  validation from session identity (`scope.rs`), and the
-  mixed-version path selection (`negotiation.rs`), plus the
-  real-path fallback integration test
+  validation from session identity (`scope.rs`), the mixed-version
+  path selection (`negotiation.rs`), and the RedEX-delegating
+  rendezvous + sensing-leader role (`rendezvous.rs`, `redex`
+  feature), plus the real-path fallback integration test
   (`tests/sensing_fallback.rs`).
 
 ## 3. Semantic model (defined before any wire format)
