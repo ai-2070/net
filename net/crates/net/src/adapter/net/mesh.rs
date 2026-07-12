@@ -5556,6 +5556,13 @@ impl MeshNode {
         ctx.router.add_route(peer_node_id, source);
         ctx.session_id_to_node
             .insert(registered_session_id, peer_node_id);
+        // Fresh session incarnation (Vacant or accepted rotation) →
+        // the peer's withdrawal seq counter restarts, so purge its
+        // gate history, exactly as the direct `connect`/`accept`
+        // install paths do. Without this, a peer reconnecting through
+        // a relay (`connect_via`) has its reset-sequence withdrawals
+        // rejected as stale until the gate ages them out (cubic P2).
+        ctx.route_withdraw_gate.forget_sender(peer_node_id);
 
         // Spawn the send. If it fails, roll back all three registrations
         // (peer session, peer-addr map, and routing table entry). Leaving
