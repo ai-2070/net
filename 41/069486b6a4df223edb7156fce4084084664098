@@ -1,0 +1,34 @@
+web/src/content/docs/sdk/go/discover.md
+  s_c28bdf38c0df3a::t_e77310d8320d85 37-67
+web/src/content/docs/sdk/python/discover.md
+  s_c28bdf38c0df3a::t_ee7053a0f697d2 3-4,7,10,12-14,17-23
+net/crates/net/docs/BEHAVIOR.md
+  s_c28bdf38c0df3a::t_ec4c6ecd0b53e1 97-114
+web/src/content/docs/sdk/typescript/discover.md
+  s_c28bdf38c0df3a::t_d9616adaf14b8d 27-31,34,37-42,46-48
+  s_c28bdf38c0df3a::t_5ff0d1dd3a3431 49
+web/src/content/docs/sdk/rust/discover.md
+  s_c28bdf38c0df3a::t_8681993b5919e7 18-22,25-31,35-37
+  s_c28bdf38c0df3a::t_e053ae4c472182 38
+net/crates/net/docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md
+  s_c28bdf38c0df3a::t_f34c137406bd34 311-320
+  s_c28bdf38c0df3a::t_a922683645d480 3-4
+net/crates/net/docs/TRANSPORT.md
+  s_c28bdf38c0df3a::t_5c732810fbc7ea 197-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "41069486b6a4df223edb7156fce4084084664098",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
