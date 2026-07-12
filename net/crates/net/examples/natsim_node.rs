@@ -407,6 +407,10 @@ mod natsim {
                     "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
                     "self_nat_class": format!("{:?}", node.nat_class()),
                     "peer_nat_class": format!("{:?}", node.peer_nat_class(tinfo.node_id)),
+                    // Reflex A used to reach B — if this isn't B's
+                    // gateway public (10.99.0.x:700x), the punch train
+                    // fired at the wrong address and could never land.
+                    "peer_reflex": node.peer_reflex_addr(tinfo.node_id).map(|a| a.to_string()),
                     "stats": stats_json(&node),
                 })
             }
@@ -439,6 +443,17 @@ mod natsim {
                     "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
                     "relay_addr": relay_addr.to_string(),
                     "self_nat_class": format!("{:?}", node.nat_class()),
+                    // Diagnostics for an `upgrades_attempted=0` outcome —
+                    // pinpoint which early-return attempt_direct_upgrade
+                    // takes. `peer_nat_class=Unknown` ⇒ pair_action lands
+                    // on SinglePunch (defers); `peer_reflex=null` ⇒
+                    // Direct-with-no-reflex (records failure);
+                    // `upgrade_loop_candidate=false` ⇒ the loop never
+                    // considers the peer (C1 / relayed / throttle gate).
+                    "peer_nat_class": format!("{:?}", node.peer_nat_class(tinfo.node_id)),
+                    "peer_reflex": node.peer_reflex_addr(tinfo.node_id).map(|a| a.to_string()),
+                    "upgrade_loop_candidate": node
+                        .upgrade_is_loop_candidate_for_test(tinfo.node_id),
                     "stats": stats_json(&node),
                 })
             }
