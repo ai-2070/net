@@ -27,11 +27,17 @@
 //! before SI-1 lands is cheap, changing it after is a wire break.
 
 pub mod continuity;
+pub mod controller;
 pub mod delivery;
 pub mod evaluator;
 pub mod identity;
 pub mod incarnation;
 pub mod table;
+
+pub use controller::{
+    population_is_boundable, project_aggregate, resolve_candidates, AggregateView, BranchView,
+    CandidatePolicy, CandidateProvider, ResolutionRefusal, ResolvedCandidates, TagAssertion,
+};
 
 pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};
 
