@@ -328,15 +328,17 @@ impl Mesh {
         // Step 1: registry insert. Done before the handler so the
         // descriptor is observable to `tool.metadata.fetch` the
         // moment the handler responds to its first call.
-        let prior = registry.insert(descriptor);
-        if let Some(prior) = prior {
-            // Reject duplicate registrations rather than silently
-            // overwriting — the prior handler still lives in
-            // `rpc_local_services` from its own `serve_rpc_typed`
-            // call; overwriting would leak that handler's
-            // `ServeHandle` Drop and surface confusing behavior
-            // (registry says X, handler answers Y).
-            registry.insert(prior);
+        // `try_insert` rejects duplicates atomically — the prior
+        // handler still lives in `rpc_local_services` from its own
+        // `serve_rpc_typed` call; overwriting would leak that
+        // handler's `ServeHandle` Drop and surface confusing
+        // behavior (registry says X, handler answers Y). Unlike
+        // the old insert-then-rollback shape, a rejected duplicate
+        // never mutates the registry, so concurrent readers can't
+        // observe the attempted descriptor and the local-caps
+        // change signal doesn't announce a registration that
+        // never committed.
+        if !registry.try_insert(descriptor) {
             return Err(ServeError::AlreadyServing(tool_id));
         }
 
@@ -415,11 +417,10 @@ impl Mesh {
         }
         let registry = self.inner().tool_registry().clone();
 
-        // Step 1: registry insert (duplicate rejection + paired-remove
-        // rollback, exactly as `serve_tool`).
-        let prior = registry.insert(descriptor);
-        if let Some(prior) = prior {
-            registry.insert(prior);
+        // Step 1: registry insert (atomic duplicate rejection,
+        // exactly as `serve_tool` — see the comment there for why
+        // rejected duplicates must not touch the registry).
+        if !registry.try_insert(descriptor) {
             return Err(ServeError::AlreadyServing(tool_id));
         }
 
@@ -501,11 +502,10 @@ impl Mesh {
         }
         let registry = self.inner().tool_registry().clone();
 
-        // Step 1: registry insert (same paired-remove rollback on
-        // failure as `serve_tool`).
-        let prior = registry.insert(descriptor);
-        if let Some(prior) = prior {
-            registry.insert(prior);
+        // Step 1: registry insert (atomic duplicate rejection,
+        // exactly as `serve_tool` — see the comment there for why
+        // rejected duplicates must not touch the registry).
+        if !registry.try_insert(descriptor) {
             return Err(ServeError::AlreadyServing(tool_id));
         }
 

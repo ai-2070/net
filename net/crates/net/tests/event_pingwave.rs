@@ -1,0 +1,195 @@
+//! RT-4 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): event-triggered
+//! pingwaves.
+//!
+//! Pre-RT-4, pingwaves were emitted only from the heartbeat tick, so
+//! a third party learned about a new session after up to
+//! `heartbeat_interval` PER HOP. These tests park the heartbeat far
+//! past the assertion window: any route that shows up inside it can
+//! only have arrived via an event-triggered flood.
+//!
+//! Run: `cargo test --features net --test event_pingwave`
+
+#![cfg(feature = "net")]
+
+mod common;
+use common::*;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
+
+fn slow_heartbeat_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, CHAOS_PSK)
+        // The periodic pingwave tick sits 30 s out — far past every
+        // assertion deadline below.
+        .with_heartbeat_interval(Duration::from_secs(30))
+        .with_session_timeout(Duration::from_secs(120))
+        .with_handshake(3, Duration::from_secs(2));
+    cfg.socket_buffers = SocketBufferConfig {
+        send_buffer_size: CHAOS_BUFFER_SIZE,
+        recv_buffer_size: CHAOS_BUFFER_SIZE,
+    };
+    cfg
+}
+
+async fn build_node() -> Arc<MeshNode> {
+    build_node_with(|cfg| cfg).await
+}
+
+/// Closure-convenience builder over the slow-heartbeat config; the
+/// node construction itself delegates to `common::build_node_with`
+/// (shadowed here by this same-named helper — call it via its full
+/// path).
+async fn build_node_with<F>(tweak: F) -> Arc<MeshNode>
+where
+    F: FnOnce(MeshNodeConfig) -> MeshNodeConfig,
+{
+    common::build_node_with(tweak(slow_heartbeat_config())).await
+}
+
+/// `common::connect_pair` (connect + accept) plus the `start()` calls.
+/// A initiator, B responder; `start` is idempotent, so re-handshaking
+/// an already-started node is fine.
+async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    connect_pair(a, b).await;
+    a.start();
+    b.start();
+}
+
+/// Cond-first arg-order adapter over `common::poll_until`.
+async fn wait_until<F: FnMut() -> bool>(cond: F, timeout: Duration) -> bool {
+    poll_until(timeout, cond).await
+}
+
+/// The RT-4 core claim: when A joins B, a node C two hops away
+/// installs a route to A within one flood — with the heartbeat tick
+/// (the only pre-RT-4 pingwave source) parked 30 s in the future.
+#[tokio::test]
+async fn new_session_installs_multihop_route_at_flood_speed() {
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
+
+    // B ↔ C first; both running.
+    handshake(&b, &c).await;
+
+    // A joins B. The started node must be the initiator (a running
+    // dispatch loop owns the socket, so post-start `accept` doesn't
+    // see handshake packets) — B connects, A accepts. A's
+    // accept-side event pingwave (origin A) goes to B, which
+    // forwards it to C on the receive path.
+    handshake(&b, &a).await;
+
+    let a_id = a.node_id();
+    let found = wait_until(
+        || c.router().routing_table().lookup(a_id).is_some(),
+        Duration::from_secs(2),
+    )
+    .await;
+    if !found {
+        // Failure triage: whose pingwaves were sent/received/
+        // forwarded tells apart "never emitted" / "dropped at the
+        // gate" / "not forwarded".
+        for (name, n) in [("A", &a), ("B", &b), ("C", &c)] {
+            let s = n.proximity_graph().stats();
+            eprintln!(
+                "{name}: id={:#x} addr={} sent={} recv={} fwd={} nodes={} edges={}",
+                n.node_id(),
+                n.local_addr(),
+                s.pingwaves_sent,
+                s.pingwaves_received,
+                s.pingwaves_forwarded,
+                s.node_count,
+                s.edge_count
+            );
+        }
+    }
+    assert!(
+        found,
+        "C never installed a route to A — the session-open event \
+         pingwave did not flood (the heartbeat tick is 30 s away, so \
+         nothing else could have carried it)",
+    );
+
+    // The installed next-hop must be B — C has no direct session
+    // with A, so the route can only be the pingwave-learned
+    // (A via B) entry.
+    let next_hop = c.router().routing_table().lookup(a_id);
+    let b_addr_for_c = b.local_addr();
+    assert_eq!(
+        next_hop,
+        Some(b_addr_for_c),
+        "C's route to A must go via B (the forwarding peer)",
+    );
+}
+
+/// `event_pingwave_min_gap = Duration::MAX` disables event
+/// pingwaves: with the tick also parked, C must NOT learn about A.
+/// Guards against the gate check being bypassed or inverted.
+#[tokio::test]
+async fn max_gap_disables_event_pingwaves() {
+    let a = build_node_with(|cfg| cfg.with_event_pingwave_min_gap(Duration::MAX)).await;
+    let b = build_node_with(|cfg| cfg.with_event_pingwave_min_gap(Duration::MAX)).await;
+    let c = build_node_with(|cfg| cfg.with_event_pingwave_min_gap(Duration::MAX)).await;
+
+    handshake(&b, &c).await;
+    handshake(&b, &a).await;
+
+    let a_id = a.node_id();
+    // Negative window: generous enough that a mistakenly-emitted
+    // flood would land well inside it.
+    assert!(
+        !wait_until(
+            || c.router().routing_table().lookup(a_id).is_some(),
+            Duration::from_millis(750),
+        )
+        .await,
+        "C learned a route to A although event pingwaves are disabled \
+         and the heartbeat tick hasn't fired — something emitted an \
+         unexpected flood",
+    );
+}
+
+/// RT-4 review Finding 10: an event pingwave that lands INSIDE the
+/// min-gap window is coalesced into a trailing-edge emission at the
+/// window's end, not silently dropped. Pre-fix the leading-edge-only
+/// gate dropped in-window events, so an absorbed topology change
+/// waited for the heartbeat tick. Observable via the origin's
+/// `pingwaves_sent` counter: a second in-window session-open produces
+/// one more emission after the gap elapses.
+#[tokio::test]
+async fn in_gap_event_pingwave_emits_on_trailing_edge() {
+    let gap = Duration::from_millis(2000);
+    let a = build_node_with(|cfg| cfg.with_event_pingwave_min_gap(gap)).await;
+    let b = build_node().await;
+    let c = build_node().await;
+
+    // A initiates BOTH sessions so every emission is A's own. The
+    // first connect is the leading edge (immediate); the second,
+    // well within the 2s gap, is absorbed and must re-emit at the
+    // trailing edge.
+    handshake(&a, &b).await;
+    handshake(&a, &c).await;
+
+    // Let the leading-edge rounds finish. The trailing edge is still
+    // ~2s out (measured from the leading edge), so the counter here
+    // reflects only the leading edge.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_leading = a.proximity_graph().stats().pingwaves_sent;
+    assert!(after_leading >= 1, "leading-edge emission never happened");
+
+    // The trailing-edge catch-up must fire — pre-fix the in-window
+    // second event was dropped and this counter would never move.
+    let bumped = wait_until(
+        || a.proximity_graph().stats().pingwaves_sent > after_leading,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        bumped,
+        "in-window event pingwave was dropped — no trailing-edge emission",
+    );
+}

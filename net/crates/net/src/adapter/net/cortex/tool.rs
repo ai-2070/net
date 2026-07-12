@@ -503,6 +503,16 @@ pub enum ToolMetadataResponse {
 #[derive(Debug, Default)]
 pub struct ToolMetadataRegistry {
     inner: parking_lot::Mutex<RegistryState>,
+    /// Local-caps change signal (RT-2,
+    /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Bumped on every
+    /// announce-relevant mutation — insert/replace, and remove of a
+    /// present entry — so a change-driven announcer can wake without
+    /// polling. `None` for standalone registries (unit tests /
+    /// external construction); `MeshNode::new` injects its shared
+    /// sender. Lives inside the registry rather than at call sites
+    /// so a future mutation path can't forget to fire it (same
+    /// reasoning as `Fold::signal_changed`).
+    change_signal: Option<std::sync::Arc<tokio::sync::watch::Sender<u64>>>,
 }
 
 #[derive(Debug, Default)]
@@ -518,14 +528,78 @@ impl ToolMetadataRegistry {
         Self::default()
     }
 
+    /// Empty registry wired to a shared local-caps change signal
+    /// (RT-2) — what `MeshNode::new` constructs. Every
+    /// announce-relevant mutation bumps the sender's generation.
+    pub fn with_change_signal(signal: std::sync::Arc<tokio::sync::watch::Sender<u64>>) -> Self {
+        Self {
+            inner: Default::default(),
+            change_signal: Some(signal),
+        }
+    }
+
+    /// Fire the change signal, if wired. Called (after the lock is
+    /// released) by every mutation that changes what
+    /// `announce_capabilities` would emit.
+    fn signal_changed(&self) {
+        if let Some(tx) = &self.change_signal {
+            tx.send_modify(|g| *g = g.wrapping_add(1));
+        }
+    }
+
     /// Insert (or replace) the descriptor for `name`. Returns the
-    /// previous entry if one existed — callers can use this for
-    /// duplicate-registration diagnostics (the SDK's `serve_tool`
-    /// rejects duplicate names rather than silently overwriting).
+    /// previous entry if one existed. Registration paths that must
+    /// reject duplicates use [`Self::try_insert`] instead — an
+    /// insert-then-rollback around this method would fire the
+    /// change signal (and expose the attempted descriptor to
+    /// concurrent readers) for a registration that never commits.
     pub fn insert(&self, descriptor: ToolDescriptor) -> Option<ToolDescriptor> {
-        let mut guard = self.inner.lock();
-        guard.snapshot = None;
-        guard.map.insert(descriptor.tool_id.clone(), descriptor)
+        let (prev, changed) = {
+            let mut guard = self.inner.lock();
+            // Only a real change to the announced surface should fire
+            // the signal. A byte-identical re-insert (e.g. an app's
+            // periodic ensure-registered loop) is a no-op: signaling
+            // it would wake the RT-3 announcer into a full mesh-wide
+            // capability broadcast + pingwave flood for zero
+            // information change (RT-2 review Finding 9). Matches
+            // `LocalServiceRegistry::insert`, which already suppresses
+            // idempotent re-serves.
+            let changed = guard.map.get(&descriptor.tool_id) != Some(&descriptor);
+            if changed {
+                guard.snapshot = None;
+            }
+            let prev = guard.map.insert(descriptor.tool_id.clone(), descriptor);
+            (prev, changed)
+        };
+        if changed {
+            self.signal_changed();
+        }
+        prev
+    }
+
+    /// Insert only if no descriptor exists for this `tool_id`;
+    /// returns `true` when the insert committed. Atomic under the
+    /// registry lock, so a duplicate registration neither mutates
+    /// the map (concurrent readers never observe the attempted
+    /// descriptor) nor fires the change signal — the RT-2/RT-3
+    /// announcer must only ever publish registrations that
+    /// actually committed. This is the `serve_tool`-path
+    /// registration primitive.
+    pub fn try_insert(&self, descriptor: ToolDescriptor) -> bool {
+        let inserted = {
+            let mut guard = self.inner.lock();
+            if guard.map.contains_key(&descriptor.tool_id) {
+                false
+            } else {
+                guard.map.insert(descriptor.tool_id.clone(), descriptor);
+                guard.snapshot = None;
+                true
+            }
+        };
+        if inserted {
+            self.signal_changed();
+        }
+        inserted
     }
 
     /// Look up the full descriptor for `name`. `None` when the
@@ -537,11 +611,19 @@ impl ToolMetadataRegistry {
 
     /// Remove the descriptor for `name`. Returns the removed entry
     /// if one existed. Called by the SDK's `serve_tool` Drop hook.
+    /// Removing an absent entry is not a capability change and does
+    /// not fire the change signal.
     pub fn remove(&self, name: &str) -> Option<ToolDescriptor> {
-        let mut guard = self.inner.lock();
-        let prev = guard.map.remove(name);
+        let prev = {
+            let mut guard = self.inner.lock();
+            let prev = guard.map.remove(name);
+            if prev.is_some() {
+                guard.snapshot = None;
+            }
+            prev
+        };
         if prev.is_some() {
-            guard.snapshot = None;
+            self.signal_changed();
         }
         prev
     }
@@ -630,6 +712,71 @@ mod tests {
         assert_eq!(
             desc.node_count, 0,
             "node_count is filled by the aggregator, not here"
+        );
+    }
+
+    #[test]
+    fn change_signal_fires_on_real_mutations_only() {
+        // RT-2 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): the registry
+        // fires the injected local-caps signal on announce-relevant
+        // mutations only — never on reads or no-op removes — so a
+        // change-driven announcer wakes exactly when the announced
+        // surface changed.
+        let signal = std::sync::Arc::new(tokio::sync::watch::channel(0u64).0);
+        let reg = ToolMetadataRegistry::with_change_signal(signal.clone());
+        let generation = || *signal.borrow();
+
+        assert!(reg.remove("ghost").is_none());
+        assert_eq!(generation(), 0, "remove of an absent tool must not signal");
+
+        let desc = ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new());
+        reg.insert(desc.clone());
+        assert_eq!(generation(), 1, "insert must signal");
+
+        // A byte-identical re-insert is a no-op — it must NOT signal
+        // (RT-2 review Finding 9: idempotent re-register would
+        // otherwise trigger a full mesh-wide announce for no change).
+        reg.insert(desc.clone());
+        assert_eq!(generation(), 1, "idempotent re-insert must not signal");
+
+        // A replace that actually changes the descriptor must signal.
+        let mut changed = desc;
+        changed.description = Some("now with a description".to_string());
+        reg.insert(changed);
+        assert_eq!(generation(), 2, "a changed replace must signal");
+
+        assert!(reg.remove("web_search").is_some());
+        assert_eq!(generation(), 3, "remove of a present tool must signal");
+
+        let _ = reg.get("web_search");
+        let _ = reg.snapshot();
+        let _ = reg.is_empty();
+        assert_eq!(generation(), 3, "reads must not signal");
+    }
+
+    #[test]
+    fn try_insert_rejects_duplicates_without_mutation_or_signal() {
+        // RT-2 review follow-up (cubic P1): a rejected duplicate
+        // registration must not mutate the registry (concurrent
+        // readers could observe the attempted descriptor) and must
+        // not fire the change signal (the announcer would publish a
+        // registration that never committed).
+        let signal = std::sync::Arc::new(tokio::sync::watch::channel(0u64).0);
+        let reg = ToolMetadataRegistry::with_change_signal(signal.clone());
+        let generation = || *signal.borrow();
+
+        let original = ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new());
+        assert!(reg.try_insert(original.clone()), "first insert commits");
+        assert_eq!(generation(), 1, "committed insert must signal");
+
+        let mut imposter = ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new());
+        imposter.description = Some("imposter".to_string());
+        assert!(!reg.try_insert(imposter), "duplicate must be rejected");
+        assert_eq!(generation(), 1, "rejected duplicate must not signal");
+        assert_eq!(
+            reg.get("web_search").expect("entry present").description,
+            original.description,
+            "rejected duplicate must not replace the committed descriptor",
         );
     }
 

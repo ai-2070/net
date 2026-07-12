@@ -578,3 +578,223 @@ async fn list_tools_dedupes_and_aggregates_node_count() {
     let count_rows = tools.iter().filter(|t| t.tool_id == "shared_tool").count();
     assert_eq!(count_rows, 1, "dedupe must collapse duplicates");
 }
+
+/// RT-2 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): registry mutations
+/// through the shared `Arc` — the exact path the SDK's `serve_tool`
+/// and its Drop hook use — bump the node's local-caps generation,
+/// so a change-driven announcer can wake on them without polling.
+#[tokio::test]
+async fn local_caps_generation_tracks_registry_mutations() {
+    let host = build_node().await;
+    let base = host.local_caps_generation();
+
+    host.tool_registry().insert(descriptor("web_search"));
+    assert_eq!(
+        host.local_caps_generation(),
+        base + 1,
+        "serve_tool-path insert must bump the local-caps generation",
+    );
+
+    assert!(host.tool_registry().remove("web_search").is_some());
+    assert_eq!(
+        host.local_caps_generation(),
+        base + 2,
+        "ServeHandle-drop-path remove must bump the local-caps generation",
+    );
+
+    assert!(host.tool_registry().remove("web_search").is_none());
+    assert_eq!(
+        host.local_caps_generation(),
+        base + 2,
+        "remove of an absent tool is not a capability change",
+    );
+}
+
+/// Handshake with the host started via `start_arc` — the RT-3
+/// change-driven announcer (like the re-announce keep-alive)
+/// captures `self_weak` at spawn time, so `start_arc` must be the
+/// FIRST start call; a bare `start()` first would spawn the loop
+/// with no weak and park it.
+async fn handshake_pair_host_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
+    let host_id = host.node_id();
+    let peer_id = peer.node_id();
+    let peer_pub = *peer.public_key();
+    let peer_addr = peer.local_addr();
+    let peer_clone = peer.clone();
+    let accept = tokio::spawn(async move { peer_clone.accept(host_id).await });
+    host.connect(peer_addr, &peer_pub, peer_id)
+        .await
+        .expect("connect failed");
+    accept
+        .await
+        .expect("accept task panicked")
+        .expect("accept failed");
+    host.start_arc();
+    peer.start();
+}
+
+/// RT-3 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): a registry mutation
+/// propagates to peers with NO explicit `announce_capabilities`
+/// call — the change-driven announcer wakes on the RT-2 signal,
+/// debounces, and broadcasts.
+#[tokio::test]
+async fn registry_change_announces_without_explicit_call() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair_host_arc(&host, &peer).await;
+
+    host.tool_registry().insert(descriptor("auto_announced"));
+
+    let filter = CapabilityFilter::default().require_tag("ai-tool:auto_announced");
+    assert!(
+        wait_until(
+            || peer.find_nodes_by_filter(&filter).contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the tool — the change-driven announcer did not fire",
+    );
+}
+
+/// RT-3: a burst of registry mutations inside one debounce window
+/// collapses into a single announce call carrying all of them.
+#[tokio::test]
+async fn registry_burst_coalesces_into_one_announce() {
+    let host = {
+        // Wide debounce so the back-to-back inserts are guaranteed
+        // to land inside one window even on a stalled CI box.
+        let cfg = test_config().with_announce_debounce(Duration::from_millis(300));
+        let keypair = EntityKeypair::generate();
+        Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
+    };
+    let peer = build_node().await;
+    handshake_pair_host_arc(&host, &peer).await;
+
+    // Assumes this host never `serve_rpc`s: `index_self_with_local_services`
+    // also bumps capability_announce_version without a broadcast, so the
+    // `+1` delta below is an exact announce-call count only for
+    // non-RPC-serving nodes (see the getter's doc, RT-3 review Finding 13).
+    let version_before = host.capability_announce_version();
+
+    host.tool_registry().insert(descriptor("burst_a"));
+    host.tool_registry().insert(descriptor("burst_b"));
+    host.tool_registry().insert(descriptor("burst_c"));
+
+    let all_visible = || {
+        ["burst_a", "burst_b", "burst_c"].iter().all(|id| {
+            let filter = CapabilityFilter::default().require_tag(format!("ai-tool:{id}"));
+            peer.find_nodes_by_filter(&filter).contains(&host.node_id())
+        })
+    };
+    assert!(
+        wait_until(all_visible, Duration::from_secs(3)).await,
+        "peer never saw the full burst",
+    );
+
+    assert_eq!(
+        host.capability_announce_version(),
+        version_before + 1,
+        "a debounced burst must produce exactly one announce call",
+    );
+}
+
+/// Handshake with the host started via a bare `start()` FIRST and
+/// then `start_arc()` — the ordering that RT-3 review Finding 7 flags.
+/// `start()` is idempotent, so the second call cannot respawn the
+/// loops; the change-driven announcer (and keep-alive) must therefore
+/// pick up the weak handle `start_arc` installs rather than having
+/// snapshotted `None` at spawn.
+async fn handshake_pair_host_bare_then_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
+    let host_id = host.node_id();
+    let peer_id = peer.node_id();
+    let peer_pub = *peer.public_key();
+    let peer_addr = peer.local_addr();
+    let peer_clone = peer.clone();
+    let accept = tokio::spawn(async move { peer_clone.accept(host_id).await });
+    host.connect(peer_addr, &peer_pub, peer_id)
+        .await
+        .expect("connect failed");
+    accept
+        .await
+        .expect("accept task panicked")
+        .expect("accept failed");
+    // The buggy ordering: bare start first, then start_arc.
+    host.start();
+    host.start_arc();
+    peer.start();
+}
+
+/// RT-3 review Finding 7: a registry mutation after `start()` then
+/// `start_arc()` must still auto-announce. Pre-fix, the change-driven
+/// announcer snapshotted `self_weak` at spawn (during the bare
+/// `start()`, when it was `None`) and parked forever, so the tool
+/// never propagated.
+#[tokio::test]
+async fn registry_change_announces_after_bare_start_then_start_arc() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair_host_bare_then_arc(&host, &peer).await;
+
+    host.tool_registry().insert(descriptor("late_started"));
+
+    let filter = CapabilityFilter::default().require_tag("ai-tool:late_started");
+    assert!(
+        wait_until(
+            || peer.find_nodes_by_filter(&filter).contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the tool — the change-driven announcer parked \
+         because start() ran before start_arc()",
+    );
+}
+
+/// RT-3 review Finding 8: a change-driven re-announce re-reads the
+/// CURRENT user-caps baseline rather than overwriting it with a stale
+/// snapshot. An explicit announce's tag and a later tool registration
+/// must therefore BOTH reach peers — pre-fix a snapshot-then-overwrite
+/// re-announce could drop the explicit baseline.
+#[tokio::test]
+async fn change_driven_reannounce_preserves_explicit_baseline() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair_host_arc(&host, &peer).await;
+
+    // Explicit baseline tag.
+    host.announce_capabilities(CapabilitySet::new().add_tag("baseline-keep"))
+        .await
+        .expect("announce baseline");
+    let base_filter = CapabilityFilter::default().require_tag("baseline-keep");
+    assert!(
+        wait_until(
+            || peer
+                .find_nodes_by_filter(&base_filter)
+                .contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the explicit baseline",
+    );
+
+    // Tool registration wakes the change-driven announcer, which
+    // re-announces the CURRENT baseline plus the new tool.
+    host.tool_registry().insert(descriptor("added_tool"));
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:added_tool");
+    assert!(
+        wait_until(
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer never saw the change-driven tool announce",
+    );
+    // The baseline tag must survive the re-announce.
+    assert!(
+        peer.find_nodes_by_filter(&base_filter)
+            .contains(&host.node_id()),
+        "the change-driven re-announce dropped the explicit baseline tag \
+         (it overwrote user_caps with a stale snapshot instead of re-reading it)",
+    );
+}
