@@ -1,5 +1,6 @@
 //! Relay delivery: store, pack, down-sample (plan §4.4) — the
-//! in-process composition of gate + continuity + interest table.
+//! in-process composition of gate + continuity + interest table,
+//! per provider-targeted branch (v4.1 Layer 2).
 //!
 //! Attestations are origin-signed, self-contained, latest-wins — a
 //! relay is a *cache with a schedule*:
@@ -14,15 +15,21 @@
 //!   latest attestation is delivered with `continuity_bearing =
 //!   false`, always — a cached Ready must never become "fresh" by
 //!   being forwarded (§4.5);
-//! - **hop-by-hop continuity** (§4.4, v3.1): a relay MUST NOT
-//!   deliver as continuity-bearing while its OWN upstream continuity
-//!   for the key is Unestablished or Expired. The flag is local
-//!   delivery metadata on the relay→downstream envelope (which the
-//!   relay authors and the session authenticates) — never a field
-//!   inside the origin-signed attestation. Establishment therefore
+//! - **hop-by-hop continuity** (§4.4): a relay MUST NOT deliver as
+//!   continuity-bearing while its OWN upstream continuity for the
+//!   branch is Unestablished or Expired. The flag is local delivery
+//!   metadata on the relay→downstream envelope (which the relay
+//!   authors and the session authenticates) — never a field inside
+//!   the origin-signed attestation. Establishment therefore
 //!   propagates hop-by-hop from the live origin stream, and a chain
 //!   of staggered caches cannot manufacture apparent
 //!   post-registration continuity (SI-0 test 13).
+//!
+//! Layer discipline (v4.1, plan §3.5): everything here moves
+//! provider *observations* — signed proofs — between hops. Nothing
+//! here computes or forwards a capability-level verdict: budgets
+//! make viability consumer-relative, so the result-mode aggregate
+//! lives with the Layer-1 controller at each consumer.
 //!
 //! SI-0 note: [`Attestation`] here is the semantic object; its
 //! `fingerprint` stands in for the digest of the signed wire bytes
@@ -35,7 +42,10 @@ use std::time::{Duration, Instant};
 use super::continuity::{
     AttestedStatus, Continuity, DeliveredBeat, ObservationCell, ProjectedReadiness,
 };
-use super::identity::{AudienceScopeCommitment, Digest256, ReadinessKey};
+use super::identity::{
+    AudienceScopeCommitment, CapabilityInterestKey, Digest256, ProviderInterestKey,
+    ProviderObservationKey,
+};
 use super::incarnation::{Incarnation, IncarnationSeqGate};
 use super::table::{DownstreamId, InterestTable, RegisterOutcome};
 
@@ -44,17 +54,19 @@ use super::table::{DownstreamId, InterestTable, RegisterOutcome};
 /// delay, never alter.
 #[derive(Clone, Debug)]
 pub struct Attestation {
-    /// Provider node id.
-    pub origin: u64,
+    /// The full observation identity: interest + provider + the
+    /// provider's own announce generation.
+    pub key: ProviderObservationKey,
     /// Signed boot epoch (§4.6).
     pub origin_incarnation: Incarnation,
-    /// The full conditional identity this attests.
-    pub key: ReadinessKey,
     /// Signed status.
     pub status: AttestedStatus,
-    /// Signed time-to-start estimate.
+    /// Signed time-to-start estimate — a PROVIDER-side quantity;
+    /// each consumer adds its own route estimate against its own
+    /// budget (§3.3).
     pub estimated_start: Option<Duration>,
-    /// Signed per-(incarnation, interest) sequence number.
+    /// Signed per-(incarnation, interest) sequence number
+    /// (generation-independent, §3.4).
     pub seq: u64,
     /// Signed emission cadence for the aggregated branch.
     pub promised_cadence: Duration,
@@ -67,20 +79,19 @@ impl Attestation {
     /// Build an attestation, deriving the fingerprint from the
     /// signed fields (two emitters producing different payloads for
     /// one (incarnation, seq) therefore collide at the gate — §4.6).
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        origin: u64,
+        key: ProviderObservationKey,
         origin_incarnation: Incarnation,
-        key: ReadinessKey,
         status: AttestedStatus,
         estimated_start: Option<Duration>,
         seq: u64,
         promised_cadence: Duration,
     ) -> Self {
         let mut hasher = blake3::Hasher::new_derive_key("net.sensing.attestation.fingerprint.v1");
-        hasher.update(&origin.to_le_bytes());
+        hasher.update(&key.provider.to_le_bytes());
+        hasher.update(&key.capability_generation.to_le_bytes());
         hasher.update(&origin_incarnation.get().to_le_bytes());
-        hasher.update(key.interest_digest.as_bytes());
+        hasher.update(key.interest.interest_digest.as_bytes());
         hasher.update(&[match status {
             AttestedStatus::Ready => 0u8,
             AttestedStatus::NotReady => 1,
@@ -96,9 +107,8 @@ impl Attestation {
         hasher.update(&promised_cadence.as_nanos().to_le_bytes());
         let fingerprint = Digest256::from_bytes(*hasher.finalize().as_bytes());
         Self {
-            origin,
-            origin_incarnation,
             key,
+            origin_incarnation,
             status,
             estimated_start,
             seq,
@@ -107,11 +117,17 @@ impl Attestation {
         }
     }
 
+    /// The routed branch this attestation answers.
+    pub fn branch(&self) -> ProviderInterestKey {
+        ProviderInterestKey::new(self.key.interest.clone(), self.key.provider)
+    }
+
     fn as_beat(&self, continuity_bearing: bool) -> DeliveredBeat {
         DeliveredBeat {
             attested_status: self.status,
             estimated_start: self.estimated_start,
             source_incarnation: self.origin_incarnation,
+            capability_generation: self.key.capability_generation,
             seq: self.seq,
             promised_cadence: self.promised_cadence,
             continuity_bearing,
@@ -134,8 +150,8 @@ pub struct Delivery {
 }
 
 struct RelayKeyState {
-    /// The relay's OWN continuity toward the origin — the hop rule's
-    /// input.
+    /// The relay's OWN continuity toward the provider — the hop
+    /// rule's input.
     upstream: ObservationCell,
     /// Latest admitted attestation (the cache; never history).
     cached: Option<Attestation>,
@@ -151,16 +167,17 @@ struct DeliverySlot {
 }
 
 /// An in-process sensing relay: seq gate + own upstream continuity +
-/// interest table + per-downstream delivery schedule. SI-2/SI-4 wire
-/// this onto real sessions; the semantics are frozen here.
+/// interest table + per-downstream delivery schedule, all per
+/// provider-targeted branch ([`ProviderInterestKey`]). SI-2/SI-4
+/// wire this onto real sessions; the semantics are frozen here.
 pub struct SensingRelay {
     factor: u32,
     gate: IncarnationSeqGate,
     /// The per-hop interest table (public: the harness drives
     /// registration outcomes/upstream actions through it).
     pub table: InterestTable,
-    keys: HashMap<ReadinessKey, RelayKeyState>,
-    slots: HashMap<(ReadinessKey, DownstreamId), DeliverySlot>,
+    keys: HashMap<ProviderInterestKey, RelayKeyState>,
+    slots: HashMap<(ProviderInterestKey, DownstreamId), DeliverySlot>,
 }
 
 impl SensingRelay {
@@ -176,17 +193,17 @@ impl SensingRelay {
         }
     }
 
-    /// Register (or refresh) a downstream and warm-start it from the
-    /// cache: every registration re-sends the cached latest per key
-    /// (anti-entropy for forwards lost in transit; the downstream's
-    /// gate absorbs duplicates as StaleSeq) — ALWAYS as provisional
-    /// (`continuity_bearing = false`), regardless of the relay's own
-    /// continuity: the downstream's optimism must be earned by a
-    /// subsequent live beat, never seeded by a cache (§4.4).
-    #[allow(clippy::too_many_arguments)]
+    /// Register (or refresh) a downstream on a branch and warm-start
+    /// it from the cache: every registration re-sends the cached
+    /// latest (anti-entropy for forwards lost in transit; the
+    /// downstream's gate absorbs duplicates as StaleSeq) — ALWAYS as
+    /// provisional (`continuity_bearing = false`), regardless of the
+    /// relay's own continuity: the downstream's optimism must be
+    /// earned by a subsequent live beat, never seeded by a cache
+    /// (§4.4).
     pub fn register_downstream(
         &mut self,
-        key: &ReadinessKey,
+        key: &ProviderInterestKey,
         downstream: DownstreamId,
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
@@ -221,11 +238,6 @@ impl SensingRelay {
                 next_due: now,
                 pending: false,
             });
-        // Every registration — including a ttl/2 refresh — re-sends
-        // the cached latest. That is the anti-entropy for a forward
-        // lost in transit (the relay's slot believed it delivered);
-        // a downstream that already holds the beat absorbs the
-        // duplicate at its gate as StaleSeq.
         let warm_start = state.cached.as_ref().map(|cached| {
             slot.last_status = Some(cached.status);
             slot.last_delivered = Some((cached.origin_incarnation, cached.seq));
@@ -251,15 +263,16 @@ impl SensingRelay {
         attestation: &Attestation,
         upstream_bearing: bool,
     ) -> Vec<Delivery> {
-        let Some(state) = self.keys.get_mut(&attestation.key) else {
+        let branch = attestation.branch();
+        let Some(state) = self.keys.get_mut(&branch) else {
             // No registered interest — no idle work, no cache.
             return Vec::new();
         };
         if !self
             .gate
             .admit(
-                attestation.origin,
-                attestation.key.interest_digest,
+                attestation.key.provider,
+                attestation.key.interest.interest_digest,
                 attestation.origin_incarnation,
                 attestation.seq,
                 attestation.fingerprint,
@@ -272,19 +285,19 @@ impl SensingRelay {
             .upstream
             .on_admitted_beat(now, attestation.as_beat(upstream_bearing));
         self.table
-            .set_upstream_continuity(&attestation.key, state.upstream.continuity());
+            .set_upstream_continuity(&branch, state.upstream.continuity());
         state.cached = Some(attestation.clone());
 
         // The hop rule: outgoing bearing derives from the relay's OWN
         // continuity, never from the incoming flag alone.
         let bearing = state.upstream.continuity() == Continuity::Established;
         let mut deliveries = Vec::new();
-        for downstream in self.table.downstreams(&attestation.key, now) {
-            let Some(row) = self.table.downstream_entry(&attestation.key, downstream) else {
+        for downstream in self.table.downstreams(&branch, now) {
+            let Some(row) = self.table.downstream_entry(&branch, downstream) else {
                 continue;
             };
             let interval = row.requested_sample_interval;
-            let Some(slot) = self.slots.get_mut(&(attestation.key.clone(), downstream)) else {
+            let Some(slot) = self.slots.get_mut(&(branch.clone(), downstream)) else {
                 continue;
             };
             let edge = slot.last_status != Some(attestation.status);
@@ -345,20 +358,22 @@ impl SensingRelay {
         deliveries
     }
 
-    /// The relay's own upstream continuity for a key (test
+    /// The relay's own upstream continuity for a branch (test
     /// introspection).
-    pub fn upstream_continuity(&self, key: &ReadinessKey) -> Option<Continuity> {
+    pub fn upstream_continuity(&self, key: &ProviderInterestKey) -> Option<Continuity> {
         self.keys.get(key).map(|state| state.upstream.continuity())
     }
 }
 
 /// A terminal consumer: seq gate + one `ObservationCell` per
-/// registered key. This is the shape SI-4's fold-overlay apply layer
-/// takes; kept minimal here.
+/// registered branch. The Layer-1 controller reads
+/// [`Self::branch_projections`] to compute its LOCAL result-mode
+/// aggregate (plan §3.5); this type deliberately has no aggregate
+/// opinion of its own.
 pub struct SensingConsumer {
     factor: u32,
     gate: IncarnationSeqGate,
-    cells: HashMap<ReadinessKey, ObservationCell>,
+    cells: HashMap<ProviderInterestKey, ObservationCell>,
 }
 
 impl SensingConsumer {
@@ -371,8 +386,14 @@ impl SensingConsumer {
         }
     }
 
-    /// Register interest in a key at this consumer's own D.
-    pub fn register_interest(&mut self, key: &ReadinessKey, own_interval: Duration, now: Instant) {
+    /// Register interest in a resolved branch at this consumer's
+    /// own D.
+    pub fn register_interest(
+        &mut self,
+        key: &ProviderInterestKey,
+        own_interval: Duration,
+        now: Instant,
+    ) {
         self.cells.insert(
             key.clone(),
             ObservationCell::register(now, own_interval, self.factor),
@@ -382,14 +403,14 @@ impl SensingConsumer {
     /// Ingest one delivery: gate first, then the continuity cell.
     pub fn on_delivery(&mut self, now: Instant, delivery: &Delivery) {
         let attestation = &delivery.attestation;
-        let Some(cell) = self.cells.get_mut(&attestation.key) else {
+        let Some(cell) = self.cells.get_mut(&attestation.branch()) else {
             return;
         };
         if !self
             .gate
             .admit(
-                attestation.origin,
-                attestation.key.interest_digest,
+                attestation.key.provider,
+                attestation.key.interest.interest_digest,
                 attestation.origin_incarnation,
                 attestation.seq,
                 attestation.fingerprint,
@@ -401,23 +422,42 @@ impl SensingConsumer {
         cell.on_admitted_beat(now, attestation.as_beat(delivery.continuity_bearing));
     }
 
-    /// Drive the clock across every registered key.
+    /// Drive the clock across every registered branch.
     pub fn poll(&mut self, now: Instant) {
         for cell in self.cells.values_mut() {
             cell.expire_if_due(now);
         }
     }
 
-    /// Current projection for a key (unregistered → Unknown).
-    pub fn projected(&self, key: &ReadinessKey) -> ProjectedReadiness {
+    /// Current projection for a branch (unregistered → Unknown).
+    pub fn projected(&self, key: &ProviderInterestKey) -> ProjectedReadiness {
         self.cells
             .get(key)
             .map(ObservationCell::projected)
             .unwrap_or(ProjectedReadiness::Unknown)
     }
 
-    /// The cell for a key (test introspection).
-    pub fn cell(&self, key: &ReadinessKey) -> Option<&ObservationCell> {
+    /// Per-provider projections (+ provider start estimates) for one
+    /// capability interest — the Layer-1 aggregate's input (§3.5).
+    pub fn branch_projections(
+        &self,
+        interest: &CapabilityInterestKey,
+    ) -> Vec<(u64, ProjectedReadiness, Option<Duration>)> {
+        self.cells
+            .iter()
+            .filter(|(key, _)| &key.interest == interest)
+            .map(|(key, cell)| {
+                (
+                    key.provider,
+                    cell.projected(),
+                    cell.observation().and_then(|obs| obs.estimated_start),
+                )
+            })
+            .collect()
+    }
+
+    /// The cell for a branch (test introspection).
+    pub fn cell(&self, key: &ProviderInterestKey) -> Option<&ObservationCell> {
         self.cells.get(key)
     }
 }
@@ -425,12 +465,14 @@ impl SensingConsumer {
 #[cfg(test)]
 mod tests {
     use super::super::identity::{
-        CanonicalConstraints, CapabilityId, DisclosureClass, InterestSpec, WorkLatencyEnvelope,
+        CanonicalConstraints, CapabilityId, DisclosureClass, InterestSpec, ProviderSelector,
+        ResultMode, WorkLatencyEnvelope,
     };
     use super::*;
 
     const K: u32 = 3;
     const ORIGIN: u64 = 0xE0;
+    const GEN: u64 = 4;
     const TTL: Duration = Duration::from_secs(30);
     const CADENCE: Duration = Duration::from_millis(100);
 
@@ -442,16 +484,17 @@ mod tests {
         AudienceScopeCommitment::from_bytes([0xAA; 32])
     }
 
-    fn key_for(fps: &str) -> ReadinessKey {
+    fn key_for(fps: &str) -> ProviderInterestKey {
         let spec = InterestSpec {
             capability_id: CapabilityId::new("video.transcode"),
-            capability_generation: 4,
             constraints: CanonicalConstraints::from_entries([("fps", fps)]).unwrap(),
-            work_latency: WorkLatencyEnvelope { max_start: ms(200) },
+            work_latency: WorkLatencyEnvelope::start_within(ms(200)),
+            providers: ProviderSelector::AnyAuthorized,
+            result_mode: ResultMode::Any,
             disclosure_class: DisclosureClass::Owner,
             audience: root(),
         };
-        ReadinessKey::for_interest(ORIGIN, &spec)
+        ProviderInterestKey::new(spec.key(), ORIGIN)
     }
 
     /// Scripted origin: emits live attestations with its own
@@ -469,12 +512,11 @@ mod tests {
             }
         }
 
-        fn emit(&mut self, key: &ReadinessKey, status: AttestedStatus) -> Attestation {
+        fn emit(&mut self, key: &ProviderInterestKey, status: AttestedStatus) -> Attestation {
             self.seq += 1;
             Attestation::new(
-                ORIGIN,
+                ProviderObservationKey::new(key.interest.clone(), key.provider, GEN),
                 self.incarnation,
-                key.clone(),
                 status,
                 None,
                 self.seq,
@@ -620,13 +662,11 @@ mod tests {
             // The loose watcher's own D dominates its window
             // (3 × 500ms) — down-sampled delivery must never
             // false-Unknown it.
-            if tick >= 1 {
-                assert_eq!(
-                    watcher_b.projected(&key),
-                    ProjectedReadiness::Ready,
-                    "loose watcher false-Unknowned at tick {tick}",
-                );
-            }
+            assert_eq!(
+                watcher_b.projected(&key),
+                ProjectedReadiness::Ready,
+                "loose watcher false-Unknowned at tick {tick}",
+            );
         }
         assert_eq!(count_a, 10, "strict watcher sees the full cadence");
         assert_eq!(

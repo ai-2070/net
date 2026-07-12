@@ -1,7 +1,7 @@
 //! Per-hop interest table — per-downstream soft state (plan §4.3)
 //! and cadence-refusal partitioning (plan §4.4).
 //!
-//! Each downstream owns its own entry per `ReadinessKey` and expires
+//! Each downstream owns its own entry per `ProviderInterestKey` and expires
 //! independently (refresh at ttl/2, dropped after 2 missed refreshes
 //! — one shared expiry would let a refreshing A keep a silent C
 //! subscribed). Aggregates — the strictest D, whether upstream
@@ -13,11 +13,16 @@
 //! pure forwarder; coalescing activates only where fan-in meets, and
 //! this table is itself the fan-in measurement.
 //!
-//! The table key is the full [`ReadinessKey`] — the interest digest
-//! already binds disclosure class and audience commitment, so
-//! interests belonging to different audiences land in different
-//! entries **structurally** (plan §4.9); no aggregation code path
-//! can merge them.
+//! The table key is the [`ProviderInterestKey`] — the routed
+//! coalescing unit (plan §3.2, v4.1): one entry per provider-targeted
+//! branch, and the interest digest inside it binds disclosure class
+//! and audience commitment, so interests belonging to different
+//! audiences land in different entries **structurally** (plan
+//! §4.10); no aggregation code path can merge them. This table is a
+//! Layer-2 object: it tracks per-downstream demand for a branch and
+//! NEVER reasons about capability-level aggregates — a branch entry
+//! dies when its last downstream row dies, not when some relay
+//! decides `Any` is satisfied (plan §3.5).
 //!
 //! Refusal partitioning (plan §4.4): one impossible subscriber must
 //! not poison a satisfiable aggregate. On
@@ -26,15 +31,14 @@
 //! refuse and the satisfiable aggregate to re-register (exactly
 //! once — M is cached against refusal/retry loops), and locally
 //! refuses late joiners below the cached floor without a provider
-//! round-trip. The cached M invalidates on provider incarnation
-//! change; a generation change produces a NEW ReadinessKey (the
-//! digest binds the generation), so its cache dies structurally.
+//! round-trip. The cached M invalidates on that provider's
+//! incarnation change (the floor may have changed with it).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::continuity::Continuity;
-use super::identity::{AudienceScopeCommitment, ReadinessKey};
+use super::identity::{AudienceScopeCommitment, ProviderInterestKey};
 
 /// Who registered an interest at this hop: the node's own consumer
 /// or a downstream peer session.
@@ -126,7 +130,7 @@ struct InterestEntry {
 /// The per-hop interest table (plan §4.3).
 #[derive(Debug)]
 pub struct InterestTable {
-    entries: HashMap<ReadinessKey, InterestEntry>,
+    entries: HashMap<ProviderInterestKey, InterestEntry>,
     /// Live (key, downstream) rows per downstream, for the cap.
     per_downstream: HashMap<DownstreamId, usize>,
     max_interests_per_peer: usize,
@@ -144,7 +148,7 @@ impl InterestTable {
     }
 
     /// Strictest live D for a key — the derived upstream aggregate.
-    pub fn aggregate(&self, key: &ReadinessKey, now: Instant) -> Option<Duration> {
+    pub fn aggregate(&self, key: &ProviderInterestKey, now: Instant) -> Option<Duration> {
         self.entries.get(key).and_then(|entry| {
             entry
                 .downstreams
@@ -160,7 +164,7 @@ impl InterestTable {
     /// independently.
     pub fn register(
         &mut self,
-        key: &ReadinessKey,
+        key: &ProviderInterestKey,
         downstream: DownstreamId,
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
@@ -217,8 +221,8 @@ impl InterestTable {
     /// Drop expired downstream rows everywhere and report the keys
     /// whose upstream aggregate consequently changed. Empty entries
     /// (and their cached floors) are removed entirely.
-    pub fn expire(&mut self, now: Instant) -> Vec<(ReadinessKey, UpstreamAction)> {
-        let keys: Vec<ReadinessKey> = self.entries.keys().cloned().collect();
+    pub fn expire(&mut self, now: Instant) -> Vec<(ProviderInterestKey, UpstreamAction)> {
+        let keys: Vec<ProviderInterestKey> = self.entries.keys().cloned().collect();
         let mut actions = Vec::new();
         for key in keys {
             let Some(entry) = self.entries.get_mut(&key) else {
@@ -249,8 +253,8 @@ impl InterestTable {
         &mut self,
         downstream: DownstreamId,
         now: Instant,
-    ) -> Vec<(ReadinessKey, UpstreamAction)> {
-        let keys: Vec<ReadinessKey> = self
+    ) -> Vec<(ProviderInterestKey, UpstreamAction)> {
+        let keys: Vec<ProviderInterestKey> = self
             .entries
             .iter()
             .filter(|(_, entry)| entry.downstreams.contains_key(&downstream))
@@ -277,7 +281,7 @@ impl InterestTable {
     /// exactly once; a duplicate refusal at the same M is absorbed.
     pub fn on_refusal(
         &mut self,
-        key: &ReadinessKey,
+        key: &ProviderInterestKey,
         minimum_supported: Duration,
         now: Instant,
     ) -> RefusalPartition {
@@ -310,11 +314,12 @@ impl InterestTable {
         RefusalPartition { refused, upstream }
     }
 
-    /// Provider incarnation change: the floor may have changed with
-    /// it — every cached M for that provider is invalidated (plan
-    /// §4.4). Generation changes need no counterpart here: they mint
-    /// a new ReadinessKey, so the old entry (and cache) dies whole.
-    pub fn on_provider_incarnation_change(&mut self, provider: u64) {
+    /// Provider incarnation OR generation change: the floor may have
+    /// changed with either (a restart reconfigures, a redefinition
+    /// re-specs), so every cached M for that provider is invalidated
+    /// (plan §4.4/§4.8). The branch entries themselves survive — the
+    /// routed key binds neither epoch (v4.1 §3.2).
+    pub fn invalidate_provider_floors(&mut self, provider: u64) {
         for (key, entry) in self.entries.iter_mut() {
             if key.provider == provider {
                 entry.refused_minimum = None;
@@ -324,27 +329,27 @@ impl InterestTable {
 
     /// The relay's own upstream continuity for a key (plan §4.3) —
     /// read by the delivery layer's hop rule.
-    pub fn upstream_continuity(&self, key: &ReadinessKey) -> Option<Continuity> {
+    pub fn upstream_continuity(&self, key: &ProviderInterestKey) -> Option<Continuity> {
         self.entries.get(key).map(|entry| entry.upstream_continuity)
     }
 
     /// Update the stored upstream continuity (driven by the relay's
     /// own `ObservationCell` for the key).
-    pub fn set_upstream_continuity(&mut self, key: &ReadinessKey, continuity: Continuity) {
+    pub fn set_upstream_continuity(&mut self, key: &ProviderInterestKey, continuity: Continuity) {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.upstream_continuity = continuity;
         }
     }
 
     /// The cached provider floor for a key, if any.
-    pub fn cached_floor(&self, key: &ReadinessKey) -> Option<Duration> {
+    pub fn cached_floor(&self, key: &ProviderInterestKey) -> Option<Duration> {
         self.entries
             .get(key)
             .and_then(|entry| entry.refused_minimum)
     }
 
     /// Live downstream ids for a key (delivery fan-out, SI-0f).
-    pub fn downstreams(&self, key: &ReadinessKey, now: Instant) -> Vec<DownstreamId> {
+    pub fn downstreams(&self, key: &ProviderInterestKey, now: Instant) -> Vec<DownstreamId> {
         self.entries
             .get(key)
             .map(|entry| {
@@ -361,7 +366,7 @@ impl InterestTable {
     /// One downstream's live row for a key (delivery scheduling).
     pub fn downstream_entry(
         &self,
-        key: &ReadinessKey,
+        key: &ProviderInterestKey,
         downstream: DownstreamId,
     ) -> Option<&DownstreamEntry> {
         self.entries
@@ -382,7 +387,7 @@ impl InterestTable {
 
     /// Diff the recomputed live aggregate against what upstream was
     /// last told, record the new value, and report the delta.
-    fn action_for(&mut self, key: &ReadinessKey, now: Instant) -> UpstreamAction {
+    fn action_for(&mut self, key: &ProviderInterestKey, now: Instant) -> UpstreamAction {
         let Some(entry) = self.entries.get_mut(key) else {
             return UpstreamAction::None;
         };
@@ -414,7 +419,7 @@ impl InterestTable {
         }
     }
 
-    fn drop_if_empty(&mut self, key: &ReadinessKey) {
+    fn drop_if_empty(&mut self, key: &ProviderInterestKey) {
         let empty = self
             .entries
             .get(key)
@@ -428,7 +433,8 @@ impl InterestTable {
 #[cfg(test)]
 mod tests {
     use super::super::identity::{
-        CanonicalConstraints, CapabilityId, DisclosureClass, InterestSpec, WorkLatencyEnvelope,
+        CanonicalConstraints, CapabilityId, DisclosureClass, InterestSpec, ProviderSelector,
+        ResultMode, WorkLatencyEnvelope,
     };
     use super::*;
 
@@ -438,21 +444,20 @@ mod tests {
         AudienceScopeCommitment::from_bytes([byte; 32])
     }
 
-    fn key_with_audience(byte: u8) -> ReadinessKey {
+    fn key_with_audience(byte: u8) -> ProviderInterestKey {
         let spec = InterestSpec {
             capability_id: CapabilityId::new("video.transcode"),
-            capability_generation: 4,
             constraints: CanonicalConstraints::from_entries([("fps", "60")]).unwrap(),
-            work_latency: WorkLatencyEnvelope {
-                max_start: Duration::from_millis(200),
-            },
+            work_latency: WorkLatencyEnvelope::start_within(Duration::from_millis(200)),
+            providers: ProviderSelector::AnyAuthorized,
+            result_mode: ResultMode::Any,
             disclosure_class: DisclosureClass::Owner,
             audience: root(byte),
         };
-        ReadinessKey::for_interest(PROVIDER, &spec)
+        ProviderInterestKey::new(spec.key(), PROVIDER)
     }
 
-    fn key() -> ReadinessKey {
+    fn key() -> ProviderInterestKey {
         key_with_audience(0xAA)
     }
 
@@ -579,17 +584,17 @@ mod tests {
     }
 
     #[test]
-    fn cached_floor_invalidates_on_provider_incarnation_change() {
-        // SI-0 test 15 tail: the provider restarted — its floor may
-        // have changed, so the cached M must not keep refusing
-        // locally on stale grounds.
+    fn cached_floor_invalidates_on_provider_epoch_change() {
+        // SI-0 test 15 tail: the provider restarted (or redefined
+        // the capability) — its floor may have changed, so the
+        // cached M must not keep refusing locally on stale grounds.
         let now = Instant::now();
         let mut table = InterestTable::new(512);
         table.register(&key(), DownstreamId::Peer(1), ms(100), TTL, root(0xAA), now);
         table.on_refusal(&key(), ms(50), now);
         assert_eq!(table.cached_floor(&key()), Some(ms(50)));
 
-        table.on_provider_incarnation_change(PROVIDER);
+        table.invalidate_provider_floors(PROVIDER);
         assert_eq!(table.cached_floor(&key()), None);
         // A 30ms joiner now goes through to the provider again.
         assert_eq!(
@@ -659,7 +664,7 @@ mod tests {
         table.register(&key_b, leaving, ms(50), TTL, root(2), now);
 
         let mut actions = table.remove_downstream(leaving, now);
-        actions.sort_by_key(|(key, _)| key.interest_digest.as_bytes().to_vec());
+        actions.sort_by_key(|(key, _)| key.interest.interest_digest.as_bytes().to_vec());
         let mut expected = vec![
             (
                 key_a.clone(),
@@ -667,7 +672,7 @@ mod tests {
             ),
             (key_b.clone(), UpstreamAction::Deregister),
         ];
-        expected.sort_by_key(|(key, _)| key.interest_digest.as_bytes().to_vec());
+        expected.sort_by_key(|(key, _)| key.interest.interest_digest.as_bytes().to_vec());
         assert_eq!(actions, expected);
         assert_eq!(table.len(), 1);
     }

@@ -38,12 +38,16 @@ pub const DEFAULT_ATTESTATION_CADENCE_FLOOR: Duration = Duration::from_millis(50
 /// freezes these parameters — SI-3 binds the fold's capability entry
 /// to them when the origin emitter lands; the entry adds context,
 /// never replaces a parameter.
+///
+/// v4: there is deliberately NO generation parameter — a
+/// capability-directed interest cannot bind one provider's
+/// generation (plan §3.2). The provider always evaluates against
+/// its CURRENT generation and stamps that generation into the
+/// signed attestation, where the observation key binds it.
 #[derive(Clone, Copy, Debug)]
 pub struct EvaluationRequest<'a> {
     /// Capability the predicate targets.
     pub capability_id: &'a CapabilityId,
-    /// The announce generation the interest was compiled against.
-    pub capability_generation: u64,
     /// Work characteristics C (already digest-validated).
     pub constraints: &'a CanonicalConstraints,
     /// Latency envelope L.
@@ -246,7 +250,6 @@ mod tests {
     ) -> EvaluationRequest<'a> {
         EvaluationRequest {
             capability_id,
-            capability_generation: 3,
             constraints,
             work_latency,
         }
@@ -255,9 +258,7 @@ mod tests {
     #[test]
     fn evaluator_contract_round_trips_through_a_real_impl() {
         let id = CapabilityId::new("job.run");
-        let latency = WorkLatencyEnvelope {
-            max_start: Duration::from_millis(100),
-        };
+        let latency = WorkLatencyEnvelope::start_within(Duration::from_millis(100));
         let ok = CanonicalConstraints::from_entries([("max_load", "50")]).unwrap();
         let alien = CanonicalConstraints::from_entries([("gpu_class", "h100")]).unwrap();
 

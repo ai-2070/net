@@ -123,6 +123,10 @@ pub struct ReadinessObservation {
     pub estimated_start: Option<Duration>,
     /// Boot epoch the attestation was signed under.
     pub source_incarnation: Incarnation,
+    /// The provider's announce generation the attestation was signed
+    /// under (v4.1: generation is attested content — the interest
+    /// never binds it, and continuity never crosses it, §3.4).
+    pub capability_generation: u64,
     /// Seq of the latest admitted beat (post-gate).
     pub last_seq: u64,
     /// The emission cadence the provider signed for this branch.
@@ -154,6 +158,8 @@ pub struct DeliveredBeat {
     pub estimated_start: Option<Duration>,
     /// Signed boot epoch.
     pub source_incarnation: Incarnation,
+    /// Signed provider announce generation.
+    pub capability_generation: u64,
     /// Signed sequence number.
     pub seq: u64,
     /// Signed emission cadence.
@@ -219,10 +225,20 @@ impl ObservationCell {
     /// - Continuity never carries across an incarnation boundary: a
     ///   warm-started beat from a NEW incarnation expires the cell
     ///   (§4.7) until the new stream itself establishes.
+    /// - Continuity never carries across a GENERATION boundary
+    ///   either (v4.1, §3.4) — but a generation change is a
+    ///   *redefinition*, not a failure signal: the cell resets to a
+    ///   fresh observation (Unestablished, establishment deadline
+    ///   restarted), so a warm-started NotReady under the new
+    ///   generation still projects (pessimism is safe) while a
+    ///   warm-started Ready must earn continuity anew.
     pub fn on_admitted_beat(&mut self, now: Instant, beat: DeliveredBeat) {
         let crossed_incarnation = self
             .observation
             .is_some_and(|obs| obs.source_incarnation != beat.source_incarnation);
+        let crossed_generation = self
+            .observation
+            .is_some_and(|obs| obs.capability_generation != beat.capability_generation);
 
         if beat.continuity_bearing {
             self.continuity = Continuity::Established;
@@ -231,12 +247,17 @@ impl ObservationCell {
         } else if crossed_incarnation && self.continuity == Continuity::Established {
             self.continuity = Continuity::Expired;
             self.last_disrupt = Some(DisruptReason::IncarnationSuperseded);
+        } else if crossed_generation {
+            self.continuity = Continuity::Unestablished;
+            self.deadline = now + self.own_interval.saturating_mul(self.factor);
+            self.last_disrupt = Some(DisruptReason::GenerationChanged);
         }
 
         self.observation = Some(ReadinessObservation {
             attested_status: beat.attested_status,
             estimated_start: beat.estimated_start,
             source_incarnation: beat.source_incarnation,
+            capability_generation: beat.capability_generation,
             last_seq: beat.seq,
             promised_cadence: beat.promised_cadence,
             continuity: self.continuity,
@@ -302,10 +323,52 @@ mod tests {
             attested_status: status,
             estimated_start: None,
             source_incarnation: Incarnation::new(1),
+            capability_generation: 4,
             seq,
             promised_cadence: Duration::from_millis(100),
             continuity_bearing: bearing,
         }
+    }
+
+    #[test]
+    fn generation_change_starts_a_fresh_observation() {
+        // v4.1 §3.4: continuity never crosses a generation change,
+        // but the change is a redefinition, not a failure — the cell
+        // resets to Unestablished with a restarted establishment
+        // deadline.
+        let t0 = Instant::now();
+        let mut cell = ObservationCell::register(t0, D, K);
+        cell.on_admitted_beat(t0, beat(10, AttestedStatus::Ready, true));
+        assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+
+        // Warm-started Ready under the NEW generation: optimism must
+        // be earned anew.
+        let mut regen = beat(11, AttestedStatus::Ready, false);
+        regen.capability_generation = 5;
+        cell.on_admitted_beat(t0 + D, regen);
+        assert_eq!(cell.continuity(), Continuity::Unestablished);
+        assert_eq!(cell.projected(), ProjectedReadiness::Unknown);
+        assert_eq!(cell.last_disrupt(), Some(DisruptReason::GenerationChanged));
+
+        // The restarted establishment deadline still fires (stale
+        // pessimism/optimism cannot sit forever)…
+        cell.expire_if_due(t0 + D + D * K);
+        assert_eq!(cell.continuity(), Continuity::Expired);
+
+        // …and a live beat under the new generation establishes.
+        let mut live = beat(12, AttestedStatus::Ready, true);
+        live.capability_generation = 5;
+        cell.on_admitted_beat(t0 + D * 5, live);
+        assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+
+        // The NotReady polarity: a fresh-generation warm-started
+        // NotReady projects immediately (pessimism is safe).
+        let mut pessimist = ObservationCell::register(t0, D, K);
+        pessimist.on_admitted_beat(t0, beat(1, AttestedStatus::NotReady, true));
+        let mut regen_nr = beat(2, AttestedStatus::NotReady, false);
+        regen_nr.capability_generation = 5;
+        pessimist.on_admitted_beat(t0 + D, regen_nr);
+        assert_eq!(pessimist.projected(), ProjectedReadiness::NotReady);
     }
 
     #[test]

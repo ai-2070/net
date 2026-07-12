@@ -1,21 +1,32 @@
-//! Conditional readiness identity (plan §3.1–§3.3).
+//! Capability sensing identity (plan §3.1–§3.3, v4.1).
 //!
-//! All sensing state — wire, table, fold overlay — is keyed by the
-//! FULL conditional sensing identity ([`ReadinessKey`]), never less.
+//! Two semantic levels, one routed unit:
+//!
+//! - [`CapabilityInterestKey`] — what the consumer wants: the
+//!   capability, constraints C, provider-evaluated latency L,
+//!   provider selector, result mode, and disclosure/audience. NO
+//!   provider, NO generation. Drives local dedup, candidate
+//!   resolution, aggregate projection, and branch lifecycle.
+//! - [`ProviderInterestKey`] — the routed coalescing unit (interest
+//!   plus resolved provider). The ONLY key entering the Layer-2
+//!   table; it routes via `next_hop(provider)`, so the aggregation
+//!   tree exists.
+//! - [`ProviderObservationKey`] — interest plus provider plus THAT
+//!   provider's announce generation: what attestations, caches, and
+//!   continuity key on.
+//!
 //! Two interests against the same capability (720p@30 vs 4K@60) are
 //! two keys, two observations, two lifecycles: one going Unknown
 //! never touches the other and never suspends the capability entry.
+//! The identity is 256-bit and domain-separated — a 64-bit key is an
+//! adversarial-collision hazard when it *merges* interests.
 //!
-//! The identity is 256-bit and domain-separated. A 64-bit key is an
-//! adversarial-collision hazard when it *merges* interests; short
-//! indices may be derived for local tables but are never the wire or
-//! semantic identity.
-//!
-//! Three time dimensions, three rules (plan §3.3):
+//! Time dimensions (plan §3.3):
 //!
 //! | dimension | rule |
 //! |---|---|
-//! | `work_latency` (L) | part of the readiness predicate — exact match, inside the digest |
+//! | `work_latency` (L) | provider-evaluated predicate dims — exact match, inside the digest |
+//! | `consumer_budget` | consumer-local end-to-end acceptance — NOT identity, NOT wire |
 //! | `requested_sample_interval` (D) | min-dominance upstream — deliberately NOT in the digest |
 //! | `soft_state_ttl` | per-downstream subscription lifetime — says nothing about evidence |
 //!
@@ -73,10 +84,10 @@ impl fmt::Debug for Digest256 {
 }
 
 /// The capability a readiness interest targets — the fold's
-/// capability name, canonicalized as its UTF-8 bytes. Paired with
-/// [`ReadinessKey::capability_generation`] (the announcement's
-/// per-origin monotonic `version`) so a readiness identity can never
-/// straddle a capability redefinition.
+/// capability name, canonicalized as its UTF-8 bytes. Observations
+/// pair it with the answering provider's announce generation
+/// ([`ProviderObservationKey::capability_generation`]) so no
+/// observation ever straddles a capability redefinition.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct CapabilityId(String);
 
@@ -153,22 +164,74 @@ impl fmt::Debug for AudienceScopeCommitment {
     }
 }
 
-/// The latency envelope L — "can the provider *start* this work
-/// within L". Part of the readiness **predicate**, so it matches
-/// exactly (inside the digest); it is not a sampling or delivery
-/// parameter (plan §3.3).
+/// The latency envelope L — the **provider-evaluated** dimensions of
+/// the predicate (plan §3.3, review 5): things a provider can
+/// honestly sign because they do not depend on any consumer's path.
+/// Part of the predicate, so exact match, inside the digest. The
+/// consumer's end-to-end budget is deliberately NOT here — see
+/// [`ConsumerLatencyBudget`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WorkLatencyEnvelope {
-    /// Upper bound on time-to-start the provider must be able to
-    /// honor for the predicate to evaluate Ready.
-    pub max_start: Duration,
+    /// "I can *start* the work within this bound."
+    pub provider_start_within: Option<Duration>,
+    /// "First result/event within this bound after admission."
+    pub first_event_after_admission: Option<Duration>,
 }
 
 impl WorkLatencyEnvelope {
-    /// Fixed-width canonical encoding (u128 LE nanoseconds) — the
-    /// form hashed into the interest digest.
-    pub fn canonical_bytes(&self) -> [u8; 16] {
-        self.max_start.as_nanos().to_le_bytes()
+    /// Envelope with only a start bound (the common case).
+    pub const fn start_within(bound: Duration) -> Self {
+        Self {
+            provider_start_within: Some(bound),
+            first_event_after_admission: None,
+        }
+    }
+
+    /// Fixed-width injective canonical encoding — per dimension one
+    /// presence byte + u128 LE nanoseconds (zeros when absent).
+    pub fn canonical_bytes(&self) -> [u8; 34] {
+        let mut out = [0u8; 34];
+        for (slot, dim) in [self.provider_start_within, self.first_event_after_admission]
+            .into_iter()
+            .enumerate()
+        {
+            let base = slot * 17;
+            if let Some(bound) = dim {
+                out[base] = 1;
+                out[base + 1..base + 17].copy_from_slice(&bound.as_nanos().to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
+/// The consumer's end-to-end acceptance bound (plan §3.3, review 5).
+/// **Local by definition** — never in the digest, never on the wire,
+/// never provider-signed: a provider cannot know this consumer's
+/// path cost, so `end_to_end_within` is checked at the consumer as
+/// `route_estimate + provider estimated_start ≤ budget`. Two
+/// consumers may legitimately derive different viability from the
+/// same signed attestation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct ConsumerLatencyBudget {
+    /// End-to-end bound from this consumer's perspective; `None`
+    /// accepts any path.
+    pub end_to_end_within: Option<Duration>,
+}
+
+impl ConsumerLatencyBudget {
+    /// The local viability check: does a provider proof carrying
+    /// `estimated_start` satisfy this budget over a path currently
+    /// estimated at `route_estimate`? A missing provider estimate
+    /// counts as "can start now" (the proof still had to project
+    /// Ready through continuity to get here).
+    pub fn admits(&self, route_estimate: Duration, estimated_start: Option<Duration>) -> bool {
+        match self.end_to_end_within {
+            None => true,
+            Some(budget) => {
+                route_estimate.saturating_add(estimated_start.unwrap_or(Duration::ZERO)) <= budget
+            }
+        }
     }
 }
 
@@ -371,22 +434,183 @@ fn read_string(cursor: &mut &[u8]) -> Result<String, ConstraintError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| ConstraintError::InvalidUtf8)
 }
 
-/// The digest-bearing half of an interest: everything that defines
-/// the readiness **predicate identity** (plan §3.2) — and nothing
-/// that doesn't. `requested_sample_interval` is deliberately absent:
-/// stricter sampling dominates looser (§3.3), so D must not split
-/// otherwise-identical interests.
+/// A stable, owner-scoped group identity commitment (plan §4.10).
+/// Interests address the group identity, never a copied member
+/// list; local folds materialize membership. The commitment is an
+/// opaque 32-byte identity — the fold's group machinery resolves it;
+/// it is never a bearer secret.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroupRef([u8; 32]);
+
+impl GroupRef {
+    /// Wrap a group identity commitment.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw commitment bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GroupRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GroupRef({})", hex::encode(self.0))
+    }
+}
+
+/// One exact-match tag requirement inside a `Tags` selector. v1 is
+/// exact conjunction only — no Boolean algebra on the wire (plan
+/// §9). Whether a matching *assertion* is acceptable is a
+/// provenance question answered at candidate resolution (§4.10),
+/// not part of the match syntax.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TagMatch {
+    /// Tag key.
+    pub key: String,
+    /// Required exact value.
+    pub value: String,
+}
+
+/// The provider population an interest may be satisfied from (plan
+/// §3.1). `AnyAuthorized` is the default — the provider is an
+/// answer, not part of the question; the other variants are the
+/// operator's explicit-surveillance overrides. The selector is
+/// **inside the interest digest**: "any printer" must never coalesce
+/// with "printer-7 only".
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ProviderSelector {
+    /// Any provider the authority scope admits.
+    AnyAuthorized,
+    /// Exactly this node — the v3 provider-targeted case.
+    Node(u64),
+    /// An explicit node set (canonical: sorted, deduplicated — use
+    /// [`ProviderSelector::nodes`]).
+    Nodes(Vec<u64>),
+    /// An owner-scoped group identity.
+    Group(GroupRef),
+    /// All-of tag conjunction (canonical: sorted, deduplicated —
+    /// use [`ProviderSelector::tags`]).
+    Tags(Vec<TagMatch>),
+}
+
+impl ProviderSelector {
+    /// Canonical `Nodes` selector: sorted and deduplicated, so
+    /// authorship order can never split interest identity.
+    pub fn nodes(mut ids: Vec<u64>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        Self::Nodes(ids)
+    }
+
+    /// Canonical `Tags` selector: sorted by (key, value) and
+    /// deduplicated.
+    pub fn tags(mut matches: Vec<TagMatch>) -> Self {
+        matches.sort();
+        matches.dedup();
+        Self::Tags(matches)
+    }
+
+    /// Injective canonical encoding hashed into the interest digest:
+    /// a variant tag, then length-prefixed fields. `Nodes`/`Tags`
+    /// are re-canonicalized defensively (sorting is idempotent).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::AnyAuthorized => out.push(0u8),
+            Self::Node(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            Self::Nodes(ids) => {
+                out.push(2);
+                let mut ids = ids.clone();
+                ids.sort_unstable();
+                ids.dedup();
+                out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+            Self::Group(group) => {
+                out.push(3);
+                out.extend_from_slice(group.as_bytes());
+            }
+            Self::Tags(matches) => {
+                out.push(4);
+                let mut matches = matches.clone();
+                matches.sort();
+                matches.dedup();
+                out.extend_from_slice(&(matches.len() as u32).to_le_bytes());
+                for tag in matches {
+                    for part in [tag.key.as_str(), tag.value.as_str()] {
+                        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                        out.extend_from_slice(part.as_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// How much of the selected provider population must be observed
+/// (plan §3.1). Separate from the selector because a population
+/// alone is ambiguous ("any camera usable?" vs "observe each
+/// camera"). Inside the digest: "any member of G" must never
+/// coalesce with "each member of G".
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ResultMode {
+    /// One viable provider satisfies the interest (the default).
+    Any,
+    /// Maintain up to K ranked viable providers.
+    TopK(u16),
+    /// Provider-indexed observation per member — explicit
+    /// surveillance, guard-railed (plan §4.7).
+    Each,
+    /// At least K viable providers.
+    Quorum(u16),
+}
+
+impl ResultMode {
+    /// Fixed-width canonical encoding: variant tag + u16 parameter
+    /// (zero where unused).
+    pub const fn canonical_bytes(&self) -> [u8; 3] {
+        match self {
+            Self::Any => [0, 0, 0],
+            Self::TopK(k) => {
+                let b = k.to_le_bytes();
+                [1, b[0], b[1]]
+            }
+            Self::Each => [2, 0, 0],
+            Self::Quorum(k) => {
+                let b = k.to_le_bytes();
+                [3, b[0], b[1]]
+            }
+        }
+    }
+}
+
+/// The digest-bearing interest: everything that defines the
+/// **capability-interest identity** (plan §3.2) — and nothing that
+/// doesn't. `requested_sample_interval` is absent (min-dominance);
+/// **provider identity and capability generation are absent** — a
+/// capability-directed interest cannot bind one provider's
+/// generation; generation binding lives one level down, in
+/// [`ProviderObservationKey`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InterestSpec {
     /// Capability the predicate targets.
     pub capability_id: CapabilityId,
-    /// The provider's announce version this predicate was compiled
-    /// against; a generation change is a new identity.
-    pub capability_generation: u64,
     /// Work characteristics C.
     pub constraints: CanonicalConstraints,
     /// Latency envelope L.
     pub work_latency: WorkLatencyEnvelope,
+    /// The provider population (plan §3.1).
+    pub providers: ProviderSelector,
+    /// The required cardinality over that population.
+    pub result_mode: ResultMode,
     /// Disclosure class (v1: owner).
     pub disclosure_class: DisclosureClass,
     /// Audience commitment (v1: canonical owner-root identity).
@@ -399,9 +623,11 @@ impl InterestSpec {
     /// ```text
     /// interest_digest = blake3_derive_key("net.sensing.interest.v1",
     ///     len(capability_id) || capability_id ||
-    ///     capability_generation ||
     ///     len(canonical(C)) || canonical(C) ||
-    ///     canonical(L) || disclosure_class_tag || audience_commitment)
+    ///     canonical(L) ||
+    ///     len(canonical(selector)) || canonical(selector) ||
+    ///     canonical(result_mode) ||
+    ///     disclosure_class_tag || audience_commitment)
     /// ```
     ///
     /// Variable-length fields are length-prefixed and the remaining
@@ -412,46 +638,101 @@ impl InterestSpec {
         let id_bytes = self.capability_id.as_str().as_bytes();
         hasher.update(&(id_bytes.len() as u64).to_le_bytes());
         hasher.update(id_bytes);
-        hasher.update(&self.capability_generation.to_le_bytes());
         let constraint_bytes = self.constraints.canonical_bytes();
         hasher.update(&(constraint_bytes.len() as u64).to_le_bytes());
         hasher.update(&constraint_bytes);
         hasher.update(&self.work_latency.canonical_bytes());
+        let selector_bytes = self.providers.canonical_bytes();
+        hasher.update(&(selector_bytes.len() as u64).to_le_bytes());
+        hasher.update(&selector_bytes);
+        hasher.update(&self.result_mode.canonical_bytes());
         hasher.update(&[self.disclosure_class.canonical_tag()]);
         hasher.update(self.audience.as_bytes());
         Digest256(*hasher.finalize().as_bytes())
     }
+
+    /// Key this spec (convenience over
+    /// [`CapabilityInterestKey::for_spec`]).
+    pub fn key(&self) -> CapabilityInterestKey {
+        CapabilityInterestKey::for_spec(self)
+    }
 }
 
-/// The full conditional sensing identity (plan §3.1). Every table,
-/// observation, and fold-overlay entry is keyed by this — never by
-/// capability alone.
+/// The capability-interest identity (plan §3.2) — what the consumer
+/// wants, free of any provider identity. Coalescing, the per-hop
+/// interest table, and the fold overlay key on this.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ReadinessKey {
-    /// Provider node id.
-    pub provider: u64,
-    /// Capability the interest targets.
+pub struct CapabilityInterestKey {
+    /// Capability the interest targets (indexing convenience; also
+    /// bound inside the digest).
     pub capability_id: CapabilityId,
-    /// Provider's announce version (see [`InterestSpec`]).
-    pub capability_generation: u64,
-    /// The 256-bit interest identity ([`InterestSpec::interest_digest`]).
+    /// The 256-bit interest identity
+    /// ([`InterestSpec::interest_digest`]).
     pub interest_digest: Digest256,
 }
 
-impl ReadinessKey {
-    /// Key a spec against a provider.
-    pub fn for_interest(provider: u64, spec: &InterestSpec) -> Self {
+impl CapabilityInterestKey {
+    /// Key a spec.
+    pub fn for_spec(spec: &InterestSpec) -> Self {
         Self {
-            provider,
             capability_id: spec.capability_id.clone(),
-            capability_generation: spec.capability_generation,
             interest_digest: spec.interest_digest(),
         }
     }
 }
 
-/// A consumer's registration: the predicate identity plus the two
-/// non-identity time dimensions (plan §3.3).
+/// The routed coalescing unit (plan §3.2, review 5): a
+/// provider-targeted interest. This is the ONLY key that enters the
+/// Layer-2 per-hop table — it routes via `next_hop(provider)`, so
+/// the aggregation tree exists (its root is the provider), and
+/// interests from consumers that resolved to the same provider merge
+/// at fan-in exactly as in v3. The capability-interest key above
+/// drives local dedup, resolution, aggregation, and branch
+/// lifecycle; it never travels provider-free.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ProviderInterestKey {
+    /// The capability interest this branch serves.
+    pub interest: CapabilityInterestKey,
+    /// The resolved provider this branch targets.
+    pub provider: u64,
+}
+
+impl ProviderInterestKey {
+    /// Key a resolved branch.
+    pub fn new(interest: CapabilityInterestKey, provider: u64) -> Self {
+        Self { interest, provider }
+    }
+}
+
+/// The provider-observation identity (plan §3.2) — which provider,
+/// under which of ITS announce generations, currently answers the
+/// interest. Attestations, observation cells, relay caches, and
+/// per-provider continuity key on this; a provider generation change
+/// mints a new observation key while the interest above survives
+/// untouched.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ProviderObservationKey {
+    /// The capability interest being answered.
+    pub interest: CapabilityInterestKey,
+    /// The answering provider.
+    pub provider: u64,
+    /// That provider's announce version.
+    pub capability_generation: u64,
+}
+
+impl ProviderObservationKey {
+    /// Key a provider's answer to an interest.
+    pub fn new(interest: CapabilityInterestKey, provider: u64, capability_generation: u64) -> Self {
+        Self {
+            interest,
+            provider,
+            capability_generation,
+        }
+    }
+}
+
+/// A consumer's registration: the predicate identity plus the
+/// non-identity, consumer-local dimensions (plan §3.3).
 #[derive(Clone, Debug)]
 pub struct InterestRegistration {
     /// The digest-bearing predicate identity.
@@ -464,6 +745,9 @@ pub struct InterestRegistration {
     /// Subscription lifetime — per-downstream soft-state expiry;
     /// says nothing about evidence.
     pub soft_state_ttl: Duration,
+    /// This consumer's end-to-end acceptance bound — local viability
+    /// only, never identity, never wire (§3.3).
+    pub consumer_budget: ConsumerLatencyBudget,
 }
 
 /// Min-dominance aggregation for D (plan §3.3): the strictest
@@ -488,15 +772,14 @@ mod tests {
     fn spec() -> InterestSpec {
         InterestSpec {
             capability_id: CapabilityId::new("video.transcode"),
-            capability_generation: 10,
             constraints: CanonicalConstraints::from_entries([
                 ("fps", "60"),
                 ("resolution", "3840x2160"),
             ])
             .unwrap(),
-            work_latency: WorkLatencyEnvelope {
-                max_start: Duration::from_millis(250),
-            },
+            work_latency: WorkLatencyEnvelope::start_within(Duration::from_millis(250)),
+            providers: ProviderSelector::AnyAuthorized,
+            result_mode: ResultMode::Any,
             disclosure_class: DisclosureClass::Owner,
             audience: audience(0xAA),
         }
@@ -508,39 +791,141 @@ mod tests {
     }
 
     #[test]
-    fn requested_sample_interval_never_splits_identity() {
-        // §3.3: D is min-dominated, not identity-bearing. Two
-        // registrations that differ ONLY in D (and ttl) must key to
-        // the same ReadinessKey — this is the tripwire against D
-        // ever migrating into the digest.
+    fn consumer_local_dimensions_never_split_identity() {
+        // §3.3: D is min-dominated and the end-to-end budget is
+        // local viability — neither is identity-bearing. Two
+        // registrations differing ONLY in D, ttl, and budget must
+        // key to the same interest: the tripwire against either
+        // migrating into the digest.
         let strict = InterestRegistration {
             spec: spec(),
             requested_sample_interval: Duration::from_millis(50),
             soft_state_ttl: Duration::from_secs(30),
+            consumer_budget: ConsumerLatencyBudget {
+                end_to_end_within: Some(Duration::from_millis(400)),
+            },
         };
         let loose = InterestRegistration {
             spec: spec(),
             requested_sample_interval: Duration::from_secs(5),
             soft_state_ttl: Duration::from_secs(300),
+            consumer_budget: ConsumerLatencyBudget::default(),
         };
-        assert_eq!(
-            ReadinessKey::for_interest(7, &strict.spec),
-            ReadinessKey::for_interest(7, &loose.spec),
+        assert_eq!(strict.spec.key(), loose.spec.key());
+    }
+
+    #[test]
+    fn budget_admission_is_route_relative() {
+        // Review 5: two consumers, the SAME provider proof
+        // (estimated_start = 300 ms), different route estimates —
+        // different viability. The aggregate is local by definition.
+        let budget = ConsumerLatencyBudget {
+            end_to_end_within: Some(Duration::from_millis(500)),
+        };
+        let start = Some(Duration::from_millis(300));
+        assert!(budget.admits(Duration::from_millis(150), start));
+        assert!(!budget.admits(Duration::from_millis(250), start));
+        // No budget accepts any path; a missing provider estimate
+        // counts as "can start now".
+        assert!(ConsumerLatencyBudget::default().admits(Duration::from_secs(10), start));
+        assert!(budget.admits(Duration::from_millis(500), None));
+    }
+
+    #[test]
+    fn capability_generation_never_splits_interest_identity() {
+        // v4 §3.2: a capability-directed interest cannot bind one
+        // provider's generation — different printers have different
+        // generations. Generation lives in the OBSERVATION key: the
+        // same interest, answered by one provider across a
+        // generation bump, is one interest but two observations.
+        let key = spec().key();
+        let gen10 = ProviderObservationKey::new(key.clone(), 7, 10);
+        let gen11 = ProviderObservationKey::new(key.clone(), 7, 11);
+        assert_eq!(gen10.interest, gen11.interest);
+        assert_ne!(gen10, gen11);
+        // And two providers answering one interest are two
+        // observations under one interest.
+        let other = ProviderObservationKey::new(key, 8, 10);
+        assert_eq!(gen10.interest, other.interest);
+        assert_ne!(gen10, other);
+    }
+
+    #[test]
+    fn provider_selector_is_identity_bearing() {
+        // §3.2: "any printer" must never coalesce with "printer-7
+        // only", nor with a different node's surveillance.
+        let mut node7 = spec();
+        node7.providers = ProviderSelector::Node(7);
+        let mut node8 = spec();
+        node8.providers = ProviderSelector::Node(8);
+        assert_ne!(spec().interest_digest(), node7.interest_digest());
+        assert_ne!(node7.interest_digest(), node8.interest_digest());
+    }
+
+    #[test]
+    fn result_mode_is_identity_bearing() {
+        // §3.2: "any member of G" must never coalesce with "each
+        // member of G".
+        let mut each = spec();
+        each.result_mode = ResultMode::Each;
+        let mut quorum = spec();
+        quorum.result_mode = ResultMode::Quorum(2);
+        assert_ne!(spec().interest_digest(), each.interest_digest());
+        assert_ne!(each.interest_digest(), quorum.interest_digest());
+        assert_ne!(
+            ResultMode::TopK(2).canonical_bytes(),
+            ResultMode::Quorum(2).canonical_bytes(),
         );
+    }
+
+    #[test]
+    fn selectors_canonicalize_order_and_duplicates_away() {
+        // Authorship order must not split identity.
+        let ab = ProviderSelector::nodes(vec![9, 3, 3, 7]);
+        let ba = ProviderSelector::nodes(vec![7, 9, 3]);
+        assert_eq!(ab.canonical_bytes(), ba.canonical_bytes());
+
+        let tag = |k: &str, v: &str| TagMatch {
+            key: k.into(),
+            value: v.into(),
+        };
+        let t1 = ProviderSelector::tags(vec![
+            tag("site", "factory-7"),
+            tag("modality", "thermal"),
+            tag("site", "factory-7"),
+        ]);
+        let t2 = ProviderSelector::tags(vec![tag("modality", "thermal"), tag("site", "factory-7")]);
+        assert_eq!(t1.canonical_bytes(), t2.canonical_bytes());
+
+        // But different populations are different identities.
+        let t3 = ProviderSelector::tags(vec![tag("modality", "rgb"), tag("site", "factory-7")]);
+        assert_ne!(t1.canonical_bytes(), t3.canonical_bytes());
+
+        let mut spec_t1 = spec();
+        spec_t1.providers = t1;
+        let mut spec_t3 = spec();
+        spec_t3.providers = t3;
+        assert_ne!(spec_t1.interest_digest(), spec_t3.interest_digest());
     }
 
     #[test]
     fn work_latency_is_identity_bearing() {
         let mut other = spec();
-        other.work_latency.max_start = Duration::from_millis(251);
+        other.work_latency.provider_start_within = Some(Duration::from_millis(251));
         assert_ne!(spec().interest_digest(), other.interest_digest());
-    }
-
-    #[test]
-    fn capability_generation_is_identity_bearing() {
-        let mut other = spec();
-        other.capability_generation = 11;
-        assert_ne!(spec().interest_digest(), other.interest_digest());
+        // Presence itself is identity-bearing too, and the two
+        // dimensions are position-distinct (injective encoding).
+        let mut absent = spec();
+        absent.work_latency.provider_start_within = None;
+        assert_ne!(spec().interest_digest(), absent.interest_digest());
+        let swapped = WorkLatencyEnvelope {
+            provider_start_within: None,
+            first_event_after_admission: Some(Duration::from_millis(250)),
+        };
+        assert_ne!(
+            WorkLatencyEnvelope::start_within(Duration::from_millis(250)).canonical_bytes(),
+            swapped.canonical_bytes(),
+        );
     }
 
     #[test]
@@ -692,13 +1077,19 @@ mod tests {
     }
 
     #[test]
-    fn readiness_key_binds_the_full_identity() {
-        let base = ReadinessKey::for_interest(7, &spec());
-        assert_ne!(base, ReadinessKey::for_interest(8, &spec()));
+    fn interest_key_binds_the_predicate_not_the_provider() {
+        let base = spec().key();
+        // Constraints split the interest…
         let mut other = spec();
         other.constraints = CanonicalConstraints::from_entries([("fps", "30")]).unwrap();
-        assert_ne!(base, ReadinessKey::for_interest(7, &other));
+        assert_ne!(base, other.key());
+        // …while the answering provider never does: providers vary
+        // beneath one interest as observation keys.
         assert_eq!(base.interest_digest, spec().interest_digest());
+        assert_ne!(
+            ProviderObservationKey::new(base.clone(), 7, 1),
+            ProviderObservationKey::new(base, 8, 1),
+        );
     }
 
     #[test]
