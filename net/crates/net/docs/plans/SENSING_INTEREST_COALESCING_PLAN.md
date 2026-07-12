@@ -1,10 +1,12 @@
 # Capability Sensing Plan (Interest Coalescing)
 
 Status: v4.1 — capability-native API over a provider-targeted wire
-(review 5, 2026-07-12). SI-0 re-scoped below; spike refactor in
-progress (`behavior::sensing`, SI-0a–f as-built, re-keyed for v4.1).
-SI-1 and wire-id allocation remain BLOCKED until the gate conditions
-in the SI-1 entry are met
+(review 5, 2026-07-12). SI-0 spike COMPLETE in-tree
+(`behavior::sensing`, items 1–23 as-built under v4.1 keys,
+2026-07-12) pending review sign-off. SI-1 and wire-id allocation
+remain BLOCKED until the gate conditions in the SI-1 entry are
+signed off (each condition maps to an as-built test/definition —
+see the gate entry)
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -172,19 +174,21 @@ Unchanged from v3 except as noted:
   `behavior::group` provides owner-scoped group identities. These
   are the candidate-resolution inputs (§4.7); tag *provenance*
   (§4.10) is thinner than v4.1 wants and is called out there.
-- **In-tree spike (SI-0a–f as-built):** `behavior::sensing` holds
-  the domain-separated digest + canonical constraints
+- **In-tree spike (SI-0 as-built, v4.1 keys):** `behavior::sensing`
+  holds the two-level identity + digest + canonical constraints
   (`identity.rs`), the incarnation boot protocol + equivocation
   seq-gate (`incarnation.rs`), the continuity state machine with the
   pinned projection table (`continuity.rs`), the frozen evaluator
   contract + cadence refusal + security counters (`evaluator.rs`),
-  the per-downstream interest table with refusal partitioning
-  (`table.rs`), and the relay store/pack/down-sample layer with the
-  hop-by-hop continuity rule (`delivery.rs`). Built against v3.1
-  provider-first keys; the v4.1 refactor re-keys identity/table/
-  delivery and adds the Layer-1 resolver + aggregation. The
-  incarnation, continuity, and evaluator layers carry over
-  unchanged.
+  the per-branch interest table with refusal partitioning
+  (`table.rs`), the relay store/pack/down-sample layer with the
+  hop-by-hop continuity rule (`delivery.rs`), the Layer-1 controller
+  — candidate resolution, bounded exploration, budget checks, local
+  result-mode aggregates (`controller.rs`), owner-root scope
+  validation from session identity (`scope.rs`), and the
+  mixed-version path selection (`negotiation.rs`), plus the
+  real-path fallback integration test
+  (`tests/sensing_fallback.rs`).
 
 ## 3. Semantic model (defined before any wire format)
 
@@ -666,15 +670,22 @@ must exercise the real dispatch path.
   3. inline constraint canonicalization + digest validation
      (as-built);
   4. incarnation semantics + persistence failure matrix (as-built);
-  5. owner-root check from authenticated session identity (pending,
-     with old-relay fallback);
+  5. owner-root check from authenticated session identity (as-built:
+     `scope.rs` — proven root returned for the table row; wire claim
+     cross-checked, never load-bearing, with a session-unbacked
+     claim counted protocol-invalid; cross-root and
+     audience-mismatch refusals tested);
   6. per-provider observation + projection (as-built) +
      generation-crossing disruption;
   7. **test:** two interests on one capability independent
      (as-built);
   8. **test:** origin restart behind relay (as-built);
   9. **test:** downstream expiry independence (as-built);
-  10. **test (real path):** old-version relay fallback (pending);
+  10. **test (real path):** old-version relay fallback (as-built:
+      `negotiation.rs` selection + `tests/sensing_fallback.rs` —
+      three real MeshNodes, selection driven by real fold tags, the
+      fallback payload routed end-to-end through the tagless relay
+      with its opacity re-asserted; frame codec deferred to SI-1);
   11. **test:** down-sampling, edges never held, provisional
       warm-start both polarities (as-built);
   12. evaluator contract + cadence refusal + security counter
@@ -727,6 +738,18 @@ must exercise the real dispatch path.
   guardrails refuse broad selectors before activation (test 21);
   (p) provider-evaluated vs consumer-budget latency split enforced —
   no end-to-end claim ever provider-signed (item 2, test 23).
+  *As-built condition→test map (2026-07-12):* (a)/(b) delivery.rs
+  tests 11/13; (c) continuity.rs test 14 + establishment-deadline
+  tests; (d) table.rs test 15; (e) identity audience tests +
+  scope.rs AudienceMismatch; (f) IncarnationSeqGate is the only seq
+  consumer, admission-only; (g) continuity.rs model + pinned
+  projection table; (h) tests/sensing_fallback.rs; (i) scope.rs;
+  (j) evaluator.rs; (k) identity selector/result-mode/generation
+  tests; (l) controller.rs flagship test; (m) controller.rs
+  bounded-exploration test; (n) controller.rs open-world test;
+  (o) controller.rs broad-Each test; (p) identity budget tests +
+  controller.rs budget-locality test. Remaining before SI-1 starts:
+  review sign-off + wire-id commitment.
 - **SI-2 — interest table + resolver wiring.** Layer-2 table on real
   sessions; Layer-1 resolver over the real capability fold +
   proximity ranking + tag provenance; trailing-edge propagation;
