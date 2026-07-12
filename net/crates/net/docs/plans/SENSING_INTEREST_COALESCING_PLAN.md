@@ -1,12 +1,11 @@
 # Capability Sensing Plan (Interest Coalescing)
 
-Status: v4.1 — capability-native API over a provider-targeted wire
-(review 5, 2026-07-12). SI-0 spike COMPLETE in-tree
-(`behavior::sensing`, items 1–23 as-built under v4.1 keys,
-2026-07-12) pending review sign-off. SI-1 and wire-id allocation
-remain BLOCKED until the gate conditions in the SI-1 entry are
-signed off (each condition maps to an as-built test/definition —
-see the gate entry)
+Status: v4.2 — capability interests rendezvous at the RedEX-elected
+scope sensing leader (review 6, 2026-07-12); provider-specific
+sensing stays on the provider-targeted wire. SI-0 items 1–23
+as-built; items 24–31 (rendezvous/failover) in progress. SI-1 and
+wire-id allocation remain BLOCKED until the rendezvous/failover
+tests pass and the gate map (a)–(q) is signed off
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -57,6 +56,33 @@ machinery the deferred cross-root story must build on)
 > proof). Consequently the result-mode aggregate is local **by
 > definition**: relays distribute proofs, never authoritative
 > aggregate verdicts, and never globally resolve `Any`.
+>
+> **v4.2 (review 6, 2026-07-12 — the rendezvous already exists).**
+> Review 5's "provider-free interests have nowhere to travel" gap
+> closes without capability-name routing, flooding, or a new
+> coordinator: **Net already has the rendezvous primitive** — the
+> RedEX deterministic leader election (health-filtered, ranked by a
+> total (key, NodeId) order; the next-ranked healthy node wins on
+> leader loss, which IS the bully fallback). Provider-free capability
+> interests are addressed to the current scope-local **sensing
+> leader** by NodeId over ordinary Net routing; the leader coalesces
+> equivalent interests BEFORE provider selection, resolves bounded
+> candidates, opens provider-targeted branches (the v3 machinery),
+> and fans identical provider-signed proofs back. Two routing
+> stages, no NDN. Sensing anchors the SAME election function at a
+> shared proximity-centrality key (instead of RedEX's self-anchored
+> RTT) via a non-member observer — a parameterization, never a
+> second election subsystem. The leader is island-relative, not a
+> truth oracle: partitions may elect one leader per island, duplicate
+> provider streams are acceptable (advisory plane, origin-signed
+> proofs, soft state, authoritative admission) and converge by
+> expiry; leader failover is soft-state re-registration — no
+> synchronous state transfer is required for correctness. The
+> latency split stands: the leader selects candidates with its
+> proximity view and distributes proofs; each consumer still judges
+> viability against its own path budget and may consume the standby
+> candidate. SI-0 gains the eight rendezvous/failover tests (items
+> 24–31); SI-1 stays blocked until they pass.
 
 ## 1. Problem
 
@@ -112,41 +138,48 @@ moment, path-incongruent), or v3's provider-first sensing — which
 fragments demand only when consumers *resolve differently*, but
 offered no capability-level surface at all.
 
-The v4.1 mechanism — two layers:
+The v4.2 mechanism — a rendezvous stage over the two layers:
 
 ```
-Layer 1 (local capability sensing controller):
-    consumer expresses (Y, C, L, selector, mode)
+Consumer (local controller):
+    expresses (Y, C, L, selector, mode)
     → one CapabilityInterestKey per distinct interest — all local
       consumers of the same interest share it (local coalescing)
-    → candidate resolver: fold ∩ selector ∩ authority ∩ reachability,
-      proximity-ranked, bounded exploration per result mode
-    → a bounded set of provider-targeted interests
+    → Node/Nodes selectors have explicit destinations: route
+      provider-targeted branches directly (the v3 path)
+    → open-population selectors (AnyAuthorized / Group / Tags):
+      address the provider-free interest to the current scope
+      sensing leader by NodeId (§4.1) over ordinary Net routing
+
+Sensing leader (RedEX-elected center, bully fallback):
+    → coalesces equivalent CapabilityInterestKeys — BEFORE provider
+      selection, across consumers
+    → resolves bounded candidates once per distinct interest
+      (fold ∩ selector ∩ authority ∩ reachability, proximity-ranked)
+    → opens provider-targeted readiness branches
 
 Layer 2 (routed provider-readiness protocol — the v3 machinery):
-    each provider interest travels next_hop(provider)
-    → per-hop coalescing on (provider, interest digest) — interests
-      from different consumers that resolved to the same provider
-      merge on shared route segments
+    each branch travels next_hop(provider)
+    → per-hop coalescing on (provider, interest digest)
     → provider evaluates once per distinct digest, signs attestations
-    → attestations fan back; relays cache/pack/down-sample; every
-      hop maintains per-provider continuity
+    → attestations fan back; the leader (and any relay) forwards
+      identical signed proofs; every hop maintains per-provider
+      continuity
 
-Layer 1 again (local):
-    provider observations + route estimates + consumer budget
+Consumer again (local):
+    provider proofs + own route estimates + own budget
     → result-mode aggregate (Any/TopK/Each/Quorum) + provider proofs
 ```
 
 - Provider sensing load scales with **interested routing-tree
   branches × distinct interests**, never raw watcher count.
-- All consumers on one node share one resolution and one bounded
-  provider-interest set.
-- Cross-node demand merges whenever consumers resolve to the same
-  provider — consumers sharing fold and proximity facts usually do;
-  when they resolve differently they are often genuinely
-  experiencing different path conditions. **Divergent resolution
-  means no merge: an honest v1 limitation**, measured (SI-7 stats)
-  and revisited through the future gate (§4.1) only on evidence.
+- All consumers on one node share one interest; all consumers in a
+  reachable scope share one coalesced interest AT THE LEADER — the
+  preselection coalescing v4 wanted, now with a real destination.
+- The leader is rendezvous, deduplicator, bounded candidate
+  resolver, and fan-out point — the PROVIDER remains the authority
+  (origin-signed proofs), and each consumer remains the judge of
+  its own path viability (§3.5).
 - The answer carries the provider: a consumer acts on
   `Ready(provider = printer-7, estimated_start = 800 ms)` and
   invokes that provider subject to final admission.
@@ -168,7 +201,9 @@ Unchanged from v3 except as noted:
   monotonic announce `version` (the provider-side
   `capability_generation`); `WithdrawalSeqGate` LRU shape; RT-1/RT-4
   coalescing gates; multi-event frames; `ACK_RANGES_CAPABILITY_TAG`
-  negotiation precedent.
+  negotiation precedent; **`redex::replication_election::elect`** —
+  the pure deterministic health-filtered leader election the v4.2
+  rendezvous parameterizes (§4.1).
 - **Capability fold + tags + groups:** capability queries and tag
   matching exist (`behavior::{query, tag, capability}`);
   `behavior::group` provides owner-scoped group identities. These
@@ -363,48 +398,90 @@ row for it is gone (§4.3), never on its own aggregate reasoning.
 
 ## 4. Design
 
-### 4.1 Routing: local resolution, provider-targeted coalescing
+### 4.1 Capability-interest rendezvous, then provider-targeted branches
 
-There is no capability-name routing in v1 — a provider-free interest
-has no `next_hop` and therefore no defined path on which two
-consumers' interests could meet (review 5). The honest flow:
+There is still no capability-name routing in v1 — a provider-free
+interest has no `next_hop` of its own. Review 6 closed the gap with
+a primitive Net already ships: provider-free capability interests
+are addressed to the current **scope-local sensing leader**, and the
+leader is selected using the existing RedEX election mechanism — a
+pure, deterministic, health-filtered ranking by a total
+`(key, NodeId)` order (`redex::replication_election::elect`), where
+"the next-ranked healthy node wins when the leader dies" is exactly
+the bully fallback. Two routing stages:
 
 ```
-CapabilityInterest (Y, C, L, selector, mode)
-        │  Layer 1, local
-        ▼
-candidate resolver: fold ∩ selector ∩ authority ∩ reachability
-        │  bounded ProviderInterests
-        ▼
-(P1, interest_digest), (P2, interest_digest), …
-        │  Layer 2, routed — per provider
-        ▼
-v3 routing-tree coalescing along next_hop(P)
-        │  provider-signed observations
-        ▼
-local aggregate: Any / TopK / Each / Quorum + proofs
+provider-free interest (AnyAuthorized / Group / Tags):
+    route to elected sensing leader R by NodeId — next_hop(R)
+
+provider-specific sensing:
+    route from R toward each selected provider — next_hop(P)
 ```
 
-Coalescing surfaces, honestly stated:
+`Node(X)`/`Nodes` selectors have explicit destinations and skip the
+rendezvous entirely (the v3 provider-targeted path, no resolver).
+
+**Anchoring (reuse, not reinvention).** RedEX anchors the election
+key at self-RTT (follow-the-nearest; self-bias intended — each
+replica may act on its own view). A rendezvous needs every observer
+to compute the SAME winner, so sensing calls the SAME `elect`
+function with (a) a shared ranking key — a closeness-centrality
+score over the shared, pingwave-flooded proximity view (the
+proximity center "tends to reduce aggregate paths" between
+consumers, candidates, and branches) — and (b) a non-member observer
+id, which disables the self-RTT-zero bias. Same health filter, same
+sort, same tiebreak, same code path: a parameterization, never a
+second election subsystem. If sensing ever reveals a concrete need
+for terms/epochs, that lands in RedEX, not beside it.
+
+**At the leader:** identical `CapabilityInterestKey`s coalesce into
+one table row → one bounded candidate-resolution pass → one set of
+provider-targeted branches → identical signed proofs fanned to every
+registered consumer. The leader is rendezvous, deduplicator, bounded
+resolver, and fan-out point — nothing more: the provider signs the
+answers, and each consumer judges path viability locally (§3.5).
+
+**Leader failover (soft state makes it cheap).** Interests are
+already per-downstream soft state, so no synchronous transfer of the
+interest table is required for correctness:
+
+```
+failure detector marks R unavailable
+→ the same election yields the next-ranked healthy node R₂
+→ consumers re-register their (still-live) interests with R₂
+→ R₂ rebuilds aggregates from registrations, re-resolves candidates
+→ sensing resumes; R's rows expire wherever they were
+```
+
+A state handoff can improve recovery latency later; the correctness
+path is new leader + downstream refresh + provider re-resolution.
+Consumers that accept a new election result STOP refreshing the old
+leader — its branch state expires and its emitters die.
+
+**Split-brain (deliberately tolerated).** The design must not block
+sensing on global leader consensus. During a partition, each
+reachable island may elect its own leader; if both islands reach one
+provider through different routes, temporary duplicate
+provider-sensing streams result. That is acceptable because
+evaluation is advisory, interests are bounded, attestations remain
+origin-signed, each leader holds its own soft-state branch, final
+admission stays authoritative, and duplicates expire after topology
+converges. The leader is observer/island-relative — like the
+proximity graph it derives from — never a global truth oracle.
+
+Coalescing surfaces, restated:
 
 - **Local, pre-selection**: every consumer on one node asking the
-  same (Y, C, L, selector, mode) shares one `CapabilityInterestKey`,
-  one resolution, one provider-interest set. (Hermes, the scheduler,
-  and a UI asking for "any color A4 printer" cost one stream set.)
-- **Cross-node, post-resolution**: A and C both resolving to P1
-  merge at shared relays on `(P1, digest)` — the proven v3 tree.
-  A resolving P1 while C resolves P2 → no merge. **Honest v1
-  limitation.**
-- **Future gate (evidence-triggered):** if SI-7 measurement shows
-  divergent provider selection prevents meaningful coalescing,
-  evaluate a scoped capability-interest rendezvous (owner-root or
-  digest-deterministic) or reverse-announcement-path routing. Not
-  before: no rendezvous, no flood, no capability-routing protocol on
-  speculation.
-
-Selector-specific resolution (all Layer 1): `Node(X)` → exactly X
-(the v3 case, no resolver); `Nodes([..])` → the listed set;
-`Group`/`Tags`/`AnyAuthorized` → resolve + rank + bound (§4.7).
+  same (Y, C, L, selector, mode) shares one `CapabilityInterestKey`
+  before anything leaves the node.
+- **Scope-wide, pre-selection (v4.2)**: equivalent interests from
+  different nodes meet at the elected leader and coalesce BEFORE
+  provider selection — divergent local provider rankings no longer
+  fragment demand (the review-5 limitation is repaired, not merely
+  measured).
+- **Residual divergence**: distinct islands during partitions, and
+  the window while an election result propagates. Bounded, expiring,
+  and measured (SI-7 merge-miss stats).
 
 ### 4.2 Wire objects (Layer 2 only)
 
@@ -724,7 +801,37 @@ must exercise the real dispatch path.
       SAME signed Ready proof (estimated_start = 300 ms) with
       different route estimates — one derives viable, the other
       not; the aggregate is local by definition and a relay never
-      forwards a capability-level verdict.
+      forwards a capability-level verdict;
+  24. **test (center rendezvous, review 6):** A and C with different
+      local provider rankings compute the SAME elected sensing
+      leader from the shared membership + proximity view;
+  25. **test (leader coalescing — the restored flagship):** A and C
+      register the identical provider-free interest at the leader →
+      ONE interest row, ONE bounded candidate branch, one signed
+      readiness stream, the identical proof delivered to both;
+  26. **test (leader loss):** R fails; the same election (health-
+      filtered) yields the next-ranked R₂; consumers re-register
+      their soft-state interests; candidates re-resolve; readiness
+      recovers — with NO synchronous state transfer;
+  27. **test (center change):** the proximity view shifts and a
+      different node becomes center; consumers re-register with it;
+      the old leader's rows expire to empty — no duplicate
+      permanence;
+  28. **test (partition):** two islands elect one leader each;
+      neither claims global authority; both may hold a branch to the
+      same provider (duplicate streams tolerated); after healing,
+      both islands elect one leader and the loser's state expires;
+  29. **test (old-leader suppression):** consumers that accept the
+      new election result stop refreshing the old leader; its
+      interest table drains and its branch demand deregisters;
+  30. **test (local latency disagreement):** the leader fans ONE
+      provider proof; A accepts it under its path budget while C
+      rejects it and consumes the standby candidate — the leader
+      never claims a universal end-to-end result;
+  31. **test (no new election machinery):** the sensing rendezvous
+      delegates to `redex::replication_election::elect` — outcome-
+      equivalence pinned across a matrix including tie-breaks; no
+      second election algorithm exists in the sensing tree.
 - **SI-1 — wire types + gates.** Codecs + signing for the Layer-2
   shapes (`ProviderInterest`, `ReadinessAttestation`);
   incarnation-scoped seq gate on the LRU shape; signature-cost
@@ -737,7 +844,10 @@ must exercise the real dispatch path.
   (n) no NotReady without a complete bounded set (item 22); (o) Each
   guardrails refuse broad selectors before activation (test 21);
   (p) provider-evaluated vs consumer-budget latency split enforced —
-  no end-to-end claim ever provider-signed (item 2, test 23).
+  no end-to-end claim ever provider-signed (item 2, test 23);
+  (q) the rendezvous/failover tests (items 24–31) pass and the
+  rendezvous demonstrably REUSES the RedEX election surface — no
+  second election subsystem (item 31).
   *As-built condition→test map (2026-07-12):* (a)/(b) delivery.rs
   tests 11/13; (c) continuity.rs test 14 + establishment-deadline
   tests; (d) table.rs test 15; (e) identity audience tests +
@@ -748,8 +858,9 @@ must exercise the real dispatch path.
   tests; (l) controller.rs flagship test; (m) controller.rs
   bounded-exploration test; (n) controller.rs open-world test;
   (o) controller.rs broad-Each test; (p) identity budget tests +
-  controller.rs budget-locality test. Remaining before SI-1 starts:
-  review sign-off + wire-id commitment.
+  controller.rs budget-locality test; (q) rendezvous.rs (items
+  24–31). Remaining before SI-1 starts: review sign-off + wire-id
+  commitment.
 - **SI-2 — interest table + resolver wiring.** Layer-2 table on real
   sessions; Layer-1 resolver over the real capability fold +
   proximity ranking + tag provenance; trailing-edge propagation;
@@ -786,9 +897,20 @@ SI-4; SI-7 last.
   delivery without Established upstream continuity (test 13);
   (4) capability-level NotReady without a complete bounded set
   (item 22).
-- **Divergent resolution = lost coalescing.** The honest v1 cost of
-  provider-targeted wire. Measured (SI-7); the §4.1 future gate is
-  evidence-triggered, not speculative.
+- **Island-relative leaders.** Partitions and election-propagation
+  windows produce duplicate provider streams — tolerated by design
+  (§4.1), bounded by soft-state expiry, measured (SI-7 merge-miss).
+  Do NOT "fix" this with consensus: blocking sensing on global
+  leader agreement is the failure mode.
+- **Leader hotspot.** The leader concentrates a scope's interest
+  demand: bounded by scope size, per-downstream caps, coalescing
+  (one row per distinct interest), and the fact that attestation
+  fan-out reuses the relay delivery machinery. SI-7 must expose
+  leader load so operators see it; a per-digest leader spread is a
+  possible later refinement, not v1.
+- **Election-reuse discipline.** Any terms/epochs or election
+  behavior change sensing appears to need lands in RedEX, not
+  beside it (review 6: no second leader-election subsystem).
 - **A fifth near-tripwire: relay-resolved aggregates.** Any code
   path where a relay suppresses, stops, or asserts capability-level
   state for downstreams (rather than forwarding proofs and
@@ -846,11 +968,13 @@ SI-4; SI-7 last.
 
 ## 9. Non-goals
 
-- **Capability-directed wire routing / rendezvous** — no owner-root
-  coordinator, no digest-deterministic rendezvous, no
-  reverse-announcement interest routing, no scoped flood in v1.
-  Revisited ONLY through the §4.1 evidence gate (SI-7
-  merge-miss measurement).
+- **Capability-name routing (NDN-style), scoped flooding, and
+  reverse-announcement interest routing** — still out. The v4.2
+  rendezvous is NOT a new routing plane: interests route to a
+  NodeId (the elected leader) over ordinary Net routing, and the
+  leader is chosen by the EXISTING RedEX election. No new
+  coordinator design, no second election subsystem, no
+  digest-deterministic DHT-style rendezvous.
 - **Evidence-age (strong freshness) guarantees** — named follow-up.
 - **Arbitrary Boolean selector or compound capability expressions on
   the wire** — local views and scheduler policy only; v1 selectors
