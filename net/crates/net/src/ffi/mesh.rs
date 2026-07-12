@@ -4312,7 +4312,7 @@ mod tests {
             .collect();
         assert_eq!(s, "203.0.113.5:4321");
         // NUL-terminated within the buffer.
-        assert!(out.port_mapping_external.iter().any(|&c| c == 0));
+        assert!(out.port_mapping_external.contains(&0));
 
         // Inactive mapping → empty string, active = 0.
         let snap_off = TraversalStatsSnapshot {
