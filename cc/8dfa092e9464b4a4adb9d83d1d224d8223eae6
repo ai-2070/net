@@ -1,0 +1,23 @@
+net/crates/net/bindings/go/net/tool.go
+  s_c28bdf38c0df3a::t_7f5f4e926f35e7 10-14
+  s_c28bdf38c0df3a::t_2c76159f147130 25-59,67
+  s_c28bdf38c0df3a::t_47cdad8388dc87 882-888,891-898,902-905,907-912,915-916,926-944,947-958,960-972,976-985,987-988,990,992-1002,1004
+net/crates/net/bindings/go/net/tool_test.go
+  s_c28bdf38c0df3a::t_c46d91209e6942 352-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "cc8dfa092e9464b4a4adb9d83d1d224d8223eae6",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
