@@ -1,0 +1,22 @@
+web/src/docs.order.ts
+  s_fbe2227727c023::t_3e3444a9b815bd 139
+  s_fbe2227727c023::t_95ead12ccf1bed 296
+net/crates/net/docs/releases/RELEASE_v0.32_SUMMER_MADNESS.md
+  s_fbe2227727c023::t_b31b9333c6e23a 1-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2227cdea82c311c41a170a32b7a82f475b04cfb1",
+  "prompts": {},
+  "sessions": {
+    "s_fbe2227727c023": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0cdbead5-31a7-4441-91a8-4d9ed48d817c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
