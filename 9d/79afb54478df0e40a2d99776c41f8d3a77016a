@@ -1,0 +1,48 @@
+net/crates/net/src/adapter/net/behavior/sensing/continuity.rs
+  s_c28bdf38c0df3a::t_bd77f14f54e6e7 47-52
+net/crates/net/src/adapter/net/behavior/sensing/evaluator.rs
+  s_c28bdf38c0df3a::t_9b3c1a149042c5 82-87
+net/crates/net/src/adapter/net/behavior/sensing/identity.rs
+  s_c28bdf38c0df3a::t_a349a0f24e538b 154-159
+net/crates/net/src/adapter/net/behavior/sensing/frames.rs
+  s_c28bdf38c0df3a::t_71086fa16c92ef 51-52,55,57-58
+  s_c28bdf38c0df3a::t_42095c3a120b86 106-110,123-135,137-139
+  s_c28bdf38c0df3a::t_a4abc8d25c0308 184-186,199-202,206-395,400-415
+  s_c28bdf38c0df3a::t_9440fa942ba69e 19-27,31-37,43-49
+  s_c28bdf38c0df3a::t_cf0dce477e5262 449,459-464,472-618
+  s_c28bdf38c0df3a::t_14595c24d894c4 416
+  s_c28bdf38c0df3a::t_ce794055bc8a50 619
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_226a0ea92ae38d 22-27,29-39
+  s_c28bdf38c0df3a::t_6b23e5ac56677d 56,58
+  s_c28bdf38c0df3a::t_f508778d4a0192 65-71
+net/crates/net/src/adapter/net/behavior/sensing/incarnation.rs
+  s_c28bdf38c0df3a::t_5a2b4986dc1d46 44-51
+net/crates/net/src/adapter/net/behavior/broadcast.rs
+  s_c28bdf38c0df3a::t_ebd02b21dbef32 31-34
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_1a4cf0fb1e086a 45-46,48
+  s_c28bdf38c0df3a::t_2995421b68ba43 376,393-409
+  s_c28bdf38c0df3a::t_961c9e8c18dabc 146-147
+  s_c28bdf38c0df3a::t_9d1b251bccac92 335-337,342-345
+net/crates/net/src/adapter/net/behavior/sensing/wire.rs
+  s_c28bdf38c0df3a::t_4290956e712a02 1-206,209-885,888-892,895-897
+  s_c28bdf38c0df3a::t_b57a3c29943abd 207-208
+  s_c28bdf38c0df3a::t_87f102627d5c47 886-887,893-894
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "9d79afb54478df0e40a2d99776c41f8d3a77016a",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
