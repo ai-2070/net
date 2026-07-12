@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_7546553b92fe16 38
+  s_c28bdf38c0df3a::t_78f01368d26958 25-32
+  s_c28bdf38c0df3a::t_bfe438b7190cbc 50,53-55
+net/crates/net/src/adapter/net/behavior/sensing/identity.rs
+  s_c28bdf38c0df3a::t_63e3d2a62cd2c0 530-533
+  s_c28bdf38c0df3a::t_00f0e133763879 64-97,101
+  s_c28bdf38c0df3a::t_b3b9e8d900fe19 213-217
+  s_c28bdf38c0df3a::t_f7bf457c796d6f 613-615
+  s_c28bdf38c0df3a::t_4fed88ce0f324f 126
+  s_c28bdf38c0df3a::t_903e2a613f2f43 127-129,515-517
+  s_c28bdf38c0df3a::t_19a081f7cadf2a 178-179,183
+  s_c28bdf38c0df3a::t_c7abc47b81766c 485-486,490
+  s_c28bdf38c0df3a::t_ab43f906cff160 102,184,491
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_98d3d5fd003b23 962-1086,1090-1217
+  s_c28bdf38c0df3a::t_903e2a613f2f43 48-49,1087-1089
+  s_c28bdf38c0df3a::t_559b2d6759fd21 36-37,45-46,51
+  s_c28bdf38c0df3a::t_1de4f0883155dd 124-207
+  s_c28bdf38c0df3a::t_c02deef5367c1b 321-443
+net/crates/net/tests/sensing_routed_origin.rs
+  s_c28bdf38c0df3a::t_b86a0553dace3c 340-348,350,352-356,360-368
+  s_c28bdf38c0df3a::t_51844786da0756 1-339,349,351,357-359,369-676
+net/crates/net/src/adapter/net/behavior/sensing/frames.rs
+  s_c28bdf38c0df3a::t_9d3a893575669e 1-287
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "23ebb1302836566c3bf4c156afcdc6fd6f5e4518",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
