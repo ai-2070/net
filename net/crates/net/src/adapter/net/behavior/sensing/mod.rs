@@ -19,8 +19,15 @@
 //! before SI-1 lands is cheap, changing it after is a wire break.
 
 pub mod continuity;
+pub mod evaluator;
 pub mod identity;
 pub mod incarnation;
+
+pub use evaluator::{
+    check_cadence, project_evaluation, validate_interest_constraints, CadenceRefusal,
+    EvaluationRequest, ReadinessEvaluation, ReadinessEvaluator, SensingCounters, StatusReason,
+    DEFAULT_ATTESTATION_CADENCE_FLOOR,
+};
 
 pub use continuity::{
     project, AttestedStatus, Continuity, DeliveredBeat, DisruptReason, ObservationCell,
