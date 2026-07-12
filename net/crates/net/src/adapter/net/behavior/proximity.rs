@@ -851,13 +851,44 @@ impl ProximityGraph {
     /// avoiding the quadratic `path.clone()`-per-neighbor cost of the
     /// naive "queue of paths" BFS.
     pub fn path_to(&self, dest: &NodeId) -> Option<Vec<NodeId>> {
+        self.bfs_path_to(dest, None)
+    }
+
+    /// Shortest path from self to `dest` that does NOT traverse the
+    /// direct `(self, dest)` edge — a genuinely INDIRECT route through
+    /// another neighbor. `None` means `dest` is reachable only
+    /// directly (or not at all).
+    ///
+    /// When a direct link fails, its `(self → dest)` edge lingers in
+    /// the graph until `sweep_stale_edges`, so an unrestricted
+    /// [`Self::path_to`] returns `[self, dest]` — the now-dead direct
+    /// hop — and masks any indirect alternate. Callers deciding
+    /// whether a failed peer is still reachable through someone else
+    /// must exclude that edge so the search is forced to route around
+    /// it (RT-5 review: withdrawal suppression, cubic P1).
+    pub fn path_to_excluding_direct(&self, dest: &NodeId) -> Option<Vec<NodeId>> {
+        self.bfs_path_to(dest, Some((self.my_id, *dest)))
+    }
+
+    /// BFS shortest path from self to `dest`, optionally dropping one
+    /// directed `(from, to)` edge from the adjacency so the search
+    /// routes around it. Shared by [`Self::path_to`] (no exclusion)
+    /// and [`Self::path_to_excluding_direct`].
+    fn bfs_path_to(
+        &self,
+        dest: &NodeId,
+        exclude_edge: Option<(NodeId, NodeId)>,
+    ) -> Option<Vec<NodeId>> {
         if *dest == self.my_id {
             return Some(vec![self.my_id]);
         }
 
-        // Build adjacency from edges
+        // Build adjacency from edges, skipping the excluded edge.
         let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for edge in self.edges.iter() {
+            if exclude_edge == Some((edge.from, edge.to)) {
+                continue;
+            }
             adjacency.entry(edge.from).or_default().push(edge.to);
         }
 
@@ -1515,6 +1546,54 @@ mod tests {
 
         let path = graph.path_to(&y).expect("path_to(y) should return Some");
         assert_eq!(path, vec![my_id, z, y]);
+    }
+
+    #[test]
+    fn path_to_excluding_direct_routes_around_the_direct_edge() {
+        // A dest reachable BOTH directly (self→Y) and indirectly
+        // (self→Z→Y). The unrestricted search takes the direct edge;
+        // excluding it forces the indirect route (cubic P1: the failed
+        // link's direct edge must not mask a live alternate).
+        let my_id = make_node_id(1);
+        let z = make_node_id(2);
+        let y = make_node_id(3);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from_y: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let from_z: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        // Direct edge self→Y (pingwave straight from Y).
+        graph.on_pingwave_from(EnhancedPingwave::new(y, 1, 3), y, from_y);
+        // Indirect self→Z→Y (pingwave for Y forwarded via Z).
+        let mut pw = EnhancedPingwave::new(y, 2, 3);
+        pw.hop_count = 1;
+        graph.on_pingwave_from(pw, z, from_z);
+
+        assert_eq!(
+            graph.path_to(&y),
+            Some(vec![my_id, y]),
+            "unrestricted search takes the shortest (direct) edge",
+        );
+        assert_eq!(
+            graph.path_to_excluding_direct(&y),
+            Some(vec![my_id, z, y]),
+            "excluding the direct edge forces the indirect route",
+        );
+    }
+
+    #[test]
+    fn path_to_excluding_direct_none_when_only_direct() {
+        let my_id = make_node_id(1);
+        let y = make_node_id(3);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from_y: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        graph.on_pingwave_from(EnhancedPingwave::new(y, 1, 3), y, from_y);
+
+        assert_eq!(graph.path_to(&y), Some(vec![my_id, y]));
+        assert_eq!(
+            graph.path_to_excluding_direct(&y),
+            None,
+            "a dest reachable only directly has no indirect alternate",
+        );
     }
 
     #[test]
