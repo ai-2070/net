@@ -838,7 +838,7 @@ pub fn capability_tags_for_all(
 /// Of `node_ids`, those advertising `tag` in their folded capability
 /// set — computed under a single `with_state` lock, with no per-node
 /// tag-`Vec` allocation. Coordinator selection filters its direct-peer
-/// candidates by [`RELAY_CAPABLE_TAG`] this way, instead of taking the
+/// candidates by `RELAY_CAPABLE_TAG` this way, instead of taking the
 /// fold lock and materializing a full tag union once per candidate
 /// (a `1 + N`-lock, `N`-allocation pattern).
 pub fn nodes_with_capability_tag(

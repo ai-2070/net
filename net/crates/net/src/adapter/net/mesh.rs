@@ -13123,7 +13123,7 @@ impl MeshNode {
     ///    with both ends — the highest-probability coordinator, and no
     ///    discovery needed.
     /// 2. **`relay-capable` direct peer.** A mutual direct peer that
-    ///    advertised [`RELAY_CAPABLE_TAG`]. Picked at random from the
+    ///    advertised `RELAY_CAPABLE_TAG`. Picked at random from the
     ///    tier's candidates (not lowest-`node_id`): a deterministic
     ///    pick would funnel every requester's punches through one peer,
     ///    making it a mesh-wide coordinator hotspot and single point of
@@ -14977,18 +14977,19 @@ impl MeshNode {
     /// Spawn the background direct-path upgrade scan loop (Stage 3).
     /// Every tick, find relay-routed peers for which this node is the
     /// lower-id initiator (C1) and whose throttle window has elapsed,
-    /// and fire a per-peer [`Self::attempt_direct_upgrade`]. No-op
+    /// and fire a per-peer `attempt_direct_upgrade`. No-op
     /// unless `MeshNodeConfig::auto_direct_upgrade` is set; exits on
     /// `shutdown_notify`.
     ///
-    /// The task holds only a [`Weak`] self-ref (upgraded transiently
-    /// per tick), never `Arc::clone(self)`. A strong self-ref held for
-    /// the task's lifetime would stop [`MeshNode::drop`] — the path
-    /// that sets `shutdown` — from ever running for an `Arc<MeshNode>`
-    /// dropped without an explicit `shutdown()`: the loop would then
-    /// spin forever and leak the node, its socket, and every other
-    /// background task. Same `Weak`-then-`upgrade()` contract as
-    /// [`Self::spawn_capability_reannounce_loop`].
+    /// The task holds only a [`Weak`](std::sync::Weak) self-ref
+    /// (upgraded transiently per tick), never `Arc::clone(self)`. A
+    /// strong self-ref held for the task's lifetime would stop
+    /// [`MeshNode::drop`] — the path that sets `shutdown` — from ever
+    /// running for an `Arc<MeshNode>` dropped without an explicit
+    /// `shutdown()`: the loop would then spin forever and leak the
+    /// node, its socket, and every other background task. Same
+    /// `Weak`-then-`upgrade()` contract as
+    /// `spawn_capability_reannounce_loop`.
     #[cfg(feature = "nat-traversal")]
     pub fn spawn_direct_upgrade_loop(self: &Arc<Self>) -> JoinHandle<()> {
         const SCAN_INTERVAL: Duration = Duration::from_secs(1);

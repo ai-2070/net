@@ -244,7 +244,7 @@ pub async fn publish_blob<A: BlobAdapter + ?Sized>(
 /// [`BlobAdapter::accepted_schemes`] *here*, mirroring the gate in
 /// [`resolve_payload`]. Without the publish-side check, a URI the
 /// adapter rejects at resolve time (e.g. a scheme-less `"key/name"`
-/// against the `file`-only [`FileSystemAdapter`]) would store
+/// against the `file`-only `FileSystemAdapter`) would store
 /// successfully and mint an encoded ref that the very same adapter
 /// can never resolve — silently breaking [`publish_blob`]'s
 /// round-trip guarantee. Failing fast at publish turns that poisoned
