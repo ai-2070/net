@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_03d1b91346107a 22,24-25
+net/crates/net/src/adapter/net/behavior/sensing/delivery.rs
+  s_c28bdf38c0df3a::t_75988befac5354 706-708
+  s_c28bdf38c0df3a::t_e5ad5eea528df1 180-185
+  s_c28bdf38c0df3a::t_46665c6d3e617e 80,287,375,450,563-568,579-584,659-662
+  s_c28bdf38c0df3a::t_38beb37eda9c36 224-229,234,238
+  s_c28bdf38c0df3a::t_0a3e30344671aa 1-79,81-179,186-223,230-233,235-237,239-286,288-374,376-449,451-562,569-578,585-658,663-705,709-806
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "0b81a23c29f5cc39963fa4d859ae1ae380fdf88b",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
