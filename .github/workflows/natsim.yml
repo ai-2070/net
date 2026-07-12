@@ -13,17 +13,7 @@ name: natsim
 on:
   pull_request:
     paths:
-      - "net/crates/net/src/adapter/net/traversal/**"
-      - "net/crates/net/src/adapter/net/mesh.rs"
-      - "net/crates/net/src/adapter/net/session.rs"
-      - "net/crates/net/tests/natsim/**"
-      - "net/crates/net/tests/natsim.rs"
-      - "net/crates/net/examples/natsim_node.rs"
-      # Dependency / feature-flag changes can break the
-      # `--features net,nat-traversal` build or shift runtime
-      # behavior without touching traversal source (cubic P2).
-      - "net/crates/net/Cargo.toml"
-      - "net/crates/net/Cargo.lock"
+      - "net/crates/net/**"
       - ".github/workflows/natsim.yml"
   schedule:
     # Nightly at 03:17 UTC — off the peak to keep runner queues calm.
