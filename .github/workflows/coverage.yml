@@ -30,7 +30,7 @@ on:
       - '.github/workflows/coverage.yml'
   pull_request:
     paths:
-      - 'net/**'
+      - "net/crates/net/**"
       - 'go/**'
       - '.github/workflows/coverage.yml'
 
