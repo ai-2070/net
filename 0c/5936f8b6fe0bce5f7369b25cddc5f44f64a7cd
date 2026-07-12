@@ -1,0 +1,20 @@
+net/crates/net/examples/natsim_node.rs
+  s_6f4d4a41711b2b::t_d852db9d4fa860 410-413
+  s_6f4d4a41711b2b::t_ffb15ed2af9a08 446-456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "0c5936f8b6fe0bce5f7369b25cddc5f44f64a7cd",
+  "prompts": {},
+  "sessions": {
+    "s_6f4d4a41711b2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2a40a731-f07a-4efa-9058-fa494f0474b7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
