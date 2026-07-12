@@ -58,6 +58,7 @@ pub mod safety;
 #[cfg(all(feature = "cortex", feature = "meshos"))]
 pub mod scheduler_bridge;
 pub mod schema;
+pub mod sensing;
 pub mod subnet;
 pub mod tag;
 pub mod tag_codec;

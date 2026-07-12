@@ -97,6 +97,11 @@ net = [
     "dep:hex",
     "dep:libc",
     "dep:blake2",
+    # Sensing-interest digests (`behavior::sensing`,
+    # SENSING_INTEREST_COALESCING_PLAN §3.2) are blake3 with
+    # derive_key domain separation — already in the tree via
+    # meshos/dataforts; the sensing plane makes it a `net` dep.
+    "dep:blake3",
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
     # Constant-time byte compares for the bearer-secret newtypes
