@@ -116,10 +116,16 @@ impl WithdrawalSeqGate {
     /// seq for this `(sender, dest)` (or the pair is unseen);
     /// records it (and refreshes its access tick) when seen.
     pub fn admit(&self, sender: u64, dest: u64, seq: u64) -> bool {
-        self.evict_if_over_capacity();
-        // Every sighting (admitted or not) refreshes the pair's tick —
-        // a pair still receiving withdrawals is active and must not be
-        // evicted out from under an in-flight reorder.
+        // Refresh/insert the incoming pair FIRST — apply its ordering
+        // check against any existing entry and stamp it with the
+        // newest tick — and only THEN bound the map. Evicting first
+        // could drop this very pair's history (if it were the LRU
+        // victim) right before the insert, so even an OLDER seq would
+        // be reinserted as new and wrongly admitted (cubic P1). By
+        // sighting first, the incoming pair becomes the most-recently-
+        // touched and is never evicted by its own admit. Every
+        // sighting (admitted or not) refreshes the tick, since a pair
+        // still receiving withdrawals is active.
         let touch = self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut admitted = false;
         self.seen
@@ -135,6 +141,7 @@ impl WithdrawalSeqGate {
                 admitted = true;
                 SeqEntry { seq, touch }
             });
+        self.evict_if_over_capacity();
         admitted
     }
 
@@ -245,6 +252,28 @@ mod tests {
             "recently-active pair's ordering must survive overflow eviction",
         );
         assert!(gate.admit(1, 7, 101), "a genuinely newer seq still admits");
+    }
+
+    #[test]
+    fn seq_gate_admit_survives_the_overflow_it_triggers() {
+        // cubic P1: the pair a withdrawal names is refreshed BEFORE
+        // eviction victims are chosen, so an admit that trips the
+        // capacity bound never evicts its own pair — the pair keeps
+        // its ordering instead of being dropped and reinserted as a
+        // fresh entry that would admit an older seq.
+        let gate = WithdrawalSeqGate::new();
+        // Fill exactly to the bound with filler pairs.
+        for dest in 0..(WithdrawalSeqGate::MAX_ENTRIES as u64) {
+            gate.admit(2, dest, 1);
+        }
+        // This pair's admit tips over the bound and triggers eviction;
+        // it must survive (just sighted → newest) and then gate a
+        // later stale withdrawal for itself.
+        assert!(gate.admit(1, 7, 100), "overflow-triggering pair admitted");
+        assert!(
+            !gate.admit(1, 7, 50),
+            "the pair that triggered the overflow kept its ordering",
+        );
     }
 
     #[test]
