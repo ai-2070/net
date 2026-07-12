@@ -1,13 +1,16 @@
 # Capability Sensing Plan (Interest Coalescing)
 
-Status: v4.3 — review 7 (2026-07-12): election reuse and gates
-(a)–(q) semantic/continuity conditions ACCEPTED; sign-off withheld
-on the provider-free transport — §4.2 now defines the two-stage
-`SensingInterestFrame` (leader-addressed `CapabilityRegistration`
-carrying selector + mode, provider-addressed `ProviderRegistration`,
-`Deregister`) with leader-side digest re-derivation, and §4.10 the
-routed-origin authority rule. Gates (r)/(s) added; SI-1 and wire-id
-allocation remain BLOCKED until (r)/(s) are as-built and signed off
+Status: v4.3 — **gate map (a)–(s) SIGNED OFF; SI-0 COMPLETE; SI-1
+AUTHORIZED** (review 7 sign-off, 2026-07-12, verified at 45ac1f44e).
+0x0C02 (`SensingInterestFrame`) and 0x0C03 (`ReadinessAttestation`)
+MAY be committed. SI-1 scope: canonical codecs, signing +
+verification honoring the transcript invariant below (§4.2),
+incarnation seq gate rehosted on the bounded LRU shape, and the
+sign/verify benchmark at the 50 ms cadence floor + realistic
+fan-out — batching only if the numbers justify it. SI-2+ is NOT
+implied by this sign-off; semantic gate review is closed — SI-1
+implements the frozen wire and reports the real benchmark, it does
+not reopen the architecture
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -520,16 +523,40 @@ SensingInterestFrame =
     constraints:               InlineBytes,
     constraints_digest:        Digest256,
     work_latency:              WorkLatencyEnvelope,
+    // Carried for COMPLETE digest verification, even though they do
+    // not affect provider-side predicate evaluation (review 7
+    // sign-off, SI-1 transcript invariant): the provider must never
+    // sign an attestation against an opaque, unvalidated
+    // interest-digest claim.
+    providers:                 ProviderSelector,
+    result_mode:               ResultMode,
+    disclosure_class:          DisclosureClass,
+    audience_scope:            Scope,
     interest_digest:           Digest256,
     requested_sample_interval: Duration,
     soft_state_ttl:            Duration,
-    audience_scope:            Scope,
   }
 | Deregister {
     interest_digest:           Digest256,
     target:                    Option<NodeId>,
   }
 ```
+
+**The provider re-derives too (SI-1 transcript invariant, review 7
+sign-off).** On `ProviderRegistration` the provider (1) canonicalizes
+and validates the constraints, (2) reconstructs the COMPLETE
+interest identity from the carried fields, (3) re-derives
+`interest_digest`, (4) rejects any mismatch as protocol-invalid,
+(5) evaluates only the provider-relevant predicate, and (6) signs
+the VALIDATED identity. "The provider does not evaluate population
+semantics" stays true — it carries selector/mode/class only to
+validate the transcript it signs. The `ReadinessAttestation`
+signature transcript binds at minimum: protocol domain/version,
+interest digest, origin NodeId, origin incarnation, capability id,
+capability generation, status + reason, estimated start, sequence,
+promised cadence, audience scope — and because the digest was
+validated first, signing it commits the attestation to the complete
+predicate + selector + mode + disclosure + audience identity.
 
 **The leader re-derives.** On `CapabilityRegistration` the leader
 recomputes the interest digest from the carried predicate + selector
