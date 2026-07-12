@@ -48,6 +48,9 @@ mod natsim {
     const PSK: [u8; 32] = [0x42u8; 32];
     /// How long coordination waits (files, reflex visibility) may take.
     const COORD_TIMEOUT: Duration = Duration::from_secs(60);
+    // How long a joiner keeps re-running the classification sweep
+    // waiting for a concrete NAT class before giving up and proceeding.
+    const CLASSIFY_TIMEOUT: Duration = Duration::from_secs(20);
 
     fn usage() -> ! {
         eprintln!(
@@ -325,7 +328,34 @@ mod natsim {
         node.start_arc();
         // Classify against the two publics (distinct public IPs → real
         // cone-vs-symmetric discrimination), then announce class+reflex.
-        node.reclassify_nat().await;
+        //
+        // Retry the sweep until a concrete class lands (or the
+        // deadline). A single post-connect sweep can lose its reflex
+        // probes to a session that's still warming right after the
+        // handshake; the <2-observation guard then keeps the prior
+        // class (Unknown) rather than flapping, and the node announces
+        // `nat:unknown` for the rest of the run. The loopback classify
+        // suites poll the same way. NOTE: this only rescues a class
+        // that would otherwise arrive late — it can't correct a sweep
+        // that observes the wrong reflex (e.g. a mis-simulated NAT).
+        {
+            use net::adapter::net::traversal::classify::NatClass;
+            let deadline = tokio::time::Instant::now() + CLASSIFY_TIMEOUT;
+            loop {
+                node.reclassify_nat().await;
+                if node.nat_class() != NatClass::Unknown {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "natsim_node: {name} NAT class stayed Unknown after \
+                         {CLASSIFY_TIMEOUT:?}; proceeding (outcome will report Unknown)"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
         node.announce_capabilities(CapabilitySet::new())
             .await
             .expect("joiner announce");
