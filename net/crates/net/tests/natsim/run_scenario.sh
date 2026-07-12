@@ -78,7 +78,21 @@ if [[ "$MODE" == upgrade ]]; then
   ID2="$(echo "$K2" | sed -n 's/.*"node_id":\([0-9]*\).*/\1/p')"
   S1="$(echo "$K1" | sed -n 's/.*"seed_hex":"\([0-9a-f]*\)".*/\1/p')"
   S2="$(echo "$K2" | sed -n 's/.*"seed_hex":"\([0-9a-f]*\)".*/\1/p')"
-  if [[ "$ID1" -lt "$ID2" ]]; then LOW="$S1"; HIGH="$S2"; else LOW="$S2"; HIGH="$S1"; fi
+  # node_id is a u64 that routinely exceeds i64::MAX (~half of keys).
+  # Bash arithmetic `-lt` is SIGNED 64-bit and silently truncates /
+  # mis-orders those values, so ~half the runs would hand A the HIGHER
+  # id — failing the C1 "only the lower id initiates" gate so the
+  # background upgrade never fires (the flaky relay_upgrade failure:
+  # upgrade_loop_candidate=false, upgrades_attempted=0). Compare as
+  # zero-padded fixed-width decimal strings: for equal widths, lexical
+  # order == unsigned numeric order, and no value is ever parsed as a
+  # (truncated, signed) integer.
+  pad_u64() { printf '%020s' "$1" | tr ' ' '0'; }
+  if [[ "$(pad_u64 "$ID1")" < "$(pad_u64 "$ID2")" ]]; then
+    LOW="$S1"; HIGH="$S2"
+  else
+    LOW="$S2"; HIGH="$S1"
+  fi
   SEED_ARGS_A=(--seed-hex "$LOW")
   SEED_ARGS_B=(--seed-hex "$HIGH")
 fi
