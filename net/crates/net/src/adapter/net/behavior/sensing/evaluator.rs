@@ -79,7 +79,12 @@ pub enum ReadinessEvaluation {
 /// Compact `status_reason` code carried beside the wire status
 /// (plan §4.2/§4.4). Consumers treat every `ProviderUnknown` alike;
 /// these codes exist for observability distributions (SI-7).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Serde exists for the SI-1 wire codec
+/// (`super::wire::ReadinessAttestation`, postcard); the signature
+/// transcript never hashes a serde encoding — it uses the
+/// fixed-width canonical tag in `super::wire`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StatusReason {
     /// No detail (the normal Ready case).
     None,

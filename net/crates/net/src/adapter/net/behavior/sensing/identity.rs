@@ -151,7 +151,12 @@ impl fmt::Display for CapabilityId {
 /// v1 is owner-root-only; the variant is in the digest from day one
 /// so adding delegated classes later separates identities instead of
 /// silently merging them.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Serde exists because the amended `ProviderRegistration` leg
+/// carries the class for COMPLETE digest verification (plan §4.2,
+/// review 7); identity always hashes [`Self::canonical_tag`], never
+/// a serde encoding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DisclosureClass {
     /// Disclosed only within the owner root's own infrastructure.

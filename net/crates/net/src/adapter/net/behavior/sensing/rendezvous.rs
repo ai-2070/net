@@ -42,10 +42,10 @@ use super::controller::{
     resolve_candidates, CandidatePolicy, CandidateProvider, ResolutionRefusal,
 };
 use super::delivery::{Delivery, SensingRelay};
-use super::evaluator::{validate_interest_constraints, SensingCounters};
-use super::frames::SensingInterestFrame;
+use super::evaluator::SensingCounters;
+use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{
-    AudienceScopeCommitment, CapabilityInterestKey, ConstraintError, DisclosureClass, InterestSpec,
+    AudienceScopeCommitment, CapabilityInterestKey, ConstraintError, InterestSpec,
     ProviderInterestKey,
 };
 use super::scope::{validate_subscriber_scope, ScopeError};
@@ -143,8 +143,8 @@ pub enum FrameRejection {
         authenticated: u64,
     },
     /// The inline constraint bytes failed parse or digest validation
-    /// ([`validate_interest_constraints`] — which already counted the
-    /// rejection).
+    /// ([`super::evaluator::validate_interest_constraints`] — which
+    /// already counted the rejection).
     Constraints(ConstraintError),
     /// The RE-DERIVED interest digest does not match the frame's
     /// claim (plan §4.2, review 7): the sender's bytes don't hash to
@@ -332,13 +332,17 @@ impl SensingLeader {
     ///    rule.
     /// 2. **Predicate reconstruction** — the inline constraint bytes
     ///    parse and must hash to the carried `constraints_digest`
-    ///    ([`validate_interest_constraints`], which owns the
-    ///    invalid-constraints/security counting).
+    ///    (via [`SensingInterestFrame::validated_spec`], whose
+    ///    constraint intake owns the invalid-constraints/security
+    ///    counting).
     /// 3. **Digest re-derivation** — the [`InterestSpec`] rebuilt
     ///    from the carried predicate + selector + mode + scope must
     ///    hash to the frame's `interest_digest`; a mismatch is
     ///    protocol-invalid. **The RE-DERIVED identity is what
-    ///    coalesces** — the claim is only ever a cross-check.
+    ///    coalesces** — the claim is only ever a cross-check. Steps
+    ///    2–3 are [`SensingInterestFrame::validated_spec`] — the
+    ///    SAME intake pipeline the provider leg runs before signing
+    ///    (plan §4.2, review 7).
     /// 4. **Scope validation** — [`validate_subscriber_scope`]
     ///    against the session-proven root; the frame's
     ///    `audience_scope` is the wire claim AND the digest-bound
@@ -365,17 +369,11 @@ impl SensingLeader {
         now: Instant,
     ) -> Result<LeaderRegistration, FrameRejection> {
         let SensingInterestFrame::CapabilityRegistration {
-            capability_id,
-            constraints,
-            constraints_digest,
-            work_latency,
-            providers,
-            result_mode,
-            interest_digest,
             requested_sample_interval,
             soft_state_ttl,
             audience_scope,
             consumer,
+            ..
         } = frame
         else {
             return Err(FrameRejection::NotLeaderAddressed);
@@ -392,29 +390,23 @@ impl SensingLeader {
             });
         }
 
-        // (2) Reconstruct the predicate: parse + digest-validate the
-        // inline constraints (counting lives in the evaluator's
-        // intake helper).
-        let constraints = validate_interest_constraints(constraints, constraints_digest, counters)
-            .map_err(FrameRejection::Constraints)?;
-        let spec = InterestSpec {
-            capability_id: capability_id.clone(),
-            constraints,
-            work_latency: *work_latency,
-            providers: providers.clone(),
-            result_mode: *result_mode,
-            disclosure_class: DisclosureClass::Owner,
-            audience: *audience_scope,
-        };
-
-        // (3) RE-DERIVE the interest digest and cross-check the
-        // claim. The re-derived key — spec.key(), inside
-        // register_capability_interest — is the ONLY identity that
-        // ever coalesces.
-        if spec.interest_digest() != *interest_digest {
-            counters.protocol_invalid.fetch_add(1, Ordering::Relaxed);
-            return Err(FrameRejection::DigestMismatch);
-        }
+        // (2)+(3) The shared intake pipeline (frames.rs — used by
+        // BOTH legs): parse + digest-validate the inline
+        // constraints, reconstruct the COMPLETE spec, RE-DERIVE the
+        // interest digest, and cross-check the claim. The re-derived
+        // key — spec.key(), inside register_capability_interest — is
+        // the ONLY identity that ever coalesces.
+        let spec = frame
+            .validated_spec(counters)
+            .map_err(|error| match error {
+                FrameSpecError::Constraints(error) => FrameRejection::Constraints(error),
+                FrameSpecError::InterestDigestMismatch => FrameRejection::DigestMismatch,
+                // Unreachable: the CapabilityRegistration match above
+                // already excluded the spec-free variants.
+                FrameSpecError::NotARegistration | FrameSpecError::NotProviderAddressed => {
+                    FrameRejection::NotLeaderAddressed
+                }
+            })?;
 
         // (4) Owner-root scope from the SESSION identity; the frame
         // field is the cross-checked wire claim.

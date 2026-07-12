@@ -19,17 +19,24 @@
 //! with the SI-0 test matrix (plan §6, tests 7–23) — BEFORE any wire
 //! format or subprotocol id is committed.
 //!
-//! SI-0 is deliberately **in-process**: nothing here is reachable
-//! from `MeshNode` dispatch, no subprotocol ids are consumed, and
-//! the 0x0C02/0x0C03 reservations stay uncommitted until the SI-1
-//! gate conditions (plan §6, items (a)–(s)) hold. The v4.3 gates
-//! (r)/(s) add the two-stage frame SHAPES (`frames.rs` — semantic,
-//! serde-serializable, still no wire id) and the leader-side frame
-//! intake with digest re-derivation + routed-origin authority
+//! SI-0 was deliberately **in-process**: nothing was reachable from
+//! `MeshNode` dispatch and no subprotocol ids were consumed until
+//! the SI-1 gate conditions (plan §6, items (a)–(s)) held. The v4.3
+//! gates (r)/(s) added the two-stage frame SHAPES (`frames.rs` —
+//! semantic, serde-serializable) and the leader-side frame intake
+//! with digest re-derivation + routed-origin authority
 //! (`SensingLeader::register_from_frame`,
-//! `tests/sensing_routed_origin.rs`). The wire shapes in plan §4.2
-//! gain their frozen codec in SI-1; changing a type here before SI-1
-//! lands is cheap, changing it after is a wire break.
+//! `tests/sensing_routed_origin.rs`).
+//!
+//! **SI-1 (review 7 sign-off)** commits the wire: `wire.rs` owns the
+//! 0x0C02/0x0C03 subprotocol ids, the frozen postcard codec (strict
+//! decode, 4 KiB cap), attestation signing + verification over the
+//! §4.2 transcript, and the wire→semantic attestation bridge.
+//! `frames.rs` gained the review-7 `ProviderRegistration` amendment
+//! (selector/mode/class carried for COMPLETE digest verification)
+//! and the shared intake pipeline both legs run
+//! (`SensingInterestFrame::validated_spec`). Changing any wire-borne
+//! type from here on is a wire break.
 
 pub mod continuity;
 pub mod controller;
@@ -46,14 +53,22 @@ pub mod negotiation;
 pub mod rendezvous;
 pub mod scope;
 pub mod table;
+pub mod wire;
 
-pub use frames::SensingInterestFrame;
+pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
     closeness_score, sensing_leader, FrameRejection, LeaderRegistration, SensingLeader,
 };
 pub use scope::{validate_subscriber_scope, ScopeError};
+pub use wire::{
+    decode_attestation, decode_interest_frame, encode_attestation, encode_interest_frame,
+    semantic_attestation, sign_attestation, verify_attestation, AttestationBridgeError,
+    AttestationSignError, AttestationVerifyError, ReadinessAttestation, UnsignedAttestation,
+    WireError, ATTESTATION_SIG_DOMAIN, MAX_SENSING_FRAME_BYTES, SUBPROTOCOL_READINESS_ATTESTATION,
+    SUBPROTOCOL_SENSING_INTEREST,
+};
 
 pub use controller::{
     population_is_boundable, project_aggregate, resolve_candidates, AggregateView, BranchView,

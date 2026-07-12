@@ -44,7 +44,12 @@ use super::incarnation::Incarnation;
 /// evaluate (unsupported predicate, transient failure, invalid
 /// constraints) — consumer-side Unknown is *derived* via projection,
 /// never attested.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Serde exists for the SI-1 wire codec
+/// (`super::wire::ReadinessAttestation`, postcard); the signature
+/// transcript never hashes a serde encoding — it uses the
+/// fixed-width canonical tag in `super::wire`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AttestedStatus {
     /// Predicate holds; work can start within the envelope.
     Ready,

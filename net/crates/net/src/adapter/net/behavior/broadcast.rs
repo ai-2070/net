@@ -28,6 +28,10 @@ pub const SUBPROTOCOL_CAPABILITY_ANN: u16 = 0x0C00;
 /// the guard, not merely new enough to have this constant.
 pub const SUBPROTOCOL_ROUTE_WITHDRAW: u16 = 0x0C01;
 
+// 0x0C02/0x0C03 (sensing interest / readiness attestation) are
+// sensing-owned and live in `super::sensing::wire` — committed there
+// per the SENSING_INTEREST_COALESCING_PLAN review-7 sign-off.
+
 /// Poison-reverse route withdrawal: the SENDER declares "I no longer
 /// forward toward `dest`". The `via` leg is implicit and
 /// authenticated — it is always the session peer the packet arrived

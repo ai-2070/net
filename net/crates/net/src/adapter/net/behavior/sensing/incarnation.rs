@@ -41,7 +41,14 @@ use super::identity::Digest256;
 
 /// A provider boot epoch — the persisted monotonic counter under
 /// which an origin signs its attestation sequence.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+///
+/// Serde (a transparent u64) exists for the SI-1 wire codec
+/// (`super::wire::ReadinessAttestation`, postcard); the signature
+/// transcript never hashes a serde encoding — it binds the counter
+/// as fixed-width LE bytes in `super::wire`.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct Incarnation(u64);
 
 impl Incarnation {
