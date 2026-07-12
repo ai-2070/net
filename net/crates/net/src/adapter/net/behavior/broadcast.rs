@@ -85,15 +85,27 @@ impl RouteWithdrawal {
 /// re-handshake so each session incarnation starts clean.
 #[derive(Debug, Default)]
 pub struct WithdrawalSeqGate {
-    seen: dashmap::DashMap<(u64, u64), u64>,
+    seen: dashmap::DashMap<(u64, u64), SeqEntry>,
+    /// Monotonic access clock; each [`Self::admit`] stamps the
+    /// touched entry with the next tick so overflow eviction can drop
+    /// the least-recently-active pairs.
+    tick: std::sync::atomic::AtomicU64,
+}
+
+/// Per-`(sender, dest)` gate state: the last admitted `seq` plus the
+/// access `tick` of the most recent sighting (for LRU eviction).
+#[derive(Debug)]
+struct SeqEntry {
+    seq: u64,
+    touch: u64,
 }
 
 impl WithdrawalSeqGate {
-    /// Hard bound on tracked pairs. Exceeding it clears the map —
-    /// the cost of forgetting is at worst admitting one stale
-    /// duplicate (repaired by anti-entropy), which beats unbounded
-    /// growth from (peer × dest) churn.
+    /// Hard bound that triggers eviction.
     const MAX_ENTRIES: usize = 8192;
+    /// Post-eviction target: overflow drops the least-recently-touched
+    /// entries down to this mark rather than clearing the whole map.
+    const LOW_WATER: usize = 6144;
 
     /// Empty gate — nothing admitted yet.
     pub fn new() -> Self {
@@ -102,25 +114,56 @@ impl WithdrawalSeqGate {
 
     /// `true` iff `seq` is strictly newer than the last admitted
     /// seq for this `(sender, dest)` (or the pair is unseen);
-    /// records it when admitted.
+    /// records it (and refreshes its access tick) when seen.
     pub fn admit(&self, sender: u64, dest: u64, seq: u64) -> bool {
-        if self.seen.len() > Self::MAX_ENTRIES {
-            self.seen.clear();
-        }
+        self.evict_if_over_capacity();
+        // Every sighting (admitted or not) refreshes the pair's tick —
+        // a pair still receiving withdrawals is active and must not be
+        // evicted out from under an in-flight reorder.
+        let touch = self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut admitted = false;
         self.seen
             .entry((sender, dest))
-            .and_modify(|last| {
-                if seq > *last {
-                    *last = seq;
+            .and_modify(|e| {
+                e.touch = touch;
+                if seq > e.seq {
+                    e.seq = seq;
                     admitted = true;
                 }
             })
             .or_insert_with(|| {
                 admitted = true;
-                seq
+                SeqEntry { seq, touch }
             });
         admitted
+    }
+
+    /// Drop only the least-recently-touched entries down to
+    /// [`Self::LOW_WATER`] when the map exceeds [`Self::MAX_ENTRIES`].
+    ///
+    /// The previous implementation cleared the WHOLE map on overflow,
+    /// which forgot the ordering of every tracked `(sender, dest)`
+    /// pair at once — a single overflow then let a delayed OLDER
+    /// withdrawal for any route slip through and tear down a route the
+    /// sender had since re-advertised (cubic review P2). Evicting only
+    /// the idle tail preserves the ordering of the recently-active
+    /// pairs, which are exactly the ones an in-flight reorder can
+    /// threaten. O(n) but only on the rare overflow.
+    fn evict_if_over_capacity(&self) {
+        if self.seen.len() <= Self::MAX_ENTRIES {
+            return;
+        }
+        let mut touches: Vec<u64> = self.seen.iter().map(|e| e.value().touch).collect();
+        if touches.len() <= Self::LOW_WATER {
+            return;
+        }
+        // The cutoff is the `LOW_WATER`-th newest touch; ticks are
+        // unique, so retaining `touch >= cutoff` keeps exactly the
+        // newest `LOW_WATER` pairs.
+        let cutoff_idx = touches.len() - Self::LOW_WATER;
+        touches.select_nth_unstable(cutoff_idx);
+        let cutoff = touches[cutoff_idx];
+        self.seen.retain(|_, e| e.touch >= cutoff);
     }
 
     /// Drop every entry authored by `sender` — called on
@@ -164,16 +207,44 @@ mod tests {
     }
 
     #[test]
-    fn seq_gate_survives_overflow_clear() {
+    fn seq_gate_survives_overflow_eviction() {
         let gate = WithdrawalSeqGate::new();
+        // dest 0 is inserted first, so it's the least-recently-touched
+        // and gets evicted when the map overflows.
         for dest in 0..=(WithdrawalSeqGate::MAX_ENTRIES as u64) {
             assert!(gate.admit(1, dest, 1));
         }
-        // Past the bound the map clears; the gate keeps functioning
-        // (a post-clear duplicate is admitted once — documented
-        // trade-off — then gated again).
-        assert!(gate.admit(1, 0, 1), "post-clear sighting admits");
-        assert!(!gate.admit(1, 0, 1), "gating resumes after the clear");
+        // The next admit trips the bound and evicts the idle tail
+        // (including the long-untouched dest 0). The gate keeps
+        // functioning: an evicted pair is admitted once, then gated.
+        assert!(gate.admit(1, 0, 1), "evicted pair's sighting admits");
+        assert!(!gate.admit(1, 0, 1), "gating resumes after the eviction");
+    }
+
+    #[test]
+    fn seq_gate_overflow_preserves_recently_active_ordering() {
+        // cubic P2: a whole-map clear on overflow would forget EVERY
+        // pair's ordering and let a delayed OLDER withdrawal tear down
+        // a re-established route. Bounded eviction must keep the
+        // recently-active pairs' ordering intact.
+        let gate = WithdrawalSeqGate::new();
+        // Fill to the bound with filler pairs.
+        for dest in 0..(WithdrawalSeqGate::MAX_ENTRIES as u64) {
+            gate.admit(2, dest, 1);
+        }
+        // A hot pair, touched last → most-recently-active, seq 100.
+        assert!(gate.admit(1, 7, 100));
+        // One more insert tips over the bound and evicts the OLDEST
+        // (filler) entries; the just-touched hot pair must survive.
+        assert!(gate.admit(2, WithdrawalSeqGate::MAX_ENTRIES as u64, 1));
+        // The hot pair's ordering is intact — a delayed older
+        // withdrawal is still rejected (a whole-map clear would have
+        // wrongly admitted it), while a genuinely newer one admits.
+        assert!(
+            !gate.admit(1, 7, 50),
+            "recently-active pair's ordering must survive overflow eviction",
+        );
+        assert!(gate.admit(1, 7, 101), "a genuinely newer seq still admits");
     }
 
     #[test]
