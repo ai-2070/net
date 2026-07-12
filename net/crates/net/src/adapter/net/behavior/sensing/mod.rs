@@ -18,8 +18,14 @@
 //! plan §4.2 serialize these types in SI-1; changing a type here
 //! before SI-1 lands is cheap, changing it after is a wire break.
 
+pub mod continuity;
 pub mod identity;
 pub mod incarnation;
+
+pub use continuity::{
+    project, AttestedStatus, Continuity, DeliveredBeat, DisruptReason, ObservationCell,
+    ProjectedReadiness, ReadinessObservation,
+};
 
 pub use incarnation::{
     next_incarnation, Admission, Incarnation, IncarnationError, IncarnationPersistence,
