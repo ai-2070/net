@@ -33,10 +33,17 @@ pub mod evaluator;
 pub mod identity;
 pub mod incarnation;
 pub mod negotiation;
+// The rendezvous REUSES the RedEX election (plan §4.1, review 6) —
+// the reuse is real, not copied, so the module rides the `redex`
+// feature. SI-2 revisits the final layering.
+#[cfg(feature = "redex")]
+pub mod rendezvous;
 pub mod scope;
 pub mod table;
 
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
+#[cfg(feature = "redex")]
+pub use rendezvous::{closeness_score, sensing_leader, LeaderRegistration, SensingLeader};
 pub use scope::{validate_subscriber_scope, ScopeError};
 
 pub use controller::{
