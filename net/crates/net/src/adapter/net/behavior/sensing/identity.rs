@@ -73,21 +73,51 @@ macro_rules! impl_hex32_serde {
     ($ty:ty) => {
         impl serde::Serialize for $ty {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_str(&hex::encode(self.0))
+                if serializer.is_human_readable() {
+                    serializer.serialize_str(&hex::encode(self.0))
+                } else {
+                    // Compact binary form for the wire codec
+                    // (postcard: varint length + 32 raw bytes = 33 B
+                    // instead of the 65 B hex string) — tightened
+                    // before any deployment existed, so no wire
+                    // migration was needed.
+                    serializer.serialize_bytes(&self.0)
+                }
             }
         }
 
         impl<'de> serde::Deserialize<'de> for $ty {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let text = <String as serde::Deserialize>::deserialize(deserializer)?;
-                let decoded = hex::decode(&text).map_err(serde::de::Error::custom)?;
-                let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
-                    serde::de::Error::custom(concat!(
-                        stringify!($ty),
-                        ": expected 32 bytes of hex (64 chars)"
-                    ))
-                })?;
-                Ok(Self(bytes))
+                struct Bytes32Visitor;
+                impl<'de> serde::de::Visitor<'de> for Bytes32Visitor {
+                    type Value = [u8; 32];
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("32 raw bytes")
+                    }
+                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; 32], E> {
+                        v.try_into()
+                            .map_err(|_| E::custom("expected exactly 32 bytes"))
+                    }
+                    fn visit_byte_buf<E: serde::de::Error>(
+                        self,
+                        v: Vec<u8>,
+                    ) -> Result<[u8; 32], E> {
+                        self.visit_bytes(&v)
+                    }
+                }
+                if deserializer.is_human_readable() {
+                    let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+                    let decoded = hex::decode(&text).map_err(serde::de::Error::custom)?;
+                    let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+                        serde::de::Error::custom(concat!(
+                            stringify!($ty),
+                            ": expected 32 bytes of hex (64 chars)"
+                        ))
+                    })?;
+                    Ok(Self(bytes))
+                } else {
+                    deserializer.deserialize_bytes(Bytes32Visitor).map(Self)
+                }
             }
         }
     };
