@@ -340,20 +340,28 @@ mod natsim {
         // that observes the wrong reflex (e.g. a mis-simulated NAT).
         {
             use net::adapter::net::traversal::classify::NatClass;
-            let deadline = tokio::time::Instant::now() + CLASSIFY_TIMEOUT;
-            loop {
+            // A concrete class needs ≥2 distinct observers (the sweep's
+            // <2-observation guard). With fewer publics every sweep can
+            // only re-confirm Unknown, so don't burn the retry budget —
+            // sweep once and proceed.
+            if publics.len() >= 2 {
+                let deadline = tokio::time::Instant::now() + CLASSIFY_TIMEOUT;
+                loop {
+                    node.reclassify_nat().await;
+                    if node.nat_class() != NatClass::Unknown {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "natsim_node: {name} NAT class stayed Unknown after \
+                             {CLASSIFY_TIMEOUT:?}; proceeding (outcome will report Unknown)"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            } else {
                 node.reclassify_nat().await;
-                if node.nat_class() != NatClass::Unknown {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    eprintln!(
-                        "natsim_node: {name} NAT class stayed Unknown after \
-                         {CLASSIFY_TIMEOUT:?}; proceeding (outcome will report Unknown)"
-                    );
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
         node.announce_capabilities(CapabilitySet::new())
