@@ -27,7 +27,7 @@ The NAT Traversal work adds the shorter path for the cases a direct punch is fea
 
 ---
 
-## The punch that fires itself — and the review that made it safe
+## The punch — and the review that made it safe
 
 The first NAT Traversal cut shipped the machinery but left the punch dormant: it only fired when an application hand-supplied a coordinator and called `connect_direct` itself. Traffic between NATed peers stayed on relays unless something orchestrated a punch by hand. The **NAT Traversal V2** work closes that gap and hardens the control plane a code review flagged as sitting at exactly the seam an attacker wants.
 
