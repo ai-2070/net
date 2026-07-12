@@ -1,8 +1,8 @@
 # Sensing-Interest Coalescing Plan
 
-Status: draft v3 (post design reviews 2026-07-12) — SI-0 approved as a
-bounded spike; SI-1 and wire-id allocation are BLOCKED until the six gate
-conditions at the end of §6/SI-0 are met
+Status: v3.1 — SI-0 APPROVED as a bounded spike (review 3, 2026-07-12)
+with the amendments below folded in; SI-1 and wire-id allocation remain
+BLOCKED until the gate conditions in the SI-1 entry are met
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -33,6 +33,17 @@ machinery the deferred cross-root story must build on)
 > (CAS deferred), authenticated-identity scope validation, an explicit
 > unsupported-cadence refusal, a frozen evaluator contract, expanded
 > incarnation failure tests, and a real-path old-relay fallback test.
+>
+> **v3.1 (review 3 amendments, SI-0 approved):** hop-by-hop upstream
+> continuity — a relay may not deliver Ready as continuity-bearing
+> while its own upstream continuity is Unestablished/Expired (multi-hop
+> cache chains could otherwise manufacture apparent post-registration
+> continuity); Unestablished now expires (stale pessimism cannot
+> persist indefinitely); cadence-refusal partitioning (one impossible
+> subscriber cannot poison a satisfiable aggregate); the audience/root
+> commitment is bound into the interest digest; the seq-rate inference
+> is demoted to diagnostics-only; terminology frozen
+> (requested_sample_interval / promised_cadence / continuity_window).
 
 ## 1. Problem
 
@@ -53,6 +64,9 @@ strong freshness contract requires a challenge/time protocol and is a
 named follow-up (§9). Readiness here is **advisory**: final admission
 (the gang-claim / invocation path) remains the authoritative recheck,
 so stale optimism costs a transient refusal, never unsafe execution.
+That sentence is load-bearing for every consumer — a physical or
+safety-critical integration MUST NOT treat this advisory state as
+authorization to proceed without its own final local admission.
 
 A node A that needs this relation evaluated has two options today,
 both bad at scale:
@@ -164,16 +178,27 @@ interest_digest = blake3(
     capability_generation ||
     canonical(constraints C) ||
     canonical(work_latency L) ||
-    disclosure_class                    // §4.9
+    disclosure_class ||                 // §4.9
+    audience_scope_commitment           // v1: canonical owner-root id
 )
 ```
 
 256-bit, domain-separated. A 64-bit key is an adversarial-collision
 hazard when it *merges* interests; short indices may be derived for
-local tables but are never the wire or semantic identity. **The
-requested sample interval D is deliberately NOT in the digest** —
-stricter sampling dominates looser (§3.3), so D must not split
-otherwise-identical interests.
+local tables but are never the wire or semantic identity.
+
+The **audience commitment is inside the digest** so that "interests
+belonging to different audiences cannot coalesce" holds by
+construction, not by relay diligence: two future roots that both use
+`disclosure_class = owner` still produce distinct digests. For v1 the
+commitment is the canonical owner-root identity; for future delegated
+groups, a hash of the scope/grant/audience-set identity. Digest
+inclusion *separates semantic identities after validation* — it never
+replaces the session-identity check (§4.9).
+
+**The requested sample interval D is deliberately NOT in the
+digest** — stricter sampling dominates looser (§3.3), so D must not
+split otherwise-identical interests.
 
 ### 3.3 Three time dimensions, three rules
 
@@ -219,14 +244,30 @@ avoidance; a stale Ready selects a provider that may no longer be
 ready — **pessimism is safe, optimism must be earned**. Continuity
 transitions:
 
-- `Unestablished → Established`: on the first **strictly-newer**
-  attestation admitted after this consumer's interest registration
-  (a cached warm-start alone never establishes; §4.4).
-- `Established → Expired`: continuity window elapses (§4.5), route
-  toward the provider fails/withdraws, incarnation changes,
-  generation changes, or scope validation fails.
-- Unknown is locally derived from these transitions. The provider
-  emits `ProviderUnknown` only when it cannot evaluate the predicate.
+```
+interest registration
+    → continuity = Unestablished; start establishment deadline
+strictly-newer CONTINUITY-BEARING beat admitted (§4.4 hop rule)
+    → Established
+no qualifying newer beat before the establishment deadline
+    → Expired            (Unestablished → Expired)
+Established, then continuity window elapses without a newer beat
+    → Expired            (Established → Expired)
+route withdrawal / path failure / incarnation change /
+generation change / scope-validation failure
+    → Expired            (from either state)
+```
+
+**Unestablished expires too.** A cached NotReady projects
+immediately while Unestablished — without the establishment deadline
+it could persist indefinitely on a dead stream (stale pessimism made
+permanent). Both deadlines derive from the consumer's own delivery
+schedule (§4.5); the projections are unchanged: cached Ready +
+Unestablished → Unknown, cached NotReady + Unestablished → NotReady,
+either + Expired → Unknown.
+
+Unknown is locally derived from these transitions. The provider emits
+`ProviderUnknown` only when it cannot evaluate the predicate.
 
 ## 4. Design
 
@@ -299,6 +340,14 @@ delay, never alter.
 
 ```
 (target, ReadinessKey) → {
+    upstream_continuity: Unestablished | Established | Expired,
+                         // the relay's OWN continuity toward the
+                         // origin — gates continuity-bearing
+                         // forwarding (§4.4 hop rule)
+    refused_minimum: Option<Duration>,
+                         // cached provider floor M (§4.4 refusal
+                         // partitioning); invalidated on generation /
+                         // incarnation change
     downstreams: Map<DownstreamId | LOCAL, {
         requested_sample_interval,
         soft_state_ttl,
@@ -343,16 +392,32 @@ ReadinessEvaluation =
 The three non-Ready/NotReady variants project onto the wire as
 `ProviderUnknown` with a compact `status_reason` code — observability
 keeps the distinction even though consumers treat all three as
-Unknown.
+Unknown. One classification matters for security telemetry: a
+`constraints_digest` mismatch is **malformed or tampered protocol
+input**, not merely an unevaluable predicate — it increments a
+protocol-invalid/security counter even though it projects publicly as
+`ProviderUnknown { InvalidConstraints }`.
 
-**Unsupported cadence is refused, not silently degraded.** If the
-coalesced strictest D is below `attestation_cadence_floor`, the
-provider MUST answer with a structured refusal
-(`sampling_interval_unsupported { minimum_supported }`) projected as
-ProviderUnknown-with-reason — never silently serve a weaker stream
-that the consumer's continuity rule will eventually flag as Unknown
-anyway. Relays propagate the refusal to the downstreams whose D is
-unsatisfiable; downstreams with satisfiable D are unaffected.
+**Unsupported cadence is refused, not silently degraded — and the
+refusal is partitioned.** If the coalesced strictest D is below the
+provider's floor, the provider answers with a structured refusal
+(`sampling_interval_unsupported { minimum_supported: M }`) projected
+as ProviderUnknown-with-reason — never a silently weaker stream. The
+naive aggregate would let one impossible subscriber poison everyone
+(A@20 ms + C@100 ms coalesce to strictest 20 ms → refused → C starves
+despite being satisfiable). On receiving the refusal a relay MUST:
+
+1. partition its downstreams on M: `D < M` → propagate the refusal to
+   exactly those; `D ≥ M` → keep eligible;
+2. recompute the upstream aggregate from satisfiable downstreams only
+   (`new strictest D = min(D where D ≥ M)`) and re-register it;
+3. cache M per (provider, ReadinessKey) so the same unsupported
+   aggregate is never re-submitted (no refusal/retry loop); the
+   cached M invalidates on capability-generation or incarnation
+   change (the provider's floor may have changed with it).
+
+A later-joining downstream with `D < cached M` is refused locally
+without a provider round-trip.
 
 X compiles the predicate once per distinct `interest_digest` and
 emits one signed stream per (distinct interest × directly-interested
@@ -378,40 +443,83 @@ a schedule*:
   downstream immediately receives the cached latest attestation per
   matching key, which seeds `attested_status` with
   `continuity = Unestablished`. Projected state stays Unknown (for a
-  cached Ready) until the first strictly-newer post-registration
-  attestation arrives — **a cached Ready must never become "fresh" by
-  being forwarded** (§4.5). A cached NotReady projects immediately
-  (pessimism is safe).
+  cached Ready) until a continuity-bearing strictly-newer attestation
+  arrives — **a cached Ready must never become "fresh" by being
+  forwarded** (§4.5). A cached NotReady projects immediately
+  (pessimism is safe), subject to the Unestablished establishment
+  deadline (§3.4).
+
+**Hop-by-hop continuity (multi-hop laundering closed).** The
+single-hop "strictly-newer after registration" rule does not compose
+across cache chains: in `X → C → B → A` with C holding cached seq 101
+and B holding cached seq 100, A registering and later receiving C's
+cached 101 via B would observe a strictly-newer post-registration seq
+that was never a live post-registration evaluation. Therefore every
+relay tracks its OWN upstream continuity per `ReadinessKey`, under
+the same state machine as consumers (§3.4), and:
+
+```
+A relay MUST NOT deliver a Ready attestation as continuity-bearing
+while its own upstream continuity for that ReadinessKey is
+Unestablished or Expired. It MAY deliver it as a provisional
+warm-start; the downstream's projected state remains Unknown.
+```
+
+"Continuity-bearing" vs "warm-start" is **local delivery metadata on
+the relay→downstream frame envelope** (which the relay authors and
+the session authenticates) — never a field inside the origin-signed
+attestation, which relays cannot alter. Establishment therefore
+propagates hop-by-hop from the live origin stream: X emits a live
+beat → C establishes → C's forward is continuity-bearing → B
+establishes → B's forward is continuity-bearing → A may establish. A
+relay lying about the flag is the time-shifting malicious relay of
+§4.5's stated v1 trust assumption — the hop rule closes the *honest*
+multi-hop accident, not the adversarial case.
 
 **Latest-per-key, never history.** The batch of intermediates carries
-nothing the downstream can't already get: status flaps were flushed
-as edges; origin *emission continuity* is recoverable from the latest
-beat alone — `seq` increments per origin emission, so
-`Δseq × promised_cadence / Δt ≈ 1` means smooth emission regardless
-of down-sampling (which never consumes seqs), while a shortfall means
-upstream discontinuity (origin flap or origin↔relay path flap —
-indistinguishable; label it "upstream discontinuity", never "origin
-down"). A consumer wanting the full temporal pattern registers
+nothing correctness-relevant the downstream can't already get: status
+flaps were flushed as edges, and evidence handling is governed by the
+continuity state machine alone. Sequence gaps are expected under
+relay down-sampling and carry **no correctness meaning beyond
+strictly-newer admission**; implementations may expose local
+diagnostic statistics (e.g. an emission-continuity EWMA), but no
+readiness, continuity, or failure transition may depend on inferred
+origin emission rate in v1 — the ratio is confounded by status-edge
+emissions, min-gaps, scheduling jitter, loss before a caching relay,
+and route changes, and must not become an accidental second health
+protocol. A consumer wanting the full temporal pattern registers
 `D ≈ promised_cadence` — down-sampling degenerates to full-stream;
 "latest" and "batch" are the two ends of the D knob, not modes.
-Consumers MAY keep a derived, locally computed emission-continuity
-EWMA; it is never relay-asserted.
 
 ### 4.5 Continuity, not evidence age — stated honestly
+
+**Frozen terminology** (three related but distinct durations):
+
+| Term | Owner | Meaning |
+|---|---|---|
+| `requested_sample_interval` (D) | downstream | the delivery-continuity objective it registered |
+| `promised_cadence` | provider | upstream emission cadence for the aggregated branch, signed in the attestation |
+| `continuity_window` | each consumer/relay locally | the suspicion deadline derived from its expected delivery schedule |
+
+A relay down-samples provider emissions to downstream delivery
+intervals, so a consumer primarily reasons about its own expected
+delivery interval; `promised_cadence` is a conservative input to the
+window, never a proof of evidence age.
 
 **What is guaranteed (honest relays):** the consumer receives a
 continuing sequence of origin-signed attestations with locally
 bounded interarrival; broken continuity degrades to Unknown within
 
 ```
-k × max(promised_cadence, own requested_sample_interval)   (k = 3)
+continuity_window = k × max(promised_cadence, own D)   (k = 3)
 ```
 
 This is a *stream-suspicion* rule (the failure detector's trick,
 clock-free, composes per hop). The `max` term is load-bearing under
 down-sampling: keying off `promised_cadence` alone would
 false-Unknown every down-sampled subscriber. Each consumer's window
-uses only values it requested or received signed.
+uses only values it requested or received signed. The establishment
+deadline (§3.4, Unestablished → Expired) is derived the same way.
 
 **What is NOT guaranteed:** the age of the provider's evaluation. A
 signature proves authorship, not recency; a relay-cached attestation
@@ -586,24 +694,49 @@ function.
       breakage;
   11. **test:** relay down-sampling — a looser watcher delivered at
       its own D is never false-Unknowned; a status edge is never
-      held; a late joiner's cached Ready projects Unknown until the
-      first strictly-newer post-registration attestation
-      (freshness-laundering tripwire), while a cached NotReady
-      projects immediately;
-  12. the frozen `ReadinessEvaluator` contract (§4.4) and the
-      unsupported-cadence structured refusal.
+      held; a late joiner's cached Ready projects Unknown until a
+      continuity-bearing strictly-newer attestation
+      (single-hop freshness-laundering tripwire), while a cached
+      NotReady projects immediately;
+  12. the frozen `ReadinessEvaluator` contract (§4.4), the
+      unsupported-cadence structured refusal, and the
+      digest-mismatch security counter;
+  13. **test (multi-hop laundering):** `X → C → B → A` with C holding
+      cached seq 101, B holding cached seq 100, X silent. A registers
+      → warm-started with 100 → Unknown. C's cached 101 later reaches
+      A via B's schedule → **A must still be Unknown** (B's upstream
+      continuity was never Established). X emits live seq 102 →
+      continuity establishes hop-by-hop → A may project Ready;
+  14. **test (Unestablished expiry):** a warm-started cached NotReady
+      whose stream never produces a qualifying newer beat expires to
+      Unknown at the establishment deadline — stale pessimism cannot
+      persist indefinitely;
+  15. **test (refusal partitioning):** A requests 20 ms, C requests
+      100 ms, provider floor 50 ms → A gets
+      `sampling_interval_unsupported`, C receives its 100 ms stream,
+      the relay re-registers the satisfiable aggregate exactly once
+      (cached M, no refusal/retry loop), and the cached M invalidates
+      on generation/incarnation change.
 - **SI-1 — wire types + gates.** Codecs + signing for the
   SI-0-frozen shapes; incarnation-scoped seq gate; the
   **signature-cost benchmark** (sign CPU at cadence floor, verify at
   realistic fan-out, packet sizes) on the plain
   one-signature-per-attestation path before any batching cleverness.
   **Gate — SI-1 does not start until all of:**
-  (a) cached Ready cannot become fresh by being forwarded (SI-0
-  test 11 green); (b) the continuity-vs-evidence-validity split is
-  frozen in the observation model; (c) the old-relay fallback is
-  exercised through the real routing path (test 10); (d) owner-root
-  scope derives from authenticated identity (item 5); (e) unsupported
-  cadence yields the structured refusal (item 12); (f) the evaluator
+  (a) cached Ready cannot become fresh by being forwarded, single-hop
+  (test 11); (b) multi-hop cached sequence advancement cannot
+  establish continuity unless every upstream relay has established
+  continuity (test 13); (c) Unestablished expires to Expired when no
+  qualifying newer beat arrives (test 14); (d) an unsupported strict
+  subscriber is partitioned and cannot poison a satisfiable aggregate
+  (test 15); (e) the interest digest binds the validated
+  audience/root commitment, not only a generic disclosure class
+  (item 1); (f) seq deltas remain admission/diagnostic information
+  only — no readiness inference depends on emission-rate estimation
+  (§4.4); (g) the continuity-vs-evidence-validity split is frozen in
+  the observation model; (h) the old-relay fallback is exercised
+  through the real routing path (test 10); (i) owner-root scope
+  derives from authenticated identity (item 5); (j) the evaluator
   result model is frozen (item 12).
 - **SI-2 — interest table.** Per-downstream soft state, derived
   aggregates, trailing-edge upstream propagation, caps,
@@ -639,11 +772,14 @@ SI-4; SI-7 last.
 
 ## 7. Risks / watch-outs
 
-- **The two permanent tripwires:** (1) any code path reducing a
+- **The three permanent tripwires:** (1) any code path reducing a
   `ReadinessKey`-scoped observation to an entry-level effect is a bug
   (SI-0 test 7); (2) any code path projecting Ready from
-  `continuity = Unestablished` is a bug — that is freshness
-  laundering reintroduced (SI-0 test 11).
+  `continuity = Unestablished` is a bug — freshness laundering
+  reintroduced (SI-0 test 11); (3) any relay delivering
+  continuity-bearing Ready while its own upstream continuity is not
+  Established is a bug — multi-hop laundering reintroduced (SI-0
+  test 13).
 - **Relay suppression/delay is not a new power** — the forwarder is
   `next_hop(X)`. Holds only while strictly on-path. Disclosure
   authority is §4.9's boundary; time-shifting a buffered stream is
@@ -663,22 +799,28 @@ SI-4; SI-7 last.
 - **Signing cost unproven at cadence** — SI-1's benchmark gates the
   floor default before any batching design.
 - **Down-sampling makes same-key seq gaps normal.** Never loss or
-  reorder evidence; the one sanctioned seq-delta use is the
-  emission-continuity ratio (§4.4), labeled "upstream discontinuity",
-  never "origin down".
+  reorder evidence, and — v3.1 — never an input to readiness,
+  continuity, or failure transitions: emission-rate inference is
+  diagnostics-only (§4.4). A future "gap detector" or rate-based
+  health signal here would be an accidental second health protocol
+  confounded by edges, min-gaps, jitter, and pre-relay loss.
 - **Cross-plane ordering.** Attestations and pingwaves/withdrawals
   share no counter; strictest signal wins (Unknown for scheduling);
   anti-entropy repairs.
 
 ## 8. Done criteria
 
-- The conditional relation survives end-to-end: SI-0 tests 7–11 pass
+- The conditional relation survives end-to-end: SI-0 tests 7–15 pass
   unchanged once the real wire path replaces the in-process spike.
 - N watchers behind one relay: X's attestation send count tracks
   (branches × distinct interests), not N (SI-4, test-pinned).
 - **A cached Ready never projects Ready without established
   continuity** — under warm-start, relay delay, and multi-hop
-  caching (the freshness-laundering criterion).
+  cache chains with staggered cached sequences (the single- and
+  multi-hop freshness-laundering criteria, tests 11 + 13).
+- Stale pessimism cannot persist: Unestablished observations expire
+  at the establishment deadline (test 14); one impossible cadence
+  never starves a satisfiable co-subscriber (test 15).
 - Readiness observable ONLY through the fold's keyed overlay;
   scheduler consumes through the same seam as local liveness; entry
   suspension fires only on unconditional loss.
