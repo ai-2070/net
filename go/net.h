@@ -39,6 +39,8 @@ typedef enum {
     NET_ERR_INT_OVERFLOW = -9,
     /* Stream handle does not belong to the supplied node. */
     NET_ERR_MISMATCHED_HANDLES = -10,
+    /* CString::new interior NUL — see include/net.h for rationale. */
+    NET_ERR_INTERIOR_NUL = -11,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
      * `netdb` + `redex-disk` features on). Codes below -99 so they
@@ -604,11 +606,46 @@ int      net_mesh_probe_reflex(net_meshnode_t* handle,
 int      net_mesh_reclassify_nat(net_meshnode_t* handle);
 
 /* Fill cumulative traversal counters. Any of the out-pointers may
- * be NULL to skip that field. Monotonic — counters never reset. */
+ * be NULL to skip that field. Monotonic — counters never reset.
+ * Legacy 3-field surface; new callers should prefer
+ * `net_mesh_traversal_stats_v2`. */
 int      net_mesh_traversal_stats(net_meshnode_t* handle,
                                   uint64_t* out_punches_attempted,
                                   uint64_t* out_punches_succeeded,
                                   uint64_t* out_relay_fallbacks);
+
+/* Full traversal-stats snapshot (stage 5). Field order, widths,
+ * and the 64-byte address buffer are ABI — matches the Rust
+ * `#[repr(C)] NetTraversalStatsV2`. `punches_failed` is derived
+ * (`attempted - succeeded`, saturating); the three cause counters
+ * (timeouts / rejections / no-relay) include pre-mediation
+ * failures and are not a partition of `punches_failed`.
+ * `port_mapping_external` is a NUL-terminated "ip:port", empty
+ * when no mapping is active. */
+typedef struct {
+    uint64_t punches_attempted;
+    uint64_t punches_succeeded;
+    uint64_t punches_failed;
+    uint64_t relay_fallbacks;
+    uint64_t punch_timeouts;
+    uint64_t punch_rejections;
+    uint64_t rendezvous_no_relay;
+    uint64_t upgrades_attempted;
+    uint64_t upgrades_succeeded;
+    uint64_t upgrades_deferred_busy;
+    uint64_t port_mapping_renewals;
+    uint8_t  port_mapping_active;
+    char     port_mapping_external[64];
+} net_traversal_stats_v2_t;
+
+/* Fill `out` with the complete traversal snapshot. Returns 0 on
+ * success. Base counters are monotonic; `punches_failed` is
+ * derived (`attempted - succeeded`) and can decrease while a
+ * punch is in flight, and `port_mapping_renewals` resets on each
+ * fresh install — difference only the base counters for rates.
+ * See the struct comment for the cause-counter semantics. */
+int      net_mesh_traversal_stats_v2(net_meshnode_t* handle,
+                                     net_traversal_stats_v2_t* out);
 
 /* Establish a session via rendezvous through `coordinator`. The
  * pair-type matrix picks between a direct handshake and a
@@ -619,6 +656,15 @@ int      net_mesh_connect_direct(net_meshnode_t* handle,
                                  uint64_t peer_node_id,
                                  const char* peer_pubkey_hex,
                                  uint64_t coordinator);
+
+/* Like `net_mesh_connect_direct`, but auto-selects the rendezvous
+ * coordinator (routing next-hop, then a relay-capable mutual
+ * peer, then any mutual peer). Punch-needing pairs with no
+ * candidate fail with NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY; the
+ * caller stays on the routed path. */
+int      net_mesh_connect_direct_auto(net_meshnode_t* handle,
+                                      uint64_t peer_node_id,
+                                      const char* peer_pubkey_hex);
 
 /* Install a runtime reflex override. `external` is a
  * null-terminated "ip:port" string. Forces `nat_type` to "open"
@@ -892,6 +938,25 @@ int      net_predicate_redact_metadata_keys(const char* report_json,
                                             const char* keys_json,
                                             char** out_redacted_json,
                                             size_t* out_redacted_len);
+
+/* CR-8: same redaction over a wire-format trace tree (output of
+ * net_predicate_evaluate_with_trace). Walks the tree and rewrites
+ * every `label` matching the metadata-clause shapes; preserves
+ * children order and `result` fields.
+ *
+ * Inputs (NUL-terminated UTF-8 JSON):
+ *   - trace_json — wire-format ClauseTrace (`{"label", "result",
+ *     "children": [...]}` recursively).
+ *   - keys_json  — `["api_key", "secret_token"]`.
+ *
+ * Output: *out_redacted_json/_len — same wire shape, free with
+ * `net_free_string`. Idempotent.
+ *
+ * Returns 0 on success, NET_ERR_* (negative) otherwise. */
+int      net_predicate_redact_trace_metadata_keys(const char* trace_json,
+                                                  const char* keys_json,
+                                                  char** out_redacted_json,
+                                                  size_t* out_redacted_len);
 
 /* =========================================================================
  * Compute — MeshDaemon + migration. Stage 6 of

@@ -560,20 +560,18 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
 /// Waiter map for incoming `PunchIntroduce` messages keyed by the
 /// counterpart endpoint's `node_id`. Value is `(generation,
-/// expected coordinator node id, oneshot sender)`. Used by the
-/// rendezvous-coordinated punch flow to bind introduce delivery
-/// to the relay the local node sent `PunchRequest` to.
+/// expected coordinator node id, punch_id, oneshot sender)`. Used
+/// by the rendezvous-coordinated punch flow to bind introduce
+/// delivery to the relay the local node sent `PunchRequest` to.
+/// `punch_id` is the wire correlation token the request carried —
+/// a `PunchReject` resolves the waiter only when it echoes the
+/// same id (cubic P2: `target` alone conflates concurrent
+/// requests; a delayed reject for a superseded request must not
+/// fail its replacement). Waiters installed without a request
+/// (`await_punch_introduce`) hold the never-minted sentinel `0`.
 #[cfg(feature = "nat-traversal")]
-type PendingPunchIntroduces = Arc<
-    DashMap<
-        u64,
-        (
-            u64,
-            u64,
-            oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-        ),
-    >,
->;
+type PendingPunchIntroduces =
+    Arc<DashMap<u64, (u64, u64, u32, oneshot::Sender<PunchIntroduceOutcome>)>>;
 
 /// Waiter map for incoming `PunchAck` messages keyed by the sender
 /// endpoint's `node_id`. Value is `(generation, expected coordinator
@@ -590,6 +588,146 @@ type PendingPunchAcks = Arc<
         ),
     >,
 >;
+
+/// Outcome delivered to a `request_punch` waiter. The rendezvous
+/// coordinator either mediates (an introduce arrives) or refuses (a
+/// reject arrives). Both resolve the same pending-introduce waiter so
+/// the requester unblocks in one place; a timeout is still the third
+/// outcome, handled by `request_punch` itself.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Clone, Copy)]
+enum PunchIntroduceOutcome {
+    /// The coordinator mediated: here's the counterpart's reflex.
+    Introduce(super::traversal::rendezvous::PunchIntroduce),
+    /// The coordinator refused with a typed reason.
+    Rejected(super::traversal::rendezvous::RejectReason),
+}
+
+/// Rendezvous abuse budgets (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2,
+/// closing review Finding 5). Three independent limiters:
+///
+/// - `requests` — coordinator per-requester fixed-window budget on
+///   `PunchRequest`, keyed by the requester's `node_id`.
+/// - `trains` — responder per-source fixed-window budget on
+///   keep-alive trains scheduled from *unsolicited* introduces, keyed
+///   by the introducing peer's `node_id`. (Replaces Stage 1's
+///   temporary `unsolicited_introduce_rate` cap.)
+/// - `concurrent_trains` — global count of outstanding unsolicited
+///   trains, capped so a Sybil set of sources each under its per-source
+///   budget can't multiply the aggregate.
+///
+/// Both windowed maps use the same lazy fixed-window scheme as the
+/// subscribe-auth throttle: a `(count, window_start)` pair per key,
+/// reset on the first charge past the window end.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Default)]
+struct RendezvousBudgets {
+    requests: DashMap<u64, (u32, Instant)>,
+    trains: DashMap<u64, (u32, Instant)>,
+    concurrent_trains: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl RendezvousBudgets {
+    /// Charge one unit against a fixed-window map. Returns `true` (and
+    /// records the charge) when `key` is under `max` for the current
+    /// window; `false` when exhausted. `max == 0` disables the limit.
+    fn charge(map: &DashMap<u64, (u32, Instant)>, key: u64, window: Duration, max: u32) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let mut entry = map.entry(key).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+        if now.duration_since(*window_start) >= window {
+            *count = 0;
+            *window_start = now;
+        }
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Coordinator side: charge a `PunchRequest` from `requester`.
+    fn charge_request(&self, requester: u64, window: Duration, max: u32) -> bool {
+        Self::charge(&self.requests, requester, window, max)
+    }
+
+    /// Responder side: charge an unsolicited keep-alive train from
+    /// `source`.
+    fn charge_train(&self, source: u64, window: Duration, max: u32) -> bool {
+        Self::charge(&self.trains, source, window, max)
+    }
+
+    /// Try to reserve one of the `max` global concurrent-train slots.
+    /// Returns an RAII [`TrainSlot`] that releases the slot on drop, or
+    /// `None` when the ceiling is reached. `max == 0` disables the
+    /// ceiling (always grants an untracked slot).
+    fn try_train_slot(self: &Arc<Self>, max: usize) -> Option<TrainSlot> {
+        use std::sync::atomic::Ordering;
+        if max == 0 {
+            return Some(TrainSlot { budgets: None });
+        }
+        // Compare-and-swap loop: only claim a slot if we stay ≤ max.
+        let mut cur = self.concurrent_trains.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match self.concurrent_trains.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(TrainSlot {
+                        budgets: Some(self.clone()),
+                    })
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+/// Per-peer throttle for the background direct-path upgrade
+/// (`NAT_TRAVERSAL_V2_PLAN.md` Stage 3). Prevents a pathological pair
+/// from re-punching on every scan: a failure backs off exponentially, a
+/// success stops further attempts (the session is now direct), and a
+/// busy-defer retries after a short delay.
+#[cfg(feature = "nat-traversal")]
+#[derive(Debug, Clone, Copy)]
+struct UpgradeCacheEntry {
+    /// Earliest instant a fresh attempt is allowed.
+    next_eligible: Instant,
+    /// Consecutive failures — drives the exponential backoff.
+    failures: u32,
+    /// Once a direct session is established there is nothing left to
+    /// upgrade; stop attempting.
+    done: bool,
+}
+
+/// RAII reservation for one global unsolicited-train slot. Holding it
+/// keeps the slot counted; dropping it (when the punch scheduler's
+/// observer task ends) releases the slot. `budgets == None` is the
+/// disabled-ceiling case — nothing to release.
+#[cfg(feature = "nat-traversal")]
+struct TrainSlot {
+    budgets: Option<Arc<RendezvousBudgets>>,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Drop for TrainSlot {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budgets {
+            b.concurrent_trains
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
 
 /// Cancellation-safe rollback for a freshly registered peer
 /// session + addr map + routing entry.
@@ -703,6 +841,17 @@ enum RoutedRotationOutcome {
     /// static must wait for its existing session to time out before
     /// the new keys are accepted.
     RefuseFresh,
+    /// A same-static re-handshake arrived (would normally rotate),
+    /// but the existing session is **live and busy** — it has open
+    /// application streams or unacked in-flight reliable data. Swapping
+    /// now would drop that in-flight state with no retransmit on the
+    /// new session (`NAT_TRAVERSAL_V2_PLAN.md` C3, responder half).
+    /// Refuse like `RefuseFresh` (drop msg1); the initiator's upgrade
+    /// fails cleanly and retries, and the relay-routed session stays
+    /// intact. Bounded: once the session goes quiescent — or idle past
+    /// `session_timeout`, so a genuinely dead path recovering after a
+    /// NAT rebind isn't blocked — a later re-handshake rotates.
+    DeferBusy,
     /// No conflict (or the existing session has timed out). The
     /// caller should construct a fresh session and insert it under
     /// the same entry guard.
@@ -734,6 +883,20 @@ fn routed_rotation_outcome(
         // ephemeral.
         if existing.last_initiator_ephemeral.as_ref() == Some(new_ephemeral) {
             return RoutedRotationOutcome::DropReplay;
+        }
+        // Legitimate re-handshake. Normally rotates — but if the
+        // existing session is live (not idle past `session_timeout`)
+        // and busy (open streams or unacked in-flight data), defer:
+        // swapping now would drop that in-flight state (C3). Keying
+        // liveness on `is_timed_out` bounds the deferral to
+        // `session_timeout` — a genuinely dead path (e.g. the peer's
+        // NAT rebound) stops delivering inbound, times out, and the
+        // next re-handshake rotates, so recovery is never blocked
+        // for longer than a fresh-static rotation would be.
+        let live = !existing.session.is_timed_out(session_timeout);
+        let busy = existing.session.has_open_streams() || existing.session.has_unacked();
+        if live && busy {
+            return RoutedRotationOutcome::DeferBusy;
         }
         return RoutedRotationOutcome::AcceptRotation;
     }
@@ -967,6 +1130,10 @@ struct DispatchCtx {
             ),
         >,
     >,
+    /// Rendezvous abuse budgets. See the matching field doc on
+    /// `MeshNode` (`rendezvous_budgets`).
+    #[cfg(feature = "nat-traversal")]
+    rendezvous_budgets: Arc<RendezvousBudgets>,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
     /// since `TraversalConfig` is `Clone` and small. The dispatch
@@ -1359,6 +1526,29 @@ pub struct MeshNodeConfig {
     /// Default: `false`.
     #[cfg(feature = "port-mapping")]
     pub try_port_mapping: bool,
+
+    /// Enable the background **direct-path upgrade**
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` Stage 3): once a session to a peer
+    /// is established via a relay, opportunistically re-handshake over
+    /// a direct/punched path and migrate the session, cutting relay
+    /// hops out of the data plane.
+    ///
+    /// **Optimization, not correctness.** The data plane never waits on
+    /// the upgrade — traffic rides the relay until (and unless) a direct
+    /// path is established, then migrates transparently. The swap is
+    /// guarded by the migration contract: only the lower-node-id end
+    /// initiates (no crossing-handshake race), the install is
+    /// compare-and-swap'd against a racing rotation, and a session with
+    /// open streams / unacked in-flight data defers rather than dropping
+    /// that state.
+    ///
+    /// **Default `false`.** This is new session-migration behavior; the
+    /// flag exists so it can be enabled per-deployment (and by the
+    /// integration tests) and validated against the real-NAT harness
+    /// (Stage 4) before any consideration of flipping the default.
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub auto_direct_upgrade: bool,
 }
 
 impl MeshNodeConfig {
@@ -1402,7 +1592,20 @@ impl MeshNodeConfig {
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
+            #[cfg(feature = "nat-traversal")]
+            auto_direct_upgrade: false,
         }
+    }
+
+    /// Enable the background direct-path upgrade. See
+    /// [`MeshNodeConfig::auto_direct_upgrade`] for semantics and the
+    /// migration-safety guarantees.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn with_auto_direct_upgrade(mut self, enabled: bool) -> Self {
+        self.auto_direct_upgrade = enabled;
+        self
     }
 
     /// Set the reflex override — the public `SocketAddr` this
@@ -1888,7 +2091,10 @@ impl Drop for SweepGuard<'_> {
 ///   keep-alive sender task — which holds a socket handle + payload
 ///   — for that whole duration, with `start + offset` risking an
 ///   `Instant` overflow. Clamping bounds the sender task's lifetime
-///   to the observer's.
+///   to within ~250 ms of the observer's: the `+100/+250 ms` spacing
+///   below is applied *after* the clamp, so at the clamp extreme the
+///   last keep-alive fires at `deadline + 250 ms` — still bounded and
+///   panic-free, just not exactly co-terminous with the observer.
 /// - **floored at zero** by the saturating subtraction — a lead in
 ///   the past (clock skew, slow path) collapses to "fire
 ///   immediately."
@@ -2617,6 +2823,17 @@ pub struct MeshNode {
     /// (`connect_direct` + `request_punch` both affected).
     #[cfg(feature = "nat-traversal")]
     next_waiter_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Wire correlation tokens for outbound `PunchRequest`s.
+    /// Distinct from `next_waiter_gen` (a local-only guard): this
+    /// value rides the wire and is echoed by `PunchReject` so the
+    /// requester can tell a reject for ITS request from a delayed
+    /// reject for a superseded concurrent request to the same
+    /// target (cubic P2). Starts at 1 — `0` is the reserved
+    /// no-request sentinel used by `await_punch_introduce`
+    /// waiters. u32 wraparound is harmless: collisions would need
+    /// two in-flight requests 2^32 mints apart.
+    #[cfg(feature = "nat-traversal")]
+    next_punch_id: Arc<std::sync::atomic::AtomicU32>,
     /// Keep-alive observers for in-progress punches, keyed by
     /// the `SocketAddr` we're watching for inbound traffic (the
     /// counterpart's `peer_reflex`). The value pairs the expected
@@ -2635,6 +2852,16 @@ pub struct MeshNode {
             ),
         >,
     >,
+    /// Rendezvous abuse budgets (coordinator per-requester,
+    /// responder per-source, global concurrent-train ceiling) —
+    /// `NAT_TRAVERSAL_V2_PLAN.md` Stage 2, closing review Finding 5.
+    /// See [`RendezvousBudgets`].
+    #[cfg(feature = "nat-traversal")]
+    rendezvous_budgets: Arc<RendezvousBudgets>,
+    /// Per-peer throttle for the background direct-path upgrade
+    /// (Stage 3). See [`UpgradeCacheEntry`].
+    #[cfg(feature = "nat-traversal")]
+    upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>>,
     /// Single-flight gate for the classification sweep.
     /// [`Self::reclassify_nat`] sets this on entry and clears it on
     /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
@@ -3293,6 +3520,18 @@ impl MeshNode {
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
 
+        // Direct-path upgrade throttle cache (Stage 3) — created here
+        // (not in the struct literal) so the failure callback can drop
+        // a dead peer's entry. Without that drop the cache grows
+        // without bound under peer churn, and a peer that regresses
+        // direct→relay and reconnects under the same node_id stays
+        // pinned to the relay by a stale terminal `done` from its
+        // previous session. Same rationale as `capability_fold` /
+        // `subscriber_chains` above.
+        #[cfg(feature = "nat-traversal")]
+        let upgrade_cache: Arc<DashMap<u64, UpgradeCacheEntry>> = Arc::new(DashMap::new());
+        #[cfg(feature = "nat-traversal")]
+        let upgrade_cache_failure = upgrade_cache.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -3370,6 +3609,11 @@ impl MeshNode {
                     None,
                 );
             }
+            // Drop the dead peer's direct-path upgrade throttle entry,
+            // in lockstep with the maps above (see the `upgrade_cache`
+            // creation comment).
+            #[cfg(feature = "nat-traversal")]
+            upgrade_cache_failure.remove(&node_id);
         })
         .on_recovery(move |node_id| {
             rp_recovery.on_recovery(node_id);
@@ -3476,9 +3720,15 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             #[cfg(feature = "nat-traversal")]
+            next_punch_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            #[cfg(feature = "nat-traversal")]
             nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
+            #[cfg(feature = "nat-traversal")]
+            upgrade_cache,
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 if initial_reflex_override.is_some() {
@@ -3639,6 +3889,15 @@ impl MeshNode {
     /// the source node by its `node_id`.
     pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
         self.peers.get(&node_id).map(|e| e.value().addr)
+    }
+
+    /// Test/debug accessor for the live [`NetSession`] to a peer.
+    /// Integration tests use it to drive session-level state (e.g. open
+    /// a stream to make a session "busy" for the upgrade C3 gate).
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
+        self.peers.get(&node_id).map(|e| e.value().session.clone())
     }
 
     /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
@@ -3906,6 +4165,11 @@ impl MeshNode {
     /// route + peer entry + reverse address index. The
     /// `addr_mode` determines how `addr_to_node` is touched —
     /// see [`AddrInstallMode`] for the rationale per caller.
+    ///
+    /// Unconditional last-writer-wins: any existing session for the
+    /// peer is replaced. For the compare-and-swap variant used by the
+    /// NAT-traversal direct-path upgrade, see
+    /// [`Self::install_peer_cas`].
     fn install_peer(
         &self,
         peer_node_id: u64,
@@ -3913,6 +4177,37 @@ impl MeshNode {
         keys: SessionKeys,
         addr_mode: AddrInstallMode,
     ) {
+        // `None` expected → unconditional install; always returns true.
+        self.install_peer_cas(peer_node_id, peer_addr, keys, addr_mode, None);
+    }
+
+    /// Peer-install with an optional compare-and-swap against the
+    /// current session_id (`NAT_TRAVERSAL_V2_PLAN.md` C2).
+    ///
+    /// When `expected_prior_session_id` is `Some(sid)`, the install
+    /// proceeds only if the peer's current session_id equals `sid` —
+    /// i.e. nothing replaced the session since the caller observed it.
+    /// A background direct-path upgrade uses this so that a racing
+    /// inbound rotation (which the upgrade's handshake didn't know
+    /// about) wins and is NOT clobbered — the last-writer-wins
+    /// nondeterminism is removed from the upgrade path specifically.
+    /// The check + insert are atomic under the DashMap entry's shard
+    /// write lock.
+    ///
+    /// Returns `true` if the session was installed, `false` if the CAS
+    /// check failed (the caller should treat its upgrade as lost and
+    /// leave the current session — typically the working relay path —
+    /// intact).
+    fn install_peer_cas(
+        &self,
+        peer_node_id: u64,
+        peer_addr: SocketAddr,
+        keys: SessionKeys,
+        addr_mode: AddrInstallMode,
+        expected_prior_session_id: Option<u64>,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -3924,19 +4219,42 @@ impl MeshNode {
         // PeerInfo so we can populate the reverse index
         // (PERF_AUDIT §2.4).
         let session_id = session.session_id();
+        let new_entry = PeerInfo {
+            node_id: peer_node_id,
+            addr: peer_addr,
+            session,
+            remote_static_pub,
+            // Initiator-side: replay-guard is a responder-side
+            // concern, leave empty.
+            last_initiator_ephemeral: None,
+        };
+
+        // CAS + insert atomically under the entry's shard write lock.
+        // On a failed CAS we mutate nothing (no route, no reverse
+        // index) and bail, so a lost upgrade leaves the working
+        // session untouched.
+        let displaced: Option<PeerInfo> = match self.peers.entry(peer_node_id) {
+            Entry::Occupied(mut occ) => {
+                if let Some(expected) = expected_prior_session_id {
+                    if occ.get().session.session_id() != expected {
+                        return false;
+                    }
+                }
+                Some(occ.insert(new_entry))
+            }
+            Entry::Vacant(vac) => {
+                if expected_prior_session_id.is_some() {
+                    // CAS expected a prior session, but it's gone (torn
+                    // down). Abort rather than resurrect a session the
+                    // upgrade didn't intend to create.
+                    return false;
+                }
+                vac.insert(new_entry);
+                None
+            }
+        };
+
         self.router.add_route(peer_node_id, peer_addr);
-        let displaced = self.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: peer_addr,
-                session,
-                remote_static_pub,
-                // Initiator-side: replay-guard is a
-                // responder-side concern, leave empty.
-                last_initiator_ephemeral: None,
-            },
-        );
         self.peer_addrs.insert(peer_node_id, peer_addr);
         // Old direct address of a re-handshaking peer, captured
         // before `displaced` is consumed below (RT-5: address
@@ -3952,9 +4270,19 @@ impl MeshNode {
         // forever. Eviction before insert keeps the fresh mapping
         // even in the (cryptographically improbable) case where
         // the new handshake derived the same session_id.
-        if let Some(old) = displaced {
+        if let Some(old) = &displaced {
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
+            // displaced session's stale reverse-addr mapping when its
+            // addr differs from the new one (a relay→direct swap leaves
+            // the old relay addr behind otherwise). Guard on ownership
+            // so we never evict an entry another peer legitimately owns
+            // (e.g. a shared relay addr).
+            if old.addr != peer_addr {
+                self.addr_to_node
+                    .remove_if(&old.addr, |_, n| *n == peer_node_id);
+            }
         }
         self.session_id_to_node.insert(session_id, peer_node_id);
         // A fresh session incarnation restarts the peer's
@@ -3990,6 +4318,7 @@ impl MeshNode {
                 self.addr_to_node.entry(peer_addr).or_insert(peer_node_id);
             }
         }
+        true
     }
 
     /// Accept a connection from a peer. Performs Noise NKpsk0 as responder.
@@ -4295,6 +4624,14 @@ impl MeshNode {
         // existing weak is equally valid, so ignore the result.
         let _ = self.self_weak.set(Arc::downgrade(self));
         self.start();
+        // Background direct-path upgrade scan loop (Stage 3). The loop
+        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
+        // unconditionally is cheap; keeping it here means any Arc-held
+        // node started via `start_arc` gets upgrades when enabled.
+        // Detached like the other lifecycle loops — it exits on
+        // `shutdown_notify`.
+        #[cfg(feature = "nat-traversal")]
+        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -4521,6 +4858,13 @@ impl MeshNode {
                         // `start_arc` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
+                        // Decision 8, trigger 2: if the observed
+                        // reflex drifted from the published one since
+                        // the last announce, run one classification
+                        // sweep first so tag + reflex ship together.
+                        // No drift → no sweep (cadence guard).
+                        #[cfg(feature = "nat-traversal")]
+                        node.reclassify_if_reflex_drifted().await;
                         // Re-announce the CURRENT baseline (None) — do
                         // not snapshot-and-overwrite, which would
                         // clobber a concurrent explicit announce
@@ -4794,6 +5138,8 @@ impl MeshNode {
             pending_punch_acks: self.pending_punch_acks.clone(),
             #[cfg(feature = "nat-traversal")]
             punch_observers: self.punch_observers.clone(),
+            #[cfg(feature = "nat-traversal")]
+            rendezvous_budgets: self.rendezvous_budgets.clone(),
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
@@ -5505,6 +5851,17 @@ impl MeshNode {
                              session is still within session_timeout. New keys \
                              can be installed once the live session has gone \
                              silent for at least session_timeout (rotation gate)"
+                        );
+                        return;
+                    }
+                    RoutedRotationOutcome::DeferBusy => {
+                        tracing::debug!(
+                            peer_node_id,
+                            "routed handshake: deferring key rotation — existing \
+                             session is live and busy (open streams / unacked \
+                             in-flight data). Swapping now would drop that state; \
+                             the initiator retries once the session is quiescent \
+                             (direct-path upgrade C3 busy gate)"
                         );
                         return;
                     }
@@ -6433,12 +6790,24 @@ impl MeshNode {
                         // and was silently dropped.
                         let took = ctx
                             .pending_punch_introduces
-                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _)| {
+                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _pid, _)| {
                                 *expected_coord == from_node
                             });
-                        if let Some((_, (_gen, _expected, tx))) = took {
-                            let _ = tx.send(intro);
-                        } else if ctx.pending_punch_introduces.contains_key(&intro.peer) {
+                        if let Some((_, (_gen, _expected, _pid, tx))) = took {
+                            // Initiator role: we asked for this punch,
+                            // so the introduce is trusted — it's bound
+                            // to the coordinator we recorded when we
+                            // sent the PunchRequest. Complete the
+                            // waiter (unblocks `request_punch`) and
+                            // fire our own keep-alive train. Initiator
+                            // trains aren't budget-gated — they're
+                            // self-initiated and self-limited by the
+                            // connect_direct flow (no train slot).
+                            let _ = tx.send(PunchIntroduceOutcome::Introduce(intro));
+                            Self::schedule_punch(from_node, intro, ctx, None);
+                            continue;
+                        }
+                        if ctx.pending_punch_introduces.contains_key(&intro.peer) {
                             // A waiter exists but the coordinator
                             // mismatched. Drop without completing
                             // and without scheduling a punch — this
@@ -6450,7 +6819,23 @@ impl MeshNode {
                             );
                             continue;
                         }
-                        Self::schedule_punch(from_node, intro, ctx);
+                        // Unsolicited introduce — the responder role
+                        // (B never called `request_punch`), or a
+                        // forged direct introduce from an authenticated
+                        // session peer. `intro.peer_reflex` is wire-
+                        // supplied and, unguarded, would steer our
+                        // keep-alive train at an attacker-named victim
+                        // (review Finding 4). Validate it against the
+                        // counterpart's cached signed reflex and charge
+                        // the responder budgets before firing; the
+                        // returned slot is held for the train's
+                        // lifetime (Finding 5).
+                        let Some(slot) =
+                            Self::unsolicited_introduce_permitted(&intro, from_node, ctx)
+                        else {
+                            continue;
+                        };
+                        Self::schedule_punch(from_node, intro, ctx, Some(slot));
                     }
                     rendezvous::RendezvousMsg::PunchAck(ack) => {
                         if ack.to_peer == ctx.local_node_id {
@@ -6493,6 +6878,52 @@ impl MeshNode {
                             // original sender, which is what the
                             // recipient correlates on.
                             Self::forward_punch_ack(ack, ctx);
+                        }
+                    }
+                    rendezvous::RendezvousMsg::PunchReject(rej) => {
+                        // Requester side: the coordinator refused to
+                        // mediate. Resolve the pending-introduce waiter
+                        // (keyed by the target we named) with the typed
+                        // reason so `request_punch` fails fast instead
+                        // of waiting out `punch_deadline`.
+                        //
+                        // Bind to the recorded coordinator, exactly like
+                        // the introduce path: only the relay we sent the
+                        // PunchRequest to may reject it. Otherwise any
+                        // session peer could forge a reject and abort a
+                        // legitimate in-flight punch (a cheap DoS on the
+                        // optimization).
+                        //
+                        // ALSO require the punch_id echo to match the
+                        // waiter's (cubic P2): two concurrent
+                        // request_punch calls to the same target replace
+                        // each other's waiter, and a delayed reject for
+                        // the superseded request must not fail its
+                        // replacement. A mismatched id leaves the waiter
+                        // in place — the replacement request gets its
+                        // own answer (or its own timeout). Introduces
+                        // deliberately stay id-free: a late introduce
+                        // carries equally-valid reflex data for the
+                        // replacement request, so conflation is benign
+                        // there (full ack/introduce correlation is the
+                        // deferred stage-6 punch_id work).
+                        let took = ctx.pending_punch_introduces.remove_if(
+                            &rej.target,
+                            |_, (_gen, expected_coord, pid, _)| {
+                                *expected_coord == from_node && *pid == rej.punch_id
+                            },
+                        );
+                        if let Some((_, (_gen, _expected, _pid, tx))) = took {
+                            let _ = tx.send(PunchIntroduceOutcome::Rejected(rej.reason));
+                        } else {
+                            tracing::trace!(
+                                from = from_node,
+                                target = rej.target,
+                                punch_id = rej.punch_id,
+                                reason = rej.reason.kind(),
+                                "rendezvous: PunchReject with no matching waiter / \
+                                 non-coordinator sender / stale punch_id; dropping"
+                            );
                         }
                     }
                 }
@@ -9513,7 +9944,81 @@ impl MeshNode {
         req: super::traversal::rendezvous::PunchRequest,
         ctx: &DispatchCtx,
     ) {
-        use super::traversal::rendezvous::{PunchIntroduce, RendezvousMsg};
+        use super::traversal::rendezvous::{
+            PunchIntroduce, PunchReject, RejectReason, RendezvousMsg,
+        };
+
+        // Resolve A's session up-front. We need A's observed wire
+        // source address to validate the self-reported reflex, to send
+        // A its `PunchIntroduce`, and to send A a typed `PunchReject`
+        // on any refusal. If A isn't in our peer table we can't
+        // coordinate — and can't reject either — so just drop.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+
+        // Helper: send A a typed `PunchReject` so its `request_punch`
+        // fails fast (Finding 5) instead of blocking until
+        // `punch_deadline`. `target` echoes the request so A resolves
+        // the matching waiter. Best-effort — a failed send just
+        // degrades to the old timeout behavior. Borrows `a_session` /
+        // `ctx.socket` and clones only when actually invoked, so the
+        // common successful-mediation path (no reject fires) pays no
+        // Arc refcount bumps. Its last call precedes A_session's move
+        // into the introduce spawn below, so the borrow is released in
+        // time (NLL).
+        let reject_target = req.target;
+        // Echo the request's correlation token so A's waiter can
+        // tell this reject answers THIS request, not a superseded
+        // concurrent one to the same target (cubic P2).
+        let reject_punch_id = req.punch_id;
+        let send_reject = |reason: RejectReason| {
+            let session = a_session.clone();
+            let socket = ctx.socket.clone();
+            let body = RendezvousMsg::PunchReject(PunchReject {
+                target: reject_target,
+                punch_id: reject_punch_id,
+                reason,
+            })
+            .encode();
+            tokio::spawn(async move {
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session
+                        .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                    stream.next_tx_seq()
+                };
+                let events = vec![body];
+                let packet = builder.build_subprotocol(
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                );
+                let _ = socket.send_to(&packet, a_addr).await;
+            });
+        };
+
+        // Coordinator per-requester budget (Finding 5). Over budget →
+        // fast typed rejection, no fan-out.
+        if !ctx.rendezvous_budgets.charge_request(
+            from_node,
+            ctx.traversal_config.punch_budget_window,
+            ctx.traversal_config.punch_requests_per_window,
+        ) {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "rendezvous: PunchRequest over per-requester budget; rejecting",
+            );
+            send_reject(RejectReason::RateLimited);
+            return;
+        }
 
         // 1. Resolve B's reflex address. A's self-reported reflex
         //    (carried on the request) is the fallback when the
@@ -9529,21 +10034,9 @@ impl MeshNode {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 target = format!("{:#x}", req.target),
-                "rendezvous: no cached reflex for target; dropping PunchRequest",
+                "rendezvous: no cached reflex for target; rejecting PunchRequest",
             );
-            return;
-        };
-
-        // Resolve A's session up-front. We need A's observed wire
-        // source address both to validate the self-reported reflex
-        // (immediately below) and, later, to send A its
-        // `PunchIntroduce`. If A isn't in our peer table we can't
-        // coordinate at all.
-        let Some((a_addr, a_session)) = ctx
-            .peers
-            .get(&from_node)
-            .map(|e| (e.value().addr, e.value().session.clone()))
-        else {
+            send_reject(RejectReason::UnknownTargetReflex);
             return;
         };
 
@@ -9557,18 +10050,27 @@ impl MeshNode {
         // hidden. Bind the self-report to A's actual session source
         // IP: a genuine A is reachable at `a_addr`, so its real
         // reflex shares that IP — only the port can differ, under
-        // symmetric NAT. A mismatched IP is a spoofed target; drop
-        // silently, exactly like any other coordinator-side drop, and
-        // A's `connect_direct` falls back to the relay on its
-        // timeout.
+        // symmetric NAT. A mismatched IP is a spoofed target; reject
+        // (fast typed failure) and A's `connect_direct` falls back to
+        // the relay.
+        //
+        // Assumption: A is a *direct* session peer of R, so `a_addr`
+        // is A's own wire source. In the normal rendezvous topology A
+        // reaches its chosen coordinator directly, so this holds. If R
+        // ever reached A via a relay, `PeerInfo::addr` would be the
+        // relay's address and this guard would compare A's self-report
+        // against the relay IP and drop a legitimate request — but
+        // that only costs the optimization (A falls back to the
+        // relay), never correctness.
         if req.self_reflex.ip() != a_addr.ip() {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 claimed = %req.self_reflex,
                 session_src = %a_addr,
                 "rendezvous: PunchRequest self_reflex IP != session source; \
-                 dropping (anti-reflection)",
+                 rejecting (anti-reflection)",
             );
+            send_reject(RejectReason::ReflexMismatch);
             return;
         }
 
@@ -9612,10 +10114,9 @@ impl MeshNode {
         })
         .encode();
 
-        // Look up B's session. If B isn't in our peer table we
-        // can't introduce — stage 5 SDK surface will map this to
-        // `RendezvousNoRelay` on A's side via the `connect_direct`
-        // timeout. (A's session was resolved up-front, above.)
+        // Look up B's session. If B isn't in our peer table we can't
+        // introduce — reject with `NoSessionWithTarget` so A fails
+        // fast. (A's session was resolved up-front, above.)
         let Some((b_addr, b_session)) = ctx
             .peers
             .get(&req.target)
@@ -9624,8 +10125,9 @@ impl MeshNode {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 target = format!("{:#x}", req.target),
-                "rendezvous: target peer not directly connected; dropping",
+                "rendezvous: target peer not directly connected; rejecting",
             );
+            send_reject(RejectReason::NoSessionWithTarget);
             return;
         };
 
@@ -9673,6 +10175,107 @@ impl MeshNode {
         });
     }
 
+    /// Gate an *unsolicited* `PunchIntroduce` (one with no local
+    /// waiter — the responder role, or a forged direct introduce)
+    /// before it drives a keep-alive train. Closes review Finding 4:
+    /// without this, any authenticated session peer could ship us a
+    /// forged introduce naming a victim's `ip:port` as `peer_reflex`,
+    /// and we would fire our keep-alive train there — turning this
+    /// node into a UDP reflector with the forger's identity hidden.
+    ///
+    /// Validation mirrors the coordinator-side anti-reflection guard
+    /// in [`Self::handle_punch_request`]:
+    ///
+    /// - If we hold a *cached, signed* reflex for the claimed
+    ///   counterpart (`intro.peer`, from its capability announcement),
+    ///   the introduce's `peer_reflex` must share that IP. Only the
+    ///   port may legitimately differ — a symmetric NAT rebinds the
+    ///   port per-destination but never the public IP. A mismatched IP
+    ///   is a spoofed target; drop.
+    /// - If no reflex is cached yet (fresh counterpart, announcement
+    ///   not yet folded — a legitimate race on a young mesh), we have
+    ///   nothing to validate against. Admit only through a
+    ///   conservative fixed-window per-source cap so a peer that names
+    ///   a nonexistent counterpart (to force this branch) gets at most
+    ///   a trickle. Stage 2 replaces this cap with the full rendezvous
+    ///   responder budget + typed `RendezvousRejected`.
+    ///
+    /// Returns `Some(slot)` — a reserved global concurrent-train slot,
+    /// held for the punch's lifetime — to proceed to
+    /// [`Self::schedule_punch`]; `None` to drop silently (answering an
+    /// attacker is pure information leak, and no requester is waiting
+    /// on the responder path; the legitimate responder re-arrives on
+    /// the next introduce once the counterpart's announcement folds
+    /// in).
+    ///
+    /// Beyond the Stage 1 IP validation, this charges the Stage 2
+    /// responder budgets (Finding 5): a per-source fixed-window cap on
+    /// how many unsolicited trains one introducing peer can trigger,
+    /// plus a global concurrent-train ceiling so a Sybil source set
+    /// can't multiply the aggregate.
+    #[cfg(feature = "nat-traversal")]
+    fn unsolicited_introduce_permitted(
+        intro: &super::traversal::rendezvous::PunchIntroduce,
+        from_node: u64,
+        ctx: &DispatchCtx,
+    ) -> Option<TrainSlot> {
+        // 1. Anti-reflection (Finding 4): if we hold a signed reflex
+        //    for the claimed counterpart, the introduce's peer_reflex
+        //    must share its IP (symmetric NAT may shift the port, never
+        //    the public IP).
+        if let Some(cached) =
+            super::behavior::fold::reflex_addr_for(&ctx.capability_fold, intro.peer)
+        {
+            if intro.peer_reflex.ip() != cached.ip() {
+                tracing::trace!(
+                    from = from_node,
+                    counterpart = intro.peer,
+                    claimed = %intro.peer_reflex,
+                    announced = %cached,
+                    "rendezvous: unsolicited PunchIntroduce peer_reflex IP != \
+                     announced reflex; dropping (anti-reflection, Finding 4)"
+                );
+                return None;
+            }
+        }
+
+        // 2. Per-source responder budget (Finding 5). Applies to every
+        //    unsolicited train — cached-match and uncached alike — so a
+        //    peer can't flood introduces even at a legitimate target.
+        let window = ctx.traversal_config.punch_budget_window;
+        if !ctx.rendezvous_budgets.charge_train(
+            from_node,
+            window,
+            ctx.traversal_config.punch_trains_per_window,
+        ) {
+            tracing::trace!(
+                from = from_node,
+                counterpart = intro.peer,
+                "rendezvous: unsolicited PunchIntroduce over per-source train \
+                 budget; dropping"
+            );
+            return None;
+        }
+
+        // 3. Global concurrent-train ceiling (Finding 5). The slot is
+        //    released when the punch scheduler's observer task ends.
+        match ctx
+            .rendezvous_budgets
+            .try_train_slot(ctx.traversal_config.punch_trains_concurrent_max)
+        {
+            Some(slot) => Some(slot),
+            None => {
+                tracing::trace!(
+                    from = from_node,
+                    counterpart = intro.peer,
+                    "rendezvous: unsolicited PunchIntroduce over global concurrent-train \
+                     ceiling; dropping"
+                );
+                None
+            }
+        }
+    }
+
     /// Endpoint-side: schedule the keep-alive train + observer
     /// after receiving a `PunchIntroduce`. Plan §3 endpoint
     /// behavior, end-to-end:
@@ -9695,11 +10298,18 @@ impl MeshNode {
     /// Best-effort throughout: a failed send at any step is
     /// logged-and-skipped. Rendezvous is an optimization (plan
     /// framing); routed-handshake is always the safety net.
+    ///
+    /// `train_slot` is the responder budget's global concurrent-train
+    /// reservation (`Some` for an unsolicited train, `None` for an
+    /// initiator's own train, which isn't budget-gated). It is moved
+    /// into the observer task so the slot stays counted until the
+    /// punch resolves or times out, then released on drop.
     #[cfg(feature = "nat-traversal")]
     fn schedule_punch(
         coordinator_node_id: u64,
         intro: super::traversal::rendezvous::PunchIntroduce,
         ctx: &DispatchCtx,
+        train_slot: Option<TrainSlot>,
     ) {
         use super::traversal::rendezvous::{encode_keepalive, Keepalive, PunchAck, RendezvousMsg};
 
@@ -9775,6 +10385,26 @@ impl MeshNode {
                     .send_to(&keepalive_payload[..], peer_reflex)
                     .await;
             }
+            // Sustain the train for the rest of the punch window. The
+            // §3 burst above is only a 250 ms opener; a real cone NAT
+            // often needs repeated keep-alives to latch, because the
+            // two sides' conntrack mappings are rarely both established
+            // at the same instant — scheduling skew, or an early packet
+            // dropped at the peer's gateway before its own outbound
+            // created the reverse mapping. Keep firing at the same
+            // 250 ms cadence until `deadline`, when the observer gives
+            // up anyway. Extra keep-alives once the punch latches are
+            // harmless: the peer's observer is already consumed and
+            // ignores them. (Loopback punches land on the opener, so
+            // this only ever matters against genuine NAT.)
+            let mut resend = tokio::time::interval(Duration::from_millis(250));
+            resend.tick().await; // consume the immediate tick
+            while start.elapsed() < deadline {
+                resend.tick().await;
+                let _ = socket_send
+                    .send_to(&keepalive_payload[..], peer_reflex)
+                    .await;
+            }
         });
 
         // Observer task: waits for the receive loop to fire the
@@ -9783,6 +10413,11 @@ impl MeshNode {
         // for cleanup so the map-eviction race against a
         // replacement observer is handled in one place.
         tokio::spawn(async move {
+            // Hold the concurrent-train slot (if any) for the whole
+            // observer lifetime — it releases on drop when this task
+            // ends, so `concurrent_trains` reflects trains that are
+            // still plausibly live (≤ punch_deadline).
+            let _train_slot = train_slot;
             // The receive loop only fires this observer for a
             // keep-alive whose `sender_node_id` matches `peer` (the
             // expected id was stored alongside the oneshot at insert
@@ -12465,13 +13100,178 @@ impl MeshNode {
     /// snapshot.
     ///
     /// See [`super::traversal::TraversalStatsSnapshot`] for the
-    /// field semantics. Counters are monotonic and never reset;
-    /// callers that want deltas should subtract snapshots.
+    /// field semantics. The base counters are monotonic and never
+    /// reset, so deltas between snapshots are safe — with two
+    /// exceptions: `punches_failed` is DERIVED at snapshot time
+    /// (`attempted - succeeded`) and can decrease when an in-flight
+    /// punch lands, and `port_mapping_renewals` resets to zero on
+    /// each fresh mapping install. Compute rates from the base
+    /// counters, not the derived/resettable fields.
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
     pub fn traversal_stats(&self) -> super::traversal::TraversalStatsSnapshot {
         self.traversal_stats.snapshot()
+    }
+
+    /// Whether the session to `peer_id` reachable at `addr` is
+    /// **relay-routed** rather than direct. Signal: `addr_to_node[addr]`
+    /// — the node owning that transport address — is someone *other
+    /// than* `peer_id` (a relay), or the address isn't registered at
+    /// all. A direct session's address is owned by the peer itself. An
+    /// unknown address counts as relayed — the conservative default
+    /// that makes the upgrade loop re-examine it and coordinator
+    /// selection exclude it. Single source of truth for the
+    /// relayed-vs-direct test shared by [`Self::select_punch_coordinator`],
+    /// [`Self::attempt_direct_upgrade`], and
+    /// [`Self::upgrade_is_loop_candidate`], so the three can't drift
+    /// apart on the default or the ownership rule.
+    #[cfg(feature = "nat-traversal")]
+    fn is_relayed_peer(&self, peer_id: u64, addr: &SocketAddr) -> bool {
+        self.addr_to_node
+            .get(addr)
+            .map(|owner| *owner != peer_id)
+            .unwrap_or(true)
+    }
+
+    /// Pick a rendezvous coordinator for a punch to `target`, without
+    /// the caller having to name one (`NAT_TRAVERSAL_V2_PLAN.md`
+    /// decision 5). Four tiers, graceful degradation:
+    ///
+    /// 1. **Routing next-hop.** For a relay-reached target, the peer
+    ///    currently forwarding to it demonstrably has live sessions
+    ///    with both ends — the highest-probability coordinator, and no
+    ///    discovery needed.
+    /// 2. **`relay-capable` direct peer.** A mutual direct peer that
+    ///    advertised `RELAY_CAPABLE_TAG`. Picked at random from the
+    ///    tier's candidates (not lowest-`node_id`): a deterministic
+    ///    pick would funnel every requester's punches through one peer,
+    ///    making it a mesh-wide coordinator hotspot and single point of
+    ///    failure.
+    /// 3. **Any direct peer.** Best-effort; the chosen peer may lack a
+    ///    session with the target, in which case its coordinator
+    ///    rejects with `NoSessionWithTarget` and the caller falls back.
+    /// 4. **None.** No candidate — the caller surfaces
+    ///    `RendezvousNoRelay` and stays on the routed path.
+    ///
+    /// Never fails a connection: a `None` here only means the punch
+    /// optimization isn't attempted, never that the peer is
+    /// unreachable.
+    #[cfg(feature = "nat-traversal")]
+    pub fn select_punch_coordinator(&self, target: u64) -> Option<u64> {
+        // Tier 1: the relay currently forwarding to the target. Only
+        // yields a distinct node for a relay-reached target — for a
+        // direct peer the next hop is the target itself (excluded).
+        if let Some(next_hop) = self.router.routing_table().lookup(target) {
+            if let Some(nid) = self.addr_to_node.get(&next_hop).map(|e| *e.value()) {
+                if nid != target && nid != self.node_id && self.peers.contains_key(&nid) {
+                    return Some(nid);
+                }
+            }
+        }
+
+        // Tiers 2 & 3: collect the direct mutual peers (excluding self
+        // and the target), then split into relay-capable and any.
+        // Collected (not min-reduced) so the pick can be spread across
+        // the tier's candidates — see `spread_pick`.
+        let mut any: Vec<u64> = Vec::new();
+        for entry in self.peers.iter() {
+            let nid = *entry.key();
+            if nid == target || nid == self.node_id {
+                continue;
+            }
+            // Only genuinely DIRECT peers qualify (cubic P2): the peer
+            // table also holds relay-routed sessions whose `addr` is the
+            // relay's. A routed "coordinator" is doubly wrong — our
+            // PunchRequest would land at the relay's address (whose
+            // session can't decrypt it), and even if it arrived, the
+            // coordinator's anti-reflection guard would reject the
+            // routed pair anyway.
+            if self.is_relayed_peer(nid, &entry.value().addr) {
+                continue;
+            }
+            any.push(nid);
+        }
+        // Relay-capable subset, resolved in ONE fold lock for the whole
+        // candidate batch — the prior code took the fold lock and
+        // allocated a tag `Vec` for every candidate just to test one tag.
+        let relay_capable_set = super::behavior::fold::nodes_with_capability_tag(
+            &self.capability_fold,
+            &any,
+            super::behavior::capability::RELAY_CAPABLE_TAG,
+        );
+
+        // Tier 2 preferred, tier 3 fallback, else tier 4 (None). Spread
+        // the pick within the chosen tier so load doesn't concentrate.
+        if !relay_capable_set.is_empty() {
+            let relay_capable: Vec<u64> = any
+                .iter()
+                .copied()
+                .filter(|nid| relay_capable_set.contains(nid))
+                .collect();
+            Self::spread_pick(&relay_capable)
+        } else {
+            Self::spread_pick(&any)
+        }
+    }
+
+    /// Pick one node id from `pool` at random, spread across calls so
+    /// rendezvous-coordination load doesn't concentrate on one peer.
+    /// Uses a freshly-seeded [`RandomState`] hash for per-call entropy
+    /// (the same OS-entropy trick as `adapter::dedup_state`) — cheap,
+    /// dependency-free, and varies both across requesters and across a
+    /// single requester's retries, so no node becomes a coordinator
+    /// hotspot / SPOF. Returns `None` only for an empty pool.
+    ///
+    /// [`RandomState`]: std::collections::hash_map::RandomState
+    #[cfg(feature = "nat-traversal")]
+    fn spread_pick(pool: &[u64]) -> Option<u64> {
+        use std::hash::BuildHasher;
+        if pool.is_empty() {
+            return None;
+        }
+        let salt = std::collections::hash_map::RandomState::new().hash_one(pool.len() as u64);
+        pool.get((salt % pool.len() as u64) as usize).copied()
+    }
+
+    /// Like [`Self::connect_direct`], but auto-selects the rendezvous
+    /// coordinator via [`Self::select_punch_coordinator`] instead of
+    /// taking one from the caller — the ergonomic entry point for
+    /// "just give me the best path to this peer."
+    ///
+    /// - `Direct` pairs don't need a coordinator (the peer is publicly
+    ///   reachable), so this delegates straight through.
+    /// - `SinglePunch` / `SkipPunch` pairs need one; if no candidate
+    ///   exists, returns [`super::traversal::TraversalError::RendezvousNoRelay`]
+    ///   — the tier-4 skip. The caller stays on the routed-handshake
+    ///   path (connectivity is never at risk; the punch is the
+    ///   optimization).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct_auto(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+    ) -> Result<u64, super::traversal::TraversalError> {
+        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::TraversalError;
+
+        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_node_id));
+        match action {
+            // Direct pairs ignore the coordinator entirely; pass a
+            // sentinel `0` — the Direct arm never reads it.
+            PairAction::Direct => self.connect_direct(peer_node_id, peer_pubkey, 0).await,
+            PairAction::SinglePunch | PairAction::SkipPunch => {
+                match self.select_punch_coordinator(peer_node_id) {
+                    Some(coord) => self.connect_direct(peer_node_id, peer_pubkey, coord).await,
+                    None => {
+                        self.traversal_stats.record_rendezvous_no_relay();
+                        Err(TraversalError::RendezvousNoRelay)
+                    }
+                }
+            }
+        }
     }
 
     /// Establish a direct session to `peer_node_id`, using the
@@ -12828,6 +13628,12 @@ impl MeshNode {
                     Err(_) => {
                         self.pending_punch_acks
                             .remove_if(&peer_node_id, |_, (g, _, _)| *g == ack_gen);
+                        // Ack-wait deadline elapsed: the introduce
+                        // arrived but the counterpart's PunchAck never
+                        // did — the punch's one timeout for this flow
+                        // (the introduce wait resolved Ok, so
+                        // `request_punch` didn't count one).
+                        self.traversal_stats.record_punch_timeout();
                         let id = connect_via_coordinator(coord).await?;
                         self.traversal_stats.record_relay_fallback();
                         Ok(id)
@@ -13880,6 +14686,390 @@ impl MeshNode {
         Ok(dest_node_id)
     }
 
+    /// Handshake to `target_addr` and install the resulting session
+    /// with a compare-and-swap against `expected_prior_session_id`
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` C2). Same retrying handshake as
+    /// [`Self::connect_via`], but the install proceeds only if the
+    /// peer's current session_id still matches — so a background
+    /// direct-path upgrade never clobbers a racing rotation.
+    ///
+    /// Returns `Ok(true)` if the session was installed, `Ok(false)` if
+    /// the CAS lost (a racing handshake won — the caller leaves the
+    /// current session, typically the working relay path, intact), or
+    /// `Err` on handshake failure (nothing was mutated, so the relay
+    /// session is likewise untouched).
+    #[cfg(feature = "nat-traversal")]
+    async fn connect_via_cas(
+        &self,
+        target_addr: SocketAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+        expected_prior_session_id: u64,
+        addr_mode: AddrInstallMode,
+    ) -> Result<bool, AdapterError> {
+        let mut attempt = 0;
+        let keys = loop {
+            attempt += 1;
+            match self
+                .try_connect_via_once(target_addr, dest_pubkey, dest_node_id)
+                .await
+            {
+                Ok(keys) => break keys,
+                Err(e) if attempt < self.config.handshake_retries => {
+                    tracing::debug!(attempt, error = %e, "upgrade handshake retry");
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        Ok(self.install_peer_cas(
+            dest_node_id,
+            target_addr,
+            keys,
+            addr_mode,
+            Some(expected_prior_session_id),
+        ))
+    }
+
+    // ── Background direct-path upgrade (Stage 3) ─────────────────────────
+
+    /// `true` if a fresh upgrade attempt for `peer_id` is allowed right
+    /// now — no cache entry, or an entry that isn't `done` and whose
+    /// backoff/defer window has elapsed.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_should_attempt(&self, peer_id: u64) -> bool {
+        match self.upgrade_cache.get(&peer_id) {
+            None => true,
+            Some(e) => !e.done && Instant::now() >= e.next_eligible,
+        }
+    }
+
+    /// Lease an attempt: push `next_eligible` out so the scan loop won't
+    /// re-spawn a second attempt for this peer while one is in flight.
+    /// The attempt's outcome recorder overwrites this.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_lease(&self, peer_id: u64, lease: Duration) {
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
+        e.next_eligible = Instant::now() + lease;
+    }
+
+    /// Record a terminal outcome: the session is direct (or can't be
+    /// upgraded) — stop attempting.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_done(&self, peer_id: u64) {
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
+        e.done = true;
+    }
+
+    /// Record a busy-defer: retry after a short delay, without counting
+    /// it as a failure (the session is healthy, just carrying traffic).
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_defer(&self, peer_id: u64, delay: Duration) {
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
+        e.next_eligible = Instant::now() + delay;
+    }
+
+    /// Record a failed attempt: exponential backoff on the retry.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_record_failure(&self, peer_id: u64) {
+        const BASE: Duration = Duration::from_secs(2);
+        const MAX_SHIFT: u32 = 5; // cap backoff at BASE << 5 = 64 s
+        let mut e = self
+            .upgrade_cache
+            .entry(peer_id)
+            .or_insert(UpgradeCacheEntry {
+                next_eligible: Instant::now(),
+                failures: 0,
+                done: false,
+            });
+        e.failures = e.failures.saturating_add(1);
+        let backoff = BASE.saturating_mul(1u32 << e.failures.min(MAX_SHIFT));
+        e.next_eligible = Instant::now() + backoff;
+    }
+
+    /// Attempt a single background direct-path upgrade of a
+    /// relay-routed session to `peer_id` (`NAT_TRAVERSAL_V2_PLAN.md`
+    /// Stage 3). Best-effort throughout: on any failure the working
+    /// relay session is left intact (the whole feature is an
+    /// optimization). Enforces the migration contract:
+    ///
+    /// - **C3 initiator busy gate:** if the local session has open
+    ///   streams or unacked in-flight data, defer — a swap would drop
+    ///   it. Retried once quiescent.
+    /// - **C2 CAS install:** the punched session installs only if the
+    ///   peer's session_id hasn't changed since we snapshotted it, so a
+    ///   racing inbound rotation wins instead of being clobbered.
+    ///
+    /// (C1 — only the lower-node-id end initiates — is enforced by the
+    /// scan loop before this is called.)
+    ///
+    /// This landing upgrades **`Direct` pairs** (the peer is directly
+    /// reachable at its reflex). Coordinated-punch (`SinglePunch`)
+    /// upgrades reuse the same install machinery and are a follow-up;
+    /// `SkipPunch` pairs can never punch. `SkipPunch` is marked
+    /// terminal (`done`) so the scan stops revisiting it, but
+    /// `SinglePunch` is only *deferred*: a later reflex-drift
+    /// reclassification can flip the pair to `Direct`, and a permanent
+    /// `done` would pin the session to the relay for the rest of the
+    /// process's life. The per-peer cache entry is also dropped when
+    /// the peer is evicted (heartbeat sweep), so a session that
+    /// regresses direct→relay and reconnects starts from a clean slate.
+    #[cfg(feature = "nat-traversal")]
+    async fn attempt_direct_upgrade(&self, peer_id: u64) {
+        use super::traversal::classify::{pair_action, PairAction};
+
+        // Re-evaluate a not-yet-upgradable `SinglePunch` pair after
+        // this long, so a NAT reclassification that makes it `Direct`
+        // gets picked up instead of being cached off permanently.
+        const SINGLEPUNCH_RECHECK: Duration = Duration::from_secs(30);
+
+        // Snapshot the current session.
+        let Some((relay_addr, prior_sid, pubkey, busy)) = self.peers.get(&peer_id).map(|e| {
+            let v = e.value();
+            (
+                v.addr,
+                v.session.session_id(),
+                v.remote_static_pub,
+                v.session.has_open_streams() || v.session.has_unacked(),
+            )
+        }) else {
+            return;
+        };
+
+        // Still relay-routed? A direct session is already on the best
+        // path — nothing to upgrade.
+        if !self.is_relayed_peer(peer_id, &relay_addr) {
+            self.upgrade_record_done(peer_id);
+            return;
+        }
+
+        // C3 initiator busy gate.
+        if busy {
+            self.traversal_stats.record_upgrade_deferred_busy();
+            self.upgrade_record_defer(peer_id, Duration::from_secs(1));
+            return;
+        }
+
+        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_id));
+        let target_addr = match action {
+            PairAction::Direct => match self.peer_reflex_addr(peer_id) {
+                Some(addr) => addr,
+                // No cached reflex yet — retry with backoff once the
+                // peer's announcement lands.
+                None => {
+                    self.upgrade_record_failure(peer_id);
+                    return;
+                }
+            },
+            // `SkipPunch` can never punch — terminal, stop scanning.
+            PairAction::SkipPunch => {
+                self.upgrade_record_done(peer_id);
+                return;
+            }
+            // `SinglePunch` upgrades aren't wired yet, but the pair may
+            // become `Direct` after a reclassification. Defer instead
+            // of marking terminal so the scan revisits it.
+            PairAction::SinglePunch => {
+                self.upgrade_record_defer(peer_id, SINGLEPUNCH_RECHECK);
+                return;
+            }
+        };
+
+        // Guard against "upgrading" to the very path we're already on.
+        if target_addr == relay_addr {
+            self.upgrade_record_done(peer_id);
+            return;
+        }
+
+        self.traversal_stats.record_upgrade_attempt();
+        match self
+            .connect_via_cas(
+                target_addr,
+                &pubkey,
+                peer_id,
+                prior_sid,
+                AddrInstallMode::DirectOverwrite,
+            )
+            .await
+        {
+            Ok(true) => {
+                self.traversal_stats.record_upgrade_success();
+                self.upgrade_record_done(peer_id);
+            }
+            // CAS lost to a racing rotation, or handshake failed — the
+            // existing session is untouched. Back off and re-evaluate;
+            // if the race made the session direct, the next attempt's
+            // relayed-check marks it done.
+            Ok(false) | Err(_) => {
+                self.upgrade_record_failure(peer_id);
+            }
+        }
+    }
+
+    /// Test hook: drive a single [`Self::attempt_direct_upgrade`]
+    /// synchronously, bypassing the background scan loop's timing so
+    /// integration tests are deterministic under parallel load. The
+    /// caller is responsible for the C1 lower-node-id check the loop
+    /// normally enforces.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub async fn attempt_direct_upgrade_for_test(&self, peer_id: u64) {
+        self.attempt_direct_upgrade(peer_id).await;
+    }
+
+    /// Whether the scan loop should consider `peer_id` for a background
+    /// upgrade this tick: the local node is the lower-id initiator (C1),
+    /// the session is relay-routed (not already direct), and the
+    /// per-peer throttle window has elapsed.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_is_loop_candidate(&self, peer_id: u64) -> bool {
+        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr) else {
+            return false;
+        };
+        self.upgrade_is_loop_candidate_at(peer_id, addr)
+    }
+
+    /// As [`Self::upgrade_is_loop_candidate`] but with the peer's
+    /// session `addr` already in hand — lets the scan loop test each
+    /// peer straight from the `peers` iterator entry instead of doing a
+    /// redundant `peers.get` shard-lookup on the map it is iterating.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: SocketAddr) -> bool {
+        // C1: only the lower-node-id end initiates.
+        if self.node_id >= peer_id {
+            return false;
+        }
+        // Relay-routed only — a direct session has nothing to upgrade.
+        if !self.is_relayed_peer(peer_id, &addr) {
+            return false;
+        }
+        self.upgrade_should_attempt(peer_id)
+    }
+
+    /// Test hook for [`Self::upgrade_is_loop_candidate`] — lets
+    /// integration tests assert the C1 / relay-routed filter
+    /// deterministically without racing the loop's cadence.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_is_loop_candidate_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_is_loop_candidate(peer_id)
+    }
+
+    /// Test hook: whether the direct-path upgrade throttle cache holds
+    /// an entry for `peer_id`. Pins that a failed peer's entry is
+    /// dropped so the cache can't grow without bound under churn.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_cache_contains_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_cache.contains_key(&peer_id)
+    }
+
+    /// Test hook: the `done` (terminal) flag of `peer_id`'s throttle
+    /// entry, or `None` if there is no entry. `SkipPunch` is terminal
+    /// (`Some(true)`); a deferred `SinglePunch` is not (`Some(false)`).
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_entry_is_done_for_test(&self, peer_id: u64) -> Option<bool> {
+        self.upgrade_cache.get(&peer_id).map(|e| e.done)
+    }
+
+    /// Spawn the background direct-path upgrade scan loop (Stage 3).
+    /// Every tick, find relay-routed peers for which this node is the
+    /// lower-id initiator (C1) and whose throttle window has elapsed,
+    /// and fire a per-peer `attempt_direct_upgrade`. No-op
+    /// unless `MeshNodeConfig::auto_direct_upgrade` is set; exits on
+    /// `shutdown_notify`.
+    ///
+    /// The task holds only a [`Weak`](std::sync::Weak) self-ref
+    /// (upgraded transiently per tick), never `Arc::clone(self)`. A
+    /// strong self-ref held for the task's lifetime would stop
+    /// [`MeshNode::drop`] — the path that sets `shutdown` — from ever
+    /// running for an `Arc<MeshNode>` dropped without an explicit
+    /// `shutdown()`: the loop would then spin forever and leak the
+    /// node, its socket, and every other background task. Same
+    /// `Weak`-then-`upgrade()` contract as
+    /// `spawn_capability_reannounce_loop`.
+    #[cfg(feature = "nat-traversal")]
+    pub fn spawn_direct_upgrade_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+        const ATTEMPT_LEASE: Duration = Duration::from_secs(10);
+
+        let weak = Arc::downgrade(self);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            // Feature off → nothing to do. Transient upgrade only to
+            // read the flag; the strong ref is dropped with the match.
+            match weak.upgrade() {
+                Some(node) if node.config.auto_direct_upgrade => {}
+                _ => return,
+            }
+            let mut tick = tokio::time::interval(SCAN_INTERVAL);
+            tick.tick().await; // skip the immediate tick
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = shutdown_notify.notified() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                    }
+                    _ = tick.tick() => {}
+                }
+
+                // Upgrade transiently for this tick; if the node is
+                // gone, exit. The strong ref lives only across the
+                // synchronous scan below — never across an await — so
+                // it can't keep the node alive past a `drop`.
+                let Some(node) = weak.upgrade() else { break };
+
+                // Snapshot eligible peers without holding a shard guard
+                // across the spawned attempts. Test each peer straight
+                // from the iterator entry (id + addr in hand) so the
+                // filter doesn't re-`get` the map it's iterating.
+                let candidates: Vec<u64> = node
+                    .peers
+                    .iter()
+                    .filter(|entry| {
+                        node.upgrade_is_loop_candidate_at(*entry.key(), entry.value().addr)
+                    })
+                    .map(|entry| *entry.key())
+                    .collect();
+
+                for peer_id in candidates {
+                    // Lease before spawning so the next scan doesn't
+                    // double-fire while this attempt is in flight.
+                    node.upgrade_lease(peer_id, ATTEMPT_LEASE);
+                    let n = node.clone();
+                    tokio::spawn(async move {
+                        n.attempt_direct_upgrade(peer_id).await;
+                    });
+                }
+            }
+        })
+    }
+
     /// Connect to a peer by node id, using the routing table to pick the
     /// first hop. Fails with `Connection("no route to ...")` if the
     /// routing table doesn't have a route to the destination yet — in
@@ -14355,6 +15545,63 @@ impl MeshNode {
         }
     }
 
+    /// Reflex-diff re-classification trigger
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` decision 8, trigger 2). Called by
+    /// the capability re-announce loop before each periodic announce:
+    /// if the currently-observed reflex differs from the one in the
+    /// last *published* announcement, run exactly one classification
+    /// sweep first so the `nat:*` tag and the reflex field ship
+    /// together — a reflex that drifted since the last sweep (probe /
+    /// punch activity, gateway reboot) usually means the class is
+    /// stale too.
+    ///
+    /// Returns `true` iff a sweep ran. Deliberately conservative —
+    /// all of these skip (no sweep, `false`):
+    /// - an active reflex override (it pins `(class, reflex)`; the
+    ///   sweep would be short-circuited anyway),
+    /// - no prior published announcement (the initial announce path
+    ///   owns the first pair),
+    /// - no current observation (`reflex_addr = None` — the classify
+    ///   loop owns first population; announcing `None` is honest),
+    /// - observed == published (the no-flap cadence guard: steady
+    ///   state must not add sweeps to the re-announce tick).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_if_reflex_drifted(&self) -> bool {
+        use std::sync::atomic::Ordering as AtOrd;
+        if self.reflex_override_active.load(AtOrd::Acquire) {
+            return false;
+        }
+        let Some(published) = self.local_announcement.load_full() else {
+            return false;
+        };
+        let Some(observed) = self.reflex_addr() else {
+            return false;
+        };
+        if published.reflex_addr == Some(observed) {
+            return false;
+        }
+        self.reclassify_nat().await;
+        true
+    }
+
+    /// Testing hook: overwrite the observed reflex WITHOUT the
+    /// override pin (unlike [`Self::set_reflex_override`], which pins
+    /// `(class, reflex)` and short-circuits the classifier). Lets
+    /// tests simulate a between-announce reflex drift — something a
+    /// real deployment gets from probe/punch observations after a
+    /// gateway reboot, and loopback can never produce naturally —
+    /// so the reflex-diff trigger has something to reconcile. Runs
+    /// under `traversal_publish_mu` like every multi-field traversal
+    /// write.
+    #[cfg(feature = "nat-traversal")]
+    #[doc(hidden)]
+    pub fn set_reflex_for_test(&self, addr: SocketAddr) {
+        let _g = self.traversal_publish_mu.lock();
+        self.reflex_addr.store(Some(Arc::new(addr)));
+    }
+
     /// Testing / debugging hook: force this node's advertised
     /// `NatClass` without running the probe sweep. On loopback
     /// every node classifies as `Open`, which means the pair-type
@@ -14409,9 +15656,14 @@ impl MeshNode {
     ///   active session.
     /// - [`super::traversal::TraversalError::Transport`] on a socket-level send
     ///   failure.
+    /// - [`super::traversal::TraversalError::RendezvousRejected`] if the
+    ///   coordinator refused with a typed `PunchReject` (rate-limited, no
+    ///   cached target reflex, no session with the target, or the
+    ///   anti-reflection check failed). This resolves *immediately* — no
+    ///   `punch_deadline` wait — and carries the reason sub-kind.
     /// - [`super::traversal::TraversalError::PunchFailed`] if the coordinator
-    ///   doesn't introduce within [`super::traversal::TraversalConfig::punch_deadline`]
-    ///   (likely: R has no cached reflex for `target`).
+    ///   neither introduced nor rejected within
+    ///   [`super::traversal::TraversalConfig::punch_deadline`].
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
@@ -14446,16 +15698,30 @@ impl MeshNode {
         let gen = self
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Wire correlation token, echoed by any PunchReject this
+        // request draws. Skip the reserved 0 sentinel on wrap.
+        let punch_id = {
+            let mut id = self
+                .next_punch_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if id == 0 {
+                id = self
+                    .next_punch_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            id
+        };
         // Bind to the relay we're sending PunchRequest to — only
         // that node is authorized to send the matching introduce
         // back. Without this, any session peer could forge a
         // PunchIntroduce for `target` and complete this oneshot
         // with attacker-chosen reflex data.
         self.pending_punch_introduces
-            .insert(target, (gen, relay, tx));
+            .insert(target, (gen, relay, punch_id, tx));
 
         let body = RendezvousMsg::PunchRequest(PunchRequest {
             target,
+            punch_id,
             self_reflex,
         })
         .encode();
@@ -14464,22 +15730,35 @@ impl MeshNode {
             .await
         {
             self.pending_punch_introduces
-                .remove_if(&target, |_, (g, _, _)| *g == gen);
+                .remove_if(&target, |_, (g, _, _, _)| *g == gen);
             return Err(TraversalError::Transport(e.to_string()));
         }
 
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(intro)) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
+                // Coordinator refused with a typed reason — fast,
+                // non-timeout failure (Finding 5). The waiter was
+                // removed by the dispatch arm that delivered the
+                // reject; nothing to clean up here.
+                self.traversal_stats.record_punch_rejection();
+                Err(TraversalError::RendezvousRejected(
+                    reason.kind().to_string(),
+                ))
+            }
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — another request_punch to the
                 // same target replaced our sender. Don't touch the
-                // map: the replacement owns the entry now.
+                // map: the replacement owns the entry now. Not a
+                // timeout — no reason counter (stage 5): the
+                // superseding call does its own accounting.
                 Err(TraversalError::PunchFailed)
             }
             Err(_elapsed) => {
                 self.pending_punch_introduces
-                    .remove_if(&target, |_, (g, _, _)| *g == gen);
+                    .remove_if(&target, |_, (g, _, _, _)| *g == gen);
+                self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -14514,14 +15793,21 @@ impl MeshNode {
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending_punch_introduces
-            .insert(counterpart, (gen, coordinator, tx));
+            .insert(counterpart, (gen, coordinator, 0, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(intro)) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Introduce(intro))) => Ok(intro),
+            Ok(Ok(PunchIntroduceOutcome::Rejected(reason))) => {
+                self.traversal_stats.record_punch_rejection();
+                Err(TraversalError::RendezvousRejected(
+                    reason.kind().to_string(),
+                ))
+            }
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces
-                    .remove_if(&counterpart, |_, (g, _, _)| *g == gen);
+                    .remove_if(&counterpart, |_, (g, _, _, _)| *g == gen);
+                self.traversal_stats.record_punch_timeout();
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -16457,6 +17743,127 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// Direct-path upgrade C2: `install_peer_cas` refuses to overwrite
+    /// when the peer's current session_id no longer matches the one
+    /// the upgrade observed — a racing handshake won, and clobbering it
+    /// is exactly the F5 nondeterminism the CAS removes. The working
+    /// session is left intact.
+    #[tokio::test]
+    async fn install_peer_cas_refuses_on_session_id_mismatch() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Cu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0xAB_CD_EF_01u64;
+        let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
+        let (relay_keys, _) = make_session_keys();
+        let relay_session_id = relay_keys.session_id;
+        node.install_peer(
+            peer_id,
+            relay_addr,
+            relay_keys,
+            AddrInstallMode::RoutedPreserve,
+        );
+
+        // A racing rotation installs a DIFFERENT session for the peer
+        // (simulated by a plain install). The upgrade below still holds
+        // the OLD session_id as its expectation.
+        let (raced_keys, _) = make_session_keys();
+        let raced_session_id = raced_keys.session_id;
+        node.install_peer(
+            peer_id,
+            relay_addr,
+            raced_keys,
+            AddrInstallMode::RoutedPreserve,
+        );
+
+        // Upgrade tries to install a punched session but expects the
+        // pre-race session_id → CAS must refuse.
+        let punched_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let (punch_keys, _) = make_session_keys();
+        let installed = node.install_peer_cas(
+            peer_id,
+            punched_addr,
+            punch_keys,
+            AddrInstallMode::DirectOverwrite,
+            Some(relay_session_id),
+        );
+        assert!(!installed, "CAS must refuse when the session_id changed");
+        // The raced session survives untouched.
+        assert_eq!(
+            node.peers
+                .get(&peer_id)
+                .map(|p| p.value().session.session_id()),
+            Some(raced_session_id),
+            "the racing session must be left intact after a refused CAS",
+        );
+        assert!(
+            !node.addr_to_node.contains_key(&punched_addr),
+            "a refused CAS must not touch addr_to_node",
+        );
+    }
+
+    /// C2 happy path: when the observed session_id still matches,
+    /// `install_peer_cas` installs the new (punched) session and the
+    /// C4 hygiene removes the displaced relay addr's stale reverse
+    /// mapping.
+    #[tokio::test]
+    async fn install_peer_cas_installs_and_cleans_stale_addr_on_match() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Du8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x11_22_33_44u64;
+        // Direct install so addr_to_node[old_addr] = peer_id (a
+        // stale mapping the swap should clean up).
+        let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let (first_keys, _) = make_session_keys();
+        let first_session_id = first_keys.session_id;
+        node.install_peer(
+            peer_id,
+            old_addr,
+            first_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+        assert_eq!(
+            node.addr_to_node.get(&old_addr).map(|e| *e),
+            Some(peer_id),
+            "precondition: old addr maps to the peer",
+        );
+
+        let new_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let (punch_keys, _) = make_session_keys();
+        let punch_session_id = punch_keys.session_id;
+        let installed = node.install_peer_cas(
+            peer_id,
+            new_addr,
+            punch_keys,
+            AddrInstallMode::DirectOverwrite,
+            Some(first_session_id),
+        );
+        assert!(installed, "CAS must install when the session_id matches");
+        assert_eq!(
+            node.peers
+                .get(&peer_id)
+                .map(|p| p.value().session.session_id()),
+            Some(punch_session_id),
+            "the punched session must replace the old one",
+        );
+        assert_eq!(
+            node.addr_to_node.get(&new_addr).map(|e| *e),
+            Some(peer_id),
+            "the new addr must map to the peer",
+        );
+        assert!(
+            !node.addr_to_node.contains_key(&old_addr),
+            "C4: the displaced addr's stale reverse mapping must be removed",
+        );
+    }
+
     /// PERF_AUDIT §2.8 regression — the grant-path fast path must
     /// be SELF-PRIMING: a fallback resolution publishes the node id
     /// onto the session so the next packet takes the tier-1 atomic
@@ -16832,6 +18239,60 @@ mod heartbeat_aead_tests {
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
             routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
+            RoutedRotationOutcome::AcceptRotation,
+        );
+    }
+
+    /// Direct-path upgrade C3 (responder half): a same-static
+    /// re-handshake that would normally rotate is DEFERRED when the
+    /// existing session is live and busy (an open application stream),
+    /// so an in-flight transfer isn't dropped by the swap.
+    #[test]
+    fn routed_rotation_outcome_defers_while_session_busy() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        // Open an application stream → the session is now "busy".
+        session.get_or_create_stream(1);
+        assert!(session.has_open_streams(), "precondition: session is busy");
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+        };
+        // Same static, fresh ephemeral, live (30 s timeout) + busy.
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_secs(30)),
+            RoutedRotationOutcome::DeferBusy,
+        );
+    }
+
+    /// The DeferBusy liveness bound: a busy session that has gone idle
+    /// past `session_timeout` rotates anyway (AcceptRotation), so a
+    /// genuinely dead path — e.g. the peer recovering after a NAT
+    /// rebind — is never blocked by stale "busy" state.
+    #[test]
+    fn routed_rotation_outcome_accepts_busy_session_past_timeout() {
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        session.get_or_create_stream(1);
+        assert!(session.has_open_streams(), "precondition: session is busy");
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            addr,
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+        };
+        // Let the session go idle past a 1 ms timeout — not live.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_millis(1)),
             RoutedRotationOutcome::AcceptRotation,
         );
     }

@@ -1213,24 +1213,24 @@ Core semantics live in the main
 
 ## Cargo features
 
-The five feature flags that gate the storage / query / OS surfaces on this binding. Wheels built without a feature silently omit its symbols — the build never warns. `bindings/python/python/net/__init__.py` try-imports each block individually, so `from net import Redex` raises `ImportError` (not `AttributeError`) when the underlying `_net` extension was compiled without `cortex`.
+The feature flags that gate the storage / query / OS surfaces on this binding. Wheels built without a feature silently omit its symbols — the build never warns. `bindings/python/python/net/__init__.py` try-imports each block individually, so `from net import Redex` raises `ImportError` (not `AttributeError`) when the underlying `_net` extension was compiled without `cortex`.
+
+Feature names below are **this package's** (`net-python`) features — see `[features]` in `bindings/python/Cargo.toml`. Note that the underlying crate's `netdb` and `redex-disk` features are folded into this binding's `cortex` feature (`cortex = ["net/netdb", "net/redex-disk", …]`); they are not separately toggleable here.
 
 | Feature | Surface enabled in the PyO3 module |
 |---|---|
-| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
-| `redex-disk` | Disk-backed persistence for RedEX — the `persistent_dir` ctor arg and `Persistent: true` on `open_file`. Without it the persistent path returns `RedexError`. |
-| `netdb` | `NetDb` composition over Tasks + Memories (requires `cortex`). The `net_netdb_*` FFI entry points ship with this feature. |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError`. Includes the crate-level `netdb` composition and `redex-disk` persistence (the `persistent_dir` ctor arg and `Persistent: true` on `open_file`). |
 | `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`, the rest of the query layer, plus the `libnet_meshdb` cdylib. |
 | `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
 
-Enable at build time:
+All of the above are **default features** of this binding — a bare `maturin develop` / `maturin build` already includes them. The flags only matter when building a thin wheel:
 
 ```bash
-# Dev install into the active venv:
-maturin develop --features "cortex netdb redex-disk meshdb meshos"
+# Thin wheel: mesh transport + cortex only, nothing else:
+maturin develop --no-default-features --features "extension-module net cortex"
 
-# Or produce a wheel:
-maturin build --release --features "cortex netdb redex-disk meshdb meshos"
+# Or produce a full-fat wheel explicitly (same as the default):
+maturin build --release
 ```
 
 PyPI wheels published as `net-mesh` ship with every feature enabled; the flags above only matter for source builds.

@@ -158,6 +158,20 @@ type MeshConfig struct {
 	// path. Silently ignored when the Rust cdylib was built
 	// without `--features port-mapping`.
 	TryPortMapping bool `json:"try_port_mapping,omitempty"`
+
+	// AutoDirectUpgrade enables the background direct-path
+	// upgrade: once a session to a peer is established via a
+	// relay, the mesh opportunistically re-handshakes over a
+	// direct path and migrates the session, cutting relay hops
+	// out of the data plane. The swap is guarded by a migration
+	// contract (lower-id initiator, compare-and-swap install,
+	// busy-session deferral) so in-flight work is never dropped.
+	//
+	// Optimization, not correctness — traffic rides the relay
+	// until (and unless) a direct path lands. Default false.
+	// Silently ignored when the Rust cdylib was built without
+	// `--features nat-traversal`.
+	AutoDirectUpgrade bool `json:"auto_direct_upgrade,omitempty"`
 }
 
 // StreamConfig configures an opened mesh stream.
@@ -404,21 +418,49 @@ func (m *MeshNode) Start() error {
 // as ErrTraversalUnsupported from the shared-library stubs.
 
 // TraversalStats is the snapshot returned by
-// MeshNode.TraversalStats(). All counters are monotonic u64 —
-// they never reset, so callers that want deltas should subtract
-// successive snapshots.
+// MeshNode.TraversalStats(). Base counters are monotonic u64 —
+// they never reset, so callers that want deltas can subtract
+// successive snapshots. Two fields are exempt from delta math:
+// PunchesFailed is derived at snapshot time (attempted −
+// succeeded) and can decrease when an in-flight punch lands, and
+// PortMappingRenewals resets to zero on each fresh mapping
+// install. Difference only the base counters for rates.
 //
-//   - PunchesAttempted: the pair-type matrix elected to attempt a
-//     hole-punch. Increments per attempt, regardless of outcome.
+//   - PunchesAttempted: the coordinator successfully mediated a
+//     punch introduction. Increments per mediated attempt.
 //   - PunchesSucceeded: subset of attempts that produced a direct
 //     session. Always <= PunchesAttempted.
+//   - PunchesFailed: derived at snapshot time — attempted minus
+//     succeeded (a punch in flight counts as failed until it
+//     resolves).
 //   - RelayFallbacks: MeshNode.ConnectDirect resolutions that
 //     stayed on the routed-handshake path — matrix-skipped pairs
 //     plus punch-failed attempts.
+//   - PunchTimeouts / PunchRejections / RendezvousNoRelay: failure
+//     *cause* counters (deadline elapsed / typed coordinator
+//     reject / no coordinator candidate). Causes include
+//     pre-mediation failures, so they are not a partition of
+//     PunchesFailed.
+//   - UpgradesAttempted / UpgradesSucceeded / UpgradesDeferredBusy:
+//     background direct-path upgrade activity (deferred-busy
+//     upgrades retry later; they are not failures).
+//   - PortMappingActive / PortMappingExternal /
+//     PortMappingRenewals: UPnP / NAT-PMP / PCP port-mapping
+//     state. PortMappingExternal is "" when no mapping is active.
 type TraversalStats struct {
-	PunchesAttempted uint64
-	PunchesSucceeded uint64
-	RelayFallbacks   uint64
+	PunchesAttempted     uint64
+	PunchesSucceeded     uint64
+	PunchesFailed        uint64
+	RelayFallbacks       uint64
+	PunchTimeouts        uint64
+	PunchRejections      uint64
+	RendezvousNoRelay    uint64
+	UpgradesAttempted    uint64
+	UpgradesSucceeded    uint64
+	UpgradesDeferredBusy uint64
+	PortMappingActive    bool
+	PortMappingExternal  string
+	PortMappingRenewals  uint64
 }
 
 // NatType returns this mesh's NAT classification as a stable
@@ -523,24 +565,34 @@ func (m *MeshNode) ReclassifyNat() error {
 }
 
 // TraversalStats returns a cumulative snapshot of NAT-traversal
-// counters. See TraversalStats for per-field semantics.
+// counters — the full stage-5 shape, read via the v2 FFI call.
+// See TraversalStats for per-field semantics.
 func (m *MeshNode) TraversalStats() (TraversalStats, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return TraversalStats{}, ErrShuttingDown
 	}
-	var stats TraversalStats
-	code := C.net_mesh_traversal_stats(
-		m.handle,
-		(*C.uint64_t)(unsafe.Pointer(&stats.PunchesAttempted)),
-		(*C.uint64_t)(unsafe.Pointer(&stats.PunchesSucceeded)),
-		(*C.uint64_t)(unsafe.Pointer(&stats.RelayFallbacks)),
-	)
+	var c C.net_traversal_stats_v2_t
+	code := C.net_mesh_traversal_stats_v2(m.handle, &c)
 	if err := meshErrorFromCode(code); err != nil {
 		return TraversalStats{}, err
 	}
-	return stats, nil
+	return TraversalStats{
+		PunchesAttempted:     uint64(c.punches_attempted),
+		PunchesSucceeded:     uint64(c.punches_succeeded),
+		PunchesFailed:        uint64(c.punches_failed),
+		RelayFallbacks:       uint64(c.relay_fallbacks),
+		PunchTimeouts:        uint64(c.punch_timeouts),
+		PunchRejections:      uint64(c.punch_rejections),
+		RendezvousNoRelay:    uint64(c.rendezvous_no_relay),
+		UpgradesAttempted:    uint64(c.upgrades_attempted),
+		UpgradesSucceeded:    uint64(c.upgrades_succeeded),
+		UpgradesDeferredBusy: uint64(c.upgrades_deferred_busy),
+		PortMappingActive:    c.port_mapping_active != 0,
+		PortMappingExternal:  C.GoString(&c.port_mapping_external[0]),
+		PortMappingRenewals:  uint64(c.port_mapping_renewals),
+	}, nil
 }
 
 // ConnectDirect establishes a session to peerNodeID via the
@@ -572,6 +624,30 @@ func (m *MeshNode) ConnectDirect(
 		C.uint64_t(peerNodeID),
 		cPk,
 		C.uint64_t(coordinator),
+	)
+	return meshErrorFromCode(code)
+}
+
+// ConnectDirectAuto is ConnectDirect with the rendezvous
+// coordinator auto-selected: the relay currently forwarding to
+// the peer, then a relay-capable mutual peer, then any mutual
+// peer. Punch-needing pairs with no candidate fail with
+// ErrTraversalRendezvousNoRelay — the caller simply stays on the
+// routed path, which is always available.
+func (m *MeshNode) ConnectDirectAuto(
+	peerNodeID uint64, peerPubkeyHex string,
+) error {
+	cPk := C.CString(peerPubkeyHex)
+	defer C.free(unsafe.Pointer(cPk))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_connect_direct_auto(
+		m.handle,
+		C.uint64_t(peerNodeID),
+		cPk,
 	)
 	return meshErrorFromCode(code)
 }

@@ -33,25 +33,28 @@
 //! ```
 //!
 //! - `kind` is the discriminator: `0x01 = PunchRequest`,
-//!   `0x02 = PunchIntroduce`, `0x03 = PunchAck`.
+//!   `0x02 = PunchIntroduce`, `0x03 = PunchAck`,
+//!   `0x04 = PunchReject`.
 //! - Addresses are encoded as `family(1) | addr(16) | port(2)` —
 //!   the same 19-byte shape used by the reflex subprotocol, so a
 //!   future migration can share the codec without a wire bump.
 //! - Multi-byte integers are big-endian.
 //!
-//! ## PunchRequest body (8 + 19 = 27 bytes)
+//! ## PunchRequest body (8 + 4 + 19 = 31 bytes)
 //!
 //! ```text
-//! ┌──────────────────┬─────────────────────────────┐
-//! │ target_node (8)  │ self_reflex (19)            │
-//! └──────────────────┴─────────────────────────────┘
+//! ┌──────────────────┬───────────────┬─────────────────────┐
+//! │ target_node (8)  │ punch_id (4)  │ self_reflex (19)    │
+//! └──────────────────┴───────────────┴─────────────────────┘
 //! ```
 //!
 //! `target_node` is the `node_id` of the peer the requester wants
-//! to punch to. `self_reflex` is the requester's current best
-//! guess of its own public `SocketAddr` — R uses this to stamp
-//! into B's `PunchIntroduce` if R doesn't have a fresher reflex
-//! in its capability cache.
+//! to punch to. `punch_id` is the requester-minted correlation
+//! token echoed by any `PunchReject` this request draws (0 is the
+//! no-request sentinel; requesters mint from 1). `self_reflex` is
+//! the requester's current best guess of its own public
+//! `SocketAddr` — R uses this to stamp into B's `PunchIntroduce`
+//! if R doesn't have a fresher reflex in its capability cache.
 //!
 //! ## PunchIntroduce body (8 + 19 + 8 = 35 bytes)
 //!
@@ -83,6 +86,23 @@
 //! identities during forwarding — this module makes them both
 //! explicit so the coordinator doesn't have to rewrite bytes
 //! mid-flight.
+//!
+//! ## PunchReject body (8 + 4 + 1 = 13 bytes)
+//!
+//! ```text
+//! ┌─────────────────┬───────────────┬──────────────┐
+//! │ target (8)      │ punch_id (4)  │ reason (1)   │
+//! └─────────────────┴───────────────┴──────────────┘
+//! ```
+//!
+//! `R → A` only. A coordinator that won't mediate a `PunchRequest`
+//! (rate-limited, no cached target reflex, no session with the
+//! target, or a failed anti-reflection check) sends this instead of
+//! a `PunchIntroduce`. `target` echoes the request's target so the
+//! requester resolves the matching pending-introduce waiter (keyed
+//! by target node id); `reason` is a [`RejectReason`]. The requester
+//! surfaces it as [`super::TraversalError::RendezvousRejected`]
+//! immediately, rather than blocking until `punch_deadline`.
 //!
 //! # Keep-alive packet
 //!
@@ -141,10 +161,11 @@ const FAMILY_V6: u8 = 6;
 const KIND_PUNCH_REQUEST: u8 = 0x01;
 const KIND_PUNCH_INTRODUCE: u8 = 0x02;
 const KIND_PUNCH_ACK: u8 = 0x03;
+const KIND_PUNCH_REJECT: u8 = 0x04;
 
 /// Total on-wire size of a `PunchRequest` payload.
-/// `kind(1) + target_node(8) + self_reflex(19) = 28`.
-pub const PUNCH_REQUEST_LEN: usize = 1 + 8 + ADDR_LEN;
+/// `kind(1) + target_node(8) + punch_id(4) + self_reflex(19) = 32`.
+pub const PUNCH_REQUEST_LEN: usize = 1 + 8 + 4 + ADDR_LEN;
 
 /// Total on-wire size of a `PunchIntroduce` payload.
 /// `kind(1) + peer(8) + peer_reflex(19) + fire_at_ms(8) = 36`.
@@ -153,6 +174,10 @@ pub const PUNCH_INTRODUCE_LEN: usize = 1 + 8 + ADDR_LEN + 8;
 /// Total on-wire size of a `PunchAck` payload.
 /// `kind(1) + from_peer(8) + to_peer(8) + punch_id(4) = 21`.
 pub const PUNCH_ACK_LEN: usize = 1 + 8 + 8 + 4;
+
+/// Total on-wire size of a `PunchReject` payload.
+/// `kind(1) + target(8) + punch_id(4) + reason(1) = 14`.
+pub const PUNCH_REJECT_LEN: usize = 1 + 8 + 4 + 1;
 
 /// Two-byte magic prefix identifying a pre-session keep-alive
 /// packet. Chosen to be disjoint from the Net packet `MAGIC`
@@ -246,11 +271,79 @@ pub struct PunchRequest {
     /// rejects the request with a typed error and A falls back to
     /// routed-handshake (plan §3 coordinator step 1).
     pub target: u64,
+    /// Per-request correlation token, minted by the requester and
+    /// echoed verbatim in any [`PunchReject`] this request draws.
+    /// `target` alone is NOT a unique key: two concurrent
+    /// `request_punch` calls to the same target replace each
+    /// other's waiter, and a delayed reject for the first request
+    /// must not fail the second (cubic P2). `0` is reserved as the
+    /// no-request sentinel (responder-side introduce waiters);
+    /// requesters mint ids starting at 1.
+    pub punch_id: u32,
     /// A's current best guess of its own public `SocketAddr`.
     /// R forwards this into B's `PunchIntroduce` — it's an
     /// optimization, not load-bearing: R may override with a
     /// fresher reflex observation from its own cache.
     pub self_reflex: SocketAddr,
+}
+
+/// Why a coordinator refused to mediate a `PunchRequest`. Rides a
+/// [`PunchReject`] back to the requester so its `request_punch`
+/// resolves immediately with a typed
+/// [`super::TraversalError::RendezvousRejected`] instead of waiting
+/// out `punch_deadline`. Unknown values decode to
+/// [`RejectReason::Unspecified`] so a future reason code never turns
+/// a reject into a dropped packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RejectReason {
+    /// The coordinator's per-requester `PunchRequest` budget is
+    /// exhausted for the current window.
+    RateLimited = 0x01,
+    /// The coordinator holds no cached reflex for the named target,
+    /// so it cannot introduce the pair.
+    UnknownTargetReflex = 0x02,
+    /// The coordinator has no live session with the named target.
+    NoSessionWithTarget = 0x03,
+    /// The requester's `self_reflex` IP disagreed with its session
+    /// source (anti-reflection guard, Finding 1).
+    ReflexMismatch = 0x04,
+    /// Reason not recognized by this build — treated as a generic
+    /// refusal. Never sent; only produced by [`decode`] for
+    /// forward-compatibility.
+    Unspecified = 0xFF,
+}
+
+impl RejectReason {
+    /// Wire byte.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire byte. Unrecognized values map to
+    /// [`RejectReason::Unspecified`] rather than failing, so a newer
+    /// coordinator's reason code degrades gracefully.
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            0x01 => Self::RateLimited,
+            0x02 => Self::UnknownTargetReflex,
+            0x03 => Self::NoSessionWithTarget,
+            0x04 => Self::ReflexMismatch,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Stable machine-readable sub-kind, embedded in the
+    /// `RendezvousRejected(_)` message string. Never localized.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate-limited",
+            Self::UnknownTargetReflex => "unknown-target-reflex",
+            Self::NoSessionWithTarget => "no-session-with-target",
+            Self::ReflexMismatch => "reflex-mismatch",
+            Self::Unspecified => "unspecified",
+        }
+    }
 }
 
 /// A `PunchIntroduce` payload — R → A and R → B ("here's the
@@ -296,9 +389,31 @@ pub struct PunchAck {
     pub punch_id: u32,
 }
 
-/// Decoded rendezvous subprotocol message. The three variants
-/// correspond to the three event-frame payload shapes described in
-/// the module docs. Use [`decode`] to obtain one from raw bytes.
+/// A `PunchReject` payload — R → A ("I won't mediate this punch").
+/// Sent instead of a `PunchIntroduce` so the requester's
+/// `request_punch` resolves immediately with a typed error rather
+/// than blocking until `punch_deadline`. `target` locates the
+/// requester's pending-introduce waiter (keyed by target node id);
+/// `punch_id` proves the reject answers THAT waiter's request and
+/// not a superseded concurrent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchReject {
+    /// The target the rejected `PunchRequest` named — lets the
+    /// requester locate its pending-introduce waiter.
+    pub target: u64,
+    /// Echo of the rejected `PunchRequest.punch_id`. The requester
+    /// resolves its waiter only when this matches the id it minted —
+    /// a delayed reject for an earlier request to the same target
+    /// must not fail the replacement request (cubic P2).
+    pub punch_id: u32,
+    /// Why the coordinator refused. Wire-encoded via
+    /// [`RejectReason::as_u8`].
+    pub reason: RejectReason,
+}
+
+/// Decoded rendezvous subprotocol message. The variants correspond
+/// to the event-frame payload shapes described in the module docs.
+/// Use [`decode`] to obtain one from raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendezvousMsg {
     /// A → R: please mediate a punch to `target`.
@@ -308,17 +423,23 @@ pub enum RendezvousMsg {
     /// {A, B} → {A, B}: punch succeeded on my side (sent via
     /// routed-handshake, not the punched path).
     PunchAck(PunchAck),
+    /// R → A: refused to mediate (rate-limit / unknown target /
+    /// anti-reflection). Fast typed failure in place of a silent
+    /// drop + `punch_deadline` timeout.
+    PunchReject(PunchReject),
 }
 
 impl RendezvousMsg {
     /// Encode the message as an event-body `Bytes`. Length is
     /// exactly one of [`PUNCH_REQUEST_LEN`], [`PUNCH_INTRODUCE_LEN`],
-    /// or [`PUNCH_ACK_LEN`] depending on the variant.
+    /// [`PUNCH_ACK_LEN`], or [`PUNCH_REJECT_LEN`] depending on the
+    /// variant.
     pub fn encode(&self) -> Bytes {
         match self {
             RendezvousMsg::PunchRequest(req) => encode_punch_request(req),
             RendezvousMsg::PunchIntroduce(intro) => encode_punch_introduce(intro),
             RendezvousMsg::PunchAck(ack) => encode_punch_ack(ack),
+            RendezvousMsg::PunchReject(rej) => encode_punch_reject(rej),
         }
     }
 }
@@ -364,6 +485,7 @@ fn encode_punch_request(req: &PunchRequest) -> Bytes {
     let mut buf = BytesMut::with_capacity(PUNCH_REQUEST_LEN);
     buf.put_u8(KIND_PUNCH_REQUEST);
     buf.put_u64(req.target);
+    buf.put_u32(req.punch_id);
     encode_addr(&mut buf, req.self_reflex);
     debug_assert_eq!(buf.len(), PUNCH_REQUEST_LEN);
     buf.freeze()
@@ -389,6 +511,16 @@ fn encode_punch_ack(ack: &PunchAck) -> Bytes {
     buf.freeze()
 }
 
+fn encode_punch_reject(rej: &PunchReject) -> Bytes {
+    let mut buf = BytesMut::with_capacity(PUNCH_REJECT_LEN);
+    buf.put_u8(KIND_PUNCH_REJECT);
+    buf.put_u64(rej.target);
+    buf.put_u32(rej.punch_id);
+    buf.put_u8(rej.reason.as_u8());
+    debug_assert_eq!(buf.len(), PUNCH_REJECT_LEN);
+    buf.freeze()
+}
+
 /// Decode a rendezvous payload. Returns `None` on any malformed
 /// input (wrong length for the claimed kind, unknown kind
 /// discriminator, unknown address family byte). Callers drop
@@ -403,9 +535,11 @@ pub fn decode(payload: &[u8]) -> Option<RendezvousMsg> {
                 return None;
             }
             let target = u64::from_be_bytes(payload[1..9].try_into().ok()?);
-            let self_reflex = decode_addr(&payload[9..28])?;
+            let punch_id = u32::from_be_bytes(payload[9..13].try_into().ok()?);
+            let self_reflex = decode_addr(&payload[13..32])?;
             Some(RendezvousMsg::PunchRequest(PunchRequest {
                 target,
+                punch_id,
                 self_reflex,
             }))
         }
@@ -435,6 +569,19 @@ pub fn decode(payload: &[u8]) -> Option<RendezvousMsg> {
                 punch_id,
             }))
         }
+        KIND_PUNCH_REJECT => {
+            if payload.len() != PUNCH_REJECT_LEN {
+                return None;
+            }
+            let target = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+            let punch_id = u32::from_be_bytes(payload[9..13].try_into().ok()?);
+            let reason = RejectReason::from_u8(payload[13]);
+            Some(RendezvousMsg::PunchReject(PunchReject {
+                target,
+                punch_id,
+                reason,
+            }))
+        }
         _ => None,
     }
 }
@@ -451,6 +598,7 @@ mod tests {
     fn punch_request_roundtrip_ipv4() {
         let req = PunchRequest {
             target: 0x1122_3344_5566_7788,
+            punch_id: 7,
             self_reflex: sa("192.0.2.1:9001"),
         };
         let encoded = RendezvousMsg::PunchRequest(req).encode();
@@ -465,6 +613,7 @@ mod tests {
     fn punch_request_roundtrip_ipv6() {
         let req = PunchRequest {
             target: 42,
+            punch_id: u32::MAX,
             self_reflex: sa("[2001:db8::1]:443"),
         };
         let encoded = RendezvousMsg::PunchRequest(req).encode();
@@ -477,20 +626,21 @@ mod tests {
     /// Byte-level regression test for the [`PunchRequest`] wire
     /// layout + the size math in the module doc header.
     ///
-    /// History: the doc used to claim `PunchRequest body (12 + 19 =
-    /// 31 bytes)`, which was wrong twice over — the body is
-    /// `target_node(8) + self_reflex(19) = 27 bytes`, and the
-    /// total on-wire payload is `kind(1) + 27 = 28 bytes`
-    /// ([`PUNCH_REQUEST_LEN`]). A reviewer flagged the doc
-    /// inconsistency; this test pins the layout so the doc and
-    /// code can't drift silently again.
+    /// History: the doc once claimed `body (12 + 19 = 31 bytes)`
+    /// when the body was 27; a reviewer flagged the drift and this
+    /// test has pinned the layout ever since. The cubic-P2
+    /// correlation fix later inserted `punch_id(4)` after the
+    /// target, making the body `target_node(8) + punch_id(4) +
+    /// self_reflex(19) = 31` and the total `kind(1) + 31 = 32`
+    /// ([`PUNCH_REQUEST_LEN`]).
     ///
     /// Assertions:
     ///
-    /// - Total length is `PUNCH_REQUEST_LEN` (28 bytes).
+    /// - Total length is `PUNCH_REQUEST_LEN` (32 bytes).
     /// - Byte 0 is the kind discriminator (`KIND_PUNCH_REQUEST = 0x01`).
     /// - Bytes 1..9 are `target_node` as big-endian u64.
-    /// - Bytes 9..28 are the 19-byte `self_reflex` socket-addr
+    /// - Bytes 9..13 are `punch_id` as big-endian u32.
+    /// - Bytes 13..32 are the 19-byte `self_reflex` socket-addr
     ///   block (family byte + 16-byte address + big-endian port).
     ///   For IPv4 the address block is zero-padded in its upper
     ///   12 bytes — same shape as `reflex::encode_response`.
@@ -498,18 +648,19 @@ mod tests {
     fn punch_request_wire_layout_matches_doc() {
         let req = PunchRequest {
             target: 0x0102_0304_0506_0708,
+            punch_id: 0x0A0B_0C0D,
             self_reflex: sa("192.0.2.7:9001"),
         };
         let encoded = RendezvousMsg::PunchRequest(req).encode();
 
         // Size matches PUNCH_REQUEST_LEN and the documented
-        // "body (8 + 19 = 27) + kind (1) = 28" math.
+        // "body (8 + 4 + 19 = 31) + kind (1) = 32" math.
         assert_eq!(encoded.len(), PUNCH_REQUEST_LEN, "total wire length");
-        assert_eq!(PUNCH_REQUEST_LEN, 28, "kind(1) + body(27)");
+        assert_eq!(PUNCH_REQUEST_LEN, 32, "kind(1) + body(31)");
         assert_eq!(
             PUNCH_REQUEST_LEN - 1,
-            27,
-            "body = 8 (target) + 19 (self_reflex)",
+            31,
+            "body = 8 (target) + 4 (punch_id) + 19 (self_reflex)",
         );
 
         // Byte 0: kind discriminator.
@@ -522,18 +673,25 @@ mod tests {
             "target_node big-endian at offset 1",
         );
 
-        // Bytes 9..28: self_reflex socket-addr block (family + 16 + port).
-        assert_eq!(encoded[9], FAMILY_V4, "family byte at offset 9");
-        assert_eq!(&encoded[10..14], &[192, 0, 2, 7], "IPv4 in low 4 bytes");
+        // Bytes 9..13: punch_id big-endian.
         assert_eq!(
-            &encoded[14..26],
+            &encoded[9..13],
+            &0x0A0B_0C0D_u32.to_be_bytes(),
+            "punch_id big-endian at offset 9",
+        );
+
+        // Bytes 13..32: self_reflex socket-addr block (family + 16 + port).
+        assert_eq!(encoded[13], FAMILY_V4, "family byte at offset 13");
+        assert_eq!(&encoded[14..18], &[192, 0, 2, 7], "IPv4 in low 4 bytes");
+        assert_eq!(
+            &encoded[18..30],
             &[0u8; 12],
             "upper 12 bytes of address field zero-padded for IPv4",
         );
         assert_eq!(
-            &encoded[26..28],
+            &encoded[30..32],
             &9001_u16.to_be_bytes(),
-            "port big-endian at offset 26",
+            "port big-endian at offset 30",
         );
     }
 
@@ -590,6 +748,67 @@ mod tests {
     }
 
     #[test]
+    fn punch_reject_roundtrip() {
+        for reason in [
+            RejectReason::RateLimited,
+            RejectReason::UnknownTargetReflex,
+            RejectReason::NoSessionWithTarget,
+            RejectReason::ReflexMismatch,
+        ] {
+            let rej = PunchReject {
+                target: 0xDEAD_BEEF_0000_1234,
+                punch_id: 0xC0FF_EE00,
+                reason,
+            };
+            let encoded = RendezvousMsg::PunchReject(rej).encode();
+            assert_eq!(encoded.len(), PUNCH_REJECT_LEN);
+            match decode(&encoded) {
+                Some(RendezvousMsg::PunchReject(out)) => assert_eq!(out, rej),
+                other => panic!("expected PunchReject, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn punch_reject_unknown_reason_decodes_to_unspecified() {
+        // A reason byte this build doesn't recognize must still decode
+        // as a reject (never a dropped packet) so a newer coordinator's
+        // reason code degrades gracefully.
+        let mut payload = vec![0u8; PUNCH_REJECT_LEN];
+        payload[0] = KIND_PUNCH_REJECT;
+        payload[13] = 0x7E; // unknown reason (punch_id bytes stay 0)
+        match decode(&payload) {
+            Some(RendezvousMsg::PunchReject(out)) => {
+                assert_eq!(out.reason, RejectReason::Unspecified);
+            }
+            other => panic!("expected PunchReject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_reject_wrong_length_rejects() {
+        // Kind byte says reject but the body is short — must decode
+        // as None, never panic.
+        let mut payload = vec![0u8; PUNCH_REJECT_LEN - 1];
+        payload[0] = KIND_PUNCH_REJECT;
+        assert!(decode(&payload).is_none());
+    }
+
+    #[test]
+    fn reject_reason_kind_strings_are_stable() {
+        assert_eq!(RejectReason::RateLimited.kind(), "rate-limited");
+        assert_eq!(
+            RejectReason::UnknownTargetReflex.kind(),
+            "unknown-target-reflex"
+        );
+        assert_eq!(
+            RejectReason::NoSessionWithTarget.kind(),
+            "no-session-with-target"
+        );
+        assert_eq!(RejectReason::ReflexMismatch.kind(), "reflex-mismatch");
+    }
+
+    #[test]
     fn unknown_kind_rejects() {
         // Length matches PunchAck but kind byte is outside the
         // reserved vocabulary. Must decode as `None`, never panic.
@@ -626,15 +845,38 @@ mod tests {
 
     #[test]
     fn unknown_address_family_rejects() {
-        // Build an otherwise-valid PunchRequest payload but with
-        // an unknown address-family byte (neither 4 nor 6). Must
-        // decode as None, not panic or produce a garbage addr.
-        let mut payload = vec![0u8; PUNCH_REQUEST_LEN];
-        payload[0] = KIND_PUNCH_REQUEST;
-        // target = 0 (bytes 1..9 left at 0)
-        // address family at byte 9 — set to invalid
-        payload[9] = 7;
-        assert!(decode(&payload).is_none());
+        // Start from a fully-VALID encoded PunchRequest and corrupt
+        // only the address-family byte (offset 13: after kind(1) +
+        // target(8) + punch_id(4)). Decode must reject; restoring
+        // the byte must decode again — proving the family byte is
+        // the one field under test.
+        //
+        // Cubic round 5: after the punch_id insertion shifted the
+        // address block from offset 9 to 13, this test kept writing
+        // its "invalid family" at offset 9 — by then the punch_id's
+        // first byte, where 7 is perfectly valid — and only passed
+        // because the zero-initialized byte at 13 happened to be an
+        // invalid family too. Building from a valid encode removes
+        // the offset assumption entirely.
+        let valid = RendezvousMsg::PunchRequest(PunchRequest {
+            target: 0x0102_0304_0506_0708,
+            punch_id: 7,
+            self_reflex: sa("192.0.2.7:9001"),
+        })
+        .encode();
+        let mut payload = valid.to_vec();
+        assert_eq!(payload[13], FAMILY_V4, "family byte lives at offset 13");
+        payload[13] = 7; // neither FAMILY_V4 nor FAMILY_V6
+        assert!(
+            decode(&payload).is_none(),
+            "an unknown address family must reject, not produce a garbage addr",
+        );
+        payload[13] = FAMILY_V4;
+        assert!(
+            decode(&payload).is_some(),
+            "restoring the family byte must decode again — it was the only \
+             malformed field",
+        );
     }
 
     #[test]
@@ -725,6 +967,7 @@ mod tests {
         // version.
         let req = PunchRequest {
             target: 1,
+            punch_id: 1,
             self_reflex: sa("10.0.0.1:1"),
         };
         let intro = PunchIntroduce {

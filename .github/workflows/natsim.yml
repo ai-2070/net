@@ -1,0 +1,65 @@
+# Real-NAT validation for the mesh's NAT-traversal layer
+# (NAT_TRAVERSAL_V2_PLAN.md Stage 4).
+#
+# Provisions network namespaces with genuine nftables masquerade
+# (cone = plain, symmetric = fully-random) and runs the punch /
+# fallback / upgrade scenario matrix across them — the only place
+# the feature is exercised against actual NAT behavior rather than
+# loopback. See net/crates/net/tests/natsim/README.md.
+#
+# Runs on traversal-touching PRs, nightly, and on demand.
+name: natsim
+
+on:
+  pull_request:
+    paths:
+      - "net/crates/net/**"
+      - ".github/workflows/natsim.yml"
+  schedule:
+    # Nightly at 03:17 UTC — off the peak to keep runner queues calm.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: natsim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  natsim:
+    name: netns NAT scenario matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: net/crates/net
+
+      - name: Install nftables
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nftables iproute2
+
+      - name: Build helper + test binaries
+        working-directory: net/crates/net
+        run: |
+          cargo build --example natsim_node --features net,nat-traversal
+          cargo test --test natsim --features net,nat-traversal --no-run
+
+      # Serial on purpose: scenarios share namespace names and the
+      # 10.99.0.0/24 range. Each test provisions + tears down its own
+      # topology via sudo.
+      - name: Run scenario matrix
+        working-directory: net/crates/net
+        run: |
+          cargo test --test natsim --features net,nat-traversal \
+            -- --ignored --test-threads=1 --nocapture
+
+      - name: Teardown (paranoia)
+        if: always()
+        run: sudo net/crates/net/tests/natsim/teardown.sh

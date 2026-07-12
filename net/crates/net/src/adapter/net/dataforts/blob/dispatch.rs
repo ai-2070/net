@@ -237,11 +237,29 @@ pub async fn publish_blob<A: BlobAdapter + ?Sized>(
 /// [`BlobRef`] instead of the encoded form. Useful when the caller
 /// wants to surface the URI / hash / size separately (e.g. for
 /// telemetry or a side-channel index).
+///
+/// # Scheme gate symmetry
+///
+/// The URI's scheme is validated against
+/// [`BlobAdapter::accepted_schemes`] *here*, mirroring the gate in
+/// [`resolve_payload`]. Without the publish-side check, a URI the
+/// adapter rejects at resolve time (e.g. a scheme-less `"key/name"`
+/// against the `file`-only `FileSystemAdapter`) would store
+/// successfully and mint an encoded ref that the very same adapter
+/// can never resolve — silently breaking [`publish_blob`]'s
+/// round-trip guarantee. Failing fast at publish turns that poisoned
+/// ref into an immediate typed [`BlobError::UnsupportedScheme`],
+/// before any bytes hit the backend.
 pub async fn publish_blob_ref<A: BlobAdapter + ?Sized>(
     adapter: &A,
     uri: impl Into<String>,
     bytes: &[u8],
 ) -> Result<BlobRef, BlobError> {
+    let uri: String = uri.into();
+    let accepted = adapter.accepted_schemes();
+    if !accepted.is_empty() && !accepted.contains(&uri_scheme(&uri)) {
+        return Err(BlobError::UnsupportedScheme(uri));
+    }
     let hash: [u8; 32] = blake3::hash(bytes).into();
     let blob = BlobRef::small(uri, hash, bytes.len() as u64);
     adapter.store(&blob, bytes).await?;
@@ -686,6 +704,59 @@ mod tests {
         let encoded = blob.encode();
         let err = resolve_payload(&encoded, &adapter).await.unwrap_err();
         assert!(matches!(err, BlobError::UnsupportedScheme(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Publish-side mirror of the scheme gate: publishing through an
+    /// adapter with a URI whose scheme it doesn't accept fails fast
+    /// with `UnsupportedScheme` and stores nothing. Without this
+    /// gate, `publish_blob` minted an encoded ref that the SAME
+    /// adapter then rejected at `resolve_payload` — a poisoned ref
+    /// that silently broke the documented publish→resolve round-trip
+    /// guarantee. (Surfaced by the Python binding's
+    /// `test_async_blob_round_trip`, which published a scheme-less
+    /// URI through the file adapter.)
+    #[tokio::test]
+    async fn publish_rejects_uri_with_unaccepted_scheme_before_store() {
+        let root = std::env::temp_dir().join(format!(
+            "net-blob-pubscheme-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let adapter = FileSystemAdapter::new("pub-scheme-test", &root);
+
+        // Scheme-less URI (the shape that surfaced the bug) and a
+        // wrong-scheme URI both fail fast.
+        for bad_uri in ["tx5/sample", "s3://attacker/key"] {
+            let err = publish_blob(&adapter, bad_uri, b"payload")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, BlobError::UnsupportedScheme(_)),
+                "publish with {bad_uri:?} must fail the scheme gate, got {err:?}",
+            );
+        }
+        // Nothing was stored — the gate runs before the backend write.
+        assert!(
+            !root.exists()
+                || std::fs::read_dir(&root)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "a rejected publish must not leave stored bytes behind",
+        );
+
+        // The guarantee, restated end-to-end: an ACCEPTED publish
+        // resolves through the same adapter.
+        let encoded = publish_blob(&adapter, "file:tx5/sample", b"payload")
+            .await
+            .expect("file-scheme publish");
+        let resolved = resolve_payload(&encoded, &adapter)
+            .await
+            .expect("publish→resolve round-trip must hold");
+        assert_eq!(resolved.as_ref(), b"payload");
         let _ = std::fs::remove_dir_all(&root);
     }
 

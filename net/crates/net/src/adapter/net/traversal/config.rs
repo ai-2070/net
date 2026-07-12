@@ -55,6 +55,40 @@ pub struct TraversalConfig {
     /// Default: 30 min — much shorter than the 3600 s TTL we
     /// request, matches plan decision 12.
     pub port_mapping_renewal: Duration,
+
+    /// Fixed window for the rendezvous abuse budgets
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2, closing review
+    /// Finding 5). Both the coordinator per-requester budget and the
+    /// responder per-source keep-alive-train budget reset on this
+    /// cadence.
+    ///
+    /// Default: 10 s.
+    pub punch_budget_window: Duration,
+
+    /// Coordinator budget: max `PunchRequest`s a single requester may
+    /// have mediated per [`Self::punch_budget_window`]. Beyond this
+    /// the coordinator answers with a `PunchReject { RateLimited }`
+    /// instead of fanning out an introduce.
+    ///
+    /// Default: 4.
+    pub punch_requests_per_window: u32,
+
+    /// Responder budget: max keep-alive trains a single introducing
+    /// peer may trigger via *unsolicited* `PunchIntroduce`s per
+    /// [`Self::punch_budget_window`]. Beyond this the introduce is
+    /// dropped (no requester is waiting, so there is nothing to
+    /// reject). Replaces Stage 1's temporary per-source cap.
+    ///
+    /// Default: 4.
+    pub punch_trains_per_window: u32,
+
+    /// Responder budget: global ceiling on outstanding unsolicited
+    /// keep-alive trains, so a Sybil set of session peers each under
+    /// their per-source budget can't multiply the aggregate. A train
+    /// holds a slot for its scheduled lifetime (≤ `punch_deadline`).
+    ///
+    /// Default: 8.
+    pub punch_trains_concurrent_max: usize,
 }
 
 impl Default for TraversalConfig {
@@ -65,6 +99,10 @@ impl Default for TraversalConfig {
             punch_fire_lead: Duration::from_millis(500),
             punch_deadline: Duration::from_secs(5),
             port_mapping_renewal: Duration::from_secs(30 * 60),
+            punch_budget_window: Duration::from_secs(10),
+            punch_requests_per_window: 4,
+            punch_trains_per_window: 4,
+            punch_trains_concurrent_max: 8,
         }
     }
 }
@@ -83,5 +121,9 @@ mod tests {
         assert_eq!(cfg.punch_fire_lead, Duration::from_millis(500));
         assert_eq!(cfg.punch_deadline, Duration::from_secs(5));
         assert_eq!(cfg.port_mapping_renewal, Duration::from_secs(1800));
+        assert_eq!(cfg.punch_budget_window, Duration::from_secs(10));
+        assert_eq!(cfg.punch_requests_per_window, 4);
+        assert_eq!(cfg.punch_trains_per_window, 4);
+        assert_eq!(cfg.punch_trains_concurrent_max, 8);
     }
 }

@@ -47,6 +47,14 @@ async fn connect_pair(a: &Mesh, b: &Mesh) {
 /// Freshly built meshes classify as `Unknown` and report no
 /// reflex address. Background classification doesn't run until
 /// `start()` and ≥2 peers are connected.
+///
+/// Also the SDK's stats-shape parity pin (Stage 5): the full
+/// snapshot — punch outcomes, derived failures, the three
+/// failure-cause counters, upgrade activity, and port-mapping
+/// state — boots to zero/empty. Every field is asserted by name,
+/// so a core-snapshot field that vanishes (or a binding that
+/// stops forwarding one) fails to compile / fails here. The
+/// Node, Python, and Go bindings mirror this same shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_classification_state_is_unknown() {
     let psk = [0x42u8; 32];
@@ -58,7 +66,17 @@ async fn pre_classification_state_is_unknown() {
     let stats = a.traversal_stats();
     assert_eq!(stats.punches_attempted, 0);
     assert_eq!(stats.punches_succeeded, 0);
+    assert_eq!(stats.punches_failed, 0);
     assert_eq!(stats.relay_fallbacks, 0);
+    assert_eq!(stats.punch_timeouts, 0);
+    assert_eq!(stats.punch_rejections, 0);
+    assert_eq!(stats.rendezvous_no_relay, 0);
+    assert_eq!(stats.upgrades_attempted, 0);
+    assert_eq!(stats.upgrades_succeeded, 0);
+    assert_eq!(stats.upgrades_deferred_busy, 0);
+    assert!(!stats.port_mapping_active);
+    assert!(stats.port_mapping_external.is_none());
+    assert_eq!(stats.port_mapping_renewals, 0);
 }
 
 /// Two-peer reflex probe end-to-end via the SDK surface:

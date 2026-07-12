@@ -444,6 +444,13 @@ struct MeshNewConfig {
     /// without `--features port-mapping`.
     #[serde(default)]
     try_port_mapping: bool,
+    /// Enable the background direct-path upgrade: relay-routed
+    /// sessions are opportunistically re-handshaked over a direct
+    /// path and migrated (Stage 3; optimization, not correctness —
+    /// traffic rides the relay until the swap). Silently ignored
+    /// when the cdylib is built without `--features nat-traversal`.
+    #[serde(default)]
+    auto_direct_upgrade: bool,
 }
 
 /// FFI handle for a [`MeshNode`].
@@ -567,6 +574,13 @@ pub unsafe extern "C" fn net_mesh_new(
     // Same drop-on-the-floor pattern as reflex_override above.
     #[cfg(not(feature = "port-mapping"))]
     let _ = cfg.try_port_mapping;
+    #[cfg(feature = "nat-traversal")]
+    if cfg.auto_direct_upgrade {
+        node_cfg = node_cfg.with_auto_direct_upgrade(true);
+    }
+    // Same drop-on-the-floor pattern as reflex_override above.
+    #[cfg(not(feature = "nat-traversal"))]
+    let _ = cfg.auto_direct_upgrade;
 
     let identity = match cfg.identity_seed_hex {
         Some(seed_hex) => {
@@ -778,6 +792,33 @@ pub unsafe extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *m
     }
     0
 }
+/// Parse a NUL-terminated 64-char-hex peer public key into its
+/// 32-byte form. Shared by every `net_mesh_connect*` entry point so
+/// the validation rules and error codes can't drift apart between
+/// wrappers (cubic P2). Error codes match what the wrappers
+/// historically returned inline: `InvalidUtf8` for a non-UTF-8 C
+/// string, `NET_ERR_MESH_HANDSHAKE` for bad hex or a wrong-length
+/// key.
+///
+/// # Safety
+///
+/// `peer_pubkey_hex` must be a valid, NUL-terminated C string
+/// pointer (callers null-check before invoking).
+unsafe fn parse_peer_pubkey_hex(peer_pubkey_hex: *const c_char) -> Result<[u8; 32], c_int> {
+    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
+        return Err(NetError::InvalidUtf8.into());
+    };
+    let pk_bytes = match hex::decode(pk_s) {
+        Ok(b) => b,
+        Err(_) => return Err(NET_ERR_MESH_HANDSHAKE),
+    };
+    if pk_bytes.len() != 32 {
+        return Err(NET_ERR_MESH_HANDSHAKE);
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+    Ok(pk)
+}
 
 /// Connect (initiator). Blocks until the handshake completes.
 #[unsafe(no_mangle)]
@@ -802,18 +843,10 @@ pub unsafe extern "C" fn net_mesh_connect(
         Ok(a) => a,
         Err(_) => return NET_ERR_MESH_HANDSHAKE,
     };
-    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
-        return NetError::InvalidUtf8.into();
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
     };
-    let pk_bytes = match hex::decode(pk_s) {
-        Ok(b) => b,
-        Err(_) => return NET_ERR_MESH_HANDSHAKE,
-    };
-    if pk_bytes.len() != 32 {
-        return NET_ERR_MESH_HANDSHAKE;
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pk_bytes);
 
     let node = h.inner.clone();
     match block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
@@ -1100,24 +1133,151 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let Some(pk_s) = (unsafe { c_str_to_string(peer_pubkey_hex) }) else {
-        return NetError::InvalidUtf8.into();
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
     };
-    let pk_bytes = match hex::decode(pk_s) {
-        Ok(b) => b,
-        Err(_) => return NET_ERR_MESH_HANDSHAKE,
-    };
-    if pk_bytes.len() != 32 {
-        return NET_ERR_MESH_HANDSHAKE;
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pk_bytes);
 
     let node = h.inner.clone();
     match block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
         Ok(_) => 0,
         Err(e) => traversal_err_to_code(&e),
     }
+}
+
+/// Like `net_mesh_connect_direct`, but auto-selects the rendezvous
+/// coordinator (routing next-hop → `relay-capable` mutual peer →
+/// any mutual peer). Punch-needing pairs with no candidate fail
+/// with `NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY` — the caller stays
+/// on the routed path; connectivity is never at risk.
+///
+/// `peer_pubkey_hex` is the peer's 32-byte Noise static public
+/// key as a 64-char hex string.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_connect_direct_auto(
+    handle: *mut MeshNodeHandle,
+    peer_node_id: u64,
+    peer_pubkey_hex: *const c_char,
+) -> c_int {
+    if handle.is_null() || peer_pubkey_hex.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let pk = match unsafe { parse_peer_pubkey_hex(peer_pubkey_hex) } {
+        Ok(pk) => pk,
+        Err(code) => return code,
+    };
+
+    let node = h.inner.clone();
+    match block_on(async move { node.connect_direct_auto(peer_node_id, &pk).await }) {
+        Ok(_) => 0,
+        Err(e) => traversal_err_to_code(&e),
+    }
+}
+
+/// Full traversal-stats snapshot for `net_mesh_traversal_stats_v2`.
+/// `#[repr(C)]` — field order, widths, and the 64-byte address
+/// buffer are ABI; matched by `net_traversal_stats_v2_t` in
+/// `include/net.go.h`. Extend only by appending a new versioned
+/// struct + call, never by mutating this one.
+#[repr(C)]
+pub struct NetTraversalStatsV2 {
+    /// Punches whose `PunchRequest` was successfully mediated.
+    pub punches_attempted: u64,
+    /// Mediated punches that produced a direct session.
+    pub punches_succeeded: u64,
+    /// Derived: `punches_attempted - punches_succeeded` (saturating).
+    pub punches_failed: u64,
+    /// `connect_direct` calls that resolved on the routed path.
+    pub relay_fallbacks: u64,
+    /// Punch flows that gave up on a deadline (cause counter).
+    pub punch_timeouts: u64,
+    /// Punch flows refused by a typed `PunchReject` (cause counter).
+    pub punch_rejections: u64,
+    /// Punch-needing pairs skipped with no coordinator candidate.
+    pub rendezvous_no_relay: u64,
+    /// Background direct-path upgrades started (Stage 3).
+    pub upgrades_attempted: u64,
+    /// Upgrades that replaced a relay session with a direct one.
+    pub upgrades_succeeded: u64,
+    /// Upgrades deferred by the C3 busy gate (retried; not failures).
+    pub upgrades_deferred_busy: u64,
+    /// Successful renewal ticks since the current mapping installed.
+    pub port_mapping_renewals: u64,
+    /// 1 when a port mapping is currently installed, else 0.
+    pub port_mapping_active: u8,
+    /// NUL-terminated `"ip:port"` of the mapped external address;
+    /// empty string when no mapping is active. 64 bytes covers the
+    /// longest textual form (`[v6]:65535` ≤ 54 chars).
+    pub port_mapping_external: [c_char; 64],
+}
+
+/// Copy a core snapshot into the C-ABI v2 struct. Factored out of
+/// the extern fn so the field mapping (and the external-address
+/// string encoding) is unit-testable without a live node.
+#[cfg(feature = "nat-traversal")]
+fn fill_traversal_stats_v2(
+    snap: &crate::adapter::net::traversal::TraversalStatsSnapshot,
+    out: &mut NetTraversalStatsV2,
+) {
+    out.punches_attempted = snap.punches_attempted;
+    out.punches_succeeded = snap.punches_succeeded;
+    out.punches_failed = snap.punches_failed;
+    out.relay_fallbacks = snap.relay_fallbacks;
+    out.punch_timeouts = snap.punch_timeouts;
+    out.punch_rejections = snap.punch_rejections;
+    out.rendezvous_no_relay = snap.rendezvous_no_relay;
+    out.upgrades_attempted = snap.upgrades_attempted;
+    out.upgrades_succeeded = snap.upgrades_succeeded;
+    out.upgrades_deferred_busy = snap.upgrades_deferred_busy;
+    out.port_mapping_renewals = snap.port_mapping_renewals;
+    out.port_mapping_active = u8::from(snap.port_mapping_active);
+    out.port_mapping_external = [0; 64];
+    if let Some(addr) = snap.port_mapping_external {
+        let s = addr.to_string();
+        // Truncation guard: leave the final byte as NUL. `[v6]:port`
+        // tops out ≤ 54 chars, so this never actually truncates —
+        // the guard exists so a future address form degrades to a
+        // clipped string rather than an unterminated buffer.
+        let n = s.len().min(63);
+        for (dst, src) in out.port_mapping_external[..n].iter_mut().zip(s.as_bytes()) {
+            *dst = *src as c_char;
+        }
+    }
+}
+
+/// Fill `out` with the complete traversal-stats snapshot — the
+/// stage-5 v2 surface. The v1 3-out-param
+/// `net_mesh_traversal_stats` stays ABI-stable for compiled
+/// consumers; new callers should prefer this one.
+///
+/// Base counters are monotonic; two fields are exempt from delta
+/// math: `punches_failed` is derived at snapshot time
+/// (`attempted - succeeded`) and can decrease when an in-flight
+/// punch lands, and `port_mapping_renewals` resets on each fresh
+/// mapping install. Returns `0` on success.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_traversal_stats_v2(
+    handle: *mut MeshNodeHandle,
+    out: *mut NetTraversalStatsV2,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let snap = h.inner.traversal_stats();
+    fill_traversal_stats_v2(&snap, unsafe { &mut *out });
+    0
 }
 
 /// Install a runtime reflex override. `external` is a
@@ -1261,6 +1421,25 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
     _peer_node_id: u64,
     _peer_pubkey_hex: *const c_char,
     _coordinator: u64,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_connect_direct_auto(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _peer_pubkey_hex: *const c_char,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_traversal_stats_v2(
+    _handle: *mut MeshNodeHandle,
+    _out: *mut NetTraversalStatsV2,
 ) -> c_int {
     NET_ERR_TRAVERSAL_UNSUPPORTED
 }
@@ -3881,6 +4060,140 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 mod tests {
     use super::*;
 
+    /// ABI parity between the Rust `#[repr(C)] NetTraversalStatsV2` and
+    /// the hand-maintained C header `include/net.go.h`. The Go guard
+    /// `go/header_parity_test.go` compares the two C headers against
+    /// each other, but nothing checked either against the Rust struct —
+    /// so a field reordered / retyped / added on one side but not the
+    /// other is silent cgo ABI corruption (Go reads at the wrong
+    /// offsets) with no compile error and no test failure (review #5).
+    #[cfg(feature = "nat-traversal")]
+    mod traversal_stats_abi {
+        use super::super::NetTraversalStatsV2;
+        use std::mem::{align_of, offset_of, size_of};
+
+        /// Byte offset of a struct field by its C name. `offset_of!`
+        /// needs a literal field ident, so this match is the one
+        /// hand-maintained seam: a renamed or removed field fails to
+        /// compile here until it's updated.
+        fn rust_offset(name: &str) -> Option<usize> {
+            Some(match name {
+                "punches_attempted" => offset_of!(NetTraversalStatsV2, punches_attempted),
+                "punches_succeeded" => offset_of!(NetTraversalStatsV2, punches_succeeded),
+                "punches_failed" => offset_of!(NetTraversalStatsV2, punches_failed),
+                "relay_fallbacks" => offset_of!(NetTraversalStatsV2, relay_fallbacks),
+                "punch_timeouts" => offset_of!(NetTraversalStatsV2, punch_timeouts),
+                "punch_rejections" => offset_of!(NetTraversalStatsV2, punch_rejections),
+                "rendezvous_no_relay" => offset_of!(NetTraversalStatsV2, rendezvous_no_relay),
+                "upgrades_attempted" => offset_of!(NetTraversalStatsV2, upgrades_attempted),
+                "upgrades_succeeded" => offset_of!(NetTraversalStatsV2, upgrades_succeeded),
+                "upgrades_deferred_busy" => offset_of!(NetTraversalStatsV2, upgrades_deferred_busy),
+                "port_mapping_renewals" => offset_of!(NetTraversalStatsV2, port_mapping_renewals),
+                "port_mapping_active" => offset_of!(NetTraversalStatsV2, port_mapping_active),
+                "port_mapping_external" => offset_of!(NetTraversalStatsV2, port_mapping_external),
+                _ => return None,
+            })
+        }
+
+        /// (size, align) of a C scalar/array type as spelled in the
+        /// header. Derived from the Rust primitive each field maps to,
+        /// NOT hardcoded: `uint64_t` is not 8-byte-aligned on every C
+        /// ABI (x86-32 System V aligns it to 4), and a `#[repr(C)]`
+        /// struct follows that same target ABI — so hardcoding 8 here
+        /// would false-fail the offset/size cross-check on 32-bit
+        /// targets where the header and Rust struct are in fact
+        /// compatible. Panics on an unrecognized type so a
+        /// newly-introduced field type forces this table to be extended.
+        fn c_type_layout(ctype: &str) -> (usize, usize) {
+            use std::mem::{align_of, size_of};
+            use std::os::raw::c_char;
+            match ctype {
+                "uint64_t" => (size_of::<u64>(), align_of::<u64>()),
+                "uint8_t" => (size_of::<u8>(), align_of::<u8>()),
+                "char[64]" => (size_of::<c_char>() * 64, align_of::<c_char>()),
+                other => panic!("unhandled C type in net_traversal_stats_v2_t: {other:?}"),
+            }
+        }
+
+        fn round_up(off: usize, align: usize) -> usize {
+            off.div_ceil(align) * align
+        }
+
+        /// Ordered `(ctype, name)` fields of the anonymous
+        /// `net_traversal_stats_v2_t` struct body. `char x[64]` folds
+        /// to ctype `char[64]`, name `x`.
+        fn parse_header_fields(header: &str) -> Vec<(String, String)> {
+            let end = header
+                .find("} net_traversal_stats_v2_t;")
+                .expect("stats typedef present in header");
+            let open = header[..end].rfind('{').expect("struct open brace");
+            let mut fields = Vec::new();
+            for line in header[open + 1..end].lines() {
+                let line = line.trim();
+                if line.is_empty()
+                    || line.starts_with("//")
+                    || line.starts_with('*')
+                    || line.starts_with("/*")
+                {
+                    continue;
+                }
+                let decl = line.trim_end_matches(';').trim();
+                let (ctype, name_arr) = decl
+                    .rsplit_once(char::is_whitespace)
+                    .expect("field decl shaped `type name`");
+                let (ctype, name_arr) = (ctype.trim(), name_arr.trim());
+                if let Some((name, arr)) = name_arr.split_once('[') {
+                    fields.push((format!("{ctype}[{arr}"), name.to_string()));
+                } else {
+                    fields.push((ctype.to_string(), name_arr.to_string()));
+                }
+            }
+            fields
+        }
+
+        #[test]
+        fn c_header_layout_matches_rust_repr_c() {
+            let header =
+                std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/net.go.h"))
+                    .expect("read include/net.go.h");
+            let fields = parse_header_fields(&header);
+            assert_eq!(
+                fields.len(),
+                13,
+                "expected 13 fields in net_traversal_stats_v2_t, parsed {fields:?}",
+            );
+
+            // Recompute the C struct layout with C alignment rules and
+            // cross-check every field offset against the Rust struct.
+            // Catches reorder (offsets shift), retype (offset/size
+            // shift), and add/remove (size or name-resolution mismatch).
+            let mut off = 0usize;
+            let mut align = 1usize;
+            for (ctype, name) in &fields {
+                let (sz, al) = c_type_layout(ctype);
+                off = round_up(off, al);
+                align = align.max(al);
+                let rust = rust_offset(name)
+                    .unwrap_or_else(|| panic!("header field `{name}` has no Rust struct field"));
+                assert_eq!(
+                    rust, off,
+                    "field `{name}`: Rust offset {rust} != C offset {off}"
+                );
+                off += sz;
+            }
+            assert_eq!(
+                size_of::<NetTraversalStatsV2>(),
+                round_up(off, align),
+                "net_traversal_stats_v2_t total size drift (Rust vs C header)",
+            );
+            assert_eq!(
+                align_of::<NetTraversalStatsV2>(),
+                align,
+                "net_traversal_stats_v2_t alignment drift (Rust vs C header)",
+            );
+        }
+    }
+
     /// Regression for a cubic-flagged P2: Go-supplied JSON values
     /// wider than u16::MAX silently wrapped via `as u16` in
     /// `gpu_info_from_json` / `accelerator_from_json` /
@@ -3899,6 +4212,120 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// The shared pubkey parser behind every `net_mesh_connect*`
+    /// entry point: valid 64-char hex round-trips; non-hex, wrong
+    /// length, and non-UTF-8 inputs return the exact codes the
+    /// wrappers historically produced inline. One implementation =
+    /// the three wrappers can't drift apart (cubic P2).
+    #[test]
+    fn parse_peer_pubkey_hex_accepts_valid_and_rejects_malformed() {
+        use std::ffi::CString;
+
+        let valid = CString::new("ab".repeat(32)).unwrap();
+        // SAFETY: valid NUL-terminated pointer for the call's lifetime.
+        let parsed = unsafe { parse_peer_pubkey_hex(valid.as_ptr()) };
+        assert_eq!(parsed, Ok([0xABu8; 32]), "64-char hex round-trips");
+
+        let bad_hex = CString::new("zz".repeat(32)).unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(bad_hex.as_ptr()) };
+        assert_eq!(err, Err(NET_ERR_MESH_HANDSHAKE), "non-hex rejects");
+
+        let short = CString::new("abcd").unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(short.as_ptr()) };
+        assert_eq!(err, Err(NET_ERR_MESH_HANDSHAKE), "wrong length rejects");
+
+        // Valid CString bytes, invalid UTF-8 → the UTF-8 code.
+        let non_utf8 = CString::new(vec![0xFFu8, 0xFEu8]).unwrap();
+        // SAFETY: as above.
+        let err = unsafe { parse_peer_pubkey_hex(non_utf8.as_ptr()) };
+        assert_eq!(
+            err,
+            Err(NetError::InvalidUtf8.into()),
+            "non-UTF-8 C string rejects with the UTF-8 code",
+        );
+    }
+
+    /// The v2 stats fill maps every core-snapshot field into the
+    /// C-ABI struct, encodes the external address as a
+    /// NUL-terminated string, and leaves the buffer empty when no
+    /// mapping is active. Pins the field mapping so an added core
+    /// field that's forgotten here shows up as a compile error
+    /// (struct literal) or a failing assert (value).
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn traversal_stats_v2_fill_maps_all_fields() {
+        use crate::adapter::net::traversal::TraversalStatsSnapshot;
+
+        let snap = TraversalStatsSnapshot {
+            punches_attempted: 1,
+            punches_succeeded: 2,
+            relay_fallbacks: 3,
+            port_mapping_active: true,
+            port_mapping_external: Some("203.0.113.5:4321".parse().unwrap()),
+            port_mapping_renewals: 4,
+            upgrades_attempted: 5,
+            upgrades_succeeded: 6,
+            upgrades_deferred_busy: 7,
+            punches_failed: 8,
+            punch_timeouts: 9,
+            punch_rejections: 10,
+            rendezvous_no_relay: 11,
+        };
+        let mut out = NetTraversalStatsV2 {
+            punches_attempted: 0,
+            punches_succeeded: 0,
+            punches_failed: 0,
+            relay_fallbacks: 0,
+            punch_timeouts: 0,
+            punch_rejections: 0,
+            rendezvous_no_relay: 0,
+            upgrades_attempted: 0,
+            upgrades_succeeded: 0,
+            upgrades_deferred_busy: 0,
+            port_mapping_renewals: 0,
+            port_mapping_active: 0,
+            port_mapping_external: [0x7F; 64], // poisoned: fill must clear
+        };
+        fill_traversal_stats_v2(&snap, &mut out);
+
+        assert_eq!(out.punches_attempted, 1);
+        assert_eq!(out.punches_succeeded, 2);
+        assert_eq!(out.relay_fallbacks, 3);
+        assert_eq!(out.port_mapping_renewals, 4);
+        assert_eq!(out.upgrades_attempted, 5);
+        assert_eq!(out.upgrades_succeeded, 6);
+        assert_eq!(out.upgrades_deferred_busy, 7);
+        assert_eq!(out.punches_failed, 8);
+        assert_eq!(out.punch_timeouts, 9);
+        assert_eq!(out.punch_rejections, 10);
+        assert_eq!(out.rendezvous_no_relay, 11);
+        assert_eq!(out.port_mapping_active, 1);
+        let s: String = out
+            .port_mapping_external
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, "203.0.113.5:4321");
+        // NUL-terminated within the buffer.
+        assert!(out.port_mapping_external.contains(&0));
+
+        // Inactive mapping → empty string, active = 0.
+        let snap_off = TraversalStatsSnapshot {
+            port_mapping_active: false,
+            port_mapping_external: None,
+            ..snap
+        };
+        fill_traversal_stats_v2(&snap_off, &mut out);
+        assert_eq!(out.port_mapping_active, 0);
+        assert_eq!(
+            out.port_mapping_external[0], 0,
+            "empty string when inactive"
+        );
     }
 
     /// Regression: `parse_modality_cap` must surface unknown
@@ -4577,6 +5004,20 @@ mod nat_traversal_stub_tests {
     fn connect_direct_stub_returns_unsupported() {
         // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
         let code = unsafe { net_mesh_connect_direct(ptr::null_mut(), 0, ptr::null(), 0) };
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn connect_direct_auto_stub_returns_unsupported() {
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_connect_direct_auto(ptr::null_mut(), 0, ptr::null()) };
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn traversal_stats_v2_stub_returns_unsupported() {
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_traversal_stats_v2(ptr::null_mut(), ptr::null_mut()) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
