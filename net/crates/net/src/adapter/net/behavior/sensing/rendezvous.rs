@@ -33,6 +33,8 @@
 //! reuse is real, not copied. SI-2 revisits the final layering.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use super::super::super::redex::{elect, ElectionOutcome};
@@ -40,9 +42,13 @@ use super::controller::{
     resolve_candidates, CandidatePolicy, CandidateProvider, ResolutionRefusal,
 };
 use super::delivery::{Delivery, SensingRelay};
+use super::evaluator::{validate_interest_constraints, SensingCounters};
+use super::frames::SensingInterestFrame;
 use super::identity::{
-    AudienceScopeCommitment, CapabilityInterestKey, InterestSpec, ProviderInterestKey,
+    AudienceScopeCommitment, CapabilityInterestKey, ConstraintError, DisclosureClass, InterestSpec,
+    ProviderInterestKey,
 };
+use super::scope::{validate_subscriber_scope, ScopeError};
 use super::table::{DownstreamId, UpstreamAction};
 
 /// Observer id fed to [`elect`]: never a member, so the
@@ -114,6 +120,90 @@ struct LeaderInterest {
     active: Vec<u64>,
     standby: Vec<u64>,
 }
+
+/// Why the leader refused one [`SensingInterestFrame`] at intake
+/// (gate (r), plan §4.2/§4.10). Wraps the existing failure classes;
+/// each keeps its own counter discipline (see
+/// [`SensingLeader::register_from_frame`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameRejection {
+    /// The frame is not a `CapabilityRegistration` — provider- or
+    /// deregister-addressed frames have no business at the leader's
+    /// registration intake.
+    NotLeaderAddressed,
+    /// The frame's `consumer` field does not name the authenticated
+    /// routed origin (plan §4.10, review 7): an honest consumer's
+    /// stack always binds its own id, so the mismatch is malformed
+    /// or forged protocol input — protocol-invalid, exactly like a
+    /// wire scope claim the session does not back.
+    ConsumerMismatch {
+        /// What the frame claimed.
+        claimed: u64,
+        /// What the routed session actually authenticated.
+        authenticated: u64,
+    },
+    /// The inline constraint bytes failed parse or digest validation
+    /// ([`validate_interest_constraints`] — which already counted the
+    /// rejection).
+    Constraints(ConstraintError),
+    /// The RE-DERIVED interest digest does not match the frame's
+    /// claim (plan §4.2, review 7): the sender's bytes don't hash to
+    /// the identity it asserted — protocol-invalid input. The
+    /// claimed digest is never the coalescing identity, so nothing
+    /// was registered.
+    DigestMismatch,
+    /// Scope validation from the session identity refused the
+    /// registration (plan §4.10; counted by
+    /// [`validate_subscriber_scope`]).
+    Scope(ScopeError),
+    /// The predicate was authentic and in-scope but candidate
+    /// resolution refused to activate any stream (e.g. a broad
+    /// `Each` selector, plan §4.7).
+    Resolution(ResolutionRefusal),
+}
+
+impl FrameRejection {
+    /// Whether this rejection incremented the protocol-invalid/
+    /// security counter: forged or malformed protocol input, as
+    /// opposed to an honest authorization or policy refusal.
+    pub const fn is_security_relevant(self) -> bool {
+        match self {
+            Self::ConsumerMismatch { .. } | Self::DigestMismatch => true,
+            Self::Constraints(error) => error.is_security_relevant(),
+            Self::Scope(error) => error.is_security_relevant(),
+            Self::NotLeaderAddressed | Self::Resolution(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for FrameRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLeaderAddressed => {
+                f.write_str("frame is not a leader-addressed CapabilityRegistration")
+            }
+            Self::ConsumerMismatch {
+                claimed,
+                authenticated,
+            } => write!(
+                f,
+                "frame consumer {claimed:#x} is not the authenticated routed origin \
+                 {authenticated:#x}"
+            ),
+            Self::Constraints(error) => write!(f, "constraint intake refused: {error}"),
+            Self::DigestMismatch => {
+                f.write_str("re-derived interest digest does not match the frame's claim")
+            }
+            Self::Scope(error) => write!(f, "scope validation refused: {error}"),
+            Self::Resolution(ResolutionRefusal::SelectorTooBroad { matched, cap }) => write!(
+                f,
+                "candidate resolution refused: selector matched {matched} providers (cap {cap})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FrameRejection {}
 
 /// One consumer registration's outcome at the leader.
 #[derive(Debug)]
@@ -226,6 +316,129 @@ impl SensingLeader {
             newly_resolved,
             warm_starts,
         })
+    }
+
+    /// Leader-side frame intake (gate (r), plan §4.2/§4.10 review
+    /// 7): validate one routed [`SensingInterestFrame`] against the
+    /// AUTHENTICATED transport identity, re-derive the coalescing
+    /// identity, and only then delegate to
+    /// [`Self::register_capability_interest`]. Order matters:
+    ///
+    /// 1. **Consumer binding** — `frame.consumer` must name
+    ///    `authenticated_origin` (the routed end-to-end session
+    ///    identity, NEVER the ingress relay). A mismatch is
+    ///    protocol-invalid input: `protocol_invalid` +
+    ///    `scope_refusals` both bump, mirroring the wire-scope-claim
+    ///    rule.
+    /// 2. **Predicate reconstruction** — the inline constraint bytes
+    ///    parse and must hash to the carried `constraints_digest`
+    ///    ([`validate_interest_constraints`], which owns the
+    ///    invalid-constraints/security counting).
+    /// 3. **Digest re-derivation** — the [`InterestSpec`] rebuilt
+    ///    from the carried predicate + selector + mode + scope must
+    ///    hash to the frame's `interest_digest`; a mismatch is
+    ///    protocol-invalid. **The RE-DERIVED identity is what
+    ///    coalesces** — the claim is only ever a cross-check.
+    /// 4. **Scope validation** — [`validate_subscriber_scope`]
+    ///    against the session-proven root; the frame's
+    ///    `audience_scope` is the wire claim AND the digest-bound
+    ///    interest audience (v1 owner-root scope), cross-checked and
+    ///    never load-bearing.
+    /// 5. **Coalesce/resolve** — the existing registration path,
+    ///    keyed under `DownstreamId::Peer(authenticated_origin)` with
+    ///    the PROVEN root.
+    ///
+    /// `session_root` is derived from the authenticated routed
+    /// session identity (v1:
+    /// [`AudienceScopeCommitment::owner_root`] of the session's
+    /// entity); `local_root` is this leader's own owner root (the
+    /// one it was constructed with).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_from_frame(
+        &mut self,
+        frame: &SensingInterestFrame,
+        authenticated_origin: u64,
+        session_root: &AudienceScopeCommitment,
+        local_root: &AudienceScopeCommitment,
+        counters: &SensingCounters,
+        snapshot: &[CandidateProvider],
+        now: Instant,
+    ) -> Result<LeaderRegistration, FrameRejection> {
+        let SensingInterestFrame::CapabilityRegistration {
+            capability_id,
+            constraints,
+            constraints_digest,
+            work_latency,
+            providers,
+            result_mode,
+            interest_digest,
+            requested_sample_interval,
+            soft_state_ttl,
+            audience_scope,
+            consumer,
+        } = frame
+        else {
+            return Err(FrameRejection::NotLeaderAddressed);
+        };
+
+        // (1) The consumer field is bound to the authenticated
+        // routed origin — never trusted alone (§4.10, review 7).
+        if *consumer != authenticated_origin {
+            counters.scope_refusals.fetch_add(1, Ordering::Relaxed);
+            counters.protocol_invalid.fetch_add(1, Ordering::Relaxed);
+            return Err(FrameRejection::ConsumerMismatch {
+                claimed: *consumer,
+                authenticated: authenticated_origin,
+            });
+        }
+
+        // (2) Reconstruct the predicate: parse + digest-validate the
+        // inline constraints (counting lives in the evaluator's
+        // intake helper).
+        let constraints = validate_interest_constraints(constraints, constraints_digest, counters)
+            .map_err(FrameRejection::Constraints)?;
+        let spec = InterestSpec {
+            capability_id: capability_id.clone(),
+            constraints,
+            work_latency: *work_latency,
+            providers: providers.clone(),
+            result_mode: *result_mode,
+            disclosure_class: DisclosureClass::Owner,
+            audience: *audience_scope,
+        };
+
+        // (3) RE-DERIVE the interest digest and cross-check the
+        // claim. The re-derived key — spec.key(), inside
+        // register_capability_interest — is the ONLY identity that
+        // ever coalesces.
+        if spec.interest_digest() != *interest_digest {
+            counters.protocol_invalid.fetch_add(1, Ordering::Relaxed);
+            return Err(FrameRejection::DigestMismatch);
+        }
+
+        // (4) Owner-root scope from the SESSION identity; the frame
+        // field is the cross-checked wire claim.
+        let proven_root = validate_subscriber_scope(
+            session_root,
+            audience_scope,
+            local_root,
+            &spec.audience,
+            counters,
+        )
+        .map_err(FrameRejection::Scope)?;
+
+        // (5) The validated registration joins the ordinary
+        // coalescing path under the authenticated origin.
+        self.register_capability_interest(
+            &spec,
+            DownstreamId::Peer(authenticated_origin),
+            *requested_sample_interval,
+            *soft_state_ttl,
+            proven_root,
+            snapshot,
+            now,
+        )
+        .map_err(FrameRejection::Resolution)
     }
 
     /// Promote the next standby candidate to active for one interest
@@ -745,5 +958,261 @@ mod tests {
         // ties: lowest NodeId.
         let tie_view = shared_view(&[(1, 2, 100), (1, 3, 100), (2, 3, 100)]);
         assert_eq!(sensing_leader(MEMBERS, &tie_view, all_alive), Some(1));
+    }
+
+    // ── gate (r): leader frame intake ───────────────────────────
+
+    use super::super::evaluator::SensingCounters;
+    use super::super::frames::SensingInterestFrame;
+    use super::super::identity::{ConstraintError, Digest256};
+    use super::super::scope::ScopeError;
+
+    fn other_root() -> AudienceScopeCommitment {
+        AudienceScopeCommitment::from_bytes([0xBB; 32])
+    }
+
+    fn frame_for(spec: &InterestSpec, consumer: u64, d: Duration) -> SensingInterestFrame {
+        SensingInterestFrame::capability_registration(spec, d, TTL, consumer)
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        SensingCounters::get(counter)
+    }
+
+    #[test]
+    fn frame_intake_coalesces_two_authenticated_origins_into_one_row() {
+        // Gate (r) happy path: two REAL frames from two authenticated
+        // origins, same predicate/selector/mode, different D — the
+        // leader re-derives the digest from each and coalesces them
+        // into ONE row on the RE-DERIVED identity.
+        let t0 = Instant::now();
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let snapshot = vec![provider(7, 10), provider(8, 40)];
+
+        let reg_a = leader
+            .register_from_frame(
+                &frame_for(&spec(), 0xA, ms(100)),
+                0xA,
+                &root(),
+                &root(),
+                &counters,
+                &snapshot,
+                t0,
+            )
+            .expect("A's frame is valid");
+        let reg_c = leader
+            .register_from_frame(
+                &frame_for(&spec(), 0xC, ms(250)),
+                0xC,
+                &root(),
+                &root(),
+                &counters,
+                &snapshot,
+                t0,
+            )
+            .expect("C's frame is valid");
+
+        assert!(reg_a.newly_resolved);
+        assert!(!reg_c.newly_resolved, "C joined the coalesced row");
+        assert_eq!(reg_a.interest, reg_c.interest);
+        assert_eq!(
+            reg_a.interest.interest_digest,
+            spec().interest_digest(),
+            "the registered identity is the re-derived digest",
+        );
+        assert_eq!(leader.interest_count(), 1, "one coalesced row");
+        assert_eq!(reg_a.branches, vec![7], "one bounded branch");
+        // Both AUTHENTICATED origins — and only they — hold table
+        // rows on the branch.
+        let branch = ProviderInterestKey::new(reg_a.interest.clone(), 7);
+        let mut downstreams = leader.relay.table.downstreams(&branch, t0);
+        downstreams.sort_by_key(|d| match d {
+            DownstreamId::Local => 0,
+            DownstreamId::Peer(id) => *id,
+        });
+        assert_eq!(
+            downstreams,
+            vec![DownstreamId::Peer(0xA), DownstreamId::Peer(0xC)],
+        );
+        // A clean intake moves no security or refusal counters.
+        assert_eq!(count(&counters.protocol_invalid), 0);
+        assert_eq!(count(&counters.scope_refusals), 0);
+        assert_eq!(count(&counters.invalid_constraints), 0);
+    }
+
+    #[test]
+    fn frame_intake_rejects_a_consumer_field_mismatch() {
+        // §4.10 review 7: the frame claims a consumer the routed
+        // session did not authenticate — protocol-invalid, refused
+        // before any predicate work.
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let rejection = leader
+            .register_from_frame(
+                &frame_for(&spec(), 0xBAD, ms(100)),
+                0xA,
+                &root(),
+                &root(),
+                &counters,
+                &[provider(7, 10)],
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            rejection,
+            FrameRejection::ConsumerMismatch {
+                claimed: 0xBAD,
+                authenticated: 0xA,
+            },
+        );
+        assert!(rejection.is_security_relevant());
+        assert_eq!(count(&counters.protocol_invalid), 1);
+        assert_eq!(count(&counters.scope_refusals), 1);
+        assert_eq!(leader.interest_count(), 0, "nothing registered");
+    }
+
+    #[test]
+    fn frame_intake_rejects_a_forged_interest_digest_claim() {
+        // §4.2 review 7: the leader re-derives; a claim the carried
+        // fields don't hash to is protocol-invalid, and the claimed
+        // digest never becomes an identity.
+        let t0 = Instant::now();
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let snapshot = vec![provider(7, 10)];
+
+        let forged_claim = Digest256::from_bytes([0xEE; 32]);
+        let mut frame = frame_for(&spec(), 0xA, ms(100));
+        let SensingInterestFrame::CapabilityRegistration {
+            interest_digest, ..
+        } = &mut frame
+        else {
+            unreachable!("helper builds the leader-addressed variant");
+        };
+        *interest_digest = forged_claim;
+
+        let rejection = leader
+            .register_from_frame(&frame, 0xA, &root(), &root(), &counters, &snapshot, t0)
+            .unwrap_err();
+        assert_eq!(rejection, FrameRejection::DigestMismatch);
+        assert!(rejection.is_security_relevant());
+        assert_eq!(count(&counters.protocol_invalid), 1);
+        assert_eq!(leader.interest_count(), 0, "the claim registered nothing");
+
+        // The claimed digest is IGNORED as identity: a subsequent
+        // honest frame registers under the re-derived digest, which
+        // is not the forged claim.
+        let reg = leader
+            .register_from_frame(
+                &frame_for(&spec(), 0xA, ms(100)),
+                0xA,
+                &root(),
+                &root(),
+                &counters,
+                &snapshot,
+                t0,
+            )
+            .expect("honest frame registers");
+        assert_eq!(reg.interest.interest_digest, spec().interest_digest());
+        assert_ne!(reg.interest.interest_digest, forged_claim);
+    }
+
+    #[test]
+    fn frame_intake_refuses_a_foreign_session_root() {
+        // §4.10 v1 boundary: an HONEST foreign subscriber (its wire
+        // claim matches its own proven root) is refused — an
+        // authorization outcome, not a security event.
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut foreign_spec = spec();
+        foreign_spec.audience = other_root();
+        let rejection = leader
+            .register_from_frame(
+                &frame_for(&foreign_spec, 0xA, ms(100)),
+                0xA,
+                &other_root(), // the session proves the foreign root
+                &root(),       // this leader's owner root
+                &counters,
+                &[provider(7, 10)],
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            rejection,
+            FrameRejection::Scope(ScopeError::CrossRootRefused),
+        );
+        assert!(!rejection.is_security_relevant());
+        assert_eq!(count(&counters.scope_refusals), 1);
+        assert_eq!(count(&counters.protocol_invalid), 0);
+        assert_eq!(leader.interest_count(), 0);
+    }
+
+    #[test]
+    fn frame_intake_rejects_a_constraints_digest_mismatch() {
+        // §4.2: inline bytes that don't hash to the carried
+        // constraints digest are tampered/malformed protocol input —
+        // both the invalid-constraints and security counters move.
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut frame = frame_for(&spec(), 0xA, ms(100));
+        let SensingInterestFrame::CapabilityRegistration {
+            constraints_digest, ..
+        } = &mut frame
+        else {
+            unreachable!("helper builds the leader-addressed variant");
+        };
+        *constraints_digest = Digest256::from_bytes([0u8; 32]);
+
+        let rejection = leader
+            .register_from_frame(
+                &frame,
+                0xA,
+                &root(),
+                &root(),
+                &counters,
+                &[provider(7, 10)],
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            rejection,
+            FrameRejection::Constraints(ConstraintError::DigestMismatch),
+        );
+        assert!(rejection.is_security_relevant());
+        assert_eq!(count(&counters.invalid_constraints), 1);
+        assert_eq!(count(&counters.protocol_invalid), 1);
+        assert_eq!(leader.interest_count(), 0);
+    }
+
+    #[test]
+    fn frame_intake_rejects_frames_that_are_not_leader_addressed() {
+        // Provider-addressed and deregister frames have no business
+        // at the registration intake.
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let not_leader_addressed = [
+            SensingInterestFrame::provider_registration(&spec(), 7, ms(100), TTL),
+            SensingInterestFrame::Deregister {
+                interest_digest: spec().interest_digest(),
+                target: None,
+            },
+        ];
+        for frame in not_leader_addressed {
+            let rejection = leader
+                .register_from_frame(
+                    &frame,
+                    0xA,
+                    &root(),
+                    &root(),
+                    &counters,
+                    &[provider(7, 10)],
+                    Instant::now(),
+                )
+                .unwrap_err();
+            assert_eq!(rejection, FrameRejection::NotLeaderAddressed);
+            assert!(!rejection.is_security_relevant());
+        }
+        assert_eq!(leader.interest_count(), 0);
     }
 }

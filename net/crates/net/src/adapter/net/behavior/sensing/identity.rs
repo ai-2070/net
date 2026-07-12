@@ -61,9 +61,44 @@ pub const CONSTRAINTS_DIGEST_DOMAIN: &str = "net.sensing.constraints.v1";
 /// CAS-backed constraints are a named follow-up (plan §9).
 pub const MAX_CONSTRAINT_BYTES: usize = 1024;
 
-/// A 256-bit sensing digest (blake3 output).
+/// Serde for the 32-byte identity newtypes ([`Digest256`],
+/// [`AudienceScopeCommitment`], [`GroupRef`]): a lowercase hex
+/// string (64 chars), matching the `Debug` rendering — JSON-friendly
+/// and unambiguous. This is the SI-0 SEMANTIC serialization used by
+/// the in-process frame shapes (plan §4.2,
+/// [`super::frames::SensingInterestFrame`]); SI-1 freezes the real
+/// wire codec and may choose a binary form without breaking these
+/// types.
+macro_rules! impl_hex32_serde {
+    ($ty:ty) => {
+        impl serde::Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&hex::encode(self.0))
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+                let decoded = hex::decode(&text).map_err(serde::de::Error::custom)?;
+                let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+                    serde::de::Error::custom(concat!(
+                        stringify!($ty),
+                        ": expected 32 bytes of hex (64 chars)"
+                    ))
+                })?;
+                Ok(Self(bytes))
+            }
+        }
+    };
+}
+
+/// A 256-bit sensing digest (blake3 output). Serializes as a hex
+/// string (see [`impl_hex32_serde`] note above).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest256([u8; 32]);
+
+impl_hex32_serde!(Digest256);
 
 impl Digest256 {
     /// Wrap raw digest bytes (e.g. off a decoded frame in SI-1).
@@ -88,7 +123,10 @@ impl fmt::Debug for Digest256 {
 /// pair it with the answering provider's announce generation
 /// ([`ProviderObservationKey::capability_generation`]) so no
 /// observation ever straddles a capability redefinition.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// Serializes as a plain string (SI-0 semantic form, plan §4.2).
+#[derive(
+    Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct CapabilityId(String);
 
 impl CapabilityId {
@@ -137,9 +175,12 @@ impl DisclosureClass {
 /// audiences cannot coalesce" holds by construction, not by relay
 /// diligence. Digest inclusion *separates semantic identities after
 /// validation* — it never replaces the authenticated-session
-/// identity check (plan §4.9).
+/// identity check (plan §4.9). Serializes as a hex string (see the
+/// [`impl_hex32_serde`] note on [`Digest256`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudienceScopeCommitment([u8; 32]);
+
+impl_hex32_serde!(AudienceScopeCommitment);
 
 impl AudienceScopeCommitment {
     /// v1 commitment: the owner root's entity identity.
@@ -169,8 +210,11 @@ impl fmt::Debug for AudienceScopeCommitment {
 /// honestly sign because they do not depend on any consumer's path.
 /// Part of the predicate, so exact match, inside the digest. The
 /// consumer's end-to-end budget is deliberately NOT here — see
-/// [`ConsumerLatencyBudget`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// [`ConsumerLatencyBudget`] (which correspondingly derives NO serde:
+/// it must never ride the wire, structurally). Serde is the SI-0
+/// semantic form (plan §4.2); identity always hashes
+/// [`Self::canonical_bytes`], never a serde encoding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WorkLatencyEnvelope {
     /// "I can *start* the work within this bound."
     pub provider_start_within: Option<Duration>,
@@ -438,9 +482,12 @@ fn read_string(cursor: &mut &[u8]) -> Result<String, ConstraintError> {
 /// Interests address the group identity, never a copied member
 /// list; local folds materialize membership. The commitment is an
 /// opaque 32-byte identity — the fold's group machinery resolves it;
-/// it is never a bearer secret.
+/// it is never a bearer secret. Serializes as a hex string (see the
+/// [`impl_hex32_serde`] note on [`Digest256`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupRef([u8; 32]);
+
+impl_hex32_serde!(GroupRef);
 
 impl GroupRef {
     /// Wrap a group identity commitment.
@@ -465,7 +512,9 @@ impl fmt::Debug for GroupRef {
 /// §9). Whether a matching *assertion* is acceptable is a
 /// provenance question answered at candidate resolution (§4.10),
 /// not part of the match syntax.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct TagMatch {
     /// Tag key.
     pub key: String,
@@ -478,8 +527,10 @@ pub struct TagMatch {
 /// answer, not part of the question; the other variants are the
 /// operator's explicit-surveillance overrides. The selector is
 /// **inside the interest digest**: "any printer" must never coalesce
-/// with "printer-7 only".
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// with "printer-7 only". Serde is the SI-0 semantic form (plan
+/// §4.2); identity always hashes [`Self::canonical_bytes`], never a
+/// serde encoding.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ProviderSelector {
     /// Any provider the authority scope admits.
     AnyAuthorized,
@@ -559,8 +610,9 @@ impl ProviderSelector {
 /// (plan §3.1). Separate from the selector because a population
 /// alone is ambiguous ("any camera usable?" vs "observe each
 /// camera"). Inside the digest: "any member of G" must never
-/// coalesce with "each member of G".
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// coalesce with "each member of G". Serde is the SI-0 semantic form
+/// (plan §4.2); identity always hashes [`Self::canonical_bytes`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ResultMode {
     /// One viable provider satisfies the interest (the default).
     Any,

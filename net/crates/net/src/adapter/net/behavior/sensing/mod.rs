@@ -22,14 +22,20 @@
 //! SI-0 is deliberately **in-process**: nothing here is reachable
 //! from `MeshNode` dispatch, no subprotocol ids are consumed, and
 //! the 0x0C02/0x0C03 reservations stay uncommitted until the SI-1
-//! gate conditions (plan §6, items (a)–(p)) hold. The wire shapes in
-//! plan §4.2 serialize these types in SI-1; changing a type here
-//! before SI-1 lands is cheap, changing it after is a wire break.
+//! gate conditions (plan §6, items (a)–(s)) hold. The v4.3 gates
+//! (r)/(s) add the two-stage frame SHAPES (`frames.rs` — semantic,
+//! serde-serializable, still no wire id) and the leader-side frame
+//! intake with digest re-derivation + routed-origin authority
+//! (`SensingLeader::register_from_frame`,
+//! `tests/sensing_routed_origin.rs`). The wire shapes in plan §4.2
+//! gain their frozen codec in SI-1; changing a type here before SI-1
+//! lands is cheap, changing it after is a wire break.
 
 pub mod continuity;
 pub mod controller;
 pub mod delivery;
 pub mod evaluator;
+pub mod frames;
 pub mod identity;
 pub mod incarnation;
 pub mod negotiation;
@@ -41,9 +47,12 @@ pub mod rendezvous;
 pub mod scope;
 pub mod table;
 
+pub use frames::SensingInterestFrame;
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 #[cfg(feature = "redex")]
-pub use rendezvous::{closeness_score, sensing_leader, LeaderRegistration, SensingLeader};
+pub use rendezvous::{
+    closeness_score, sensing_leader, FrameRejection, LeaderRegistration, SensingLeader,
+};
 pub use scope::{validate_subscriber_scope, ScopeError};
 
 pub use controller::{
