@@ -84,6 +84,12 @@ plane:
   trailing-edge shape interest re-coalescing needs.
 - Failure plane: failure detector transitions + RT-5 withdrawals give
   the "readiness → unknown" edges without new machinery.
+- Fold dynamic-axis merges: dataforts capabilities already ride
+  per-heartbeat-cadence values (`disk_free_gb`, blob-heat) on
+  capability entries, and the scheduler-bridge liveness design
+  specifies a per-entry suspension flag (suspend-not-delete,
+  `scheduler_bridge/liveness.rs` docs) — readiness reuses both
+  patterns instead of introducing a parallel belief store (§3.8).
 - Subprotocol id space: 0x0C00 (capability ann) and 0x0C01 (route
   withdrawal) are allocated; 0x0C02/0x0C03 are free in the
   mesh-state-broadcast family.
@@ -176,16 +182,34 @@ window and expires via §3.5.
   empties, propagate upstream (trailing-edge) so X's cadence relaxes
   and emitters die when interest dies.
 
-### 3.8 Consumer surface
+### 3.8 Consumer surface: the capability fold IS the surface
 
-`MeshNode::watch_readiness(target, interest) ->
-watch::Receiver<ReadinessState>` where
-`ReadinessState = Ready | NotReady | Unknown { since }` — the same
-missed-wakeup-safe `watch` shape as `subscribe_local_caps_changes` and
-`Fold::subscribe_changes`. First consumer: the scheduler bridge — a
-remote island's attestation stream feeding candidate pruning the same
-way `project_liveness` prunes on direct-peer health today (that
-projection stays; this extends its reach past one hop).
+Admitted attestations do not feed a new belief store — they **apply
+into the local capability fold** as a dynamic readiness axis on X's
+existing entry, the same entry-level merge pattern dataforts already
+uses for `disk_free_gb` and blob-heat. `Unknown` maps onto the
+per-entry liveness-suspension flag the scheduler-bridge plan
+specifies (`scheduler_bridge/liveness.rs` docs: suspend, don't
+delete — preserves the fold's AP semantics). Consumers therefore
+query and watch readiness through the surfaces they already use —
+`find_nodes_by_filter`, `list_tools`, `Fold::subscribe_changes` — and
+the scheduler consumes remote readiness through the *identical*
+projection seam as direct-peer liveness. No `watch_readiness` API, no
+second query plane, no second decision path.
+
+### 3.9 Division of labor across the existing planes
+
+This plan deliberately splits along what each plane is good at:
+
+| Plane | Role | Why not more |
+|---|---|---|
+| Capability fold | Facts + the ONLY consumer/query surface; readiness lands here (§3.8) | Its transport is the announcement flood — everyone pays for every signal; O(mesh × cadence) for per-second readiness, and full announcement frames are heavyweight for a 20 Hz status bit |
+| Proximity graph / routing table | The aggregation tree (`next_hop`), edge latencies, failure edges | Pingwaves are unsigned raw UDP (readiness must be origin-signed), TTL-flooded rather than interest-scoped, and locked to the global heartbeat cadence |
+| Interest-scoped attestations (new) | Delivery only: a signed cadence amplifier for one axis of a fold entry, paid only where fan-in exists | It is not a store — every admitted attestation immediately becomes fold state |
+
+Three tiers, one identity, one view: fold = slow flooded facts;
+pingwaves = free ambient liveness/load; attestations = the precision
+tier scoped to registered interest.
 
 ## 4. Config surface
 
@@ -214,20 +238,24 @@ message is emitted or honored.
   stream at strictest-Z/2 with immediate status-change edges +
   min-gap. Integration test: two watchers with different Z → one
   stream at the stricter cadence; interest expiry kills the emitter.
-- **SI-4 — relay forwarding.** Identical-bytes fan-down, seq gate,
-  cadence-continuity expiry to Unknown. The flagship three-node test:
-  A and B both interested in X via relay B — X emits one stream
-  (attestation send-count independent of watcher count), A receives
-  via B, A's state degrades to Unknown within k × cadence of X going
-  silent. Heartbeat parked out of the window (the RT-4/RT-5 test
-  discipline) so nothing else can explain the signal.
+- **SI-4 — relay forwarding + fold application.** Identical-bytes
+  fan-down, seq gate, cadence-continuity expiry, and the fold apply:
+  an admitted attestation updates X's local capability entry
+  (readiness axis; Unknown → suspension flag). The flagship
+  three-node test: A and B both interested in X via relay B — X emits
+  one stream (attestation send-count independent of watcher count), A
+  observes readiness through `find_nodes_by_filter` / the fold change
+  signal, and A's view degrades to Unknown within k × cadence of X
+  going silent. Heartbeat parked out of the window (the RT-4/RT-5
+  test discipline) so nothing else can explain the signal.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed →
   immediate Unknown + re-registration on reroute. Test rides the
   route_withdraw harness.
-- **SI-6 — consumer surface + scheduler bridge.** `watch_readiness`
-  + a scheduler-bridge projection consuming remote attestations for
-  candidate pruning. SDK exposure deliberately deferred to its own
-  plan once the substrate shape has soaked.
+- **SI-6 — scheduler bridge.** Remote attestations reach candidate
+  pruning through the same fold-suspension seam `project_liveness`
+  uses for direct peers — no second projection path. SDK exposure
+  deliberately deferred to its own plan once the substrate shape has
+  soaked.
 - **SI-7 — docs + observability.** Stats counters
   (interests_active, attestations_emitted/forwarded/gated,
   unknown_transitions) in the `ProximityStats` style; BEHAVIOR.md +
@@ -283,8 +311,10 @@ after SI-4; SI-7 last.
   stale Ready past those bounds.
 - Zero idle cost: no interests → no emitters, no timers, no messages;
   flag off → plane inert.
-- Scheduler candidate pruning consumes remote attestations through the
-  same projection seam as local liveness (no second decision path).
+- No second belief store or query surface: readiness is observable
+  ONLY through the capability fold (queries, filters, change signal),
+  and scheduler candidate pruning consumes remote attestations through
+  the same fold-suspension seam as local liveness.
 
 ## 8. Non-goals
 
