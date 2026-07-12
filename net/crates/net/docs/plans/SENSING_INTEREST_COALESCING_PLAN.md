@@ -895,11 +895,18 @@ must exercise the real dispatch path.
   `CapabilityRegistration` from provider-addressed
   `ProviderRegistration`; the leader receives selector + result mode
   and RE-DERIVES the capability-interest digest before coalescing or
-  resolution (§4.2, review 7);
+  resolution (§4.2, review 7) — as-built: `frames.rs` +
+  `SensingLeader::register_from_frame` (consumer/origin cross-check,
+  digest re-derivation with security counter, scope validation, all
+  rejection classes unit-tested);
   (s) a multi-hop real-path test (`A → X → R`, `C → Y → R`) proves
   authenticated consumer origin, owner-scope enforcement, digest
   re-derivation, coalescing at the elected leader, and routed proof
-  fan-out — without confusing transport relays for subscribers.
+  fan-out — without confusing transport relays for subscribers —
+  as-built: `tests/sensing_routed_origin.rs` (five real nodes, frame
+  traffic forced through the relays; one row with exactly the two
+  authenticated consumers as downstreams; inconsistent scope claim
+  rejected; proof fanned to both; relays opaque throughout).
   *As-built condition→test map (2026-07-12):* (a)/(b) delivery.rs
   tests 11/13; (c) continuity.rs test 14 + establishment-deadline
   tests; (d) table.rs test 15; (e) identity audience tests +
