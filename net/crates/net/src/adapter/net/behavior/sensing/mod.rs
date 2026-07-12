@@ -22,6 +22,11 @@ pub mod continuity;
 pub mod evaluator;
 pub mod identity;
 pub mod incarnation;
+pub mod table;
+
+pub use table::{
+    DownstreamEntry, DownstreamId, InterestTable, RefusalPartition, RegisterOutcome, UpstreamAction,
+};
 
 pub use evaluator::{
     check_cadence, project_evaluation, validate_interest_constraints, CadenceRefusal,
