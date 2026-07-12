@@ -861,8 +861,15 @@ must exercise the real dispatch path.
   bounded-exploration test; (n) controller.rs open-world test;
   (o) controller.rs broad-Each test; (p) identity budget tests +
   controller.rs budget-locality test; (q) rendezvous.rs (items
-  24–31). Remaining before SI-1 starts: review sign-off + wire-id
-  commitment.
+  24–31) + `tests/sensing_rendezvous.rs` — the REAL-path half of
+  review 6's "proven in-process and on the real routing path": three
+  real MeshNodes on a line topology each compute the leader from
+  their OWN pingwave-flooded proximity graph (via the new
+  `ProximityGraph::edge_latency` read accessor) and agree on the
+  center; both consumers then route interest payloads to the elected
+  leader over pingwave-learned routes (nothing hand-configured) and
+  the leader receives both. Remaining before SI-1 starts: review
+  sign-off + wire-id commitment.
 - **SI-2 — interest table + resolver wiring.** Layer-2 table on real
   sessions; Layer-1 resolver over the real capability fold +
   proximity ranking + tag provenance; trailing-edge propagation;

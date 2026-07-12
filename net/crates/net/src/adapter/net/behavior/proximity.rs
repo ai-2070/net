@@ -693,6 +693,18 @@ impl ProximityGraph {
         Some(pw)
     }
 
+    /// Latency of the directed edge `from → to`, if the graph holds
+    /// one (pingwave-learned, EWMA-smoothed). `None` when the pair
+    /// has never been observed. The sensing rendezvous reads these
+    /// as its shared centrality inputs
+    /// (SENSING_INTEREST_COALESCING_PLAN §4.1); callers wanting an
+    /// undirected view should try both orientations.
+    pub fn edge_latency(&self, from: NodeId, to: NodeId) -> Option<Duration> {
+        self.edges
+            .get(&(from, to))
+            .map(|edge| Duration::from_micros(edge.value().latency_us))
+    }
+
     /// Remove one directed edge (RT-5,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Called when a peer
     /// withdraws its route toward `to`: the `(peer, to)` edge is what
