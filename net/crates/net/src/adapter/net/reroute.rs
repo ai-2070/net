@@ -234,7 +234,7 @@ impl ReroutePolicy {
     /// non-`node_id` hop is a directly-connected peer of ours.
     ///
     /// Deliberately WITHOUT the "any direct peer" fallback that
-    /// [`Self::find_graph_alternate_for`] ends with: a best-effort
+    /// `find_graph_alternate_for` ends with: a best-effort
     /// guess is not evidence that `node_id` is actually reachable. Used
     /// to decide whether to emit a poison-reverse route withdrawal for
     /// a just-failed direct peer (RT-5 review Finding 5). When a

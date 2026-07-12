@@ -7837,7 +7837,7 @@ impl MeshNode {
     /// rate-limit-coalesced alike.
     ///
     /// NOTE: this is NOT a pure count of announce *calls*.
-    /// [`Self::index_self_with_local_services`] (invoked by `serve_rpc`
+    /// `index_self_with_local_services` (invoked by `serve_rpc`
     /// on the cortex path) also bumps the same counter without a
     /// broadcast — a "sync, no broadcast" self-index. So on an
     /// RPC-serving node the delta over a window can exceed the number
