@@ -73,8 +73,10 @@ sign-off.
 
 ## Resolution status — 2026-07-12 fix pass (branch `nat-traversal-improvements`)
 
-All nine actionable findings are fixed, each in its own commit with tests
-where the behavior is observable. Full suite green: lib unit tests
+All nine actionable findings are fixed across dedicated fix-pass commits —
+each finding in its own commit except the three perf cleanups (#7–#9),
+which are batched into a single commit (`67eb8e417`) — with tests where
+the behavior is observable. Full suite green: lib unit tests
 (4582 passed), plus the NAT integration suites (`direct_upgrade`,
 `coordinator_selection`, `rendezvous_coordinator`,
 `rendezvous_introduce_validation`, `nat_matrix`, `traversal_observability`,

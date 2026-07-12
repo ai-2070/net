@@ -4096,13 +4096,21 @@ mod tests {
         }
 
         /// (size, align) of a C scalar/array type as spelled in the
-        /// header. Panics on an unrecognized type so a newly-introduced
-        /// field type forces this table to be extended.
+        /// header. Derived from the Rust primitive each field maps to,
+        /// NOT hardcoded: `uint64_t` is not 8-byte-aligned on every C
+        /// ABI (x86-32 System V aligns it to 4), and a `#[repr(C)]`
+        /// struct follows that same target ABI — so hardcoding 8 here
+        /// would false-fail the offset/size cross-check on 32-bit
+        /// targets where the header and Rust struct are in fact
+        /// compatible. Panics on an unrecognized type so a
+        /// newly-introduced field type forces this table to be extended.
         fn c_type_layout(ctype: &str) -> (usize, usize) {
+            use std::mem::{align_of, size_of};
+            use std::os::raw::c_char;
             match ctype {
-                "uint64_t" => (8, 8),
-                "uint8_t" => (1, 1),
-                "char[64]" => (64, 1),
+                "uint64_t" => (size_of::<u64>(), align_of::<u64>()),
+                "uint8_t" => (size_of::<u8>(), align_of::<u8>()),
+                "char[64]" => (size_of::<c_char>() * 64, align_of::<c_char>()),
                 other => panic!("unhandled C type in net_traversal_stats_v2_t: {other:?}"),
             }
         }
