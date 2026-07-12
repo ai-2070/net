@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/sensing/evaluator.rs
+  s_c28bdf38c0df3a::t_1ae04e57ede311 1-202,204-363
+  s_c28bdf38c0df3a::t_eab4259098ef85 203
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_05e7c9dfe8d4ed 22,26-30
+  s_c28bdf38c0df3a::t_6a8a08069e8abf 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "32306c72c404509b53b148d0d1d4c183bd0c9166",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
