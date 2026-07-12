@@ -946,6 +946,26 @@ must exercise the real dispatch path.
   (o) controller.rs broad-Each test; (p) identity budget tests +
   controller.rs budget-locality test; (q) rendezvous.rs (items
   24–31) + `tests/sensing_rendezvous.rs` — the REAL-path half of
+  review 6's proof (see below); gates (r)/(s) as-built further
+  below.
+  *SI-1 as-built (2026-07-12, post-sign-off):* ids 0x0C02/0x0C03
+  COMMITTED (`sensing::wire`); strict postcard codecs (4 KiB cap,
+  trailing-bytes rejected); `ProviderRegistration` carries the full
+  identity fields and the provider re-derives the complete digest
+  before signing (transcript invariant honored, tamper-tested per
+  field); ed25519 over blake3-derive_key of the hand-rolled §4.2
+  transcript, which doubles as the semantic fingerprint;
+  `IncarnationSeqGate` rehosted on the bounded LRU shape
+  (8192/6144, poisoned entries evict last). **Benchmark (criterion
+  medians, Apple Silicon dev box):** sign 13.3 µs, verify 41.2 µs,
+  encode+decode round-trip 0.94 µs. At the 50 ms cadence floor
+  (20 signs/s per interest×branch stream) one core sustains
+  ≈3,750 signed streams (sign) / ≈1,215 verified streams per
+  verifying hop — verification is once per attestation per hop;
+  fan-out multiplies delivery, not verification. **Verdict: the
+  plain one-signature-per-attestation path has orders-of-magnitude
+  headroom at the floor; batching/hash-chain optimization is NOT
+  justified (§9 stays).**
   review 6's "proven in-process and on the real routing path": three
   real MeshNodes on a line topology each compute the leader from
   their OWN pingwave-flooded proximity graph (via the new

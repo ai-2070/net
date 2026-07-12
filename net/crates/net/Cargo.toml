@@ -429,6 +429,14 @@ name = "origin_cache_bench"
 harness = false
 required-features = ["net"]
 
+# SI-1d (SENSING_INTEREST_COALESCING_PLAN): attestation sign/verify
+# cost at the 50 ms cadence floor. `wire.rs` needs only `net`
+# (rendezvous alone rides `redex`).
+[[bench]]
+name = "sensing_signature"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
