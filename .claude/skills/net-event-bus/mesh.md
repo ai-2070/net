@@ -62,11 +62,11 @@ async fn main() -> net_sdk::error::Result<()> {
 ```
 
 **Key facts:**
-- `Mesh::builder(bind_addr, &psk)` returns a `MeshBuilder` (`net/crates/net/sdk/src/mesh.rs:341-343`). PSK is `&[u8; 32]` — 32 bytes, not a passphrase.
-- `Mesh::public_key()` (`mesh.rs:348`) returns the Noise static pubkey to share with initiators. `Mesh::node_id()` (`mesh.rs:353`) returns the u64 routing id derived from the entity keypair.
-- `Mesh::local_addr()` (`mesh.rs:385`) returns the node's **actual bound socket address**. Call it when you bind to `:0` (OS-assigned port) — a peer's `connect()` needs the real `ip:port`, not `:0`. Bound in every language: Python `NetMesh.local_addr()` (`bindings/python/src/lib.rs:1402`), Node `NetMesh.localAddr()` (`bindings/node/index.d.ts:2098`).
-- `connect(peer_addr, &peer_pubkey, peer_node_id)` for the initiator side (`mesh.rs:366-377`); `accept(peer_node_id)` for the responder (`mesh.rs:383-386`). Pair them: one side connects, the other accepts. Symmetric "both sides connect" doesn't work — the second handshake collides with the first.
-- `register_channel(ChannelConfig)` (publisher only) + `subscribe_channel(publisher_node_id, &channel)` (subscriber). `publish(&channel, payload, config)` returns a `PublishReport` (`mesh.rs:561-568`). For typed payloads, serialize with serde and pass `Bytes`.
+- `Mesh::builder(bind_addr, &psk)` returns a `MeshBuilder` (`net/crates/net/sdk/src/mesh.rs:384`). PSK is `&[u8; 32]` — 32 bytes, not a passphrase.
+- `Mesh::public_key()` (`mesh.rs:391`) returns the Noise static pubkey to share with initiators. `Mesh::node_id()` (`mesh.rs:396`) returns the u64 routing id derived from the entity keypair.
+- `Mesh::local_addr()` (`mesh.rs:411`) returns the node's **actual bound socket address**. Call it when you bind to `:0` (OS-assigned port) — a peer's `connect()` needs the real `ip:port`, not `:0`. Bound in every language: Python `NetMesh.local_addr()` (`bindings/python/src/lib.rs:1402`), Node `NetMesh.localAddr()` (`bindings/node/index.d.ts:2098`).
+- `connect(peer_addr, &peer_pubkey, peer_node_id)` for the initiator side (`mesh.rs:459`); `accept(peer_node_id)` for the responder (`mesh.rs:476`). Pair them: one side connects, the other accepts. Symmetric "both sides connect" doesn't work — the second handshake collides with the first.
+- `register_channel(ChannelConfig)` (publisher only) + `subscribe_channel(publisher_node_id, &channel)` (subscriber). `publish(&channel, payload, config)` returns a `PublishReport` (`mesh.rs:710`). For typed payloads, serialize with serde and pass `Bytes`.
 - **Channel authorization is on by default.** The SDK `Mesh` (`mesh.rs:296`) and the Python/Node `NetMesh` bindings all install a `ChannelConfigRegistry`, so a peer's subscribe to a channel with **no registered config** is rejected (`UnknownChannel`) — `register_channel` adds the config (and nRPC's `serve_rpc` auto-registers its own service channels, so direct RPC needs no manual entry). The escape hatch, for test rigs and dynamic-channel surfaces that don't pre-register, is the bindings' `permissive_channels=True` (Python, `bindings/python/src/lib.rs:1258`) / `permissiveChannels: true` on `NetMesh.create({...})` (Node, `bindings/node/index.d.ts:4744`) — installs no registry, so there's no ACL. Default `false`.
 
 ### TypeScript
@@ -195,22 +195,39 @@ Cargo feature: `nat-traversal` (Rust SDK). The TS / Python bindings ship with st
 // Rust — Cargo.toml
 // net-sdk = { version = "...", features = ["nat-traversal"] }
 
+// Ergonomic path — auto-selects the rendezvous coordinator for you:
+let session = mesh.connect_direct_auto(peer_node_id, &peer_pubkey).await?;
+
+// Explicit coordinator — when you want to name the mediator yourself:
 let session = mesh.connect_direct(peer_node_id, &peer_pubkey, coordinator_node_id).await?;
 //                                                                ^^^^^^^^^^^^^^^^^^^
 //                                                a peer we already have a session with;
 //                                                mediates the introduction.
 
 let class = mesh.nat_type();                      // NatClass::{Open, Cone, Symmetric, Unknown}
-let stats = mesh.traversal_stats();
-println!("attempts={} succeeded={} relay_fallbacks={}",
-    stats.punches_attempted, stats.punches_succeeded, stats.relay_fallbacks);
+let stats = mesh.traversal_stats();               // TraversalStatsSnapshot
+println!("attempts={} succeeded={} failed={} relay_fallbacks={}",
+    stats.punches_attempted, stats.punches_succeeded, stats.punches_failed, stats.relay_fallbacks);
 ```
 
-The three counters (`punches_attempted`, `punches_succeeded`, `relay_fallbacks`) are monotonic u64s. Operators read them for an effectiveness signal — a deploy where `punches_succeeded / punches_attempted` is near zero says "the NATs in your environment don't punch; the mesh is mostly relayed; that's fine, but you're paying the relay tax."
+Prefer `connect_direct_auto` — it selects the rendezvous coordinator (a peer you already share a session with) instead of making you pass one. Reach for the explicit `connect_direct` only when you want to name the mediator. When no coordinator candidate exists, `connect_direct_auto` returns `SdkError::Traversal { kind: "rendezvous-no-relay", .. }` — the routed handshake still works, you just don't get a punch. `Direct` / `Open` pairs need no coordinator and always succeed.
 
-`connect_direct` always resolves: on a punch-failed outcome, the session lands on the routed-handshake path. Inspect `traversal_stats` afterward to distinguish a successful punch from a relay fallback (`net/crates/net/sdk/src/mesh.rs:937-973`).
+`traversal_stats()` returns a **`TraversalStatsSnapshot`**. The old three-counter view grew into a full effectiveness-plus-diagnosis surface in NAT-Traversal V2 — all `u64` counters (most cumulative; `punches_failed` is derived per snapshot) plus three port-mapping status fields. Read them as a group:
 
-The `nat_type` / `connect_direct` / `traversal_stats` surface is on the lower-level binding (`@net-mesh/core`'s `NetMesh` in TS, `from net import NetMesh` in Python). The Rust SDK exposes them on `Mesh` directly behind `#[cfg(feature = "nat-traversal")]`.
+| Field | Meaning |
+|---|---|
+| `punches_attempted` / `punches_succeeded` | Mediated punch attempts, and the subset that produced a direct session. |
+| `punches_failed` | **Derived** at snapshot time (`attempted − succeeded`); a punch in flight counts as failed until it resolves. |
+| `relay_fallbacks` | `connect_direct` calls that ended on the routed-handshake path (matrix-skipped `Symmetric × Symmetric`, punch-failed, or direct-handshake-failed). |
+| `punch_timeouts` / `punch_rejections` / `rendezvous_no_relay` | **Cause** counters — deadline give-ups, typed `PunchReject`s, and pairs skipped for want of any coordinator. *Not* partitions of `punches_failed`: they can fire before an attempt is even counted. |
+| `upgrades_attempted` / `upgrades_succeeded` / `upgrades_deferred_busy` | **Background direct-path upgrade** (V2 Stage 3): a relay-routed session the runtime later re-punches into a direct one, no new call needed. `deferred_busy` = swap postponed because the session had open streams / unacked data; retried later, not a failure. |
+| `port_mapping_active` (`bool`) / `port_mapping_external` (`Option<SocketAddr>`) / `port_mapping_renewals` (`u64`) | Current router port-mapping status — see § Port mapping. |
+
+Effectiveness signal: `punches_succeeded / punches_attempted` near zero means the NATs in your environment don't punch — the mesh is mostly relayed; correct, but you pay the relay tax. The cause counters tell you *why* (timeouts vs. rejections vs. no coordinator).
+
+`connect_direct` / `connect_direct_auto` always resolve: on a punch-failed outcome the session lands on the routed-handshake path. Inspect `traversal_stats` afterward to distinguish a successful punch from a relay fallback. Because of background upgrade, a session that started relayed may quietly become direct later — watch `upgrades_succeeded`.
+
+The `nat_type` / `connect_direct` / `connect_direct_auto` / `traversal_stats` surface is on the lower-level binding (`@net-mesh/core`'s `NetMesh` in TS, `from net import NetMesh` in Python), with full stats parity across the FFI, Go, Node, and Python bindings. The Rust SDK exposes it on `Mesh` directly behind `#[cfg(feature = "nat-traversal")]`.
 
 ---
 
@@ -246,7 +263,7 @@ What it does, on `start()`:
 3. Renews every 30 min. Three consecutive renewal failures = clear the override and exit cleanly (classifier takes over).
 4. Revokes the mapping on graceful shutdown.
 
-A router that doesn't speak either protocol leaves the node on the classifier path — that's fine, this is an optimization. Port-forwarded servers with a known external `ip:port` should pin it via `with_reflex_override(addr)` (Rust) / `reflexOverride: 'ip:port'` (TS) / `reflex_override='ip:port'` (Python) instead of running the probe.
+A router that doesn't speak either protocol leaves the node on the classifier path — that's fine, this is an optimization. Port-forwarded servers with a known external `ip:port` should pin it via `reflex_override(addr)` (Rust `MeshBuilder`) / `reflexOverride: 'ip:port'` (TS) / `reflex_override='ip:port'` (Python) instead of running the probe.
 
 ---
 
@@ -283,6 +300,6 @@ A publish from A reaches B and C if both have `subscribe_channel(a_node_id, &cha
 - **Open the UDP port in your firewall.** Outbound + inbound on the bind port. The mesh is UDP — security groups that only allow TCP will silently break the handshake.
 - **Opt into `nat-traversal` + `port-mapping` only when the deploy actually crosses NAT boundaries.** For a LAN-only deploy, leave them off — there's nothing to traverse.
 - **Test the routed-handshake fallback explicitly.** Simulate one peer with no direct UDP path (block its port, or use `block_peer` in a test harness). Confirm events still flow via a relay. If they don't, your topology has no relay-capable node and the fallback isn't actually working.
-- **Call `accept()` for every responder peer BEFORE `start()`.** Calling `accept()` after `start()` returns `AdapterError::Fatal` (`net/crates/net/src/adapter/net/mesh.rs:1798-1838`) — the runtime rejects it explicitly to prevent the handshake-race hang.
-- **Watch `traversal_stats` if NAT traversal is on.** A `relay_fallbacks` counter that grows much faster than `punches_succeeded` says the punch path isn't earning its keep — fine for correctness, expensive for relays.
+- **Call `accept()` for every responder peer BEFORE `start()`.** Calling `accept()` after `start()` returns `AdapterError::Fatal` (`net/crates/net/src/adapter/net/mesh.rs:4386`) — the runtime rejects it explicitly to prevent the handshake-race hang.
+- **Watch `traversal_stats` if NAT traversal is on.** A `relay_fallbacks` counter that grows much faster than `punches_succeeded` says the punch path isn't earning its keep — fine for correctness, expensive for relays. When it does, the cause counters (`punch_timeouts` / `punch_rejections` / `rendezvous_no_relay`) tell you which failure mode dominates, and a healthy `upgrades_succeeded` means relayed sessions are still being reclaimed into direct ones in the background.
 - **Shutdown cleanly.** See `runtime.md` — same contract as memory transport, plus the mesh closes peer sessions on the way out (peers see "graceful departure" rather than "suspect").

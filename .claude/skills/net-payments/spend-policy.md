@@ -22,6 +22,15 @@ let engine = SpendPolicyEngine::new(policy_path, SpendProfile::Production)
 `policy::store::default_payment_policy_path()` gives the standard location
 (`<local data>/net-mesh/payment-policy.json`).
 
+Bindings that take the profile as a **string** (Python's `spend_profile`, the
+Node / Python HTTP-402 config) all route through the one canonical parser —
+`SpendProfile::parse` / `FromStr` in `policy::spend`. It accepts `"production"`
+and `"dev_test"` (aliases `"dev-test"` / `"devtest"`) and rejects anything else
+with `UnknownSpendProfile` naming the offending value — **no silent fallback,
+no case-folding.** Don't hand-roll the string→enum match: the divergence this
+single-sourcing removed was one copy (an operator verb) defaulting an unknown
+profile while the flow-construction copies errored.
+
 ## Limits
 
 ```rust

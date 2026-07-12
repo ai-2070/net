@@ -72,7 +72,7 @@ file.close()?;  // closes this handle; outstanding tails see Closed
 - `append_postcard(&value)` serializes a `serde::Serialize` value with postcard. `append_inline(&[u8; 24])` is the small-payload fast path (avoids the heap segment).
 - `tail()` returns an async `Stream<Item = Result<RedexEvent, RedexError>>`. Each subscriber gets its own cursor; the publisher fans out to all live tails plus persists to disk.
 - `read_range(start, end)` is a bounded scan. Cheap when both endpoints are in memory; lands on disk reads only when retention has pushed events out of the in-memory window.
-- `sync()` is a manual flush; on `FsyncPolicy::Periodic` (default), the runtime flushes on a cadence. `FsyncPolicy::Always` syncs every append (durable but slow); `FsyncPolicy::Never` skips fsync entirely (fastest, no durability).
+- `sync()` is a manual flush. `FsyncPolicy` is **`Never` by default** — appends don't fsync (`close()` still syncs); lowest latency, fine for telemetry / best-effort logs. Tighter bounds opt in: `EveryN(u64)` fsyncs after every N appends (off the hot path), `Interval(Duration)` fsyncs on a timer, and `IntervalOrBytes { period, max_bytes }` fsyncs when either the interval elapses **or** that many bytes accumulate. There is no `Periodic` or `Always` variant.
 - `sweep_retention()` is the manual retention-trim call; call on a cadence (a tokio task in your application) when you want trim to run.
 - `RedexFold<T>` trait + `append_and_fold(fold, value, state)` is the in-line fold path — convenient when you want to update local state in the same call that appends.
 

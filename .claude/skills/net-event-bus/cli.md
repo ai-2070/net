@@ -26,7 +26,7 @@ Six subcommands. Sized fetches render a determinate byte-progress bar, unknown s
 ```
 net-mesh transfer recv-blob <SOURCE> <REF> --out <PATH> [--via <RELAY>] [--quiet]
 ```
-`<SOURCE>` = holder node id (decimal or hex), `<REF>` = the `BlobRef`, `--via` = optional relay for indirect transfer. Streams chunk-at-a-time through an **atomic-rename writer**: on success the destination becomes the complete file; on failure it stays untouched and a `<PATH>.partial` is left for inspection. Peak memory is one chunk (~4 MiB) regardless of total size. **Exit codes: `0` ok, `2` fetch failure, `3` hash-verification failure, `4` write failure.**
+`<SOURCE>` = holder node id (decimal or hex), `<REF>` = the `BlobRef`, `--via` = optional relay for indirect transfer. Streams chunk-at-a-time through an **atomic-rename writer**: on success the destination becomes the complete file; on failure it stays untouched and a `<PATH>.partial` is left for inspection. Peak memory is one chunk (~4 MiB) regardless of total size. **Exit codes follow the global table below:** `0` success, `2` for a malformed `<SOURCE>`/`<REF>`, `3` for a transfer/SDK failure — `fetch_blob_stream` yields already-verified chunks, so a fetch error, an integrity failure, and a disk-write failure all surface as an SDK error (code `3`), not separate codes.
 
 ### `send-blob` — chunk a file, print its `BlobRef`
 ```
@@ -93,13 +93,19 @@ Lists added/removed tools, version bumps, and schema deltas (added/removed/chang
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | general error / argument parse failure |
-| `2` | network / transport failure (no holder, unreachable peer, session refused) |
-| `3` | integrity failure (hash mismatch, manifest verification failed) |
-| `4` | I/O failure (disk write, source read) |
-| `5` | authorization failure (missing token, capability mismatch) |
-| `14` | `typegen diff --exit-code`: a BREAKING change was detected |
-| `64–78` | reserved for binding-specific status (mirrors `sysexits.h`) |
+| `1` | generic error |
+| `2` | invalid arguments / parse failure |
+| `3` | SDK error (a `net-sdk` operation failed — transfer, query, …) |
+| `4` | `net ice`: simulation blocked |
+| `5` | `net ice`: operator policy rejected |
+| `6` | connection failure (no holder, unreachable peer, session refused) |
+| `7` | timeout |
+| `8` | confirmation refused (a required confirmation was declined) |
+| `10` | `net daemon`: factory id not registered |
+| `11` | `net db`: query JSON failed to parse |
+| `12` | `net db`: predicate DSL (`--where` / `--filter`) failed to parse |
+| `13` | `net ice`: an operator signature failed cryptographic verification |
+| `14` | `net typegen diff --exit-code`: a BREAKING change was detected |
 
 Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stderr** alongside the human-readable message. **Scripts should parse the JSON line, not scrape the human text.**
 

@@ -51,7 +51,7 @@ gw = CapabilityGateway(
     pin_store_path=None,
     delegation_leaf=None, delegation_chain=None,
     payment_policy_path=None,
-    payment_profile=None,               # "production" | "dev_test"
+    payment_profile=None,               # "production" | "dev_test" (aliases "dev-test"/"devtest"); unknown → ValueError, no silent fallback
     payment_unsafe_mock_auto_allow=False,
     payment_signer_address=None,
     payment_signer=None,                # eip155: (typed_data_json: str) -> "0x..." (65-byte EIP-712 sig)

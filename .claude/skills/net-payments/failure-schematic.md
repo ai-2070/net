@@ -101,11 +101,23 @@ these names): `insufficient_funds`, `no_wallet_configured`,
   the schematic only when the bytes **deserialize to the full `FailureSchematic`
   shape** (a typed `serde` parse — all required fields with the right types,
   including the nested `Recovery`) **and** the `object` tag is
-  `net.payment.failure@1`. Duplicate headers, malformed bytes, invalid UTF-8, a
-  non-standard JSON number (`Infinity`/`NaN`), a foreign/`@2` tag, a non-object,
-  or a **tagged-but-incomplete/mistyped** object all read as **absent** — fall
-  back to the human error body, never an error, never a guess. Unknown reasons
-  and extra fields parse fine (the additive-tolerance contract).
+  `net.payment.failure@1`. A **duplicate of a known field**, malformed bytes,
+  invalid UTF-8, a non-standard JSON number (`Infinity`/`NaN`), a foreign/`@2`
+  tag, a non-object, or a **tagged-but-incomplete/mistyped** object all read as
+  **absent** — fall back to the human error body, never an error, never a guess.
+  Unknown reasons and extra fields parse fine (the additive-tolerance contract).
+
+  Duplicate JSON **keys** split by whether the key is known. A repeated *known*
+  field (`object`, `reason`, …) makes `serde_json` error in **either** key order,
+  so `from_header_bytes` reads the header as absent. A repeated *unknown* key
+  instead collapses last-wins into the flattened `extra` map and the header is
+  still **accepted** — matching JS `JSON.parse` / Python `json.loads` / Go
+  `encoding/json`, which last-wins-collapse *every* duplicate. So the one
+  **cross-language divergence** is narrow: only a duplicate *known* field, which
+  Rust rejects and the others silently accept. It's moot in practice — the serde
+  serializer never emits duplicate keys, so such a header is malformed input whose
+  cross-language handling is deliberately **unspecified**, and it is *not* a
+  golden vector (unlike every other reject case above, which is pinned as one).
 
 ## Redaction is contract
 
