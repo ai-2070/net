@@ -19,7 +19,10 @@
 //! before SI-1 lands is cheap, changing it after is a wire break.
 
 pub mod continuity;
+pub mod delivery;
 pub mod evaluator;
+
+pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};
 pub mod identity;
 pub mod incarnation;
 pub mod table;
