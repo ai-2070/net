@@ -537,11 +537,15 @@ jobs:
         run: npm i
 
       # Build napi binding with the features the vitest suite covers:
-      # `net` for the mesh surface + `cortex` for the CortEX / NetDB
-      # tests + `compute` for the MeshDaemon / migration tests +
-      # `groups` for the `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
-      # tests (Stages 3 + 4 of `SDK_COMPUTE_SURFACE_PLAN` and
-      # `SDK_GROUPS_SURFACE_PLAN`) + `test-helpers` so
+      # `net` for the mesh surface + `nat-traversal` for the
+      # `traversalStats` / `connectDirectAuto` surface (stage 5 —
+      # `traversal_stats.test.ts`; the impl block is `#[cfg]`-gated on
+      # this feature, so omitting it compiles those methods out and the
+      # test hits `traversalStats is not a function`) + `cortex` for the
+      # CortEX / NetDB tests + `compute` for the MeshDaemon / migration
+      # tests + `groups` for the `ReplicaGroup` / `ForkGroup` /
+      # `StandbyGroup` tests (Stages 3 + 4 of `SDK_COMPUTE_SURFACE_PLAN`
+      # and `SDK_GROUPS_SURFACE_PLAN`) + `test-helpers` so
       # `_testInjectSyntheticPeer` is exported for the group-placement
       # fixtures.
       #
@@ -553,10 +557,12 @@ jobs:
       # Invoke napi directly (not `npm run build:test`) so we can pass
       # `--no-default-features` to suppress `redis`; the package.json
       # scripts bake `redis` in for consumers who want the full
-      # surface from source.
+      # surface from source. NOTE: `--no-default-features` means every
+      # feature the suite needs must be listed explicitly here — the
+      # crate default set (which includes `nat-traversal`) is NOT active.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,test-helpers
+        run: npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
