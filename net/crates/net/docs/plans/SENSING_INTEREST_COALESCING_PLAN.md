@@ -1,12 +1,13 @@
 # Capability Sensing Plan (Interest Coalescing)
 
-Status: v4.2 — capability interests rendezvous at the RedEX-elected
-scope sensing leader (review 6, 2026-07-12); provider-specific
-sensing stays on the provider-targeted wire. SI-0 spike COMPLETE
-in-tree: items 1–31 as-built (rendezvous/failover items 24–31 in
-`behavior::sensing::rendezvous`, 2026-07-12), pending review
-sign-off. SI-1 and wire-id allocation remain BLOCKED until the gate
-map (a)–(q) is signed off
+Status: v4.3 — review 7 (2026-07-12): election reuse and gates
+(a)–(q) semantic/continuity conditions ACCEPTED; sign-off withheld
+on the provider-free transport — §4.2 now defines the two-stage
+`SensingInterestFrame` (leader-addressed `CapabilityRegistration`
+carrying selector + mode, provider-addressed `ProviderRegistration`,
+`Deregister`) with leader-side digest re-derivation, and §4.10 the
+routed-origin authority rule. Gates (r)/(s) added; SI-1 and wire-id
+allocation remain BLOCKED until (r)/(s) are as-built and signed off
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -485,34 +486,61 @@ Coalescing surfaces, restated:
   the window while an election result propagates. Bounded, expiring,
   and measured (SI-7 merge-miss stats).
 
-### 4.2 Wire objects (Layer 2 only)
+### 4.2 Wire objects
 
 Two subprotocols in the 0x0C family (ids reserved, **not committed
-until the SI-1 gate**). Only provider-targeted objects travel:
+until the SI-1 gate**). v4.3 (review 7): the routing has two legs —
+consumer → leader (provider-free) and leader → provider
+(provider-targeted) — and the digest COMMITS to selector/mode but
+does not REVEAL them, so the leader-addressed leg must carry the
+full canonical interest. 0x0C02 is therefore a tagged frame:
 
 ```
 SUBPROTOCOL_SENSING_INTEREST = 0x0C02
 
-ProviderInterest {
-    target:                    NodeId,        // resolved provider
+SensingInterestFrame =
+  CapabilityRegistration {              // addressed to the leader
     capability_id:             CapabilityId,
-    interest_digest:           Digest256,     // §3.2 — binds C, L,
-                                              // selector, mode, scope
     constraints:               InlineBytes,   // canonical C; ≤ 1 KiB
     constraints_digest:        Digest256,
     work_latency:              WorkLatencyEnvelope,
+    providers:                 ProviderSelector,   // leader needs these
+    result_mode:               ResultMode,          // to resolve
+    interest_digest:           Digest256,     // cross-checked, below
     requested_sample_interval: Duration,
-    subscriber_scope:          Scope,
     soft_state_ttl:            Duration,
-}
+    audience_scope:            Scope,
+    consumer:                  NodeId,   // bound to the authenticated
+                                         // routed origin — never
+                                         // trusted alone (§4.10)
+  }
+| ProviderRegistration {                // addressed to the provider
+    target:                    NodeId,
+    capability_id:             CapabilityId,
+    constraints:               InlineBytes,
+    constraints_digest:        Digest256,
+    work_latency:              WorkLatencyEnvelope,
+    interest_digest:           Digest256,
+    requested_sample_interval: Duration,
+    soft_state_ttl:            Duration,
+    audience_scope:            Scope,
+  }
+| Deregister {
+    interest_digest:           Digest256,
+    target:                    Option<NodeId>,
+  }
 ```
 
-(The predicate fields ride along so the provider can validate and
-compile them; the digest is the coalescing identity and the provider
-re-derives + cross-checks it. Selector/mode/budget do not need
-dedicated wire fields for evaluation — they are inputs to the digest
-and to local resolution — but the digest binds them so distinct
-intents never merge.)
+**The leader re-derives.** On `CapabilityRegistration` the leader
+recomputes the interest digest from the carried predicate + selector
++ mode + scope and cross-checks the carried `interest_digest` — a
+mismatch is protocol-invalid input (security counter), and the
+RE-DERIVED digest is the coalescing identity, never the claimed one.
+`ProviderRegistration` omits selector/mode (the provider evaluates
+the predicate, not the population); the provider re-derives and
+validates the predicate binding exactly as before.
+`ConsumerLatencyBudget` appears in NEITHER object — it is local by
+definition (§3.3).
 
 `SUBPROTOCOL_READINESS_ATTESTATION = 0x0C03` — unchanged from v4:
 `ReadinessAttestation { interest_digest, origin, origin_incarnation,
@@ -690,7 +718,20 @@ authenticated downstream session identity (wire scope fields
 cross-checked, never load-bearing); a relay never aggregates across
 disclosure classes or audiences (structural via the digest);
 cross-root sensing deferred to scoped-capabilities. v4 additions
-stand:
+stand, plus one v4.3 requirement (review 7):
+
+- **Origin and authority survive multi-hop routing.** For
+  `A → X → R`, the leader authorizes A's `CapabilityRegistration`
+  from **A's authenticated routed origin** — never from X merely
+  because X delivered the final hop — and fans the proof back to the
+  authenticated routed destination, never to the ingress relay as if
+  it were the subscriber. This rides the existing routed end-to-end
+  identity/session machinery (routed frames are encrypted end-to-end
+  and the nRPC layer authenticates caller origin); no
+  sensing-specific signature is invented for it. The frame's
+  `consumer` field is cross-checked against that authenticated
+  origin, exactly as wire scope claims are cross-checked against the
+  session root.
 
 - **Tags require provenance.** `calibrated=true` or
   `safety_certified=true` implies an authority; the candidate filter
@@ -849,7 +890,16 @@ must exercise the real dispatch path.
   no end-to-end claim ever provider-signed (item 2, test 23);
   (q) the rendezvous/failover tests (items 24–31) pass and the
   rendezvous demonstrably REUSES the RedEX election surface — no
-  second election subsystem (item 31).
+  second election subsystem (item 31);
+  (r) the wire distinguishes leader-addressed
+  `CapabilityRegistration` from provider-addressed
+  `ProviderRegistration`; the leader receives selector + result mode
+  and RE-DERIVES the capability-interest digest before coalescing or
+  resolution (§4.2, review 7);
+  (s) a multi-hop real-path test (`A → X → R`, `C → Y → R`) proves
+  authenticated consumer origin, owner-scope enforcement, digest
+  re-derivation, coalescing at the elected leader, and routed proof
+  fan-out — without confusing transport relays for subscribers.
   *As-built condition→test map (2026-07-12):* (a)/(b) delivery.rs
   tests 11/13; (c) continuity.rs test 14 + establishment-deadline
   tests; (d) table.rs test 15; (e) identity audience tests +
