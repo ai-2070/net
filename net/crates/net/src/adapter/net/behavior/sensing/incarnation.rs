@@ -27,9 +27,12 @@
 //!   sensing merely makes it visible; the spike shows it is
 //!   contained.
 //!
-//! In-process spike: the gate map is unbounded here; SI-1 rehosts it
-//! on the `WithdrawalSeqGate` LRU shape (evict the idle tail, never
-//! clear an active pair's ordering — plan §7).
+//! The gate map is bounded on the `WithdrawalSeqGate` LRU shape
+//! (SI-1): every sighting refreshes the stream's access tick, and on
+//! overflow only the least-recently-touched idle tail is evicted —
+//! never the whole map, so active pairs keep their ordering (plan
+//! §7). Poisoned streams are evicted last; see
+//! [`IncarnationSeqGate`] for the exact retention bound.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -176,6 +179,9 @@ struct GateEntry {
     /// Highest incarnation proven to have two live emitters; beats
     /// at or below it are refused.
     poisoned_at: Option<Incarnation>,
+    /// Access tick of the most recent sighting (admitted or not),
+    /// for LRU eviction — a stream still receiving beats is active.
+    touch: u64,
 }
 
 /// Observer-side strictly-newer admission over
@@ -190,12 +196,52 @@ struct GateEntry {
 /// cloned-emitter case, because independent seq counters started
 /// from a cloned snapshot collide at the frontier almost
 /// immediately, and every collision poisons the incarnation.
+///
+/// # Bounds (SI-1, `WithdrawalSeqGate` LRU shape)
+///
+/// The map is hard-bounded: when a sighting pushes it past
+/// `MAX_ENTRIES`, the least-recently-touched streams are evicted
+/// down to `LOW_WATER` (plan §7: evict the idle tail, never clear
+/// active pairs' ordering). Every sighting — admitted, stale, or
+/// poisoned — refreshes the stream's tick, and the incoming stream
+/// is sighted BEFORE victims are chosen, so an admit never evicts
+/// its own ordering.
+///
+/// **Poisoned streams are evicted last, not exempted.** A full
+/// exemption would let a compromised signing key pin unbounded
+/// entries by equivocating across arbitrarily many interest digests
+/// — the gate itself would become the memory DoS. Evict-last keeps
+/// the hard bound while making the clone-re-admit window (a poisoned
+/// stream whose record is dropped would admit the clones afresh)
+/// open only under mass equivocation: a poison record can be evicted
+/// only when MORE than `LOW_WATER` distinct poisoned streams exist —
+/// which requires the origin's signing keys across thousands of
+/// streams, i.e. a full identity compromise, not a replay — and even
+/// then the `LOW_WATER` most-recently-sighted poison records are
+/// retained.
 #[derive(Default)]
 pub struct IncarnationSeqGate {
     entries: HashMap<(u64, Digest256), GateEntry>,
+    /// Monotonic access clock; each [`Self::admit`] stamps the
+    /// sighted stream with the next tick so overflow eviction can
+    /// drop the least-recently-active streams.
+    tick: u64,
 }
 
 impl IncarnationSeqGate {
+    /// Hard bound that triggers eviction. Matches
+    /// `WithdrawalSeqGate::MAX_ENTRIES`: both gates hold one small
+    /// ordering record per remote stream, so the same mesh-scale
+    /// sizing argument (thousands of peers x a few streams each,
+    /// well under the bound in honest operation) budgets both alike.
+    const MAX_ENTRIES: usize = 8192;
+    /// Post-eviction target: overflow drops the least-recently-
+    /// touched streams down to this mark rather than clearing the
+    /// whole map. Matches `WithdrawalSeqGate::LOW_WATER`; the
+    /// 2048-entry hysteresis gap amortizes the O(n) eviction sweep
+    /// over at least that many subsequent inserts.
+    const LOW_WATER: usize = 6144;
+
     /// Empty gate.
     pub fn new() -> Self {
         Self::default()
@@ -213,6 +259,32 @@ impl IncarnationSeqGate {
         seq: u64,
         fingerprint: Digest256,
     ) -> Admission {
+        // Sight the incoming stream FIRST — apply its ordering check
+        // against any existing entry and stamp it with the newest
+        // tick — and only THEN bound the map. Evicting first could
+        // drop this very stream's history right before the insert,
+        // so even a stale beat would be reinserted as new and
+        // wrongly admitted. By sighting first, the incoming stream
+        // is the most-recently-touched and is never evicted by its
+        // own admit (the `WithdrawalSeqGate` ordering).
+        let verdict = self.sight(origin, digest, incarnation, seq, fingerprint);
+        self.evict_if_over_capacity();
+        verdict
+    }
+
+    /// The ordering check itself: refresh/insert the stream's entry
+    /// and stamp its access tick. Every sighting refreshes the tick
+    /// — even stale or poisoned beats mean the stream is active.
+    fn sight(
+        &mut self,
+        origin: u64,
+        digest: Digest256,
+        incarnation: Incarnation,
+        seq: u64,
+        fingerprint: Digest256,
+    ) -> Admission {
+        let touch = self.tick;
+        self.tick += 1;
         let entry = match self.entries.get_mut(&(origin, digest)) {
             None => {
                 self.entries.insert(
@@ -222,12 +294,14 @@ impl IncarnationSeqGate {
                         last_seq: seq,
                         last_fingerprint: fingerprint,
                         poisoned_at: None,
+                        touch,
                     },
                 );
                 return Admission::Admit;
             }
             Some(entry) => entry,
         };
+        entry.touch = touch;
 
         if let Some(poisoned) = entry.poisoned_at {
             if incarnation <= poisoned {
@@ -259,6 +333,36 @@ impl IncarnationSeqGate {
                     Admission::StaleSeq
                 }
             }
+        }
+    }
+
+    /// Drop only the least-recently-touched streams down to
+    /// [`Self::LOW_WATER`] when the map exceeds
+    /// [`Self::MAX_ENTRIES`] — plan §7: evict the idle tail, never
+    /// clear active pairs' ordering. O(n), but only on the rare
+    /// overflow, and the hysteresis gap spreads sweeps apart.
+    ///
+    /// Victims are ranked clean-before-poisoned, oldest touch first
+    /// within each class: a poisoned record whose ordering was
+    /// evicted would let the clones re-admit afresh, so poison
+    /// records outlive every clean record under pressure (see the
+    /// type-level docs for why evict-last rather than a full
+    /// exemption, and the exact `> LOW_WATER` bound).
+    fn evict_if_over_capacity(&mut self) {
+        if self.entries.len() <= Self::MAX_ENTRIES {
+            return;
+        }
+        let excess = self.entries.len() - Self::LOW_WATER;
+        // Ticks are unique, so `(poisoned, touch)` totally orders
+        // the entries; the `excess` smallest are the victims.
+        let mut victims: Vec<(bool, u64, (u64, Digest256))> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.poisoned_at.is_some(), entry.touch, *key))
+            .collect();
+        victims.select_nth_unstable_by_key(excess - 1, |&(poisoned, touch, _)| (poisoned, touch));
+        for &(_, _, key) in &victims[..excess] {
+            self.entries.remove(&key);
         }
     }
 
@@ -509,5 +613,101 @@ mod tests {
             .admit(1, other_digest, Incarnation::new(1), 1, fp(3))
             .is_admitted());
         assert_eq!(gate.len(), 3);
+    }
+
+    #[test]
+    fn eviction_drops_oldest_touched_idle_streams_to_low_water() {
+        let mut gate = IncarnationSeqGate::new();
+        let inc = Incarnation::new(1);
+        // Fill exactly to the bound; origin 0 is sighted first, so
+        // it is the least-recently-touched entry.
+        for origin in 0..(IncarnationSeqGate::MAX_ENTRIES as u64) {
+            assert!(gate.admit(origin, digest(), inc, 1, fp(1)).is_admitted());
+        }
+        assert_eq!(gate.len(), IncarnationSeqGate::MAX_ENTRIES);
+        // One more stream tips the bound: the oldest-touched idle
+        // tail is evicted down to LOW_WATER — never the whole map.
+        let tipping = IncarnationSeqGate::MAX_ENTRIES as u64;
+        assert!(gate.admit(tipping, digest(), inc, 1, fp(1)).is_admitted());
+        assert_eq!(gate.len(), IncarnationSeqGate::LOW_WATER);
+        // The tipping stream (newest touch) survived its own
+        // overflow: its ordering still gates a duplicate.
+        assert_eq!(
+            gate.admit(tipping, digest(), inc, 1, fp(1)),
+            Admission::StaleSeq,
+        );
+        // A recently-touched filler survived too.
+        assert_eq!(
+            gate.admit(tipping - 1, digest(), inc, 1, fp(1)),
+            Admission::StaleSeq,
+        );
+        // The oldest-touched stream was evicted: its ordering is
+        // forgotten, so the same beat re-admits as a first sighting.
+        assert!(gate.admit(0, digest(), inc, 1, fp(1)).is_admitted());
+    }
+
+    #[test]
+    fn active_stream_ordering_survives_one_shot_churn() {
+        let mut gate = IncarnationSeqGate::new();
+        let inc = Incarnation::new(3);
+        // Hot stream outside the churn's origin range.
+        let hot = u64::MAX;
+        assert!(gate.admit(hot, digest(), inc, 100, fp(1)).is_admitted());
+        // Heavy churn: 3x MAX_ENTRIES one-shot streams — several
+        // full eviction sweeps — while the hot stream keeps beating
+        // (every sighting refreshes its tick, so it never becomes
+        // part of the idle tail).
+        let mut hot_seq = 100;
+        for origin in 0..(3 * IncarnationSeqGate::MAX_ENTRIES as u64) {
+            assert!(gate.admit(origin, digest(), inc, 1, fp(2)).is_admitted());
+            if origin % 1024 == 0 {
+                hot_seq += 1;
+                assert!(gate.admit(hot, digest(), inc, hot_seq, fp(3)).is_admitted());
+            }
+        }
+        // The hot stream's ordering survived every sweep: a delayed
+        // stale beat is still gated — an evicted entry would have
+        // wrongly re-admitted it as a first sighting.
+        assert_eq!(
+            gate.admit(hot, digest(), inc, 50, fp(4)),
+            Admission::StaleSeq,
+        );
+        assert!(gate
+            .admit(hot, digest(), inc, hot_seq + 1, fp(5))
+            .is_admitted());
+    }
+
+    #[test]
+    fn poisoned_stream_survives_eviction_pressure_and_still_refuses() {
+        let mut gate = IncarnationSeqGate::new();
+        let inc = Incarnation::new(7);
+        let cloned = u64::MAX;
+        // Two clones collide at the frontier: poisoned.
+        assert!(gate.admit(cloned, digest(), inc, 1, fp(0xA1)).is_admitted());
+        assert_eq!(
+            gate.admit(cloned, digest(), inc, 1, fp(0xB1)),
+            Admission::Equivocation,
+        );
+        assert_eq!(gate.poisoned(cloned, digest()), Some(inc));
+        // Heavy one-shot churn with the poisoned stream never
+        // re-sighted: under plain LRU it would be the very first
+        // eviction victim.
+        for origin in 0..(3 * IncarnationSeqGate::MAX_ENTRIES as u64) {
+            assert!(gate
+                .admit(origin, digest(), Incarnation::new(1), 1, fp(2))
+                .is_admitted());
+        }
+        // Evict-last: with fewer than LOW_WATER poisoned streams the
+        // poison record cannot be chosen as a victim, so the clones
+        // are still refused after every sweep...
+        assert_eq!(gate.poisoned(cloned, digest()), Some(inc));
+        assert_eq!(
+            gate.admit(cloned, digest(), inc, 999, fp(0xA2)),
+            Admission::PoisonedIncarnation,
+        );
+        // ...and a genuine restart is still the recovery path.
+        assert!(gate
+            .admit(cloned, digest(), Incarnation::new(8), 1, fp(0xC1))
+            .is_admitted());
     }
 }
