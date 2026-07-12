@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_4e259a5adc8049 898-901,905-909
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "45ac1f44eceed4e94fb36108259a4775654f16df",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
