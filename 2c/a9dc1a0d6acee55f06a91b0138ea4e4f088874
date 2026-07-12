@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_6e3ba98fcf8a1a::t_c70aa32436f5c8 1551-1595,1598
+  s_6e3ba98fcf8a1a::t_a24ccc8690dcd7 854-881,886
+  s_6e3ba98fcf8a1a::t_35546885fb1125 889-891,1596-1597
+net/crates/net/src/adapter/net/reroute.rs
+  s_6e3ba98fcf8a1a::t_b5c22011f370d0 232-242,245-249,259-261,264-266
+  s_6e3ba98fcf8a1a::t_dd85eeed959159 663-704
+  s_6e3ba98fcf8a1a::t_b48385c9cafe49 662
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2ca9dc1a0d6acee55f06a91b0138ea4e4f088874",
+  "prompts": {},
+  "sessions": {
+    "s_6e3ba98fcf8a1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06d6941e-b88a-429a-8af7-b32d33e82522",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
