@@ -1,0 +1,27 @@
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_ffe98b9032a091 204-206
+  s_c28bdf38c0df3a::t_fc756c419b6f92 847-850,861-863
+  s_c28bdf38c0df3a::t_66d5b8f83696d7 3-8
+  s_c28bdf38c0df3a::t_d67be29ba0b2f1 401-419,421-446,449-453,456-472,475-484
+  s_c28bdf38c0df3a::t_3729ae4b2cac5a 971-977
+  s_c28bdf38c0df3a::t_486555952ca941 141,144-145,148-159,162-163,165-167,169-170,176-182
+  s_c28bdf38c0df3a::t_ee1fde9ae6ecf5 804-834
+  s_c28bdf38c0df3a::t_83c45dfb0d1168 900-913
+  s_c28bdf38c0df3a::t_67c9fd0b50f663 59-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "89d874c9581393cda8b47d7bd837779f3537a515",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
