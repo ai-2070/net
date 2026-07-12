@@ -19,6 +19,12 @@
 //! before SI-1 lands is cheap, changing it after is a wire break.
 
 pub mod identity;
+pub mod incarnation;
+
+pub use incarnation::{
+    next_incarnation, Admission, Incarnation, IncarnationError, IncarnationPersistence,
+    IncarnationSeqGate, PersistenceFault,
+};
 
 pub use identity::{
     strictest_sample_interval, AudienceScopeCommitment, CanonicalConstraints, CapabilityId,
