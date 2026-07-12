@@ -1770,7 +1770,47 @@ impl RpcResponseSink {
             }
         }
     }
+
+    /// Emit one non-terminal chunk, **waiting** for pump-queue room
+    /// instead of dropping on overflow. The backpressure-aware
+    /// sibling of [`Self::send`]: when the per-call pump queue
+    /// ([`STREAMING_PUMP_CAPACITY`]) is full — e.g. a flow-controlled
+    /// caller has stopped granting credit — this parks until the
+    /// pump drains a slot rather than silently discarding the chunk.
+    ///
+    /// Returns [`RpcSinkClosed`] when the pump receiver is gone (the
+    /// call is torn down); the chunk was not sent and the handler
+    /// should stop producing.
+    ///
+    /// Use this from handlers whose stream carries deltas that must
+    /// not be lost silently (e.g. the `tool.watch` subscription,
+    /// whose overflow contract requires an explicit resync frame
+    /// instead of a drop); keep [`Self::send`] for streams where
+    /// dropping under backpressure is acceptable.
+    pub async fn send_wait(&self, body: impl Into<bytes::Bytes>) -> Result<(), RpcSinkClosed> {
+        self.inner
+            .send(body.into())
+            .await
+            .map_err(|_| RpcSinkClosed)
+    }
 }
+
+/// Error returned by [`RpcResponseSink::send_wait`] when the
+/// per-call pump receiver has shut down (the streaming call is
+/// being torn down server-side). The chunk was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcSinkClosed;
+
+impl std::fmt::Display for RpcSinkClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rpc streaming sink: pump receiver closed; chunk not sent"
+        )
+    }
+}
+
+impl std::error::Error for RpcSinkClosed {}
 
 /// Bounded capacity for the streaming pump's internal mpsc. A
 /// runaway handler that produces chunks faster than the publish

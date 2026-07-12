@@ -2350,6 +2350,14 @@ impl MeshNode {
         // + pump task bump server-side counters (including the
         // streaming-only `streaming_chunks_emitted_total`).
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        // Keep clones of the emit closure + metrics handle for the
+        // callee-side capability-auth gate in the bridge below —
+        // same defense-in-depth shape as the unary `serve_rpc`
+        // bridge. The fold owns its own clones; these only serve
+        // the deny path, which runs BEFORE the fold (and therefore
+        // the handler) ever sees the event.
+        let emit_for_bridge = Arc::clone(&emit);
+        let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
                 .with_metrics(metrics_handle),
@@ -2357,6 +2365,17 @@ impl MeshNode {
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
+        // Register the service + refresh the self-indexed
+        // announcement BEFORE installing the dispatcher, exactly as
+        // the unary path does: the callee-side gate reads the local
+        // fold, so a self-announcement carrying `nrpc:<service>`
+        // must exist the moment the first inbound event lands —
+        // otherwise the gate would deny legitimate callers of a
+        // just-registered service (see the unary `serve_rpc`
+        // comment + `CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
+        // H1 / H2).
+        self.rpc_local_services_arc().insert(service.to_string());
+        self.index_self_with_local_services();
         if self
             .register_rpc_inbound(channel_hash, dispatcher)
             .is_some()
@@ -2364,10 +2383,67 @@ impl MeshNode {
             return Err(ServeError::AlreadyServing(service.to_string()));
         }
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
+        let mesh_for_bridge = Arc::clone(self);
+        let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
+            let tag = format!("nrpc:{}", service_for_bridge);
+            use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
                     origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
+                }
+                // Callee-side capability-auth gate — the streaming
+                // mirror of the unary bridge's defense-in-depth
+                // check (the caller-side gate inside
+                // `call_service_streaming` covers the well-behaved
+                // client path). Skip only when the wire session
+                // resolved no NodeId (`from_node == 0` is the
+                // loopback / test sentinel per
+                // `RpcInboundEvent::from_node`).
+                let self_node = mesh_for_bridge.node_id();
+                let from_node = inbound.from_node;
+                if from_node != 0
+                    && !capability_bridge::may_execute(
+                        mesh_for_bridge.capability_fold(),
+                        self_node,
+                        &tag,
+                        from_node,
+                    )
+                {
+                    // Decode the EventMeta so we can address the
+                    // caller's reply channel (keyed on
+                    // `caller_origin`) and tag the response with
+                    // the correct `call_id`. A garbled meta would
+                    // have been rejected by the fold's own decode
+                    // path too; drop silently to match that
+                    // skip-on-malformed behavior.
+                    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
+                        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
+                    } else {
+                        None
+                    }) else {
+                        continue;
+                    };
+                    // Terminal frame: a non-`Ok` status closes the
+                    // caller's stream regardless of streaming
+                    // headers (`classify_streaming_chunk`), so this
+                    // single emit both denies and terminates.
+                    let resp = super::cortex::RpcResponsePayload {
+                        status: RpcStatus::CapabilityDenied,
+                        headers: vec![],
+                        body: Bytes::from(format!(
+                            "callee-side capability-auth gate denied nrpc:{}",
+                            service_for_bridge
+                        )),
+                    };
+                    // Same operator-visibility bump as the unary
+                    // deny path: the handler never runs, so the
+                    // fold-side metrics can't count this.
+                    metrics_for_bridge
+                        .capability_denied_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp).await;
+                    continue;
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
@@ -2377,7 +2453,6 @@ impl MeshNode {
                 }
             }
         });
-        self.rpc_local_services_arc().insert(service.to_string());
         Ok(ServeHandle {
             channel_hash,
             service: service.to_string(),

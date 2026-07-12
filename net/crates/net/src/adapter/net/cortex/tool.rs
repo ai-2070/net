@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::net::behavior::fold::capability_aggregation::TagMatcher;
 use crate::adapter::net::behavior::ToolCapability;
 
 // ============================================================================
@@ -487,6 +488,167 @@ pub enum ToolMetadataResponse {
     },
 }
 
+// ============================================================================
+// tool.watch — server-streamed remote watch (RT-6)
+// ============================================================================
+//
+// `MeshNode::watch_tools` is a *local* surface: it diffs the local
+// capability fold. A remote consumer (e.g. the Go RPC binding's
+// `WatchTools`) previously had to re-poll `list_tools` over nRPC on
+// a ticker. `tool.watch` is the server-streaming subscription that
+// replaces that poll: the serving node runs its own (event-driven)
+// `watch_tools` and streams one `ToolWatchFrame` per change to the
+// subscriber, with a bounded per-subscriber buffer and an explicit
+// resync signal on overflow. See
+// `docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` §4.4 Track C.
+
+/// Canonical nRPC service name for the server-streamed remote tool
+/// watch. Both halves of the call (the auto-installed server handler
+/// in the SDK and any streaming client) use this constant so a
+/// future rename catches at one site.
+pub const TOOL_WATCH_SERVICE: &str = "tool.watch";
+
+/// Request body for `tool.watch` — the two `MeshNode::watch_tools`
+/// parameters in wire-friendly form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchToolsRequest {
+    /// Optional tag filter with the same semantics as `list_tools`
+    /// / `watch_tools`: an entry is included if ANY of its tags
+    /// match. `None` watches every tool the serving node's fold
+    /// sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<TagMatcher>,
+    /// Optional debounce-ceiling in milliseconds, mirroring the
+    /// `interval` parameter of `watch_tools`: `None` is pure
+    /// event-driven; `Some(ms)` additionally guarantees a re-diff
+    /// at least every `ms` on the serving node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
+/// Wire frame of the `tool.watch` stream. One frame per streaming
+/// chunk, JSON-encoded, tagged by `"type"` with the same JSON shape
+/// the FFI bindings already use for [`ToolListChange`]:
+///
+/// ```json
+/// { "type": "added",              "descriptor": { ... } }
+/// { "type": "removed",            "descriptor": { ... } }
+/// { "type": "node_count_changed", "descriptor": { ... }, "prev_node_count": 3 }
+/// { "type": "resync" }
+/// ```
+///
+/// # Resync contract
+///
+/// The server relays deltas through a bounded per-subscriber
+/// buffer. When a subscriber falls behind and that buffer
+/// overflows, the server drops the subscriber's queued deltas and
+/// emits one [`ToolWatchFrame::Resync`] instead — a delta is never
+/// lost silently. On receiving `Resync` the client must discard its
+/// accumulated view and re-baseline from its **own local fold** via
+/// `list_tools` (the capability fold is mesh-replicated; there is
+/// no remote list service to call). Frames after the `Resync`
+/// resume normal delta semantics; a delta that is already reflected
+/// in the fresh baseline is possible and must be tolerated.
+#[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one transient frame per streamed change, encoded and immediately \
+              consumed — boxing the change would add an allocation + \
+              wire-invisible indirection to every delta for a stack-size win \
+              nothing is sensitive to (same call as ToolMetadataResponse above)"
+)]
+pub enum ToolWatchFrame {
+    /// One [`ToolListChange`] observed by the serving node's local
+    /// watch, relayed verbatim.
+    Change(ToolListChange),
+    /// The server overflowed this subscriber's buffer and dropped
+    /// queued deltas. Re-baseline via `list_tools` — see the
+    /// type-level resync contract.
+    Resync,
+}
+
+/// Wire tag values for [`ToolWatchFrame`]'s `"type"` field. Shared
+/// by the manual `Serialize` / `Deserialize` impls below so the two
+/// directions can't drift.
+const TOOL_WATCH_FRAME_KINDS: [&str; 4] = ["added", "removed", "node_count_changed", "resync"];
+
+impl Serialize for ToolWatchFrame {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        /// Borrowed wire shape — flat `"type"`-tagged map matching
+        /// the FFI JSON for `ToolListChange` plus the `resync` kind.
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            descriptor: Option<&'a ToolDescriptor>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prev_node_count: Option<u32>,
+        }
+        let wire = match self {
+            Self::Change(ToolListChange::Added(d)) => Wire {
+                kind: TOOL_WATCH_FRAME_KINDS[0],
+                descriptor: Some(d),
+                prev_node_count: None,
+            },
+            Self::Change(ToolListChange::Removed(d)) => Wire {
+                kind: TOOL_WATCH_FRAME_KINDS[1],
+                descriptor: Some(d),
+                prev_node_count: None,
+            },
+            Self::Change(ToolListChange::NodeCountChanged {
+                descriptor,
+                prev_node_count,
+            }) => Wire {
+                kind: TOOL_WATCH_FRAME_KINDS[2],
+                descriptor: Some(descriptor),
+                prev_node_count: Some(*prev_node_count),
+            },
+            Self::Resync => Wire {
+                kind: TOOL_WATCH_FRAME_KINDS[3],
+                descriptor: None,
+                prev_node_count: None,
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolWatchFrame {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Owned wire shape — see the `Serialize` impl.
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            descriptor: Option<ToolDescriptor>,
+            #[serde(default)]
+            prev_node_count: Option<u32>,
+        }
+        use serde::de::Error;
+        let wire = Wire::deserialize(deserializer)?;
+        let descriptor =
+            |d: Option<ToolDescriptor>| d.ok_or_else(|| D::Error::missing_field("descriptor"));
+        match wire.kind.as_str() {
+            "added" => Ok(Self::Change(ToolListChange::Added(descriptor(
+                wire.descriptor,
+            )?))),
+            "removed" => Ok(Self::Change(ToolListChange::Removed(descriptor(
+                wire.descriptor,
+            )?))),
+            "node_count_changed" => Ok(Self::Change(ToolListChange::NodeCountChanged {
+                descriptor: descriptor(wire.descriptor)?,
+                prev_node_count: wire
+                    .prev_node_count
+                    .ok_or_else(|| D::Error::missing_field("prev_node_count"))?,
+            })),
+            "resync" => Ok(Self::Resync),
+            other => Err(D::Error::unknown_variant(other, &TOOL_WATCH_FRAME_KINDS)),
+        }
+    }
+}
+
 /// Local-only registry holding the full `ToolDescriptor` for every
 /// tool `serve_tool` registered on this node. The
 /// `tool.metadata.fetch` handler reads this registry; `serve_tool`
@@ -713,6 +875,85 @@ mod tests {
             desc.node_count, 0,
             "node_count is filled by the aggregator, not here"
         );
+    }
+
+    // ---- tool.watch wire frames (RT-6) ----
+
+    fn sample_descriptor() -> ToolDescriptor {
+        ToolDescriptor::from_capability(&cap("web_search"), &BTreeMap::new())
+    }
+
+    #[test]
+    fn tool_watch_frame_json_matches_ffi_change_shape() {
+        // The frame's JSON for `Change` must be exactly the FFI
+        // watch-tools JSON (`{"type": "...", "descriptor": ...}`),
+        // so a binding-side decoder can share one code path.
+        let added = ToolWatchFrame::Change(ToolListChange::Added(sample_descriptor()));
+        let v: serde_json::Value = serde_json::to_value(&added).unwrap();
+        assert_eq!(v["type"], "added");
+        assert_eq!(v["descriptor"]["tool_id"], "web_search");
+        assert!(v.get("prev_node_count").is_none());
+
+        let ncc = ToolWatchFrame::Change(ToolListChange::NodeCountChanged {
+            descriptor: sample_descriptor(),
+            prev_node_count: 3,
+        });
+        let v: serde_json::Value = serde_json::to_value(&ncc).unwrap();
+        assert_eq!(v["type"], "node_count_changed");
+        assert_eq!(v["prev_node_count"], 3);
+
+        let v: serde_json::Value = serde_json::to_value(&ToolWatchFrame::Resync).unwrap();
+        assert_eq!(v, serde_json::json!({ "type": "resync" }));
+    }
+
+    #[test]
+    fn tool_watch_frame_round_trips_every_variant() {
+        let frames = vec![
+            ToolWatchFrame::Change(ToolListChange::Added(sample_descriptor())),
+            ToolWatchFrame::Change(ToolListChange::Removed(sample_descriptor())),
+            ToolWatchFrame::Change(ToolListChange::NodeCountChanged {
+                descriptor: sample_descriptor(),
+                prev_node_count: 7,
+            }),
+            ToolWatchFrame::Resync,
+        ];
+        for frame in frames {
+            let json = serde_json::to_vec(&frame).unwrap();
+            let back: ToolWatchFrame = serde_json::from_slice(&json).unwrap();
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn tool_watch_frame_rejects_malformed_wire() {
+        // Missing descriptor on a change kind.
+        let err = serde_json::from_str::<ToolWatchFrame>(r#"{"type":"added"}"#);
+        assert!(err.is_err(), "added without descriptor must fail");
+        // Missing prev_node_count.
+        let d = serde_json::to_value(sample_descriptor()).unwrap();
+        let raw = serde_json::json!({ "type": "node_count_changed", "descriptor": d });
+        assert!(serde_json::from_value::<ToolWatchFrame>(raw).is_err());
+        // Unknown kind.
+        let err = serde_json::from_str::<ToolWatchFrame>(r#"{"type":"nonsense"}"#);
+        assert!(err.is_err(), "unknown frame kind must fail");
+    }
+
+    #[test]
+    fn watch_tools_request_omits_absent_options() {
+        let req = WatchToolsRequest {
+            matcher: None,
+            interval_ms: None,
+        };
+        assert_eq!(serde_json::to_string(&req).unwrap(), "{}");
+        let req = WatchToolsRequest {
+            matcher: Some(TagMatcher::Prefix {
+                value: "ai-tool:".into(),
+            }),
+            interval_ms: Some(250),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: WatchToolsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]
