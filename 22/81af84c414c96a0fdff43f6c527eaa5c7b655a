@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/sensing/incarnation.rs
+  s_c28bdf38c0df3a::t_0076fd5278f5e7 617-712
+  s_c28bdf38c0df3a::t_2b022ce7787344 182-184
+  s_c28bdf38c0df3a::t_ef806b1b8ad6a7 30-35
+  s_c28bdf38c0df3a::t_aa82505ba36eef 199-221,225-228,232-244,262-287,297,304
+  s_c28bdf38c0df3a::t_c5da5dd4d8d8b0 339-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2281af84c414c96a0fdff43f6c527eaa5c7b655a",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
