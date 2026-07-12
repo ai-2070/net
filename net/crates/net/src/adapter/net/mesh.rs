@@ -10385,6 +10385,26 @@ impl MeshNode {
                     .send_to(&keepalive_payload[..], peer_reflex)
                     .await;
             }
+            // Sustain the train for the rest of the punch window. The
+            // §3 burst above is only a 250 ms opener; a real cone NAT
+            // often needs repeated keep-alives to latch, because the
+            // two sides' conntrack mappings are rarely both established
+            // at the same instant — scheduling skew, or an early packet
+            // dropped at the peer's gateway before its own outbound
+            // created the reverse mapping. Keep firing at the same
+            // 250 ms cadence until `deadline`, when the observer gives
+            // up anyway. Extra keep-alives once the punch latches are
+            // harmless: the peer's observer is already consumed and
+            // ignores them. (Loopback punches land on the opener, so
+            // this only ever matters against genuine NAT.)
+            let mut resend = tokio::time::interval(Duration::from_millis(250));
+            resend.tick().await; // consume the immediate tick
+            while start.elapsed() < deadline {
+                resend.tick().await;
+                let _ = socket_send
+                    .send_to(&keepalive_payload[..], peer_reflex)
+                    .await;
+            }
         });
 
         // Observer task: waits for the receive loop to fire the
