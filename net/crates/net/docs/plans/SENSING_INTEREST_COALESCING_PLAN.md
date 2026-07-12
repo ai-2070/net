@@ -1,7 +1,13 @@
 # Capability Sensing Plan (Interest Coalescing)
 
 Status: v4.3 — **gate map (a)–(s) SIGNED OFF; SI-0 COMPLETE; SI-1
-AUTHORIZED** (review 7 sign-off, 2026-07-12, verified at 45ac1f44e).
+COMPLETE AND ACCEPTED** (SI-1 review closed 2026-07-12, reviewer-
+verified at 3018e6520: transcript invariant test coverage confirmed,
+benchmark interpretation confirmed — "fan-out multiplies delivery
+work, not signature verification … that preserves the core economic
+claim of coalescing"). Next: SI-2 (interest table + resolver on
+real sessions) awaits its own go-ahead — SI-2+ was not implied by
+the gate sign-off.
 0x0C02 (`SensingInterestFrame`) and 0x0C03 (`ReadinessAttestation`)
 MAY be committed. SI-1 scope: canonical codecs, signing +
 verification honoring the transcript invariant below (§4.2),
