@@ -1,8 +1,11 @@
-# Sensing-Interest Coalescing Plan
+# Capability Sensing Plan (Interest Coalescing)
 
-Status: v3.1 — SI-0 APPROVED as a bounded spike (review 3, 2026-07-12)
-with the amendments below folded in; SI-1 and wire-id allocation remain
-BLOCKED until the gate conditions in the SI-1 entry are met
+Status: v4 — re-centered on capability-directed sensing (review 4,
+2026-07-12). The v3.1 SI-0 approval is superseded: SI-0 is re-scoped
+below and its spike refactor is in progress (`behavior::sensing`,
+SI-0a–f as-built for v3.1 keys, re-keyed for v4). SI-1 and wire-id
+allocation remain BLOCKED until the gate conditions in the SI-1
+entry are met
 Owner: TBD
 Related: `REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` (predecessor — the event
 plumbing, seq-gate, and trailing-edge patterns this reuses),
@@ -15,206 +18,288 @@ liveness plane this must subsume, not duplicate),
 `SCOPED_CAPABILITIES_PLAN.md` / `CAPABILITY_AUTH_PLAN.md` (the authority
 machinery the deferred cross-root story must build on)
 
-> **Revision note.** v1 flattened conditional readiness into one bit on
-> a capability entry. v2 made the conditional relation the semantic
-> core, fixed wire/restart/authority defects, and added the relay
-> store-pack-down-sample delivery model. v3 corrects the one remaining
-> critical defect (review 2, 2026-07-12): **freshness semantics**. The
-> v2 prose claimed "evidenced no staler than S" — an evidence-age
-> guarantee that a clockless mechanism over caching relays cannot
-> provide (freshness laundering: a relay-cached Ready becomes "fresh"
-> merely by being forwarded, and the effect accumulates per hop). v3
-> renames the parameter to what it is (a requested sample/delivery
-> interval), separates evidence validity from stream suspicion, gates
-> optimistic states on established continuity (cached Ready warm-starts
-> as Provisional, never Ready), states the v1 relay trust assumption,
-> and defers cryptographic evidence-age (challenge/time protocol) to a
-> named follow-up. Also from review 2: inline-only constraints for v1
-> (CAS deferred), authenticated-identity scope validation, an explicit
-> unsupported-cadence refusal, a frozen evaluator contract, expanded
-> incarnation failure tests, and a real-path old-relay fallback test.
+> **Revision note.** v1 flattened conditional readiness into one bit
+> on a capability entry. v2 made the conditional relation the
+> semantic core and added the relay store-pack-down-sample delivery
+> model. v3 fixed freshness semantics (the honest continuity
+> contract: no evidence-age claims; optimism gated on established
+> continuity). v3.1 added hop-by-hop upstream continuity,
+> Unestablished expiry, refusal partitioning, audience-bound digests,
+> and froze terminology.
 >
-> **v3.1 (review 3 amendments, SI-0 approved):** hop-by-hop upstream
-> continuity — a relay may not deliver Ready as continuity-bearing
-> while its own upstream continuity is Unestablished/Expired (multi-hop
-> cache chains could otherwise manufacture apparent post-registration
-> continuity); Unestablished now expires (stale pessimism cannot
-> persist indefinitely); cadence-refusal partitioning (one impossible
-> subscriber cannot poison a satisfiable aggregate); the audience/root
-> commitment is bound into the interest digest; the seq-rate inference
-> is demoted to diagnostics-only; terminology frozen
-> (requested_sample_interval / promised_cadence / continuity_window).
+> **v4 (review 4, 2026-07-12 — the re-centering).** v3 answered "can
+> **known provider X** satisfy Y under C/L?" — provider-targeted at
+> the sensing transport layer. The product primitive is existential:
+> *"can **any authorized provider** currently satisfy capability Y
+> under characteristics C and latency envelope L?"* — any sensor able
+> to produce the observation, any printer able to print. The
+> provider identity is an **answer, not part of the question**; and
+> per the same review, capability-directed must be the *default*,
+> not the only addressing mode — operators must still be able to
+> surveil a specific node, group, or tag-selected population
+> explicitly. v4 therefore makes the interest three orthogonal
+> dimensions (capability predicate × provider selector × result
+> mode), splits the identity into a provider-free
+> `CapabilityInterestKey` with a `ProviderObservationKey` beneath it
+> (capability generation moves OUT of the interest digest — it is
+> provider-specific), coalesces equivalent interests **before**
+> provider selection, resolves bounded provider candidates from the
+> capability + proximity graphs, and projects result-mode aggregates
+> conservatively (proving "no provider is ready" is far harder than
+> proving "this provider is ready"). Everything v3 built beneath the
+> key — signed provider attestations, incarnation ordering,
+> continuity semantics, relay caching, provisional warm-start,
+> per-downstream soft state, cadence refusal, the authority boundary,
+> the admission recheck — is preserved as the internal
+> provider-observation submechanism. v3's provider-specific sensing
+> survives verbatim as the `Node(X)` selector.
 
 ## 1. Problem
 
-Readiness is **not a property of a capability**. It is a conditional
-relation:
+The product-level question is not "is printer X online?" or "can
+sensor X provide Y?". It is:
+
+```
+Can any authorized provider currently satisfy capability Y
+under characteristics C and latency envelope L?
+```
+
+The application asks for a print or an observation, not for the
+health of one preselected device. Formally, the primary relation is
+existential over the eligible provider set P:
+
+```
+∃ X ∈ P(Y, C, S):  R(X, Y, C, L, t)
+```
+
+with the underlying per-provider relation unchanged from v3:
 
 ```
 (provider X, capability Y, work characteristics C, latency envelope L)
     → Ready | NotReady | Unknown
 ```
 
-**The contract this plane provides (honest continuity contract):** for
-each registered interest, the consumer holds the *last
-provider-attested status*, delivered under a requested continuity
-interval D, with optimistic states gated on established continuity
-(§4.5). It does NOT bound the age of the provider's evaluation — that
-strong freshness contract requires a challenge/time protocol and is a
-named follow-up (§9). Readiness here is **advisory**: final admission
-(the gang-claim / invocation path) remains the authoritative recheck,
-so stale optimism costs a transient refusal, never unsafe execution.
-That sentence is load-bearing for every consumer — a physical or
+An interest therefore has **three independent dimensions**:
+
+1. **What** — the capability predicate (Y, C, L);
+2. **From where** — the provider population that may satisfy it
+   (default: any authorized provider; operator overrides: a specific
+   node, an explicit node set, a group, a tag-selected population);
+3. **How many** — the result cardinality over that population
+   (default: any one; also top-K, each member, quorum).
+
+**The contract this plane provides (honest continuity contract,
+unchanged from v3):** for each registered interest, the consumer
+holds provider-signed *last attested statuses*, delivered under a
+requested continuity interval D, with optimistic states gated on
+established continuity (§4.5), joined into a result-mode aggregate
+(§3.5). It does NOT bound the age of any provider's evaluation —
+that strong freshness contract requires a challenge/time protocol
+and is a named follow-up (§9). Readiness here is **advisory**: final
+admission (the gang-claim / invocation path, targeted at the
+selected provider) remains the authoritative recheck, so stale
+optimism costs a transient refusal, never unsafe execution. That
+sentence is load-bearing for every consumer — a physical or
 safety-critical integration MUST NOT treat this advisory state as
 authorization to proceed without its own final local admission.
 
-A node A that needs this relation evaluated has two options today,
-both bad at scale:
+Today a node that needs this evaluated has three options, all bad:
 
-1. **Read the capability fold.** Dynamic readiness (load, queue depth,
-   model-loaded, disk headroom) refreshes on the announce keep-alive
-   scale (150 s default), and the fold carries no per-(C, L)
-   evaluation at all.
-2. **Probe X directly.** N watchers at average path length Lp and
-   cadence f cost ~2·N·Lp·f messages/s and N·f probes/s on X — peaking
-   exactly when X looks free (the gang-claim contention moment). The
-   observation is also *path-incongruent*: a direct probe measures a
-   path A's actual (possibly relayed) work may never take.
+1. **Read the capability fold.** Dynamic readiness refreshes on the
+   announce keep-alive scale (150 s default) and carries no
+   per-(C, L) evaluation at all.
+2. **Probe providers directly.** N watchers × K candidates at
+   cadence f cost ~2·N·K·Lp·f messages/s, peaking exactly at the
+   contention moment; and the observation is path-incongruent.
+3. **Choose a provider first, then sense it (v3).** Demand
+   fragments: if A locally prefers printer P1 and C prefers P2,
+   their *identical* intent ("any color A4 printer") produces two
+   disjoint interests that never coalesce. Provider-first sensing
+   makes the coalescing primitive miss exactly the equivalent-demand
+   case it was built for.
 
-The mechanism: equivalent interests coalesce along the routing tree.
+The v4 mechanism:
 
 ```
-interests travel up the actual routing tree
-→ equivalent interests coalesce at fan-in points
-→ provider evaluates once per distinct interest, at the strictest
-  requested sample interval
-→ provider-signed results fan back down the same tree
-→ broken continuity degrades to Unknown
+consumers express capability interests (Y, C, L, selector, mode)
+→ equivalent interests coalesce on the interest digest — BEFORE
+  provider selection
+→ relays resolve bounded provider candidates from their local
+  capability fold ∩ authority ∩ proximity
+→ provider-specific sensing branches follow next_hop(candidate)
+  (the v3 routing-tree machinery, per branch)
+→ providers evaluate once per distinct interest and sign
+  attestations
+→ signed observations fan back down; each hop maintains
+  per-provider continuity; consumers hold result-mode aggregates
+  plus the supporting provider proofs
 ```
 
-- Provider sensing load scales with **interested routing-tree branches
-  × distinct conditional interests — not raw watcher count**.
-- Network cost drops from ~N·Lp probe round-trips to the tree's edge
-  count.
-- Observations are **path-congruent**: A's signal arrives via
-  `next_hop(X)` — the segment A's work will traverse — plus an
-  A→next-hop edge whose latency A already tracks.
+- Provider sensing load still scales with **interested routing-tree
+  branches × distinct interests**, never raw watcher count.
+- Demand for the same capability predicate merges even when
+  consumers would have ranked providers differently.
+- The answer carries the provider: a consumer acts on
+  `Ready(provider = printer-7, estimated_start = 800 ms)` and
+  invokes that provider subject to final admission.
 
 ## 2. Current state (verified inventory)
 
-**Readiness sensing today is passive, direct-peer-only, and local.**
+Unchanged from v3 except as noted:
 
-- `meshos/probes.rs` — pull-via-tick probes over the proximity graph:
-  `ProximityGraphHealthProbe` classifies each *direct* peer from
-  `ProximityNode::last_seen` staleness; `LocalityProbe` surfaces
-  per-peer RTT. Both feed `MeshOsState::node_health` on the MeshOS
-  tick.
-- `scheduler_bridge/liveness.rs` — `project_liveness` (pure) prunes
-  the gang scheduler's candidate set from `node_health`. Its docs
-  specify per-entry capability **suspension** (suspend-not-delete) for
-  node-level loss — the correct tool for *unconditional* loss and only
-  that (§4.8).
-- Multi-hop "readiness" is only *inferred*: forwarded pingwaves imply
-  arrival-based liveness (cadence dilutes per hop; unsigned raw UDP);
-  capability-fold dynamic tags refresh on announce cadence; RT-5
-  withdrawals signal route-level death only.
-- **Channel pub/sub cannot express this.** `MeshNode::publish` is
-  "one per-peer unicast per subscriber — no multicast primitive". The
-  delta this plan adds is relay-level aggregation.
-
-**Primitives this plan reuses:**
-
-- Routing tree + proximity graph: `next_hop(X)`, per-edge latency
-  EWMA; failure detector + RT-5 withdrawals give path-death edges.
-- Origin signing: `EntityKeypair` signatures (capability-announcement
-  conventions); subprotocol frames ride encrypted sessions (hop
-  authentication for free) — the session identity is what scope
-  validation derives the owner root from (§4.9).
-- Opaque relaying exists: routed sessions forward encrypted frames the
-  relay cannot decrypt (pinned by the three_node relay tests — "B
-  should not decrypt A→C data — it only relays"), which is the
-  transport the old-relay fallback rides (§4.10).
-- Digests: `blake3` is an in-tree dependency (dataforts CAS / meshos).
-- Capability versioning: announcements stamp a monotonic per-origin
-  `version: u64`; the fold rejects stale versions. This is the
-  `capability_generation` an attestation binds.
-- Ordering-gate shape: `WithdrawalSeqGate` (LRU-bounded
-  strictly-newer admission) — reused in structure, keyed with
-  incarnation (§4.6); purge-on-rehandshake alone is NOT sufficient
-  (indirect observers never see the origin's handshake).
-- Coalescing discipline: RT-1 trailing-edge gate; RT-4 leading +
-  trailing event shape.
-- Frame packing: subprotocol frames natively carry multiple events
-  (`build_subprotocol(&[Bytes])`, `EventFrame::read_events`) — relay
-  batching needs no new wire format (§4.4).
-- Feature negotiation precedent: `ACK_RANGES_CAPABILITY_TAG` (§4.10).
+- `meshos/probes.rs` pull-via-tick direct-peer probes;
+  `scheduler_bridge/liveness.rs` candidate pruning with
+  suspend-not-delete (reserved for *unconditional* loss, §4.9).
+- Multi-hop readiness only inferred (pingwave arrival, fold dynamic
+  tags, RT-5 route death). Channel pub/sub has no aggregation.
+- **Primitives reused:** routing tree + proximity graph
+  (`next_hop`, latency EWMA, failure edges); `EntityKeypair`
+  signing; encrypted-session subprotocol frames (hop
+  authentication); opaque routed relaying (pinned by three_node
+  tests); blake3; per-origin monotonic announce `version` (the
+  provider-side `capability_generation`); `WithdrawalSeqGate` LRU
+  shape; RT-1/RT-4 coalescing gates; multi-event frames;
+  `ACK_RANGES_CAPABILITY_TAG` negotiation precedent.
+- **Capability fold + tags + groups:** capability queries and tag
+  matching exist (`behavior::{query, tag, capability}`);
+  `behavior::group` provides owner-scoped group identities. These
+  are the candidate-resolution inputs (§4.7); tag *provenance*
+  (§4.10) is thinner than v4 wants and is called out there.
+- **In-tree spike (SI-0a–f as-built):** `behavior::sensing` holds
+  the domain-separated digest + canonical constraints
+  (`identity.rs`), the incarnation boot protocol + equivocation
+  seq-gate (`incarnation.rs`), the continuity state machine with the
+  pinned projection table (`continuity.rs`), the frozen evaluator
+  contract + cadence refusal + security counters (`evaluator.rs`),
+  the per-downstream interest table with refusal partitioning
+  (`table.rs`), and the relay store/pack/down-sample layer with the
+  hop-by-hop continuity rule (`delivery.rs`). Built against v3.1
+  provider-first keys; the v4 refactor re-keys identity/table/
+  delivery and adds candidate resolution + aggregation. The
+  incarnation, continuity, and evaluator layers carry over
+  unchanged.
 
 ## 3. Semantic model (defined before any wire format)
 
-### 3.1 The conditional readiness key
-
-All state — wire, table, fold — is keyed by the full conditional
-sensing identity, never less:
+### 3.1 The interest: three orthogonal dimensions
 
 ```
-ReadinessKey {
-    provider:               NodeId,
-    capability_id:          CapabilityId,
-    capability_generation:  u64,        // provider's announce version
-    interest_digest:        Digest256,  // §3.2
+SensingInterest {
+    capability_id:             CapabilityId,
+    constraints:               InlineBytes,      // canonical C; ≤ 1 KiB
+    constraints_digest:        Digest256,
+    work_latency:              WorkLatencyEnvelope,   // L
+    providers:                 ProviderSelector,
+    result_mode:               ResultMode,
+    requested_sample_interval: Duration,          // D — not identity
+    subscriber_scope:          Scope,             // §4.10; v1: owner root
+    soft_state_ttl:            Duration,
+}
+
+ProviderSelector =
+    AnyAuthorized                  // the default: provider is an answer
+  | Node(NodeId)                   // explicit surveillance of one node
+  | Nodes(sorted, deduped Vec<NodeId>)
+  | Group(GroupRef)                // owner-scoped stable group identity
+  | Tags(AllOf<sorted TagMatch>)   // exact-conjunction tag selection
+
+ResultMode =
+    Any            // one viable provider satisfies the interest
+  | TopK(u16)      // maintain up to K ranked viable providers
+  | Each           // provider-indexed observation per member
+  | Quorum(u16)    // at least K viable providers
+```
+
+Defaults: `AnyAuthorized + Any` — "I need this capability; I do not
+care which device provides it." Explicit provider surveillance
+(`Node(X) + Each`, `Group(G) + Each`, …) is the operator override
+for diagnostics, maintenance, auditing, affinity, and physically
+meaningful sensor identity. v3's entire model is the
+`Node(X) + Each` cell of this matrix.
+
+Selector and mode are separate fields because a population alone is
+ambiguous: `Group(factory-cameras)` could mean "is any camera
+usable?", "are all operational?", or "observe each independently".
+
+Selectors are canonical: `Nodes` sorted + deduped; `Tags` an
+exact-match conjunction sorted by (key, value) — order of authorship
+must not split identity. **No arbitrary Boolean selector
+expressions** (`(A OR B) AND NOT C`) — that is a distributed query
+language with normalization and cost problems; v1 is exact
+conjunction only (§9).
+
+### 3.2 Two-level keying
+
+**The capability-interest key** — what the consumer wants; contains
+no provider identity and no provider generation:
+
+```
+interest_digest = blake3_derive_key("net.sensing.interest.v1",
+    len(capability_id) || capability_id ||
+    len(canonical(C)) || canonical(C) ||
+    canonical(L) ||
+    canonical(provider_selector) ||
+    canonical(result_mode) ||
+    disclosure_class ||
+    audience_scope_commitment      // v1: canonical owner-root id
+)
+
+CapabilityInterestKey {
+    capability_id:   CapabilityId,
+    interest_digest: Digest256,
 }
 ```
 
-Two interests against the same capability (720p@30 vs 4K@60) are two
-keys, two observations, two lifecycles. One going Unknown never
-touches the other, and never suspends the capability entry.
+256-bit, domain-separated, injectively encoded (length-prefixed
+variable fields). Coalescing, the per-hop interest table, and the
+fold overlay all key on this.
 
-### 3.2 Canonical interest identity
+- The **selector is inside the digest**: "any printer" must never
+  coalesce with "printer-7 only", and "any member of G" must never
+  coalesce with "each member of G", even though their capability
+  predicates match.
+- The **audience commitment is inside the digest** (v3.1 rule,
+  unchanged): different audiences cannot coalesce by construction.
+  Digest inclusion separates semantic identities *after* validation
+  — it never replaces the session-identity check (§4.10).
+- **`capability_generation` is OUT.** A capability-directed
+  interest cannot bind one provider's generation — different
+  printers have different generations. Generation binding moves to
+  the observation level, where it belongs.
+- **D is OUT** (unchanged): stricter sampling dominates looser and
+  must not split identity.
+
+**The provider-observation key** — which provider currently answers
+the interest:
 
 ```
-interest_digest = blake3(
-    "net.sensing.interest.v1" ||        // domain separation
-    capability_id ||
-    capability_generation ||
-    canonical(constraints C) ||
-    canonical(work_latency L) ||
-    disclosure_class ||                 // §4.9
-    audience_scope_commitment           // v1: canonical owner-root id
-)
+ProviderObservationKey {
+    interest:              CapabilityInterestKey,
+    provider:              NodeId,
+    capability_generation: u64,     // that provider's announce version
+}
 ```
 
-256-bit, domain-separated. A 64-bit key is an adversarial-collision
-hazard when it *merges* interests; short indices may be derived for
-local tables but are never the wire or semantic identity.
+Attestations, observation cells, relay caches, and per-provider
+continuity all key on this. The attestation signature still binds
+capability_id + constraints digest + the provider's own generation +
+incarnation, so a stale "generation-10 Ready" can never mark
+generation 11 ready — stale-attestation protection is preserved, one
+level down.
 
-The **audience commitment is inside the digest** so that "interests
-belonging to different audiences cannot coalesce" holds by
-construction, not by relay diligence: two future roots that both use
-`disclosure_class = owner` still produce distinct digests. For v1 the
-commitment is the canonical owner-root identity; for future delegated
-groups, a hash of the scope/grant/audience-set identity. Digest
-inclusion *separates semantic identities after validation* — it never
-replaces the session-identity check (§4.9).
-
-**The requested sample interval D is deliberately NOT in the
-digest** — stricter sampling dominates looser (§3.3), so D must not
-split otherwise-identical interests.
-
-### 3.3 Three time dimensions, three rules
+### 3.3 Three time dimensions, three rules (unchanged from v3)
 
 | Dimension | Meaning | Rule |
 |---|---|---|
-| `work_latency` (L) | "can X *start* Y within L" — part of the readiness **predicate** | exact match (inside the digest) |
-| `requested_sample_interval` (D) | how often the consumer wants evidence sampled/delivered — a delivery-continuity interval, **not** an evidence-age bound | min-dominance upstream (strictest wins); per-downstream delivery schedule downstream (§4.4) |
-| `soft_state_ttl` | subscription lifetime | per-downstream expiry (§4.3); says nothing about evidence |
+| `work_latency` (L) | "can a provider *start* Y within L" — part of the predicate | exact match (inside the digest) |
+| `requested_sample_interval` (D) | delivery-continuity interval, **not** an evidence-age bound | min-dominance upstream; per-downstream delivery schedule downstream (§4.4) |
+| `soft_state_ttl` | subscription lifetime | per-downstream expiry (§4.3) |
 
-The v1/v2 name `max_observation_staleness` is retired: this mechanism
-bounds local arrival continuity, not cryptographic age since provider
-evaluation, and the name must not promise otherwise.
+The retired name `max_observation_staleness` stays retired.
 
-### 3.4 Observation state: evidence vs. continuity
+### 3.4 Per-provider observation state (unchanged from v3)
 
-Two independent facts, stored separately and never conflated:
+Per `ProviderObservationKey`, evidence and continuity stay separate:
 
 ```
 ReadinessObservation {
@@ -228,626 +313,595 @@ ReadinessObservation {
 }
 ```
 
-Public projection (the fold overlay exposes only the projected
-three-state surface):
+The projection table is pinned (v3 §3.4, in-tree as
+`continuity::project`): Ready needs Established continuity; NotReady
+projects immediately (pessimism is safe, optimism must be earned);
+Expired and ProviderUnknown project Unknown; Unestablished expires
+at the establishment deadline. All continuity transitions —
+registration → Unestablished, continuity-bearing strictly-newer beat
+→ Established, deadlines and disruptions → Expired — are unchanged.
+Two additions:
 
-| attested_status | continuity | projected |
-|---|---|---|
-| Ready | Unestablished | **Unknown** |
-| Ready | Established | Ready |
-| NotReady | Unestablished or Established | NotReady |
-| ProviderUnknown | any | Unknown |
-| any | Expired | Unknown |
+- **Continuity never crosses a generation change.** The
+  observation key binds the generation, so a provider announcing a
+  new generation starts a fresh observation (Unestablished) for the
+  interest; the old generation's cell is disrupted
+  (`GenerationChanged`). A predicate compiled against generation N
+  may mean something else under N+1.
+- **Seq ordering is generation-independent**: the ordering key stays
+  `(provider, incarnation, interest_digest)` (§4.6); generation is
+  attested content, not sequence scope, so a provider bumping its
+  generation continues one monotonic seq stream.
 
-The asymmetry is deliberate: a stale NotReady only costs unnecessary
-avoidance; a stale Ready selects a provider that may no longer be
-ready — **pessimism is safe, optimism must be earned**. Continuity
-transitions:
+### 3.5 Aggregate projection per result mode (new)
+
+The consumer-facing result joins per-provider projections into the
+requested cardinality. Let `ready` = candidates with projected
+Ready, `unknown` = candidates with projected Unknown, and
+`complete` = the bounded authoritative candidate set is fully
+resolved and observed (no unresolved or unprobed member):
 
 ```
-interest registration
-    → continuity = Unestablished; start establishment deadline
-strictly-newer CONTINUITY-BEARING beat admitted (§4.4 hop rule)
-    → Established
-no qualifying newer beat before the establishment deadline
-    → Expired            (Unestablished → Expired)
-Established, then continuity window elapses without a newer beat
-    → Expired            (Established → Expired)
-route withdrawal / path failure / incarnation change /
-generation change / scope-validation failure
-    → Expired            (from either state)
+required = 1 (Any) | K (Quorum(K))
+
+ready ≥ required                          → Ready (+ supporting providers)
+complete AND ready + unknown < required   → NotReady
+otherwise                                 → Unknown
 ```
 
-**Unestablished expires too.** A cached NotReady projects
-immediately while Unestablished — without the establishment deadline
-it could persist indefinitely on a dead stream (stale pessimism made
-permanent). Both deadlines derive from the consumer's own delivery
-schedule (§4.5); the projections are unchanged: cached Ready +
-Unestablished → Unknown, cached NotReady + Unestablished → NotReady,
-either + Expired → Unknown.
+- **Any**: one established-Ready candidate → Ready with that
+  provider's proof. In an open mesh, proving "no provider exists or
+  is ready" is much harder than proving "this provider is ready" —
+  so `complete` is only true for *bounded authoritative* populations
+  (explicit `Node`/`Nodes`, fully-resolved owner `Group`); for
+  `AnyAuthorized`/`Tags` v1 conservatively never projects NotReady,
+  only Unknown.
+- **TopK(K)**: up to K established-viable providers, locally ranked;
+  scalar status is Ready iff ≥ 1.
+- **Each**: the provider-indexed map, **never flattened to one
+  bit** — operational monitoring, not existential resolution.
+- **Quorum(K)**: as the formula; `complete && ready + unknown < K`
+  is the only NotReady path.
 
-Unknown is locally derived from these transitions. The provider emits
-`ProviderUnknown` only when it cannot evaluate the predicate.
+The aggregate is a **local materialized view over provider proofs**:
+a relay or consumer can only claim "some printer is ready" while
+holding the signed provider attestation behind it. Relays aggregate
+and forward attestations; they never invent capability-level
+results.
 
 ## 4. Design
 
-### 4.1 The tree is the routing tree (unchanged)
+### 4.1 Routing: coalesce first, then resolve by selector
 
-A registers interest with `next_hop(X)` — nothing else. The forwarder
-is topologically closer AND on A's execution path **by construction**;
-reroutes relocate the tree automatically. Strictly on-path for v1.
+Coalescing keys on the interest digest and happens at every fan-in
+point — **before provider selection**. Two consumers wanting "any
+color A4 printer" merge at their common relay even if their local
+proximity views would rank different printers first.
+
+Candidate resolution then happens per relay hop, against the local
+fold (§4.7), and forwarding follows the selector:
+
+```
+Node(X)
+    → next_hop(X) — exactly the v3 routing-tree path, one branch
+
+Nodes([X, Y, Z])
+    → group members by next_hop branch; one branch-level interest
+      per relevant branch
+
+Group(G) / Tags(T) / AnyAuthorized
+    → eligible = capability fold ∩ selector ∩ authority ∩ reachability
+    → rank by proximity (+ existing readiness evidence)
+    → forward the coalesced interest toward a BOUNDED number of
+      candidate branches (§4.7); expand only while the result mode
+      is unsatisfied
+```
+
+The wire never floods blindly; strictly on-path per branch for v1.
 
 ### 4.2 Wire objects
 
 Two subprotocols in the 0x0C family (ids reserved, **not committed
-until the SI-1 gate**; same mixed-version caveat as 0x0C01):
+until the SI-1 gate**):
+
+`SUBPROTOCOL_SENSING_INTEREST = 0x0C02` carries `SensingInterest`
+(§3.1). v1 constraints are inline-only (≤ 1 KiB, digest-validated;
+CAS-backed constraints deferred, §9); undecodable constraints answer
+`ProviderUnknown { InvalidConstraints }`, and a `constraints_digest`
+mismatch additionally increments the protocol-invalid/security
+counter (§4.4).
+
+`SUBPROTOCOL_READINESS_ATTESTATION = 0x0C03`:
 
 ```
-SUBPROTOCOL_SENSING_INTEREST = 0x0C02
-
-ReadinessInterest {
-    target:                    NodeId,
-    capability_id:             CapabilityId,
-    capability_generation:     u64,
-    constraints:               InlineBytes,     // canonical; ≤ 1 KiB, v1
-    constraints_digest:        Digest256,
-    work_latency:              WorkLatencyEnvelope,
-    requested_sample_interval: Duration,
-    subscriber_scope:          Scope,           // §4.9; v1: owner root
-    soft_state_ttl:            Duration,
-}
-```
-
-**v1 constraints are inline-only.** The v2 CAS-reference path (fetch
-through dataforts, validate digest, then evaluate) pulls fetch
-timeouts, artifact authority, interest-expiry-during-fetch, and
-hostile-reference handling into the first implementation; readiness
-predicates should be compact, and a predicate needing a large object
-is probably smuggling a workload descriptor. CAS-backed constraints
-are a named follow-up (§9). The interest still carries the actual
-predicate — a digest is an identity, not a query; the provider
-validates `constraints_digest` against the inline bytes and answers
-undecodable constraints with `ProviderUnknown { InvalidConstraints }`.
-
-```
-SUBPROTOCOL_READINESS_ATTESTATION = 0x0C03
-
 ReadinessAttestation {
-    origin:                 NodeId,
+    interest_digest:        Digest256,      // the capability interest
+    origin:                 NodeId,          // the answering provider
     origin_incarnation:     Incarnation,     // §4.6
     capability_id:          CapabilityId,
-    capability_generation:  u64,
-    interest_digest:        Digest256,
+    capability_generation:  u64,             // the PROVIDER's generation
     status:                 Ready | NotReady | ProviderUnknown,
-    status_reason:          compact code (§4.4 evaluator projection)
+    status_reason:          compact code (§4.4),
     estimated_start:        Option<Duration>,
     seq:                    u64,
     promised_cadence:       Duration,
-    audience_scope:         Scope,           // §4.9
+    audience_scope:         Scope,           // §4.10
     signature:              Signature,       // over ALL fields above
 }
 ```
 
-The signature binds capability_id + generation + constraints digest +
-incarnation: a stale in-flight "generation-10 Ready" can never mark
-generation 11 ready; a pre-restart attestation can never be ordered
-into the post-restart sequence space. **The signature proves the
-origin produced this attestation — it does not prove it produced it
-recently** (§4.5). Relays forward identical signed bytes — suppress or
-delay, never alter.
+**The signature proves the origin produced this attestation — not
+that it produced it recently** (§4.5). Relays forward identical
+signed bytes — suppress or delay, never alter. The
+"continuity-bearing vs warm-start" flag is relay-authored envelope
+metadata, never inside the signed bytes (§4.4).
 
 ### 4.3 Per-hop interest table — per-downstream soft state
 
+Keyed by `CapabilityInterestKey`:
+
 ```
-(target, ReadinessKey) → {
-    upstream_continuity: Unestablished | Established | Expired,
-                         // the relay's OWN continuity toward the
-                         // origin — gates continuity-bearing
-                         // forwarding (§4.4 hop rule)
-    refused_minimum: Option<Duration>,
-                         // cached provider floor M (§4.4 refusal
-                         // partitioning); invalidated on generation /
-                         // incarnation change
+CapabilityInterestKey → {
+    active_candidates: [ProviderObservationKey],   // resolved branches (§4.7)
+    refused_minimum: Map<NodeId, Duration>,
+        // cached provider floors M, per provider (§4.4);
+        // invalidated per provider on generation/incarnation change
     downstreams: Map<DownstreamId | LOCAL, {
         requested_sample_interval,
         soft_state_ttl,
         expires_at,
-        owner_root,          // derived from the session, §4.9
+        owner_root,            // derived from the session, §4.10
     }>,
 }
 ```
 
-Each downstream refreshes its own entry at ttl/2 and expires
-independently after 2 missed refreshes (one shared expiry would let a
-refreshing A keep a silent C subscribed). Aggregates — strictest D,
-whether upstream interest exists — are **derived** from live entries;
-a derived change propagates one trailing-edge-coalesced update to
-`next_hop(target)` (the RT-1 gate shape). A relay with one downstream
-is a pure forwarder; coalescing activates only where fan-in meets,
-and the table is itself the fan-in measurement.
+Per-downstream rows refresh at ttl/2 and expire independently after
+2 missed refreshes. Aggregates (strictest D, interest liveness) are
+derived and diffed against what upstream was last told — exactly one
+trailing-edge-coalesced update per derived change (RT-1 gate shape).
+A relay with one downstream is a pure forwarder; the table is the
+fan-in measurement. Per-provider upstream continuity lives with the
+delivery layer's observation cells (§4.4), not in this table.
+
+The table key being the full digest keeps disclosure classes and
+audiences structurally unmergeable (§4.10).
 
 ### 4.4 Origin evaluation, emission, and relay delivery
 
-**Evaluator contract (frozen in SI-0).** Capability integrations
-implement one narrow trait; without it every integration invents its
-own meaning for ProviderUnknown:
+**Evaluator contract (frozen; in-tree).** One narrow trait per
+capability integration:
 
 ```
 trait ReadinessEvaluator {
-    fn evaluate(
-        capability:  &CapabilityEntry,
-        constraints: &CanonicalConstraints,
-        work_latency: &WorkLatencyEnvelope,
-    ) -> ReadinessEvaluation;
+    fn evaluate(&self, request: &EvaluationRequest) -> ReadinessEvaluation;
 }
+
+EvaluationRequest { capability_id, constraints, work_latency }
+// NOTE v4: no generation parameter — the provider always evaluates
+// against its CURRENT generation and stamps that generation into
+// the attestation.
 
 ReadinessEvaluation =
     Ready { estimated_start }
   | NotReady { reason }
-  | UnsupportedPredicate      // this capability can't answer this C/L
-  | TemporarilyUnevaluable    // transient local failure
-  | InvalidConstraints        // undecodable / digest mismatch
+  | UnsupportedPredicate
+  | TemporarilyUnevaluable
+  | InvalidConstraints
 ```
 
-The three non-Ready/NotReady variants project onto the wire as
-`ProviderUnknown` with a compact `status_reason` code — observability
-keeps the distinction even though consumers treat all three as
-Unknown. One classification matters for security telemetry: a
-`constraints_digest` mismatch is **malformed or tampered protocol
-input**, not merely an unevaluable predicate — it increments a
-protocol-invalid/security counter even though it projects publicly as
-`ProviderUnknown { InvalidConstraints }`.
+The three non-Ready/NotReady variants project as `ProviderUnknown`
+with distinct `status_reason` codes; a digest mismatch increments
+the protocol-invalid/security counter (all unchanged, in-tree).
 
 **Unsupported cadence is refused, not silently degraded — and the
-refusal is partitioned.** If the coalesced strictest D is below the
-provider's floor, the provider answers with a structured refusal
-(`sampling_interval_unsupported { minimum_supported: M }`) projected
-as ProviderUnknown-with-reason — never a silently weaker stream. The
-naive aggregate would let one impossible subscriber poison everyone
-(A@20 ms + C@100 ms coalesce to strictest 20 ms → refused → C starves
-despite being satisfiable). On receiving the refusal a relay MUST:
-
-1. partition its downstreams on M: `D < M` → propagate the refusal to
-   exactly those; `D ≥ M` → keep eligible;
-2. recompute the upstream aggregate from satisfiable downstreams only
-   (`new strictest D = min(D where D ≥ M)`) and re-register it;
-3. cache M per (provider, ReadinessKey) so the same unsupported
-   aggregate is never re-submitted (no refusal/retry loop); the
-   cached M invalidates on capability-generation or incarnation
-   change (the provider's floor may have changed with it).
-
-A later-joining downstream with `D < cached M` is refused locally
-without a provider round-trip.
+refusal is partitioned** (unchanged mechanics, now per provider):
+provider P's `sampling_interval_unsupported { minimum_supported: M }`
+partitions the *serving branch's* downstreams on M, re-registers the
+satisfiable aggregate exactly once, and caches M per (interest, P) —
+invalidated on P's generation/incarnation change. Under
+`AnyAuthorized`, a refusal from P additionally lets the resolver
+prefer a candidate whose floor admits the aggregate (§4.7); the
+partition rule guards the case where P is the only (or the
+selected) branch.
 
 X compiles the predicate once per distinct `interest_digest` and
 emits one signed stream per (distinct interest × directly-interested
 branch) at cadence ≈ strictest-D/2, floored by config. Status edges
-emit immediately with a min-gap; unchanged state rides the cadence;
-no idle emission without registered interest.
+emit immediately with a min-gap; no idle emission without registered
+interest. **Honest load claim:** provider emission is
+O(branches × distinct interests), independent of watcher count.
 
-**Honest load claim:** provider emission is O(branches × distinct
-interests), independent of the number of watchers behind each branch.
+**Relay delivery: store, pack, down-sample** (unchanged, per
+provider stream): the relay caches latest-per-`ProviderObservationKey`
+(never history), packs multiple keys per downstream flush, delivers
+each downstream at its own D, never holds a status edge, and
+warm-starts late joiners from cache — always as provisional. Every
+registration (including ttl/2 refreshes) re-sends the cached latest
+as anti-entropy; downstream gates absorb duplicates.
 
-**Relay delivery: store, pack, down-sample.** Attestations are
-origin-signed, self-contained, latest-wins — a relay is a *cache with
-a schedule*:
-
-- **packs**: multiple keys bound for one downstream coalesce into one
-  multi-event frame per flush (native EventFrame support);
-- **down-samples**: each downstream is delivered the latest
-  attestation per key at its OWN D — min-dominance governs what flows
-  up; per-subscriber schedules govern what flows down;
-- **never holds a status edge**: transitions flush immediately; only
-  same-key continuity beats may wait, bounded by the downstream's D;
-- **warm-starts late joiners as Provisional**: a newly registered
-  downstream immediately receives the cached latest attestation per
-  matching key, which seeds `attested_status` with
-  `continuity = Unestablished`. Projected state stays Unknown (for a
-  cached Ready) until a continuity-bearing strictly-newer attestation
-  arrives — **a cached Ready must never become "fresh" by being
-  forwarded** (§4.5). A cached NotReady projects immediately
-  (pessimism is safe), subject to the Unestablished establishment
-  deadline (§3.4).
-
-**Hop-by-hop continuity (multi-hop laundering closed).** The
-single-hop "strictly-newer after registration" rule does not compose
-across cache chains: in `X → C → B → A` with C holding cached seq 101
-and B holding cached seq 100, A registering and later receiving C's
-cached 101 via B would observe a strictly-newer post-registration seq
-that was never a live post-registration evaluation. Therefore every
-relay tracks its OWN upstream continuity per `ReadinessKey`, under
-the same state machine as consumers (§3.4), and:
+**Hop-by-hop continuity (unchanged, per provider stream):**
 
 ```
 A relay MUST NOT deliver a Ready attestation as continuity-bearing
-while its own upstream continuity for that ReadinessKey is
+while its own upstream continuity for that ProviderObservationKey is
 Unestablished or Expired. It MAY deliver it as a provisional
 warm-start; the downstream's projected state remains Unknown.
 ```
 
-"Continuity-bearing" vs "warm-start" is **local delivery metadata on
-the relay→downstream frame envelope** (which the relay authors and
-the session authenticates) — never a field inside the origin-signed
-attestation, which relays cannot alter. Establishment therefore
-propagates hop-by-hop from the live origin stream: X emits a live
-beat → C establishes → C's forward is continuity-bearing → B
-establishes → B's forward is continuity-bearing → A may establish. A
-relay lying about the flag is the time-shifting malicious relay of
-§4.5's stated v1 trust assumption — the hop rule closes the *honest*
-multi-hop accident, not the adversarial case.
+Establishment propagates hop-by-hop from the live origin stream. A
+relay lying about the flag is §4.5's stated v1 trust assumption.
 
-**Latest-per-key, never history.** The batch of intermediates carries
-nothing correctness-relevant the downstream can't already get: status
-flaps were flushed as edges, and evidence handling is governed by the
-continuity state machine alone. Sequence gaps are expected under
-relay down-sampling and carry **no correctness meaning beyond
-strictly-newer admission**; implementations may expose local
-diagnostic statistics (e.g. an emission-continuity EWMA), but no
-readiness, continuity, or failure transition may depend on inferred
-origin emission rate in v1 — the ratio is confounded by status-edge
-emissions, min-gaps, scheduling jitter, loss before a caching relay,
-and route changes, and must not become an accidental second health
-protocol. A consumer wanting the full temporal pattern registers
-`D ≈ promised_cadence` — down-sampling degenerates to full-stream;
-"latest" and "batch" are the two ends of the D knob, not modes.
+**Latest-per-key, never history** (unchanged): seq gaps under
+down-sampling carry no meaning beyond strictly-newer admission;
+emission-rate inference stays diagnostics-only — no readiness,
+continuity, or failure transition may depend on it.
 
-### 4.5 Continuity, not evidence age — stated honestly
+### 4.5 Continuity, not evidence age (unchanged from v3.1)
 
-**Frozen terminology** (three related but distinct durations):
-
-| Term | Owner | Meaning |
-|---|---|---|
-| `requested_sample_interval` (D) | downstream | the delivery-continuity objective it registered |
-| `promised_cadence` | provider | upstream emission cadence for the aggregated branch, signed in the attestation |
-| `continuity_window` | each consumer/relay locally | the suspicion deadline derived from its expected delivery schedule |
-
-A relay down-samples provider emissions to downstream delivery
-intervals, so a consumer primarily reasons about its own expected
-delivery interval; `promised_cadence` is a conservative input to the
-window, never a proof of evidence age.
-
-**What is guaranteed (honest relays):** the consumer receives a
-continuing sequence of origin-signed attestations with locally
-bounded interarrival; broken continuity degrades to Unknown within
+Frozen terminology: `requested_sample_interval` (D, downstream),
+`promised_cadence` (provider, signed), `continuity_window` (each
+consumer/relay locally):
 
 ```
-continuity_window = k × max(promised_cadence, own D)   (k = 3)
+continuity_window = k × max(promised_cadence, own D)     (k = 3)
 ```
 
-This is a *stream-suspicion* rule (the failure detector's trick,
-clock-free, composes per hop). The `max` term is load-bearing under
-down-sampling: keying off `promised_cadence` alone would
-false-Unknown every down-sampled subscriber. Each consumer's window
-uses only values it requested or received signed. The establishment
-deadline (§3.4, Unestablished → Expired) is derived the same way.
+Guaranteed (honest relays): a continuing sequence of origin-signed
+attestations with locally bounded interarrival; broken continuity
+degrades to Unknown within the window; cached Ready projects Unknown
+until a continuity-bearing strictly-newer beat post-registration.
+NOT guaranteed: evaluation age — a malicious on-path relay
+time-shifting a buffered stream is undetectable without a
+challenge/time protocol (named follow-up, §9); in the v1 owner-root
+boundary, relays are owner infrastructure. Final admission remains
+the authoritative recheck — now explicitly *targeted at the selected
+provider* out of the aggregate view.
 
-**What is NOT guaranteed:** the age of the provider's evaluation. A
-signature proves authorship, not recency; a relay-cached attestation
-re-delivered later is indistinguishable from a fresh one, and the
-effect accumulates across caching hops. Two consequences are designed
-in rather than papered over:
-
-1. **Optimism is gated on continuity** (§3.4): cached Ready projects
-   Unknown until the consumer has seen a strictly-newer attestation
-   arrive *within its own continuity window* post-registration. This
-   closes accidental stale warm-starts from honest relays.
-2. **The residual trust assumption is stated:** a *malicious*
-   on-path relay that records a valid attestation sequence and
-   replays it at the expected cadence cannot be distinguished without
-   a time or subscriber-originated-challenge mechanism reaching X. In
-   the v1 owner-root-only boundary (§4.9), relays are owner
-   infrastructure and are trusted not to time-shift buffered streams.
-   The strong freshness contract (challenge/nonce echo or
-   origin-monotonic-time correlation — review Option B) is a named
-   follow-up (§9), not an implicit property of v1.
-
-Final admission (claim / invocation) remains the authoritative
-readiness recheck; this plane only steers candidate selection.
-
-### 4.6 Ordering across restarts: incarnation-scoped sequences
+### 4.6 Ordering across restarts (unchanged mechanics)
 
 Ordering key: `(origin, origin_incarnation, interest_digest)` →
-strictly-newer seq. A new incarnation — authenticated by X's
-signature over it — supersedes the old sequence space (indirect
-observers never see X's handshake, so purge-on-rehandshake cannot
-work). Recommendation: a *monotonic persisted* boot counter beside
-the identity key material; a random per-boot value cannot be ordered
-and lets a replayed old incarnation masquerade as a fresh restart.
+strictly-newer seq, with the monotonic persisted boot counter,
+increment-before-participation, fail-closed persistence, rollback
+containment at the observer gate, and equivocation poisoning
+(cloned identity degrades to Unknown, never flaps) — all in-tree
+with the §4.6 persistence failure matrix tested (SI-0 item 4).
+Generation is attested content, not part of the ordering key (§3.4).
 
-**SI-0 must test the persistence assumptions, not just the happy
-path:** increment-before-network-participation ordering; crash
-between increment and persist; filesystem rollback; restored device
-backup; cloned identity state on two machines (two live nodes emitting
-under one identity — conflicting incarnations/seqs must degrade to
-Unknown, not flap Ready); counter exhaustion. Identity cloning is not
-a sensing-specific failure, but sensing makes it visible — the spike
-must show the failure mode is contained.
+### 4.7 Candidate selection and bounded exploration (new)
 
-Capability-generation change immediately expires every `ReadinessKey`
-carrying the old generation.
-
-### 4.7 Failure-plane integration
-
-- `next_hop(X)` Failed / RT-5 withdrawal toward X → all `(X, *)`
-  observations' continuity → Expired (projected Unknown); interests
-  re-register along the promoted route (refresh as backstop).
-- Downstream loss → drop its per-downstream entries; derived
-  aggregates recompute; trailing-edge upstream update; emitters die
-  when the last interest dies.
-- Incarnation change → old-incarnation observations Expired until the
-  new stream establishes continuity.
-
-### 4.8 Fold state: a keyed readiness overlay, not a bit
-
-The capability fold remains the one consumer-facing surface via a
-keyed overlay:
+The candidate population for an interest at a hop:
 
 ```
-capability_entry.readiness[ReadinessKey] → ReadinessObservation
+Candidates = CapabilityProviders(Y, C)      // fold: structural match
+           ∩ ProviderSelector                // §3.1
+           ∩ AuthorityScope                  // §4.10
+           ∩ Reachability                    // routing/proximity plane
 ```
 
-Consumers join the capability declaration (fold), route state
-(routing/proximity), and the conditional observation (overlay);
-queries filter on (capability, constraints digest, L); the fold
-change signal fires on overlay updates so existing watch surfaces
-light up. The overlay stores the internal
-`attested_status × continuity` pair and exposes only the projected
-three-state surface (§3.4).
-
-The **entry-level suspension flag** is reserved for *unconditional*
-loss only (X unreachable, Y withdrawn, authority revoked). One
-conditional observation never suspends the capability — a 4K@60
-Unknown must not hide a valid 720p@30 operating point.
-
-### 4.9 Authority: v1 boundary, enforced from session identity
-
-On-path forwarding solves integrity, not *disclosure*: A may route
-through B yet not be entitled to sense X/Y, and a relay
-re-registering upstream is a confused deputy risk. v1 boundary:
-
-- **Owner-root-only**, and the root is **derived from the
-  authenticated downstream session identity — never trusted from the
-  wire field**. "Wire says root R" is accepted only when the session
-  identity proves root R. The scope fields exist on the wire from day
-  one so tightening later isn't a wire break, but they are
-  cross-checked, not load-bearing.
-- **A relay never aggregates interests from different disclosure
-  classes into one upstream interest**, even when constraints are
-  otherwise identical. The interest digest already includes
-  `disclosure_class`; the per-hop table key MUST be the full digest so
-  this holds structurally, and the relay's upstream re-registration
-  carries the (single) root scope of its aggregation.
-- Cross-root sensing — delegation proofs, per-hop aggregation grants,
-  audience-restricted attestations — is a named follow-up on the
-  scoped-capabilities machinery. No cross-root claims in v1.
-
-### 4.10 Mixed-version negotiation and fallback
-
-Sensing support is advertised as a capability tag (`net.sensing@1`,
-the `ACK_RANGES_CAPABILITY_TAG` gating pattern):
+ranked by proximity (route metric, edge EWMA) and any existing
+readiness evidence. The result mode determines how much of the
+ranked set is actively sensed:
 
 ```
-next_hop(X) advertises net.sensing@1
-    → register interest through it (coalesced path)
-next_hop(X) does not, but X does
-    → direct non-coalesced sensing over an end-to-end session to X
-      (direct if one exists; else a routed session THROUGH the old
-      relay — routed relays forward encrypted frames opaquely without
-      dispatching their subprotocols, pinned by the three_node relay
-      tests)
-X does not advertise net.sensing@1
-    → Unknown
+CandidatePolicy {
+    initial_fanout:  1,     // Any: start with the best candidate
+    standby_count:   1,     // optional warm standby
+    maximum_fanout:  3,     // hard exploration bound
+}
 ```
 
-The fallback loses coalescing, never correctness. **SI-0 test 10 must
-exercise the real dispatch path** — an actual old-version relay
-carrying the routed fallback frames — not merely the feature-selection
-function.
+- **Any**: sense the best candidate (+ optional standby). Once one
+  candidate is established Ready, stop probing further candidates;
+  re-expand only when the satisfying observation expires or turns
+  NotReady. "Any provider of Y?" must never become "probe every
+  provider of Y".
+- **TopK(K) / Quorum(K)**: maintain up to max(K, policy) ranked
+  branches, bounded by `maximum_fanout` and config.
+- **Each is explicit surveillance** and gets guardrails: a maximum
+  resolved-provider cap, the cadence floor, scope limits, and a
+  structured **broad-selector refusal** — an accidental
+  `Tags(type=sensor) + Each + 50 ms` must be refused *before*
+  activating thousands of high-frequency streams, with the match
+  count in the refusal.
 
-### 4.11 Division of labor across existing planes
+Exact fanout values are configuration/application policy, not
+protocol semantics; the protocol only needs to identify the
+interest, associate provider attestations, suppress duplicate
+exploration, and stop or shrink sensing when the mode is satisfied.
+
+Candidate sets are **locally resolved and may differ across hops**
+(different folds know different providers) — that is expected; the
+interest digest keeps the *demand* merged, attestations flowing back
+repair divergent views, and the bounded fanout caps the cost of
+disagreement.
+
+Membership dynamics ride existing machinery: fold changes (new
+provider announces Y, generation bumps, withdrawal) recompute the
+eligible set event-driven; a `Group` interest addresses the stable
+`GroupRef` — membership changes recompute candidates without
+rebuilding the interest (§4.10).
+
+### 4.8 Failure-plane integration (per provider)
+
+- `next_hop(P)` Failed / RT-5 withdrawal toward candidate P → all
+  `(interest, P, *)` observations' continuity → Expired; the
+  aggregate view recomputes (Any may fail over to the standby or
+  expand); branches re-register along promoted routes.
+- Downstream loss → drop its rows; derived aggregates recompute;
+  emitters die when the last interest dies.
+- Provider incarnation change → that provider's observations
+  Expired until its new stream establishes; cached floors for it
+  invalidate.
+- Provider generation change → new `ProviderObservationKey`; the old
+  generation's observation is disrupted; the *interest* survives
+  untouched (it never bound the generation).
+
+### 4.9 Fold state: a two-level readiness overlay
+
+```
+capability_entry.readiness[interest_digest] → {
+    aggregate:  CapabilityReadinessView,          // §3.5 projection
+    candidates: Map<(provider, generation) → ReadinessObservation>,
+}
+
+CapabilityReadinessView {
+    status:     Ready | NotReady | Unknown,   // scalar modes
+    supporting: [provider proofs]             // Each: the full map
+}
+```
+
+Consumers join the capability declaration (fold), route state, and
+the observations; the fold change signal fires on overlay updates.
+The **entry-level suspension flag** stays reserved for
+*unconditional* loss only — one conditional observation, and equally
+one provider's NotReady inside a group, never suspends the
+capability entry (a 4K@60 Unknown must not hide a valid 720p@30
+operating point; camera B failing must not flatten the group).
+
+### 4.10 Authority: v1 boundary, enforced from session identity
+
+Unchanged v3 core: **owner-root-only**, root derived from the
+authenticated downstream session identity (wire scope fields
+cross-checked, never load-bearing); a relay never aggregates
+interests across disclosure classes or audiences (structural via the
+digest); cross-root sensing is a named follow-up on
+scoped-capabilities. v4 additions:
+
+- **Tags require provenance.** Selector tags are not equivalent
+  self-assertions: `color=true` is provider-authored description,
+  `calibrated=true` or `safety_certified=true` implies an authority.
+  The candidate filter accepts a tag match only when the assertion's
+  provenance satisfies the selector's policy; for the v1 owner-root
+  boundary, owner-authored (owner-root-signed) tags and groups are
+  sufficient, and a provider must not enter a candidate set by
+  self-labeling an authority-implying tag. The fold's tag provenance
+  surface (asserted_by, generation, scope, signature) is the SI-2+
+  integration point; the SI-0 spike models provenance as an
+  authority commitment per assertion.
+- **Groups are stable scoped identities**: interests address a
+  `GroupRef` (owner root + group id), never a copied member list;
+  local folds materialize membership; membership generation changes
+  recompute candidates.
+
+### 4.11 Mixed-version negotiation and fallback
+
+Unchanged pattern (`net.sensing@1` capability tag, opaque routed
+fallback through old relays, degrade to Unknown — never silent
+breakage), with one v4 note: the fallback path applies per candidate
+branch; a branch whose next hop lacks the tag falls back to
+end-to-end sensing of that candidate over a routed session. SI-0
+test 10 must still exercise the real dispatch path.
+
+### 4.12 Division of labor across existing planes
 
 | Plane | Role | Why not more |
 |---|---|---|
-| Capability fold | Facts + the only consumer surface; keyed readiness overlay (§4.8) | Its transport is the announcement flood; carries no per-(C, L) evaluation |
-| Proximity graph / routing table | Aggregation tree, edge latencies, failure edges | Pingwaves are unsigned raw UDP, TTL-flooded, heartbeat-locked cadence |
-| Interest-scoped attestations (new) | Delivery only: a signed sampling amplifier for keyed overlay entries | Not a store — every admitted attestation immediately becomes overlay state |
+| Capability fold | Facts, candidate structure (who provides Y/C), the only consumer surface (two-level overlay §4.9) | Announce-flood transport; no per-(C, L) evaluation |
+| Proximity graph / routing table | Candidate ranking, aggregation trees per branch, failure edges | Unsigned raw-UDP pingwaves, heartbeat-locked |
+| Sensing plane (new) | Delivery + join: coalesced interests, bounded branches, signed per-provider attestations, result-mode views | Not a store; not a query planner; no Boolean algebra |
+| Scheduler / application | Compound AND, quorum policy across capabilities, substitution, reservation + atomic claim | Owns semantics the wire must not |
 
 ## 5. Config surface
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `enable_sensing_coalescing` | `false` | whole plane off — v1 ships dark |
-| `sensing_interest_ttl` | 30 s | default soft-state lifetime; refresh at ttl/2, drop after 2 missed |
-| `max_interests_per_peer` | 512 | per-downstream inbound cap (amplification bound) |
-| `max_constraint_bytes` | 1 KiB | inline canonical constraints; larger = InvalidConstraints (CAS deferred) |
-| `attestation_cadence_floor` | 50 ms | below this, the interest is refused with `sampling_interval_unsupported` |
-| `continuity_factor` | 3 | k in the stream-suspicion window (§4.5) |
+| `sensing_interest_ttl` | 30 s | soft-state lifetime; refresh ttl/2, drop after 2 missed |
+| `max_interests_per_peer` | 512 | per-downstream inbound cap |
+| `max_constraint_bytes` | 1 KiB | inline canonical constraints cap |
+| `attestation_cadence_floor` | 50 ms | below this, structured refusal |
+| `continuity_factor` | 3 | k in the suspicion window |
+| `candidate_initial_fanout` | 1 | Any-mode starting branches |
+| `candidate_standby_count` | 1 | warm standby beyond the satisfying candidate |
+| `candidate_max_fanout` | 3 | hard per-interest exploration bound |
+| `each_mode_max_providers` | 32 | Each refuses selectors matching more (broad-selector refusal) |
 
 ## 6. Slices
 
 - **SI-0 — semantic spike (gates everything; in-process, no new
-  subprotocols).** Define and test:
-  1. canonical `ReadinessKey` + `interest_digest` (blake3,
-     domain-separated, 256-bit);
-  2. the L / D / ttl split and each dimension's rule (§3.3),
-     including the retirement of evidence-age language;
+  subprotocols).** As-built for items 1–15 under v3.1 keys
+  (`behavior::sensing`, tests passing); the v4 re-scope adds items
+  16–21 and re-keys 1/7/9/15:
+  1. canonical `CapabilityInterestKey` + interest digest — v4:
+     selector + result mode IN, provider + generation OUT;
+     `ProviderObservationKey` beneath; canonical selector encodings
+     (sorted/deduped Nodes, sorted Tags conjunction);
+  2. the L / D / ttl split (unchanged, as-built);
   3. inline constraint canonicalization + digest validation +
-     `InvalidConstraints` handling;
-  4. incarnation semantics **including the persistence failure
-     matrix** (§4.6: crash-between-increment-and-persist, FS
-     rollback, restored backup, cloned identity with two live
-     emitters, exhaustion);
-  5. owner-root check derived from authenticated session identity
-     (wire field cross-checked, never load-bearing);
-  6. keyed readiness overlay with the
-     `attested_status × continuity → projection` table (§3.4);
-  7. **test:** two simultaneous interests on one capability, one
-     Ready and one NotReady — independent observations, neither
-     suspends the other;
-  8. **test:** origin restart behind a relay — new incarnation
-     admitted, delayed old-incarnation Ready rejected;
-  9. **test:** one downstream expires while another refreshes —
-     aggregates shrink, survivor unaffected;
-  10. **test (real path):** old-version relay on the route — the
-      fallback's routed frames traverse the old relay opaquely and
-      sensing runs end-to-end, or degrade to Unknown; no silent
-      breakage;
-  11. **test:** relay down-sampling — a looser watcher delivered at
-      its own D is never false-Unknowned; a status edge is never
-      held; a late joiner's cached Ready projects Unknown until a
-      continuity-bearing strictly-newer attestation
-      (single-hop freshness-laundering tripwire), while a cached
-      NotReady projects immediately;
-  12. the frozen `ReadinessEvaluator` contract (§4.4), the
-      unsupported-cadence structured refusal, and the
-      digest-mismatch security counter;
-  13. **test (multi-hop laundering):** `X → C → B → A` with C holding
-      cached seq 101, B holding cached seq 100, X silent. A registers
-      → warm-started with 100 → Unknown. C's cached 101 later reaches
-      A via B's schedule → **A must still be Unknown** (B's upstream
-      continuity was never Established). X emits live seq 102 →
-      continuity establishes hop-by-hop → A may project Ready;
-  14. **test (Unestablished expiry):** a warm-started cached NotReady
-      whose stream never produces a qualifying newer beat expires to
-      Unknown at the establishment deadline — stale pessimism cannot
-      persist indefinitely;
-  15. **test (refusal partitioning):** A requests 20 ms, C requests
-      100 ms, provider floor 50 ms → A gets
-      `sampling_interval_unsupported`, C receives its 100 ms stream,
-      the relay re-registers the satisfiable aggregate exactly once
-      (cached M, no refusal/retry loop), and the cached M invalidates
-      on generation/incarnation change.
-- **SI-1 — wire types + gates.** Codecs + signing for the
-  SI-0-frozen shapes; incarnation-scoped seq gate; the
-  **signature-cost benchmark** (sign CPU at cadence floor, verify at
-  realistic fan-out, packet sizes) on the plain
-  one-signature-per-attestation path before any batching cleverness.
-  **Gate — SI-1 does not start until all of:**
-  (a) cached Ready cannot become fresh by being forwarded, single-hop
-  (test 11); (b) multi-hop cached sequence advancement cannot
-  establish continuity unless every upstream relay has established
-  continuity (test 13); (c) Unestablished expires to Expired when no
-  qualifying newer beat arrives (test 14); (d) an unsupported strict
-  subscriber is partitioned and cannot poison a satisfiable aggregate
-  (test 15); (e) the interest digest binds the validated
-  audience/root commitment, not only a generic disclosure class
-  (item 1); (f) seq deltas remain admission/diagnostic information
-  only — no readiness inference depends on emission-rate estimation
-  (§4.4); (g) the continuity-vs-evidence-validity split is frozen in
-  the observation model; (h) the old-relay fallback is exercised
-  through the real routing path (test 10); (i) owner-root scope
-  derives from authenticated identity (item 5); (j) the evaluator
-  result model is frozen (item 12).
-- **SI-2 — interest table.** Per-downstream soft state, derived
-  aggregates, trailing-edge upstream propagation, caps,
-  disclosure-class-separated keys.
-- **SI-3 — origin emitter.** Inline-constraint validation,
-  per-interest predicate evaluation via the evaluator trait, cadence
-  + status-edge emission, cadence refusal.
-- **SI-4 — relay delivery + overlay application.** Cache, packing,
-  down-sampling, immediate-edge flush, Provisional warm-start,
-  admission gate, continuity transitions, fold-overlay apply.
-  Flagship three-node test: two watchers with different D behind one
-  relay — X's send count tracks branches not watchers; the strict
-  watcher sees full cadence while the loose one is delivered at its
-  own D (packet-count asserted); a status edge reaches both
-  immediately; Unknown inside each consumer's own continuity window
-  on silence (heartbeat parked out of the window, RT-4/RT-5 test
-  discipline).
+     `InvalidConstraints` (as-built);
+  4. incarnation semantics + persistence failure matrix (as-built);
+  5. owner-root check from authenticated session identity (pending
+     with old-relay fallback work);
+  6. per-provider observation + projection table (as-built) +
+     generation-crossing disruption;
+  7. **test:** two interests on one capability independent
+     (as-built); v4: equally, one provider's NotReady inside a
+     group never flattens the group (Each map, item 18);
+  8. **test:** origin restart behind relay (as-built);
+  9. **test:** downstream expiry independence (as-built, re-keyed);
+  10. **test (real path):** old-version relay fallback (pending);
+  11. **test:** down-sampling, edges never held, provisional
+      warm-start both polarities (as-built);
+  12. evaluator contract + cadence refusal + security counter
+      (as-built; v4: request drops the generation parameter);
+  13. **test (multi-hop laundering):** staggered caches X→C→B→A
+      (as-built);
+  14. **test:** Unestablished expiry (as-built);
+  15. **test:** refusal partitioning A@20ms/C@100ms/floor 50ms
+      (as-built; re-keyed per provider);
+  16. **test (v4 flagship — coalesce before selection):** A and C
+      both want "any color A4 printer" with different local
+      provider rankings → identical interest digest → ONE table
+      entry at relay R → one bounded candidate branch probed → one
+      printer signs Ready → both receive the same provider proof;
+  17. **test:** `Node(P1)` selector — digest distinct from
+      `AnyAuthorized` with the same predicate; resolution returns
+      exactly P1 (the v3 path);
+  18. **test (Group/Each):** three providers, three independent
+      observations; one NotReady/failure never flattens the map;
+  19. **test (Tags/Any + authority):** a structurally matching
+      provider with a self-asserted authority-implying tag is
+      excluded; the authorized assertion enters the candidate set;
+  20. **test (Quorum):** readiness flips as the established-Ready
+      count crosses K, degrades to Unknown when it drops below with
+      candidates unresolved, and NotReady only with the bounded set
+      complete;
+  21. **test (broad-selector cap):** an `Each` interest whose
+      selector matches more than `each_mode_max_providers` is
+      refused with the match count BEFORE any stream activates;
+  22. **conservative-projection rule pinned:** no NotReady without
+      `complete`; `AnyAuthorized`/`Tags` populations are never
+      `complete` in v1.
+- **SI-1 — wire types + gates.** Codecs + signing for the SI-0
+  shapes (now including selector/result-mode canonical forms);
+  incarnation-scoped seq gate on the LRU shape; the signature-cost
+  benchmark. **Gate — SI-1 does not start until all of:**
+  (a)–(j) as v3.1 (all mapped to as-built tests/definitions), plus:
+  (k) the interest digest binds selector + result mode and excludes
+  provider + generation (item 1, test 17); (l) equivalent interests
+  coalesce before provider selection (test 16); (m) candidate
+  exploration is bounded and Any stops on satisfaction (item 21 +
+  resolver tests); (n) no NotReady projection without a complete
+  bounded authoritative set (item 22); (o) Each guardrails refuse
+  broad selectors before stream activation (test 21).
+- **SI-2 — interest table + candidate resolver wiring.**
+  Per-downstream soft state on real sessions; resolver over the real
+  capability fold + proximity ranking + tag provenance; trailing-edge
+  upstream propagation; caps.
+- **SI-3 — origin emitter.** Per-interest predicate compilation via
+  the evaluator trait against the provider's current generation;
+  cadence + edge emission; refusals.
+- **SI-4 — relay delivery + overlay application.** Per-provider
+  caches, packing, down-sampling, hop rule, admission gate, overlay
+  apply, aggregate views. Flagship three-node test from v3 (two
+  watchers, different D, branch-counted emission) plus test 16 on
+  the real path.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
-  incarnation-change / generation-change → Expired continuity +
-  re-registration; rides the route_withdraw harness.
-- **SI-6 — scheduler bridge.** Remote conditional observations join
-  candidate pruning through the same projection seam as local
-  liveness; entry-level suspension stays reserved for unconditional
-  loss; stale optimism is bounded by the claim path's authoritative
-  recheck. SDK exposure deferred.
-- **SI-7 — docs + observability.** Stats (interests_active,
-  attestations emitted/forwarded/gated/expired, continuity
-  transitions, refusals, fallback_selections), status_reason
-  distributions, BEHAVIOR.md + SUBPROTOCOLS.md entries.
+  incarnation / generation → per-provider expiry + candidate
+  recompute + re-registration.
+- **SI-6 — scheduler bridge.** Aggregate views join candidate
+  pruning through the same projection seam as local liveness;
+  compound AND/gang semantics stay in the scheduler; claim path
+  targets the selected provider.
+- **SI-7 — docs + observability.** Stats (+ candidate fanout,
+  refusals by kind incl. broad-selector, aggregate transitions),
+  BEHAVIOR.md + SUBPROTOCOLS.md.
 
 Dependency order: SI-0 → SI-1 → SI-2 → SI-3 → SI-4; SI-5/SI-6 after
 SI-4; SI-7 last.
 
 ## 7. Risks / watch-outs
 
-- **The three permanent tripwires:** (1) any code path reducing a
-  `ReadinessKey`-scoped observation to an entry-level effect is a bug
-  (SI-0 test 7); (2) any code path projecting Ready from
-  `continuity = Unestablished` is a bug — freshness laundering
-  reintroduced (SI-0 test 11); (3) any relay delivering
-  continuity-bearing Ready while its own upstream continuity is not
-  Established is a bug — multi-hop laundering reintroduced (SI-0
-  test 13).
-- **Relay suppression/delay is not a new power** — the forwarder is
-  `next_hop(X)`. Holds only while strictly on-path. Disclosure
-  authority is §4.9's boundary; time-shifting a buffered stream is
-  §4.5's stated v1 trust assumption, not a solved problem.
-- **Tree churn.** Reroute strands old-branch interests until
-  soft-state expiry; event-driven re-registration bounds the common
-  case; keep cleanup asynchronous.
-- **Amplification.** `max_interests_per_peer`, inline-size cap,
-  cadence floor with structured refusal, one-hop interest travel
-  (a relay re-registers under its own quota).
-- **State bounds.** Soft state + TTL + caps for tables; LRU-bounded
-  admission gates — evict idle tail, never clear active pairs'
-  ordering.
-- **Sparse interest is comparable to, not cheaper than, a direct
-  probe stream.** The claim is "coalescing activates only at
-  fan-in", not "costs nothing". Off by default.
-- **Signing cost unproven at cadence** — SI-1's benchmark gates the
-  floor default before any batching design.
-- **Down-sampling makes same-key seq gaps normal.** Never loss or
-  reorder evidence, and — v3.1 — never an input to readiness,
-  continuity, or failure transitions: emission-rate inference is
-  diagnostics-only (§4.4). A future "gap detector" or rate-based
-  health signal here would be an accidental second health protocol
-  confounded by edges, min-gaps, jitter, and pre-relay loss.
-- **Cross-plane ordering.** Attestations and pingwaves/withdrawals
-  share no counter; strictest signal wins (Unknown for scheduling);
-  anti-entropy repairs.
+- **The four permanent tripwires:** (1) any code path reducing a
+  keyed observation to an entry-level effect (test 7/18); (2) any
+  path projecting Ready from Unestablished continuity (test 11);
+  (3) any relay delivering continuity-bearing Ready without its own
+  Established upstream continuity (test 13); (4) **any path
+  projecting capability-level NotReady without a complete bounded
+  candidate set** (item 22) — absence-of-providers is a claim v1
+  cannot generally prove.
+- **Candidate-set divergence.** Different hops resolve different
+  candidates from different folds. Bounded fanout caps the cost;
+  attestations repair views; the digest keeps demand merged. A
+  branch flap storm (candidates churning under proximity jitter)
+  needs damping in the resolver (reuse the RT-1 trailing-edge gate
+  shape).
+- **Each-mode amplification.** The whole reason for the
+  broad-selector refusal + `each_mode_max_providers`; also the
+  existing per-downstream caps and cadence floor.
+- **Tag authority spoofing.** Self-asserted `safety_certified=true`
+  entering candidate sets is an authority bug, not a sensing bug —
+  the filter must check provenance (§4.10) and the SI-2 fold
+  integration must not regress it.
+- **Relay suppression/delay is not a new power** (unchanged);
+  time-shifting buffered streams is §4.5's stated trust assumption.
+- **Tree churn / reroute** strands branch interests until soft-state
+  expiry; event-driven re-registration bounds the common case.
+- **State bounds:** soft state + TTL + caps; LRU-bounded gates —
+  evict idle tails, never active ordering.
+- **Down-sampling seq gaps stay diagnostics-only** (unchanged).
+- **Signing cost unproven at cadence** — SI-1 benchmark before any
+  batching design.
+- **Cross-plane ordering:** attestations vs pingwaves/withdrawals
+  share no counter; strictest signal wins; anti-entropy repairs.
 
 ## 8. Done criteria
 
-- The conditional relation survives end-to-end: SI-0 tests 7–15 pass
-  unchanged once the real wire path replaces the in-process spike.
-- N watchers behind one relay: X's attestation send count tracks
-  (branches × distinct interests), not N (SI-4, test-pinned).
+- The existential primitive works end-to-end: a consumer asking
+  `AnyAuthorized + Any` for (Y, C, L) receives Ready with a signed
+  provider proof, without ever naming a provider (test 16 on the
+  real path, SI-4).
+- Equivalent capability interests from consumers with different
+  local provider preferences coalesce into one interest, one
+  candidate exploration, one provider stream (test 16).
+- Explicit surveillance works: `Node(X)` reproduces the v3 tree;
+  `Group + Each` yields the un-flattened per-member map (tests
+  17/18).
+- Candidate exploration is bounded: Any stops probing once
+  satisfied (+ standby); Each over the cap is refused before
+  activation (test 21); "any provider of Y" never becomes "probe
+  every provider of Y".
+- SI-0 tests 7–22 pass unchanged once the real wire path replaces
+  the in-process spike.
 - **A cached Ready never projects Ready without established
-  continuity** — under warm-start, relay delay, and multi-hop
-  cache chains with staggered cached sequences (the single- and
-  multi-hop freshness-laundering criteria, tests 11 + 13).
-- Stale pessimism cannot persist: Unestablished observations expire
-  at the establishment deadline (test 14); one impossible cadence
-  never starves a satisfiable co-subscriber (test 15).
-- Readiness observable ONLY through the fold's keyed overlay;
-  scheduler consumes through the same seam as local liveness; entry
-  suspension fires only on unconditional loss.
-- Continuity expires within its window on silence, and immediately on
-  route withdrawal, path failure, incarnation change, or generation
-  change; unsupported cadence produces the structured refusal, never
-  a doomed stream.
-- Old relay on path → measured fallback over the real routed path;
-  zero silent breakage.
-- Zero idle cost with no interests; flag off → plane inert.
-- No plan or code text claims an evidence-age bound; the contract
-  language is the honest continuity contract (§1).
+  continuity** — warm-start, relay delay, multi-hop chains (tests
+  11 + 13); stale pessimism expires (test 14); one impossible
+  cadence never starves a satisfiable co-subscriber (test 15).
+- **No capability-level NotReady without a complete bounded
+  candidate set** (item 22).
+- N watchers behind one relay: provider emission tracks branches ×
+  distinct interests, not watchers (SI-4, test-pinned).
+- Readiness observable ONLY through the fold's two-level overlay;
+  entry suspension only on unconditional loss; scheduler consumes
+  through the same seam as local liveness.
+- Old relay on path → measured fallback per branch; zero silent
+  breakage. Zero idle cost with no interests; flag off → inert.
+- No plan or code text claims an evidence-age bound.
 
 ## 9. Non-goals
 
-- **Evidence-age (strong freshness) guarantees** — requires a
-  challenge/nonce-echo or origin-monotonic-time correlation protocol
-  (review Option B); named follow-up, explicitly out of v1.
+- **Evidence-age (strong freshness) guarantees** — named follow-up
+  (challenge/nonce-echo or origin-monotonic-time correlation).
+- **Arbitrary Boolean selector or compound capability expressions on
+  the wire** — `(A OR B) AND NOT C`, multi-capability AND, quorum
+  policy across capabilities: local views and scheduler policy, not
+  protocol. v1 selectors are the closed §3.1 set with exact
+  conjunction tags.
+- **Full capability-name interest routing (NDN-style).** v1 resolves
+  bounded candidates from local folds and routes per branch; a relay
+  network that routes interests by capability name alone —
+  distributed query execution — is deliberately deferred, and even
+  then the object sought is an authority-bound execution condition,
+  not replaceable cached content.
+- Node-only surveillance without a capability predicate — that is
+  the proximity/failure plane; not faked as `capability = *`.
 - Constraint implication/subsumption (exact digest match only).
 - CAS-backed large constraints (inline-only in v1).
 - Clock synchronization or wall-clock freshness validation.
 - Off-path observer selection.
-- Cross-root authority propagation (follow-up on scoped-capabilities;
-  v1 is owner-root-only).
-- Signed-batch / hash-chain attestation optimizations (measure the
-  plain signature path first).
+- Cross-root authority propagation (v1 owner-root-only).
+- Signed-batch / hash-chain attestation optimizations.
 - A general multicast data plane — sensing only.
-- Automatic work recovery: this plane updates readiness state and
-  emits transitions; it never retries, migrates, or substitutes work.
+- Automatic work recovery (no retries, migration, substitution —
+  the plane reports; applications act).
 - SDK/FFI bindings (follow-up once the substrate soaks).
