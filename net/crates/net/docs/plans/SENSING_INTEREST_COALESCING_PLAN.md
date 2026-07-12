@@ -317,9 +317,30 @@ latest attestation per `ReadinessKey` and:
   optimism exposure is one continuity window — identical to the
   delay power a forwarder already has, so no new trust surface.
 
+**Latest-per-key, never history.** A relay forwards the latest
+attestation per key — not the accumulated batch of intermediates.
+The batch carries no information the downstream can't already get:
+status flaps were flushed as immediate edges; evidence age comes from
+the latest beat + continuity window + proximity edge latencies; and
+origin *emission continuity* is recoverable from the latest beat
+alone, because `seq` increments per origin emission — across two
+deliveries, `Δseq × promised_cadence / Δt ≈ 1` means the origin
+emitted smoothly regardless of relay down-sampling (which never
+consumes seqs), while a shortfall means beats went missing upstream
+(origin intermittency or an origin↔relay path flap — the downstream
+cannot distinguish these, and must not label the signal "origin was
+down"). A consumer that wants the full temporal pattern simply
+registers `S ≈ promised_cadence` — down-sampling degenerates to
+full-stream delivery; "latest" and "batch" are the two ends of the S
+knob, not modes. Consumers MAY maintain a derived, locally-computed
+emission-continuity ratio (EWMA of the seq statistic) on the
+observation; it is never relay-asserted.
+
 The relay never alters bytes (signature-protected); down-sampling
 means intentional same-key seq gaps at looser watchers, so seq gaps
-MUST NOT be treated as a loss signal anywhere.
+MUST NOT be treated as transport loss or reorder evidence anywhere —
+the sanctioned use of seq deltas is the emission-rate inference
+above, nothing else.
 
 ### 4.5 Freshness by cadence continuity, not clocks
 
@@ -551,7 +572,10 @@ SI-4; SI-7 last.
 - **Down-sampling makes same-key seq gaps normal.** No layer may
   treat an attestation seq gap as loss or reorder evidence — the gate
   is strictly-newer-wins, nothing more. A future "gap detector" would
-  false-alarm on every down-sampled subscriber.
+  false-alarm on every down-sampled subscriber. The one sanctioned
+  seq-delta use is the emission-continuity ratio (§4.4), which is
+  immune to down-sampling by construction and must be labeled
+  "upstream discontinuity", never "origin down".
 - **Warm-start optimism is bounded, not zero.** A cached handoff can
   be up to one continuity window stale before the first live delivery
   corrects it — the same exposure as a relay delaying live traffic,
