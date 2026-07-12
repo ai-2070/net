@@ -1,0 +1,30 @@
+net/crates/net/tests/natsim/setup.sh
+  s_d15043c27a0f20::t_cbdabc43a9ce63 49-65,68-71
+  s_d15043c27a0f20::t_6ed3f96728e43f 129-141,146,150-152,160-164
+  s_d15043c27a0f20::t_410563286a5c66 72
+net/crates/net/examples/natsim_node.rs
+  s_d15043c27a0f20::t_cacc72ba24655f 283-290
+.github/workflows/natsim.yml
+  s_d15043c27a0f20::t_7522e218f8176d 18,22-26
+net/crates/net/tests/natsim.rs
+  s_d15043c27a0f20::t_b8167185045589 152-239
+net/crates/net/tests/natsim/run_scenario.sh
+  s_d15043c27a0f20::t_a11228b3d165b8 116-121
+  s_d15043c27a0f20::t_cbbfc006089c71 28-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "35660a25e6bbef53081cd08b475747469851477d",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

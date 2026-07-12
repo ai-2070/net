@@ -1,0 +1,74 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_d15043c27a0f20::t_be76d84b04b512 2572-2604
+  s_d15043c27a0f20::t_d91408530edff1 268-269,276-279,286-314
+  s_d15043c27a0f20::t_ee422027eeb922 1526-1529
+  s_d15043c27a0f20::t_37c7e54a40044f 1190-1203
+  s_d15043c27a0f20::t_c9643f03557f39 1660-1665,1670
+  s_d15043c27a0f20::t_8d5aa6b903d6a5 2497-2503,2512,2514-2522
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_d15043c27a0f20::t_ac32e91fb0991c 633-636
+  s_d15043c27a0f20::t_fed7f83c5bbb29 912-942
+go/net.h
+  s_d15043c27a0f20::t_dbb4e819c77ec3 607-609,615-644,655-662
+  s_d15043c27a0f20::t_d6a400e66006f7 663
+net/crates/net/sdk/src/mesh.rs
+  s_d15043c27a0f20::t_01f59f222c9ddb 123-124,146-147,266-283,313-315
+  s_d15043c27a0f20::t_f4bb8bcb02ab70 316
+net/crates/net/bindings/python/tests/test_traversal_stats.py
+  s_d15043c27a0f20::t_674e344988a5db 1-65
+go/traversal_stats_test.go
+  s_d15043c27a0f20::t_fc2a3a462e8b2c 1-85
+web/src/content/docs/guides/nat-and-traversal.md
+  s_d15043c27a0f20::t_a77aed16723841 13
+  s_d15043c27a0f20::t_2eac89ea8dd27d 42-49
+  s_d15043c27a0f20::t_ce32e176c9181a 64,69-74
+go/mesh.go
+  s_d15043c27a0f20::t_2688b1ff95a1be 425-426,429-431,435-445,447-459
+  s_d15043c27a0f20::t_5682ae866df075 161-174
+  s_d15043c27a0f20::t_1b68e84d8c527a 627-650
+  s_d15043c27a0f20::t_dc17baa4006038 564-565,572-573,577-591
+net/crates/net/include/README.md
+  s_d15043c27a0f20::t_de1d9e3a6f86a2 305,315
+net/crates/net/docs/plans/NAT_TRAVERSAL_V2_PLAN.md
+  s_d15043c27a0f20::t_4a0b0ae410ac2f 306-307,310-339
+  s_d15043c27a0f20::t_4e7abfb18160d6 340
+net/crates/net/include/net.go.h
+  s_d15043c27a0f20::t_83c90c07dfb083 624-626,632-661,672-679
+  s_d15043c27a0f20::t_3b19c65f9f4d5a 680
+net/crates/net/bindings/node/test/traversal_stats.test.ts
+  s_d15043c27a0f20::t_1e8f077dc0bd97 1-43,58-80
+  s_d15043c27a0f20::t_136e52ddca1e41 44-57
+net/crates/net/src/ffi/mesh.rs
+  s_d15043c27a0f20::t_0e7719a88b8a31 447-453
+  s_d15043c27a0f20::t_8b6e58aec0ed76 577-583
+  s_d15043c27a0f20::t_aac2c1426ac6f6 1422-1440
+  s_d15043c27a0f20::t_dd3acb90d0049c 4077-4152
+  s_d15043c27a0f20::t_7935811805fb8e 4832-4845
+  s_d15043c27a0f20::t_43b82d05bf007c 1137-1276
+net/crates/net/bindings/python/src/lib.rs
+  s_d15043c27a0f20::t_3e5f0757622f0c 1249-1256
+  s_d15043c27a0f20::t_ce4a79d4221040 1484-1489,1491-1494,1499
+  s_d15043c27a0f20::t_d6a78e31e2cf37 1220
+  s_d15043c27a0f20::t_7fae4abdd8c5f4 2672-2690,2701,2703-2714
+  s_d15043c27a0f20::t_80b98e07843831 1326-1331
+  s_d15043c27a0f20::t_6376d8bd11094c 3104-3107,3112
+  s_d15043c27a0f20::t_7e4cab4b71eec0 2766-2805
+net/crates/net/sdk/tests/mesh_nat_traversal.rs
+  s_d15043c27a0f20::t_bd11ae1916184d 50-57,69,71-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "412fde300ebcda816f2b2b2813dcebdd4113685c",
+  "prompts": {},
+  "sessions": {
+    "s_d15043c27a0f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47de36b5-a0ab-46ec-8280-668f1f28ce92",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
