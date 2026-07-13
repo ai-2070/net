@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_14a424b2679724 11498-11513
+  s_c28bdf38c0df3a::t_c04a69f91dbde7 11315,11326-11339,11361-11363,11368
+  s_c28bdf38c0df3a::t_38149cc2d1d092 10959-10969
+  s_c28bdf38c0df3a::t_47ec8316a9df89 11131-11144
+  s_c28bdf38c0df3a::t_092b1bbfbfadc0 11262-11264,11275-11277,11279-11282
+  s_c28bdf38c0df3a::t_0932a297438b40 6050
+  s_c28bdf38c0df3a::t_6106015c7abbb6 6033-6034,6042-6049
+  s_c28bdf38c0df3a::t_cf4de20914f8cb 4637-4644
+  s_c28bdf38c0df3a::t_608239587070a2 6097,6100-6101,6105,6107-6111,6114-6117,6119,6136-6145
+  s_c28bdf38c0df3a::t_8e2a60c76ee4b9 4183-4202,4208
+  s_c28bdf38c0df3a::t_b3258f411f6043 3013-3023,3031-3034
+  s_c28bdf38c0df3a::t_61fd4244178336 9008-9012,9020-9022,9024-9025,9027-9030
+  s_c28bdf38c0df3a::t_bb6ca5c0cdb747 2839-2848
+  s_c28bdf38c0df3a::t_5ba9998d398073 4501-4509
+  s_c28bdf38c0df3a::t_9096d49b80a3cf 4555-4564,4568-4574,4588-4593
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_feb38edff3c8f3 87-90
+net/crates/net/src/adapter/net/behavior/sensing/emitter.rs
+  s_c28bdf38c0df3a::t_808fe79de685e7 616
+  s_c28bdf38c0df3a::t_e7e4408cb83828 864,866-868,941-945
+  s_c28bdf38c0df3a::t_a4824c18462be6 2-6,25-54,71-81,89-104,107,121-129,141-181,186-187,198-201,216-284,295-296,299-300,305-308,313-317,319-323,329,339-345,349-358,364-365,369-375,385,393,401-405,410,412,421-423,426-428,432-452,474,494-495,497-501,503,514-525,527,533-536,593,617,634-651,665-667,676-714,729,773,784,799,802-804,823-825,836,842,853-854,858,861-862,869-908,910-923,928,931,933,935-939,947-948,950-966,968,970-971,974,976,980-982
+  s_c28bdf38c0df3a::t_b1c701cba3bcd9 967,969,972-973,975,977-979,983
+  s_c28bdf38c0df3a::t_c5036fd294838a 112
+net/crates/net/tests/sensing_origin_emitter.rs
+  s_c28bdf38c0df3a::t_5857444add61cb 37-42
+  s_c28bdf38c0df3a::t_dfc97275d084c3 477-603
+  s_c28bdf38c0df3a::t_eae12d1e6aa8dd 604-606
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "a610590dc03004f239f3df22de1024d5813dbde1",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
