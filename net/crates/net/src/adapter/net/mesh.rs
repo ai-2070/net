@@ -1117,11 +1117,9 @@ struct DispatchCtx {
     /// SI-3c: the 0x0C03 intake's §4.6 observer gate. See the
     /// matching field on `MeshNode`.
     sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
-    /// SI-3c: latest admitted attestation per branch. See the
-    /// matching field on `MeshNode`.
-    sensing_observations: Arc<
-        parking_lot::Mutex<HashMap<sensing::ProviderInterestKey, sensing::ReadinessAttestation>>,
-    >,
+    /// SI-3c: the verified-observation seam (latest + refusals +
+    /// provider epochs). See the matching field on `MeshNode`.
+    sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2850,10 +2848,65 @@ fn sensing_interval_in_bounds(interval: Duration, ttl: Duration) -> bool {
 /// stored entry answered a branch this hop actually held rows for
 /// (the solicited check), so honest population is bounded by the
 /// interest table; the cap only guards the lag between a row's death
-/// and its observation's eviction. A NEW branch over the cap is
-/// dropped (never an eviction cascade) — the origin re-sends within
-/// one cadence.
+/// and its reclamation (closure item 6 — branch death reclaims on
+/// the sweep/deregister/partition paths, so the cap is a backstop,
+/// never the steady state). A NEW branch over the cap is dropped
+/// (never an eviction cascade) — the origin re-sends within one
+/// cadence.
 const MAX_SENSING_OBSERVATIONS: usize = 4096;
+
+/// SI-3c + closure items 3/6: the verified-observation seam behind
+/// the 0x0C03 intake. SI-4's relay caches (per-provider, keyed on
+/// the full `ProviderObservationKey`) subsume `latest`.
+#[derive(Default)]
+struct SensingObservations {
+    /// Latest ADMITTED ordinary attestation per branch — warm-start
+    /// status. Refusal beats never land here (closure item 6): they
+    /// are cadence-request-relative CONTROL responses, not a
+    /// provider-wide readiness observation, and must not warm-start
+    /// surviving downstreams.
+    latest: HashMap<sensing::ProviderInterestKey, sensing::ReadinessAttestation>,
+    /// Latest admitted refusal beat per branch, kept apart from
+    /// `latest` (closure item 6), age-stamped. A fully-partitioned
+    /// branch dies the moment its refusal lands, so the record
+    /// survives branch death as a TOMBSTONE (the refused consumer's
+    /// only trace of why) and the sweep reclaims it once it is
+    /// older than `sensing_interest_ttl` with no live branch behind
+    /// it — bounded lifetime, never cap-then-drop-forever.
+    refusals: HashMap<sensing::ProviderInterestKey, (sensing::ReadinessAttestation, Instant)>,
+    /// Last admitted `(incarnation, generation)` per origin
+    /// (closure item 3): a move on EITHER axis invalidates every
+    /// cached floor for that origin before the new epoch's state
+    /// applies — a floor learned under an older boot or capability
+    /// definition must not keep refusing registrations.
+    provider_epochs: HashMap<u64, (sensing::Incarnation, u64)>,
+}
+
+impl SensingObservations {
+    /// Branch death at this hop by WITHDRAWAL (sweep expiry,
+    /// deregister — nobody is left to care): drop everything the
+    /// branch pinned, including the origin's epoch record once its
+    /// last branch is gone (closure item 6 — cap-then-drop-forever
+    /// is not acceptable; the store must breathe with the table).
+    fn reclaim_branch(&mut self, key: &sensing::ProviderInterestKey) {
+        self.refusals.remove(key);
+        self.reclaim_status(key);
+    }
+
+    /// Branch death by REFUSAL PARTITION: the warm-start status and
+    /// epoch memory go, but the just-stored refusal stays as the
+    /// tombstone documenting the outcome (struct docs) — the sweep
+    /// ages it out.
+    fn reclaim_status(&mut self, key: &sensing::ProviderInterestKey) {
+        self.latest.remove(key);
+        let provider = key.provider;
+        if !self.latest.keys().any(|k| k.provider == provider)
+            && !self.refusals.keys().any(|k| k.provider == provider)
+        {
+            self.provider_epochs.remove(&provider);
+        }
+    }
+}
 
 /// SI-2a: admit-or-drop for one upstream interest update (see
 /// [`SENSING_UPSTREAM_MIN_GAP`]). Same entry/and_modify shape as the
@@ -3545,16 +3598,17 @@ pub struct MeshNode {
     /// its first live consumer. Keys on the transcript digest, so
     /// equivocation detection binds exactly the signed bytes.
     sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
-    /// SI-3c: latest ADMITTED attestation per branch — the verified
-    /// observation seam (decode → solicited check → signature →
-    /// seq gate → here). Deliberately minimal: SI-4's relay
+    /// SI-3c: the verified observation seam (decode → solicited
+    /// check → signature → seq gate → here): latest admitted status
+    /// per branch, refusal control responses kept apart (closure
+    /// item 6), and per-origin epoch memory for floor invalidation
+    /// (closure item 3). Reclaims with the interest table (branch
+    /// death on sweep/deregister/partition); bounded by
+    /// [`MAX_SENSING_OBSERVATIONS`] as a backstop. SI-4's relay
     /// delivery machinery (per-provider caches keyed on the full
     /// [`sensing::ProviderObservationKey`], packing, down-sampling,
-    /// hop rule) subsumes it. Bounded by
-    /// [`MAX_SENSING_OBSERVATIONS`].
-    sensing_observations: Arc<
-        parking_lot::Mutex<HashMap<sensing::ProviderInterestKey, sensing::ReadinessAttestation>>,
-    >,
+    /// hop rule) subsumes the `latest` half.
+    sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -4272,7 +4326,7 @@ impl MeshNode {
             sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
                 sensing::IncarnationSeqGate::new(),
             )),
-            sensing_observations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            sensing_observations: Arc::new(parking_lot::Mutex::new(SensingObservations::default())),
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -4705,13 +4759,29 @@ impl MeshNode {
         &self,
         key: &sensing::ProviderInterestKey,
     ) -> Option<sensing::ReadinessAttestation> {
-        self.sensing_observations.lock().get(key).cloned()
+        self.sensing_observations.lock().latest.get(key).cloned()
+    }
+
+    /// SI-3 closure item 6: the latest admitted REFUSAL beat for one
+    /// branch — a cadence-request-relative control response, kept
+    /// apart from the warm-start observation store so it can never
+    /// masquerade as provider-wide readiness.
+    pub fn sensing_latest_refusal(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<sensing::ReadinessAttestation> {
+        self.sensing_observations
+            .lock()
+            .refusals
+            .get(key)
+            .map(|(attestation, _)| attestation.clone())
     }
 
     /// SI-3c: how many branches hold an admitted observation (tests
-    /// + observability).
+    /// and observability). Reclaims with the interest table, so a
+    /// drained table drains this too (closure item 6).
     pub fn sensing_observation_count(&self) -> usize {
-        self.sensing_observations.lock().len()
+        self.sensing_observations.lock().latest.len()
     }
 
     /// SI-3c: whether this hop's observer gate poisoned an origin's
@@ -8884,6 +8954,8 @@ impl MeshNode {
         let enable_sensing_coalescing = self.config.enable_sensing_coalescing;
         let sensing_interest_table = self.sensing_interest_table.clone();
         let sensing_emitter = self.sensing_emitter.clone();
+        let sensing_observations = self.sensing_observations.clone();
+        let sensing_interest_ttl = self.config.sensing_interest_ttl;
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -9013,6 +9085,12 @@ impl MeshNode {
                             let actions =
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
+                                // Closure item 6: a dead branch
+                                // reclaims its observations with
+                                // the table.
+                                if action == sensing::UpstreamAction::Deregister {
+                                    sensing_observations.lock().reclaim_branch(&key);
+                                }
                                 if key.provider == local_node_id {
                                     // SI-3: this node is the origin —
                                     // the last row's expiry retires
@@ -9050,6 +9128,40 @@ impl MeshNode {
                                         bytes,
                                         );
                                     }
+                                }
+                            }
+
+                            // Closure item 6: age out refusal
+                            // TOMBSTONES — records that outlived
+                            // their partitioned branch (struct
+                            // docs) — once older than the soft-
+                            // state lifetime with no live branch
+                            // behind them. Two-phase so the
+                            // observation and table locks stay
+                            // sequential, never nested.
+                            let sweep_now = Instant::now();
+                            let aged: Vec<sensing::ProviderInterestKey> = {
+                                let observations = sensing_observations.lock();
+                                observations
+                                    .refusals
+                                    .iter()
+                                    .filter(|(_, (_, stored_at))| {
+                                        sweep_now.duration_since(*stored_at)
+                                            >= sensing_interest_ttl
+                                    })
+                                    .map(|(key, _)| key.clone())
+                                    .collect()
+                            };
+                            if !aged.is_empty() {
+                                let dead: Vec<sensing::ProviderInterestKey> = {
+                                    let table = sensing_interest_table.lock();
+                                    aged.into_iter()
+                                        .filter(|key| !table.has_entry(key))
+                                        .collect()
+                                };
+                                let mut observations = sensing_observations.lock();
+                                for key in dead {
+                                    observations.refusals.remove(&key);
                                 }
                             }
                         }
@@ -11165,51 +11277,66 @@ impl MeshNode {
                 );
                 match outcome {
                     sensing::RegisterOutcome::Registered(action) => {
-                        // Trailing edge (§4.3): exactly one coalesced
-                        // upstream update per DERIVED change. The
-                        // target provider itself has no upstream —
+                        // The target provider itself has no upstream —
                         // there the registration feeds the origin
                         // emitter instead (SI-3).
                         if validated.target == ctx.local_node_id {
                             Self::feed_sensing_origin(ctx, &key, &validated.spec, now);
                             return;
                         }
-                        match action {
-                            sensing::UpstreamAction::Register { strictest } => {
-                                if !sensing_upstream_damper_admits(
-                                    &ctx.sensing_upstream_damper,
-                                    validated.target,
-                                    *key.interest.interest_digest.as_bytes(),
-                                ) {
-                                    return;
-                                }
-                                let upstream = sensing::SensingInterestFrame::provider_registration(
-                                    &validated.spec,
-                                    validated.target,
-                                    strictest,
-                                    ttl,
-                                );
-                                if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                                    spawn_sensing_frame_send(
-                                        &ctx.socket,
-                                        &ctx.peers,
-                                        &ctx.addr_to_node,
-                                        &ctx.router,
-                                        &ctx.partition_filter,
-                                        ctx.local_node_id,
-                                        validated.target,
-                                        sensing::SUBPROTOCOL_SENSING_INTEREST,
-                                        bytes,
-                                    );
-                                }
-                            }
-                            // A registration can't kill the last
-                            // downstream, but honor the action shape
-                            // exhaustively anyway.
-                            sensing::UpstreamAction::Deregister => {
-                                Self::send_sensing_deregister_upstream(ctx, &key);
-                            }
-                            sensing::UpstreamAction::None => {}
+                        // A registration can't kill the last
+                        // downstream, but honor the action shape
+                        // exhaustively anyway.
+                        if action == sensing::UpstreamAction::Deregister {
+                            Self::send_sensing_deregister_upstream(ctx, &key);
+                            return;
+                        }
+                        // SI-3 closure (item 2's principle at the
+                        // damper seam): anti-entropy on EVERY
+                        // admitted registration/refresh at the
+                        // CURRENT aggregate, min-gap damped — the
+                        // exact `register_sensing_interest` / leader-
+                        // seam shape. The previous trailing-edge-only
+                        // send lost a damper-suppressed transition
+                        // forever (`register()` had already committed
+                        // `last_advertised`, so later refreshes
+                        // diffed to `None`) AND let upstream rows
+                        // starve to ttl expiry in leaderless relay
+                        // chains (§4.3 refreshes rows at ttl/2 —
+                        // every hop must re-send, not just the
+                        // first). The damper bounds the re-send rate;
+                        // the receiving hop's register is an
+                        // idempotent refresh.
+                        let Some(strictest) =
+                            ctx.sensing_interest_table.lock().aggregate(&key, now)
+                        else {
+                            return;
+                        };
+                        if !sensing_upstream_damper_admits(
+                            &ctx.sensing_upstream_damper,
+                            validated.target,
+                            *key.interest.interest_digest.as_bytes(),
+                        ) {
+                            return;
+                        }
+                        let upstream = sensing::SensingInterestFrame::provider_registration(
+                            &validated.spec,
+                            validated.target,
+                            strictest,
+                            ttl,
+                        );
+                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                            spawn_sensing_frame_send(
+                                &ctx.socket,
+                                &ctx.peers,
+                                &ctx.addr_to_node,
+                                &ctx.router,
+                                &ctx.partition_filter,
+                                ctx.local_node_id,
+                                validated.target,
+                                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                bytes,
+                            );
                         }
                     }
                     sensing::RegisterOutcome::OverCap => {
@@ -11269,6 +11396,11 @@ impl MeshNode {
                     now,
                 );
                 for (key, action) in actions {
+                    // Closure item 6: a dead branch reclaims its
+                    // observations with the table.
+                    if action == sensing::UpstreamAction::Deregister {
+                        ctx.sensing_observations.lock().reclaim_branch(&key);
+                    }
                     if key.provider == ctx.local_node_id {
                         // SI-3: this node is the origin — the last
                         // downstream's death retires the emission
@@ -11494,6 +11626,28 @@ impl MeshNode {
             );
             return;
         }
+        // Closure item 3: an admitted beat whose origin epoch moved
+        // on EITHER axis (incarnation restart, capability
+        // redefinition) invalidates every cached floor for that
+        // origin BEFORE the new state applies — a floor learned
+        // under the old epoch may be obsolete and must not keep
+        // refusing registrations on stale grounds (§4.4/§4.8).
+        let epoch = (
+            attestation.origin_incarnation,
+            attestation.capability_generation,
+        );
+        let epoch_moved = {
+            let mut observations = ctx.sensing_observations.lock();
+            observations
+                .provider_epochs
+                .insert(attestation.origin, epoch)
+                .is_some_and(|previous| previous != epoch)
+        };
+        if epoch_moved {
+            ctx.sensing_interest_table
+                .lock()
+                .invalidate_provider_floors(attestation.origin);
+        }
         if attestation.status_reason == sensing::StatusReason::SamplingIntervalUnsupported {
             // Closure item 4: under the refusal tag, the signed
             // promised_cadence means the floor M — bound it like
@@ -11510,6 +11664,26 @@ impl MeshNode {
                     "sensing: refusal beat with out-of-bounds floor dropped"
                 );
                 return;
+            }
+            // Closure item 6: a refusal is a cadence-request-
+            // relative CONTROL response, never warm-start status —
+            // it lands in the refusals map, apart from `latest`,
+            // and BEFORE the partition so a fully-refused branch
+            // keeps the tombstone documenting its outcome.
+            {
+                let mut observations = ctx.sensing_observations.lock();
+                if observations.refusals.len() < MAX_SENSING_OBSERVATIONS
+                    || observations.refusals.contains_key(&branch)
+                {
+                    observations
+                        .refusals
+                        .insert(branch.clone(), (attestation.clone(), now));
+                } else {
+                    tracing::debug!(
+                        origin = format!("{:#x}", attestation.origin),
+                        "sensing: refusal store at cap, new branch dropped"
+                    );
+                }
             }
             let partition = ctx.sensing_interest_table.lock().on_refusal(
                 &branch,
@@ -11534,21 +11708,28 @@ impl MeshNode {
                     payload.to_vec(),
                 );
             }
-            if partition.upstream == sensing::UpstreamAction::Deregister
-                && branch.provider != ctx.local_node_id
-            {
-                Self::send_sensing_deregister_upstream(ctx, &branch);
+            if partition.upstream == sensing::UpstreamAction::Deregister {
+                if branch.provider != ctx.local_node_id {
+                    Self::send_sensing_deregister_upstream(ctx, &branch);
+                }
+                // The partition emptied the branch — the warm-start
+                // status and epoch memory reclaim now; the refusal
+                // tombstone above ages out via the sweep.
+                ctx.sensing_observations.lock().reclaim_status(&branch);
             }
+            return;
         }
         let mut observations = ctx.sensing_observations.lock();
-        if observations.len() >= MAX_SENSING_OBSERVATIONS && !observations.contains_key(&branch) {
+        if observations.latest.len() >= MAX_SENSING_OBSERVATIONS
+            && !observations.latest.contains_key(&branch)
+        {
             tracing::debug!(
                 origin = format!("{:#x}", attestation.origin),
                 "sensing: observation store at cap, new branch dropped"
             );
             return;
         }
-        observations.insert(branch, attestation);
+        observations.latest.insert(branch, attestation);
     }
 
     /// SI-3: sign one refusal beat and fan it to the given peers

@@ -152,6 +152,13 @@ impl InterestTable {
         }
     }
 
+    /// Whether ANY entry exists for the key (live rows or not-yet-
+    /// swept ones) — the refusal-tombstone GC's liveness input
+    /// (SI-3 closure item 6).
+    pub fn has_entry(&self, key: &ProviderInterestKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Strictest live D for a key — the derived upstream aggregate.
     pub fn aggregate(&self, key: &ProviderInterestKey, now: Instant) -> Option<Duration> {
         self.entries.get(key).and_then(|entry| {

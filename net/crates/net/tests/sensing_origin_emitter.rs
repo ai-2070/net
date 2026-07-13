@@ -228,7 +228,10 @@ async fn origin_streams_signed_readiness_then_edges_then_drains() {
     let edge = c.sensing_latest_attestation(&branch).expect("present");
     assert_eq!(edge.status_reason, StatusReason::Provider(7));
 
-    // ── ttl drain: the stream retires; zero idle emission ──
+    // ── ttl drain: the stream retires (zero idle emission is
+    //    structural — a retired stream cannot be collected; unit-
+    //    tested) and C's observation store reclaims with its table
+    //    (closure item 6) ──
     refresher.abort();
     await_condition(Duration::from_secs(10), "P retires the stream", || {
         p.sensing_live_streams() == 0
@@ -238,12 +241,16 @@ async fn origin_streams_signed_readiness_then_edges_then_drains() {
         p.sensing_table_is_empty()
     })
     .await;
-    let idle_seq = c.sensing_latest_attestation(&branch).expect("present").seq;
+    await_condition(Duration::from_secs(10), "C reclaims observations", || {
+        c.sensing_observation_count() == 0
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(p.sensing_live_streams(), 0, "the stream stays retired");
     assert_eq!(
-        c.sensing_latest_attestation(&branch).expect("present").seq,
-        idle_seq,
-        "zero idle emission — no beats after the last downstream died",
+        c.sensing_observation_count(),
+        0,
+        "nothing repopulates a drained hop",
     );
 
     // Nothing on the flow was protocol-invalid at either hop.
@@ -280,7 +287,7 @@ async fn below_floor_interest_refused_with_signed_beat() {
 
     // Register (re-sending on loss) until the refusal beat lands.
     await_condition(Duration::from_secs(10), "refusal beat lands at C", || {
-        if c.sensing_latest_attestation(&branch).is_none() {
+        if c.sensing_latest_refusal(&branch).is_none() {
             let _ = c.register_sensing_interest(&spec, p_id, bad_d, LONG_TTL);
             false
         } else {
@@ -289,7 +296,7 @@ async fn below_floor_interest_refused_with_signed_beat() {
     })
     .await;
 
-    let refusal = c.sensing_latest_attestation(&branch).expect("present");
+    let refusal = c.sensing_latest_refusal(&branch).expect("present");
     assert_eq!(refusal.status, AttestedStatus::ProviderUnknown);
     assert_eq!(
         refusal.status_reason,
@@ -301,6 +308,12 @@ async fn below_floor_interest_refused_with_signed_beat() {
         "the provider floor M rides promised_cadence",
     );
     assert_eq!(refusal.estimated_start, None);
+    // Closure item 6: a refusal is a control response, never
+    // warm-start status — the observation store stays empty.
+    assert!(
+        c.sensing_latest_attestation(&branch).is_none(),
+        "refusals never enter the warm-start observation store",
+    );
 
     // The origin never streamed and holds no row (the partition
     // removed the only downstream).
@@ -327,7 +340,7 @@ async fn below_floor_interest_refused_with_signed_beat() {
     let seq = refusal.seq;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        c.sensing_latest_attestation(&branch).expect("present").seq,
+        c.sensing_latest_refusal(&branch).expect("present").seq,
         seq,
         "no refusal stream — one signed beat per refused attempt",
     );
@@ -602,5 +615,329 @@ async fn out_of_bounds_intervals_refused_at_intake() {
     .await;
 
     c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Closure item 3: a cached provider floor is invalidated when an
+/// admitted attestation moves the origin's epoch on EITHER axis —
+/// incarnation (restart) or capability generation (redefinition) —
+/// so a floor learned under the old epoch cannot keep refusing
+/// registrations on stale grounds. All 0x0C03 frames are
+/// hand-authored (P stays a dark origin).
+#[tokio::test]
+async fn cached_floor_invalidates_on_origin_epoch_change() {
+    let (c, p, fleet) = consumer_provider_pair(None).await;
+    let c_addr = c.local_addr();
+    let p_id = p.node_id();
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let digest = spec.interest_digest();
+
+    let beat = |incarnation: u64, generation: u64, seq: u64, refusal: bool| {
+        let unsigned = UnsignedAttestation {
+            interest_digest: digest,
+            origin: p_id,
+            origin_incarnation: Incarnation::new(incarnation),
+            capability_id: CapabilityId::new("print.document"),
+            capability_generation: generation,
+            status: if refusal {
+                AttestedStatus::ProviderUnknown
+            } else {
+                AttestedStatus::Ready
+            },
+            status_reason: if refusal {
+                StatusReason::SamplingIntervalUnsupported
+            } else {
+                StatusReason::None
+            },
+            estimated_start: None,
+            seq,
+            promised_cadence: Duration::from_millis(50),
+            audience_scope: fleet,
+        };
+        encode_attestation(&sign_attestation(p.entity_keypair(), unsigned).expect("sign"))
+            .expect("encode")
+    };
+    let send_until = |bytes: Vec<u8>, done: Box<dyn Fn() -> bool + Send>, what: &'static str| {
+        let p = p.clone();
+        async move {
+            await_condition(Duration::from_secs(10), what, || {
+                if done() {
+                    true
+                } else {
+                    let p = p.clone();
+                    let bytes = bytes.clone();
+                    tokio::spawn(async move {
+                        let _ = p
+                            .send_subprotocol(c_addr, SUBPROTOCOL_READINESS_ATTESTATION, &bytes)
+                            .await;
+                    });
+                    false
+                }
+            })
+            .await;
+        }
+    };
+
+    // A 100 ms row that will SURVIVE the refusals — the floor cache
+    // lives on the entry, so a survivor must hold it open.
+    await_condition(Duration::from_secs(10), "survivor row at C", || {
+        if c.sensing_downstreams(&branch).is_empty() {
+            let _ = c.register_sensing_interest(&spec, p_id, D, LONG_TTL);
+            false
+        } else {
+            true
+        }
+    })
+    .await;
+
+    // ── Round 1: incarnation axis ──
+    {
+        let c = c.clone();
+        let branch = branch.clone();
+        send_until(
+            beat(5, 1, 0, true),
+            Box::new(move || c.sensing_latest_refusal(&branch).is_some()),
+            "refusal (inc 5) lands",
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            c.register_sensing_interest(&spec, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::RefusedByCachedFloor { .. })
+        ),
+        "the cached floor refuses a sub-floor joiner locally",
+    );
+    {
+        let c = c.clone();
+        let branch = branch.clone();
+        send_until(
+            beat(6, 1, 0, false),
+            Box::new(move || c.sensing_latest_attestation(&branch).is_some()),
+            "Ready beat (inc 6) lands",
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            c.register_sensing_interest(&spec, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::Registered(_))
+        ),
+        "a new incarnation invalidated the cached floor — the sub-floor request goes through again",
+    );
+
+    // ── Round 2: generation axis ──
+    // Restore a surviving 100 ms row (the sub-floor registration
+    // above replaced the Local row), then re-cache a floor under
+    // (inc 6, gen 1).
+    assert!(c
+        .register_sensing_interest(&spec, p_id, D, LONG_TTL)
+        .is_ok());
+    {
+        let c = c.clone();
+        let branch = branch.clone();
+        send_until(
+            beat(6, 1, 1, true),
+            Box::new(move || {
+                c.sensing_latest_refusal(&branch)
+                    .is_some_and(|r| r.origin_incarnation == Incarnation::new(6))
+            }),
+            "refusal (inc 6, gen 1) lands",
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            c.register_sensing_interest(&spec, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::RefusedByCachedFloor { .. })
+        ),
+        "the re-cached floor refuses locally again",
+    );
+    {
+        let c = c.clone();
+        let branch = branch.clone();
+        send_until(
+            beat(6, 2, 2, false),
+            Box::new(move || {
+                c.sensing_latest_attestation(&branch)
+                    .is_some_and(|a| a.capability_generation == 2)
+            }),
+            "Ready beat (gen 2) lands",
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            c.register_sensing_interest(&spec, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::Registered(_))
+        ),
+        "a new capability generation invalidated the cached floor too",
+    );
+
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Closure item 2 end-to-end (the review's required three-hop
+/// mixed-cadence test): a sub-floor consumer joining THROUGH a
+/// relay must not strand the surviving consumer's demand.
+///
+/// ```text
+///   A (100 ms) ─┐
+///               R ── P (floor 50 ms)
+///   C (10 ms) ──┘
+/// ```
+///
+/// C's 10 ms tightens R's aggregate below P's floor; P refuses and
+/// partitions its Peer(R) row (stream dies). R partitions Peer(C)
+/// out, keeps survivor Peer(A) — and A's next refresh finds the
+/// PENDING survivor transition (`on_refusal` no longer consumes it)
+/// and re-registers 100 ms upstream, so P's stream RESUMES. Before
+/// the fix, `last_advertised` was already consumed and the refresh
+/// produced no upstream update: A stranded permanently.
+#[tokio::test]
+async fn mixed_cadence_refusal_recovers_the_survivor_through_the_relay() {
+    let fleet_kp = EntityKeypair::generate();
+    let fleet = AudienceScopeCommitment::owner_root(fleet_kp.entity_id());
+    let mk = |incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(fleet);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    };
+    let a = mk(None).await;
+    let c = mk(None).await;
+    let r = mk(None).await;
+    let p = mk(Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(
+        CapabilityId::new("print.document"),
+        Arc::new(FlagEvaluator {
+            ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+
+    connect_pair(&a, &r).await;
+    connect_pair(&c, &r).await;
+    connect_pair(&r, &p).await;
+    a.start();
+    c.start();
+    r.start();
+    p.start();
+    for node in [&a, &c, &r, &p] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    let a_id = a.node_id();
+    let c_id = c.node_id();
+    let r_id = r.node_id();
+    let p_id = p.node_id();
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(c_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    // Consumers reach P through R.
+    a.router().add_route(p_id, r.local_addr());
+    c.router().add_route(p_id, r.local_addr());
+    // SI-3 seam bound (documented on the 0x0C03 intake): a hop
+    // verifies beats against the ORIGIN's TOFU pin, and pin
+    // propagation to non-adjacent hops rides SI-4 — pin P at the
+    // consumers deterministically, exactly as the SI-2 chain test
+    // pinned its injected declarer.
+    let p_entity = p.entity_keypair().entity_id().clone();
+    a.test_pin_peer_entity(p_id, p_entity.clone());
+    c.test_pin_peer_entity(p_id, p_entity);
+
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    use net::adapter::net::behavior::sensing::DownstreamId;
+
+    // ── A registers 100 ms through R; P streams; R observes ──
+    let refresher_a = {
+        let a = a.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = a.register_sensing_interest(&spec, p_id, Duration::from_millis(100), TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+    await_condition(Duration::from_secs(10), "P streams to R", || {
+        p.sensing_live_streams() == 1 && r.sensing_latest_attestation(&branch).is_some()
+    })
+    .await;
+    assert_eq!(
+        r.sensing_downstreams(&branch),
+        vec![DownstreamId::Peer(a_id)],
+    );
+
+    // ── C's sub-floor 10 ms triggers the refusal episode ──
+    await_condition(Duration::from_secs(10), "refusal lands at R", || {
+        if r.sensing_latest_refusal(&branch).is_none() {
+            let _ = c.register_sensing_interest(&spec, p_id, Duration::from_millis(10), TTL);
+            false
+        } else {
+            true
+        }
+    })
+    .await;
+    let refusal = r.sensing_latest_refusal(&branch).expect("present");
+    assert_eq!(
+        refusal.status_reason,
+        StatusReason::SamplingIntervalUnsupported
+    );
+    // R partitioned C out and kept the survivor.
+    await_condition(Duration::from_secs(5), "C partitioned out at R", || {
+        r.sensing_downstreams(&branch) == vec![DownstreamId::Peer(a_id)]
+    })
+    .await;
+    // The forwarded refusal reached C (its own Local row partitioned).
+    await_condition(Duration::from_secs(5), "forwarded refusal at C", || {
+        c.sensing_latest_refusal(&branch).is_some()
+    })
+    .await;
+
+    // ── THE RECOVERY (closure item 2): A's refresh re-registers the
+    //    survivor aggregate upstream and P's stream RESUMES ──
+    await_condition(
+        Duration::from_secs(10),
+        "P re-registers the survivor",
+        || {
+            p.sensing_live_streams() == 1
+                && p.sensing_downstream_entry(&branch, DownstreamId::Peer(r_id))
+                    .is_some_and(|row| row.requested_sample_interval == Duration::from_millis(100))
+        },
+    )
+    .await;
+    // Fresh beats land at R past the refusal's seq — the stream is
+    // truly live again, not a cached leftover.
+    await_condition(Duration::from_secs(10), "fresh beats at R", || {
+        r.sensing_latest_attestation(&branch)
+            .is_some_and(|beat| beat.status == AttestedStatus::Ready && beat.seq > refusal.seq)
+    })
+    .await;
+
+    // Nothing on the episode was protocol-invalid anywhere.
+    for node in [&a, &c, &r, &p] {
+        let counters = node.sensing_counters();
+        assert_eq!(SensingCounters::get(&counters.protocol_invalid), 0);
+    }
+
+    refresher_a.abort();
+    a.shutdown().await.expect("shutdown A");
+    c.shutdown().await.expect("shutdown C");
+    r.shutdown().await.expect("shutdown R");
     p.shutdown().await.expect("shutdown P");
 }
