@@ -52,6 +52,10 @@ pub mod negotiation;
 #[cfg(feature = "redex")]
 pub mod rendezvous;
 pub mod scope;
+// SI-2b: the Layer-1 candidate snapshot over the real capability
+// fold + proximity + routing planes (plan §4.7/§4.10) — the
+// resolver inputs `MeshNode::sensing_candidate_snapshot` assembles.
+pub mod snapshot;
 pub mod table;
 pub mod wire;
 
@@ -76,6 +80,11 @@ pub use controller::{
 };
 
 pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};
+
+pub use snapshot::{
+    build_candidate_snapshot, declares_capability, extract_declarers, proximity_route_estimate,
+    DeclaredProvider, HOP_FALLBACK_ESTIMATE, UNKNOWN_ROUTE_ESTIMATE,
+};
 
 pub use table::{
     DownstreamEntry, DownstreamId, InterestTable, RefusalPartition, RegisterOutcome, UpstreamAction,

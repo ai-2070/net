@@ -1083,6 +1083,15 @@ struct DispatchCtx {
     /// on `MeshNode`.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// SI-2b: this node's OWN entity commitment. The candidate
+    /// snapshot's §4.10 authorization reads each declarer's
+    /// TOFU-pinned entity root from `peer_entity_ids`, which never
+    /// contains self — this is the root reported when the local
+    /// node is itself a declarer. Distinct from
+    /// `sensing_local_root`, which may be an operator-supplied
+    /// fleet root.
+    #[cfg(feature = "redex")]
+    sensing_local_entity_root: sensing::AudienceScopeCommitment,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2854,6 +2863,57 @@ fn spawn_sensing_upstream_send(
     });
 }
 
+/// SI-2b: assemble the Layer-1 candidate snapshot for one
+/// capability id from the LIVE planes (plan §4.7/§4.10) — shared by
+/// the 0x0C02 dispatch arm's leader intake and
+/// [`MeshNode::sensing_candidate_snapshot`], so both views of the
+/// candidate set are the same computation.
+///
+/// The seams (see [`sensing::snapshot`]):
+/// - declarers: ONE `with_state` pass over the capability fold
+///   ([`sensing::extract_declarers`] — the v1 tag/name structural
+///   match), entity roots resolved from the TOFU pin map after the
+///   fold lock drops (self resolves to `local_entity_root`);
+/// - authorization: declarer's pinned root == `local_owner_root`
+///   (§4.10 v1);
+/// - reachability: self, OR a live direct session, OR a routing
+///   table hit;
+/// - route estimate: the [`sensing::proximity_route_estimate`]
+///   ladder over the pingwave-learned proximity graph.
+#[cfg(feature = "redex")]
+#[allow(clippy::too_many_arguments)]
+fn sensing_candidate_snapshot_from_parts(
+    capability_fold: &super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+    proximity_graph: &ProximityGraph,
+    router: &NetRouter,
+    peers: &DashMap<u64, PeerInfo>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+    local_node_id: u64,
+    local_entity_root: sensing::AudienceScopeCommitment,
+    local_owner_root: &sensing::AudienceScopeCommitment,
+    capability_id: &sensing::CapabilityId,
+) -> Vec<sensing::CandidateProvider> {
+    let declarers = sensing::extract_declarers(capability_fold, capability_id, |node_id| {
+        if node_id == local_node_id {
+            Some(local_entity_root)
+        } else {
+            peer_entity_ids
+                .get(&node_id)
+                .map(|entry| sensing::AudienceScopeCommitment::owner_root(entry.value()))
+        }
+    });
+    sensing::build_candidate_snapshot(
+        &declarers,
+        local_owner_root,
+        |node_id| sensing::proximity_route_estimate(proximity_graph, node_id),
+        |node_id| {
+            node_id == local_node_id
+                || peers.contains_key(&node_id)
+                || router.routing_table().lookup(node_id).is_some()
+        },
+    )
+}
+
 /// Why [`MeshNode::register_sensing_interest`] refused a local
 /// registration (SI-2a).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4416,6 +4476,72 @@ impl MeshNode {
             .map(|leader| leader.interest_count())
     }
 
+    /// Active branch providers this node's sensing-leader role
+    /// resolved for one coalesced interest — `None` when the role is
+    /// not installed, empty when the interest is unknown (tests +
+    /// observability; the SI-2b resolver's output surface).
+    #[cfg(feature = "redex")]
+    pub fn sensing_leader_branches(
+        &self,
+        key: &sensing::CapabilityInterestKey,
+    ) -> Option<Vec<u64>> {
+        self.sensing_leader
+            .lock()
+            .as_ref()
+            .map(|leader| leader.branches(key))
+    }
+
+    /// SI-2b: the Layer-1 candidate snapshot for `capability_id`
+    /// over this node's LIVE planes (plan §4.7/§4.10) — the exact
+    /// rows the leader intake feeds
+    /// [`sensing::resolve_candidates`]:
+    ///
+    /// - **declarers** — fold nodes whose capability set
+    ///   structurally matches the capability id (one `with_state`
+    ///   pass; see [`sensing::declares_capability`] for the
+    ///   documented v1 tag/name match);
+    /// - **authorized** — the declarer's TOFU-pinned entity root
+    ///   equals this node's sensing owner root (§4.10 v1; the same
+    ///   pin the dispatch arm derives session roots from);
+    /// - **reachable** — self, a live direct session, or a routing
+    ///   table hit;
+    /// - **route_estimate** — the
+    ///   [`sensing::proximity_route_estimate`] fallback ladder over
+    ///   the proximity graph;
+    /// - **tags** — the declarer's folded assertions with the
+    ///   declarer's own pinned root as provenance; **groups** —
+    ///   empty until the `GroupRef` fold surface lands.
+    ///
+    /// `redex`-gated with the leader intake it feeds (the role
+    /// rides the RedEX election).
+    #[cfg(feature = "redex")]
+    pub fn sensing_candidate_snapshot(
+        &self,
+        capability_id: &sensing::CapabilityId,
+    ) -> Vec<sensing::CandidateProvider> {
+        sensing_candidate_snapshot_from_parts(
+            &self.capability_fold,
+            &self.proximity_graph,
+            &self.router,
+            &self.peers,
+            &self.peer_entity_ids,
+            self.node_id,
+            sensing::AudienceScopeCommitment::owner_root(self.identity.entity_id()),
+            &self.sensing_local_root,
+            capability_id,
+        )
+    }
+
+    /// Test-only helper — TOFU-pin `entity_id` for `node_id` exactly
+    /// as a signature-verified DIRECT capability announcement would
+    /// (first write wins, mirroring the dispatch pin). Lets fixtures
+    /// model fold declarers that are not live sessions: the SI-2b
+    /// candidate snapshot reads this pin for §4.10 authorization.
+    #[doc(hidden)]
+    pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
+        self.peer_entity_ids.entry(node_id).or_insert(entity_id);
+    }
+
     /// Test/debug accessor for the live [`NetSession`] to a peer.
     /// Integration tests use it to drive session-level state (e.g. open
     /// a stream to make a session "busy" for the upgrade C3 gate).
@@ -5655,6 +5781,10 @@ impl MeshNode {
             sensing_upstream_damper: self.sensing_upstream_damper.clone(),
             #[cfg(feature = "redex")]
             sensing_leader: self.sensing_leader.clone(),
+            #[cfg(feature = "redex")]
+            sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
+                self.identity.entity_id(),
+            ),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -10206,9 +10336,41 @@ impl MeshNode {
         let now = Instant::now();
 
         match &frame {
-            sensing::SensingInterestFrame::CapabilityRegistration { .. } => {
+            sensing::SensingInterestFrame::CapabilityRegistration { capability_id, .. } => {
+                // The leader intake rides the RedEX election, so
+                // only the redex build has a leader role to feed.
+                #[cfg(not(feature = "redex"))]
+                let _ = capability_id;
                 #[cfg(feature = "redex")]
                 {
+                    // Slot empty: this node is not the leader — drop
+                    // (soft state; the consumer re-registers with
+                    // the real leader) without paying for a
+                    // snapshot.
+                    if ctx.sensing_leader.lock().is_none() {
+                        return;
+                    }
+                    // SI-2b: the REAL candidate snapshot, assembled
+                    // BEFORE re-taking the leader lock so the fold/
+                    // proximity/routing reads never nest inside it.
+                    // The frame's capability-id claim seeds the
+                    // snapshot; the claim is bound by the digest
+                    // re-derivation inside `register_from_frame`,
+                    // so a lying claim is rejected there and only
+                    // ever wastes this read. (A leader uninstalled
+                    // between the two lock takes just drops the
+                    // frame — the same soft-state contract.)
+                    let snapshot = sensing_candidate_snapshot_from_parts(
+                        &ctx.capability_fold,
+                        &ctx.proximity_graph,
+                        &ctx.router,
+                        &ctx.peers,
+                        &ctx.peer_entity_ids,
+                        ctx.local_node_id,
+                        ctx.sensing_local_entity_root,
+                        &ctx.sensing_local_root,
+                        capability_id,
+                    );
                     let mut slot = ctx.sensing_leader.lock();
                     if let Some(leader) = slot.as_mut() {
                         // Rejections carry their own counter
@@ -10221,9 +10383,7 @@ impl MeshNode {
                             &session_root,
                             &ctx.sensing_local_root,
                             &ctx.sensing_counters,
-                            // SI-2a: empty snapshot — resolver is
-                            // SI-2b; no branches resolve yet.
-                            &[],
+                            &snapshot,
                             now,
                         ) {
                             tracing::debug!(
@@ -10233,9 +10393,6 @@ impl MeshNode {
                             );
                         }
                     }
-                    // Slot empty: this node is not the leader — drop
-                    // (soft state; the consumer re-registers with
-                    // the real leader).
                 }
             }
             sensing::SensingInterestFrame::ProviderRegistration { audience_scope, .. } => {

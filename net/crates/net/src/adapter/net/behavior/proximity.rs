@@ -705,6 +705,16 @@ impl ProximityGraph {
             .map(|edge| Duration::from_micros(edge.value().latency_us))
     }
 
+    /// Test-only helper — install or refresh one directed edge with
+    /// an explicit latency sample, bypassing the pingwave path.
+    /// Fixtures inject topology this way so the SI-2b candidate
+    /// resolver's reads ([`Self::edge_latency`], [`Self::path_to`])
+    /// can be exercised without timing-dependent pingwaves.
+    #[doc(hidden)]
+    pub fn test_insert_edge(&self, from: NodeId, to: NodeId, latency_us: u64) {
+        self.insert_or_update_edge(from, to, latency_us);
+    }
+
     /// Remove one directed edge (RT-5,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Called when a peer
     /// withdraws its route toward `to`: the `(peer, to)` edge is what
