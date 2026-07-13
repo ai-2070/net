@@ -1003,8 +1003,19 @@ must exercise the real dispatch path.
   ladder self 0 → measured edge → placeholder = 50 ms hop → BFS ×
   50 ms → unknown 1 s. Deviation: `sensing_owner_root` (operator
   fleet root — the tree has no ownership model; explicit config also
-  admits pinned peers claiming that root — the multi-hop leg;
-  scoped-capabilities subsumes). Close-out: leader intake → own Local
+  admits TOFU-pinned peers claiming exactly that root — the
+  multi-hop leg; strict entity-root rule otherwise, and the original
+  rule was unsatisfiable across nodes since node ids are
+  entity-derived). **Boundary (SI-2 review disposition):** the fleet
+  root is an explicit operator ASSERTION of membership, not a
+  cryptographic proof of it — TOFU pinning proves which node is
+  speaking; nothing proves organizational membership. The rule is
+  therefore valid only for owned-device deployments, must never be
+  treated as cross-owner authority, and is replaced by scoped
+  capabilities before any foreign/federated sensing. (The mesh's
+  transport-membership semantics are out of this plan's scope — the
+  authority story here deliberately rests on operator assertion +
+  session identity alone.) Close-out: leader intake → own Local
   rows → upstream, witnessed by `tests/sensing_e2e_registration.rs`
   (coalescing, R→H propagation, ttl drain). Bounds: sweep loosening
   awaits refresh repair; ttl/2 = caller's loop; refusals = SI-3;
