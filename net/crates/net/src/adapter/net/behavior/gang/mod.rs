@@ -41,6 +41,12 @@ pub mod claim;
 pub mod contention;
 pub mod filter;
 pub mod multi;
+// Ties the island's replica placement to RedEX's `ReplicationConfig`
+// / `PlacementStrategy` (plan §5), so it rides the `redex` feature —
+// a plain `--features net` build has no replication layer to
+// configure. (Pre-SI-2a this was ungated and broke the net-only
+// build; every other gang module is fold-only and stays ungated.)
+#[cfg(feature = "redex")]
 pub mod placement;
 pub mod quorum;
 pub mod schedule;
@@ -59,6 +65,7 @@ pub use filter::{
     SelectionPolicy,
 };
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
+#[cfg(feature = "redex")]
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 pub use schedule::{
