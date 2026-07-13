@@ -8,9 +8,11 @@ work, not signature verification … that preserves the core economic
 claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
 interest table + resolver + upstream propagation on real sessions,
 dark behind `enable_sensing_coalescing = false` (as-built note in
-§6). Next: SI-3 (origin emitter). Authorization stance, kept
-honest: the SI-1 sign-off said SI-2+ was NOT implied, so SI-2 was
-not within the review-7 authorization — SI-2+ implementation is
+§6); **SI-3 COMPLETE as-built (2026-07-13)** — origin emitter +
+0x0C03 verified intake (as-built note in §6). Next: SI-4 (relay
+delivery + overlay application). Authorization stance, kept
+honest: the SI-1 sign-off said SI-2+ was NOT implied, so SI-2/SI-3
+were not within the review-7 authorization — SI-2+ implementation is
 proceeding under the operator's direction; the semantic gate review
 remains closed.
 0x0C02 (`SensingInterestFrame`) and 0x0C03 (`ReadinessAttestation`)
@@ -1023,6 +1025,47 @@ must exercise the real dispatch path.
 - **SI-3 — origin emitter.** Predicate compilation via the evaluator
   against the provider's current generation; cadence + edge
   emission; refusals.
+  *SI-3 as-built (2026-07-13, d87496c9d + bed932ad3 + f31a21cdd +
+  close-out):* SI-3a: `sensing::emitter` — pure, crypto-free
+  scheduler (compile once per digest; `promised_cadence =
+  max(strictest-D/2, floor)`; edge poke min-gapped at the floor;
+  zero idle emission; seq memory OUTLIVES the stream, LRU-bounded
+  8192/6144 with live-never-evicted, so a re-formed stream within
+  one incarnation can never replay `(incarnation, seq)` — slot
+  eviction falls back to a seq-0 restart contained at observer gates
+  as rollback). SI-3b: mesh wiring — evaluator registry
+  (`register_readiness_evaluator`; no evaluator streams
+  `ProviderUnknown{TemporarilyUnevaluable}`), the
+  `notify_sensing_state_changed` edge hook, the emitter loop
+  (sleep-until-due + notify), registrations targeting self feed the
+  emitter, refusal partitioning at the origin hop answers each
+  refused peer with a one-shot signed refusal beat. SI-3c: 0x0C03
+  intake — strict decode → solicited-branch check (unsolicited
+  streams never verified or cached) → signature vs the origin's
+  TOFU pin → §4.6 strictly-newer gate (the SI-1c `IncarnationSeqGate`
+  live; equivocation poisons + counts protocol-invalid) →
+  latest-per-branch store (SI-4's relay caches subsume this seam);
+  admitted `SamplingIntervalUnsupported` beats partition downstreams
+  and forward the origin's signed bytes verbatim. Witnessed on real
+  sessions by `tests/sensing_origin_emitter.rs` (stream at cadence,
+  edge on notify, ttl-drain to zero idle, refusal flow end-to-end,
+  fail-closed dark origin, tampered/equivocating frames refused).
+  **Deviations to surface at the next review:** (1)
+  `sensing_incarnation` config knob — the §4.6 boot epoch is
+  caller-derived (`next_incarnation` over real persistence,
+  increment-before-participation, like the entity keypair);
+  `None` = fail-closed dark origin. (2) The §4.4
+  `sampling_interval_unsupported { minimum_supported: M }` refusal
+  rides the frozen §4.2 attestation object with M carried in
+  `promised_cadence` (status `ProviderUnknown` + reason
+  `SamplingIntervalUnsupported`) — a documented reading, not a wire
+  change. (3) Origin-authored refusal responses only: a relay's
+  cached-floor refusal stays local (it cannot sign for a foreign
+  origin); its refusal anti-entropy is SI-4's cache re-send.
+  Bounds: local (`Local`-row) beat delivery to the consumer overlay
+  is SI-4; multi-hop attestation forwarding/verification is SI-4;
+  origin-hop cached-floor persistence follows the table rule (floor
+  dies with the entry).
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
