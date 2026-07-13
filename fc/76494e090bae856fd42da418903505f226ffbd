@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_e2d41447941db4 1556-1564
+  s_c28bdf38c0df3a::t_fe2a20ba2caf06 10405-10420,10430-10435
+  s_c28bdf38c0df3a::t_0721da4db16fb9 4511-4525
+  s_c28bdf38c0df3a::t_f8f8d9c3931c86 8386-8391
+  s_c28bdf38c0df3a::t_28ae1b94c60425 10421-10426
+  s_c28bdf38c0df3a::t_17b61362dc25c3 8497-8506
+  s_c28bdf38c0df3a::t_b04b06a0bea794 10331-10346,10354-10362
+  s_c28bdf38c0df3a::t_96e6b2d688d355 5813
+  s_c28bdf38c0df3a::t_604cc266fe760b 1079-1086
+  s_c28bdf38c0df3a::t_580d226d81872a 10439,10471-10487,10493-10586
+net/crates/net/docs/plans/SENSING_INTEREST_COALESCING_PLAN.md
+  s_c28bdf38c0df3a::t_c0958e8746cfd7 243-247
+  s_c28bdf38c0df3a::t_87a5f1c0a20a61 999-1000,1002-1011
+  s_c28bdf38c0df3a::t_817c9b2eb1af8b 996-998,1001
+  s_c28bdf38c0df3a::t_82f1247a829817 8-15
+net/crates/net/tests/sensing_e2e_registration.rs
+  s_c28bdf38c0df3a::t_1e7ec1fb480f27 1-209,223-261,266-307,312-313,325-382
+  s_c28bdf38c0df3a::t_28ae1b94c60425 210-222,262-265,308-311,314-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "fc76494e090bae856fd42da418903505f226ffbd",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
