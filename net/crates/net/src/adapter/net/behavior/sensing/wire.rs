@@ -16,13 +16,13 @@
 //! are capped at 1 KiB (plan §5) and everything else is small;
 //! anything larger is malformed or hostile.
 //!
-//! Encoding note (documented SI-1 trade-off): the 32-byte identity
-//! newtypes ([`Digest256`], [`AudienceScopeCommitment`]) serialize
-//! as lowercase-hex STRINGS in every serde encoding — their serde is
-//! shared with the JSON-friendly semantic form and is deliberately
-//! NOT changed here, so each costs 65 bytes on the wire instead of
-//! 33. Acceptable in SI-1; a binary form would be a wire break and
-//! belongs to a future versioned revision, not a quiet edit.
+//! Encoding note: the 32-byte identity newtypes ([`Digest256`],
+//! [`AudienceScopeCommitment`]) split on `is_human_readable` — raw
+//! 33-byte `serialize_bytes` under postcard (this codec), lowercase
+//! hex under JSON-style encodings (see `impl_hex32_serde` in
+//! `identity.rs`). The split landed BEFORE any deployment existed
+//! (the SI-1 as-built note records the hex-first history), so it was
+//! an encoding choice, not a wire break.
 //!
 //! # Signature transcript (encoding-independent)
 //!

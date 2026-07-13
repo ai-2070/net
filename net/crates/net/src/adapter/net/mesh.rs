@@ -1114,6 +1114,14 @@ struct DispatchCtx {
     /// (`MeshNode::capability_version`) — stamped into attestations
     /// at evaluation time (§3.4).
     capability_version: Arc<AtomicU64>,
+    /// SI-3c: the 0x0C03 intake's §4.6 observer gate. See the
+    /// matching field on `MeshNode`.
+    sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
+    /// SI-3c: latest admitted attestation per branch. See the
+    /// matching field on `MeshNode`.
+    sensing_observations: Arc<
+        parking_lot::Mutex<HashMap<sensing::ProviderInterestKey, sensing::ReadinessAttestation>>,
+    >,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2825,6 +2833,15 @@ fn spawn_route_withdrawal_flood(
 /// propagate.
 const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
+/// SI-3c: hard cap on the latest-per-branch observation store. Every
+/// stored entry answered a branch this hop actually held rows for
+/// (the solicited check), so honest population is bounded by the
+/// interest table; the cap only guards the lag between a row's death
+/// and its observation's eviction. A NEW branch over the cap is
+/// dropped (never an eviction cascade) — the origin re-sends within
+/// one cadence.
+const MAX_SENSING_OBSERVATIONS: usize = 4096;
+
 /// SI-2a: admit-or-drop for one upstream interest update (see
 /// [`SENSING_UPSTREAM_MIN_GAP`]). Same entry/and_modify shape as the
 /// RT-5 withdrawal damper, including the opportunistic size sweep —
@@ -3495,6 +3512,21 @@ pub struct MeshNode {
     /// `ProviderUnknown { TemporarilyUnevaluable }`.
     sensing_evaluators:
         Arc<DashMap<sensing::CapabilityId, Arc<dyn sensing::ReadinessEvaluator + Send + Sync>>>,
+    /// SI-3c: §4.6 strictly-newer admission over what each origin
+    /// SIGNED — the [`sensing::IncarnationSeqGate`] (SI-1c) getting
+    /// its first live consumer. Keys on the transcript digest, so
+    /// equivocation detection binds exactly the signed bytes.
+    sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
+    /// SI-3c: latest ADMITTED attestation per branch — the verified
+    /// observation seam (decode → solicited check → signature →
+    /// seq gate → here). Deliberately minimal: SI-4's relay
+    /// delivery machinery (per-provider caches keyed on the full
+    /// [`sensing::ProviderObservationKey`], packing, down-sampling,
+    /// hop rule) subsumes it. Bounded by
+    /// [`MAX_SENSING_OBSERVATIONS`].
+    sensing_observations: Arc<
+        parking_lot::Mutex<HashMap<sensing::ProviderInterestKey, sensing::ReadinessAttestation>>,
+    >,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -4189,6 +4221,10 @@ impl MeshNode {
             sensing_emitter,
             sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
             sensing_evaluators: Arc::new(DashMap::new()),
+            sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
+                sensing::IncarnationSeqGate::new(),
+            )),
+            sensing_observations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -4578,6 +4614,34 @@ impl MeshNode {
             .as_ref()
             .map(|emitter| emitter.live_streams())
             .unwrap_or(0)
+    }
+
+    /// SI-3c: the latest ADMITTED attestation this hop holds for one
+    /// branch — decoded, solicited, signature-verified against the
+    /// origin's pinned entity, and strictly-newer at the §4.6
+    /// observer gate. SI-4's relay caches subsume this seam.
+    pub fn sensing_latest_attestation(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<sensing::ReadinessAttestation> {
+        self.sensing_observations.lock().get(key).cloned()
+    }
+
+    /// SI-3c: how many branches hold an admitted observation (tests
+    /// + observability).
+    pub fn sensing_observation_count(&self) -> usize {
+        self.sensing_observations.lock().len()
+    }
+
+    /// SI-3c: whether this hop's observer gate poisoned an origin's
+    /// incarnation for one interest digest (equivocation — two
+    /// payloads on one `(incarnation, seq)`). Tests + observability.
+    pub fn sensing_observer_poisoned(
+        &self,
+        origin: u64,
+        digest: sensing::Digest256,
+    ) -> Option<sensing::Incarnation> {
+        self.sensing_observer_gate.lock().poisoned(origin, digest)
     }
 
     /// A handle to the sensing-plane counters (SI-2a observability;
@@ -6133,6 +6197,8 @@ impl MeshNode {
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
             signing_identity: self.identity.clone(),
             capability_version: self.capability_version.clone(),
+            sensing_observer_gate: self.sensing_observer_gate.clone(),
+            sensing_observations: self.sensing_observations.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -7528,6 +7594,24 @@ impl MeshNode {
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_sensing_interest_frame(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // Capability sensing (SI-3, SENSING_INTEREST_COALESCING_PLAN
+        // §4.4/§4.6): origin-signed readiness attestations on 0x0C03.
+        // Same gates as the 0x0C02 arm: dark plane and sentinel-zero
+        // senders drop with zero work.
+        if parsed.header.subprotocol_id == sensing::SUBPROTOCOL_READINESS_ATTESTATION {
+            if !ctx.enable_sensing_coalescing {
+                return;
+            }
+            if from_node == 0 {
+                return;
+            }
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_sensing_attestation_frame(&payload, from_node, ctx);
             }
             return;
         }
@@ -11136,6 +11220,161 @@ impl MeshNode {
                 sensing::DownstreamId::Local => None,
             })
         });
+    }
+
+    /// SI-3c: the 0x0C03 verified intake (plan §4.2/§4.6) — the
+    /// admission seam SI-4's relay machinery builds its per-provider
+    /// caches on. Pipeline, fail-closed at every step:
+    ///
+    /// 1. **Strict decode** (4 KiB cap, no trailing bytes) —
+    ///    failures are protocol-invalid input.
+    /// 2. **Solicited check**: the attestation must answer a branch
+    ///    this hop holds LIVE rows for — unsolicited streams are
+    ///    never verified or cached (cache-poisoning surface, and it
+    ///    keeps the observation store bounded by the table).
+    /// 3. **Authorship**: signature over the §4.2 transcript against
+    ///    the origin's TOFU-pinned entity. v1 seam bound: the origin
+    ///    must be pinned at THIS hop (adjacent, or previously
+    ///    announced); an unpinned origin drops — relays that hold
+    ///    subscriptions always pinned their upstream hop, and the
+    ///    full multi-hop verification story rides SI-4's forwarding
+    ///    (identical signed bytes, §4.2).
+    /// 4. **Ordering** (§4.6): strictly-newer admission per
+    ///    `(origin, incarnation, interest)` on the
+    ///    [`sensing::IncarnationSeqGate`] — SI-1c's gate getting its
+    ///    first live consumer. The fingerprint is the transcript
+    ///    digest, so equivocation detection keys on exactly what the
+    ///    origin signed; an equivocation poisons the incarnation AND
+    ///    counts as protocol-invalid (security-relevant).
+    /// 5. **Refusal reaction** (§4.4): an admitted
+    ///    `SamplingIntervalUnsupported` beat partitions this hop's
+    ///    downstreams on M (carried in `promised_cadence` — the
+    ///    SI-3a documented reading), forwards the origin's SIGNED
+    ///    refusal bytes verbatim to each partitioned-out peer, and
+    ///    honors a branch death upstream. The surviving-aggregate
+    ///    upstream re-registration is skipped exactly like the
+    ///    sweep's loosened-aggregate case (no spec cache at this
+    ///    hop) — the next downstream refresh repairs it.
+    /// 6. **Store**: latest admitted attestation per branch.
+    fn handle_sensing_attestation_frame(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let Ok(attestation) = sensing::decode_attestation(payload) else {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                len = payload.len(),
+                "sensing: undecodable 0x0C03 payload dropped"
+            );
+            return;
+        };
+        let interest = sensing::CapabilityInterestKey {
+            capability_id: attestation.capability_id.clone(),
+            interest_digest: attestation.interest_digest,
+        };
+        let branch = sensing::ProviderInterestKey::new(interest, attestation.origin);
+        let now = Instant::now();
+        if ctx
+            .sensing_interest_table
+            .lock()
+            .downstreams(&branch, now)
+            .is_empty()
+        {
+            tracing::trace!(
+                origin = format!("{:#x}", attestation.origin),
+                "sensing: unsolicited attestation dropped"
+            );
+            return;
+        }
+        let Some(origin_entity) = ctx
+            .peer_entity_ids
+            .get(&attestation.origin)
+            .map(|e| e.value().clone())
+        else {
+            tracing::debug!(
+                origin = format!("{:#x}", attestation.origin),
+                "sensing: no pinned EntityId for attestation origin, drop"
+            );
+            return;
+        };
+        if let Err(error) = sensing::verify_attestation(&attestation, &origin_entity) {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                origin = format!("{:#x}", attestation.origin),
+                error = %error,
+                "sensing: attestation signature verification failed"
+            );
+            return;
+        }
+        let fingerprint = sensing::Digest256::from_bytes(attestation.transcript_digest());
+        let admission = ctx.sensing_observer_gate.lock().admit(
+            attestation.origin,
+            attestation.interest_digest,
+            attestation.origin_incarnation,
+            attestation.seq,
+            fingerprint,
+        );
+        if admission == sensing::Admission::Equivocation {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                origin = format!("{:#x}", attestation.origin),
+                incarnation = attestation.origin_incarnation.get(),
+                seq = attestation.seq,
+                "sensing: equivocating attestation — incarnation poisoned"
+            );
+            return;
+        }
+        if !admission.is_admitted() {
+            tracing::trace!(
+                origin = format!("{:#x}", attestation.origin),
+                admission = ?admission,
+                "sensing: stale attestation dropped at observer gate"
+            );
+            return;
+        }
+        if attestation.status_reason == sensing::StatusReason::SamplingIntervalUnsupported {
+            let partition = ctx.sensing_interest_table.lock().on_refusal(
+                &branch,
+                attestation.promised_cadence,
+                now,
+            );
+            for downstream in &partition.refused {
+                let sensing::DownstreamId::Peer(node) = downstream else {
+                    continue;
+                };
+                // Forward the origin's SIGNED bytes verbatim —
+                // relays never author attestations (§4.2).
+                spawn_sensing_frame_send(
+                    &ctx.socket,
+                    &ctx.peers,
+                    &ctx.addr_to_node,
+                    &ctx.router,
+                    &ctx.partition_filter,
+                    ctx.local_node_id,
+                    *node,
+                    sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                    payload.to_vec(),
+                );
+            }
+            if partition.upstream == sensing::UpstreamAction::Deregister
+                && branch.provider != ctx.local_node_id
+            {
+                Self::send_sensing_deregister_upstream(ctx, &branch);
+            }
+        }
+        let mut observations = ctx.sensing_observations.lock();
+        if observations.len() >= MAX_SENSING_OBSERVATIONS && !observations.contains_key(&branch) {
+            tracing::debug!(
+                origin = format!("{:#x}", attestation.origin),
+                "sensing: observation store at cap, new branch dropped"
+            );
+            return;
+        }
+        observations.insert(branch, attestation);
     }
 
     /// SI-3: sign one refusal beat and fan it to the given peers
