@@ -2899,11 +2899,23 @@ impl SensingObservations {
     /// ages it out.
     fn reclaim_status(&mut self, key: &sensing::ProviderInterestKey) {
         self.latest.remove(key);
-        let provider = key.provider;
-        if !self.latest.keys().any(|k| k.provider == provider)
-            && !self.refusals.keys().any(|k| k.provider == provider)
-        {
-            self.provider_epochs.remove(&provider);
+        self.reclaim_orphan_epochs([key.provider]);
+    }
+
+    /// Second closure round, item 3: drop epoch records whose
+    /// provider has nothing left behind them — no warm-start
+    /// observation and no refusal tombstone. Runs on every
+    /// reclamation path INCLUDING tombstone age-out, so
+    /// `provider_epochs` can never outlive everything that
+    /// justified it (churn across distinct providers stays
+    /// bounded).
+    fn reclaim_orphan_epochs(&mut self, providers: impl IntoIterator<Item = u64>) {
+        for provider in providers {
+            if !self.latest.keys().any(|k| k.provider == provider)
+                && !self.refusals.keys().any(|k| k.provider == provider)
+            {
+                self.provider_epochs.remove(&provider);
+            }
         }
     }
 }
@@ -2918,13 +2930,14 @@ fn sensing_upstream_damper_admits(
     damper: &DashMap<(u64, [u8; 32]), std::time::Instant>,
     provider: u64,
     interest_digest: [u8; 32],
+    min_gap: Duration,
 ) -> bool {
     let now = std::time::Instant::now();
     let mut fresh = false;
     damper
         .entry((provider, interest_digest))
         .and_modify(|t| {
-            if now.saturating_duration_since(*t) >= SENSING_UPSTREAM_MIN_GAP {
+            if now.saturating_duration_since(*t) >= min_gap {
                 *t = now;
                 fresh = true;
             }
@@ -2937,6 +2950,17 @@ fn sensing_upstream_damper_admits(
         damper.retain(|_, t| now.saturating_duration_since(*t) < SENSING_UPSTREAM_MIN_GAP);
     }
     fresh
+}
+
+/// Second closure round, item 2: the damper gap must never exceed
+/// the refresh budget of the row it protects — a fixed 100 ms gap
+/// suppressed every ttl/2 refresh of a valid `ttl < 100 ms` row
+/// until the upstream row expired. The effective gap is
+/// `min(SENSING_UPSTREAM_MIN_GAP, soft_state_ttl / 2)`, so the
+/// mandated ttl/2 refresh always passes (never an arbitrary
+/// minimum ttl instead).
+fn sensing_effective_min_gap(soft_state_ttl: Duration) -> Duration {
+    SENSING_UPSTREAM_MIN_GAP.min(soft_state_ttl / 2)
 }
 
 /// SI-2a: send one encoded sensing payload (0x0C02 interest frame
@@ -3074,6 +3098,14 @@ pub enum SensingRegistrationError {
         /// The local maximum (`sensing_interest_ttl`).
         max: Duration,
     },
+    /// Second closure round, item 2: `soft_state_ttl == 0` is
+    /// refused — a zero-ttl row is dead on arrival and only
+    /// manufactures reclamation corner cases.
+    ZeroTtl,
+    /// Second closure round, item 5: the origin is at
+    /// [`sensing::MAX_LIVE_SENSING_STREAMS`] live streams — the
+    /// registration was rolled back; retry after capacity frees.
+    AtCapacity,
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -3085,6 +3117,10 @@ impl std::fmt::Display for SensingRegistrationError {
                 f,
                 "sample interval {requested:?} out of bounds (0 < D <= {max:?})"
             ),
+            Self::ZeroTtl => f.write_str("zero soft-state ttl — the row would be dead on arrival"),
+            Self::AtCapacity => {
+                f.write_str("origin at live-stream capacity — registration rolled back")
+            }
         }
     }
 }
@@ -4561,6 +4597,10 @@ impl MeshNode {
                 max: self.config.sensing_interest_ttl,
             });
         }
+        // Round 2, item 2: a zero ttl is dead on arrival.
+        if soft_state_ttl.is_zero() {
+            return Err(SensingRegistrationError::ZeroTtl);
+        }
         // A local registration proves the local root by construction
         // (session == claimed == local); the shared validation path
         // still runs so an audience mismatch is refused exactly like
@@ -4607,13 +4647,18 @@ impl MeshNode {
                 match refusal {
                     None => self.sensing_emitter_notify.notify_one(),
                     Some(sensing::StreamRefusal::AtCapacity) => {
-                        // Closure item 1: the origin is at its live
-                        // cap — the row stands, the stream stays
-                        // dark until capacity frees. Local refusal
-                        // only (no §4.4 wire semantics for it).
-                        tracing::debug!(
-                            "sensing: origin at live-stream capacity, local stream dark"
+                        // Round 2, item 5: surface capacity honestly
+                        // — roll back the just-inserted Local row
+                        // and tell the caller; a dark row would
+                        // report success for a stream that will
+                        // never exist. Retry after capacity frees.
+                        let _ = self.sensing_interest_table.lock().deregister(
+                            &key.interest.interest_digest,
+                            Some(provider),
+                            sensing::DownstreamId::Local,
+                            now,
                         );
+                        return Err(SensingRegistrationError::AtCapacity);
                     }
                     Some(sensing::StreamRefusal::Cadence(refusal)) => {
                         self.sensing_counters
@@ -4663,6 +4708,7 @@ impl MeshNode {
                     &self.sensing_upstream_damper,
                     provider,
                     *key.interest.interest_digest.as_bytes(),
+                    sensing_effective_min_gap(ttl),
                 ) {
                     let frame = sensing::SensingInterestFrame::provider_registration(
                         spec, provider, strictest, ttl,
@@ -4782,6 +4828,14 @@ impl MeshNode {
     /// drained table drains this too (closure item 6).
     pub fn sensing_observation_count(&self) -> usize {
         self.sensing_observations.lock().latest.len()
+    }
+
+    /// Second closure round, item 3: how many origins hold an epoch
+    /// record (tests and observability). Drains with the
+    /// observation/tombstone maps — an epoch can never outlive
+    /// everything that justified it.
+    pub fn sensing_provider_epoch_count(&self) -> usize {
+        self.sensing_observations.lock().provider_epochs.len()
     }
 
     /// SI-3c: whether this hop's observer gate poisoned an origin's
@@ -9160,9 +9214,17 @@ impl MeshNode {
                                         .collect()
                                 };
                                 let mut observations = sensing_observations.lock();
+                                let providers: Vec<u64> =
+                                    dead.iter().map(|key| key.provider).collect();
                                 for key in dead {
                                     observations.refusals.remove(&key);
                                 }
+                                // Round 2, item 3: a tombstone was
+                                // the last thing pinning its
+                                // provider's epoch — reclaim it
+                                // too, or provider_epochs outlives
+                                // everything.
+                                observations.reclaim_orphan_epochs(providers);
                             }
                         }
 
@@ -11068,14 +11130,18 @@ impl MeshNode {
                 soft_state_ttl,
                 ..
             } => {
-                // Closure item 4: bound the wire interval before any
-                // work — `0 < D ≤ sensing_interest_ttl`.
+                // Closure item 4 + round 2 item 2: bound the wire
+                // interval before any work — `0 < D ≤
+                // sensing_interest_ttl` — and refuse zero-ttl rows
+                // (dead on arrival).
                 if !sensing_interval_in_bounds(*requested_sample_interval, ctx.sensing_interest_ttl)
+                    || soft_state_ttl.is_zero()
                 {
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         interval_ms = requested_sample_interval.as_millis() as u64,
-                        "sensing: out-of-bounds sample interval dropped"
+                        ttl_ms = soft_state_ttl.as_millis() as u64,
+                        "sensing: out-of-bounds interval/ttl dropped"
                     );
                     return;
                 }
@@ -11213,6 +11279,7 @@ impl MeshNode {
                             &ctx.sensing_upstream_damper,
                             provider,
                             *key.interest.interest_digest.as_bytes(),
+                            sensing_effective_min_gap(ttl),
                         ) {
                             continue;
                         }
@@ -11240,17 +11307,21 @@ impl MeshNode {
                 else {
                     return;
                 };
-                // Closure item 4: bound the wire interval —
-                // `0 < D ≤ sensing_interest_ttl` — before it can
-                // reach the table aggregate or emitter scheduling.
+                // Closure item 4 + round 2 item 2: bound the wire
+                // interval — `0 < D ≤ sensing_interest_ttl` — before
+                // it can reach the table aggregate or emitter
+                // scheduling, and refuse zero-ttl rows (dead on
+                // arrival).
                 if !sensing_interval_in_bounds(
                     validated.requested_sample_interval,
                     ctx.sensing_interest_ttl,
-                ) {
+                ) || validated.soft_state_ttl.is_zero()
+                {
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         interval_ms = validated.requested_sample_interval.as_millis() as u64,
-                        "sensing: out-of-bounds sample interval dropped"
+                        ttl_ms = validated.soft_state_ttl.as_millis() as u64,
+                        "sensing: out-of-bounds interval/ttl dropped"
                     );
                     return;
                 }
@@ -11281,7 +11352,13 @@ impl MeshNode {
                         // there the registration feeds the origin
                         // emitter instead (SI-3).
                         if validated.target == ctx.local_node_id {
-                            Self::feed_sensing_origin(ctx, &key, &validated.spec, now);
+                            Self::feed_sensing_origin(
+                                ctx,
+                                &key,
+                                &validated.spec,
+                                sensing::DownstreamId::Peer(from_node),
+                                now,
+                            );
                             return;
                         }
                         // A registration can't kill the last
@@ -11316,6 +11393,7 @@ impl MeshNode {
                             &ctx.sensing_upstream_damper,
                             validated.target,
                             *key.interest.interest_digest.as_bytes(),
+                            sensing_effective_min_gap(ttl),
                         ) {
                             return;
                         }
@@ -11433,43 +11511,56 @@ impl MeshNode {
     /// the row stands but the stream stays dark — the fail-closed
     /// §4.6 rule (see the `sensing_incarnation` knob docs).
     ///
+    /// At live-stream capacity (second closure round, item 5) the
+    /// registering `downstream`'s row is ROLLED BACK instead of
+    /// left dark — a standing row would tell the downstream its
+    /// registration succeeded. The removal is silent by design:
+    /// no §4.4 wire semantics exist for capacity and no seq slot
+    /// is minted to invent one; the downstream's next ttl/2
+    /// refresh retries after capacity frees.
+    ///
     /// Lock discipline: table read first, dropped, then the emitter
     /// — never nested (see the `sensing_emitter` field docs).
     fn feed_sensing_origin(
         ctx: &DispatchCtx,
         key: &sensing::ProviderInterestKey,
         spec: &sensing::InterestSpec,
+        downstream: sensing::DownstreamId,
         now: Instant,
     ) {
         let Some(strictest) = ctx.sensing_interest_table.lock().aggregate(key, now) else {
             return;
         };
-        let (refusal, stamp) = {
+        let outcome = {
             let mut slot = ctx.sensing_emitter.lock();
             let Some(emitter) = slot.as_mut() else {
                 return;
             };
-            match emitter.register(spec, strictest, now) {
-                Ok(()) => {
-                    drop(slot);
-                    ctx.sensing_emitter_notify.notify_one();
-                    return;
-                }
-                Err(sensing::StreamRefusal::AtCapacity) => {
-                    // Closure item 1: at the live cap — the row
-                    // stands, the stream stays dark until capacity
-                    // frees (the next refresh retries). Local-only
-                    // refusal: no §4.4 wire semantics for capacity.
-                    tracing::debug!(
-                        digest = ?key.interest.interest_digest,
-                        "sensing: origin at live-stream capacity, stream dark"
-                    );
-                    return;
-                }
-                // Closure item 7: the stamp snapshot must precede
-                // the table mutation the retire decision rests on.
-                Err(sensing::StreamRefusal::Cadence(refusal)) => (refusal, emitter.stamp()),
+            // Closure item 7: the stamp snapshot must precede the
+            // table mutation the retire decision rests on.
+            emitter
+                .register(spec, strictest, now)
+                .map_err(|refusal| (refusal, emitter.stamp()))
+        };
+        let (refusal, stamp) = match outcome {
+            Ok(()) => {
+                ctx.sensing_emitter_notify.notify_one();
+                return;
             }
+            Err((sensing::StreamRefusal::AtCapacity, _)) => {
+                let _ = ctx.sensing_interest_table.lock().deregister(
+                    &key.interest.interest_digest,
+                    Some(key.provider),
+                    downstream,
+                    now,
+                );
+                tracing::debug!(
+                    digest = ?key.interest.interest_digest,
+                    "sensing: origin at live-stream capacity, registration rolled back"
+                );
+                return;
+            }
+            Err((sensing::StreamRefusal::Cadence(refusal), stamp)) => (refusal, stamp),
         };
         // §4.4 origin-hop refusal: partition this hop's downstreams
         // on M, answer every refused peer with the one-shot signed
@@ -11529,23 +11620,33 @@ impl MeshNode {
     ///    subscriptions always pinned their upstream hop, and the
     ///    full multi-hop verification story rides SI-4's forwarding
     ///    (identical signed bytes, §4.2).
-    /// 4. **Ordering** (§4.6): strictly-newer admission per
+    /// 4. **Tagged-field validation** (second closure round,
+    ///    item 1): a refusal's floor M (`promised_cadence` under
+    ///    the reason tag) is bounded like every wire interval
+    ///    BEFORE the gate — a signed-but-malformed refusal must
+    ///    not consume sequence admission or move provider state on
+    ///    its way to being dropped.
+    /// 5. **Ordering** (§4.6): strictly-newer admission per
     ///    `(origin, incarnation, interest)` on the
     ///    [`sensing::IncarnationSeqGate`] — SI-1c's gate getting its
     ///    first live consumer. The fingerprint is the transcript
     ///    digest, so equivocation detection keys on exactly what the
     ///    origin signed; an equivocation poisons the incarnation AND
     ///    counts as protocol-invalid (security-relevant).
-    /// 5. **Refusal reaction** (§4.4): an admitted
+    /// 6. **Epoch transition** (closure items 3 + round-2 item 4):
+    ///    MONOTONIC per-origin (incarnation, generation) —
+    ///    advancing invalidates cached floors; a stale epoch
+    ///    neither regresses nor invalidates.
+    /// 7. **Refusal reaction** (§4.4): an admitted
     ///    `SamplingIntervalUnsupported` beat partitions this hop's
-    ///    downstreams on M (carried in `promised_cadence` — the
-    ///    SI-3a documented reading), forwards the origin's SIGNED
-    ///    refusal bytes verbatim to each partitioned-out peer, and
-    ///    honors a branch death upstream. The surviving-aggregate
-    ///    upstream re-registration is skipped exactly like the
-    ///    sweep's loosened-aggregate case (no spec cache at this
-    ///    hop) — the next downstream refresh repairs it.
-    /// 6. **Store**: latest admitted attestation per branch.
+    ///    downstreams on M, forwards the origin's SIGNED refusal
+    ///    bytes verbatim to each partitioned-out peer, and honors a
+    ///    branch death upstream. The surviving-aggregate upstream
+    ///    re-registration is skipped exactly like the sweep's
+    ///    loosened-aggregate case (no spec cache at this hop) — the
+    ///    next downstream refresh repairs it.
+    /// 8. **Store**: latest admitted attestation per branch;
+    ///    refusals in their own control-response map.
     fn handle_sensing_attestation_frame(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
         let Ok(attestation) = sensing::decode_attestation(payload) else {
             ctx.sensing_counters
@@ -11598,6 +11699,28 @@ impl MeshNode {
             );
             return;
         }
+        // Second closure round, item 1 (fail-closed ordering): every
+        // TAGGED field is validated BEFORE the observer gate and the
+        // epoch transition — a signed-but-malformed refusal must not
+        // consume sequence admission or move provider state on its
+        // way to being dropped. Under the refusal tag, the signed
+        // promised_cadence means the floor M — bound it like every
+        // other wire interval.
+        let is_refusal =
+            attestation.status_reason == sensing::StatusReason::SamplingIntervalUnsupported;
+        if is_refusal
+            && !sensing_interval_in_bounds(attestation.promised_cadence, ctx.sensing_interest_ttl)
+        {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                origin = format!("{:#x}", attestation.origin),
+                floor_ms = attestation.promised_cadence.as_millis() as u64,
+                "sensing: refusal beat with out-of-bounds floor dropped"
+            );
+            return;
+        }
         let fingerprint = sensing::Digest256::from_bytes(attestation.transcript_digest());
         let admission = ctx.sensing_observer_gate.lock().admit(
             attestation.origin,
@@ -11626,45 +11749,52 @@ impl MeshNode {
             );
             return;
         }
-        // Closure item 3: an admitted beat whose origin epoch moved
-        // on EITHER axis (incarnation restart, capability
-        // redefinition) invalidates every cached floor for that
-        // origin BEFORE the new state applies — a floor learned
-        // under the old epoch may be obsolete and must not keep
-        // refusing registrations on stale grounds (§4.4/§4.8).
+        // Closure item 3, hardened by round 2 item 4: provider
+        // epochs are MONOTONIC. The observer gate is per (origin,
+        // digest) but the epoch record is per origin, so a delayed
+        // old-incarnation beat on a FRESH digest passes its
+        // digest-local gate — it must neither regress the
+        // provider-wide epoch nor flush valid floors. Advance only
+        // on a strictly newer epoch — lexicographic (incarnation,
+        // generation), so incarnation dominates (generation
+        // restarts under a new incarnation) — and invalidate
+        // cached floors exactly then (§4.4/§4.8). A stale-epoch
+        // beat still applies per-branch below: its own gate
+        // admitted it.
         let epoch = (
             attestation.origin_incarnation,
             attestation.capability_generation,
         );
-        let epoch_moved = {
+        let epoch_advanced = {
             let mut observations = ctx.sensing_observations.lock();
-            observations
+            match observations
                 .provider_epochs
-                .insert(attestation.origin, epoch)
-                .is_some_and(|previous| previous != epoch)
+                .get(&attestation.origin)
+                .copied()
+            {
+                None => {
+                    // First sight of this origin — nothing was
+                    // cached under an older epoch, no invalidation.
+                    observations
+                        .provider_epochs
+                        .insert(attestation.origin, epoch);
+                    false
+                }
+                Some(current) if epoch > current => {
+                    observations
+                        .provider_epochs
+                        .insert(attestation.origin, epoch);
+                    true
+                }
+                Some(_) => false,
+            }
         };
-        if epoch_moved {
+        if epoch_advanced {
             ctx.sensing_interest_table
                 .lock()
                 .invalidate_provider_floors(attestation.origin);
         }
-        if attestation.status_reason == sensing::StatusReason::SamplingIntervalUnsupported {
-            // Closure item 4: under the refusal tag, the signed
-            // promised_cadence means the floor M — bound it like
-            // every other wire interval before it drives a
-            // partition. A floor of zero or beyond the soft-state
-            // lifetime is a malformed control response.
-            if !sensing_interval_in_bounds(attestation.promised_cadence, ctx.sensing_interest_ttl) {
-                ctx.sensing_counters
-                    .protocol_invalid
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    origin = format!("{:#x}", attestation.origin),
-                    floor_ms = attestation.promised_cadence.as_millis() as u64,
-                    "sensing: refusal beat with out-of-bounds floor dropped"
-                );
-                return;
-            }
+        if is_refusal {
             // Closure item 6: a refusal is a cadence-request-
             // relative CONTROL response, never warm-start status —
             // it lands in the refusals map, apart from `latest`,

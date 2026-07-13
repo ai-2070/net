@@ -310,26 +310,31 @@ async fn foreign_only_population_resolves_no_branches() {
         1_000,
     );
 
+    // Since the SI-3 second closure round (the standing SI-2
+    // orphan-cap finding): a population with NO authorized
+    // candidate resolves zero branches, and a zero-branch interest
+    // is REFUSED outright rather than admitted — a branchless
+    // `LeaderInterest` would sit outside branch-table expiry
+    // forever, and refreshes never re-resolve an EXISTING interest,
+    // so the failed resolution would be pinned permanently. Fail
+    // closed with ZERO retained state: every refresh re-attempts
+    // resolution, so a provider announced later is picked up by the
+    // consumer's next ttl/2 refresh.
     let spec = spec_for(owner);
     let frame = SensingInterestFrame::capability_registration(&spec, D, TTL, a.node_id());
     let bytes = encode_interest_frame(&frame).expect("frame encodes");
     let r_addr = r.local_addr();
-    let mut landed = false;
-    for _ in 0..40 {
+    for _ in 0..10 {
         a.send_subprotocol(r_addr, SUBPROTOCOL_SENSING_INTEREST, &bytes)
             .await
             .expect("A sends the registration");
-        if poll_until(Duration::from_millis(250), || {
-            r.sensing_leader_interest_count() == Some(1)
-        })
-        .await
-        {
-            landed = true;
-            break;
-        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(landed, "the registration itself is accepted");
-
+    assert_eq!(
+        r.sensing_leader_interest_count(),
+        Some(0),
+        "a branchless interest is refused, never admitted",
+    );
     let key = CapabilityInterestKey {
         capability_id: spec.capability_id.clone(),
         interest_digest: spec.interest_digest(),
@@ -337,8 +342,9 @@ async fn foreign_only_population_resolves_no_branches() {
     assert_eq!(
         r.sensing_leader_branches(&key),
         Some(Vec::new()),
-        "no authorized candidate ⇒ no active branch (fail closed)",
+        "no active branch exists for the refused interest",
     );
+    assert!(r.sensing_table_is_empty(), "no branch rows remain either");
 
     a.shutdown().await.expect("shutdown A");
     r.shutdown().await.expect("shutdown R");

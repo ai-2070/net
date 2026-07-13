@@ -199,6 +199,9 @@ impl fmt::Display for FrameRejection {
                 f,
                 "candidate resolution refused: selector matched {matched} providers (cap {cap})"
             ),
+            Self::Resolution(ResolutionRefusal::AllBranchesRefused) => f.write_str(
+                "every resolved branch refused the registration — interest not admitted",
+            ),
         }
     }
 }
@@ -309,6 +312,22 @@ impl SensingLeader {
             if let Some(delivery) = warm {
                 warm_starts.push(delivery);
             }
+        }
+        // Standing SI-2 orphan-cap finding, closed in the SI-3
+        // second closure round: the sweep drains interests ONLY
+        // through branch-table expiry, so an interest with zero
+        // live branch rows (every registration refused — per-
+        // downstream cap, cached floor) would sit outside expiry
+        // forever. Admit the interest only while at least one
+        // branch row is live; otherwise remove it and refuse —
+        // soft state, the consumer's refresh retries.
+        let any_branch_live = branches.iter().any(|provider| {
+            let branch = ProviderInterestKey::new(key.clone(), *provider);
+            self.relay.table.aggregate(&branch, now).is_some()
+        });
+        if !any_branch_live {
+            self.interests.remove(&key);
+            return Err(ResolutionRefusal::AllBranchesRefused);
         }
         Ok(LeaderRegistration {
             interest: key,
@@ -591,6 +610,59 @@ mod tests {
             tags: Vec::new(),
             groups: Vec::new(),
         }
+    }
+
+    /// Standing SI-2 orphan-cap finding, closed in the SI-3 second
+    /// closure round: an interest whose EVERY branch registration
+    /// is refused must not be admitted — before the fix the
+    /// `LeaderInterest` stayed behind with zero branch rows,
+    /// invisible to the sweep (which drains interests only through
+    /// branch-table expiry) forever.
+    #[test]
+    fn fully_cap_refused_interest_never_becomes_orphan_leader_state() {
+        let now = Instant::now();
+        // Per-downstream cap of ONE row: the second distinct
+        // interest from the same consumer has nowhere to register.
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1);
+        let snapshot = [provider(0xB1, 5)];
+        let consumer = DownstreamId::Peer(0xC1);
+
+        let first = spec();
+        leader
+            .register_capability_interest(&first, consumer, ms(100), TTL, root(), &snapshot, now)
+            .expect("first interest admits");
+        assert_eq!(leader.interest_count(), 1);
+
+        // Distinct digest, same downstream: the only branch
+        // registration is OverCap — the interest must be refused
+        // and leave NO leader state behind.
+        let mut second = spec();
+        second.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+        let refused = leader.register_capability_interest(
+            &second,
+            consumer,
+            ms(100),
+            TTL,
+            root(),
+            &snapshot,
+            now,
+        );
+        assert!(
+            matches!(refused, Err(ResolutionRefusal::AllBranchesRefused)),
+            "expected AllBranchesRefused, got {refused:?}",
+        );
+        assert_eq!(
+            leader.interest_count(),
+            1,
+            "no orphan interest outside branch-table expiry",
+        );
+
+        // A downstream with headroom admits the same spec normally.
+        let other = DownstreamId::Peer(0xC2);
+        leader
+            .register_capability_interest(&second, other, ms(100), TTL, root(), &snapshot, now)
+            .expect("fresh downstream admits");
+        assert_eq!(leader.interest_count(), 2);
     }
 
     fn proof(

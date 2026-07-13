@@ -576,7 +576,8 @@ async fn out_of_bounds_intervals_refused_at_intake() {
     );
     let spec = shared_spec(fleet);
 
-    // Local API: both bounds refused synchronously.
+    // Local API: both interval bounds refused synchronously, and
+    // (round 2, item 2) so is a zero soft-state ttl.
     for bad in [Duration::ZERO, Duration::from_secs(3600)] {
         let refused = c.register_sensing_interest(&spec, p_id, bad, TTL);
         assert!(
@@ -587,11 +588,23 @@ async fn out_of_bounds_intervals_refused_at_intake() {
             "local registration with D={bad:?} must refuse, got {refused:?}",
         );
     }
+    assert!(
+        matches!(
+            c.register_sensing_interest(&spec, p_id, D, Duration::ZERO),
+            Err(net::adapter::net::SensingRegistrationError::ZeroTtl)
+        ),
+        "a zero ttl is dead on arrival",
+    );
 
-    // Wire: crafted ProviderRegistrations with out-of-bounds D drop
-    // at P's intake — repeated sends, then the table is still empty.
-    for bad in [Duration::ZERO, Duration::from_secs(3600)] {
-        let frame = SensingInterestFrame::provider_registration(&spec, p_id, bad, TTL);
+    // Wire: crafted ProviderRegistrations with out-of-bounds D (or
+    // a zero ttl) drop at P's intake — repeated sends, then the
+    // table is still empty.
+    for (bad_d, bad_ttl) in [
+        (Duration::ZERO, TTL),
+        (Duration::from_secs(3600), TTL),
+        (D, Duration::ZERO),
+    ] {
+        let frame = SensingInterestFrame::provider_registration(&spec, p_id, bad_d, bad_ttl);
         let bytes = encode_interest_frame(&frame).expect("encode");
         for _ in 0..5 {
             let _ = c
@@ -940,4 +953,375 @@ async fn mixed_cadence_refusal_recovers_the_survivor_through_the_relay() {
     c.shutdown().await.expect("shutdown C");
     r.shutdown().await.expect("shutdown R");
     p.shutdown().await.expect("shutdown P");
+}
+
+/// Second closure round, items 1 + 4: fail-closed intake ordering
+/// and monotonic provider epochs.
+///
+/// A signed-but-MALFORMED refusal (floor M out of bounds) must be
+/// dropped before it consumes sequence admission or moves provider
+/// state; a delayed OLD-incarnation beat on a fresh digest passes
+/// its digest-local observer gate but must neither regress the
+/// provider-wide epoch nor flush valid floor caches.
+#[tokio::test]
+async fn malformed_refusals_and_stale_epochs_touch_nothing() {
+    let (c, p, fleet) = consumer_provider_pair(None).await;
+    let c_addr = c.local_addr();
+    let p_id = p.node_id();
+    let spec_a = shared_spec(fleet);
+    let branch_a = ProviderInterestKey::new(spec_a.key(), p_id);
+    let mut spec_b = shared_spec(fleet);
+    spec_b.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+    let branch_b = ProviderInterestKey::new(spec_b.key(), p_id);
+
+    let beat = |spec: &InterestSpec,
+                incarnation: u64,
+                seq: u64,
+                refusal: bool,
+                floor_ms: u64,
+                start_ms: u64| {
+        let unsigned = UnsignedAttestation {
+            interest_digest: spec.interest_digest(),
+            origin: p_id,
+            origin_incarnation: Incarnation::new(incarnation),
+            capability_id: CapabilityId::new("print.document"),
+            capability_generation: 1,
+            status: if refusal {
+                AttestedStatus::ProviderUnknown
+            } else {
+                AttestedStatus::Ready
+            },
+            status_reason: if refusal {
+                StatusReason::SamplingIntervalUnsupported
+            } else {
+                StatusReason::None
+            },
+            estimated_start: (!refusal).then(|| Duration::from_millis(start_ms)),
+            seq,
+            promised_cadence: Duration::from_millis(floor_ms),
+            audience_scope: fleet,
+        };
+        encode_attestation(&sign_attestation(p.entity_keypair(), unsigned).expect("sign"))
+            .expect("encode")
+    };
+    macro_rules! send_until {
+        ($bytes:expr, $what:literal, $done:expr) => {
+            let bytes = $bytes;
+            await_condition(Duration::from_secs(10), $what, || {
+                if $done {
+                    true
+                } else {
+                    let p = p.clone();
+                    let bytes = bytes.clone();
+                    tokio::spawn(async move {
+                        let _ = p
+                            .send_subprotocol(c_addr, SUBPROTOCOL_READINESS_ATTESTATION, &bytes)
+                            .await;
+                    });
+                    false
+                }
+            })
+            .await;
+        };
+    }
+    let floor_cached = || {
+        matches!(
+            c.register_sensing_interest(&spec_a, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::RefusedByCachedFloor { .. })
+        )
+    };
+
+    // Survivor row on branch A, then establish epoch (inc 6) and a
+    // cached floor.
+    await_condition(Duration::from_secs(10), "survivor row at C", || {
+        if c.sensing_downstreams(&branch_a).is_empty() {
+            let _ = c.register_sensing_interest(&spec_a, p_id, D, LONG_TTL);
+            false
+        } else {
+            true
+        }
+    })
+    .await;
+    send_until!(
+        beat(&spec_a, 6, 0, false, 100, 3),
+        "Ready (inc 6) admits",
+        { c.sensing_latest_attestation(&branch_a).is_some() }
+    );
+    send_until!(beat(&spec_a, 6, 1, true, 50, 0), "refusal caches floor", {
+        c.sensing_latest_refusal(&branch_a).is_some()
+    });
+    assert!(floor_cached(), "the floor refuses a sub-floor joiner");
+
+    // ── Item 1: a signed refusal with M = 0 (malformed) at inc 7,
+    //    seq 2 — dropped BEFORE the gate and the epoch ──
+    let invalid_before = SensingCounters::get(&c.sensing_counters().protocol_invalid);
+    send_until!(
+        beat(&spec_a, 7, 2, true, 0, 0),
+        "malformed refusal counted",
+        { SensingCounters::get(&c.sensing_counters().protocol_invalid) > invalid_before }
+    );
+    assert!(
+        floor_cached(),
+        "a malformed inc-7 refusal must not move the epoch or flush the floor",
+    );
+    // The gate never saw the inc-7 frame: a valid inc-6 beat at the
+    // SAME seq it carried still admits.
+    send_until!(
+        beat(&spec_a, 6, 2, false, 100, 9),
+        "inc-6 seq-2 still admits",
+        {
+            c.sensing_latest_attestation(&branch_a)
+                .is_some_and(|a| a.estimated_start == Some(Duration::from_millis(9)))
+        }
+    );
+
+    // ── Item 4: a STALE-epoch beat on a fresh digest neither
+    //    regresses the epoch nor flushes the floor ──
+    await_condition(Duration::from_secs(10), "row on branch B", || {
+        if c.sensing_downstreams(&branch_b).is_empty() {
+            let _ = c.register_sensing_interest(&spec_b, p_id, D, LONG_TTL);
+            false
+        } else {
+            true
+        }
+    })
+    .await;
+    send_until!(
+        beat(&spec_b, 5, 0, false, 100, 3),
+        "old-incarnation beat admits on its fresh digest",
+        { c.sensing_latest_attestation(&branch_b).is_some() }
+    );
+    assert!(
+        floor_cached(),
+        "a cross-digest stale epoch must not flush valid floors",
+    );
+
+    // A genuinely NEWER epoch still invalidates.
+    send_until!(beat(&spec_b, 7, 1, false, 100, 3), "inc 7 advances", {
+        c.sensing_latest_attestation(&branch_b)
+            .is_some_and(|a| a.origin_incarnation == Incarnation::new(7))
+    });
+    await_condition(Duration::from_secs(5), "floor invalidated by inc 7", || {
+        matches!(
+            c.register_sensing_interest(&spec_a, p_id, Duration::from_millis(10), LONG_TTL),
+            Ok(net::adapter::net::behavior::sensing::RegisterOutcome::Registered(_))
+        )
+    })
+    .await;
+
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Second closure round, item 2: a valid short-ttl row refreshed at
+/// exactly ttl/2 must stay continuously live upstream — the damper
+/// gap scales to min(100 ms, ttl/2), so the mandated refresh always
+/// passes instead of being suppressed until the row expires.
+#[tokio::test]
+async fn short_ttl_rows_survive_the_damper() {
+    let (c, p, fleet) = consumer_provider_pair(Some(Incarnation::new(1))).await;
+    let c_id = c.node_id();
+    let p_id = p.node_id();
+    p.register_readiness_evaluator(
+        CapabilityId::new("print.document"),
+        Arc::new(FlagEvaluator {
+            ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let short_ttl = Duration::from_millis(100);
+
+    // Refresh at exactly ttl/2.
+    let refresher = {
+        let c = c.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = c.register_sensing_interest(&spec, p_id, short_ttl, short_ttl);
+                tokio::time::sleep(short_ttl / 2).await;
+            }
+        })
+    };
+    use net::adapter::net::behavior::sensing::DownstreamId;
+    await_condition(Duration::from_secs(10), "upstream row established", || {
+        p.sensing_downstream_entry(&branch, DownstreamId::Peer(c_id))
+            .is_some()
+    })
+    .await;
+
+    // Continuously live across several ttls: before the fix the
+    // fixed 100 ms damper suppressed every 50 ms refresh and the
+    // row expired.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            p.sensing_downstream_entry(&branch, DownstreamId::Peer(c_id))
+                .is_some(),
+            "the upstream row must never lapse while refreshes flow at ttl/2",
+        );
+    }
+    assert_eq!(p.sensing_live_streams(), 1, "the stream rode along");
+
+    refresher.abort();
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Second closure round, item 3: when tombstone GC ages out the last
+/// refusal, the provider's epoch record reclaims with it — nothing
+/// outlives everything that justified it.
+#[tokio::test]
+async fn tombstone_ageout_drains_provider_epochs_too() {
+    // Short soft-state horizon so the tombstone ages out quickly.
+    let fleet_kp = EntityKeypair::generate();
+    let fleet = AudienceScopeCommitment::owner_root(fleet_kp.entity_id());
+    let c = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config()
+                .with_sensing_coalescing(true)
+                .with_sensing_owner_root(fleet)
+                .with_sensing_interest_ttl(Duration::from_secs(1)),
+        )
+        .await
+        .expect("MeshNode::new C"),
+    );
+    let p = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config()
+                .with_sensing_coalescing(true)
+                .with_sensing_owner_root(fleet),
+        )
+        .await
+        .expect("MeshNode::new P"),
+    );
+    connect_pair(&c, &p).await;
+    c.start();
+    p.start();
+    for node in [&c, &p] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    let p_id = p.node_id();
+    let c_id = c.node_id();
+    let c_addr = c.local_addr();
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        c.peer_entity_id(p_id).is_some() && p.peer_entity_id(c_id).is_some()
+    })
+    .await;
+
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let unsigned = UnsignedAttestation {
+        interest_digest: spec.interest_digest(),
+        origin: p_id,
+        origin_incarnation: Incarnation::new(3),
+        capability_id: CapabilityId::new("print.document"),
+        capability_generation: 1,
+        status: AttestedStatus::ProviderUnknown,
+        status_reason: StatusReason::SamplingIntervalUnsupported,
+        estimated_start: None,
+        seq: 0,
+        promised_cadence: Duration::from_millis(50),
+        audience_scope: fleet,
+    };
+    let refusal_bytes =
+        encode_attestation(&sign_attestation(p.entity_keypair(), unsigned).expect("sign"))
+            .expect("encode");
+
+    // A sub-floor row that the refusal fully partitions: the branch
+    // dies, leaving the tombstone + the epoch record behind.
+    await_condition(Duration::from_secs(10), "refusal tombstone lands", || {
+        if c.sensing_latest_refusal(&branch).is_some() {
+            return true;
+        }
+        let _ = c.register_sensing_interest(
+            &spec,
+            p_id,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        );
+        let p = p.clone();
+        let bytes = refusal_bytes.clone();
+        tokio::spawn(async move {
+            let _ = p
+                .send_subprotocol(c_addr, SUBPROTOCOL_READINESS_ATTESTATION, &bytes)
+                .await;
+        });
+        false
+    })
+    .await;
+    assert_eq!(c.sensing_provider_epoch_count(), 1, "epoch recorded");
+
+    // The tombstone ages out (> 1 s with no live branch) and takes
+    // the orphaned epoch with it — BOTH maps drain.
+    await_condition(Duration::from_secs(10), "tombstone and epoch drain", || {
+        c.sensing_latest_refusal(&branch).is_none() && c.sensing_provider_epoch_count() == 0
+    })
+    .await;
+    assert_eq!(c.sensing_observation_count(), 0);
+
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Second closure round, item 5: at the live-stream cap a NEW
+/// registration is surfaced as an explicit error and its row is
+/// rolled back — never a dark row reporting success.
+#[tokio::test]
+async fn at_capacity_registration_surfaced_and_rolled_back() {
+    use net::adapter::net::behavior::sensing::MAX_LIVE_SENSING_STREAMS;
+    use net::adapter::net::SensingRegistrationError;
+
+    let node = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config()
+                .with_sensing_coalescing(true)
+                .with_sensing_incarnation(Incarnation::new(1))
+                // The TABLE's per-downstream cap sits at 512 by
+                // default and would bite first — this test targets
+                // the EMITTER's live-stream cap.
+                .with_max_interests_per_peer(2 * MAX_LIVE_SENSING_STREAMS),
+        )
+        .await
+        .expect("MeshNode::new"),
+    );
+    let self_id = node.node_id();
+    let own_root = AudienceScopeCommitment::owner_root(node.entity_keypair().entity_id());
+    let spec_n = |i: usize| {
+        let mut spec = shared_spec(own_root);
+        spec.constraints =
+            CanonicalConstraints::from_entries([("slot", format!("{i}").as_str())]).unwrap();
+        spec
+    };
+
+    for i in 0..MAX_LIVE_SENSING_STREAMS {
+        node.register_sensing_interest(&spec_n(i), self_id, D, LONG_TTL)
+            .expect("registers under the cap");
+    }
+    assert_eq!(node.sensing_live_streams(), MAX_LIVE_SENSING_STREAMS);
+
+    // The 1025th distinct stream: explicit error, row rolled back.
+    let overflow = spec_n(MAX_LIVE_SENSING_STREAMS);
+    let refused = node.register_sensing_interest(&overflow, self_id, D, LONG_TTL);
+    assert!(
+        matches!(refused, Err(SensingRegistrationError::AtCapacity)),
+        "expected AtCapacity, got {refused:?}",
+    );
+    let overflow_branch = ProviderInterestKey::new(overflow.key(), self_id);
+    assert!(
+        node.sensing_downstreams(&overflow_branch).is_empty(),
+        "the refused registration's row is rolled back, never dark",
+    );
+    assert_eq!(node.sensing_live_streams(), MAX_LIVE_SENSING_STREAMS);
+
+    // Refreshes of existing live streams still succeed at cap.
+    node.register_sensing_interest(&spec_n(0), self_id, D, LONG_TTL)
+        .expect("live refresh at capacity");
+
+    node.shutdown().await.expect("shutdown");
 }

@@ -99,6 +99,13 @@ pub enum ResolutionRefusal {
         /// The configured cap.
         cap: usize,
     },
+    /// Every resolved branch refused this downstream's registration
+    /// (per-downstream cap or cached floor) and no other consumer
+    /// holds live branch rows — admitting the interest would create
+    /// leader state the branch-table sweep can never expire (the
+    /// standing SI-2 orphan-cap finding, closed in the SI-3 second
+    /// closure round). Soft state: the consumer's refresh retries.
+    AllBranchesRefused,
 }
 
 /// The bounded outcome of one resolution pass.
