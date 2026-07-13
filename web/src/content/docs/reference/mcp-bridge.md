@@ -13,7 +13,7 @@ For the how-to, see [Wrap an MCP Server](/docs/guides/wrap-mcp-server) and
 
 ```bash
 cargo install net-cli    # the `net-cli` crate builds the `net-mesh` binary
-                         # (net wrap / net mcp serve / net mcp pin / net forwarding)
+                         # (net-mesh wrap / net-mesh mcp serve / net-mesh mcp pin / net-mesh forwarding)
 ```
 
 (The operator CLI binary `net-mesh` is produced by the separate `net-cli` crate,
@@ -22,10 +22,10 @@ not by the `net-mesh` library crate. Build from source with
 
 ## Commands
 
-### `net wrap` (supply side)
+### `net-mesh wrap` (supply side)
 
 ```
-net wrap <name> [OPTIONS] -- <stdio-mcp-server-command...>
+net-mesh wrap <name> [OPTIONS] -- <stdio-mcp-server-command...>
 ```
 
 | Flag | Meaning |
@@ -44,10 +44,10 @@ node), reads `tools/list`, and announces each tool as a capability with
 `compat_tier: "mcp_bridge"`, `visibility: owner_only`. Long-running; emits
 `wrapped` → `tools_changed` → `server_exited` lifecycle events.
 
-### `net mcp serve` (demand side)
+### `net-mesh mcp serve` (demand side)
 
 ```
-net mcp serve [--identity <file>] [--allow-capability PROVIDER/CAP] [--pin-store <path>] \
+net-mesh mcp serve [--identity <file>] [--allow-capability PROVIDER/CAP] [--pin-store <path>] \
   --node-addr <peer> --node-pubkey <hex> --psk-hex <psk>
 ```
 
@@ -55,19 +55,19 @@ Runs a stdio MCP **server** exposing the mesh to a local MCP host as meta-tools.
 Run it under the same identity as the wrap side to invoke your own owner-only
 tools. `--allow-capability` pre-approves a spicy capability at startup.
 
-### `net mcp pin` (consent)
+### `net-mesh mcp pin` (consent)
 
 ```
-net mcp pin approve <provider/capability>    # out-of-band human consent
-net mcp pin reject  <provider/capability>
-net mcp pin list
+net-mesh mcp pin approve <provider/capability>    # out-of-band human consent
+net-mesh mcp pin reject  <provider/capability>
+net-mesh mcp pin list
 ```
 
 The shim and the pin verbs share one per-user pin store
 (`<local data>/net-mesh/mcp-pins.json` by default), so an approval in one terminal
-is honored by a running `net mcp serve` in another.
+is honored by a running `net-mesh mcp serve` in another.
 
-### `net forwarding` (credential forwarding policy)
+### `net-mesh forwarding` (credential forwarding policy)
 
 Manages the **caller-side** policy for opt-in credential/header forwarding —
 deny-by-default (see [Credential forwarding](#credential-forwarding-opt-in-deny-by-default)).
@@ -75,12 +75,12 @@ It manages **policy only**: it records *that* a secret ref may go to a provider,
 never the secret value (that lives in a separate keychain backend).
 
 ```
-net forwarding enable | disable            # global kill switch (default: off)
-net forwarding allow <ref> --header <H> [--provider <ID>...] [--any-provider] \
+net-mesh forwarding enable | disable            # global kill switch (default: off)
+net-mesh forwarding allow <ref> --header <H> [--provider <ID>...] [--any-provider] \
     [--capability <GLOB>...] [--purpose <TEXT>] [--force]
-net forwarding rm <ref>                     # remove a secret ref's policy
-net forwarding audit                        # value-free listing of every grant
-net forwarding set-value <ref>              # store the secret VALUE (stdin → OS keychain)
+net-mesh forwarding rm <ref>                     # remove a secret ref's policy
+net-mesh forwarding audit                        # value-free listing of every grant
+net-mesh forwarding set-value <ref>              # store the secret VALUE (stdin → OS keychain)
 ```
 
 | Flag (`allow`) | Meaning |
@@ -101,7 +101,7 @@ grant without ever touching a secret. `set-value` reads the secret from **stdin*
 (never argv / shell history) into the OS keychain and needs a build with
 `--features keychain`.
 
-## Meta-tools (what an MCP host sees via `net mcp serve`)
+## Meta-tools (what an MCP host sees via `net-mesh mcp serve`)
 
 | Meta-tool | Purpose |
 |---|---|
@@ -130,14 +130,14 @@ Display / search → never grants invocation
 Pin approval    → local client consent, NOT remote authorization; wrapper policy always wins
 ```
 
-Connecting an MCP host to `net mcp serve` grants it **no** ambient authority over
+Connecting an MCP host to `net-mesh mcp serve` grants it **no** ambient authority over
 the mesh. Owner-only is the default for wrapped tools; widening is explicit and
 per-origin.
 
 ## Credential forwarding (opt-in, deny-by-default)
 
 Net's default is **credential locality**: a secret lives on the machine that
-owns the tool and never transits the mesh (this is why `net wrap --env` stays
+owns the tool and never transits the mesh (this is why `net-mesh wrap --env` stays
 local). Forwarding inverts that *only* for downstream services that understand
 nothing but a bearer header — a **tagged concession**, not a headline feature.
 The preference order never changes: provider-held credentials > Net
@@ -146,7 +146,7 @@ delegation / identity > forwarded credentials.
 Every default here is hostile, and **both ends must opt in**:
 
 - **Caller** — the global kill switch is off, and no secret is bound to any
-  provider until `net forwarding allow` names specific providers and
+  provider until `net-mesh forwarding allow` names specific providers and
   capabilities. A credential bound to "any" provider is refused.
 - **Destination** — accepts no forwarded header until its accept-list names one
   explicitly; anything unlisted is stripped.
@@ -168,7 +168,7 @@ intended destination is **bounded by the short TTL, not prevented** — a
 receiver-side invocation-id / nonce uniqueness cache (single-use enforcement) is
 the intended defense and is not yet wired, so TTL is the current backstop. The
 secret wrapper type is unserializable and redacts itself in every log / `Debug` /
-error path; values enter through the operator (`net forwarding set-value`), never
+error path; values enter through the operator (`net-mesh forwarding set-value`), never
 a model or a tool argument.
 
 ### Never for stdio
@@ -187,7 +187,7 @@ surface in `net_describe_capability` before anything is sent. Security-sensitive
 headers can never ride the non-secret "plain header" path, and session cookies
 require an explicit `--force` acknowledgement.
 
-> **Status.** The caller-side policy surface (`net forwarding`) and the
+> **Status.** The caller-side policy surface (`net-mesh forwarding`) and the
 > OS-keychain value store ship now, deny-by-default; the forwarded-context object
 > and its sealing are in place as primitives. Wiring the seal-and-inject step
 > into the live wrap → invoke path — and distributing destination forwarding keys

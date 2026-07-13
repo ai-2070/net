@@ -12,7 +12,7 @@ Stream and connection failures are classed errors you discriminate with
 import { MeshNode, BackpressureError, NotConnectedError } from '@net-mesh/sdk';
 
 try {
-  await node.send(/* … */);
+  await node.sendOnStream(stream, [/* … */]);
 } catch (e) {
   if (e instanceof BackpressureError) {
     // window full — the only blindly-retry-safe case (or use sendWithRetry)

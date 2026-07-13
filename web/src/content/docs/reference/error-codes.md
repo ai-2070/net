@@ -68,24 +68,27 @@ Beyond the core trio, individual subsystems define their own error types. The on
 
 ### `ScalingError`
 
-Returned from `EventBus::add_shards()` and `EventBus::remove_shards()`.
+The shard-mapper scaling error. The `EventBus` scaling methods are
+`manual_scale_up(count: u16)` / `manual_scale_down(count: u16)`, and both return
+`AdapterError`; `ScalingError` is the mapper-level type underneath.
 
 | Variant                  | When it fires                                                                            |
 |--------------------------|------------------------------------------------------------------------------------------|
-| `AlreadyAtLimit`         | The bus is at its configured shard ceiling and can't add more                            |
-| `ShardInUse`             | A shard requested for removal still has in-flight work                                   |
-| `NoSuchShard`            | A shard id passed for removal doesn't exist                                              |
-| `Internal(_)`            | Internal invariant violation; investigate                                                |
+| `InvalidPolicy(_)`       | The scaling policy was rejected — the string says why                                    |
+| `AtMaxShards`            | Already at the configured shard ceiling                                                  |
+| `AtMinShards`            | Already at the shard floor                                                               |
+| `InCooldown`             | A scale operation is still inside its cooldown window; retry later                       |
+| `ShardCreationFailed(_)` | The new shard couldn't be built — investigate                                            |
 
 ### `ConfigError`
 
 Returned from `EventBusConfigBuilder::build()`.
 
+One variant — match it, read the string to see which knob.
+
 | Variant                  | When it fires                                                                            |
 |--------------------------|------------------------------------------------------------------------------------------|
-| `InvalidShardCount`      | `shards` outside the supported range                                                     |
-| `InvalidBatchConfig`     | Batch sizing values inconsistent (max_events == 0, etc.)                                 |
-| `IncompatibleFeatures`   | A feature was requested that isn't compiled in (e.g. `redis` adapter without the feature) |
+| `InvalidValue(_)`        | A configuration value was rejected; the string names the offending setting — a `num_shards` count out of range, inconsistent batch sizing (`max_events == 0`), a feature requested but not compiled in, … |
 
 ### Adapter-specific errors
 
@@ -103,15 +106,17 @@ Returned from the channel-auth token issuance and verification paths in `net::ad
 
 | Variant                          | When it fires                                                                              | What to do                                                                 |
 |----------------------------------|--------------------------------------------------------------------------------------------|----------------------------------------------------------------------------|
-| `Invalid`                        | Token doesn't deserialize or its signature doesn't verify                                  | Reject; the credential is forged or corrupted                              |
+| `InvalidSignature`               | The token's signature doesn't verify                                                       | Reject; the credential is forged or corrupted                              |
+| `InvalidFormat`                  | Wire bytes are too short or malformed                                                      | Reject; the credential is corrupted or garbage                            |
 | `Expired`                        | Token's `not_after` is in the past, modulo the configured clock-skew window                | Re-issue from the current holder; tokens are time-bound on purpose         |
 | `NotYetValid`                    | Token's `not_before` is in the future                                                      | Wait, or re-issue with an earlier validity window                          |
-| `ScopeInsufficient`              | Token's scope doesn't cover the requested operation                                        | Request a token with the right scope (publish, subscribe, admin, delegate) |
-| `ChannelMismatch`                | Token's `channel_hash` doesn't match the channel being accessed                            | Reject; the token is for a different channel                               |
-| `DelegationDepthExhausted`       | Token has `delegation_depth == 0` and is being re-delegated                                | The chain has run out of remaining delegation hops                         |
-| `Revoked`                        | Token's nonce is in the revocation list                                                    | Re-issue                                                                   |
-| `RootNotTrusted`                 | Token chain doesn't root at any of the channel's `token_roots`                             | The chain is rooted at the wrong issuer; check the channel's configured trust roots |
-| `TtlTooLong`                     | Requested TTL exceeds the one-year ceiling (`MAX_TOKEN_TTL_SECS`)                          | Issue inside the bound; the cap is intentional. The SDK's infallible `issue_token` helper soft-clamps; `try_issue` returns this error so callers can decide |
+| `NotAuthorized`                  | No valid token covers the requested action                                                 | Request a token with the right scope (publish, subscribe, admin, delegate) |
+| `DelegationNotAllowed`           | The token lacks the `DELEGATE` scope but tried to re-delegate                               | Issue from a token that carries delegate authority                        |
+| `DelegationExhausted`            | Delegation depth hit zero and the token is being re-delegated                              | The chain has run out of remaining delegation hops                         |
+| `Revoked`                        | A chain link is at or below its issuer's revocation floor                                   | Re-issue; kept distinct from `NotAuthorized` so you can tell a revoked credential from a never-authorized one |
+| `ReadOnly`                       | Signing was attempted with a public-only (zeroized / read-only) keypair                    | You hold a verify-only key — it can't sign                                 |
+| `ZeroTtl`                        | `duration_secs == 0` was passed to `try_issue`                                             | Issue with a non-zero TTL (a 0-TTL token is instantly `Expired`)          |
+| `TtlTooLong`                     | Requested TTL exceeds the ceiling (`MAX_TOKEN_TTL_SECS`)                                    | Issue inside the bound; `issue_token` soft-clamps, `try_issue` returns this so callers can decide |
 
 The TTL ceiling is a hard cap on the auth surface — issuing a token past one year is rejected on the fallible path and clamped on the SDK's infallible path. Long-lived grants need periodic re-issue, which re-checks the issuer's signing key and current policy.
 
@@ -121,38 +126,37 @@ Returned from capability-tag matchers when the requested matcher can't be compil
 
 | Variant                                          | When it fires                                                                          | What to do                                                                 |
 |--------------------------------------------------|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------|
-| `InvalidPattern(string)`                         | Pattern is syntactically malformed                                                     | Fix the pattern                                                            |
-| `RegexNotBuiltIn { pattern }`                    | A `TagMatcher::Regex` variant was used against a build of the crate compiled without `--features regex` | Rebuild with `--features regex` or use a different matcher kind         |
+| `RegexNotBuiltIn { pattern }`                    | A `TagMatcher::Regex` was used against a build compiled without `--features regex`; carries the offending pattern | Rebuild with `--features regex` or use a non-regex matcher kind         |
 
 The `regex` Cargo feature is off by default — regex matching adds about 1.1 MiB to binding artifacts, and most callers don't need it. Builds that do can opt in. Pre-v0.24 the regex-less fallback silently returned empty matches, which made misconfigured queries look indistinguishable from "no entries match"; v0.24 replaced that with the structured error above.
 
-### nRPC errors (`RpcError`, `RpcAppError`)
+### nRPC errors (`RpcError`)
 
 Returned from `call_typed`, `call_streaming_typed`, `call_client_stream_typed`, `call_duplex_typed`, and the underlying `MeshRpc` surface.
 
 | Variant                | When it fires                                                                          |
 |------------------------|----------------------------------------------------------------------------------------|
-| `RpcError::NoServer`   | No node is currently serving this service name                                         |
-| `RpcError::NoMatchingServer` | A `net-where:` predicate ruled every advertising server out                       |
-| `RpcError::Timeout`    | The call exceeded the configured timeout                                              |
-| `RpcError::Canceled`   | A `Mesh::cancel(token)` aborted the in-flight call                                    |
-| `RpcError::Panic`      | The handler panicked; caught and surfaced typed                                       |
-| `RpcError::Codec`      | Request or response failed to encode/decode (sub-classified: `CodecEncode`, `CodecDecode`) |
-| `RpcAppError(code, detail)` | Handler returned a typed application error                                       |
+| `RpcError::NoRoute { target, reason }` | The target node id is unknown to the local mesh, or the reply-channel subscription couldn't be set up |
+| `RpcError::Timeout { elapsed_ms }` | The call's deadline elapsed before a response arrived (the caller emits CANCEL) |
+| `RpcError::ServerError { status, message, headers }` | The server returned a non-`Ok` `RpcStatus`; `headers` carries the structured sidecar (e.g. a `net-failure-schematic` verdict) |
+| `RpcError::Transport(_)` | Underlying transport error (publish failure, encryption, …); wraps `AdapterError`   |
+| `RpcError::Codec { direction, message }` | Request/response failed to encode/decode; `direction` is `CodecDirection::{Encode, Decode}` |
+| `RpcError::CapabilityDenied { target, capability }` | The callee refused because the caller lacked the required capability      |
+| `RpcError::Cancelled`  | A `MeshNode::cancel(token)` aborted the in-flight call                                 |
 
-The codec error sub-classification is used by every binding's typed wrapper to surface the failure as a binding-native error type (TS / Python / Go all have idiomatic equivalents). The `RpcAppError` shape is wire-stable across languages — codes like `NRPC_TYPED_BAD_REQUEST` and `NRPC_TYPED_HANDLER_ERROR` are part of the cross-language fixture.
+There is no `NoServer` / `NoMatchingServer` / `Panic` variant — a handler that panics or returns a typed application error surfaces as `ServerError { status, message, headers }`, carrying the wire-stable status codes `NRPC_TYPED_BAD_REQUEST` / `NRPC_TYPED_HANDLER_ERROR` (part of the cross-language fixture). The binding-native typed wrappers (TS / Python / Go) re-raise these as idiomatic exceptions.
 
-### Reliable-stream errors (`StreamError`)
+### Per-peer stream errors (`StreamError`)
 
-Returned from the reliable-stream API on `MeshNode`.
+Returned from the per-peer stream API on `MeshNode`.
 
 | Variant                        | When it fires                                                                          |
 |--------------------------------|----------------------------------------------------------------------------------------|
-| `StreamError::WindowFull`      | Tx-credit window is exhausted; `send_with_retry` handles this automatically            |
-| `StreamError::Backpressure`    | Scheduler queue is full for a scheduled stream                                         |
-| `StreamError::Closed`          | Stream is closed locally or by the peer                                                |
-| `StreamError::Reset`           | Peer sent a `SUBPROTOCOL_STREAM_RESET` after exhausting retransmit retries; payload includes the reason. Blob-transfer and other consumers map this to a higher-level error promptly instead of stalling to the caller's timeout |
-| `StreamError::Timeout`         | Stream operation exceeded its configured timeout                                       |
+| `StreamError::Backpressure`    | The stream's outbound queue is full — no packets were enqueued; retry, drop, or surface. The retry-safe case (`send_with_retry` handles it automatically) |
+| `StreamError::NotConnected`    | The underlying session is gone (peer disconnected, never connected, or the stream was closed) |
+| `StreamError::Transport(_)`    | Underlying transport failure (socket / encryption error); wraps the adapter-level error's message |
+
+`WindowFull` and stream reset live *below* this surface — the tx-credit admittance value and the `SUBPROTOCOL_STREAM_RESET` wire message, respectively — they are not `StreamError` variants.
 
 ## A note on credentials in URLs
 

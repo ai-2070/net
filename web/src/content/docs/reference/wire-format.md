@@ -101,7 +101,7 @@ The handshake is Noise NKpsk0:
 - **Responder's static public key** is known in advance (out-of-band exchange, certificate, or capability advertisement).
 - **Pre-shared key** adds symmetric authentication on top of the asymmetric exchange.
 
-When two peers can't talk directly, `MeshNode::connect_via(relay_addr)` carries the Noise messages inside subprotocol `0x0601` over an existing encrypted session through a relay. The relay sees authenticated Noise bytes but can't forge them or derive the post-handshake session keys.
+When two peers can't talk directly, `MeshNode::connect_via(relay_addr, dest_pubkey, dest_node_id)` embeds the initiator's node id inside the Noise `msg1` payload and routes the handshake through the relay's dispatch loop — a HANDSHAKE-flagged packet with a routing header, not a dedicated subprotocol id. The relay sees authenticated Noise bytes but can't forge them or derive the post-handshake session keys.
 
 ## Session keys
 

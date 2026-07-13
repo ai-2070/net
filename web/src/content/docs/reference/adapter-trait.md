@@ -9,20 +9,26 @@ This page is for two audiences: people wiring up one of the shipped adapters, an
 ```rust
 #[async_trait]
 pub trait Adapter: Send + Sync {
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError>;
-    async fn poll_shard(&self, shard_id: u16, cursor: Option<&str>, limit: usize)
+    async fn init(&mut self) -> Result<(), AdapterError>;
+    async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError>;
+    async fn poll_shard(&self, shard_id: u16, from_id: Option<&str>, limit: usize)
         -> Result<ShardPollResult, AdapterError>;
     async fn flush(&self) -> Result<(), AdapterError>;
     async fn shutdown(&self) -> Result<(), AdapterError>;
+    fn name(&self) -> &'static str;
+    async fn is_healthy(&self) -> bool { true }   // defaulted
 }
 ```
 
-Four methods, four concerns:
+Six required methods (plus a defaulted `is_healthy`):
 
-- **`on_batch`** receives a batch of events from one shard's batch worker. The adapter is responsible for persisting (or forwarding) every event in the batch atomically — partial batches are not allowed.
-- **`poll_shard`** is the consumer side. Given a shard id, an optional cursor, and a limit, return the next batch of events from that shard's stream.
+- **`init`** runs once before any batches flow — open connections, create streams, run migrations.
+- **`on_batch`** receives an `Arc<Batch>` of events from one shard's batch worker. The adapter persists (or forwards) every event in the batch atomically — partial batches are not allowed.
+- **`poll_shard`** is the consumer side. Given a shard id, an optional `from_id` cursor, and a limit, return the next batch of events from that shard's stream.
 - **`flush`** is a barrier — wait until everything previously accepted via `on_batch` is durably stored.
 - **`shutdown`** signals the adapter to drain and stop. After `shutdown()` returns, `on_batch` calls must reject with `AdapterError::Shutdown`.
+- **`name`** returns a stable `&'static str` for logs and metrics.
+- **`is_healthy`** (defaulted to `true`) lets the bus gate on adapter health.
 
 ## Contract
 
@@ -97,6 +103,7 @@ Bridges to NATS JetStream. Same transitional role as the Redis adapter, for shop
 The minimum-viable shape:
 
 ```rust
+use std::sync::Arc;
 use async_trait::async_trait;
 use net::adapter::Adapter;
 use net::event::Batch;
@@ -108,7 +115,12 @@ pub struct MyAdapter {
 
 #[async_trait]
 impl Adapter for MyAdapter {
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn init(&mut self) -> Result<(), AdapterError> {
+        self.connect().await
+            .map_err(|e| AdapterError::Fatal(e.to_string()))
+    }
+
+    async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
         for event in &batch.events {
             self.write(event).await
                 .map_err(|e| AdapterError::Transient(e.to_string()))?;
@@ -116,15 +128,16 @@ impl Adapter for MyAdapter {
         Ok(())
     }
 
-    async fn poll_shard(&self, shard_id: u16, cursor: Option<&str>, limit: usize)
+    async fn poll_shard(&self, shard_id: u16, from_id: Option<&str>, limit: usize)
         -> Result<ShardPollResult, AdapterError>
     {
-        let events = self.read_from(shard_id, cursor, limit).await
+        let events = self.read_from(shard_id, from_id, limit).await
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
+        let has_more = !events.is_empty();
         Ok(ShardPollResult {
             events,
-            cursor: self.next_cursor(shard_id).await,
-            has_more: !events.is_empty(),
+            next_id: self.next_cursor(shard_id).await,   // Option<String>
+            has_more,
         })
     }
 
@@ -137,10 +150,14 @@ impl Adapter for MyAdapter {
         self.close().await
             .map_err(|e| AdapterError::Fatal(e.to_string()))
     }
+
+    fn name(&self) -> &'static str {
+        "my-adapter"
+    }
 }
 ```
 
-The four methods compose: ingest a batch (`on_batch`), consume a shard (`poll_shard`), wait for durability (`flush`), tear down (`shutdown`). The contract makes the rest of the integration mostly mechanical.
+The methods compose: initialise (`init`), ingest a batch (`on_batch`), consume a shard (`poll_shard`), wait for durability (`flush`), tear down (`shutdown`), and identify for logs/metrics (`name`). The contract makes the rest of the integration mostly mechanical.
 
 ## Idempotency and deduplication
 
@@ -164,7 +181,7 @@ For backends with native dedup (Redis Streams' MSGID, JetStream's `Nats-Msg-Id`)
 ```rust
 pub struct ShardPollResult {
     pub events: Vec<StoredEvent>,
-    pub cursor: String,
+    pub next_id: Option<String>,   // cursor for the next poll; None if no events
     pub has_more: bool,
 }
 ```

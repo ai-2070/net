@@ -36,7 +36,7 @@ you already have**. The bridge runs in both directions.
 its tools become capabilities other nodes can discover and invoke:
 
 ```
-net wrap github -- npx -y @modelcontextprotocol/server-github
+net-mesh wrap github -- npx -y @modelcontextprotocol/server-github
 ```
 
 By default the wrapped tools are **owner-only**: visible to the mesh, but
@@ -47,7 +47,7 @@ Credentials stay on the wrapping node.
 host as a small set of meta-tools — `search`, `describe`, `invoke`:
 
 ```
-net mcp serve
+net-mesh mcp serve
 ```
 
 Now an ordinary MCP host (a desktop agent, an IDE) can search the mesh, describe a
@@ -56,7 +56,7 @@ credentialed or unknown is search/describe-only until a human approves it
 out-of-band:
 
 ```
-net mcp pin approve provider/capability
+net-mesh mcp pin approve provider/capability
 ```
 
 ## The honest limit: bridged tools are request/response

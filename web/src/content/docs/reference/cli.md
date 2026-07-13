@@ -1,6 +1,6 @@
 # CLI Reference
 
-The `net-mesh` binary exposes the substrate's operator surface. Two command groups ship in v0.27: `transfer` for moving blobs and directories between nodes, and `typegen` for generating typed bindings from discovered AI tools.
+The `net-mesh` binary exposes the substrate's operator surface. Its command groups include `daemon` (run stateful daemons), `transfer` (move blobs and directories between nodes), `wrap` and `mcp` (the MCP bridge — wrap a stdio MCP server as mesh capabilities, or serve the mesh to a local MCP host), `forwarding` (credential-forwarding config), and `typegen` (generate typed bindings from discovered AI tools).
 
 The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.
 
@@ -28,7 +28,7 @@ net-mesh transfer recv-blob <SOURCE> <REF> --out <PATH> [OPTIONS]
 
 The blob streams chunk-at-a-time through an atomic-rename writer: the destination either becomes the complete file on success, or stays untouched on failure (a `<PATH>.partial` remains for inspection). Peak memory is one chunk (~4 MiB) regardless of total size.
 
-Exit codes: `0` on success, `2` on fetch failure, `3` on hash-verification failure, `4` on write failure.
+Exit codes follow the global table below: `0` on success, `2` for a malformed source/ref, and `3` for a transfer/SDK failure — the fetch yields already-verified chunks, so a fetch error, an integrity mismatch, and a disk-write failure all surface as an SDK error (code `3`), not separate codes.
 
 ### `send-blob`
 
@@ -172,11 +172,18 @@ Across all `net-mesh` subcommands:
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | General error / argument parse failure |
-| `2` | Network / transport failure (no holder, unreachable peer, session refused) |
-| `3` | Integrity failure (hash mismatch, manifest verification failed) |
-| `4` | I/O failure (write to disk, read from source) |
-| `5` | Authorization failure (missing token, capability mismatch) |
-| `64–78` | Reserved for binding-specific status (mirrors `sysexits.h`) |
+| `1` | Generic error |
+| `2` | Invalid arguments / parse failure |
+| `3` | SDK error (a `net-sdk` operation failed — transfer, query, …) |
+| `4` | `net-mesh ice`: simulation blocked |
+| `5` | `net-mesh ice`: operator policy rejected |
+| `6` | Connection failure (no holder, unreachable peer, session refused) |
+| `7` | Timeout |
+| `8` | Confirmation refused (a required confirmation was declined) |
+| `10` | `net-mesh daemon`: factory id not registered |
+| `11` | `net-mesh db`: query JSON failed to parse |
+| `12` | `net-mesh db`: predicate DSL (`--where` / `--filter`) failed to parse |
+| `13` | `net-mesh ice`: an operator signature failed cryptographic verification |
+| `14` | `net-mesh typegen diff --exit-code`: a BREAKING change was detected |
 
 Subcommands may attach a JSON `{"error": …, "detail": …}` line to stderr alongside the human-readable message; tools that script against the CLI should prefer the JSON line.

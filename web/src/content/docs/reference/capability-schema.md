@@ -100,6 +100,8 @@ A handful of prefixes carry specific meaning to the substrate, outside the four 
 | `scope:`     | Visibility scope for cross-subnet capability propagation               |
 | `ai-tool:`   | Marks a node as serving the named LLM-callable tool; added automatically by `serve_tool` |
 | `subprotocol:` | Subprotocols the node handles (added automatically by the registry)   |
+| `nat:`       | NAT classification piggybacked on the signed announcement — one of `nat:open` / `nat:cone` / `nat:symmetric` / `nat:unknown`; stripped and refreshed on every broadcast |
+| `nrpc:`      | Services the node serves over nRPC; added automatically by `serve_rpc` as `nrpc:<service>` |
 
 ## Reserved metadata keys
 

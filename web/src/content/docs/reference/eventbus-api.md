@@ -10,10 +10,11 @@ The bus is the single handle for ingestion and consumption.
 pub struct EventBus { /* ... */ }
 
 impl EventBus {
-    pub async fn new(config: EventBusConfig) -> Result<Self, ConfigError>;
+    pub async fn new(config: EventBusConfig) -> Result<Self, AdapterError>;
 
-    pub fn ingest(&self, event: Event) -> IngestionResult<()>;
-    pub fn ingest_raw(&self, event: RawEvent) -> IngestionResult<()>;
+    // On success both return (shard_id, insertion_ts).
+    pub fn ingest(&self, event: Event) -> IngestionResult<(u16, u64)>;
+    pub fn ingest_raw(&self, event: RawEvent) -> IngestionResult<(u16, u64)>;
 
     pub async fn poll(&self, request: ConsumeRequest) -> ConsumerResult<ConsumeResponse>;
 
@@ -23,15 +24,14 @@ impl EventBus {
 
     pub fn stats(&self) -> &EventBusStats;
 
-    pub async fn add_shards(&self, count: u16) -> Result<Vec<u16>, ScalingError>;
-    pub async fn remove_shards(&self, shard_ids: Vec<u16>) -> Result<(), ScalingError>;
-    pub async fn suggest_scaling(&self) -> ScalingDecision;
+    pub async fn manual_scale_up(&self, count: u16) -> Result<Vec<u16>, AdapterError>;
+    pub async fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError>;
 }
 ```
 
 Notes:
 
-- `ingest` is non-blocking. It hashes the event to a shard, pushes onto the shard's ring buffer, and returns. Failure modes are documented under `IngestionError` below.
+- `ingest` is non-blocking. It hashes the event to a shard, pushes onto the shard's ring buffer, and returns `(shard_id, insertion_ts)`. Failure modes are documented under `IngestionError` below. (There is no `add_shards`/`remove_shards`/`suggest_scaling`; the manual scaling methods are `manual_scale_up`/`manual_scale_down`, and a `ScalingDecision` is produced by the shard mapper's `evaluate_scaling`, not the bus.)
 - `poll` merges results across shards in causal order. Pass a `from(cursor)` on the request to resume from a previous response's cursor.
 - `flush` waits for every queued event to reach the adapter. Useful as a barrier in tests; not typically called in production code.
 - `shutdown` consumes the bus; `shutdown_via_ref` is the non-consuming variant for callers that hold the bus behind a shared reference. Both drain in-flight ingests, flush, and tear down workers.
@@ -40,10 +40,10 @@ Notes:
 
 ```rust
 pub struct EventBusConfig {
-    pub shards: u16,
-    pub ring_capacity: usize,
+    pub num_shards: u16,
+    pub ring_buffer_capacity: usize,
     pub batch: BatchConfig,
-    pub backpressure: BackpressureMode,
+    pub backpressure_mode: BackpressureMode,
     pub adapter: AdapterConfig,
     pub scaling: Option<ScalingPolicy>,
     pub producer_nonce_path: Option<PathBuf>,
@@ -59,10 +59,10 @@ The builder pattern is the conventional construction path:
 
 ```rust
 EventBusConfig::builder()
-    .shards(16)
-    .ring_capacity(4096)
+    .num_shards(16)
+    .ring_buffer_capacity(4096)
     .batch(BatchConfig::default().max_events(1024).max_delay_ms(5))
-    .backpressure(BackpressureMode::DropOldest)
+    .backpressure_mode(BackpressureMode::DropOldest)
     .adapter(AdapterConfig::net().listen("0.0.0.0:7777").peer("10.0.0.2:7777"))
     .scaling(ScalingPolicy::default())
     .build()?
@@ -70,11 +70,14 @@ EventBusConfig::builder()
 
 ### `BackpressureMode`
 
-| Variant      | Behavior when a shard's ring buffer is full |
-|--------------|---------------------------------------------|
-| `Block`      | Wait for room; turn `ingest` into a back-pressured call. |
-| `DropOldest` | Evict the oldest event in the ring; accept the new one. |
-| `DropNewest` | Reject the new ingest; return `IngestionError::Backpressure`. |
+| Variant           | Behavior when a shard's ring buffer is full |
+|-------------------|---------------------------------------------|
+| `DropNewest`      | Drop the incoming event (the one being inserted); the ring is unchanged. |
+| `DropOldest`      | Evict the oldest event in the ring; accept the new one. |
+| `FailProducer`    | Return an error to the producer (`IngestionError::Backpressure`). |
+| `Sample { rate }` | Keep 1 event in every `rate`; drop the rest. |
+
+There is no `Block` variant — `FailProducer` (not `DropNewest`) is the one that surfaces an error to the producer.
 
 ### `AdapterConfig`
 
@@ -136,17 +139,20 @@ impl ConsumeRequest {
 
 pub struct ConsumeResponse {
     pub events: Vec<StoredEvent>,
-    pub cursor: String,
+    pub next_id: Option<String>,          // cursor for the next poll; None if no events returned
     pub has_more: bool,
+    pub truncated_at_per_shard_cap: bool, // per-shard fetch was clamped by the internal cap
+    pub stalled_shards: Vec<u16>,         // shards that reported more but contributed nothing
+    pub failed_shards: Vec<u16>,          // shards whose adapter call errored this poll
 }
 
 pub enum Ordering {
-    Sequence,   // default — by shard sequence
-    Timestamp,  // by ingestion timestamp (cross-shard merge)
+    None,        // default — arbitrary cross-shard order (fastest; per-shard order preserved)
+    InsertionTs, // sort by insertion timestamp (cross-shard merge)
 }
 ```
 
-`cursor` is opaque base64; persist it and pass it back on the next call for at-least-once resumption.
+`next_id` is the opaque cursor; persist it and pass it back via `ConsumeRequest::from(next_id)` on the next call for at-least-once resumption.
 
 ## `EventBusStats`
 

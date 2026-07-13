@@ -12,8 +12,9 @@ if err != nil {
 // nodes is []uint64 — the node ids that match, right now.
 ```
 
-`FindNodes` returns `([]uint64, error)` — the matching node ids. Announcements
-propagate multi-hop (bounded by a hop count), so a match can be a node several hops
+`FindNodes` returns `([]uint64, error)` — the matching node ids. Announcements reach
+every **directly-connected** peer (the announcing node also self-indexes) — multi-hop
+propagation is deferred, so a match is a direct neighbour, not a node several hops
 away. Discovery is **advisory** — it tells you who *can*, with no exclusivity.
 
 ## List tools
@@ -35,4 +36,6 @@ for _, t := range tools {
 ```
 
 Folding is asynchronous — poll `ListTools` until the tool you expect appears rather
-than assuming it's there on the first call.
+than assuming it's there on the first call. For a long-running agent, prefer the
+event-driven `WatchTools` subscription, which delivers changes as they fold in
+instead of re-scanning on a timer.

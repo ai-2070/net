@@ -17,9 +17,10 @@ ids are 64-bit, so they're BigInt in JS — see
 [Payload interop](/docs/reference/capability-schema) for the u64/BigInt edge).
 `findNodesScoped(filter, scope)` narrows to a tenant/region/subnet pool.
 
-Announcements propagate multi-hop (bounded by a hop count), so a match can be a
-node several hops away, not just a direct neighbor. Discovery is **advisory** — it
-tells you who *can*, with no exclusivity.
+Announcements reach every **directly-connected** peer (the announcing node also
+self-indexes) — multi-hop propagation is deferred, so a match is a direct neighbour,
+not a node several hops away. Discovery is **advisory** — it tells you who *can*,
+with no exclusivity.
 
 ## List tools
 
@@ -38,6 +39,10 @@ for (const t of listTools(node)) {
   console.log(`${t.toolId} v${t.version}  tags=${t.tags}`);
 }
 ```
+
+For a long-running agent, prefer the push-based `watchTools(node)` subscription
+(from `@net-mesh/sdk`) over a poll loop — it delivers tool changes as they fold in.
+The poll above is fine for a one-shot wait at startup.
 
 Tool descriptors lower to provider tool-call formats (e.g. an OpenAI `tools` array
 entry) via the `openai` helpers, so a discovered tool feeds straight into a
