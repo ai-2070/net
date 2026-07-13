@@ -4,7 +4,7 @@ Announce what a node can do; peers fold it into their index and can then discove
 and invoke it.
 
 ```go
-node, err := net.NewMeshNode(net.MeshConfig{BindAddr: "127.0.0.1:0", PSK: psk})
+node, err := net.NewMeshNode(net.MeshConfig{BindAddr: "127.0.0.1:0", PskHex: psk})
 if err != nil {
     log.Fatal(err)
 }

@@ -7,17 +7,16 @@ You reach for NetDB when "talk to the right CortEX adapter and read the right st
 ## Opening a NetDB
 
 ```rust
-use net::adapter::net::netdb::{NetDb, NetDbBuilder};
+use net::adapter::net::netdb::NetDb;
 
-let db = NetDbBuilder::new(&redex, origin_hash)
+let db = NetDb::builder(redex)
     .with_tasks()
     .with_memories()
-    .with_custom("orders", OrdersFold)
     .build()
     .await?;
 ```
 
-A NetDB is a builder over a `Redex` manager and an entity identity. Each `with_*` call registers a fold under a name; the build step opens the relevant RedEX files and starts the fold tasks. From that point on, the NetDB exposes a typed handle for each registered fold.
+A NetDB is a builder over a `Redex` manager, which it takes by value. `with_tasks()` and `with_memories()` opt in the two shipped models; the async `build` step opens their RedEX files and starts the fold tasks. (An optional `.origin(origin_hash)` stamps the producer identity on every event the bundled adapters append.) From that point on, the NetDB exposes a strongly-typed handle for each enabled model.
 
 The two named models that ship — tasks and memories — get strongly-typed accessors:
 
@@ -26,29 +25,30 @@ db.tasks().state().read().count_where(&filter);
 db.memories().watch().where_tag("important").stream();
 ```
 
-Folds you add with `with_custom` are accessed by name through a generic handle:
-
-```rust
-let orders = db.custom::<Orders>("orders")?;
-```
+The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](./cortex-folds)) and manage its handle alongside the NetDB.
 
 ## Queries
 
 NetDB doesn't define a query language of its own. Each fold exposes its own query surface, and NetDB is the thing that keeps them composable. The two shipped folds give you a query builder pattern:
 
 ```rust
+use net::adapter::net::cortex::tasks::{TaskStatus, OrderBy};
+use net::adapter::net::cortex::memories::MemoriesFilter;
+
 // Tasks: filter, order, paginate
 let pending = db.tasks().state().read()
     .query()
     .where_status(TaskStatus::Pending)
-    .where_assignee(node_id)
     .order_by(OrderBy::CreatedDesc)
     .limit(50)
     .collect();
 
 // Memories: filter by tag, lookup by id
 let important = db.memories().state().read()
-    .find_many(&MemoryFilter::with_tag("important"));
+    .find_many(&MemoriesFilter {
+        tag: Some("important".to_string()),
+        ..Default::default()
+    });
 ```
 
 The queries take a brief read lock on the state and scan in memory. For the 10,000-entry, multi-field filter case, a typical query runs in tens to hundreds of microseconds — fast enough that "always query on access" is the right pattern for most flows.
@@ -60,8 +60,8 @@ The queries take a brief read lock on the state and scan in memory. For the 10,0
 ```rust
 let watcher = db.tasks()
     .watch()
-    .where_status(TaskStatus::Running)
-    .order_by(OrderBy::StartedDesc);
+    .where_status(TaskStatus::Pending)
+    .order_by(OrderBy::CreatedDesc);
 
 let (current, mut stream) = db.tasks().snapshot_and_watch(watcher);
 render(&current);
@@ -78,11 +78,11 @@ Watchers emit the current filter result on subscribe, then dedupe-emit on every 
 The single-node query path is the foundation. The layer NetDB is building toward — federated queries that span folds across multiple nodes — uses the same query AST but compiles it down to a tree of fold reads and capability-routed RPCs:
 
 ```rust
-// Federated query: every running inference task across the GPU pool
+// Federated query: every pending inference task across the GPU pool
 let federated = db.federate()
     .where_capability(predicate!("hardware.gpu" exists))
     .query::<Tasks>()
-    .where_status(TaskStatus::Running)
+    .where_status(TaskStatus::Pending)
     .collect()
     .await?;
 ```
@@ -97,13 +97,20 @@ Federation is a focused follow-up; the SDK surface is staged, and the API above 
 
 ```rust
 let bundle = db.snapshot()?;
-write_to_disk("checkpoint.bin", &bundle).await?;
+write_to_disk("checkpoint.bin", &bundle.encode()?).await?;
 ```
 
-The bundle records each fold's name, its state's serialized bytes, and the sequence number it was last folded to. On restore, the builder rehydrates each fold from the bundle and resumes its tail from where it left off:
+The bundle records, per enabled model, its state's serialized bytes and the sequence number it was last folded to. On restore, the builder rehydrates each enabled model from the bundle and resumes its tail from where it left off:
 
 ```rust
-let db2 = NetDb::open_from_snapshot(&redex, bundle, builder_config).await?;
+use net::adapter::net::netdb::NetDbSnapshot;
+
+let bundle = NetDbSnapshot::decode(&bytes)?;
+let db2 = NetDb::builder(redex)
+    .with_tasks()
+    .with_memories()
+    .build_from_snapshot(&bundle)
+    .await?;
 ```
 
 The whole-DB snapshot is the right primitive for backup, migration, and replication. It's smaller than the equivalent JSON by a healthy margin (60–70% in typical workloads), encodes in tens of microseconds at the 1k-entry scale, and round-trips deterministically.

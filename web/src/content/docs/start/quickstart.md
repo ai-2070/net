@@ -84,7 +84,7 @@ The event bus above is the substrate. Net's flagship use is agents discovering a
 invoking work across the mesh — a different loop on the same foundation:
 
 - [Discover and Invoke](/docs/guides/discover-and-invoke) — query the mesh by
-  capability (`net cap query --tag …`) and make a typed call.
+  capability (`net-mesh cap query --tag …`) and make a typed call.
 - [Wrap an MCP Server](/docs/guides/wrap-mcp-server) — turn an existing MCP tool
   into a discoverable capability with one command.
 - [Expose Net as MCP](/docs/guides/expose-net-as-mcp) — let any MCP host use the

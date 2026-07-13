@@ -17,8 +17,10 @@ for t in list_tools(node):
 
 Folding is asynchronous — an announcement takes a moment to propagate, so poll
 until the tool you expect appears rather than assuming it's there on the first
-call. Announcements propagate multi-hop (bounded by a hop count), so a tool can
-come from a node several hops away.
+call. For a long-running agent, prefer the push-based `watch_tools(node)`
+subscription over this poll loop. Announcements reach every **directly-connected**
+peer (the announcing node also self-indexes) — multi-hop propagation is deferred, so
+a tool comes from a direct neighbour, not a node several hops away.
 
 Tool descriptors lower to provider tool-call formats via the `openai` helpers, so a
 discovered tool feeds straight into a chat-completion request.

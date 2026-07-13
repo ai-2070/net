@@ -42,7 +42,7 @@ The system is built in three layers, and you can reason about each one without t
 
 **Transport** is the bottom: encrypted bytes between nodes, mesh-routed, with NAT traversal and connection management handled for you. It's deliberately invisible — if you find yourself thinking about it, something is wrong.
 
-**Identity** sits in the middle and answers three questions about every packet on the wire: who sent it, what channel it claims, and what that sender is allowed to do. Identity lives in the 64-byte packet header so that forwarding nodes can make the call in a single cache line, without ever touching the payload.
+**Identity** sits in the middle and answers three questions about every packet on the wire: who sent it, what channel it claims, and what that sender is allowed to do. Identity lives in the 68-byte packet header so that forwarding nodes can make the call without ever touching the payload.
 
 **State** is the layer you actually program against. Channels carry causally-ordered events; persist a channel and it becomes a durable log; fold the log and it becomes the state your application reads from. Everything else — RPC handlers, materialized views, distributed workers — is some variation on that pattern.
 

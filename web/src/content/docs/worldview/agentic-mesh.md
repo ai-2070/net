@@ -39,8 +39,8 @@ that announcement into a local index; and any node can **query** the index by
 what it needs rather than by who has it:
 
 ```
-net cap query --tag gpu --tag vram:24     # who can do this, right now?
-net cap nodes                             # everything the local index knows
+net-mesh cap query --tag gpu --tag vram:24     # who can do this, right now?
+net-mesh cap nodes                             # everything the local index knows
 ```
 
 Announcements propagate across the mesh, not just to direct neighbors — a node
@@ -53,7 +53,7 @@ server, or a Jetson on a factory floor, and your code doesn't care which.
 
 The agent loop Net is built for:
 
-1. **Discover** — ask the mesh who can do the work (`net cap query …`, or the SDK
+1. **Discover** — ask the mesh who can do the work (`net-mesh cap query …`, or the SDK
    `find_nodes`). You get back nodes you can talk to directly.
 2. **Describe** — read a capability's schema, risk, and provider before you commit
    to it. Display never implies permission to invoke.

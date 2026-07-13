@@ -5,7 +5,7 @@ client code — and gate CI on breaking schema changes — using `net-mesh typeg
 
 ## Prerequisites
 
-- `net-mesh` built with the CLI feature (`--features cli`).
+- The `net-cli` crate installed (it provides the `net-mesh typegen` binary): `cargo install net-cli`.
 - A node whose capability fold has discovered at least one `ai-tool:*` tool (i.e.
   a peer served a tool — see [Announce](/docs/sdk/rust/announce)).
 

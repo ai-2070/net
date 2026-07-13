@@ -61,7 +61,7 @@ consumption model; there is no async subscribe iterator (see
 ```go
 node, err := net.NewMeshNode(net.MeshConfig{
     BindAddr: "127.0.0.1:0",
-    PSK:      "42424242...",  // 32-byte pre-shared key, hex-encoded
+    PskHex:   "42424242...",  // 32-byte pre-shared key, hex-encoded
 })
 ```
 

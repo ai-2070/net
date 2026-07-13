@@ -39,7 +39,7 @@ If you want a minimal build — just the in-memory bus, no mesh, no persistence 
 
 ```toml
 [dependencies]
-net-mesh = { version = "0.27", default-features = false }
+net-mesh = { version = "0.32", default-features = false }
 ```
 
 ## Node
@@ -88,17 +88,13 @@ The Python build is produced with `maturin` and ships prebuilt wheels for the sa
 
 ## Go
 
-The Go binding is split across small FFI packages by subsystem — compute, RPC, MeshDB, MeshOS, Deck — so you can pull in only the surface you use:
+The Go binding is a single unified module — import `github.com/ai-2070/net/go` (package `net`):
 
 ```sh
-go get github.com/ai-2070/net/bindings/go/compute-ffi
-go get github.com/ai-2070/net/bindings/go/rpc-ffi
-go get github.com/ai-2070/net/bindings/go/meshdb-ffi
-go get github.com/ai-2070/net/bindings/go/meshos-ffi
-go get github.com/ai-2070/net/bindings/go/deck-ffi
+go get github.com/ai-2070/net/go
 ```
 
-Each package wraps the shared `cdylib` from the core crate via cgo. You'll need a C toolchain on the build machine (gcc/clang on Linux/macOS, MSVC on Windows) for cgo to link against.
+It wraps the shared `cdylib` from the core crate via cgo. You'll need a C toolchain on the build machine (gcc/clang on Linux/macOS, MSVC on Windows) for cgo to link against.
 
 ## C and C++
 

@@ -44,19 +44,20 @@ Internal vehicle channels (e.g. `vehicles/v-001/internal/diagnostics`) are confi
 
 ```rust
 use net::adapter::net::channel::{ChannelConfig, ChannelName, Visibility};
+use net::adapter::net::behavior::capability::CapabilityFilter;
 
-let telemetry_cfg = ChannelConfig {
-    channel_id: ChannelName::new("vehicles/v-001/telemetry/imu")?.id(),
-    visibility: Visibility::Exported,
-    publish_caps: Some(filter![ "role.vehicle" ]),
-    subscribe_caps: Some(filter![ "role.operator", "tier.production" ]),
-    require_token: true,
-    priority: 4,
-    reliable: false,
-    max_rate_pps: Some(100),
-};
+let telemetry_cfg = ChannelConfig::new(ChannelName::new("vehicles/v-001/telemetry/imu")?.id())
+    .with_visibility(Visibility::Exported)
+    .with_publish_caps(CapabilityFilter::new().require_tag("role.vehicle"))
+    .with_subscribe_caps(
+        CapabilityFilter::new().require_tag("role.operator").require_tag("tier.production"),
+    )
+    .with_require_token(true)
+    .with_priority(4)
+    .with_reliable(false)
+    .with_rate_limit(100);
 
-mesh.register_channel(telemetry_cfg).await?;
+mesh.register_channel(telemetry_cfg);   // synchronous; no await
 ```
 
 The capability filter on `publish_caps` ensures only nodes advertising `role.vehicle` can publish; the filter on `subscribe_caps` ensures only operator nodes can subscribe. Permission tokens layer on top — each vehicle holds a token scoped to its own telemetry channels, and the operations cluster holds tokens scoped to the export destinations.
@@ -66,19 +67,31 @@ The capability filter on `publish_caps` ensures only nodes advertising `role.veh
 Each vehicle is its own subnet at the third level of the hierarchy. The four-level subnet ID maps to (region, fleet, vehicle, subsystem):
 
 ```rust
-use net::adapter::net::subnet::{SubnetId, SubnetPolicy, SubnetRule};
+use std::collections::HashMap;
+use std::sync::Arc;
+use net::adapter::net::subnet::{SubnetPolicy, SubnetRule};
 
-let vehicle_policy = SubnetPolicy {
-    rules: vec![
-        SubnetRule {
-            match_tags: vec!["vehicle".into(), "fleet.west".into()],
-            target_subnet: SubnetId::new(&[3, 7, 1]),  // region 3, fleet 7, vehicle 1
-        },
-    ],
-    default_subnet: SubnetId::new(&[3, 7]),  // fleet root if no rule matches
-};
+// Each rule maps a tag prefix to one hierarchy level and each tag value to
+// that level's byte; the rules combine to build (region, fleet, vehicle).
+let vehicle_policy = SubnetPolicy::new()
+    .add_rule(SubnetRule {
+        tag_prefix: "region:".into(),
+        level: 0,
+        values: HashMap::from([("west".into(), 3u8)]),   // region byte 3
+    })
+    .add_rule(SubnetRule {
+        tag_prefix: "fleet:".into(),
+        level: 1,
+        values: HashMap::from([("alpha".into(), 7u8)]),  // fleet byte 7
+    })
+    .add_rule(SubnetRule {
+        tag_prefix: "vehicle:".into(),
+        level: 2,
+        values: HashMap::from([("v-001".into(), 1u8)]),  // vehicle byte 1
+    });
 
-mesh.set_subnet_policy(vehicle_policy);
+// The policy is supplied at mesh construction, not via a runtime setter:
+//   Mesh::builder(bind_addr, &psk).with_subnet_policy(Arc::new(vehicle_policy))
 ```
 
 The fleet's regional gateway sits at `SubnetId::new(&[3, 7])` and handles the export rules — telemetry channels marked `Exported` ride the export table to the operations subnet (`SubnetId::new(&[0])`), and everything else stops at the gateway.

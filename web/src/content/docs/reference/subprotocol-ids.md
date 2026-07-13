@@ -24,7 +24,9 @@ The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2
 | `0x0B00`           | Stream-window flow control (24-byte payload, carries `ack_seq` for ack-driven retransmit pruning) |
 | `0x0B01`           | Stream NACK — reliable-stream retransmit signaling         |
 | `0x0B02`           | Stream RESET — reliable-stream hard-failure signal         |
+| `0x0B03`           | Stream ACK — SACK-range acknowledgements for retransmit pruning |
 | `0x0C00`           | Capability announcement                                    |
+| `0x0C01`           | Route withdrawal — poison-reverse; a node floods "destination unreachable *via me*" on peer failure (0.32) |
 | `0x0D00`           | NAT-traversal reflex                                       |
 | `0x0D01`           | NAT-traversal rendezvous                                   |
 | `0x0E00`           | RedEX distributed replication                              |

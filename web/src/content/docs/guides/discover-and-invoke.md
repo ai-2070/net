@@ -42,9 +42,9 @@ the mesh):
 
 ```rust
 use net_sdk::mesh::MeshBuilder;
-use net_sdk::mesh_rpc::CallOptions;
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped, Codec};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
 struct SummarizeReq { text: String }
@@ -53,7 +53,7 @@ struct SummarizeResp { summary: String }
 
 // Provider side: announce + serve a capability.
 let provider = MeshBuilder::new("127.0.0.1:0", &psk)?.build().await?;
-let _handle = provider.serve_rpc_typed("summarize", |req: SummarizeReq| async move {
+let _handle = provider.serve_rpc_typed("summarize", Codec::Json, |req: SummarizeReq| async move {
     Ok::<_, String>(SummarizeResp { summary: summarize(&req.text) })
 })?;
 
@@ -64,7 +64,10 @@ let resp: SummarizeResp = caller.call_typed(
     provider_node_id,
     "summarize",
     &SummarizeReq { text: "…".into() },
-    CallOptions::default().with_deadline(Duration::from_millis(500)),
+    CallOptionsTyped {
+        raw: CallOptions { deadline: Some(Instant::now() + Duration::from_millis(500)), ..Default::default() },
+        ..Default::default()
+    },
 ).await?;
 ```
 

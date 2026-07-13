@@ -34,7 +34,7 @@ On top of identity sit two coordination primitives. Channels are named endpoints
 
 The state layer is what you actually program against. The unit of work is the event; the unit of organization is the channel; and the unit of ordering is the causal link that every event carries.
 
-A causal link is a 24-byte structure that names the entity that produced the event, the entity's view of what it had observed before producing it, and a hash chaining the event back to its parent. Two events from the same entity are totally ordered. Two events from different entities are ordered only if one's causal cone contains the other — Net doesn't impose a global clock, and the system gets faster the less you ask it to.
+A causal link is a 32-byte structure that names the entity that produced the event, the entity's view of what it had observed before producing it, and a hash chaining the event back to its parent. Two events from the same entity are totally ordered. Two events from different entities are ordered only if one's causal cone contains the other — Net doesn't impose a global clock, and the system gets faster the less you ask it to.
 
 Channels carry events. Persist a channel and it becomes a durable log — RedEX. Run reductions over the log and you have folded state — CortEX. Federate queries across folds and you have a database — NetDB. Materialize blobs with deduplication and cache them by access pattern and you have Dataforts. Run long-lived stateful workers against channels and you have MeshOS. Each of these is a different way to use the same primitive; none of them is a different system bolted onto the bus.
 

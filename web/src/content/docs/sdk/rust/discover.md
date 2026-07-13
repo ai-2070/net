@@ -26,6 +26,10 @@ while Instant::now() < deadline && agent.list_tools(None).len() < 1 {
 }
 ```
 
+For a long-running agent, prefer the push-based subscription `agent.watch_tools(..)`
+over a poll loop — it yields tool changes as they fold in, instead of re-scanning on
+a timer. The poll above is fine for a one-shot wait at startup.
+
 Tool descriptors lower to provider tool-call formats — e.g.
 `net_sdk::tool::formats::openai::to_openai_tool(&t)` produces an entry you can drop
 straight into an OpenAI-compatible `tools` array. The full loop (announce → list →
@@ -48,8 +52,9 @@ let nodes: Vec<u64> = mesh.find_nodes(&filter);   // not async — returns node 
 ```
 
 `find_best_node` returns a single highest-scoring node for a weighted requirement,
-and `find_nodes_scoped` narrows to a tenant/region/subnet pool. Announcements
-propagate multi-hop (bounded by a hop count), so a match can be several hops away.
+and `find_nodes_scoped` narrows to a tenant/region/subnet pool. Announcements reach
+every **directly-connected** peer (and self-index locally) — multi-hop propagation
+is deferred, so a match is a direct neighbour, not a node several hops away.
 Richer predicates (numeric, semver, AND/OR/NOT) and the CLI equivalent
 (`net cap query --tag …`) are in [Capabilities](/docs/concepts/capabilities).
 

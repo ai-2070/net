@@ -9,23 +9,31 @@ This guide covers the three patterns: migrating a single daemon (planned moves a
 The migration protocol is a strict six-phase state machine: snapshot, transfer, restore, replay, cutover, complete. Each phase has explicit start and end conditions, the events in flight during the move are buffered and replayed in order, and the daemon's identity stays bound to its keypair across the whole process.
 
 ```rust
-use net::adapter::net::compute::MigrationOrchestrator;
+use net::adapter::net::compute::{DaemonRegistry, MigrationOrchestrator};
 
-let orchestrator = MigrationOrchestrator::new(&mesh);
+let orchestrator = MigrationOrchestrator::new(daemon_registry.clone(), local_node_id);
 
-orchestrator.start_migration(
+// Synchronous — returns the ordered batch of `MigrationMessage`s to
+// hand to the transport. As replies arrive the orchestrator advances
+// the state machine.
+let messages = orchestrator.start_migration(
     daemon_origin_hash,
     source_node_id,
     target_node_id,
-).await?;
+)?;
 ```
 
 Once started, the orchestrator drives every step. The source node snapshots the daemon (state plus causal chain head plus observed horizon); the target restores from the snapshot using a local `DaemonFactoryRegistry` that knows how to construct daemons of this kind; events that arrive on the source during the transfer are buffered and shipped to the target via `BufferedEvents`; the target replays the buffer in strict sequence order; routing flips at cutover; the source cleans up.
 
-The orchestrator can pick a target itself. `start_migration_auto` queries the capability index for migration-capable nodes that match the daemon's requirements:
+The orchestrator can pick a target itself. `start_migration_auto` queries the capability index for migration-capable nodes that match the daemon's requirements, and returns the chosen target node id alongside the first batch of migration messages:
 
 ```rust
-orchestrator.start_migration_auto(daemon_origin_hash, source_node_id).await?;
+let (target_node_id, messages) = orchestrator.start_migration_auto(
+    daemon_origin_hash,
+    source_node_id,
+    &scheduler,
+    &daemon_filter,
+)?;
 ```
 
 What survives a migration:
@@ -47,13 +55,18 @@ For most workloads — planned moves, load rebalancing, draining a node for main
 When a source node crashes before a migration can run, there's no snapshot to ship. The right primitive for that case is a standby group: one daemon active, N − 1 standbys ready to promote.
 
 ```rust
-use net::adapter::net::compute::StandbyGroup;
+use net_sdk::compute::DaemonRuntime;
+use net_sdk::groups::{StandbyGroup, StandbyGroupConfig};
+use net_sdk::DaemonHostConfig;
 
-let group = StandbyGroup::new(group_id)
-    .with_members(3)
-    .with_daemon_factory(|| StatefulDaemon::new());
+// A `kind` is a named daemon factory registered once on the runtime.
+runtime.register_factory("stateful", || Box::new(StatefulDaemon::new()))?;
 
-mesh.register_standby_group(group).await?;
+let group = StandbyGroup::spawn(&runtime, "stateful", StandbyGroupConfig {
+    member_count: 3,
+    group_seed: [0u8; 32],
+    host_config: DaemonHostConfig::default(),
+})?;
 ```
 
 How it works: the active daemon processes events normally. Periodically (`sync_standbys()`, called by you or by a policy you wire up), the active produces a snapshot and ships it to each standby. The standbys apply the snapshot but don't run the daemon — they hold readiness. Between syncs, the group buffers the events the active processed; on failure, the standby that's furthest along replays the buffer and promotes.
@@ -67,14 +80,18 @@ For workloads where seconds matter — operations control planes, real-time deci
 Where standby groups are for stateful work, replica groups are for stateless work. A `ReplicaGroup` runs N identical copies of a daemon, each with a deterministic identity derived from the group seed plus an index, with load-balanced routing across them.
 
 ```rust
-use net::adapter::net::compute::{ReplicaGroup, LoadBalancer};
+use net_sdk::groups::{ReplicaGroup, ReplicaGroupConfig};
+use net_sdk::DaemonHostConfig;
+use net::adapter::net::behavior::loadbalance::Strategy;
 
-let group = ReplicaGroup::new(group_id, group_seed)
-    .with_factor(5)
-    .with_load_balancer(LoadBalancer::least_connections())
-    .with_daemon_factory(|| StatelessWorker::new());
+runtime.register_factory("worker", || Box::new(StatelessWorker::new()))?;
 
-mesh.register_replica_group(group).await?;
+let group = ReplicaGroup::spawn(&runtime, "worker", ReplicaGroupConfig {
+    replica_count: 5,
+    group_seed: [0u8; 32],
+    lb_strategy: Strategy::LeastConnections,
+    host_config: DaemonHostConfig::default(),
+})?;
 ```
 
 Recovery is automatic and coordination-free. When a node fails, the affected replica is re-spawned on a different node using the same `group_seed + index`, which produces the same keypair — so the replica's origin hash is unchanged, peers routing to it don't notice the move, and the load balancer's view repairs on the next health check.
@@ -86,13 +103,17 @@ The model only works for daemons that are *actually* stateless. If your daemon's
 Forking is the opposite of replication. Instead of N copies of the same daemon doing the same work, you make N independent daemons that share a common parent at a specific causal point and then evolve independently. Each fork has its own keypair, its own causal chain, and a verifiable lineage back to the parent:
 
 ```rust
-use net::adapter::net::compute::ForkGroup;
+use net_sdk::groups::{ForkGroup, ForkGroupConfig};
+use net_sdk::DaemonHostConfig;
+use net::adapter::net::behavior::loadbalance::Strategy;
 
-let group = ForkGroup::from_parent(parent_origin, fork_seq)
-    .with_count(3)
-    .with_daemon_factory(|| StrategyDaemon::new());
+runtime.register_factory("strategy", || Box::new(StrategyDaemon::new()))?;
 
-mesh.register_fork_group(group).await?;
+let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq, ForkGroupConfig {
+    fork_count: 3,
+    lb_strategy: Strategy::RoundRobin,
+    host_config: DaemonHostConfig::default(),
+})?;
 ```
 
 Each fork records its lineage in a `ForkRecord` carrying a verifiable sentinel hash. The fork's chain starts with a genesis link whose `parent_hash` is the sentinel, so events from the fork chain back through the genesis to the parent's chain at the fork point. Any node on the mesh can verify the lineage by recomputing the sentinel.
@@ -101,23 +122,20 @@ The use cases for forking are deliberate divergence. A/B testing on the same wor
 
 ## Continuity proofs
 
-A `ContinuityProof` is a compact 36-byte structure that proves an entity's causal chain is intact over a sequence range without transferring the full log. It's a primitive that lets one node verify another node's chain claim cheaply:
+A `ContinuityProof` is a compact 40-byte structure that proves an entity's causal chain is intact over a sequence range without transferring the full log. It's a primitive that lets one node verify another node's chain claim cheaply:
 
 ```rust
 use net::adapter::net::continuity::ContinuityProof;
 
-let proof = ContinuityProof {
-    origin_hash,
-    from_seq: 100,
-    to_seq: 200,
-    from_hash: link_at_100.parent_hash,
-    to_hash: link_at_200.parent_hash,
-};
+// Extract a proof over the local chain (or build one field-by-field:
+// origin_hash + from_seq + to_seq + from_hash + to_hash).
+let proof = ContinuityProof::from_log(&log).expect("non-empty log");
 
-let verified = verifier.verify(&proof, &log)?;
+// The receiver verifies it against its own copy of the log.
+proof.verify_against(&remote_log)?;
 ```
 
-The verifier checks that recomputing the parent-hash chain from `from_seq` to `to_seq` lands on `to_hash`. If it does, the chain is intact over that range. Continuity proofs ride on a dedicated subprotocol; they're used in audit flows, in cross-node migration verification, and in any operation that needs a small structural witness without paying for the full log.
+`verify_against` walks the chain from `from_seq` to `to_seq`, recomputing each parent-hash link along the way; it returns `Ok(())` when the range is intact and a typed `ProofError` otherwise. Continuity proofs ride on a dedicated subprotocol; they're used in audit flows, in cross-node migration verification, and in any operation that needs a small structural witness without paying for the full log.
 
 The companion type is `ContinuityStatus`, which an observer can use to describe what it sees:
 
@@ -151,14 +169,15 @@ There's one wrinkle in the migration model. During the replay and cutover phases
 
 ```rust
 pub enum SuperpositionPhase {
-    PreMigration,    // Only at source.
-    Transferring,    // At source; snapshot in flight.
-    DualActive,      // Both nodes processing in parallel.
-    PostCutover,     // Only at target.
-    Settled,         // Migration complete; superposition collapsed.
+    Localized,       // Entity exists only on source (pre-snapshot).
+    Spreading,       // Snapshot taken, target restoring; source authoritative.
+    Superposed,      // Both nodes may hold the entity.
+    ReadyToCollapse, // Target caught up; ready to collapse to one location.
+    Collapsed,       // Routing switched to target; source draining.
+    Resolved,        // Source cleaned up; back to a single location on target.
 }
 ```
 
-Observers can see the entity at both locations during `DualActive`. The superposition collapses to `Settled` after cutover completes and the source cleans up. In practice you won't see this state in application code — the runtime handles the routing — but it's the model the protocol uses, and it's the right vocabulary for reasoning about what happens at the cutover instant.
+Observers can see the entity at both locations during `Superposed`. The superposition collapses to `Resolved` after cutover completes and the source cleans up. In practice you won't see this state in application code — the runtime handles the routing — but it's the model the protocol uses, and it's the right vocabulary for reasoning about what happens at the cutover instant.
 
 The takeaway: in Net, "an entity exists" is a more nuanced statement than it sounds. During normal operation an entity is at one place. During migration it's at two for a bounded window. After a fork it's at multiple places forever. The continuity layer gives you the tools to ask all three questions precisely.

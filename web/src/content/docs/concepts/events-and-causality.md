@@ -6,7 +6,7 @@ The causal-ordering model is the part of Net that most reliably surprises people
 
 ## What a causal link is
 
-Every event produced by an entity carries a 24-byte structure called a causal link. The link names the producer (via its origin hash), names the producer's view of what it had observed when it produced the event (a compressed sketch called a horizon), names a monotonic sequence number within the producer's own timeline, and hashes the event back to its parent.
+Every event produced by an entity carries a 32-byte structure called a causal link. The link names the producer (via its origin hash), names the producer's view of what it had observed when it produced the event (a compressed sketch called a horizon), names a monotonic sequence number within the producer's own timeline, and hashes the event back to its parent.
 
 Two facts follow from this structure that drive everything else.
 
@@ -28,7 +28,7 @@ First, **subscribers can decide whether they've seen enough context to consume a
 
 Second, **the horizon makes partition healing tractable.** When two halves of a partitioned mesh reconnect, every reachable producer can compare horizons and figure out exactly which events the other side hasn't seen. There's no full-log diff, no Merkle tree exchange — just a horizon swap and a targeted replay.
 
-The horizon is encoded as a 4-byte bloom sketch, so it can ride in the header alongside the rest of the causal link. Sketches have false positives (you might think you've observed something you haven't) but never false negatives (you'll never miss something you actually need). For the partition-healing and out-of-order-detection use cases, that's the right trade-off.
+The horizon is encoded as an 8-byte (64-bit) bloom sketch, so it can ride alongside the rest of the causal link. Sketches have false positives (you might think you've observed something you haven't) but never false negatives (you'll never miss something you actually need). For the partition-healing and out-of-order-detection use cases, that's the right trade-off.
 
 ## Entity logs
 
