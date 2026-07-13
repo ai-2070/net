@@ -8,9 +8,12 @@ work, not signature verification … that preserves the core economic
 claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
 interest table + resolver + upstream propagation on real sessions,
 dark behind `enable_sensing_coalescing = false` (as-built note in
-§6); **SI-3 COMPLETE as-built (2026-07-13)** — origin emitter +
-0x0C03 verified intake (as-built note in §6). Next: SI-4 (relay
-delivery + overlay application). Authorization stance, kept
+§6); **SI-3 COMPLETE as-built (2026-07-13), REVIEWED — normal path
+WORKING, deviations ACCEPTED, robustness closure REQUIRED** (SI-3
+review disposition in §6: a seven-item bounded closure packet must
+land before broad SI-4; SI-4's first cleanup seam — observation
+reclamation — is allowed). Next: the SI-3 closure packet, then SI-4
+(relay delivery + overlay application). Authorization stance, kept
 honest: the SI-1 sign-off said SI-2+ was NOT implied, so SI-2/SI-3
 were not within the review-7 authorization — SI-2+ implementation is
 proceeding under the operator's direction; the semantic gate review
@@ -1066,6 +1069,50 @@ must exercise the real dispatch path.
   is SI-4; multi-hop attestation forwarding/verification is SI-4;
   origin-hop cached-floor persistence follows the table rule (floor
   dies with the entry).
+  *SI-3 review disposition (2026-07-13, independent review):* normal
+  path WORKING; the three declared deviations ACCEPTED — (1)
+  `sensing_incarnation` with the honest claim: `None` fails closed;
+  `Some` means MeshNode TRUSTS the caller to have persisted and
+  incremented it — MeshNode itself never proves persistence (a
+  stronger typed API may come with host integration, not an SI-3
+  reopen); (2) the refusal floor is a TAGGED interpretation —
+  `status_reason == SamplingIntervalUnsupported` ⇒ `promised_cadence`
+  means `minimum_supported`; the field stays signed and unambiguous
+  under the reason tag; (3) origin-authored refusals confirmed
+  (relays forward identical bytes, never forge). **Robustness
+  closure REQUIRED before broad SI-4** — the bounded packet:
+  1. enforce `max_live_sensing_streams = 1024` (the 8192-slot LRU
+     is SEQUENCE-memory capacity, not live capacity): at cap, live
+     refreshes accepted, new/resurrected digests refused, no live
+     eviction, capacity refusals mint no seq slot;
+  2. refusal survivor re-registration must not be lost: the live
+     0x0C03 handler ignores `UpstreamAction::Register` while
+     `on_refusal` already committed `last_advertised`, so the
+     surviving aggregate strands permanently (violates §4.4
+     "re-register the satisfiable aggregate exactly once") — defer
+     the transition until a sender actually sends; three-hop
+     mixed-cadence test;
+  3. wire `invalidate_provider_floors` into the attestation intake:
+     an admitted beat whose origin incarnation OR capability
+     generation moved invalidates cached floors first (tests: both
+     axes → previously sub-floor registration re-evaluated);
+  4. bound duration arithmetic: `0 < D ≤ sensing_interest_ttl` and
+     `0 < attestation_cadence_floor ≤ sensing_interest_ttl` at
+     intake/config (a cadence beyond the soft-state lifetime cannot
+     produce a continuity stream), `checked_add` scheduling,
+     malformed cadence never terminates the emitter task;
+  5. never call user evaluators under the emitter mutex (an
+     evaluator that calls back into MeshNode deadlocks a
+     non-reentrant lock): collect + reserve under lock → evaluate
+     unlocked → finalize;
+  6. the temporary observation store must reclaim (cap-then-drop
+     forever is not acceptable beneath SI-4) and refusal beats are
+     control responses, never warm-start status for survivors;
+  7. close the register/retire race in the emitter loop (a
+     registration landing between the table read and the retire is
+     darkened until refresh).
+  SI-4 broad implementation: HOLD until the packet lands; SI-4's
+  first cleanup seam (observation reclamation) allowed now.
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3

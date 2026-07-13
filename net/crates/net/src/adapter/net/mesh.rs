@@ -1590,7 +1590,10 @@ pub struct MeshNodeConfig {
     /// derive the value with [`sensing::next_incarnation`] over a
     /// real [`sensing::IncarnationPersistence`] BEFORE constructing
     /// the node (increment-before-participation), exactly like the
-    /// entity keypair is loaded by the caller.
+    /// entity keypair is loaded by the caller. `Some` is TRUSTED
+    /// caller input — MeshNode itself never proves the persistence
+    /// claim (SI-3 review disposition; a stronger typed API may
+    /// come with host integration).
     ///
     /// `None` (the default) is **fail-closed** (plan §4.6): the
     /// node never signs or emits readiness attestations — inbound
