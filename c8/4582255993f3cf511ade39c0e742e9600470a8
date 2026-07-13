@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_c28bdf38c0df3a::t_3583c9a37ce61f 68
+  s_c28bdf38c0df3a::t_1c48985f505242 44-49
+net/crates/net/src/adapter/net/behavior/gang/claim.rs
+  s_c28bdf38c0df3a::t_e5dbc1b9c57416 279-282
+  s_c28bdf38c0df3a::t_2a804a40ead724 273-278,283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c84582255993f3cf511ade39c0e742e9600470a8",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
