@@ -1,0 +1,51 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_8eb9f556ecdab0 2933,2940,2955-2963
+  s_c28bdf38c0df3a::t_eb3ffab3b4a6ff 11770,11772-11774
+  s_c28bdf38c0df3a::t_3f04707a9046bb 4650-4659,4661
+  s_c28bdf38c0df3a::t_da8bf1bd270d85 9217-9218,9222-9227
+  s_c28bdf38c0df3a::t_7c2fc837cc34eb 11702-11723
+  s_c28bdf38c0df3a::t_d5d1bfa628b715 11310-11314,11318-11319,11323-11324
+  s_c28bdf38c0df3a::t_c02725b5f3c980 11623-11629,11636-11640,11642-11649
+  s_c28bdf38c0df3a::t_00e731de5a65f7 3101-3108
+  s_c28bdf38c0df3a::t_7fcd31d3305441 4711,11282,11396
+  s_c28bdf38c0df3a::t_85c6afcab8435b 11355-11361
+  s_c28bdf38c0df3a::t_a2e9bb9088e34e 3120-3123
+  s_c28bdf38c0df3a::t_0ae473a689a23f 11752-11763,11768,11775-11790,11792,11797
+  s_c28bdf38c0df3a::t_464ef6da5f6fc4 11133-11136,11138,11143-11144
+  s_c28bdf38c0df3a::t_585fa0e79d7e1e 2902-2918
+  s_c28bdf38c0df3a::t_5e35be0448e7ef 4833-4840
+  s_c28bdf38c0df3a::t_4f9546042fc63e 4600-4603
+  s_c28bdf38c0df3a::t_1e41ca1ace0277 11514-11521,11528,11534,11539-11548,11550-11563
+  s_c28bdf38c0df3a::t_a95d736a4863dc 2964-2965
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_e61e0b2f5c0891 615-641,649-667
+  s_c28bdf38c0df3a::t_d27cf4520f4666 202-204
+  s_c28bdf38c0df3a::t_eb3ffab3b4a6ff 642-648
+  s_c28bdf38c0df3a::t_4c63d238252104 316-331
+net/crates/net/tests/sensing_resolver.rs
+  s_c28bdf38c0df3a::t_89823b80f61437 313-322,327,331,333-337
+  s_c28bdf38c0df3a::t_32afe8751b5dcc 345,347
+net/crates/net/tests/sensing_origin_emitter.rs
+  s_c28bdf38c0df3a::t_451b1bc8d22236 957-1044,1050-1240,1247-1283,1289-1327
+  s_c28bdf38c0df3a::t_eb3ffab3b4a6ff 1045-1049,1241-1246
+  s_c28bdf38c0df3a::t_b4426ddd56c20f 579-580,591-597,599-607
+  s_c28bdf38c0df3a::t_39c9a098f491ee 1284-1288
+net/crates/net/src/adapter/net/behavior/sensing/controller.rs
+  s_c28bdf38c0df3a::t_9540fca3c79646 102-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "85328d59b5bfd228117035dde14c4c776f83633e",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
