@@ -1113,6 +1113,45 @@ must exercise the real dispatch path.
      darkened until refresh).
   SI-4 broad implementation: HOLD until the packet lands; SI-4's
   first cleanup seam (observation reclamation) allowed now.
+  *Closure packet as-built (2026-07-13, a610590dc + 606eb4629 +
+  a07c54fbc):* all seven items landed. (1) `MAX_LIVE_SENSING_STREAMS
+  = 1024` — live refreshes accepted at cap, new/resurrected digests
+  refused via the split `StreamRefusal::AtCapacity`, live never
+  evicted, capacity refusals mint no seq slot. (2) `on_refusal`
+  PEEKS the survivor transition; senders consume it
+  (`commit_advertised`, or structurally through the next full-spec
+  refresh's `register()` diff) — plus the three-hop mixed-cadence
+  e2e. (3) per-origin (incarnation, generation) epoch records at
+  the intake; a move on either axis invalidates cached floors
+  before the new state applies — both axes e2e-tested with crafted
+  frames. (4) `0 < D ≤ sensing_interest_ttl` at every intake (wire
+  drop+trace, local `SensingRegistrationError::Interval`), refusal
+  floors M bounded the same way, `attestation_cadence_floor`
+  config-normalized, all emitter scheduling through checked-add
+  with far-future park. (5) two-phase emission — `collect_due`
+  reserves seq/schedule under the lock, evaluators run OUTSIDE it,
+  `DueBeat::into_unsigned` seals purely; reentrancy e2e (an
+  evaluator calling `notify_sensing_state_changed` from
+  `evaluate()`) confirms no deadlock and floor-bounded feedback.
+  (6) the observation seam reclaims with the table
+  (sweep/deregister reclaim everything; refusal-partition death
+  keeps the refusal as an age-stamped tombstone the sweep reclaims
+  after ttl); refusal beats live in their own control-response map
+  (`sensing_latest_refusal`), never warm-start status. (7) stamped
+  retirement (`stamp`/`retire_if_stale`) on every retire path.
+  **Two additional defects found and fixed by the required
+  mixed-cadence test:** the relay `ProviderRegistration` arm (a)
+  lost a damper-suppressed Register transition forever (the
+  finding-2 consumed-transition shape at the damper seam) and (b)
+  never re-sent upstream on refreshes, starving upstream rows to
+  ttl expiry in leaderless relay chains against §4.3's ttl/2
+  refresh model — the arm now sends damped anti-entropy at the
+  current aggregate on every admitted registration/refresh (the
+  `register_sensing_interest` / SI-2c leader-seam shape).
+  Verification state: closure implemented and locally green (4893
+  lib tests, 7 origin-emitter e2e, all sensing suites, both clippy
+  gates); the SI-4 broad hold stands until the reviewer verifies
+  the closure.
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
