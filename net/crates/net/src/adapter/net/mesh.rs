@@ -1100,6 +1100,20 @@ struct DispatchCtx {
     /// fleet root.
     #[cfg(feature = "redex")]
     sensing_local_entity_root: sensing::AudienceScopeCommitment,
+    /// SI-3: the origin-emission scheduler slot. See the matching
+    /// field on `MeshNode`; the dispatch arm feeds it when a
+    /// `ProviderRegistration` targets this node.
+    sensing_emitter: Arc<parking_lot::Mutex<Option<sensing::OriginEmitter>>>,
+    /// SI-3: wakes the emitter loop after intake changed a schedule.
+    sensing_emitter_notify: Arc<tokio::sync::Notify>,
+    /// SI-3: this node's signing identity, for one-shot refusal
+    /// beats authored on the intake path (streams sign in the
+    /// emitter loop).
+    signing_identity: Arc<EntityKeypair>,
+    /// SI-3: the node's own announce generation
+    /// (`MeshNode::capability_version`) — stamped into attestations
+    /// at evaluation time (§3.4).
+    capability_version: Arc<AtomicU64>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -1563,6 +1577,22 @@ pub struct MeshNodeConfig {
     /// the 0x0C02 dispatch arm; default-rooted nodes keep the strict
     /// entity-root rule.
     pub sensing_owner_root: Option<sensing::AudienceScopeCommitment>,
+    /// SI-3: the §4.6 origin incarnation this node's sensing plane
+    /// signs attestations under. The caller owns persistence:
+    /// derive the value with [`sensing::next_incarnation`] over a
+    /// real [`sensing::IncarnationPersistence`] BEFORE constructing
+    /// the node (increment-before-participation), exactly like the
+    /// entity keypair is loaded by the caller.
+    ///
+    /// `None` (the default) is **fail-closed** (plan §4.6): the
+    /// node never signs or emits readiness attestations — inbound
+    /// interests targeting it still register table rows, but the
+    /// streams stay dark and consumers project Unknown through
+    /// continuity. A node that emitted under a non-persisted epoch
+    /// could replay `(incarnation, seq)` pairs after a restart,
+    /// which downstream observer gates poison as equivocation —
+    /// silence is strictly safer than that.
+    pub sensing_incarnation: Option<sensing::Incarnation>,
     /// Period between `TokenCache` expiry sweeps. A subscriber
     /// whose token expires mid-subscription is evicted from the
     /// [`SubscriberRoster`] and revoked from the [`AuthGuard`]
@@ -1709,6 +1739,7 @@ impl MeshNodeConfig {
             attestation_cadence_floor: sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR,
             continuity_factor: 3,
             sensing_owner_root: None,
+            sensing_incarnation: None,
             token_sweep_interval: Duration::from_secs(30),
             max_auth_failures_per_window: 16,
             auth_failure_window: Duration::from_secs(60),
@@ -1890,6 +1921,15 @@ impl MeshNodeConfig {
     /// [`Self::sensing_owner_root`].
     pub fn with_sensing_owner_root(mut self, root: sensing::AudienceScopeCommitment) -> Self {
         self.sensing_owner_root = Some(root);
+        self
+    }
+
+    /// Set the origin incarnation the sensing plane signs under.
+    /// See [`Self::sensing_incarnation`] — derive it with
+    /// [`sensing::next_incarnation`] over real persistence; the
+    /// origin role stays fail-closed dark without it.
+    pub fn with_sensing_incarnation(mut self, incarnation: sensing::Incarnation) -> Self {
+        self.sensing_incarnation = Some(incarnation);
         self
     }
 
@@ -2816,12 +2856,14 @@ fn sensing_upstream_damper_admits(
     fresh
 }
 
-/// SI-2a: send one encoded [`sensing::SensingInterestFrame`] toward
-/// `next_hop(target)` over the encrypted per-peer subprotocol path —
-/// the `spawn_route_withdrawal_flood` shape, single-target. Interests
-/// are HOP-BY-HOP link state (plan §4.3): the frame is encrypted to
-/// the next hop's session (which registers this node as ITS
-/// downstream and re-propagates), never end-to-end to the provider.
+/// SI-2a: send one encoded sensing payload (0x0C02 interest frame
+/// or, since SI-3, 0x0C03 attestation) toward `next_hop(target)`
+/// over the encrypted per-peer subprotocol path — the
+/// `spawn_route_withdrawal_flood` shape, single-target. Both legs
+/// are HOP-BY-HOP link state (plan §4.3/§4.4): the frame is
+/// encrypted to the next hop's session (which registers this node
+/// as ITS downstream / applies its own relay rules and
+/// re-propagates), never end-to-end.
 ///
 /// Resolution order: a held session toward `target` wins (its
 /// recorded addr is the link we already use for it — the relay's
@@ -2830,7 +2872,7 @@ fn sensing_upstream_damper_admits(
 /// soft state, the next registration retries and the sweep's expiry
 /// bounds the stale window.
 #[allow(clippy::too_many_arguments)]
-fn spawn_sensing_upstream_send(
+fn spawn_sensing_frame_send(
     socket: &Arc<NetSocket>,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
@@ -2838,6 +2880,7 @@ fn spawn_sensing_upstream_send(
     partition_filter: &PartitionFilter,
     local_node_id: u64,
     target: u64,
+    subprotocol: u16,
     payload: Vec<u8>,
 ) {
     let next_addr = peers
@@ -2864,17 +2907,11 @@ fn spawn_sensing_upstream_send(
     let socket = socket.clone();
     tokio::spawn(async move {
         let events = [Bytes::from(payload)];
-        let stream_id = sensing::SUBPROTOCOL_SENSING_INTEREST as u64;
+        let stream_id = subprotocol as u64;
         let seq = session.get_or_create_stream(stream_id).next_tx_seq();
         let packet = {
             let mut builder = session.thread_local_pool().get();
-            builder.build_subprotocol(
-                stream_id,
-                seq,
-                &events,
-                PacketFlags::NONE,
-                sensing::SUBPROTOCOL_SENSING_INTEREST,
-            )
+            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
         };
         let _ = socket.send_to(&packet, addr).await;
     });
@@ -2962,9 +2999,11 @@ impl std::error::Error for SensingRegistrationError {}
 /// and `FailureDetector` (heartbeat monitoring) behind a single UDP socket.
 pub struct MeshNode {
     /// This node's identity (ed25519, for signing and node_id derivation).
-    /// Used in Phase 3 for subprotocol message signing.
-    #[allow(dead_code)]
-    identity: EntityKeypair,
+    /// Used in Phase 3 for subprotocol message signing. `Arc` so
+    /// signing tasks (the SI-3 attestation emitter) can hold it
+    /// without cloning key material; deref coercion keeps
+    /// `&self.identity` call sites unchanged.
+    identity: Arc<EntityKeypair>,
     /// Noise static keypair (Curve25519, for handshakes)
     static_keypair: StaticKeypair,
     /// Derived node ID
@@ -3437,6 +3476,25 @@ pub struct MeshNode {
     /// rides the RedEX election, never a second election subsystem.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// SI-3: the origin-emission scheduler
+    /// ([`sensing::OriginEmitter`]). `Some` only when the plane is
+    /// enabled AND [`MeshNodeConfig::sensing_incarnation`] was
+    /// supplied — the fail-closed §4.6 rule; `None` keeps the origin
+    /// role dark while relay/table behavior stays intact. Lock
+    /// order: never held together with the interest-table lock
+    /// (take table reads first, drop, then the emitter).
+    sensing_emitter: Arc<parking_lot::Mutex<Option<sensing::OriginEmitter>>>,
+    /// SI-3: wakes the emitter loop when a registration, poke, or
+    /// refusal changed the schedule (`Notify` stores one permit, so
+    /// a signal during a tick is never lost).
+    sensing_emitter_notify: Arc<tokio::sync::Notify>,
+    /// SI-3: capability integrations by capability id (plan §4.4 —
+    /// one narrow trait per integration). Registered via
+    /// [`MeshNode::register_readiness_evaluator`]; a targeted
+    /// interest with no registered evaluator streams
+    /// `ProviderUnknown { TemporarilyUnevaluable }`.
+    sensing_evaluators:
+        Arc<DashMap<sensing::CapabilityId, Arc<dyn sensing::ReadinessEvaluator + Send + Sync>>>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -4059,9 +4117,22 @@ impl MeshNode {
         let sensing_interest_table = Arc::new(parking_lot::Mutex::new(
             sensing::InterestTable::new(config.max_interests_per_peer),
         ));
+        // SI-3: the origin role exists only with BOTH the plane
+        // enabled and a caller-persisted incarnation (fail-closed,
+        // see the `sensing_incarnation` knob docs).
+        let sensing_emitter = Arc::new(parking_lot::Mutex::new(
+            match (config.enable_sensing_coalescing, config.sensing_incarnation) {
+                (true, Some(incarnation)) => Some(sensing::OriginEmitter::new(
+                    node_id,
+                    incarnation,
+                    config.attestation_cadence_floor,
+                )),
+                _ => None,
+            },
+        ));
 
         Ok(Self {
-            identity,
+            identity: Arc::new(identity),
             static_keypair,
             node_id,
             config,
@@ -4115,6 +4186,9 @@ impl MeshNode {
             sensing_upstream_damper: Arc::new(DashMap::new()),
             #[cfg(feature = "redex")]
             sensing_leader: Arc::new(parking_lot::Mutex::new(None)),
+            sensing_emitter,
+            sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
+            sensing_evaluators: Arc::new(DashMap::new()),
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -4367,7 +4441,55 @@ impl MeshNode {
             );
             (outcome, table.aggregate(&key, now))
         };
-        if matches!(outcome, sensing::RegisterOutcome::Registered(_)) && provider != self.node_id {
+        if matches!(outcome, sensing::RegisterOutcome::Registered(_)) && provider == self.node_id {
+            // SI-3: the node registered interest in ITSELF — feed
+            // the origin emitter directly (no wire hop). An emitter
+            // refusal partitions this hop's rows exactly like the
+            // dispatch path, but the refusal answer is the returned
+            // outcome — a Local downstream has no wire to ride.
+            if let Some(strictest) = aggregate {
+                let refusal = {
+                    let mut slot = self.sensing_emitter.lock();
+                    match slot.as_mut() {
+                        // Fail-closed origin role: row stands,
+                        // stream stays dark (knob docs).
+                        None => None,
+                        Some(emitter) => emitter.register(spec, strictest, now).err(),
+                    }
+                };
+                match refusal {
+                    None => self.sensing_emitter_notify.notify_one(),
+                    Some(refusal) => {
+                        self.sensing_counters
+                            .cadence_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                        let partition = self.sensing_interest_table.lock().on_refusal(
+                            &key,
+                            refusal.minimum_supported,
+                            now,
+                        );
+                        {
+                            let mut slot = self.sensing_emitter.lock();
+                            if let Some(emitter) = slot.as_mut() {
+                                match partition.upstream {
+                                    sensing::UpstreamAction::Register { strictest } => {
+                                        let _ = emitter.register(spec, strictest, now);
+                                    }
+                                    sensing::UpstreamAction::Deregister => {
+                                        emitter.retire(&key.interest.interest_digest);
+                                    }
+                                    sensing::UpstreamAction::None => {}
+                                }
+                            }
+                        }
+                        self.sensing_emitter_notify.notify_one();
+                        return Ok(sensing::RegisterOutcome::RefusedByCachedFloor {
+                            minimum_supported: refusal.minimum_supported,
+                        });
+                    }
+                }
+            }
+        } else if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
             if let Some(strictest) = aggregate {
                 if sensing_upstream_damper_admits(
                     &self.sensing_upstream_damper,
@@ -4378,7 +4500,7 @@ impl MeshNode {
                         spec, provider, strictest, ttl,
                     );
                     if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-                        spawn_sensing_upstream_send(
+                        spawn_sensing_frame_send(
                             &self.socket,
                             &self.peers,
                             &self.addr_to_node,
@@ -4386,6 +4508,7 @@ impl MeshNode {
                             &self.partition_filter,
                             self.node_id,
                             provider,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST,
                             bytes,
                         );
                     }
@@ -4393,6 +4516,68 @@ impl MeshNode {
             }
         }
         Ok(outcome)
+    }
+
+    /// SI-3: install (or replace) the [`sensing::ReadinessEvaluator`]
+    /// for one capability id (plan §4.4 — one narrow trait per
+    /// integration). Implementations must be cheap and non-blocking:
+    /// the emitter loop evaluates under its scheduler lock. Interests
+    /// targeting this node for a capability WITHOUT an evaluator
+    /// stream `ProviderUnknown { TemporarilyUnevaluable }` — an
+    /// explicit "targeted but cannot answer" beats silence.
+    ///
+    /// Registration is independent of the origin role being active:
+    /// evaluators may be installed before `start()` or while the
+    /// plane is dark; they take effect whenever emission runs.
+    pub fn register_readiness_evaluator(
+        &self,
+        capability_id: sensing::CapabilityId,
+        evaluator: Arc<dyn sensing::ReadinessEvaluator + Send + Sync>,
+    ) {
+        self.sensing_evaluators.insert(capability_id, evaluator);
+    }
+
+    /// SI-3: remove a capability's evaluator. Live streams for it
+    /// fall back to `ProviderUnknown { TemporarilyUnevaluable }` at
+    /// their next beat. Returns whether one was installed.
+    pub fn unregister_readiness_evaluator(&self, capability_id: &sensing::CapabilityId) -> bool {
+        self.sensing_evaluators.remove(capability_id).is_some()
+    }
+
+    /// SI-3: the integration's status-edge hook (plan §4.4 "status
+    /// edges immediate with min-gap"): local state affecting
+    /// `capability_id` changed — pull every live stream on that
+    /// capability forward to now, min-gapped at the cadence floor,
+    /// and wake the emitter loop. A no-op while the origin role is
+    /// dark or no stream targets the capability.
+    pub fn notify_sensing_state_changed(&self, capability_id: &sensing::CapabilityId) {
+        let moved = {
+            let mut slot = self.sensing_emitter.lock();
+            match slot.as_mut() {
+                Some(emitter) => emitter.poke(capability_id, Instant::now()),
+                None => false,
+            }
+        };
+        if moved {
+            self.sensing_emitter_notify.notify_one();
+        }
+    }
+
+    /// SI-3: whether the origin role is active — the plane is
+    /// enabled AND a persisted incarnation was supplied (fail-closed
+    /// otherwise; see [`MeshNodeConfig::sensing_incarnation`]).
+    pub fn sensing_origin_active(&self) -> bool {
+        self.sensing_emitter.lock().is_some()
+    }
+
+    /// SI-3: live emission streams on this origin (tests +
+    /// observability).
+    pub fn sensing_live_streams(&self) -> usize {
+        self.sensing_emitter
+            .lock()
+            .as_ref()
+            .map(|emitter| emitter.live_streams())
+            .unwrap_or(0)
     }
 
     /// A handle to the sensing-plane counters (SI-2a observability;
@@ -5212,6 +5397,9 @@ impl MeshNode {
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
+        // SI-3: `None` while the origin role is dark (plane off or
+        // no persisted incarnation — fail-closed, §4.6).
+        let sensing_emitter_handle = self.spawn_sensing_emitter_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the
         // operator set `try_port_mapping(true)`. Real client is
@@ -5284,6 +5472,9 @@ impl MeshNode {
             tasks.push(capability_reannounce_handle);
             tasks.push(capability_announce_on_change_handle);
             tasks.push(fold_generation_gc_handle);
+            if let Some(h) = sensing_emitter_handle {
+                tasks.push(h);
+            }
             tasks.push(token_sweep_handle);
             #[cfg(feature = "port-mapping")]
             if let Some(h) = port_mapping_handle {
@@ -5691,6 +5882,126 @@ impl MeshNode {
         })
     }
 
+    /// SI-3: spawn the origin-emission loop (plan §4.4). Sleeps
+    /// until the emitter's earliest due beat (or a
+    /// `sensing_emitter_notify` wake — registration, status-edge
+    /// poke, refusal), ticks the scheduler, signs each beat, and
+    /// fans it to the branch's live PEER downstreams. `Local`
+    /// downstreams are skipped — the local overlay/aggregate
+    /// application is SI-4. A branch whose downstream list emptied
+    /// retires its stream on the spot (zero idle emission — the
+    /// sweep and deregister paths retire too; this is the backstop
+    /// that runs even between sweeps, because `downstreams()`
+    /// filters expired rows itself).
+    ///
+    /// `None` when the origin role is dark (plane off or no
+    /// persisted incarnation — fail-closed, §4.6).
+    fn spawn_sensing_emitter_loop(&self) -> Option<JoinHandle<()>> {
+        if self.sensing_emitter.lock().is_none() {
+            return None;
+        }
+        let emitter = self.sensing_emitter.clone();
+        let notify = self.sensing_emitter_notify.clone();
+        let evaluators = self.sensing_evaluators.clone();
+        let table = self.sensing_interest_table.clone();
+        let identity = self.identity.clone();
+        let capability_version = self.capability_version.clone();
+        let socket = self.socket.clone();
+        let peers = self.peers.clone();
+        let addr_to_node = self.addr_to_node.clone();
+        let router = self.router.clone();
+        let partition_filter = self.partition_filter.clone();
+        let local_node_id = self.node_id;
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        Some(tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                let next = { emitter.lock().as_ref().and_then(|e| e.next_due()) };
+                let now = Instant::now();
+                match next {
+                    // Fully idle: zero emission until something
+                    // registers or pokes.
+                    None => {
+                        tokio::select! {
+                            _ = notify.notified() => continue,
+                            _ = shutdown_notify.notified() => break,
+                        }
+                    }
+                    Some(due) if due > now => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(due - now) => {}
+                            _ = notify.notified() => {}
+                            _ = shutdown_notify.notified() => break,
+                        }
+                        // Re-derive the schedule after any wake —
+                        // a notify may have pulled a beat earlier
+                        // OR retired the stream we were waiting on.
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+                // Generation is read at evaluation time (§3.4) —
+                // one read serves every beat in this tick.
+                let generation = capability_version.load(Ordering::Relaxed);
+                let beats = {
+                    let mut slot = emitter.lock();
+                    let Some(origin) = slot.as_mut() else { break };
+                    origin.tick(now, generation, |request| {
+                        // Clone the Arc out of the map entry before
+                        // evaluating so the shard guard drops first.
+                        let evaluator = evaluators
+                            .get(request.capability_id)
+                            .map(|entry| entry.value().clone())?;
+                        Some(evaluator.evaluate(request))
+                    })
+                };
+                for (interest, unsigned) in beats {
+                    let digest = interest.interest_digest;
+                    let branch = sensing::ProviderInterestKey::new(interest, local_node_id);
+                    let downstreams = { table.lock().downstreams(&branch, now) };
+                    if downstreams.is_empty() {
+                        if let Some(origin) = emitter.lock().as_mut() {
+                            origin.retire(&digest);
+                        }
+                        continue;
+                    }
+                    let peer_downstreams: Vec<u64> = downstreams
+                        .into_iter()
+                        .filter_map(|downstream| match downstream {
+                            sensing::DownstreamId::Peer(node) => Some(node),
+                            sensing::DownstreamId::Local => None,
+                        })
+                        .collect();
+                    if peer_downstreams.is_empty() {
+                        // Local-only interest: the stream stays
+                        // live (seq advances) but delivery to the
+                        // local overlay is SI-4.
+                        continue;
+                    }
+                    let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
+                        continue;
+                    };
+                    let Ok(bytes) = sensing::encode_attestation(&signed) else {
+                        continue;
+                    };
+                    for node in peer_downstreams {
+                        spawn_sensing_frame_send(
+                            &socket,
+                            &peers,
+                            &addr_to_node,
+                            &router,
+                            &partition_filter,
+                            local_node_id,
+                            node,
+                            sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                            bytes.clone(),
+                        );
+                    }
+                }
+            }
+        }))
+    }
+
     /// Spawn a periodic sweep that evicts subscribers whose tokens
     /// have expired. Walks the roster by peer (via
     /// `peer_entity_ids`) and, for every `require_token` channel the
@@ -5818,6 +6129,10 @@ impl MeshNode {
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
             ),
+            sensing_emitter: self.sensing_emitter.clone(),
+            sensing_emitter_notify: self.sensing_emitter_notify.clone(),
+            signing_identity: self.identity.clone(),
+            capability_version: self.capability_version.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -8383,6 +8698,7 @@ impl MeshNode {
         // empty).
         let enable_sensing_coalescing = self.config.enable_sensing_coalescing;
         let sensing_interest_table = self.sensing_interest_table.clone();
+        let sensing_emitter = self.sensing_emitter.clone();
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -8508,6 +8824,17 @@ impl MeshNode {
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
                                 if key.provider == local_node_id {
+                                    // SI-3: this node is the origin —
+                                    // the last row's expiry retires
+                                    // the emission stream (zero idle
+                                    // emission, plan §4.7).
+                                    if action == sensing::UpstreamAction::Deregister {
+                                        if let Some(emitter) =
+                                            sensing_emitter.lock().as_mut()
+                                        {
+                                            emitter.retire(&key.interest.interest_digest);
+                                        }
+                                    }
                                     continue;
                                 }
                                 if action == sensing::UpstreamAction::Deregister {
@@ -8516,7 +8843,7 @@ impl MeshNode {
                                         target: Some(key.provider),
                                     };
                                     if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-                                        spawn_sensing_upstream_send(
+                                        spawn_sensing_frame_send(
                                             &socket,
                                             &peers,
                                             &addr_to_node,
@@ -8524,7 +8851,8 @@ impl MeshNode {
                                             &partition_filter,
                                             local_node_id,
                                             key.provider,
-                                            bytes,
+                                            sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                        bytes,
                                         );
                                     }
                                 }
@@ -10574,7 +10902,7 @@ impl MeshNode {
                             &spec, provider, strictest, ttl,
                         );
                         if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                            spawn_sensing_upstream_send(
+                            spawn_sensing_frame_send(
                                 &ctx.socket,
                                 &ctx.peers,
                                 &ctx.addr_to_node,
@@ -10582,6 +10910,7 @@ impl MeshNode {
                                 &ctx.partition_filter,
                                 ctx.local_node_id,
                                 provider,
+                                sensing::SUBPROTOCOL_SENSING_INTEREST,
                                 bytes,
                             );
                         }
@@ -10618,8 +10947,11 @@ impl MeshNode {
                     sensing::RegisterOutcome::Registered(action) => {
                         // Trailing edge (§4.3): exactly one coalesced
                         // upstream update per DERIVED change. The
-                        // target provider itself has no upstream.
+                        // target provider itself has no upstream —
+                        // there the registration feeds the origin
+                        // emitter instead (SI-3).
                         if validated.target == ctx.local_node_id {
+                            Self::feed_sensing_origin(ctx, &key, &validated.spec, now);
                             return;
                         }
                         match action {
@@ -10638,7 +10970,7 @@ impl MeshNode {
                                     ttl,
                                 );
                                 if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                                    spawn_sensing_upstream_send(
+                                    spawn_sensing_frame_send(
                                         &ctx.socket,
                                         &ctx.peers,
                                         &ctx.addr_to_node,
@@ -10646,6 +10978,7 @@ impl MeshNode {
                                         &ctx.partition_filter,
                                         ctx.local_node_id,
                                         validated.target,
+                                        sensing::SUBPROTOCOL_SENSING_INTEREST,
                                         bytes,
                                     );
                                 }
@@ -10667,15 +11000,38 @@ impl MeshNode {
                         );
                     }
                     sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
-                        // Refusal responses to the downstream are
-                        // SI-3 wiring (they ride the attestation
-                        // plane); the local refusal is already the
-                        // §4.4 no-round-trip behavior.
                         tracing::debug!(
                             from_node = format!("{:#x}", from_node),
                             floor_ms = minimum_supported.as_millis() as u64,
                             "sensing: registration refused by cached provider floor"
                         );
+                        // SI-3: when THIS node is the origin, it can
+                        // author + sign the refusal response itself
+                        // (one-shot, rides the attestation plane).
+                        // A RELAY's cached-floor refusal stays local
+                        // (§4.4 no-round-trip): a relay cannot sign
+                        // an attestation for a foreign origin —
+                        // re-sending the origin's cached refusal is
+                        // SI-4's latest-per-key anti-entropy.
+                        if validated.target == ctx.local_node_id {
+                            ctx.sensing_counters
+                                .cadence_refusals
+                                .fetch_add(1, Ordering::Relaxed);
+                            let generation = ctx.capability_version.load(Ordering::Relaxed);
+                            let beat = {
+                                let mut slot = ctx.sensing_emitter.lock();
+                                slot.as_mut().map(|emitter| {
+                                    emitter.refusal_beat(
+                                        &validated.spec,
+                                        sensing::CadenceRefusal { minimum_supported },
+                                        generation,
+                                    )
+                                })
+                            };
+                            if let Some(beat) = beat {
+                                Self::send_sensing_refusal_beat(ctx, beat, [from_node]);
+                            }
+                        }
                     }
                 }
             }
@@ -10691,6 +11047,14 @@ impl MeshNode {
                 );
                 for (key, action) in actions {
                     if key.provider == ctx.local_node_id {
+                        // SI-3: this node is the origin — the last
+                        // downstream's death retires the emission
+                        // stream (zero idle emission, plan §4.7).
+                        if action == sensing::UpstreamAction::Deregister {
+                            if let Some(emitter) = ctx.sensing_emitter.lock().as_mut() {
+                                emitter.retire(&key.interest.interest_digest);
+                            }
+                        }
                         continue;
                     }
                     if action == sensing::UpstreamAction::Deregister {
@@ -10700,6 +11064,106 @@ impl MeshNode {
                     // SI-2a — see the method docs.
                 }
             }
+        }
+    }
+
+    /// SI-3: a `ProviderRegistration` targeting THIS node admitted
+    /// (or refreshed) a downstream row — feed the origin emitter at
+    /// the row's post-registration strictest aggregate. With no
+    /// emitter installed (plane off or no persisted incarnation)
+    /// the row stands but the stream stays dark — the fail-closed
+    /// §4.6 rule (see the `sensing_incarnation` knob docs).
+    ///
+    /// Lock discipline: table read first, dropped, then the emitter
+    /// — never nested (see the `sensing_emitter` field docs).
+    fn feed_sensing_origin(
+        ctx: &DispatchCtx,
+        key: &sensing::ProviderInterestKey,
+        spec: &sensing::InterestSpec,
+        now: Instant,
+    ) {
+        let Some(strictest) = ctx.sensing_interest_table.lock().aggregate(key, now) else {
+            return;
+        };
+        let refusal = {
+            let mut slot = ctx.sensing_emitter.lock();
+            let Some(emitter) = slot.as_mut() else {
+                return;
+            };
+            match emitter.register(spec, strictest, now) {
+                Ok(()) => {
+                    drop(slot);
+                    ctx.sensing_emitter_notify.notify_one();
+                    return;
+                }
+                Err(refusal) => refusal,
+            }
+        };
+        // §4.4 origin-hop refusal: partition this hop's downstreams
+        // on M, answer every refused peer with the one-shot signed
+        // refusal beat, and keep the surviving aggregate streaming.
+        ctx.sensing_counters
+            .cadence_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        let partition =
+            ctx.sensing_interest_table
+                .lock()
+                .on_refusal(key, refusal.minimum_supported, now);
+        let generation = ctx.capability_version.load(Ordering::Relaxed);
+        let beat = {
+            let mut slot = ctx.sensing_emitter.lock();
+            let Some(emitter) = slot.as_mut() else {
+                return;
+            };
+            let beat = emitter.refusal_beat(spec, refusal, generation);
+            match partition.upstream {
+                // Survivors' aggregate is ≥ M ≥ floor by
+                // construction, so this register cannot refuse.
+                sensing::UpstreamAction::Register { strictest } => {
+                    let _ = emitter.register(spec, strictest, now);
+                }
+                sensing::UpstreamAction::Deregister => {
+                    emitter.retire(&key.interest.interest_digest);
+                }
+                sensing::UpstreamAction::None => {}
+            }
+            beat
+        };
+        ctx.sensing_emitter_notify.notify_one();
+        Self::send_sensing_refusal_beat(ctx, beat, {
+            partition.refused.into_iter().filter_map(|d| match d {
+                sensing::DownstreamId::Peer(node) => Some(node),
+                sensing::DownstreamId::Local => None,
+            })
+        });
+    }
+
+    /// SI-3: sign one refusal beat and fan it to the given peers
+    /// (0x0C03). Signing is ~13 µs (SI-1d) — fine inline on the
+    /// dispatch path for a refusal, which is rare by construction.
+    fn send_sensing_refusal_beat(
+        ctx: &DispatchCtx,
+        beat: sensing::UnsignedAttestation,
+        peers: impl IntoIterator<Item = u64>,
+    ) {
+        let Ok(signed) = sensing::sign_attestation(&ctx.signing_identity, beat) else {
+            return;
+        };
+        let Ok(bytes) = sensing::encode_attestation(&signed) else {
+            return;
+        };
+        for node in peers {
+            spawn_sensing_frame_send(
+                &ctx.socket,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                node,
+                sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                bytes.clone(),
+            );
         }
     }
 
@@ -10715,7 +11179,7 @@ impl MeshNode {
             target: Some(key.provider),
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-            spawn_sensing_upstream_send(
+            spawn_sensing_frame_send(
                 &ctx.socket,
                 &ctx.peers,
                 &ctx.addr_to_node,
@@ -10723,6 +11187,7 @@ impl MeshNode {
                 &ctx.partition_filter,
                 ctx.local_node_id,
                 key.provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             );
         }
