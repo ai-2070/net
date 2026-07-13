@@ -1,0 +1,48 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_f364a6bf62c482 4781
+  s_c28bdf38c0df3a::t_5ddce67efba5b6 3601-3607,3610-3611
+  s_c28bdf38c0df3a::t_3a8da57fac0242 8958
+  s_c28bdf38c0df3a::t_5fce02c37f4032 9088-9093
+  s_c28bdf38c0df3a::t_d9e10a4b87d446 9133-9166
+  s_c28bdf38c0df3a::t_203e5ce903afd3 11280,11287-11339
+  s_c28bdf38c0df3a::t_b3fa667097dbad 11711-11714,11720,11723-11725,11732
+  s_c28bdf38c0df3a::t_364b3561a23bb0 2870-2876
+  s_c28bdf38c0df3a::t_deb8418bc13a03 11399-11403
+  s_c28bdf38c0df3a::t_4b544acac5b09f 2886-2890,2893-2901
+  s_c28bdf38c0df3a::t_d4a7871cff9980 11668-11687,11715-11718
+  s_c28bdf38c0df3a::t_4ac58847ded0c7 2851-2855,2858-2869,2877-2885,2891-2892,2902-2909
+  s_c28bdf38c0df3a::t_e91b18fb11b8aa 4329
+  s_c28bdf38c0df3a::t_80caa0fd1cc88f 8957
+  s_c28bdf38c0df3a::t_607e5f052adadd 1120-1122
+  s_c28bdf38c0df3a::t_c80c52214c4cce 4762-4772,4782,4784
+  s_c28bdf38c0df3a::t_bf4922dbd1c4ba 4773-4777
+  s_c28bdf38c0df3a::t_e75e0f5397f5b6 11629-11650
+  s_c28bdf38c0df3a::t_59178a88ddbbe3 2910
+net/crates/net/src/adapter/net/behavior/sensing/table.rs
+  s_c28bdf38c0df3a::t_7578df47c76b5b 155-161
+net/crates/net/tests/sensing_origin_emitter.rs
+  s_c28bdf38c0df3a::t_9e833e34a55f65 343
+  s_c28bdf38c0df3a::t_80d9c7f4fa74f2 290,299,311-316
+  s_c28bdf38c0df3a::t_202ad8c693f72e 620-802,804-852,861-888,890-896,901-913,923-943
+  s_c28bdf38c0df3a::t_44d12cf98412a1 853-860
+  s_c28bdf38c0df3a::t_5331a3081a828f 231-234,244-247,249,251-253
+  s_c28bdf38c0df3a::t_fdc9f63d286312 803
+  s_c28bdf38c0df3a::t_439008ab0679cc 889
+  s_c28bdf38c0df3a::t_45ea87773ca43a 897-900,914-922
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "a07c54fbc1a1f415b1833508c270d1f0070bf5e5",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
