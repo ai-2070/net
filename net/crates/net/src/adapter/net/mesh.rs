@@ -1076,6 +1076,14 @@ struct DispatchCtx {
     /// SI-2a: the owner root this node's sensing plane serves. See
     /// the matching field on `MeshNode`.
     sensing_local_root: sensing::AudienceScopeCommitment,
+    /// SI-2: whether `sensing_local_root` was EXPLICITLY supplied by
+    /// the operator (`config.sensing_owner_root.is_some()`) — the
+    /// fleet-scope deviation's opt-in. Only then does the dispatch
+    /// arm admit a pinned peer's fleet-root claim (see the
+    /// fleet-membership admission in
+    /// [`MeshNode::handle_sensing_interest_frame`]); a default-rooted
+    /// node keeps the strict entity-root rule.
+    sensing_fleet_scope: bool,
     /// SI-2a: upstream-propagation damper. See the matching field on
     /// `MeshNode`.
     sensing_upstream_damper: Arc<DashMap<(u64, [u8; 32]), std::time::Instant>>,
@@ -1545,6 +1553,15 @@ pub struct MeshNodeConfig {
     /// operator-supplied owner root no two distinct nodes could ever
     /// share a scope. Delegation proofs (scoped-capabilities
     /// follow-up, plan §4.10) subsume this knob later.
+    ///
+    /// **SI-2 extension (the multi-hop half):** setting this knob
+    /// EXPLICITLY also opts the node into the fleet-membership
+    /// admission — a TOFU-pinned session whose frames claim exactly
+    /// this root is admitted as serving it, which is what lets a
+    /// coalescing hop (whose own entity can never prove the fleet
+    /// root) re-register demand upstream. See the admission notes on
+    /// the 0x0C02 dispatch arm; default-rooted nodes keep the strict
+    /// entity-root rule.
     pub sensing_owner_root: Option<sensing::AudienceScopeCommitment>,
     /// Period between `TokenCache` expiry sweeps. A subscriber
     /// whose token expires mid-subscription is evicted from the
@@ -4491,6 +4508,21 @@ impl MeshNode {
             .map(|leader| leader.branches(key))
     }
 
+    /// Live downstream ids the sensing-leader role's OWN relay table
+    /// holds for one resolved branch — the per-consumer demand the
+    /// leader coalesces before this hop's single `Local` row (tests
+    /// + observability; `None` when the role is not installed).
+    #[cfg(feature = "redex")]
+    pub fn sensing_leader_branch_downstreams(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<Vec<sensing::DownstreamId>> {
+        self.sensing_leader
+            .lock()
+            .as_ref()
+            .map(|leader| leader.relay.table.downstreams(key, Instant::now()))
+    }
+
     /// SI-2b: the Layer-1 candidate snapshot for `capability_id`
     /// over this node's LIVE planes (plan §4.7/§4.10) — the exact
     /// rows the leader intake feeds
@@ -5778,6 +5810,7 @@ impl MeshNode {
             sensing_counters: self.sensing_counters.clone(),
             sensing_over_cap: self.sensing_over_cap.clone(),
             sensing_local_root: self.sensing_local_root,
+            sensing_fleet_scope: self.config.sensing_owner_root.is_some(),
             sensing_upstream_damper: self.sensing_upstream_damper.clone(),
             #[cfg(feature = "redex")]
             sensing_leader: self.sensing_leader.clone(),
@@ -8350,6 +8383,12 @@ impl MeshNode {
         // empty).
         let enable_sensing_coalescing = self.config.enable_sensing_coalescing;
         let sensing_interest_table = self.sensing_interest_table.clone();
+        // SI-2: the leader role's own soft state (per-consumer rows
+        // in its relay table, drained interests) expires on the same
+        // tick — an abandoned leader must converge to empty
+        // (`SensingLeader::sweep`, plan §4.1).
+        #[cfg(feature = "redex")]
+        let sensing_leader = self.sensing_leader.clone();
         let local_node_id = self.node_id;
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
@@ -8455,6 +8494,16 @@ impl MeshNode {
                         // is conservative — the next downstream
                         // refresh repairs it.
                         if enable_sensing_coalescing {
+                            // SI-2: sweep the leader role first —
+                            // expired consumer rows drop and fully
+                            // abandoned interests drain, so the
+                            // leader's coalescing state and this
+                            // hop's own Local rows (below) expire on
+                            // the same clock.
+                            #[cfg(feature = "redex")]
+                            if let Some(leader) = sensing_leader.lock().as_mut() {
+                                leader.sweep(Instant::now());
+                            }
                             let actions =
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
@@ -10279,6 +10328,22 @@ impl MeshNode {
     /// session with no pinned entity cannot prove any root, so its
     /// frames drop (the fold arm's rule).
     ///
+    /// **Fleet-membership admission (SI-2, the multi-hop half of the
+    /// `sensing_owner_root` deviation).** No per-node key can prove
+    /// operator fleet ownership — the tree has no ownership model —
+    /// so under the strict entity-root rule no relay (and no
+    /// consumer that is not itself the owner entity) could ever
+    /// re-register upstream: `A → R → next_hop(P)` would die at R's
+    /// first hop. When the operator has EXPLICITLY configured
+    /// `sensing_owner_root` (the same out-of-band ownership
+    /// assertion the receive-side deviation already trusts) and a
+    /// pinned sender's wire claim names EXACTLY that root, the
+    /// session is admitted as serving the fleet root. Bounded by the
+    /// mesh PSK + the TOFU pin; a claim of any OTHER root still
+    /// follows the strict rule (an unbacked claim stays
+    /// protocol-invalid); default-rooted nodes never admit.
+    /// Scoped-capabilities subsumes this with real delegation proofs.
+    ///
     /// Per variant:
     /// - `CapabilityRegistration` (leader-addressed): handed to the
     ///   installed [`sensing::SensingLeader`] intake. The leader role
@@ -10286,10 +10351,15 @@ impl MeshNode {
     ///   `redex`-gated — the arm itself compiles under plain `net`,
     ///   where leader-addressed frames drop (no election → no leader
     ///   role on this build; provider-leg relaying still works).
-    ///   The candidate snapshot is EMPTY in SI-2a: the
-    ///   fold/proximity resolver is SI-2b wiring, so registrations
-    ///   coalesce into leader rows but resolution yields no branches
-    ///   yet.
+    ///   The candidate snapshot is assembled from the LIVE
+    ///   fold/proximity/routing planes (SI-2b), and — SI-2's closing
+    ///   seam — each branch the leader resolves (or refreshes)
+    ///   becomes this hop's OWN `Local` row in the per-hop table,
+    ///   whose derived aggregate then propagates upstream toward
+    ///   `next_hop(provider)` exactly as
+    ///   [`MeshNode::register_sensing_interest`] does. Without that
+    ///   seam the leader's coalesced demand would never reach the
+    ///   provider direction on the wire.
     /// - `ProviderRegistration` (provider-addressed): full intake —
     ///   [`sensing::SensingInterestFrame::validate_provider_registration`]
     ///   re-derives the COMPLETE digest (counter discipline inside),
@@ -10332,15 +10402,41 @@ impl MeshNode {
             );
             return;
         };
-        let session_root = sensing::AudienceScopeCommitment::owner_root(&sender_entity);
+        // Strict v1 rule: the root the session's pinned entity
+        // proves cryptographically.
+        let entity_root = sensing::AudienceScopeCommitment::owner_root(&sender_entity);
+        // Fleet-membership admission (see the method docs): a pinned
+        // sender claiming EXACTLY the fleet root this hop was
+        // operator-configured to serve is admitted as serving it.
+        // Everything else — any other claim, or a default-rooted
+        // receiver — keeps the strict entity-derived root, so an
+        // unbacked claim still lands in `WireClaimMismatch`.
+        let claimed_scope = match &frame {
+            sensing::SensingInterestFrame::CapabilityRegistration { audience_scope, .. }
+            | sensing::SensingInterestFrame::ProviderRegistration { audience_scope, .. } => {
+                Some(*audience_scope)
+            }
+            sensing::SensingInterestFrame::Deregister { .. } => None,
+        };
+        let session_root =
+            if ctx.sensing_fleet_scope && claimed_scope == Some(ctx.sensing_local_root) {
+                ctx.sensing_local_root
+            } else {
+                entity_root
+            };
         let now = Instant::now();
 
         match &frame {
-            sensing::SensingInterestFrame::CapabilityRegistration { capability_id, .. } => {
+            sensing::SensingInterestFrame::CapabilityRegistration {
+                capability_id,
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            } => {
                 // The leader intake rides the RedEX election, so
                 // only the redex build has a leader role to feed.
                 #[cfg(not(feature = "redex"))]
-                let _ = capability_id;
+                let _ = (capability_id, requested_sample_interval, soft_state_ttl);
                 #[cfg(feature = "redex")]
                 {
                     // Slot empty: this node is not the leader — drop
@@ -10372,24 +10468,121 @@ impl MeshNode {
                         capability_id,
                     );
                     let mut slot = ctx.sensing_leader.lock();
-                    if let Some(leader) = slot.as_mut() {
-                        // Rejections carry their own counter
-                        // discipline inside `register_from_frame`;
-                        // refusal *responses* to the consumer are
-                        // later-slice wiring.
-                        if let Err(rejection) = leader.register_from_frame(
-                            &frame,
-                            from_node,
-                            &session_root,
-                            &ctx.sensing_local_root,
-                            &ctx.sensing_counters,
-                            &snapshot,
-                            now,
-                        ) {
+                    let Some(leader) = slot.as_mut() else {
+                        return;
+                    };
+                    // Rejections carry their own counter discipline
+                    // inside `register_from_frame`; refusal
+                    // *responses* to the consumer are SI-3 wiring.
+                    let registration = match leader.register_from_frame(
+                        &frame,
+                        from_node,
+                        &session_root,
+                        &ctx.sensing_local_root,
+                        &ctx.sensing_counters,
+                        &snapshot,
+                        now,
+                    ) {
+                        Ok(registration) => registration,
+                        Err(rejection) => {
                             tracing::debug!(
                                 from_node = format!("{:#x}", from_node),
                                 rejection = %rejection,
                                 "sensing: leader intake refused registration"
+                            );
+                            return;
+                        }
+                    };
+                    // SI-2 closing seam: the leader's coalesced
+                    // demand per resolved branch — the strictest D
+                    // across ALL consumers its relay table holds —
+                    // becomes this hop's OWN `Local` row, so the
+                    // per-hop table (and from it the upstream
+                    // trailing edge toward `next_hop(provider)`)
+                    // sees the leader as a first-class subscriber.
+                    // Demand thus merges at the leader BEFORE the
+                    // provider hop: N consumers → one Local row →
+                    // one upstream registration.
+                    let branch_demands: Vec<(u64, Duration)> = registration
+                        .branches
+                        .iter()
+                        .map(|provider| {
+                            let branch = sensing::ProviderInterestKey::new(
+                                registration.interest.clone(),
+                                *provider,
+                            );
+                            (
+                                *provider,
+                                leader
+                                    .relay
+                                    .table
+                                    .aggregate(&branch, now)
+                                    .unwrap_or(*requested_sample_interval),
+                            )
+                        })
+                        .collect();
+                    drop(slot);
+                    if branch_demands.is_empty() {
+                        return;
+                    }
+                    // Re-derive the spec for the upstream frames —
+                    // `register_from_frame` already validated it, so
+                    // this cannot fail (and if it somehow does, the
+                    // drop is the ordinary soft-state contract).
+                    let Ok(spec) = frame.validated_spec(&ctx.sensing_counters) else {
+                        return;
+                    };
+                    let ttl = (*soft_state_ttl).min(ctx.sensing_interest_ttl);
+                    for (provider, strictest_demand) in branch_demands {
+                        let key = sensing::ProviderInterestKey::new(
+                            registration.interest.clone(),
+                            provider,
+                        );
+                        let (outcome, aggregate) = {
+                            let mut table = ctx.sensing_interest_table.lock();
+                            let outcome = table.register(
+                                &key,
+                                sensing::DownstreamId::Local,
+                                strictest_demand,
+                                ttl,
+                                ctx.sensing_local_root,
+                                now,
+                            );
+                            (outcome, table.aggregate(&key, now))
+                        };
+                        // Anti-entropy on every admitted refresh,
+                        // min-gap damped — the exact
+                        // `register_sensing_interest` shape, so a
+                        // lost upstream frame is repaired by the
+                        // consumer's next ttl/2 refresh.
+                        if !matches!(outcome, sensing::RegisterOutcome::Registered(_))
+                            || provider == ctx.local_node_id
+                        {
+                            continue;
+                        }
+                        let Some(strictest) = aggregate else {
+                            continue;
+                        };
+                        if !sensing_upstream_damper_admits(
+                            &ctx.sensing_upstream_damper,
+                            provider,
+                            *key.interest.interest_digest.as_bytes(),
+                        ) {
+                            continue;
+                        }
+                        let upstream = sensing::SensingInterestFrame::provider_registration(
+                            &spec, provider, strictest, ttl,
+                        );
+                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                            spawn_sensing_upstream_send(
+                                &ctx.socket,
+                                &ctx.peers,
+                                &ctx.addr_to_node,
+                                &ctx.router,
+                                &ctx.partition_filter,
+                                ctx.local_node_id,
+                                provider,
+                                bytes,
                             );
                         }
                     }

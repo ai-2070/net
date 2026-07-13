@@ -5,9 +5,14 @@ COMPLETE AND ACCEPTED** (SI-1 review closed 2026-07-12, reviewer-
 verified at 3018e6520: transcript invariant test coverage confirmed,
 benchmark interpretation confirmed — "fan-out multiplies delivery
 work, not signature verification … that preserves the core economic
-claim of coalescing"). Next: SI-2 (interest table + resolver on
-real sessions) awaits its own go-ahead — SI-2+ was not implied by
-the gate sign-off.
+claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
+interest table + resolver + upstream propagation on real sessions,
+dark behind `enable_sensing_coalescing = false` (as-built note in
+§6). Next: SI-3 (origin emitter). Authorization stance, kept
+honest: the SI-1 sign-off said SI-2+ was NOT implied, so SI-2 was
+not within the review-7 authorization — SI-2+ implementation is
+proceeding under the operator's direction; the semantic gate review
+remains closed.
 0x0C02 (`SensingInterestFrame`) and 0x0C03 (`ReadinessAttestation`)
 MAY be committed. SI-1 scope: canonical codecs, signing +
 verification honoring the transcript invariant below (§4.2),
@@ -235,7 +240,11 @@ Unchanged from v3 except as noted:
   path selection (`negotiation.rs`), and the RedEX-delegating
   rendezvous + sensing-leader role (`rendezvous.rs`, `redex`
   feature), plus the real-path fallback integration test
-  (`tests/sensing_fallback.rs`).
+  (`tests/sensing_fallback.rs`). **No longer unreachable from
+  MeshNode dispatch (SI-2):** the 0x0C02 intake, per-hop table +
+  upstream propagation, and the leader's fold/proximity/routing
+  resolver run on live sessions — dark behind
+  `enable_sensing_coalescing = false` (§5; §6 SI-2 as-built).
 
 ## 3. Semantic model (defined before any wire format)
 
@@ -984,6 +993,22 @@ must exercise the real dispatch path.
   sessions; Layer-1 resolver over the real capability fold +
   proximity ranking + tag provenance; trailing-edge propagation;
   caps.
+  *SI-2 as-built (2026-07-12/13, f782263c7 + 15744857d + close-out):*
+  SI-2a: 0x0C02 intake on live dispatch (strict decode, sender root
+  from the TOFU pin, wire claims cross-checked); §5 knobs, default
+  OFF with inertness pinned; per-hop table + trailing-edge upstream
+  propagation (min-gap damped) + heartbeat expiry sweep. SI-2b:
+  candidate snapshot on the real fold/proximity/routing planes —
+  "declares Y" v1 = a tag named Y or the fold's tool-id bucket; route
+  ladder self 0 → measured edge → placeholder = 50 ms hop → BFS ×
+  50 ms → unknown 1 s. Deviation: `sensing_owner_root` (operator
+  fleet root — the tree has no ownership model; explicit config also
+  admits pinned peers claiming that root — the multi-hop leg;
+  scoped-capabilities subsumes). Close-out: leader intake → own Local
+  rows → upstream, witnessed by `tests/sensing_e2e_registration.rs`
+  (coalescing, R→H propagation, ttl drain). Bounds: sweep loosening
+  awaits refresh repair; ttl/2 = caller's loop; refusals = SI-3;
+  Groups fail closed.
 - **SI-3 — origin emitter.** Predicate compilation via the evaluator
   against the provider's current generation; cadence + edge
   emission; refusals.
