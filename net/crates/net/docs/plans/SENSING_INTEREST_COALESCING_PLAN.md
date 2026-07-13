@@ -1152,6 +1152,55 @@ must exercise the real dispatch path.
   lib tests, 7 origin-emitter e2e, all sensing suites, both clippy
   gates); the SI-4 broad hold stands until the reviewer verifies
   the closure.
+  *Closure verification (2026-07-13, independent review):* the
+  seven items, the relay anti-entropy correction, and the
+  mixed-cadence recovery are **VERIFIED**. Three boundary defects
+  block SI-4, plus two contract issues and one standing SI-2
+  finding — the SECOND (final) closure round:
+  1. **(blocker) malformed-refusal ordering**: the 0x0C03 intake
+     validated the tagged refusal floor AFTER observer-gate
+     admission and epoch mutation, so a signed-but-malformed
+     refusal (`M = 0` or `M > ttl`) consumed sequence admission and
+     could move epochs/flush floors before being dropped. Required
+     fail-closed order: decode → solicited → signature → validate
+     tagged refusal fields → observer gate → epoch transition →
+     partition/store; regression: an invalid signed refusal
+     consumes no seq and mutates no epoch.
+  2. **(blocker) short-ttl damper starvation**: the fixed 100 ms
+     upstream damper can suppress every ttl/2 refresh of a valid
+     `ttl < 100 ms` row until the upstream row expires. Fix:
+     `effective_min_gap = min(SENSING_UPSTREAM_MIN_GAP,
+     soft_state_ttl / 2)` — never an arbitrary minimum ttl — and
+     reject `soft_state_ttl == 0` at local and wire intake. Test:
+     ttl ≤ 100 ms refreshed at exactly ttl/2 keeps the upstream row
+     continuously live across several ttls.
+  3. **(blocker) tombstone epoch leak**: tombstone GC removes the
+     refusal but never re-runs provider-epoch reclamation, so
+     `provider_epochs[origin]` outlives everything; churn across
+     distinct providers grows it without bound. Fix: the sweep
+     reclaims an epoch once its provider has no observations, no
+     tombstones, and no live need; test that both maps drain.
+  4. **(fix with blockers) cross-digest epoch regression**: the
+     observer gate is per (origin, digest) but epochs are per
+     origin — a delayed old-incarnation beat on a fresh digest
+     passes its digest-local gate and moves the provider-wide epoch
+     BACKWARDS, repeatedly flushing valid floors. Epochs become
+     monotonic: advance only on greater incarnation, or equal
+     incarnation + greater generation (incarnation dominates —
+     generation restarts under a new incarnation); stale epochs
+     neither regress nor invalidate.
+  5. **(fix or document) capacity visibility**: the emitter refused
+     at capacity but the table kept the row and callers saw
+     success/silence. Fix: local registration returns an explicit
+     at-capacity error and rolls back the just-inserted Local row;
+     remote origin intake removes the newly inserted peer row and
+     stays silent (fail-closed; the next refresh retries after
+     capacity frees); no seq slot is minted for capacity.
+  6. **(standing SI-2) leader orphan cap**: `LeaderInterest` is
+     inserted before branch admission and branch outcomes are
+     ignored — a fully cap-refused interest stays outside
+     branch-table expiry forever. Close before SI-4 fan-out.
+  Gate: SI-4 broad implementation HOLD until this round lands.
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
