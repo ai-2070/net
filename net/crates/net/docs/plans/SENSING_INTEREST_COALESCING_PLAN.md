@@ -1201,6 +1201,33 @@ must exercise the real dispatch path.
      ignored — a fully cap-refused interest stays outside
      branch-table expiry forever. Close before SI-4 fan-out.
   Gate: SI-4 broad implementation HOLD until this round lands.
+  *Second closure round as-built (2026-07-14, 85328d59b):* all six
+  items landed. (1) The 0x0C03 intake validates tagged refusal
+  fields BEFORE the gate and epoch — regression proves a malformed
+  inc-7 refusal leaves the gate and the cached floor untouched.
+  (2) Damper gap = min(100 ms, soft_state_ttl/2) at every call
+  site; zero-ttl refused at local (`ZeroTtl`) and wire intake —
+  e2e: a 100 ms-ttl row refreshed at ttl/2 stays continuously live.
+  (3) Tombstone GC re-runs orphan-epoch reclamation — both maps
+  drain (new `sensing_provider_epoch_count` observability). (4)
+  Provider epochs are monotonic (lexicographic (incarnation,
+  generation), incarnation dominating); stale cross-digest beats
+  neither regress nor invalidate. (5) At-capacity registrations are
+  surfaced (`SensingRegistrationError::AtCapacity`) and rolled back
+  at BOTH intakes; remote stays silent by design (no §4.4 wire
+  semantics for capacity, no seq slot minted) — e2e fills all 1024
+  streams. (6) The leader admits an interest only while at least
+  one branch row is live (`ResolutionRefusal::AllBranchesRefused`
+  otherwise): closes the standing SI-2 orphan-cap AND re-specs the
+  foreign-only resolver behavior — a zero-candidate registration
+  now fails closed with ZERO retained state (previously the
+  branchless interest was pinned forever and refreshes never
+  re-resolved; now every ttl/2 refresh re-attempts resolution, so
+  late-announced providers are picked up naturally).
+  Verification state: locally green (133 sensing lib tests, 11
+  origin-emitter e2e, all sensing suites, 4894 full lib, both
+  clippy gates); awaiting reviewer verification to lift the SI-4
+  hold.
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
