@@ -104,9 +104,14 @@ pub struct RefusalPartition {
     /// these; their rows are removed (they may re-register with a
     /// looser D).
     pub refused: Vec<DownstreamId>,
-    /// The satisfiable aggregate to re-register upstream (exactly
-    /// once), `Deregister` if no eligible downstream remains, or
-    /// `None` for a duplicate refusal already absorbed by the cache.
+    /// The PENDING upstream transition (SI-3 closure item 2):
+    /// `Register { strictest }` = the satisfiable survivor aggregate
+    /// to re-register, returned on every refusal until a sender
+    /// consumes it ([`InterestTable::commit_advertised`] after a
+    /// successful send, or the next full-spec `register()` refresh
+    /// structurally); `Deregister` if no eligible downstream
+    /// remains; `None` when nothing changed against what upstream
+    /// was last told.
     pub upstream: UpstreamAction,
 }
 
@@ -344,15 +349,37 @@ impl InterestTable {
             entry.downstreams.remove(id);
         }
         self.release_rows(&refused);
-        // Diffing against last_advertised makes "re-register exactly
-        // once" structural: the first refusal moves the aggregate off
-        // the refused value; a duplicate refusal (in-flight crossing)
-        // removes nothing and the aggregate already matches, so no
-        // second re-registration — the refusal/retry loop cannot
-        // form.
-        let upstream = self.action_for(key, now);
+        // SI-3 closure item 2: the survivor transition is PEEKED,
+        // never consumed here. Committing `last_advertised` inside
+        // this method lost the re-registration whenever the caller
+        // could not send (the 0x0C03 intake holds no spec cache):
+        // the next refresh then diffed against the already-updated
+        // value, produced `None`, and the surviving demand stranded
+        // permanently at the provider. Now the transition stays
+        // pending until a sender consumes it — either explicitly
+        // ([`Self::commit_advertised`], the SI-4 relay sender) or
+        // structurally, when the next full-spec `register()` refresh
+        // recomputes the same `Register` action and its internal
+        // diff commits. "Exactly once" is therefore the SENDER's
+        // property: a caller that cannot send leaves the transition
+        // pending (a duplicate refusal returns it again, unsent — no
+        // retry loop forms because nothing rides an unsendable
+        // action), and a caller that sends commits.
+        let upstream = self.peek_action_for(key, now);
         self.drop_if_empty(key);
         RefusalPartition { refused, upstream }
+    }
+
+    /// SI-3 closure item 2: consume a pending upstream transition
+    /// after SUCCESSFULLY sending the re-registration the caller
+    /// derived from [`Self::on_refusal`]'s `Register { strictest }`.
+    /// Callers that cannot send (no spec cache at this hop) simply
+    /// never commit — the next downstream refresh repairs through
+    /// `register()`'s own diff, which commits structurally.
+    pub fn commit_advertised(&mut self, key: &ProviderInterestKey, strictest: Duration) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_advertised = Some(strictest);
+        }
     }
 
     /// Provider incarnation OR generation change: the floor may have
@@ -429,7 +456,23 @@ impl InterestTable {
     /// Diff the recomputed live aggregate against what upstream was
     /// last told, record the new value, and report the delta.
     fn action_for(&mut self, key: &ProviderInterestKey, now: Instant) -> UpstreamAction {
-        let Some(entry) = self.entries.get_mut(key) else {
+        let action = self.peek_action_for(key, now);
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_advertised = entry
+                .downstreams
+                .values()
+                .filter(|row| row.expires_at > now)
+                .map(|row| row.requested_sample_interval)
+                .min();
+        }
+        action
+    }
+
+    /// [`Self::action_for`] without consuming the transition —
+    /// `last_advertised` is left for the eventual sender (SI-3
+    /// closure item 2; see [`Self::on_refusal`]).
+    fn peek_action_for(&self, key: &ProviderInterestKey, now: Instant) -> UpstreamAction {
+        let Some(entry) = self.entries.get(key) else {
             return UpstreamAction::None;
         };
         let live = entry
@@ -438,15 +481,13 @@ impl InterestTable {
             .filter(|row| row.expires_at > now)
             .map(|row| row.requested_sample_interval)
             .min();
-        let action = match (entry.last_advertised, live) {
+        match (entry.last_advertised, live) {
             (Some(_), None) => UpstreamAction::Deregister,
             (previous, Some(strictest)) if previous != live => {
                 UpstreamAction::Register { strictest }
             }
             _ => UpstreamAction::None,
-        };
-        entry.last_advertised = live;
-        action
+        }
     }
 
     fn release_rows(&mut self, downstreams: &[DownstreamId]) {
@@ -568,12 +609,13 @@ mod tests {
     }
 
     #[test]
-    fn refusal_partitions_downstreams_and_reregisters_exactly_once() {
-        // SI-0 test 15 (table half): A@20ms + C@100ms coalesce to
-        // 20ms; the provider floor is 50ms. The refusal hits exactly
-        // A; C's satisfiable aggregate re-registers exactly once; the
-        // cached floor absorbs the duplicate refusal and refuses a
-        // 30ms late joiner locally.
+    fn refusal_partitions_downstreams_and_the_sender_commits_the_transition() {
+        // SI-0 test 15 (table half), re-specced by SI-3 closure
+        // item 2: A@20ms + C@100ms coalesce to 20ms; the provider
+        // floor is 50ms. The refusal hits exactly A; C's satisfiable
+        // aggregate is returned as a PENDING transition on every
+        // refusal until a sender consumes it — "exactly once" is the
+        // sender's property, not the partition's.
         let now = Instant::now();
         let mut table = InterestTable::new(512);
         let a = DownstreamId::Peer(1);
@@ -589,11 +631,24 @@ mod tests {
             UpstreamAction::Register { strictest: ms(100) },
         );
 
-        // Duplicate refusal (in-flight crossing): absorbed by the
-        // cache — no second re-registration, no retry loop.
+        // A duplicate refusal (in-flight crossing) BEFORE any send
+        // returns the still-pending transition — a caller that
+        // cannot send must not lose it (closure item 2's stranding
+        // bug); nothing loops because nothing rides an unsent
+        // action.
         let duplicate = table.on_refusal(&key(), ms(50), now);
         assert_eq!(duplicate.refused, Vec::new());
-        assert_eq!(duplicate.upstream, UpstreamAction::None);
+        assert_eq!(
+            duplicate.upstream,
+            UpstreamAction::Register { strictest: ms(100) },
+        );
+
+        // The sender commits after a successful send: a further
+        // duplicate is now fully absorbed.
+        table.commit_advertised(&key(), ms(100));
+        let absorbed = table.on_refusal(&key(), ms(50), now);
+        assert_eq!(absorbed.refused, Vec::new());
+        assert_eq!(absorbed.upstream, UpstreamAction::None);
 
         // Late joiner below the cached floor: refused locally, no
         // upstream traffic, survivor untouched.
@@ -609,6 +664,45 @@ mod tests {
         assert_eq!(
             table.register(&key(), DownstreamId::Peer(4), ms(60), TTL, root(0xAA), now),
             RegisterOutcome::Registered(UpstreamAction::Register { strictest: ms(60) }),
+        );
+    }
+
+    #[test]
+    fn unsent_refusal_transition_repairs_through_the_next_refresh() {
+        // SI-3 closure item 2, the hop with NO spec cache (the
+        // 0x0C03 intake): it partitions but cannot send, so the
+        // transition stays pending and the survivor's next ttl/2
+        // refresh — which carries the full spec — recomputes the
+        // SAME Register action through `register()` and commits it.
+        // Before the fix, `on_refusal` had already consumed the
+        // transition and the refresh produced `None`, stranding the
+        // surviving demand permanently.
+        let now = Instant::now();
+        let mut table = InterestTable::new(512);
+        let sub_floor = DownstreamId::Peer(1);
+        let survivor = DownstreamId::Peer(2);
+        table.register(&key(), sub_floor, ms(10), TTL, root(0xAA), now);
+        table.register(&key(), survivor, ms(100), TTL, root(0xAA), now);
+
+        let partition = table.on_refusal(&key(), ms(50), now);
+        assert_eq!(partition.refused, vec![sub_floor]);
+        assert_eq!(
+            partition.upstream,
+            UpstreamAction::Register { strictest: ms(100) },
+        );
+        // …the intake ignores the action (nothing to send) …
+
+        // … and the survivor's refresh produces the send.
+        assert_eq!(
+            table.register(&key(), survivor, ms(100), TTL, root(0xAA), now),
+            RegisterOutcome::Registered(UpstreamAction::Register { strictest: ms(100) }),
+            "the refresh recovers the stranded survivor aggregate",
+        );
+
+        // The refresh committed: the next refresh is quiet again.
+        assert_eq!(
+            table.register(&key(), survivor, ms(100), TTL, root(0xAA), now),
+            RegisterOutcome::Registered(UpstreamAction::None),
         );
     }
 
