@@ -41,6 +41,9 @@
 pub mod continuity;
 pub mod controller;
 pub mod delivery;
+// SI-3: the origin-side emission scheduler — pure and crypto-free;
+// the mesh signs what it produces.
+pub mod emitter;
 pub mod evaluator;
 pub mod frames;
 pub mod identity;
@@ -80,6 +83,8 @@ pub use controller::{
 };
 
 pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};
+
+pub use emitter::{OriginEmitter, MAX_STREAM_SLOTS, STREAM_SLOTS_LOW_WATER};
 
 pub use snapshot::{
     build_candidate_snapshot, declares_capability, extract_declarers, proximity_route_estimate,
