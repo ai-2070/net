@@ -84,7 +84,10 @@ pub use controller::{
 
 pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};
 
-pub use emitter::{OriginEmitter, MAX_STREAM_SLOTS, STREAM_SLOTS_LOW_WATER};
+pub use emitter::{
+    DueBeat, OriginEmitter, StreamRefusal, MAX_LIVE_SENSING_STREAMS, MAX_STREAM_SLOTS,
+    STREAM_SLOTS_LOW_WATER,
+};
 
 pub use snapshot::{
     build_candidate_snapshot, declares_capability, extract_declarers, proximity_route_estimate,

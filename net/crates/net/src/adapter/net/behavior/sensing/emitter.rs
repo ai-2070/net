@@ -1,5 +1,9 @@
 //! SI-3 origin emitter (plan §4.4): the provider-side scheduler for
-//! signed readiness streams.
+//! signed readiness streams. Hardened by the SI-3 review closure
+//! packet (§6 review disposition): live-stream capacity, bounded
+//! duration arithmetic, a two-phase due/finalize API that keeps
+//! user evaluators OUTSIDE the emitter lock, and stamped retirement
+//! that closes the register/retire race.
 //!
 //! The origin compiles each distinct interest ONCE (the validated
 //! constraints and envelope are cloned into the stream slot at
@@ -18,6 +22,36 @@
 //! number on a (never-observed) signing failure is harmless: seq
 //! gaps carry no meaning beyond strictly-newer admission (§4.4).
 //!
+//! # Two-phase emission (closure item 5)
+//!
+//! `ReadinessEvaluator::evaluate` is arbitrary user code and may
+//! legitimately call back into `MeshNode` (a notify hook, stream
+//! introspection) — running it under the emitter mutex would
+//! deadlock a non-reentrant lock. The API is therefore split:
+//!
+//! 1. **Under the lock**: [`OriginEmitter::collect_due`] reserves
+//!    the sequence number, re-arms the schedule, and snapshots the
+//!    compiled predicate into a [`DueBeat`] (the predicate rides an
+//!    `Arc`, so the snapshot is cheap).
+//! 2. **Without the lock**: the caller runs the evaluator against
+//!    [`DueBeat::request`].
+//! 3. No re-lock is needed to finalize: everything the §4.2
+//!    transcript binds was reserved in step 1, so
+//!    [`DueBeat::into_unsigned`] is a pure function. A beat whose
+//!    stream was retired between the phases is harmless — its
+//!    downstream set reads empty and the caller drops it.
+//!
+//! # Capacity (closure item 1)
+//!
+//! Live streams are capped at [`MAX_LIVE_SENSING_STREAMS`] (1024) —
+//! sized so worst-case signing at the 50 ms floor stays well under
+//! one core (SI-1d: ~13.3 µs/sign → ~27% of a core at cap). At
+//! capacity: refreshes of live digests are accepted, new or
+//! resurrected digests are refused ([`StreamRefusal::AtCapacity`]),
+//! no live stream is ever evicted, and a capacity refusal mints NO
+//! sequence slot. The 8192-slot LRU below is SEQUENCE-memory
+//! capacity, not live capacity.
+//!
 //! # Sequence memory outlives the stream
 //!
 //! Seqs are per `(origin, origin_incarnation, interest_digest)`
@@ -34,6 +68,17 @@
 //! evicted restarts at seq 0 and is contained at the observer gate
 //! as an ordinary rollback (stale drops, never a flap).
 //!
+//! # Stamped retirement (closure item 7)
+//!
+//! Retirement decisions are made from TABLE state read outside this
+//! lock, so a registration can land between that read and the
+//! retire call and be killed despite holding a live row (dark until
+//! the next refresh). Every successful [`OriginEmitter::register`]
+//! stamps the stream from the emitter's monotonic counter; callers
+//! snapshot [`OriginEmitter::stamp`] BEFORE reading the table and
+//! retire with [`OriginEmitter::retire_if_stale`], which refuses to
+//! kill a stream registered after the snapshot.
+//!
 //! # Cadence refusal (one-shot, rides the attestation plane)
 //!
 //! A coalesced strictest D below the floor is refused
@@ -41,18 +86,30 @@
 //! (`InterestTable::on_refusal`) and sends the refused ones ONE
 //! signed refusal beat ([`OriginEmitter::refusal_beat`]): status
 //! `ProviderUnknown` / `SamplingIntervalUnsupported`, with the
-//! provider floor M carried in `promised_cadence` — the one field
-//! that already means "the cadence this provider will serve", so the
-//! §4.4 `sampling_interval_unsupported { minimum_supported: M }`
-//! payload rides the frozen §4.2 wire object without a wire break.
-//! Refusal beats draw from the same seq slot as the stream, so the
-//! two can never collide on `(incarnation, seq)`.
+//! provider floor M carried in `promised_cadence` — a TAGGED
+//! interpretation (SI-3 review): under that `status_reason`, the
+//! signed field means `minimum_supported`. Refusal beats draw from
+//! the same seq slot as the stream, so the two can never collide on
+//! `(incarnation, seq)`; a slot is minted only when a response is
+//! actually authored (a capacity refusal sends nothing and mints
+//! nothing).
+//!
+//! # Bounded time arithmetic (closure item 4)
+//!
+//! The mesh bounds wire intervals at intake
+//! (`0 < D ≤ sensing_interest_ttl`), but this module never trusts
+//! that: all scheduling uses [`schedule_after`] (checked add,
+//! far-future park on overflow) and a zero cadence floor is
+//! normalized to the default at construction, so no cadence value —
+//! however malformed — can panic or hot-loop the emitter task.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::evaluator::{
     check_cadence, project_evaluation, CadenceRefusal, EvaluationRequest, ReadinessEvaluation,
+    DEFAULT_ATTESTATION_CADENCE_FLOOR,
 };
 use super::identity::{
     AudienceScopeCommitment, CanonicalConstraints, CapabilityId, CapabilityInterestKey, Digest256,
@@ -60,6 +117,15 @@ use super::identity::{
 };
 use super::incarnation::Incarnation;
 use super::wire::UnsignedAttestation;
+
+/// Hard cap on concurrently LIVE emission streams (closure item 1).
+/// Sized from the SI-1d benchmark: 1024 streams all at the 50 ms
+/// floor cost ~27% of one core in signatures — the origin role stays
+/// a background workload under worst-case demand. Honest working
+/// sets are far smaller (identical specs coalesce into one digest);
+/// a node near this cap almost certainly has a consumer defeating
+/// coalescing, and refusing surfaces that.
+pub const MAX_LIVE_SENSING_STREAMS: usize = 1024;
 
 /// Bound on the seq-slot map (live + retired), mirroring the
 /// observer gate's bound (SI-1c): comfortably above any honest
@@ -72,16 +138,53 @@ pub const MAX_STREAM_SLOTS: usize = 8192;
 /// re-trigger the sweep on every insert.
 pub const STREAM_SLOTS_LOW_WATER: usize = 6144;
 
-/// One interest's compiled evaluation inputs + live schedule.
+/// Overflow park (closure item 4): a schedule whose checked add
+/// overflows re-arms this far out instead — effectively "never",
+/// without panicking and without an immediately-due hot loop.
+const OVERFLOW_PARK: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// `base + delta` that can neither panic nor hot-loop: overflow
+/// parks the schedule [`OVERFLOW_PARK`] out (and in the
+/// never-observed case where even that overflows, falls back to
+/// `base` — a bounded extra beat, not a crash).
+fn schedule_after(base: Instant, delta: Duration) -> Instant {
+    base.checked_add(delta)
+        .or_else(|| base.checked_add(OVERFLOW_PARK))
+        .unwrap_or(base)
+}
+
+/// Why [`OriginEmitter::register`] refused a stream (closure
+/// item 1 split the refusal space).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamRefusal {
+    /// The coalesced strictest D is below the provider floor —
+    /// answer with [`OriginEmitter::refusal_beat`] after
+    /// partitioning (§4.4).
+    Cadence(CadenceRefusal),
+    /// [`MAX_LIVE_SENSING_STREAMS`] live streams already exist and
+    /// this digest is not one of them. No slot was minted, nothing
+    /// was evicted; the refusal is local (log/observe) — there is no
+    /// §4.4 wire response for capacity.
+    AtCapacity,
+}
+
+/// The compiled evaluation inputs of one interest — parsed once at
+/// registration, shared into each [`DueBeat`] by `Arc` so the
+/// two-phase split never re-clones the constraint map per beat.
+#[derive(Debug)]
+struct CompiledPredicate {
+    capability_id: CapabilityId,
+    constraints: CanonicalConstraints,
+    work_latency: WorkLatencyEnvelope,
+}
+
+/// One interest's live schedule.
 #[derive(Debug)]
 struct LiveStream {
     /// Table/index identity of the stream (digest + capability id).
     key: CapabilityInterestKey,
-    /// Compiled work characteristics C (validated at intake, cloned
-    /// once — never re-parsed on refresh).
-    constraints: CanonicalConstraints,
-    /// Latency envelope L.
-    work_latency: WorkLatencyEnvelope,
+    /// Compiled predicate (module docs — compile once per digest).
+    predicate: Arc<CompiledPredicate>,
     /// The audience the interest was validated under — signed into
     /// every beat so a proof can never be re-homed (§4.2).
     audience: AudienceScopeCommitment,
@@ -92,6 +195,10 @@ struct LiveStream {
     due_at: Instant,
     /// Last emission instant — the edge min-gap reference.
     last_emitted_at: Option<Instant>,
+    /// Monotonic stamp of the most recent (re-)registration —
+    /// [`OriginEmitter::retire_if_stale`] refuses to kill a stream
+    /// registered after the caller's snapshot (closure item 7).
+    registered_stamp: u64,
 }
 
 /// One digest's slot: the seq counter (which outlives the stream —
@@ -106,6 +213,75 @@ struct StreamSlot {
     live: Option<LiveStream>,
 }
 
+/// One reserved-but-unevaluated beat (two-phase emission, module
+/// docs): everything the §4.2 transcript binds except the
+/// evaluation outcome, snapshotted under the emitter lock. Run the
+/// evaluator against [`Self::request`] WITHOUT the lock, then seal
+/// with [`Self::into_unsigned`] — a pure function.
+#[derive(Debug)]
+pub struct DueBeat {
+    key: CapabilityInterestKey,
+    predicate: Arc<CompiledPredicate>,
+    audience: AudienceScopeCommitment,
+    origin: u64,
+    incarnation: Incarnation,
+    generation: u64,
+    seq: u64,
+    promised_cadence: Duration,
+    /// The collect-phase stamp — pass to
+    /// [`OriginEmitter::retire_if_stale`] when this beat's
+    /// downstream set reads empty.
+    stamp: u64,
+}
+
+impl DueBeat {
+    /// The stream identity this beat answers.
+    pub fn key(&self) -> &CapabilityInterestKey {
+        &self.key
+    }
+
+    /// The collect-phase stamp (module docs, stamped retirement).
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// The evaluation inputs — run the integration against this
+    /// OUTSIDE the emitter lock.
+    pub fn request(&self) -> EvaluationRequest<'_> {
+        EvaluationRequest {
+            capability_id: &self.predicate.capability_id,
+            constraints: &self.predicate.constraints,
+            work_latency: &self.predicate.work_latency,
+        }
+    }
+
+    /// Seal the beat with the evaluation outcome. `None` (no
+    /// evaluator registered for the capability) projects as
+    /// `ProviderUnknown { TemporarilyUnevaluable }` — an explicit
+    /// "targeted but cannot answer" stream beats silence.
+    pub fn into_unsigned(self, evaluation: Option<ReadinessEvaluation>) -> UnsignedAttestation {
+        let evaluation = evaluation.unwrap_or(ReadinessEvaluation::TemporarilyUnevaluable);
+        let (status, status_reason) = project_evaluation(&evaluation);
+        let estimated_start = match evaluation {
+            ReadinessEvaluation::Ready { estimated_start } => estimated_start,
+            _ => None,
+        };
+        UnsignedAttestation {
+            interest_digest: self.key.interest_digest,
+            origin: self.origin,
+            origin_incarnation: self.incarnation,
+            capability_id: self.key.capability_id,
+            capability_generation: self.generation,
+            status,
+            status_reason,
+            estimated_start,
+            seq: self.seq,
+            promised_cadence: self.promised_cadence,
+            audience_scope: self.audience,
+        }
+    }
+}
+
 /// The origin's emission scheduler (module docs). One per node;
 /// single-writer by construction (the mesh serializes access), which
 /// is what makes "never two payloads on one `(incarnation, seq)`"
@@ -116,26 +292,41 @@ pub struct OriginEmitter {
     origin: u64,
     /// The §4.6 boot epoch every beat is scoped to (caller derives
     /// it via `next_incarnation` over real persistence,
-    /// increment-before-participation).
+    /// increment-before-participation — TRUSTED caller input, per
+    /// the accepted deviation).
     incarnation: Incarnation,
     /// `attestation_cadence_floor` (plan §5): cadence lower bound
-    /// AND the status-edge min-gap.
+    /// AND the status-edge min-gap. Normalized non-zero at
+    /// construction (closure item 4).
     cadence_floor: Duration,
     /// Seq slots by interest digest — live streams + retired seq
     /// memory, LRU-bounded (module docs).
     slots: HashMap<Digest256, StreamSlot>,
-    /// Monotonic LRU stamp source.
+    /// Live-stream count, maintained on every live transition so
+    /// the capacity check is O(1) (closure item 1).
+    live_count: usize,
+    /// Monotonic LRU/registration stamp source.
     touch_counter: u64,
 }
 
 impl OriginEmitter {
-    /// New emitter for one `(origin, incarnation)` scope.
+    /// New emitter for one `(origin, incarnation)` scope. A zero
+    /// `cadence_floor` is normalized to
+    /// [`DEFAULT_ATTESTATION_CADENCE_FLOOR`] — a zero floor would
+    /// admit a zero cadence and hot-loop the emitter task (closure
+    /// item 4).
     pub fn new(origin: u64, incarnation: Incarnation, cadence_floor: Duration) -> Self {
+        let cadence_floor = if cadence_floor.is_zero() {
+            DEFAULT_ATTESTATION_CADENCE_FLOOR
+        } else {
+            cadence_floor
+        };
         Self {
             origin,
             incarnation,
             cadence_floor,
             slots: HashMap::new(),
+            live_count: 0,
             touch_counter: 0,
         }
     }
@@ -145,26 +336,43 @@ impl OriginEmitter {
         self.touch_counter
     }
 
+    /// The current registration stamp. Snapshot this BEFORE reading
+    /// table state that a retirement decision will rest on, then
+    /// retire with [`Self::retire_if_stale`] (closure item 7).
+    pub fn stamp(&self) -> u64 {
+        self.touch_counter
+    }
+
     /// Register (or refresh) one interest stream at the caller's
     /// current strictest aggregate D.
     ///
-    /// - A strictest D below the floor is refused — the stream state
-    ///   is left untouched; the caller partitions its downstreams
-    ///   and answers the refused ones with [`Self::refusal_beat`].
-    /// - First registration schedules the first beat at `now` (a new
-    ///   stream answers promptly); a refresh only moves the schedule
-    ///   when the CADENCE moved (a ttl/2 refresh must never starve
-    ///   the cadence by pushing `due_at` forever forward).
+    /// - A strictest D below the floor is refused
+    ///   ([`StreamRefusal::Cadence`]) — stream state untouched; the
+    ///   caller partitions and answers with [`Self::refusal_beat`].
+    /// - At [`MAX_LIVE_SENSING_STREAMS`], a digest that is not
+    ///   already live is refused ([`StreamRefusal::AtCapacity`])
+    ///   without minting a slot; live refreshes always succeed.
+    /// - First registration schedules the first beat at `now`; a
+    ///   refresh only moves the schedule when the CADENCE moved (a
+    ///   ttl/2 refresh must never starve the cadence by pushing
+    ///   `due_at` forever forward).
     pub fn register(
         &mut self,
         spec: &InterestSpec,
         strictest: Duration,
         now: Instant,
-    ) -> Result<(), CadenceRefusal> {
-        check_cadence(strictest, self.cadence_floor)?;
+    ) -> Result<(), StreamRefusal> {
+        check_cadence(strictest, self.cadence_floor).map_err(StreamRefusal::Cadence)?;
         let promised_cadence = (strictest / 2).max(self.cadence_floor);
         let key = CapabilityInterestKey::for_spec(spec);
         let digest = key.interest_digest;
+        let already_live = self
+            .slots
+            .get(&digest)
+            .is_some_and(|slot| slot.live.is_some());
+        if !already_live && self.live_count >= MAX_LIVE_SENSING_STREAMS {
+            return Err(StreamRefusal::AtCapacity);
+        }
         let stamp = self.touch();
         let slot = self.slots.entry(digest).or_insert(StreamSlot {
             next_seq: 0,
@@ -174,6 +382,7 @@ impl OriginEmitter {
         slot.touched = stamp;
         match &mut slot.live {
             Some(stream) => {
+                stream.registered_stamp = stamp;
                 if stream.promised_cadence != promised_cadence {
                     stream.promised_cadence = promised_cadence;
                     // Re-derive the schedule from the last beat under
@@ -181,7 +390,7 @@ impl OriginEmitter {
                     // the next beat earlier, a loosened one pushes it
                     // out; either way the min-gap (floor) holds.
                     stream.due_at = match stream.last_emitted_at {
-                        Some(last) => (last + promised_cadence).max(now),
+                        Some(last) => schedule_after(last, promised_cadence).max(now),
                         None => now,
                     };
                 }
@@ -189,13 +398,18 @@ impl OriginEmitter {
             None => {
                 slot.live = Some(LiveStream {
                     key,
-                    constraints: spec.constraints.clone(),
-                    work_latency: spec.work_latency,
+                    predicate: Arc::new(CompiledPredicate {
+                        capability_id: spec.capability_id.clone(),
+                        constraints: spec.constraints.clone(),
+                        work_latency: spec.work_latency,
+                    }),
                     audience: spec.audience,
                     promised_cadence,
                     due_at: now,
                     last_emitted_at: None,
+                    registered_stamp: stamp,
                 });
+                self.live_count += 1;
             }
         }
         self.evict_retired();
@@ -204,11 +418,36 @@ impl OriginEmitter {
 
     /// The stream's last downstream died (deregister, ttl sweep, or
     /// refusal partition) — stop emitting, keep the seq memory
-    /// (module docs). Idempotent.
+    /// (module docs). Idempotent. Prefer [`Self::retire_if_stale`]
+    /// whenever the decision rests on table state read outside the
+    /// emitter lock.
     pub fn retire(&mut self, digest: &Digest256) {
         if let Some(slot) = self.slots.get_mut(digest) {
-            slot.live = None;
+            if slot.live.take().is_some() {
+                self.live_count -= 1;
+            }
         }
+    }
+
+    /// Retire ONLY if the stream has not been (re-)registered since
+    /// the caller's [`Self::stamp`] snapshot — the register/retire
+    /// race closure (module docs, item 7). Returns whether the
+    /// stream was retired.
+    pub fn retire_if_stale(&mut self, digest: &Digest256, seen_stamp: u64) -> bool {
+        let Some(slot) = self.slots.get_mut(digest) else {
+            return false;
+        };
+        let Some(stream) = &slot.live else {
+            return false;
+        };
+        if stream.registered_stamp > seen_stamp {
+            // A registration landed after the caller observed the
+            // table — the emptiness it acted on is stale.
+            return false;
+        }
+        slot.live = None;
+        self.live_count -= 1;
+        true
     }
 
     /// A local state change on `capability_id` (the integration's
@@ -232,7 +471,7 @@ impl OriginEmitter {
                 continue;
             }
             let earliest = match stream.last_emitted_at {
-                Some(last) => (last + floor).max(now),
+                Some(last) => schedule_after(last, floor).max(now),
                 None => now,
             };
             if earliest < stream.due_at {
@@ -252,71 +491,49 @@ impl OriginEmitter {
             .min()
     }
 
-    /// Evaluate and produce every due beat.
-    ///
+    /// Phase 1 of two-phase emission (module docs): reserve and
+    /// re-arm every due stream under the lock, WITHOUT evaluating.
     /// `generation` is the provider's OWN announce generation at
-    /// this instant — attested content, read at evaluation time
-    /// (§3.4). `evaluate` resolves the integration for the request's
-    /// capability and runs it; `None` (no evaluator registered)
-    /// projects as `ProviderUnknown { TemporarilyUnevaluable }` — an
-    /// explicit "I am targeted but cannot answer" stream beats
-    /// silence, and it only costs while interests are live.
-    pub fn tick(
-        &mut self,
-        now: Instant,
-        generation: u64,
-        mut evaluate: impl FnMut(&EvaluationRequest<'_>) -> Option<ReadinessEvaluation>,
-    ) -> Vec<(CapabilityInterestKey, UnsignedAttestation)> {
-        let mut beats = Vec::new();
+    /// this instant — attested content, read at collection time
+    /// (§3.4). Evaluate each returned beat via [`DueBeat::request`]
+    /// outside the lock, then seal with [`DueBeat::into_unsigned`].
+    pub fn collect_due(&mut self, now: Instant, generation: u64) -> Vec<DueBeat> {
+        let mut due = Vec::new();
         let stamp = self.touch();
-        for (digest, slot) in &mut self.slots {
+        for slot in self.slots.values_mut() {
             let Some(stream) = &mut slot.live else {
                 continue;
             };
             if stream.due_at > now {
                 continue;
             }
-            let request = EvaluationRequest {
-                capability_id: &stream.key.capability_id,
-                constraints: &stream.constraints,
-                work_latency: &stream.work_latency,
-            };
-            let evaluation =
-                evaluate(&request).unwrap_or(ReadinessEvaluation::TemporarilyUnevaluable);
-            let (status, status_reason) = project_evaluation(&evaluation);
-            let estimated_start = match evaluation {
-                ReadinessEvaluation::Ready { estimated_start } => estimated_start,
-                _ => None,
-            };
             let seq = slot.next_seq;
             slot.next_seq += 1;
             slot.touched = stamp;
             stream.last_emitted_at = Some(now);
-            stream.due_at = now + stream.promised_cadence;
-            beats.push((
-                stream.key.clone(),
-                UnsignedAttestation {
-                    interest_digest: *digest,
-                    origin: self.origin,
-                    origin_incarnation: self.incarnation,
-                    capability_id: stream.key.capability_id.clone(),
-                    capability_generation: generation,
-                    status,
-                    status_reason,
-                    estimated_start,
-                    seq,
-                    promised_cadence: stream.promised_cadence,
-                    audience_scope: stream.audience,
-                },
-            ));
+            stream.due_at = schedule_after(now, stream.promised_cadence);
+            due.push(DueBeat {
+                key: stream.key.clone(),
+                predicate: stream.predicate.clone(),
+                audience: stream.audience,
+                origin: self.origin,
+                incarnation: self.incarnation,
+                generation,
+                seq,
+                promised_cadence: stream.promised_cadence,
+                stamp,
+            });
         }
-        beats
+        due
     }
 
     /// One signed refusal beat for a below-floor registration
     /// (module docs): `ProviderUnknown` /
     /// `SamplingIntervalUnsupported`, the floor M in
-    /// `promised_cadence`, seq drawn from the digest's shared slot.
+    /// `promised_cadence` (tagged interpretation), seq drawn from
+    /// the digest's shared slot. Mints a slot only because a
+    /// response IS being authored — capacity refusals never call
+    /// this.
     pub fn refusal_beat(
         &mut self,
         spec: &InterestSpec,
@@ -373,10 +590,7 @@ impl OriginEmitter {
 
     /// Live stream count (tests + observability).
     pub fn live_streams(&self) -> usize {
-        self.slots
-            .values()
-            .filter(|slot| slot.live.is_some())
-            .count()
+        self.live_count
     }
 
     /// Total slot count including retired seq memory (tests +
@@ -399,13 +613,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::continuity::AttestedStatus;
-    use super::super::evaluator::{
-        ReadinessEvaluation, StatusReason, DEFAULT_ATTESTATION_CADENCE_FLOOR,
-    };
-    use super::super::identity::{
-        AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DisclosureClass, InterestSpec,
-        ProviderSelector, ResultMode, WorkLatencyEnvelope,
-    };
+    use super::super::evaluator::StatusReason;
+    use super::super::identity::{DisclosureClass, ProviderSelector, ResultMode};
     use super::*;
 
     const FLOOR: Duration = DEFAULT_ATTESTATION_CADENCE_FLOOR;
@@ -422,12 +631,24 @@ mod tests {
         }
     }
 
-    fn ready() -> impl FnMut(&EvaluationRequest<'_>) -> Option<ReadinessEvaluation> {
-        |_request| {
-            Some(ReadinessEvaluation::Ready {
-                estimated_start: Some(Duration::from_millis(3)),
-            })
-        }
+    fn ready() -> Option<ReadinessEvaluation> {
+        Some(ReadinessEvaluation::Ready {
+            estimated_start: Some(Duration::from_millis(3)),
+        })
+    }
+
+    /// Collect + seal in one step for tests that don't exercise the
+    /// two-phase split itself.
+    fn beats(
+        emitter: &mut OriginEmitter,
+        now: Instant,
+        generation: u64,
+    ) -> Vec<(CapabilityInterestKey, UnsignedAttestation)> {
+        emitter
+            .collect_due(now, generation)
+            .into_iter()
+            .map(|beat| (beat.key().clone(), beat.into_unsigned(ready())))
+            .collect()
     }
 
     #[test]
@@ -441,9 +662,9 @@ mod tests {
             .unwrap();
         assert_eq!(emitter.next_due(), Some(t0));
 
-        let beats = emitter.tick(t0, 5, ready());
-        assert_eq!(beats.len(), 1);
-        let (key, beat) = &beats[0];
+        let out = beats(&mut emitter, t0, 5);
+        assert_eq!(out.len(), 1);
+        let (key, beat) = &out[0];
         assert_eq!(key.interest_digest, spec.interest_digest());
         assert_eq!(beat.seq, 0);
         assert_eq!(beat.capability_generation, 5);
@@ -452,14 +673,45 @@ mod tests {
         assert_eq!(beat.origin, 11);
 
         // Not due again until t0 + cadence; generation is read at
-        // evaluation time, not registration time.
-        assert!(emitter
-            .tick(t0 + Duration::from_millis(99), 6, ready())
-            .is_empty());
-        let beats = emitter.tick(t0 + Duration::from_millis(100), 6, ready());
-        assert_eq!(beats.len(), 1);
-        assert_eq!(beats[0].1.seq, 1);
-        assert_eq!(beats[0].1.capability_generation, 6);
+        // collection time, not registration time.
+        assert!(beats(&mut emitter, t0 + Duration::from_millis(99), 6).is_empty());
+        let out = beats(&mut emitter, t0 + Duration::from_millis(100), 6);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.seq, 1);
+        assert_eq!(out[0].1.capability_generation, 6);
+    }
+
+    #[test]
+    fn two_phase_split_reserves_under_lock_and_seals_pure() {
+        let t0 = Instant::now();
+        let mut emitter = OriginEmitter::new(11, Incarnation::new(2), FLOOR);
+        let spec = spec("job.run", "a");
+        emitter
+            .register(&spec, Duration::from_millis(200), t0)
+            .unwrap();
+
+        // Phase 1 already reserved seq + re-armed the schedule …
+        let due = emitter.collect_due(t0, 9);
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            emitter.next_due(),
+            Some(t0 + Duration::from_millis(100)),
+            "schedule re-armed before evaluation",
+        );
+        assert!(
+            emitter.collect_due(t0, 9).is_empty(),
+            "seq/schedule reserved exactly once",
+        );
+
+        // … so sealing needs no emitter access at all, and the
+        // request borrows only the beat.
+        let beat = due.into_iter().next().unwrap();
+        assert_eq!(beat.request().capability_id.as_str(), "job.run");
+        let unsigned = beat.into_unsigned(None);
+        assert_eq!(unsigned.status, AttestedStatus::ProviderUnknown);
+        assert_eq!(unsigned.status_reason, StatusReason::TemporarilyUnevaluable);
+        assert_eq!(unsigned.seq, 0);
+        assert_eq!(unsigned.origin_incarnation, Incarnation::new(2));
     }
 
     #[test]
@@ -474,7 +726,7 @@ mod tests {
             emitter.stream_cadence(&spec.interest_digest()),
             Some(Duration::from_millis(200)),
         );
-        let _ = emitter.tick(t0, 1, ready());
+        let _ = beats(&mut emitter, t0, 1);
         assert_eq!(emitter.next_due(), Some(t0 + Duration::from_millis(200)));
 
         // Same-aggregate refresh (the ttl/2 keep-alive): schedule
@@ -518,7 +770,7 @@ mod tests {
         emitter
             .register(&spec, Duration::from_millis(400), t0)
             .unwrap();
-        let _ = emitter.tick(t0, 1, ready());
+        let _ = beats(&mut emitter, t0, 1);
 
         // Edge right after a beat: clamped to last + floor.
         assert!(emitter.poke(
@@ -529,7 +781,7 @@ mod tests {
 
         // Edge long after the last beat: immediate.
         let late = t0 + Duration::from_millis(150);
-        let _ = emitter.tick(t0 + FLOOR, 1, ready());
+        let _ = beats(&mut emitter, t0 + FLOOR, 1);
         assert!(emitter.poke(&CapabilityId::new("job.run"), late));
         assert_eq!(emitter.next_due(), Some(late));
 
@@ -544,9 +796,12 @@ mod tests {
         let spec = spec("job.run", "a");
 
         // Below-floor registration refused, stream stays dark.
-        let refusal = emitter
+        let refused = emitter
             .register(&spec, Duration::from_millis(10), t0)
             .unwrap_err();
+        let StreamRefusal::Cadence(refusal) = refused else {
+            panic!("expected a cadence refusal, got {refused:?}");
+        };
         assert_eq!(refusal.minimum_supported, FLOOR);
         assert_eq!(emitter.live_streams(), 0);
 
@@ -565,9 +820,9 @@ mod tests {
         emitter
             .register(&spec, Duration::from_millis(200), t0)
             .unwrap();
-        let beats = emitter.tick(t0, 9, ready());
-        assert_eq!(beats.len(), 1);
-        assert_eq!(beats[0].1.seq, 1);
+        let out = beats(&mut emitter, t0, 9);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.seq, 1);
     }
 
     #[test]
@@ -578,15 +833,13 @@ mod tests {
         emitter
             .register(&spec, Duration::from_millis(200), t0)
             .unwrap();
-        let _ = emitter.tick(t0, 1, ready());
+        let _ = beats(&mut emitter, t0, 1);
 
         // Zero idle emission: retired stream leaves nothing due.
         emitter.retire(&spec.interest_digest());
         assert_eq!(emitter.live_streams(), 0);
         assert_eq!(emitter.next_due(), None);
-        assert!(emitter
-            .tick(t0 + Duration::from_secs(5), 1, ready())
-            .is_empty());
+        assert!(beats(&mut emitter, t0 + Duration::from_secs(5), 1).is_empty());
 
         // Resurrection continues the seq space (no equivocation on
         // (incarnation, seq) within one incarnation).
@@ -597,25 +850,8 @@ mod tests {
                 t0 + Duration::from_secs(6),
             )
             .unwrap();
-        let beats = emitter.tick(t0 + Duration::from_secs(6), 1, ready());
-        assert_eq!(beats[0].1.seq, 1);
-    }
-
-    #[test]
-    fn missing_evaluator_projects_temporarily_unevaluable() {
-        let t0 = Instant::now();
-        let mut emitter = OriginEmitter::new(11, Incarnation::new(1), FLOOR);
-        let spec = spec("job.run", "a");
-        emitter
-            .register(&spec, Duration::from_millis(200), t0)
-            .unwrap();
-        let beats = emitter.tick(t0, 1, |_request| None);
-        assert_eq!(beats.len(), 1);
-        assert_eq!(beats[0].1.status, AttestedStatus::ProviderUnknown);
-        assert_eq!(
-            beats[0].1.status_reason,
-            StatusReason::TemporarilyUnevaluable,
-        );
+        let out = beats(&mut emitter, t0 + Duration::from_secs(6), 1);
+        assert_eq!(out[0].1.seq, 1);
     }
 
     #[test]
@@ -634,12 +870,117 @@ mod tests {
 
         // Distinct digests emit independent streams with their own
         // seq spaces and cadences.
-        let beats = emitter.tick(t0, 1, ready());
-        assert_eq!(beats.len(), 2);
-        assert!(beats.iter().all(|(_, beat)| beat.seq == 0));
-        let beats = emitter.tick(t0 + Duration::from_millis(100), 1, ready());
-        assert_eq!(beats.len(), 1);
-        assert_eq!(beats[0].0.interest_digest, a.interest_digest());
+        let out = beats(&mut emitter, t0, 1);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, beat)| beat.seq == 0));
+        let out = beats(&mut emitter, t0 + Duration::from_millis(100), 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.interest_digest, a.interest_digest());
+    }
+
+    #[test]
+    fn live_capacity_refuses_new_digests_never_evicts_and_mints_no_slot() {
+        let t0 = Instant::now();
+        let mut emitter = OriginEmitter::new(11, Incarnation::new(1), FLOOR);
+        let mut specs = Vec::new();
+        for i in 0..MAX_LIVE_SENSING_STREAMS {
+            let s = spec("job.run", &format!("live-{i}"));
+            emitter
+                .register(&s, Duration::from_millis(200), t0)
+                .unwrap();
+            specs.push(s);
+        }
+        assert_eq!(emitter.live_streams(), MAX_LIVE_SENSING_STREAMS);
+        let slots_at_cap = emitter.slot_count();
+
+        // A new digest is refused, WITHOUT minting a seq slot.
+        let overflow = spec("job.run", "overflow");
+        assert_eq!(
+            emitter.register(&overflow, Duration::from_millis(200), t0),
+            Err(StreamRefusal::AtCapacity),
+        );
+        assert_eq!(emitter.live_streams(), MAX_LIVE_SENSING_STREAMS);
+        assert_eq!(emitter.slot_count(), slots_at_cap, "no slot minted");
+
+        // A refresh of an EXISTING live digest is accepted at cap.
+        assert!(emitter
+            .register(&specs[0], Duration::from_millis(120), t0)
+            .is_ok());
+        assert_eq!(
+            emitter.stream_cadence(&specs[0].interest_digest()),
+            Some(Duration::from_millis(60)),
+        );
+
+        // A retired digest is a RESURRECTION — refused at cap …
+        emitter.retire(&specs[1].interest_digest());
+        emitter
+            .register(&overflow, Duration::from_millis(200), t0)
+            .expect("one live slot freed");
+        assert_eq!(emitter.live_streams(), MAX_LIVE_SENSING_STREAMS);
+        assert_eq!(
+            emitter.register(&specs[1], Duration::from_millis(200), t0),
+            Err(StreamRefusal::AtCapacity),
+            "resurrection counts against the live cap",
+        );
+    }
+
+    #[test]
+    fn stamped_retire_skips_streams_registered_after_the_snapshot() {
+        let t0 = Instant::now();
+        let mut emitter = OriginEmitter::new(11, Incarnation::new(1), FLOOR);
+        let spec = spec("job.run", "a");
+        emitter
+            .register(&spec, Duration::from_millis(200), t0)
+            .unwrap();
+        let digest = spec.interest_digest();
+
+        // Snapshot, then a registration lands (the race): the stale
+        // retire must be refused.
+        let seen = emitter.stamp();
+        emitter
+            .register(
+                &spec,
+                Duration::from_millis(200),
+                t0 + Duration::from_millis(5),
+            )
+            .unwrap();
+        assert!(!emitter.retire_if_stale(&digest, seen));
+        assert_eq!(emitter.live_streams(), 1);
+
+        // A fresh snapshot with no interleaving registration
+        // retires normally.
+        let seen = emitter.stamp();
+        assert!(emitter.retire_if_stale(&digest, seen));
+        assert_eq!(emitter.live_streams(), 0);
+        assert!(!emitter.retire_if_stale(&digest, seen), "idempotent");
+    }
+
+    #[test]
+    fn absurd_durations_never_panic_and_park_instead_of_hot_looping() {
+        let t0 = Instant::now();
+        // Zero floor is normalized — a zero cadence can never admit.
+        let mut emitter = OriginEmitter::new(11, Incarnation::new(1), Duration::ZERO);
+        let spec = spec("job.run", "a");
+        assert!(matches!(
+            emitter.register(&spec, Duration::from_millis(1), t0),
+            Err(StreamRefusal::Cadence(_)),
+        ));
+
+        // A near-MAX interval schedules without panicking, and the
+        // overflowed re-arm parks far out instead of going due
+        // immediately.
+        emitter.register(&spec, Duration::MAX, t0).unwrap();
+        let out = beats(&mut emitter, t0, 1);
+        assert_eq!(out.len(), 1, "first beat still fires");
+        let next = emitter.next_due().expect("stream live");
+        assert!(
+            next > t0 + Duration::from_secs(60 * 60 * 24 * 30),
+            "overflowed schedule parks far in the future",
+        );
+        assert!(
+            beats(&mut emitter, t0 + Duration::from_secs(1), 1).is_empty(),
+            "no hot loop",
+        );
     }
 
     #[test]

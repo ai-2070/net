@@ -34,11 +34,12 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::sensing::{
-    encode_attestation, sign_attestation, AttestedStatus, AudienceScopeCommitment,
-    CanonicalConstraints, CapabilityId, DisclosureClass, EvaluationRequest, Incarnation,
-    InterestSpec, ProviderInterestKey, ProviderSelector, ReadinessEvaluation, ReadinessEvaluator,
-    ResultMode, SensingCounters, StatusReason, UnsignedAttestation, WorkLatencyEnvelope,
-    SUBPROTOCOL_READINESS_ATTESTATION,
+    encode_attestation, encode_interest_frame, sign_attestation, AttestedStatus,
+    AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DisclosureClass,
+    EvaluationRequest, Incarnation, InterestSpec, ProviderInterestKey, ProviderSelector,
+    ReadinessEvaluation, ReadinessEvaluator, ResultMode, SensingCounters, SensingInterestFrame,
+    StatusReason, UnsignedAttestation, WorkLatencyEnvelope, SUBPROTOCOL_READINESS_ATTESTATION,
+    SUBPROTOCOL_SENSING_INTEREST,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 use net::adapter::Adapter;
@@ -469,6 +470,136 @@ async fn tampered_and_equivocating_attestations_refused() {
         Some(Duration::from_millis(3)),
         "the equivocating twin never displaces the admitted observation",
     );
+
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Closure item 5: an evaluator is arbitrary user code and may call
+/// back into `MeshNode` from `evaluate()` — with the two-phase
+/// emitter loop it runs OUTSIDE the emitter lock, so the callback
+/// cannot deadlock the emitter task, and the poke-per-beat feedback
+/// loop stays min-gapped at the floor instead of hot-looping.
+#[tokio::test]
+async fn reentrant_evaluator_cannot_deadlock_the_emitter() {
+    struct ReentrantEvaluator {
+        node: std::sync::Mutex<Option<Arc<MeshNode>>>,
+    }
+    impl ReadinessEvaluator for ReentrantEvaluator {
+        fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
+            if let Ok(slot) = self.node.lock() {
+                if let Some(node) = slot.as_ref() {
+                    // Both re-enter MeshNode; the notify path takes
+                    // the emitter mutex this very loop iteration
+                    // released before calling us.
+                    node.notify_sensing_state_changed(&CapabilityId::new("print.document"));
+                    let _ = node.sensing_live_streams();
+                }
+            }
+            ReadinessEvaluation::Ready {
+                estimated_start: None,
+            }
+        }
+    }
+
+    let (c, p, fleet) = consumer_provider_pair(Some(Incarnation::new(1))).await;
+    let p_id = p.node_id();
+    let evaluator = Arc::new(ReentrantEvaluator {
+        node: std::sync::Mutex::new(None),
+    });
+    *evaluator.node.lock().expect("fresh lock") = Some(p.clone());
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), evaluator);
+
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let refresher = {
+        let c = c.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = c.register_sensing_interest(&spec, p_id, D, TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+
+    await_condition(Duration::from_secs(5), "stream starts", || {
+        c.sensing_latest_attestation(&branch).is_some()
+    })
+    .await;
+    let s0 = c.sensing_latest_attestation(&branch).expect("present").seq;
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let s1 = c.sensing_latest_attestation(&branch).expect("present").seq;
+    assert!(
+        s1 > s0,
+        "the stream advances despite reentrancy ({s0} → {s1})"
+    );
+    // Each beat's poke pulls the next to last+floor (50 ms): the
+    // feedback loop runs at the floor, never unboundedly.
+    assert!(
+        s1 - s0 <= 15,
+        "poke-per-beat stays min-gapped at the floor ({s0} → {s1})",
+    );
+
+    refresher.abort();
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// Closure item 4: wire intervals are bounded at intake —
+/// `0 < D ≤ sensing_interest_ttl`. A zero or beyond-lifetime D never
+/// reaches the table or the emitter, from either the wire or the
+/// local API.
+#[tokio::test]
+async fn out_of_bounds_intervals_refused_at_intake() {
+    let (c, p, fleet) = consumer_provider_pair(Some(Incarnation::new(1))).await;
+    let p_id = p.node_id();
+    let p_addr = p.local_addr();
+    p.register_readiness_evaluator(
+        CapabilityId::new("print.document"),
+        Arc::new(FlagEvaluator {
+            ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+    let spec = shared_spec(fleet);
+
+    // Local API: both bounds refused synchronously.
+    for bad in [Duration::ZERO, Duration::from_secs(3600)] {
+        let refused = c.register_sensing_interest(&spec, p_id, bad, TTL);
+        assert!(
+            matches!(
+                refused,
+                Err(net::adapter::net::SensingRegistrationError::Interval { .. })
+            ),
+            "local registration with D={bad:?} must refuse, got {refused:?}",
+        );
+    }
+
+    // Wire: crafted ProviderRegistrations with out-of-bounds D drop
+    // at P's intake — repeated sends, then the table is still empty.
+    for bad in [Duration::ZERO, Duration::from_secs(3600)] {
+        let frame = SensingInterestFrame::provider_registration(&spec, p_id, bad, TTL);
+        let bytes = encode_interest_frame(&frame).expect("encode");
+        for _ in 0..5 {
+            let _ = c
+                .send_subprotocol(p_addr, SUBPROTOCOL_SENSING_INTEREST, &bytes)
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(p.sensing_interest_count(), 0, "no row from bad intervals");
+    assert_eq!(p.sensing_live_streams(), 0, "no stream from bad intervals");
+
+    // Control: a legal D on the SAME spec registers fine.
+    await_condition(Duration::from_secs(10), "legal D registers", || {
+        if p.sensing_interest_count() == 0 {
+            let _ = c.register_sensing_interest(&spec, p_id, D, TTL);
+            false
+        } else {
+            true
+        }
+    })
+    .await;
 
     c.shutdown().await.expect("shutdown C");
     p.shutdown().await.expect("shutdown P");

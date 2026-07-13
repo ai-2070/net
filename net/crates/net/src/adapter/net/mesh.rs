@@ -2836,6 +2836,16 @@ fn spawn_route_withdrawal_flood(
 /// propagate.
 const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
+/// SI-3 closure item 4: the wire-interval bound. A zero interval
+/// demands an infinite-rate stream; an interval beyond the local
+/// soft-state lifetime cannot produce a meaningful continuity
+/// stream (the row expires between beats) — both are refused at
+/// every intake (`0 < D ≤ sensing_interest_ttl`), so no remote
+/// value ever reaches `Instant + Duration` scheduling unchecked.
+fn sensing_interval_in_bounds(interval: Duration, ttl: Duration) -> bool {
+    !interval.is_zero() && interval <= ttl
+}
+
 /// SI-3c: hard cap on the latest-per-branch observation store. Every
 /// stored entry answered a branch this hop actually held rows for
 /// (the solicited check), so honest population is bounded by the
@@ -3000,6 +3010,17 @@ pub enum SensingRegistrationError {
     /// e.g. its audience commitment names a root other than this
     /// node's own sensing root.
     Scope(sensing::ScopeError),
+    /// SI-3 closure item 4: the requested sample interval is out of
+    /// bounds — `0 < D ≤ sensing_interest_ttl`. A zero interval
+    /// would demand an infinite-rate stream; an interval beyond the
+    /// soft-state lifetime cannot produce a meaningful continuity
+    /// stream (the row expires between beats).
+    Interval {
+        /// The out-of-bounds request.
+        requested: Duration,
+        /// The local maximum (`sensing_interest_ttl`).
+        max: Duration,
+    },
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -3007,6 +3028,10 @@ impl std::fmt::Display for SensingRegistrationError {
         match self {
             Self::Disabled => f.write_str("sensing coalescing is disabled on this node"),
             Self::Scope(error) => write!(f, "sensing scope validation refused: {error}"),
+            Self::Interval { requested, max } => write!(
+                f,
+                "sample interval {requested:?} out of bounds (0 < D <= {max:?})"
+            ),
         }
     }
 }
@@ -4155,12 +4180,32 @@ impl MeshNode {
         // SI-3: the origin role exists only with BOTH the plane
         // enabled and a caller-persisted incarnation (fail-closed,
         // see the `sensing_incarnation` knob docs).
+        //
+        // Closure item 4: config-normalize the cadence floor —
+        // `0 < floor ≤ sensing_interest_ttl`. A zero floor would
+        // admit a zero cadence (hot loop); a floor beyond the
+        // soft-state lifetime cannot serve a continuity stream.
+        // (A zero ttl is operator pathology — every row would
+        // expire instantly — so it is left alone rather than
+        // "fixed" here.)
+        let sensing_cadence_floor = {
+            let floor = if config.attestation_cadence_floor.is_zero() {
+                sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR
+            } else {
+                config.attestation_cadence_floor
+            };
+            if config.sensing_interest_ttl.is_zero() {
+                floor
+            } else {
+                floor.min(config.sensing_interest_ttl)
+            }
+        };
         let sensing_emitter = Arc::new(parking_lot::Mutex::new(
             match (config.enable_sensing_coalescing, config.sensing_incarnation) {
                 (true, Some(incarnation)) => Some(sensing::OriginEmitter::new(
                     node_id,
                     incarnation,
-                    config.attestation_cadence_floor,
+                    sensing_cadence_floor,
                 )),
                 _ => None,
             },
@@ -4453,6 +4498,15 @@ impl MeshNode {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
         }
+        // Closure item 4: `0 < D ≤ sensing_interest_ttl` — the same
+        // bound the wire arms enforce.
+        if !sensing_interval_in_bounds(requested_sample_interval, self.config.sensing_interest_ttl)
+        {
+            return Err(SensingRegistrationError::Interval {
+                requested: requested_sample_interval,
+                max: self.config.sensing_interest_ttl,
+            });
+        }
         // A local registration proves the local root by construction
         // (session == claimed == local); the shared validation path
         // still runs so an audience mismatch is refused exactly like
@@ -4498,10 +4552,26 @@ impl MeshNode {
                 };
                 match refusal {
                     None => self.sensing_emitter_notify.notify_one(),
-                    Some(refusal) => {
+                    Some(sensing::StreamRefusal::AtCapacity) => {
+                        // Closure item 1: the origin is at its live
+                        // cap — the row stands, the stream stays
+                        // dark until capacity frees. Local refusal
+                        // only (no §4.4 wire semantics for it).
+                        tracing::debug!(
+                            "sensing: origin at live-stream capacity, local stream dark"
+                        );
+                    }
+                    Some(sensing::StreamRefusal::Cadence(refusal)) => {
                         self.sensing_counters
                             .cadence_refusals
                             .fetch_add(1, Ordering::Relaxed);
+                        // Closure item 7: snapshot BEFORE the table
+                        // mutation the retire decision rests on.
+                        let stamp = self
+                            .sensing_emitter
+                            .lock()
+                            .as_ref()
+                            .map(|emitter| emitter.stamp());
                         let partition = self.sensing_interest_table.lock().on_refusal(
                             &key,
                             refusal.minimum_supported,
@@ -4515,7 +4585,12 @@ impl MeshNode {
                                         let _ = emitter.register(spec, strictest, now);
                                     }
                                     sensing::UpstreamAction::Deregister => {
-                                        emitter.retire(&key.interest.interest_digest);
+                                        if let Some(stamp) = stamp {
+                                            emitter.retire_if_stale(
+                                                &key.interest.interest_digest,
+                                                stamp,
+                                            );
+                                        }
                                     }
                                     sensing::UpstreamAction::None => {}
                                 }
@@ -4559,11 +4634,14 @@ impl MeshNode {
 
     /// SI-3: install (or replace) the [`sensing::ReadinessEvaluator`]
     /// for one capability id (plan §4.4 — one narrow trait per
-    /// integration). Implementations must be cheap and non-blocking:
-    /// the emitter loop evaluates under its scheduler lock. Interests
-    /// targeting this node for a capability WITHOUT an evaluator
-    /// stream `ProviderUnknown { TemporarilyUnevaluable }` — an
-    /// explicit "targeted but cannot answer" beats silence.
+    /// integration). Implementations should be cheap and
+    /// non-blocking (they run on the emission path), but they are
+    /// invoked OUTSIDE the emitter lock (closure item 5) — an
+    /// evaluator may safely call back into `MeshNode`, including
+    /// [`Self::notify_sensing_state_changed`]. Interests targeting
+    /// this node for a capability WITHOUT an evaluator stream
+    /// `ProviderUnknown { TemporarilyUnevaluable }` — an explicit
+    /// "targeted but cannot answer" beats silence.
     ///
     /// Registration is independent of the origin role being active:
     /// evaluators may be installed before `start()` or while the
@@ -5952,14 +6030,23 @@ impl MeshNode {
     /// SI-3: spawn the origin-emission loop (plan §4.4). Sleeps
     /// until the emitter's earliest due beat (or a
     /// `sensing_emitter_notify` wake — registration, status-edge
-    /// poke, refusal), ticks the scheduler, signs each beat, and
-    /// fans it to the branch's live PEER downstreams. `Local`
+    /// poke, refusal), collects due beats, evaluates, signs, and
+    /// fans each to the branch's live PEER downstreams. `Local`
     /// downstreams are skipped — the local overlay/aggregate
     /// application is SI-4. A branch whose downstream list emptied
     /// retires its stream on the spot (zero idle emission — the
     /// sweep and deregister paths retire too; this is the backstop
     /// that runs even between sweeps, because `downstreams()`
     /// filters expired rows itself).
+    ///
+    /// Two-phase emission (closure item 5): `collect_due` reserves
+    /// seq + schedule under the emitter lock; the user evaluator
+    /// runs strictly OUTSIDE it, so an evaluator that calls back
+    /// into MeshNode (notify hook, introspection) cannot deadlock
+    /// the non-reentrant mutex. Retirement uses the beat's
+    /// collect-phase stamp (`retire_if_stale`, closure item 7), so
+    /// a registration landing between the table read and the retire
+    /// is never darkened.
     ///
     /// `None` when the origin role is dark (plane off or no
     /// persisted incarnation — fail-closed, §4.6).
@@ -6007,28 +6094,29 @@ impl MeshNode {
                     }
                     Some(_) => {}
                 }
-                // Generation is read at evaluation time (§3.4) —
+                // Generation is read at collection time (§3.4) —
                 // one read serves every beat in this tick.
                 let generation = capability_version.load(Ordering::Relaxed);
+                // Phase 1 (under the emitter lock): reserve seq +
+                // re-arm schedules. NO user code runs in here.
                 let beats = {
                     let mut slot = emitter.lock();
                     let Some(origin) = slot.as_mut() else { break };
-                    origin.tick(now, generation, |request| {
-                        // Clone the Arc out of the map entry before
-                        // evaluating so the shard guard drops first.
-                        let evaluator = evaluators
-                            .get(request.capability_id)
-                            .map(|entry| entry.value().clone())?;
-                        Some(evaluator.evaluate(request))
-                    })
+                    origin.collect_due(now, generation)
                 };
-                for (interest, unsigned) in beats {
-                    let digest = interest.interest_digest;
-                    let branch = sensing::ProviderInterestKey::new(interest, local_node_id);
+                for beat in beats {
+                    let digest = beat.key().interest_digest;
+                    let stamp = beat.stamp();
+                    let branch =
+                        sensing::ProviderInterestKey::new(beat.key().clone(), local_node_id);
                     let downstreams = { table.lock().downstreams(&branch, now) };
                     if downstreams.is_empty() {
+                        // Stamped retire (closure item 7): a
+                        // registration that landed after collect
+                        // bumped the stream's stamp past the beat's
+                        // and survives this.
                         if let Some(origin) = emitter.lock().as_mut() {
-                            origin.retire(&digest);
+                            origin.retire_if_stale(&digest, stamp);
                         }
                         continue;
                     }
@@ -6045,6 +6133,16 @@ impl MeshNode {
                         // local overlay is SI-4.
                         continue;
                     }
+                    // Phase 2 (NO emitter lock): run the user
+                    // evaluator, then seal — `into_unsigned` is
+                    // pure. Clone the Arc out of the map entry
+                    // before evaluating so the shard guard drops
+                    // first.
+                    let evaluation = evaluators
+                        .get(&beat.key().capability_id)
+                        .map(|entry| entry.value().clone())
+                        .map(|evaluator| evaluator.evaluate(&beat.request()));
+                    let unsigned = beat.into_unsigned(evaluation);
                     let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
                         continue;
                     };
@@ -8907,6 +9005,11 @@ impl MeshNode {
                             if let Some(leader) = sensing_leader.lock().as_mut() {
                                 leader.sweep(Instant::now());
                             }
+                            // Closure item 7: the stamp snapshot
+                            // precedes the expiry read the retire
+                            // decisions rest on.
+                            let emitter_stamp =
+                                sensing_emitter.lock().as_ref().map(|e| e.stamp());
                             let actions =
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
@@ -8914,12 +9017,17 @@ impl MeshNode {
                                     // SI-3: this node is the origin —
                                     // the last row's expiry retires
                                     // the emission stream (zero idle
-                                    // emission, plan §4.7).
+                                    // emission, plan §4.7), unless a
+                                    // registration raced in after
+                                    // the snapshot.
                                     if action == sensing::UpstreamAction::Deregister {
-                                        if let Some(emitter) =
-                                            sensing_emitter.lock().as_mut()
+                                        if let (Some(emitter), Some(stamp)) =
+                                            (sensing_emitter.lock().as_mut(), emitter_stamp)
                                         {
-                                            emitter.retire(&key.interest.interest_digest);
+                                            emitter.retire_if_stale(
+                                                &key.interest.interest_digest,
+                                                stamp,
+                                            );
                                         }
                                     }
                                     continue;
@@ -10848,6 +10956,17 @@ impl MeshNode {
                 soft_state_ttl,
                 ..
             } => {
+                // Closure item 4: bound the wire interval before any
+                // work — `0 < D ≤ sensing_interest_ttl`.
+                if !sensing_interval_in_bounds(*requested_sample_interval, ctx.sensing_interest_ttl)
+                {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        interval_ms = requested_sample_interval.as_millis() as u64,
+                        "sensing: out-of-bounds sample interval dropped"
+                    );
+                    return;
+                }
                 // The leader intake rides the RedEX election, so
                 // only the redex build has a leader role to feed.
                 #[cfg(not(feature = "redex"))]
@@ -11009,6 +11128,20 @@ impl MeshNode {
                 else {
                     return;
                 };
+                // Closure item 4: bound the wire interval —
+                // `0 < D ≤ sensing_interest_ttl` — before it can
+                // reach the table aggregate or emitter scheduling.
+                if !sensing_interval_in_bounds(
+                    validated.requested_sample_interval,
+                    ctx.sensing_interest_ttl,
+                ) {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        interval_ms = validated.requested_sample_interval.as_millis() as u64,
+                        "sensing: out-of-bounds sample interval dropped"
+                    );
+                    return;
+                }
                 let Ok(proven_root) = sensing::validate_subscriber_scope(
                     &session_root,
                     audience_scope,
@@ -11126,6 +11259,9 @@ impl MeshNode {
                 interest_digest,
                 target,
             } => {
+                // Closure item 7: stamp snapshot BEFORE the table
+                // mutation the retire decisions rest on.
+                let emitter_stamp = ctx.sensing_emitter.lock().as_ref().map(|e| e.stamp());
                 let actions = ctx.sensing_interest_table.lock().deregister(
                     interest_digest,
                     *target,
@@ -11136,10 +11272,14 @@ impl MeshNode {
                     if key.provider == ctx.local_node_id {
                         // SI-3: this node is the origin — the last
                         // downstream's death retires the emission
-                        // stream (zero idle emission, plan §4.7).
+                        // stream (zero idle emission, plan §4.7),
+                        // unless a registration raced in after the
+                        // snapshot.
                         if action == sensing::UpstreamAction::Deregister {
-                            if let Some(emitter) = ctx.sensing_emitter.lock().as_mut() {
-                                emitter.retire(&key.interest.interest_digest);
+                            if let (Some(emitter), Some(stamp)) =
+                                (ctx.sensing_emitter.lock().as_mut(), emitter_stamp)
+                            {
+                                emitter.retire_if_stale(&key.interest.interest_digest, stamp);
                             }
                         }
                         continue;
@@ -11172,7 +11312,7 @@ impl MeshNode {
         let Some(strictest) = ctx.sensing_interest_table.lock().aggregate(key, now) else {
             return;
         };
-        let refusal = {
+        let (refusal, stamp) = {
             let mut slot = ctx.sensing_emitter.lock();
             let Some(emitter) = slot.as_mut() else {
                 return;
@@ -11183,7 +11323,20 @@ impl MeshNode {
                     ctx.sensing_emitter_notify.notify_one();
                     return;
                 }
-                Err(refusal) => refusal,
+                Err(sensing::StreamRefusal::AtCapacity) => {
+                    // Closure item 1: at the live cap — the row
+                    // stands, the stream stays dark until capacity
+                    // frees (the next refresh retries). Local-only
+                    // refusal: no §4.4 wire semantics for capacity.
+                    tracing::debug!(
+                        digest = ?key.interest.interest_digest,
+                        "sensing: origin at live-stream capacity, stream dark"
+                    );
+                    return;
+                }
+                // Closure item 7: the stamp snapshot must precede
+                // the table mutation the retire decision rests on.
+                Err(sensing::StreamRefusal::Cadence(refusal)) => (refusal, emitter.stamp()),
             }
         };
         // §4.4 origin-hop refusal: partition this hop's downstreams
@@ -11205,12 +11358,14 @@ impl MeshNode {
             let beat = emitter.refusal_beat(spec, refusal, generation);
             match partition.upstream {
                 // Survivors' aggregate is ≥ M ≥ floor by
-                // construction, so this register cannot refuse.
+                // construction, so a cadence refusal is impossible
+                // here; a capacity refusal leaves the stream dark
+                // until the survivors' next refresh retries.
                 sensing::UpstreamAction::Register { strictest } => {
                     let _ = emitter.register(spec, strictest, now);
                 }
                 sensing::UpstreamAction::Deregister => {
-                    emitter.retire(&key.interest.interest_digest);
+                    emitter.retire_if_stale(&key.interest.interest_digest, stamp);
                 }
                 sensing::UpstreamAction::None => {}
             }
@@ -11340,6 +11495,22 @@ impl MeshNode {
             return;
         }
         if attestation.status_reason == sensing::StatusReason::SamplingIntervalUnsupported {
+            // Closure item 4: under the refusal tag, the signed
+            // promised_cadence means the floor M — bound it like
+            // every other wire interval before it drives a
+            // partition. A floor of zero or beyond the soft-state
+            // lifetime is a malformed control response.
+            if !sensing_interval_in_bounds(attestation.promised_cadence, ctx.sensing_interest_ttl) {
+                ctx.sensing_counters
+                    .protocol_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    origin = format!("{:#x}", attestation.origin),
+                    floor_ms = attestation.promised_cadence.as_millis() as u64,
+                    "sensing: refusal beat with out-of-bounds floor dropped"
+                );
+                return;
+            }
             let partition = ctx.sensing_interest_table.lock().on_refusal(
                 &branch,
                 attestation.promised_cadence,
