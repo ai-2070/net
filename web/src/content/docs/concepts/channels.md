@@ -30,16 +30,15 @@ Subnet gateways enforce these scopes at the boundary by reading the packet heade
 A channel can optionally require capability matching and a permission token before allowing a node to publish or subscribe. Both checks are configured on the channel itself, not at the call site:
 
 ```rust
-ChannelConfig {
-    channel_id,
-    visibility: Visibility::Exported,
-    publish_caps:   Some(filter![ "hardware.gpu", "software.cuda >= 12" ]),
-    subscribe_caps: Some(filter![ "tier.production" ]),
-    require_token: true,
-    priority: 4,
-    reliable: true,
-    max_rate_pps: Some(10_000),
-}
+ChannelConfig::new(channel_id)
+    .with_visibility(Visibility::Exported)
+    .with_publish_caps(CapabilityFilter::new().require_gpu().require_tag("software.cuda"))
+    .with_subscribe_caps(CapabilityFilter::new().require_tag("tier.production"))
+    .with_require_token(true)
+    .with_token_roots(vec![issuer_entity_id])   // entities allowed to issue this channel's tokens
+    .with_priority(4)
+    .with_reliable(true)
+    .with_rate_limit(10_000)
 ```
 
 The flow at subscription time is straightforward. The node's announced capabilities are matched against the channel's filter. If the channel requires a token, the node's token is verified for the appropriate scope (publish, subscribe, admin, delegate) and time validity. If both pass, the channel is added to the node's authorization set and the relevant bits are cached in the per-channel auth guard.

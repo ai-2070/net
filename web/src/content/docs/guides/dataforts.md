@@ -9,20 +9,28 @@ A blob in Dataforts is referenced by its content hash. Producers put bytes in an
 The simplest possible blob flow:
 
 ```rust
-use net::adapter::net::dataforts::{Blobs, BlobRef};
+use net_sdk::transport::{store_blob_reader, fetch_blob_discovered, Encoding, MeshBlobAdapter, BlobRef};
 
-let blobs = Blobs::open(&redex)?;
+// A per-node blob adapter over a Redex manager (`redex: Arc<Redex>`).
+let adapter = MeshBlobAdapter::new("blobs", redex.clone());
 
-// Put: returns a BlobRef identifying the blob by its content hash.
-let blob_ref: BlobRef = blobs.put(bytes).await?;
+// Put: stream bytes through the adapter; returns a BlobRef identifying
+// the content by its hash. The reader is any `AsyncRead` — a File,
+// stdin, or an in-memory slice.
+let blob_ref: BlobRef = store_blob_reader(
+    Some(&adapter),
+    &bytes[..],
+    "mem://artifact",   // source URI, recorded on the ref as metadata
+    Encoding::Replicated,
+).await?;
 
-// Get: fetches the bytes for a BlobRef, populating the local cache.
-let bytes = blobs.get(&blob_ref).await?;
+// Get: fetch the bytes for a BlobRef from the nearest holder on the mesh.
+let bytes = fetch_blob_discovered(&mesh, &blob_ref).await?;
 ```
 
-`put` is content-addressed. Putting the same bytes twice returns the same `BlobRef`; the runtime deduplicates automatically and never stores the same content twice on the same node. The hash is BLAKE3, chunked with content-defined chunking — so editing the middle of a file doesn't invalidate the chunks at the start or end, and the unchanged chunks dedupe across versions.
+`store_blob_reader` is content-addressed. Storing the same bytes twice yields the same `BlobRef`; the runtime deduplicates automatically and never stores the same content twice on the same node. The hash is BLAKE3, chunked with content-defined chunking — so editing the middle of a file doesn't invalidate the chunks at the start or end, and the unchanged chunks dedupe across versions.
 
-`get` is location-aware. The runtime looks for the blob in the local cache first, then asks the mesh for the nearest node that has it, then fetches in parallel from multiple holders if that's faster. Manifest fetches stream the per-chunk requests concurrently — a thousand-chunk blob completes in roughly the slowest single-chunk round-trip, not the sum of all of them. The first byte returned to your code typically comes from the closest cache; the rest streams in behind it.
+`fetch_blob_discovered` is location-aware. It probes connected peers and pulls the verified bytes from the first holder that serves them; when the holder is already known, `fetch_blob(&mesh, source, &blob_ref)` names it directly and skips discovery. Manifest fetches stream the per-chunk requests concurrently — a thousand-chunk blob completes in roughly the slowest single-chunk round-trip, not the sum of all of them. The first byte returned to your code typically comes from the closest cache; the rest streams in behind it.
 
 ## How the transfer actually works
 
@@ -49,7 +57,12 @@ A `BlobRef` is small (32 bytes plus a few framing bytes). It's small enough to p
 ```rust
 // Producer
 let bytes = generate_artifact();
-let blob_ref = blobs.put(bytes).await?;
+let blob_ref = store_blob_reader(
+    Some(&adapter),
+    &bytes[..],
+    "mem://artifact",
+    Encoding::Replicated,
+).await?;
 
 let event = Event::from_str(&serde_json::to_string(&ArtifactReady {
     job_id,
@@ -59,7 +72,7 @@ bus.ingest(event)?;
 
 // Consumer
 let event: ArtifactReady = parse(&payload);
-let bytes = blobs.get(&event.artifact).await?;
+let bytes = fetch_blob_discovered(&mesh, &event.artifact).await?;
 process_artifact(&bytes);
 ```
 
@@ -70,14 +83,16 @@ The producer puts the bytes once. The reference fans out through the bus to ever
 Directory transfer is a first-class operation on top of the blob primitive. `store_dir` walks a local directory, hashes each file and each subtree, and writes a manifest blob that references them all; `fetch_dir` consumes a manifest blob and materializes the tree on the receiving side.
 
 ```rust
-use net::adapter::net::dataforts::dir::{store_dir, fetch_dir};
+use net_sdk::transport::{store_dir, fetch_dir};
+use std::path::Path;
 
-// Producer side
-let root_ref: BlobRef = store_dir(&blobs, "./workspace").await?;
+// Producer side — walk the tree, hash it, write the manifest blob.
+let root_ref: BlobRef = store_dir(&adapter, Path::new("./workspace")).await?;
 publish_event(WorkspaceReady { root: root_ref });
 
-// Consumer side
-fetch_dir(&blobs, &root_ref, "./materialized").await?;
+// Consumer side — pull the manifest from `source` and materialize the tree.
+// The trailing `0` picks the default fetch concurrency.
+fetch_dir(&mesh, source, &root_ref, Path::new("./materialized"), 0).await?;
 ```
 
 `fetch_dir` is **atomic**. The runtime writes the entire tree into a sibling temp path on the same filesystem, and only renames into the caller's `dest` once every file, directory, and symlink has materialized successfully. A failure mid-fetch — network loss, disk-full, the process getting killed — removes the partial temp tree and leaves `dest` exactly as it was before the call. There's no rollback machinery to wrap around it at the application layer; the contract is the substrate's.
@@ -96,13 +111,16 @@ The runtime tracks per-blob, per-node read counts. When a blob is repeatedly rea
 
 This is the "data gravity" model the existing literature talks about: heavily-read data migrates toward heavy readers, and lightly-read data stays where it was written. The migration is async, doesn't slow down reads, and doesn't require coordination — each node makes local decisions about what to cache, based on the heat counters it's seen.
 
-For workloads where placement matters more than the default would give you, you can pin a blob to a specific set of nodes:
+For workloads where placement matters more than the default would give you, pin a blob on the nodes that must always hold it. Pinning is a local, per-node decision — each node exempts the pinned content from its own eviction and gravity sweeps:
 
 ```rust
-blobs.put_pinned(bytes, &[node_a, node_b]).await?;
+let now_ms = /* current unix time in ms */;
+if let Some(hash) = blob_ref.small_hash() {
+    adapter.pin(*hash, now_ms);
+}
 ```
 
-Pinned blobs ignore eviction and gravity — they live where you said, until you explicitly unpin them.
+A pinned blob is exempt from that node's eviction and gravity sweeps until you `unpin` it. (`pin` is keyed on a chunk hash; a multi-chunk manifest blob is pinned by pinning each of its chunk hashes.)
 
 ## Durability
 
@@ -110,31 +128,31 @@ A blob lives in two places: the local cache (memory, fast, unreliable) and the p
 
 The persistent tier uses BLAKE3 as the file name, content-defined chunking to split large blobs into deduplication-friendly pieces, and (for Phase C deployments) Reed-Solomon erasure coding to reduce storage cost across the cluster. The erasure-coding piece is optional; the default is full replication.
 
-`blobs.flush()` forces a sync to the persistent tier. You won't usually call it — the runtime flushes on its own schedule — but it's available when you need a hard durability barrier (e.g. before acknowledging an upload to an external caller).
+`adapter.sync_blob(&blob_ref).await?` forces a blob's chunks to the persistent tier. You won't usually call it — the runtime persists on its own schedule — but it's available when you need a hard durability barrier (e.g. before acknowledging an upload to an external caller).
 
 ## The transport SDK
 
 Five language tiers — Rust (`net_sdk::transport`), C (`net.h` extensions), Python (pyo3), TypeScript (napi-rs), Go (CGO over C) — expose the same three operations:
 
 ```rust
-// Rust
-let bytes = fetch_blob(&mesh, &blob_ref).await?;
-let root  = store_dir(&blobs, "./src").await?;
-fetch_dir(&blobs, &root, "./out").await?;
+// Rust (net_sdk::transport)
+let bytes = fetch_blob(&mesh, source, &blob_ref).await?;
+let root  = store_dir(&adapter, Path::new("./src")).await?;
+fetch_dir(&mesh, source, &root, Path::new("./out"), 0).await?;
 ```
 
 ```ts
-// TypeScript
-const bytes = await fetchBlob(mesh, blobRef);
-const root  = await storeDir(blobs, "./src");
-await fetchDir(blobs, root, "./out");
+// TypeScript — the ops hang off the Mesh handle
+const bytes = await mesh.fetchBlob(holderId, blobRef);
+const root  = await mesh.storeDir(adapter, "./src");
+await mesh.fetchDir(sourceId, root, "./out");
 ```
 
 ```python
-# Python
-bytes_ = await fetch_blob(mesh, blob_ref)
-root   = await store_dir(blobs, "./src")
-await fetch_dir(blobs, root, "./out")
+# Python — synchronous module functions (they block internally)
+data = fetch_blob(mesh, holder_id, blob_ref)
+root = store_dir(mesh, adapter, "./src")
+fetch_dir(mesh, source_id, root, "./out")
 ```
 
 The SDK stays deliberately thin — no retry policy, no rollback machinery beyond the substrate's own atomicity, no directory-sync primitives. Substrate primitives are exposed; applications compose policy above. The `DirManifest` and `DirEntry` introspection types are also re-exported so applications that want to walk a manifest before materializing it (build systems, dependency resolvers, agent delegators) can do so without reaching into substrate internals.

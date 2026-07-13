@@ -8,6 +8,7 @@ The mental model is unromantic. A RedEX file is a named log. Producers append; c
 
 ```rust
 use net::adapter::net::redex::{Redex, RedexFileConfig, FsyncPolicy};
+use net::adapter::net::channel::ChannelName;
 use std::sync::Arc;
 
 let redex = Arc::new(Redex::new());
@@ -16,7 +17,7 @@ let cfg = RedexFileConfig::default()
     .with_persistent(true)
     .with_fsync_policy(FsyncPolicy::EveryN(100));
 
-let file = redex.open_file("sensors/lidar/front", cfg)?;
+let file = redex.open_file(&ChannelName::new("sensors/lidar/front")?, cfg)?;
 ```
 
 `Redex` is the top-level manager: it owns the open files, handles the on-disk layout, and exposes per-channel handles. `open_file` either opens an existing log or creates a fresh one. The same call shape applies whether the channel is in-memory or disk-backed; the difference is the `with_persistent(true)` flag and a base directory configured on the `Redex` manager.
@@ -28,15 +29,15 @@ A persistent log is two on-disk files: an index file (20-byte records, one per e
 Append is the only write path. Events go in monotonically by sequence; the log is single-writer, and the writer is the channel's authoritative publisher.
 
 ```rust
-let seq = file.append(payload).await?;
+let seq = file.append(payload)?;
 ```
 
-`payload` is opaque bytes. RedEX doesn't decode it, doesn't validate it, doesn't transform it. The sequence number returned is what consumers reference when they want to resume from a specific point.
+`payload` is opaque bytes (`&[u8]`). RedEX doesn't decode it, doesn't validate it, doesn't transform it. Append is synchronous — it returns the assigned sequence number, which is what consumers reference when they want to resume from a specific point.
 
-For higher-throughput append paths, use the batched variant — it amortizes the index write and the fsync:
+For higher-throughput append paths, use the batched variant — it amortizes the index write and the fsync. It takes a slice of `Bytes` and returns the sequence of the *first* event in the batch (`None` for an empty batch):
 
 ```rust
-let seqs = file.append_batch(&payloads).await?;
+let first_seq = file.append_batch(&payloads)?;
 ```
 
 ## Reading
@@ -46,40 +47,43 @@ Three reading patterns cover the cases that come up.
 **Read a specific range.** Useful for inspection, audit, and re-derivation:
 
 ```rust
-let events = file.read_range(100, 200).await?;
+let events = file.read_range(100, 200);
 for event in events {
-    process(event.seq, &event.payload);
+    process(event.entry.seq, &event.payload);
 }
 ```
 
-**Tail subscription.** A long-lived stream that delivers events as they land. This is the path consumers use for reactive workloads:
+`read_range` is synchronous and returns the retained events in the half-open range `[start, end)` directly — not a `Result`. Evicted seqs are silently skipped.
+
+**Tail subscription.** A long-lived stream that delivers events as they land. `tail(from_seq)` is synchronous — it returns the stream immediately — and each item is a `Result<RedexEvent, RedexError>` (the `Err` surfaces a lagged or closed subscriber). Pass `0` to start from the beginning of the log and then follow the tail live. This is the path consumers use for reactive workloads:
 
 ```rust
 use futures::StreamExt;
 
-let mut tail = file.subscribe_tail().await?;
-while let Some(event) = tail.next().await {
-    process(event.seq, &event.payload);
+let mut tail = file.tail(0);
+while let Some(Ok(event)) = tail.next().await {
+    process(event.entry.seq, &event.payload);
 }
 ```
 
-**Resume from a cursor.** The tail-from-cursor flavor; useful for consumers that crash and restart and need to pick up where they left off:
+**Resume from a cursor.** The tail-from-cursor flavor; useful for consumers that crash and restart and need to pick up where they left off. Same call, with the resume sequence in place of `0`:
 
 ```rust
-let mut tail = file.subscribe_from(last_processed_seq).await?;
+let mut tail = file.tail(last_processed_seq);
 ```
 
 The cursor is just a sequence number. Persist it (in your own state, in another RedEX file, wherever fits) and you have at-least-once recovery for free.
 
 ## Choosing durability
 
-`FsyncPolicy` controls when the log is fsynced to disk. Three options, each with a different trade-off:
+`FsyncPolicy` controls when the log is fsynced to disk. Four options, each with a different trade-off:
 
 | Policy            | Worst-case loss on crash                  | Use for                                        |
 |-------------------|--------------------------------------------|------------------------------------------------|
-| `Never`           | Tail since last `close()` or `sync()`     | Telemetry, caches, best-effort logs            |
+| `Never` (default) | Tail since last `close()` or `sync()`     | Telemetry, caches, best-effort logs            |
 | `EveryN(N)`       | ≤ N − 1 entries from the last sync point | Most application state (start with `EveryN(100)`) |
 | `Interval(d)`     | ≤ d seconds of writes                      | State that must survive kernel panics          |
+| `IntervalOrBytes { period, max_bytes }` | ≤ whichever of `period` elapsing or `max_bytes` accumulating fires first | Bursty workloads that need a byte ceiling on unsynced data under load |
 
 Two invariants are worth committing to memory:
 
@@ -94,8 +98,8 @@ Logs grow without bound by default. To put a ceiling on size, configure retentio
 
 ```rust
 let cfg = RedexFileConfig::default()
-    .with_retention_max_bytes(Some(1024 * 1024 * 1024))  // 1 GB
-    .with_retention_max_age(Some(Duration::from_secs(86400 * 7)));  // 7 days
+    .with_retention_max_bytes(1024 * 1024 * 1024)  // 1 GB
+    .with_retention_max_age(Duration::from_secs(86400 * 7));  // 7 days
 ```
 
 Retention runs on append and on demand (`file.sweep_retention()`). Events past the retention horizon are evicted from the in-memory index — disk-backed events stay on disk until the next compaction pass, which is a separate concern. If you need hard caps, configure both bytes and age; the runtime applies whichever cuts first.
@@ -119,7 +123,7 @@ let cfg = RedexFileConfig::default()
             .with_factor(3)
             .with_heartbeat_ms(500),
     ));
-let file = redex.open_file("sensors/lidar/front", cfg)?;
+let file = redex.open_file(&ChannelName::new("sensors/lidar/front")?, cfg)?;
 ```
 
 `enable_replication` installs the per-`Redex` router on the mesh's replication subprotocol. After that, opening a channel with `replication: Some(_)` spawns a per-channel replication coordinator: leader election (deterministic by RTT and health), heartbeat-based liveness, and sync requests that bring replicas up to date.

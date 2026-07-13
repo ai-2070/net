@@ -9,17 +9,29 @@ The API is small. You'll mostly be composing four operations — construct, inge
 A bus is built from an `EventBusConfig`. The default config gives you a single-node, in-memory bus with sensible shard counts and batch settings. You'll replace pieces of it as your deployment grows.
 
 ```rust
+use std::time::Duration;
 use net::{EventBus, EventBusConfig, AdapterConfig, BatchConfig, BackpressureMode};
+use net::adapter::net::NetAdapterConfig;
+
+// The Net mesh adapter speaks the Net L0 transport. The initiator
+// side needs the local bind address, the peer address, a shared
+// pre-shared key, and the peer's static public key.
+let net_adapter = NetAdapterConfig::initiator(
+    "0.0.0.0:7777".parse()?,   // bind_addr
+    "10.0.0.2:7777".parse()?,  // peer_addr
+    psk,                        // [u8; 32] pre-shared key
+    peer_static_pubkey,        // [u8; 32] responder static pubkey
+);
 
 let config = EventBusConfig::builder()
-    .shards(16)
-    .batch(BatchConfig::default()
-        .max_events(1024)
-        .max_delay_ms(5))
-    .backpressure(BackpressureMode::DropOldest)
-    .adapter(AdapterConfig::net()
-        .listen("0.0.0.0:7777")
-        .peer("10.0.0.2:7777"))
+    .num_shards(16)
+    .batch(BatchConfig {
+        max_size: 1_024,
+        max_delay: Duration::from_millis(5),
+        ..BatchConfig::default()
+    })
+    .backpressure_mode(BackpressureMode::DropOldest)
+    .adapter(AdapterConfig::Net(Box::new(net_adapter)))
     .build()?;
 
 let bus = EventBus::new(config).await?;
@@ -27,11 +39,11 @@ let bus = EventBus::new(config).await?;
 
 A few of the knobs are worth understanding:
 
-**Shards.** Ingestion is parallelized across `shards` independent ring buffers. Each ingest call hashes the event onto a shard and pushes lock-free; one batch worker per shard drains into the adapter. More shards mean less contention under heavy load but more memory and more workers. The default is a reasonable compromise; bump it if you're seeing contention metrics climb under sustained ingest.
+**Shards.** Ingestion is parallelized across `num_shards` independent ring buffers. Each ingest call hashes the event onto a shard and pushes lock-free; one batch worker per shard drains into the adapter. More shards mean less contention under heavy load but more memory and more workers. The default tracks your physical core count, which is a reasonable compromise; bump it if you're seeing contention metrics climb under sustained ingest.
 
-**Batch.** A batch worker pulls events off its shard and dispatches them to the adapter in batches. `max_events` caps the batch size; `max_delay_ms` caps how long the worker waits to fill one before flushing. The trade-off is straightforward — bigger batches amortize the adapter call, smaller batches reduce tail latency.
+**Batch.** A batch worker pulls events off its shard and dispatches them to the adapter in batches. `max_size` is the ceiling on a batch and `min_size` the floor; `max_delay` caps how long the worker waits to fill one before flushing. With `adaptive` on (the default), the worker sizes each batch between those bounds based on recent ingestion velocity. The trade-off is straightforward — bigger batches amortize the adapter call, smaller batches reduce tail latency. `BatchConfig::high_throughput()` and `BatchConfig::low_latency()` ship as presets for the two ends of that trade-off.
 
-**Backpressure.** When a shard's ring buffer fills, the backpressure mode decides what happens to new ingests. `Block` waits for room (turns ingest into a back-pressured call). `DropOldest` evicts the oldest event in the buffer and accepts the new one. `DropNewest` rejects the new ingest with an error. Pick based on whether your data is more valuable at the head or the tail of the stream.
+**Backpressure.** When a shard's ring buffer fills, the backpressure mode decides what happens to new ingests. `DropOldest` (the default) evicts the oldest event in the buffer and accepts the new one. `DropNewest` drops the incoming event and silently moves on. `FailProducer` returns an error to the producer so the caller can react to the drop. `Sample { rate }` keeps one event in every `rate` and discards the rest — useful for lossy high-volume telemetry. Pick based on whether your data is more valuable at the head or the tail of the stream, and whether producers should learn about drops.
 
 **Adapter.** Where events actually go. `NoopAdapter` is the default (in-memory, no persistence). `NetAdapter` is the mesh transport. `RedisAdapter` and `JetStreamAdapter` are available behind feature flags for shops that want to bridge to an existing broker during a transition.
 
@@ -61,30 +73,34 @@ Either form is safe to call from many threads concurrently. The shard hashing ke
 
 ```rust
 use net::{ConsumeRequest, Filter};
+use serde_json::json;
 
 let request = ConsumeRequest::new(100)
-    .filter(Filter::new().eq("token", "hello"));
+    .filter(Filter::eq("token", json!("hello")));
 
 let response = bus.poll(request).await?;
-for event in response.events {
-    process(&event);
+for event in &response.events {
+    process(event);
 }
 
 // Resume from where we left off
-let next = ConsumeRequest::new(100).from(response.cursor);
-let next_response = bus.poll(next).await?;
+if let Some(cursor) = response.next_id {
+    let next = ConsumeRequest::new(100).from(cursor);
+    let next_response = bus.poll(next).await?;
+    /* ... */
+}
 ```
 
-The cursor is opaque — it encodes per-shard sequence positions in a base64 string, and it's the only thing you need to persist for at-least-once resumption. Hand it back unchanged on the next call and the bus picks up from exactly where the previous response ended.
+The `next_id` is opaque — it encodes each shard's stream position as a base64-encoded JSON map, and it's the only thing you need to persist for at-least-once resumption. Hand it back unchanged through `.from(...)` on the next request and the bus picks up from exactly where the previous response ended. It's `None` only when the poll made no progress at all, so a resumption loop simply carries the last non-`None` cursor forward.
 
-If you don't pass a cursor, the bus returns from the current tail. If you pass a stale cursor (one whose events have been compacted away by the adapter), the bus skips ahead to the earliest available position and reports the gap in the response metadata.
+If you don't pass a cursor, the bus starts from the beginning of each shard's stream. If the events your cursor points past have already been trimmed by the adapter (Redis `max_stream_len`, JetStream `max_messages` / `max_age`), the next poll resumes from the earliest event still retained — there's no separate gap signal, but the `has_more`, `failed_shards`, and `stalled_shards` fields on the response surface the adapter-health conditions you'll want to alert on.
 
 ## Filtering
 
 Filters are JSON-path equality predicates evaluated against the event payload after retrieval from the adapter, composable through the boolean operators `$and`, `$or`, and `$not`:
 
 ```rust
-use net::{Filter, FilterBuilder};
+use net::Filter;
 use serde_json::json;
 
 let filter = Filter::and(vec![
@@ -140,18 +156,24 @@ The counters are atomic and lock-free; reading them is free.
 
 ## Scaling shards on the fly
 
-A bus can add and remove shards at runtime. The scaling monitor watches per-shard utilization and proposes scaling decisions; you can either auto-apply them or feed them through your own policy:
+A bus can add and remove shards at runtime whenever it was built with a `ScalingPolicy` (the default). Under the hood the mapper's `evaluate_scaling()` watches per-shard utilization and returns a `ScalingDecision` — `None`, `ScaleUp(n)`, or `ScaleDown(n)`. You can either let the built-in monitor act on those decisions for you, or drive scaling yourself:
 
 ```rust
-let decision = bus.suggest_scaling().await;
-match decision {
-    ScalingDecision::AddShards(n) => bus.add_shards(n).await?,
-    ScalingDecision::RemoveShards(ids) => bus.remove_shards(ids).await?,
-    ScalingDecision::NoChange => {}
-}
+use std::sync::Arc;
+
+let bus = Arc::new(EventBus::new(config).await?);
+
+// Option 1: let the built-in monitor watch utilization and
+// apply ScaleUp / ScaleDown within the policy's bounds.
+bus.start_scaling_monitor();
+
+// Option 2: drive it yourself. Both take a count and return the
+// affected shard ids.
+let added = bus.manual_scale_up(2).await?;     // Vec<u16> of new shard ids
+let removed = bus.manual_scale_down(1).await?; // Vec<u16> of drained ids
 ```
 
-Adding shards is cheap — new ring buffers, new workers, and the next ingest with a hash that lands on them will be served immediately. Removing shards is more involved: the bus waits for the shard's drain worker to clear the buffer and dispatch the final batch before the shard is unregistered. The merger's view is updated atomically so a poll can't be routed to a half-removed shard.
+Adding shards is cheap — new ring buffers, new workers, and the next ingest with a hash that lands on them will be served immediately. Removing shards is more involved: the bus marks each shard draining, waits for its drain worker to clear the buffer and dispatch the final batch, and only then unregisters it (`manual_scale_down` returns the ids that fully drained). The merger's view is updated atomically so a poll can't be routed to a half-removed shard.
 
 ## Common shapes
 

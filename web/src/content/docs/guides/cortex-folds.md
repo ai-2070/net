@@ -9,7 +9,7 @@ The shape is small enough that the whole model fits in three pieces: a state typ
 A fold is a Rust trait with one required method. Take an event, take the current state, produce the new state:
 
 ```rust
-use net::adapter::net::cortex::RedexFold;
+use net::adapter::net::redex::{RedexFold, RedexEvent, RedexError};
 
 #[derive(Default, Clone)]
 struct TaskCount {
@@ -20,10 +20,13 @@ struct TaskCount {
 struct TaskCountFold;
 
 impl RedexFold<TaskCount> for TaskCountFold {
-    fn apply(&self, state: &mut TaskCount, event: &Event) -> Result<(), FoldError> {
-        match event.kind() {
-            EventKind::TaskCreated  => state.pending += 1,
-            EventKind::TaskComplete => {
+    fn apply(&mut self, ev: &RedexEvent, state: &mut TaskCount) -> Result<(), RedexError> {
+        // Decode `ev.payload` into your domain event and update the state.
+        // `DomainEvent`/`decode` here are illustrative — RedEX is agnostic
+        // to the payload's shape, so the decode is yours to define.
+        match decode(&ev.payload) {
+            DomainEvent::TaskCreated  => state.pending += 1,
+            DomainEvent::TaskComplete => {
                 state.pending = state.pending.saturating_sub(1);
                 state.completed += 1;
             }
@@ -41,14 +44,18 @@ The fold mutates the state in place. It's pure in spirit — the same sequence o
 `CortexAdapter` is what owns the state, drives the fold, and exposes the query surface. You construct it against a RedEX file and a fold:
 
 ```rust
-use net::adapter::net::cortex::CortexAdapter;
+use net::adapter::net::cortex::{CortexAdapter, CortexAdapterConfig};
+use net::adapter::net::redex::RedexFileConfig;
+use net::adapter::net::channel::ChannelName;
 
 let adapter = CortexAdapter::open(
     &redex,
-    "tasks",
-    origin_hash,
+    &ChannelName::new("tasks")?,
+    RedexFileConfig::default(),
+    CortexAdapterConfig::default(),
     TaskCountFold,
-).await?;
+    TaskCount::default(),
+)?;
 ```
 
 Behind the scenes, the adapter opens the RedEX file, spawns a fold task that subscribes to the tail, applies events as they arrive, and persists the resulting state in an `Arc<RwLock<State>>`. Readers take a brief read lock to query; the fold task takes a write lock to mutate.
@@ -122,15 +129,18 @@ A long-lived fold over a long log gets expensive to replay from genesis. Snapsho
 
 ```rust
 let (state_bytes, last_seq) = adapter.snapshot()?;
-// Persist (state_bytes, last_seq) wherever fits.
+// Persist (state_bytes, last_seq) wherever fits. `last_seq` is an
+// `Option<u64>` — `None` if no events had been folded yet.
 
 let resumed = CortexAdapter::open_from_snapshot(
     &redex,
-    origin_hash,
+    &ChannelName::new("tasks")?,
+    RedexFileConfig::default(),
+    CortexAdapterConfig::default(),
     TaskCountFold,
     &state_bytes,
     last_seq,
-).await?;
+)?;
 ```
 
 The snapshot is the state's serialized bytes plus the sequence number of the last event folded into it. On restore, the adapter deserializes the state, opens the RedEX log, and starts the fold from `last_seq + 1` — so pre-snapshot events never re-fold, and the resumed adapter is byte-identical to where it left off.
@@ -139,14 +149,18 @@ For applications that use the higher-level NetDB facade, you get whole-stack sna
 
 ```rust
 let bundle = db.snapshot()?;
-let db2 = NetDb::open_from_snapshot(&redex, bundle, builder_config)?;
+let db2 = NetDb::builder(redex)
+    .with_tasks()
+    .with_memories()
+    .build_from_snapshot(&bundle)
+    .await?;
 ```
 
-The bundle is a single postcard blob covering every adapter the NetDB knows about. Encode and decode run in tens of microseconds at the 1k-entry scale; the bundle is 60–70% smaller than the equivalent JSON.
+The bundle is a single postcard-serializable structure covering every adapter the NetDB knows about (`bundle.encode()` flattens it to a blob for persistence). Encode and decode run in tens of microseconds at the 1k-entry scale; the bundle is 60–70% smaller than the equivalent JSON.
 
 ## The two domain models that ship
 
-CortEX comes with two reference folds: tasks and memories. Tasks model long-running workloads with explicit lifecycle (`Pending`, `Running`, `Completed`, `Failed`); memories model durable observations a daemon needs across restarts. Both are useful out of the box, and both are worked examples of how to write your own fold.
+CortEX comes with two reference folds: tasks and memories. Tasks model long-running workloads with an explicit lifecycle (`Pending`, `Completed`); memories model durable observations a daemon needs across restarts. Both are useful out of the box, and both are worked examples of how to write your own fold.
 
 You don't have to use them. They live alongside any folds you write yourself; CortEX is happy to drive multiple folds against the same RedEX log, or different folds against different logs, and the NetDB facade composes them all under one query surface.
 
@@ -166,8 +180,8 @@ Folds can fail. An event with a bad payload, a logic bug in the fold, an underfl
 CortEX is eventually consistent against its own producer — appending an event to RedEX and immediately reading the state can return a stale view, because the fold task hasn't gotten there yet. For workflows that need read-your-writes, `adapter.wait_for_seq(seq)` is the barrier:
 
 ```rust
-let seq = adapter.append(payload).await?;
-adapter.wait_for_seq(seq).await;
+let seq = adapter.ingest(envelope)?;
+let _ = adapter.wait_for_seq(seq).await;
 
 // State now reflects the just-appended event.
 let view = adapter.state().read();

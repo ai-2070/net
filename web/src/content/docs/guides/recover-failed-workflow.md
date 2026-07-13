@@ -17,13 +17,18 @@ retry proxy.
 ## Retry — re-issue on a transient failure
 
 ```rust
+use std::time::{Duration, Instant};
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped};
 use net_sdk::mesh_rpc_resilience::RetryPolicy;
 
 let resp: SummarizeResp = caller.call_typed_with_retry(
     provider_node_id,
     "summarize",
     &req,
-    CallOptions::default().with_deadline(Duration::from_millis(500)),
+    CallOptionsTyped {
+        raw: CallOptions { deadline: Some(Instant::now() + Duration::from_millis(500)), ..Default::default() },
+        ..Default::default()
+    },
     &RetryPolicy::default(),          // bounded attempts + backoff; retries only retryable errors
 ).await?;
 ```
@@ -38,12 +43,13 @@ When latency matters more than duplicate work, fire a backup call after a short
 delay and take whichever returns first:
 
 ```rust
+use net_sdk::mesh_rpc::CallOptionsTyped;
 use net_sdk::mesh_rpc_resilience::HedgePolicy;
 
-let resp: SummarizeResp = caller.call_service_with_hedge(
+let resp: SummarizeResp = caller.call_service_typed_with_hedge(
     "summarize",                      // by service name — the mesh picks providers
     &req,
-    CallOptions::default(),
+    CallOptionsTyped::default(),
     &HedgePolicy::default(),
 ).await?;
 ```
@@ -74,7 +80,7 @@ mid-run and the next invoke lands on the standby.
 Call by service name (not a pinned node id) to get this for free:
 
 ```rust
-let resp: SummarizeResp = caller.call_service_typed("summarize", &req, CallOptions::default()).await?;
+let resp: SummarizeResp = caller.call_service_typed("summarize", &req, CallOptionsTyped::default()).await?;
 ```
 
 ## Multi-step work: the task lifecycle

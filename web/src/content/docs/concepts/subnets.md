@@ -19,7 +19,7 @@ Parent, child, sibling, and distance relationships all resolve with bitwise oper
 
 ## Assignment
 
-Nodes are assigned to subnets by policy, not by hand. A `SubnetPolicy` is a list of rules; each rule matches a capability tag, and the first matching rule determines the node's subnet. If nothing matches, the node falls into the policy's default subnet.
+Nodes are assigned to subnets by policy, not by hand. A `SubnetPolicy` is a list of `SubnetRule`s; each rule maps a capability-tag *prefix* to a hierarchy *level* (0–3) and a set of tag-value→byte mappings, and rules combine across levels to fill the subnet id. Any level no rule fills stays `0` — i.e. unrestricted (`GLOBAL`); there is no separate "default subnet."
 
 This means subnet membership is data-driven and changes as capabilities change. Add a `fleet=west-coast` tag to a node and it moves into the west-coast fleet's subnet automatically; the matching gateway picks it up; the matching channel scopes start applying. There's no separate config to push, and there's no opportunity for the node's claimed subnet to disagree with its capability set.
 
