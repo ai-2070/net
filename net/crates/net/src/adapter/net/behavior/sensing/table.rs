@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::continuity::Continuity;
-use super::identity::{AudienceScopeCommitment, ProviderInterestKey};
+use super::identity::{AudienceScopeCommitment, Digest256, ProviderInterestKey};
 
 /// Who registered an interest at this hop: the node's own consumer
 /// or a downstream peer session.
@@ -258,6 +258,47 @@ impl InterestTable {
             .entries
             .iter()
             .filter(|(_, entry)| entry.downstreams.contains_key(&downstream))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut actions = Vec::new();
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.downstreams.remove(&downstream);
+            }
+            self.release_rows(&[downstream]);
+            let action = self.action_for(&key, now);
+            self.drop_if_empty(&key);
+            if action != UpstreamAction::None {
+                actions.push((key, action));
+            }
+        }
+        actions
+    }
+
+    /// Explicit withdrawal (plan §4.2 `Deregister`; SI-2a dispatch):
+    /// drop one downstream's rows for `interest_digest` — exactly
+    /// the `(digest, provider)` branch when `provider` is `Some`, or
+    /// that downstream's rows across every branch of the digest when
+    /// `None` (the whole-interest withdrawal). Reports each touched
+    /// key's upstream consequence exactly as [`Self::expire`] does.
+    /// Unknown digests and absent rows are a no-op — deregistration
+    /// of soft state is idempotent, so a duplicated or crossed
+    /// `Deregister` frame removes nothing twice.
+    pub fn deregister(
+        &mut self,
+        interest_digest: &Digest256,
+        provider: Option<u64>,
+        downstream: DownstreamId,
+        now: Instant,
+    ) -> Vec<(ProviderInterestKey, UpstreamAction)> {
+        let keys: Vec<ProviderInterestKey> = self
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                key.interest.interest_digest == *interest_digest
+                    && provider.is_none_or(|p| key.provider == p)
+                    && entry.downstreams.contains_key(&downstream)
+            })
             .map(|(key, _)| key.clone())
             .collect();
         let mut actions = Vec::new();
@@ -674,6 +715,94 @@ mod tests {
         ];
         expected.sort_by_key(|(key, _)| key.interest.interest_digest.as_bytes().to_vec());
         assert_eq!(actions, expected);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn deregister_removes_exactly_the_named_branch() {
+        let now = Instant::now();
+        let mut table = InterestTable::new(512);
+        let leaver = DownstreamId::Peer(1);
+        let survivor = DownstreamId::Peer(2);
+        table.register(&key(), leaver, ms(100), TTL, root(0xAA), now);
+        table.register(&key(), survivor, ms(500), TTL, root(0xAA), now);
+
+        // The strict downstream withdraws its branch row: the
+        // survivor stays and the derived aggregate loosens.
+        let actions =
+            table.deregister(&key().interest.interest_digest, Some(PROVIDER), leaver, now);
+        assert_eq!(
+            actions,
+            vec![(key(), UpstreamAction::Register { strictest: ms(500) })],
+        );
+        assert_eq!(table.downstreams(&key(), now), vec![survivor]);
+
+        // A duplicated Deregister is idempotent: nothing left to
+        // remove, no upstream consequence.
+        let duplicate =
+            table.deregister(&key().interest.interest_digest, Some(PROVIDER), leaver, now);
+        assert_eq!(duplicate, Vec::new());
+
+        // The survivor withdraws too: last row gone → upstream
+        // deregistration, entry dropped (zero idle cost) — and the
+        // quota released, so the peer can register afresh.
+        let actions = table.deregister(
+            &key().interest.interest_digest,
+            Some(PROVIDER),
+            survivor,
+            now,
+        );
+        assert_eq!(actions, vec![(key(), UpstreamAction::Deregister)]);
+        assert!(table.is_empty());
+        assert!(matches!(
+            table.register(&key(), survivor, ms(500), TTL, root(0xAA), now),
+            RegisterOutcome::Registered(_),
+        ));
+    }
+
+    #[test]
+    fn deregister_without_target_clears_every_branch_of_the_digest() {
+        // The whole-interest withdrawal (`target: None`): one
+        // downstream's rows drop across every provider branch of the
+        // digest, and only that downstream's — another digest and
+        // another downstream are untouched.
+        let now = Instant::now();
+        let mut table = InterestTable::new(512);
+        let peer = DownstreamId::Peer(1);
+        let other_peer = DownstreamId::Peer(2);
+        let branch_a = key(); // (digest, PROVIDER)
+        let branch_b = ProviderInterestKey::new(branch_a.interest.clone(), PROVIDER + 1);
+        let unrelated = key_with_audience(0xBB);
+        table.register(&branch_a, peer, ms(100), TTL, root(0xAA), now);
+        table.register(&branch_b, peer, ms(100), TTL, root(0xAA), now);
+        table.register(&branch_b, other_peer, ms(200), TTL, root(0xAA), now);
+        table.register(&unrelated, peer, ms(100), TTL, root(0xBB), now);
+
+        let mut actions = table.deregister(&branch_a.interest.interest_digest, None, peer, now);
+        actions.sort_by_key(|(key, _)| key.provider);
+        assert_eq!(
+            actions,
+            vec![
+                (branch_a.clone(), UpstreamAction::Deregister),
+                (
+                    branch_b.clone(),
+                    UpstreamAction::Register { strictest: ms(200) },
+                ),
+            ],
+        );
+        assert_eq!(table.downstreams(&branch_a, now), Vec::new());
+        assert_eq!(table.downstreams(&branch_b, now), vec![other_peer]);
+        assert_eq!(table.downstreams(&unrelated, now), vec![peer]);
+    }
+
+    #[test]
+    fn deregister_unknown_digest_is_a_noop() {
+        let now = Instant::now();
+        let mut table = InterestTable::new(512);
+        table.register(&key(), DownstreamId::Peer(1), ms(100), TTL, root(0xAA), now);
+        let other_digest = key_with_audience(0xCC).interest.interest_digest;
+        let actions = table.deregister(&other_digest, None, DownstreamId::Peer(1), now);
+        assert_eq!(actions, Vec::new());
         assert_eq!(table.len(), 1);
     }
 
