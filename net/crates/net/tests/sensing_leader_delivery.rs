@@ -345,6 +345,122 @@ async fn provider_free_ttl_half_refreshes_do_not_starve_leader_delivery() {
 }
 
 #[tokio::test]
+async fn watch_expiry_fully_reclaims_provider_free_observation_state() {
+    // SI-4 re-review item 6: a provider-free branch has no
+    // provider-keyed table row at the final consumer, so no later
+    // table-expiry event cleans its observation state — before the
+    // fix, watch expiry removed the expectation and consumer cells
+    // but leaked latest/upstream/slots/provider epochs forever,
+    // letting provider churn permanently consume
+    // MAX_SENSING_OBSERVATIONS.
+    //
+    //   A (watch, D = 200 ms) — R (leader) — P (owner identity)
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&a, &r, &p] {
+        node.start();
+    }
+    for node in [&a, &r] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, r_id, p_id) = (a.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let refresher = |node: Arc<MeshNode>| {
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ =
+                    node.register_capability_interest(&spec, r_id, Duration::from_millis(200), TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+
+    // ── Materialize the full observation state at A ──
+    let refresh_a = refresher(a.clone());
+    await_condition(Duration::from_secs(10), "A materializes the branch", || {
+        a.sensing_observation_count() == 1
+            && a.sensing_provider_epoch_count() == 1
+            && a.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+    let overlay = a.subscribe_sensing_overlay_changes();
+    let generation_before = *overlay.borrow();
+
+    // ── Expiry: the consumer stops refreshing; the watch lapses ──
+    refresh_a.abort();
+    await_condition(
+        Duration::from_secs(10),
+        "watch expiry drains ALL observation state",
+        || {
+            a.sensing_observation_count() == 0
+                && a.sensing_provider_epoch_count() == 0
+                && a.sensing_projected(&branch) == ProjectedReadiness::Unknown
+        },
+    )
+    .await;
+    assert!(
+        *overlay.borrow() > generation_before,
+        "a disappearing projection fires the overlay signal",
+    );
+
+    // ── Reuse: a fresh registration flows end-to-end again ──
+    let refresh_a = refresher(a.clone());
+    await_condition(Duration::from_secs(10), "re-registration flows again", || {
+        a.sensing_observation_count() == 1
+            && a.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+
+    refresh_a.abort();
+    a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}
+
+#[tokio::test]
 async fn provider_refusal_partitions_the_leaders_real_consumer_rows() {
     // SI-4 re-review item 4: the mesh holds ONE aggregate Leader row
     // while the leader relay holds the real per-consumer cadences.

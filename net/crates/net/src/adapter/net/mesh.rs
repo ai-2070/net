@@ -10070,13 +10070,24 @@ impl MeshNode {
                             }
 
                             // SI-4 review P0 + P1 (local
-                            // lifecycle): expire provider-free
-                            // digest expectations, then sweep
-                            // consumer cells against what still
-                            // justifies them — a live Local row or
-                            // a live digest watch. Removals and
-                            // projection transitions fire the
-                            // overlay signal.
+                            // lifecycle) + re-review item 6: expire
+                            // provider-free digest expectations,
+                            // then sweep EVERY materialized branch
+                            // against what still justifies it. A
+                            // consumer cell survives on a live
+                            // Local row OR a live digest watch; the
+                            // rest of a branch's observation state
+                            // (latest, upstream cell, slots, epoch
+                            // share) survives on ANY live table row
+                            // or a live watch — provider-free
+                            // branches have no provider-keyed row
+                            // at this hop, so without this pass no
+                            // later table-expiry event would ever
+                            // clean them and watch churn would
+                            // permanently consume
+                            // MAX_SENSING_OBSERVATIONS. Removals
+                            // fire the overlay signal when a
+                            // visible projection disappeared.
                             let live_interests: std::collections::HashSet<
                                 sensing::CapabilityInterestKey,
                             > = {
@@ -10086,41 +10097,76 @@ impl MeshNode {
                                     .retain(|_, (_, expires)| *expires > poll_now);
                                 interests.keys().cloned().collect()
                             };
-                            let cell_keys: Vec<sensing::ProviderInterestKey> = {
-                                sensing_observations
-                                    .lock()
-                                    .consumer_cells
+                            let branch_keys: std::collections::HashSet<
+                                sensing::ProviderInterestKey,
+                            > = {
+                                let observations = sensing_observations.lock();
+                                observations
+                                    .latest
                                     .keys()
+                                    .chain(observations.upstream.keys())
+                                    .chain(observations.consumer_cells.keys())
+                                    .chain(
+                                        observations
+                                            .slots
+                                            .keys()
+                                            .map(|(branch, _)| branch),
+                                    )
                                     .cloned()
                                     .collect()
                             };
-                            let dead_cells: Vec<sensing::ProviderInterestKey> = {
+                            let mut dead_branches = Vec::new();
+                            let mut dead_cells = Vec::new();
+                            {
                                 let table = sensing_interest_table.lock();
-                                cell_keys
-                                    .into_iter()
-                                    .filter(|key| {
-                                        let local_live = table
-                                            .downstream_entry(
-                                                key,
-                                                sensing::DownstreamId::Local,
-                                            )
-                                            .is_some_and(|row| {
-                                                row.expires_at > poll_now
-                                            });
-                                        !local_live
-                                            && !live_interests.contains(&key.interest)
-                                    })
-                                    .collect()
-                            };
-                            if !dead_cells.is_empty() {
+                                for key in branch_keys {
+                                    if live_interests.contains(&key.interest) {
+                                        continue;
+                                    }
+                                    if table.downstreams(&key, poll_now).is_empty() {
+                                        // No watch, no rows: nothing
+                                        // justifies ANY of the
+                                        // branch's state.
+                                        dead_branches.push(key);
+                                        continue;
+                                    }
+                                    let local_live = table
+                                        .downstream_entry(
+                                            &key,
+                                            sensing::DownstreamId::Local,
+                                        )
+                                        .is_some_and(|row| {
+                                            row.expires_at > poll_now
+                                        });
+                                    if !local_live {
+                                        // Relay duty continues; only
+                                        // the local consumer view
+                                        // lost its justification.
+                                        dead_cells.push(key);
+                                    }
+                                }
+                            }
+                            if !dead_branches.is_empty() || !dead_cells.is_empty() {
+                                let mut projection_dropped = false;
                                 let mut observations = sensing_observations.lock();
+                                for key in dead_branches {
+                                    projection_dropped |= observations
+                                        .consumer_cells
+                                        .contains_key(&key);
+                                    observations.reclaim_branch(&key);
+                                }
                                 for key in dead_cells {
-                                    observations.consumer_cells.remove(&key);
+                                    projection_dropped |= observations
+                                        .consumer_cells
+                                        .remove(&key)
+                                        .is_some();
                                 }
                                 drop(observations);
-                                sensing_overlay_changed.send_modify(|generation| {
-                                    *generation = generation.wrapping_add(1);
-                                });
+                                if projection_dropped {
+                                    sensing_overlay_changed.send_modify(|generation| {
+                                        *generation = generation.wrapping_add(1);
+                                    });
+                                }
                             }
                         }
 
