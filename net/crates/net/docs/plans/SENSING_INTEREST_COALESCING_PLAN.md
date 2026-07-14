@@ -25,9 +25,13 @@ expectation-map tuple) is closed with the named
 further SI-4 architectural review is required"); **SI-5 COMPLETE
 as-built (2026-07-14)** — the §4.8 failure plane wired event-driven
 at the failure-detector edge, the RT-5 withdrawal intake, and the
-epoch-supersession seam, witnessed by the new
-`sensing_failure_plane` suite (as-built note in §6, awaiting
-review). Next: SI-5 review; then SI-6 (scheduler bridge).
+epoch-supersession seam (`sensing_failure_plane` suite);
+**SI-6 COMPLETE as-built (2026-07-14)** — sensed aggregate views
+join gang candidate pruning through the Projection-4 seam
+(Projection 6 + `match_islands_sensed` + `claim_island_sensed`;
+the claim targets the selected provider; §4.9 overlay accessor,
+suspension flag untouched). Both as-built notes in §6, awaiting
+review. Next: SI-5/SI-6 review; then SI-7 (docs + observability).
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1636,6 +1640,53 @@ must exercise the real dispatch path.
   pruning through the same projection seam as local liveness;
   compound AND/gang semantics stay in the scheduler; claim targets
   the selected provider.
+  *SI-6 as-built (2026-07-14, 79c15b5f0; operator-directed):*
+  1. **One viability source of truth:**
+     `sensing::classify_branch` (`BranchViability`) extracts the
+     exact §3.5 rule; `project_aggregate` refactored onto it,
+     behavior-preserving.
+  2. **Projection 6** (`scheduler_bridge/readiness.rs`, pure):
+     `project_sensed_candidates` → `SensedCandidates`
+     {viable(ranked by the aggregate's consumer-local economics),
+     potential, non_viable} + `selected_provider()`. Projection-4
+     disciplines carried over (deterministic, absence of evidence
+     never prunes, prune-not-mutate) plus §4.9's own: NEVER a
+     suspension — the entry flag stays reserved for unconditional
+     loss. The bridge shell is un-gated (Projection 6 needs only
+     fold + sensing); the cortex/meshos projections keep their
+     feature gate.
+  3. **The matcher join:** `gang::match_islands_sensed` — non-viable
+     hosts pruned from THIS match exactly like down hosts; viable
+     hosts' islands lead in sensed rank (STABLE re-rank; bands
+     preserve the selection policy); empty delta byte-identical to
+     `match_islands`.
+  4. **MeshNode seam:** `sensing_branch_views` extracted (aggregate,
+     overlay, candidate order share one input join);
+     `sensed_candidates`, `match_islands_sensed`,
+     `claim_island_sensed` (the first successful claim targets the
+     SELECTED provider), and the §4.9 TWO-LEVEL overlay accessor
+     `sensing_readiness_overlay` (aggregate + per-(provider,
+     generation) observations, joined at READ time — fold state
+     never mutated; readiness is consumer-relative, §3.5, so
+     embedding it in fold entries would be wrong twice over).
+  Witnesses (each red with the join disabled): 5 units + e2e
+  `sensing_scheduler_bridge.rs` on REAL sensed state — island loads
+  ordered AGAINST the sensed rank prove the join overrides the
+  selection policy; the claim lands on the selected provider; a
+  NotReady flip (overlay signal = the re-match wake-up) re-routes
+  the claim while the PLAIN match still offers both hosts (§4.9
+  tripwire at node level).
+  Bounds (per §4.12, for review): compound AND/gang semantics stay
+  with the scheduler (the projection is per-interest by
+  construction); re-match cadence is the scheduler's, driven by
+  `subscribe_sensing_overlay_changes`; Any-mode re-expansion stays
+  the local resolver's move (`expand_to_standby` seam); leader
+  candidate-set recomputation on fold membership changes remains
+  open (rides the SI-7 observability round or a review-directed
+  slice).
+  Verification: 4,909 lib all-features + 2,621 net-only, 38 sensing
+  e2e across eleven suites, both clippy gates (incl. `-D
+  warnings`), fmt — green.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
