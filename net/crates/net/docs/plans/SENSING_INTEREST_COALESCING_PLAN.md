@@ -34,8 +34,12 @@ suspension flag untouched). **SI-5 review (2026-07-14): CHANGES
 REQUESTED — closure LANDED same day** (P0 stale-epoch sibling
 resurrection → three-way epoch standing with stale-drop; P1
 relayed-PeerInfo misclassification → shared live-direct-session
-predicate; both red-green verified, §6). Next: SI-5 re-review +
-SI-6 review (held behind it); then SI-7 (docs + observability).
+predicate); **SI-6 review (2026-07-14): CHANGES REQUESTED — closure
+LANDED same day** (unified scheduler-input generation +
+scheduler-relevant intake tuple; overlay candidates ride the
+resolved-population seam; SI-6.1 leader fold reconciliation;
+mechanical net-only strict clippy; all red-green, §6). Next: SI-5 +
+SI-6 re-review; SI-7 holds behind both.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
