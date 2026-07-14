@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_4039add9d1db4f 69-70
+net/crates/net/tests/sensing_leader_delivery.rs
+  s_c28bdf38c0df3a::t_18f1dff9458652 44
+  s_c28bdf38c0df3a::t_820609fb8bde7a 348-485
+  s_c28bdf38c0df3a::t_6f15674ed87aae 347
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_5d586b8d93b617 12523,12525,12531-12550
+  s_c28bdf38c0df3a::t_484e7e6a9c980e 12759-12772
+  s_c28bdf38c0df3a::t_3e00b76cb3a797 12800-12806,12808-12815,12836-12853
+  s_c28bdf38c0df3a::t_9b6aeec21d1c69 13084-13086,13091,13093,13096,13112-13195,13202-13215
+  s_c28bdf38c0df3a::t_d9b0907676c90e 12807
+  s_c28bdf38c0df3a::t_7518ed252c64f8 12524,13196-13201
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_18c17b46c47f3c 120-124
+  s_c28bdf38c0df3a::t_18532a10db1c28 325
+  s_c28bdf38c0df3a::t_ec64ae11ee6b84 216-237
+  s_c28bdf38c0df3a::t_05cadeb28a4cad 538-561,563-590
+  s_c28bdf38c0df3a::t_7518ed252c64f8 562
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "2a48ff922f38b8f6463bab02d03277e3bc4402e0",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
