@@ -1,0 +1,22 @@
+net/crates/net/tests/sensing_relay_delivery.rs
+  s_c28bdf38c0df3a::t_4373ee24ae5433 224-227,230,239,241,244-250
+  s_c28bdf38c0df3a::t_634dd70bcdf150 306-315
+  s_c28bdf38c0df3a::t_8ec1bbad3566cd 60-65
+  s_c28bdf38c0df3a::t_af9d50a8a8f84c 1-59,66-223,228-229,231-238,240,242-243,251-305,316-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "81cef561fea9f497f3f4d287000849ca30e356d0",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
