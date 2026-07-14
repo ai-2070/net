@@ -1,0 +1,34 @@
+net/crates/net/tests/sensing_leader_delivery.rs
+  s_c28bdf38c0df3a::t_e64fbafb4bd024 235-314,323,325-346
+  s_c28bdf38c0df3a::t_e98cc6cb6d888e 315-322,324
+  s_c28bdf38c0df3a::t_2bf2834eecacf8 234
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_113ee1fb224286 546,562
+  s_c28bdf38c0df3a::t_843628471f5192 580-582,584
+  s_c28bdf38c0df3a::t_0f2cf23db021cd 532-539
+  s_c28bdf38c0df3a::t_42cd372f6e6f8e 818-894
+net/crates/net/src/adapter/net/behavior/sensing/delivery.rs
+  s_c28bdf38c0df3a::t_113ee1fb224286 244
+  s_c28bdf38c0df3a::t_4d5cd263227ee3 196-205,234,245-258
+  s_c28bdf38c0df3a::t_56a49f570c02be 373-415
+  s_c28bdf38c0df3a::t_97df5b8aa5674c 891-897,900
+  s_c28bdf38c0df3a::t_0d37ae7c9e4172 785-828
+  s_c28bdf38c0df3a::t_fe7fd40d9b2c5b 846-852,859-862
+  s_c28bdf38c0df3a::t_a95b9d9d335624 784
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "044a4fbe382c82a46e7eb95d746e14d1eb05b655",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
