@@ -40,12 +40,20 @@ use std::time::{Duration, Instant};
 use super::continuity::Continuity;
 use super::identity::{AudienceScopeCommitment, Digest256, ProviderInterestKey};
 
-/// Who registered an interest at this hop: the node's own consumer
-/// or a downstream peer session.
+/// Who registered an interest at this hop: the node's own consumer,
+/// the node's INTERNAL leader role, or a downstream peer session.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DownstreamId {
-    /// This node's own interest (the `LOCAL` row in plan §4.3).
+    /// This node's own application-level interest (the `LOCAL` row
+    /// in plan §4.3) — deliveries feed the node's consumer overlay.
     Local,
+    /// The node's OWN sensing-leader role's coalesced demand (SI-4
+    /// review P0): deliveries feed `SensingLeader::on_attestation`,
+    /// which fans the proof to the leader's real consumer rows.
+    /// Distinct from [`Self::Local`] so an internal leader
+    /// subscription can never masquerade as a node-local
+    /// application watch.
+    Leader,
     /// A downstream peer, by node id (session-authenticated).
     Peer(u64),
 }

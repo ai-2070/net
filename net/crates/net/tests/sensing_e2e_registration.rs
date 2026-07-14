@@ -276,8 +276,12 @@ async fn chain_registration_coalesces_propagates_and_drains() {
     );
 
     // ── (b) R's OWN table + multi-hop upstream propagation to H ──
-    await_condition(Duration::from_secs(5), "R gains its own Local row", || {
-        r.sensing_downstreams(&branch_key) == vec![DownstreamId::Local]
+    await_condition(Duration::from_secs(5), "R gains its own Leader row", || {
+        // SI-4 review P0: the leader's coalesced demand is the
+        // LEADER row — distinct from a node-local application
+        // watch, so returning proofs fan out through the leader
+        // relay instead of feeding R's own overlay.
+        r.sensing_downstreams(&branch_key) == vec![DownstreamId::Leader]
     })
     .await;
     assert_eq!(
@@ -335,8 +339,8 @@ async fn chain_registration_coalesces_propagates_and_drains() {
     );
     assert_eq!(
         r.sensing_downstreams(&branch_key),
-        vec![DownstreamId::Local],
-        "R's table still carries ONE Local row — the merge point",
+        vec![DownstreamId::Leader],
+        "R's table still carries ONE Leader row — the merge point",
     );
     assert_eq!(
         h.sensing_downstreams(&branch_key),

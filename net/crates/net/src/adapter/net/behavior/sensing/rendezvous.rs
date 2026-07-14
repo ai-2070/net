@@ -1230,7 +1230,7 @@ mod tests {
         let branch = ProviderInterestKey::new(reg_a.interest.clone(), 7);
         let mut downstreams = leader.relay.table.downstreams(&branch, t0);
         downstreams.sort_by_key(|d| match d {
-            DownstreamId::Local => 0,
+            DownstreamId::Local | DownstreamId::Leader => 0,
             DownstreamId::Peer(id) => *id,
         });
         assert_eq!(

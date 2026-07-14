@@ -1125,6 +1125,10 @@ struct DispatchCtx {
     /// wake-up seam). Subscribe via
     /// `MeshNode::subscribe_sensing_overlay_changes`.
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// SI-4 review P0: provider-free digest expectations. See the
+    /// matching field on `MeshNode`.
+    sensing_capability_interests:
+        Arc<parking_lot::Mutex<HashMap<sensing::CapabilityInterestKey, (Duration, Instant)>>>,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
@@ -2842,6 +2846,90 @@ fn spawn_route_withdrawal_flood(
 /// propagate.
 const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
+/// SI-4 review P0: fan one batch of leader-relay deliveries out to
+/// the REAL destinations. The leader's relay works on semantic
+/// attestations; the wire form is this hop's latest cache — matched
+/// on (incarnation, seq) so a torn race skips (the next beat
+/// repairs) and "relays forward identical signed bytes" holds for
+/// the leader path too. `Peer` deliveries ride the envelope stream
+/// their bearing selects; `Local` deliveries feed the node's own
+/// consumer overlay.
+#[cfg(feature = "redex")]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sensing_leader_deliveries(
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    router: &Arc<NetRouter>,
+    partition_filter: &PartitionFilter,
+    local_node_id: u64,
+    observations: &Arc<parking_lot::Mutex<SensingObservations>>,
+    overlay: &Arc<tokio::sync::watch::Sender<u64>>,
+    factor: u32,
+    deliveries: Vec<sensing::Delivery>,
+    now: Instant,
+) {
+    let mut overlay_moved = false;
+    for delivery in deliveries {
+        let branch = delivery.attestation.branch();
+        let wire = {
+            let observations = observations.lock();
+            observations.latest.get(&branch).and_then(|cached| {
+                ((cached.origin_incarnation, cached.seq)
+                    == (
+                        delivery.attestation.origin_incarnation,
+                        delivery.attestation.seq,
+                    ))
+                    .then(|| cached.clone())
+            })
+        };
+        let Some(wire) = wire else {
+            continue;
+        };
+        match delivery.to {
+            sensing::DownstreamId::Peer(node) => {
+                let stream_id = if delivery.continuity_bearing {
+                    sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64
+                } else {
+                    sensing::SENSING_PROVISIONAL_STREAM
+                };
+                if let Ok(bytes) = sensing::encode_attestation(&wire) {
+                    spawn_sensing_frame_send(
+                        socket,
+                        peers,
+                        addr_to_node,
+                        router,
+                        partition_filter,
+                        local_node_id,
+                        node,
+                        stream_id,
+                        sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                        bytes,
+                    );
+                }
+            }
+            sensing::DownstreamId::Local => {
+                let interval = wire.promised_cadence;
+                overlay_moved |= observations.lock().feed_consumer_cell(
+                    &branch,
+                    &wire,
+                    delivery.continuity_bearing,
+                    interval,
+                    factor,
+                    now,
+                );
+            }
+            // The leader's own table never holds a Leader row.
+            sensing::DownstreamId::Leader => {}
+        }
+    }
+    if overlay_moved {
+        overlay.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
 /// SI-3 closure item 4: the wire-interval bound. A zero interval
 /// demands an infinite-rate stream; an interval beyond the local
 /// soft-state lifetime cannot produce a meaningful continuity
@@ -3719,6 +3807,15 @@ pub struct MeshNode {
     /// expiry). The SI-6 scheduler bridge subscribes via
     /// [`MeshNode::subscribe_sensing_overlay_changes`].
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// SI-4 review P0: this node's PROVIDER-FREE interest
+    /// registrations (`MeshNode::register_capability_interest`) —
+    /// digest-level expectations, value = (own D, expires_at). A
+    /// returning leader fan-out for a registered digest is
+    /// solicited even though no provider-keyed row exists (the
+    /// consumer never chose the provider). Soft state: refreshed by
+    /// re-registration, expired by the sweep.
+    sensing_capability_interests:
+        Arc<parking_lot::Mutex<HashMap<sensing::CapabilityInterestKey, (Duration, Instant)>>>,
     /// SI-3c: the verified observation seam (decode → solicited
     /// check → signature → seq gate → here): latest admitted status
     /// per branch, refusal control responses kept apart (closure
@@ -4448,6 +4545,7 @@ impl MeshNode {
                 sensing::IncarnationSeqGate::new(),
             )),
             sensing_overlay_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
+            sensing_capability_interests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             sensing_observations: Arc::new(parking_lot::Mutex::new(SensingObservations::default())),
             roster,
             channel_configs: None,
@@ -4817,6 +4915,83 @@ impl MeshNode {
             }
         }
         Ok(outcome)
+    }
+
+    /// SI-4 review P0: register (or refresh) a PROVIDER-FREE
+    /// capability interest (plan §4.1) — the consumer half of the
+    /// rendezvous path. Records the digest-level expectation that
+    /// makes returning leader fan-outs solicited at this hop
+    /// (proofs may arrive for ANY provider the leader resolved —
+    /// the consumer never chose one), and sends the
+    /// `CapabilityRegistration` frame toward `leader` (min-gap
+    /// damped). Soft state: re-call at ttl/2; the sweep expires the
+    /// expectation and its consumer cells.
+    ///
+    /// The leader id is the caller's for now — computing it via the
+    /// §4.1 rendezvous requires scope-membership plumbing that
+    /// rides a later slice.
+    pub fn register_capability_interest(
+        &self,
+        spec: &sensing::InterestSpec,
+        leader: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<(), SensingRegistrationError> {
+        if !self.config.enable_sensing_coalescing {
+            return Err(SensingRegistrationError::Disabled);
+        }
+        if !sensing_interval_in_bounds(requested_sample_interval, self.config.sensing_interest_ttl)
+        {
+            return Err(SensingRegistrationError::Interval {
+                requested: requested_sample_interval,
+                max: self.config.sensing_interest_ttl,
+            });
+        }
+        if soft_state_ttl.is_zero() {
+            return Err(SensingRegistrationError::ZeroTtl);
+        }
+        sensing::validate_subscriber_scope(
+            &self.sensing_local_root,
+            &self.sensing_local_root,
+            &self.sensing_local_root,
+            &spec.audience,
+            &self.sensing_counters,
+        )
+        .map_err(SensingRegistrationError::Scope)?;
+        let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
+        let key = spec.key();
+        self.sensing_capability_interests.lock().insert(
+            key.clone(),
+            (requested_sample_interval, Instant::now() + ttl),
+        );
+        if sensing_upstream_damper_admits(
+            &self.sensing_upstream_damper,
+            leader,
+            *key.interest_digest.as_bytes(),
+            sensing_effective_min_gap(ttl),
+        ) {
+            let frame = sensing::SensingInterestFrame::capability_registration(
+                spec,
+                requested_sample_interval,
+                ttl,
+                self.node_id,
+            );
+            if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+                spawn_sensing_frame_send(
+                    &self.socket,
+                    &self.peers,
+                    &self.addr_to_node,
+                    &self.router,
+                    &self.partition_filter,
+                    self.node_id,
+                    leader,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                    bytes,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// SI-3: install (or replace) the [`sensing::ReadinessEvaluator`]
@@ -6432,7 +6607,11 @@ impl MeshNode {
                         .into_iter()
                         .filter_map(|downstream| match downstream {
                             sensing::DownstreamId::Peer(node) => Some(node),
-                            sensing::DownstreamId::Local => None,
+                            // Local: the self-provider watch (R-5
+                            // seam). Leader: a co-located origin +
+                            // leader — its fan-out rides the same
+                            // seam.
+                            sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
                         })
                         .collect();
                     if peer_downstreams.is_empty() {
@@ -6610,6 +6789,7 @@ impl MeshNode {
             sensing_observer_gate: self.sensing_observer_gate.clone(),
             sensing_continuity_factor: self.config.continuity_factor,
             sensing_overlay_changed: self.sensing_overlay_changed.clone(),
+            sensing_capability_interests: self.sensing_capability_interests.clone(),
             sensing_observations: self.sensing_observations.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
@@ -9203,6 +9383,7 @@ impl MeshNode {
         let sensing_interest_ttl = self.config.sensing_interest_ttl;
         let sensing_overlay_changed = self.sensing_overlay_changed.clone();
         let continuity_factor = self.config.continuity_factor;
+        let sensing_capability_interests = self.sensing_capability_interests.clone();
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -9321,8 +9502,36 @@ impl MeshNode {
                             // hop's own Local rows (below) expire on
                             // the same clock.
                             #[cfg(feature = "redex")]
-                            if let Some(leader) = sensing_leader.lock().as_mut() {
-                                leader.sweep(Instant::now());
+                            {
+                                // SI-4 review P0: drive the leader
+                                // relay's own clock too — its
+                                // down-sampled catch-ups fan out as
+                                // real frames.
+                                let deliveries = {
+                                    let mut slot = sensing_leader.lock();
+                                    match slot.as_mut() {
+                                        Some(leader) => {
+                                            leader.sweep(Instant::now());
+                                            leader.poll(Instant::now())
+                                        }
+                                        None => Vec::new(),
+                                    }
+                                };
+                                if !deliveries.is_empty() {
+                                    dispatch_sensing_leader_deliveries(
+                                        &socket,
+                                        &peers,
+                                        &addr_to_node,
+                                        &router,
+                                        &partition_filter,
+                                        local_node_id,
+                                        &sensing_observations,
+                                        &sensing_overlay_changed,
+                                        continuity_factor,
+                                        deliveries,
+                                        Instant::now(),
+                                    );
+                                }
                             }
                             // Closure item 7: the stamp snapshot
                             // precedes the expiry read the retire
@@ -9483,6 +9692,12 @@ impl MeshNode {
                                 }
                             }
                             let mut flushes: Vec<(u64, Vec<u8>, bool)> = Vec::new();
+                            #[cfg(feature = "redex")]
+                            let mut leader_feeds: Vec<(
+                                sensing::ProviderInterestKey,
+                                sensing::ReadinessAttestation,
+                                bool,
+                            )> = Vec::new();
                             {
                                 let mut observations = sensing_observations.lock();
                                 for key in dead_slots {
@@ -9539,9 +9754,54 @@ impl MeshNode {
                                                         poll_now,
                                                     );
                                             }
+                                            // SI-4 review P0: the
+                                            // leader row's catch-up
+                                            // hands the cached beat
+                                            // to the leader relay.
+                                            #[cfg(feature = "redex")]
+                                            sensing::DownstreamId::Leader => {
+                                                leader_feeds.push((
+                                                    branch.clone(),
+                                                    cached.clone(),
+                                                    bearing,
+                                                ));
+                                            }
+                                            #[cfg(not(feature = "redex"))]
+                                            sensing::DownstreamId::Leader => {}
                                         }
                                     }
                                 }
+                            }
+                            #[cfg(feature = "redex")]
+                            for (branch, cached, bearing) in leader_feeds {
+                                let Ok(semantic) = sensing::semantic_attestation(
+                                    &branch.interest,
+                                    &cached,
+                                ) else {
+                                    continue;
+                                };
+                                let deliveries = {
+                                    let mut slot = sensing_leader.lock();
+                                    match slot.as_mut() {
+                                        Some(leader) => leader.on_attestation(
+                                            poll_now, &semantic, bearing,
+                                        ),
+                                        None => Vec::new(),
+                                    }
+                                };
+                                dispatch_sensing_leader_deliveries(
+                                    &socket,
+                                    &peers,
+                                    &addr_to_node,
+                                    &router,
+                                    &partition_filter,
+                                    local_node_id,
+                                    &sensing_observations,
+                                    &sensing_overlay_changed,
+                                    continuity_factor,
+                                    deliveries,
+                                    poll_now,
+                                );
                             }
                             if overlay_moved {
                                 sensing_overlay_changed.send_modify(|generation| {
@@ -9566,6 +9826,60 @@ impl MeshNode {
                                     sensing::SUBPROTOCOL_READINESS_ATTESTATION,
                                     bytes,
                                 );
+                            }
+
+                            // SI-4 review P0 + P1 (local
+                            // lifecycle): expire provider-free
+                            // digest expectations, then sweep
+                            // consumer cells against what still
+                            // justifies them — a live Local row or
+                            // a live digest watch. Removals and
+                            // projection transitions fire the
+                            // overlay signal.
+                            let live_interests: std::collections::HashSet<
+                                sensing::CapabilityInterestKey,
+                            > = {
+                                let mut interests =
+                                    sensing_capability_interests.lock();
+                                interests
+                                    .retain(|_, (_, expires)| *expires > poll_now);
+                                interests.keys().cloned().collect()
+                            };
+                            let cell_keys: Vec<sensing::ProviderInterestKey> = {
+                                sensing_observations
+                                    .lock()
+                                    .consumer_cells
+                                    .keys()
+                                    .cloned()
+                                    .collect()
+                            };
+                            let dead_cells: Vec<sensing::ProviderInterestKey> = {
+                                let table = sensing_interest_table.lock();
+                                cell_keys
+                                    .into_iter()
+                                    .filter(|key| {
+                                        let local_live = table
+                                            .downstream_entry(
+                                                key,
+                                                sensing::DownstreamId::Local,
+                                            )
+                                            .is_some_and(|row| {
+                                                row.expires_at > poll_now
+                                            });
+                                        !local_live
+                                            && !live_interests.contains(&key.interest)
+                                    })
+                                    .collect()
+                            };
+                            if !dead_cells.is_empty() {
+                                let mut observations = sensing_observations.lock();
+                                for key in dead_cells {
+                                    observations.consumer_cells.remove(&key);
+                                }
+                                drop(observations);
+                                sensing_overlay_changed.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
                             }
                         }
 
@@ -11546,6 +11860,25 @@ impl MeshNode {
                             return;
                         }
                     };
+                    // SI-4 review P0: the leader relay's warm-starts
+                    // for the registering consumer go out as REAL
+                    // provisional frames (§4.4 anti-entropy on the
+                    // provider-free path).
+                    if !registration.warm_starts.is_empty() {
+                        dispatch_sensing_leader_deliveries(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            &ctx.sensing_observations,
+                            &ctx.sensing_overlay_changed,
+                            ctx.sensing_continuity_factor,
+                            registration.warm_starts.clone(),
+                            now,
+                        );
+                    }
                     // SI-2 closing seam: the leader's coalesced
                     // demand per resolved branch — the strictest D
                     // across ALL consumers its relay table holds —
@@ -11601,9 +11934,15 @@ impl MeshNode {
                         );
                         let (outcome, aggregate) = {
                             let mut table = ctx.sensing_interest_table.lock();
+                            // SI-4 review P0: the leader's coalesced
+                            // demand is the LEADER row — distinct
+                            // from a node-local application watch,
+                            // so returning proofs dispatch to the
+                            // leader relay's fan-out, never to the
+                            // node's own consumer overlay.
                             let outcome = table.register(
                                 &key,
-                                sensing::DownstreamId::Local,
+                                sensing::DownstreamId::Leader,
                                 strictest_demand,
                                 ttl,
                                 ctx.sensing_local_root,
@@ -11991,7 +12330,7 @@ impl MeshNode {
         Self::send_sensing_refusal_beat(ctx, beat, {
             partition.refused.into_iter().filter_map(|d| match d {
                 sensing::DownstreamId::Peer(node) => Some(node),
-                sensing::DownstreamId::Local => None,
+                sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
             })
         });
     }
@@ -12063,11 +12402,22 @@ impl MeshNode {
         };
         let branch = sensing::ProviderInterestKey::new(interest, attestation.origin);
         let now = Instant::now();
-        if ctx
-            .sensing_interest_table
-            .lock()
-            .downstreams(&branch, now)
-            .is_empty()
+        // SI-4 review P0: a PROVIDER-FREE registration solicits
+        // proofs from any provider the leader resolved — the
+        // digest-level expectation admits what no provider-keyed
+        // row can.
+        let digest_watch: Option<Duration> = {
+            let interests = ctx.sensing_capability_interests.lock();
+            interests
+                .get(&branch.interest)
+                .and_then(|(interval, expires)| (*expires > now).then_some(*interval))
+        };
+        if digest_watch.is_none()
+            && ctx
+                .sensing_interest_table
+                .lock()
+                .downstreams(&branch, now)
+                .is_empty()
         {
             tracing::trace!(
                 origin = format!("{:#x}", attestation.origin),
@@ -12297,6 +12647,24 @@ impl MeshNode {
             .set_upstream_continuity(&branch, continuity);
         let bearing = continuity == sensing::Continuity::Established;
         Self::schedule_sensing_forwards(ctx, &branch, &attestation, payload, bearing, now);
+        // SI-4 review P0: a provider-free digest watch consumes the
+        // beat directly at the consumer's own D — no provider-keyed
+        // row exists to schedule through.
+        if let Some(interval) = digest_watch {
+            let moved = ctx.sensing_observations.lock().feed_consumer_cell(
+                &branch,
+                &attestation,
+                bearing,
+                interval,
+                ctx.sensing_continuity_factor,
+                now,
+            );
+            if moved {
+                ctx.sensing_overlay_changed.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
+            }
+        }
     }
 
     /// SI-4a: per-downstream forwarding of one admitted beat (the
@@ -12328,6 +12696,7 @@ impl MeshNode {
         };
         let mut forwards: Vec<u64> = Vec::new();
         let mut overlay_moved = false;
+        let mut feed_leader = false;
         {
             let mut observations = ctx.sensing_observations.lock();
             for (downstream, interval) in rows {
@@ -12364,6 +12733,10 @@ impl MeshNode {
                                 now,
                             );
                         }
+                        // SI-4 review P0: the leader row's delivery
+                        // point hands the beat to the leader relay,
+                        // which fans it to the REAL consumer rows.
+                        sensing::DownstreamId::Leader => feed_leader = true,
                     }
                 } else {
                     slot.pending = true;
@@ -12375,6 +12748,33 @@ impl MeshNode {
                 *generation = generation.wrapping_add(1);
             });
         }
+        #[cfg(feature = "redex")]
+        if feed_leader {
+            if let Ok(semantic) = sensing::semantic_attestation(&branch.interest, attestation) {
+                let deliveries = {
+                    let mut slot = ctx.sensing_leader.lock();
+                    match slot.as_mut() {
+                        Some(leader) => leader.on_attestation(now, &semantic, bearing),
+                        None => Vec::new(),
+                    }
+                };
+                dispatch_sensing_leader_deliveries(
+                    &ctx.socket,
+                    &ctx.peers,
+                    &ctx.addr_to_node,
+                    &ctx.router,
+                    &ctx.partition_filter,
+                    ctx.local_node_id,
+                    &ctx.sensing_observations,
+                    &ctx.sensing_overlay_changed,
+                    ctx.sensing_continuity_factor,
+                    deliveries,
+                    now,
+                );
+            }
+        }
+        #[cfg(not(feature = "redex"))]
+        let _ = feed_leader;
         let stream_id = if bearing {
             sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64
         } else {
