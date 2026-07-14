@@ -1803,6 +1803,45 @@ must exercise the real dispatch path.
   reviewer's machine.
   Gate: SI-6 sign-off CHANGES REQUESTED; SI-7 HOLD until the SI-5 +
   SI-6 closures.
+  *SI-6 review closure as-built (2026-07-14, 8e6334ec3):* all three
+  items + both notes landed, each red-green verified against the
+  reviewer's exact assertions.
+  (1) Observation intake compares the scheduler-relevant tuple
+  (projection, estimated_start, generation); the watch is promoted
+  into ONE unified scheduler-input generation
+  (`subscribe_sensing_scheduler_inputs`, aliasing the overlay
+  watch) bumped by fold application, route withdrawals, failure and
+  recovery edges, and the event-pingwave chokepoint (session open /
+  change-driven topology). Continuous route-EWMA drift is
+  deliberately sampled at re-match — event-bumping it would fire at
+  heartbeat rate; budgets stay caller-owned. Witnesses: the
+  3 ms→1000 ms Ready→Ready estimate flip reverses
+  `selected_provider()` AND fires the watch; a pure fold-membership
+  change fires it with zero sensing-state movement.
+  (2) the overlay's candidate list rides the same
+  resolved-population seam as its aggregate — retained
+  out-of-population cells excluded, missing expected providers
+  absent (they are Unknown branches, not observations); witnessed
+  with a live out-of-population cell.
+  (3) SI-6.1: `SensingLeader::reconcile_with_snapshot` re-resolves
+  every interest on a changed capability (damped per capability id,
+  RT-1 shape): ineligible providers tear down (relay branch via the
+  new `InterestTable::remove_branch`, mesh Leader row + upstream
+  demand through the shared removal consequences), newly eligible
+  ones fill under-filled active sets with surviving consumers
+  registered at their existing D/ttl, standby refreshes, changes
+  bump the unified generation. Witness: a provider that stops
+  declaring the capability loses its leader branch, mesh row, and
+  origin stream far ahead of the row ttl.
+  Notes taken: island→band precomputed from one topology snapshot;
+  net-only strict clippy green (leader-only failure captures
+  cfg-gated). Test-harness caveat recorded: bare-`start()` nodes
+  DROP in-window announces (the RT-1 flush needs `start_arc`) — the
+  witness re-announces in a retry loop.
+  Verification: 4,911 lib all-features, sensing suites green
+  (scheduler bridge 1, leader delivery 8, failure plane 5), both
+  strict clippy gates, fmt. Awaiting re-review with the SI-5
+  closure; SI-7 holds behind both.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
