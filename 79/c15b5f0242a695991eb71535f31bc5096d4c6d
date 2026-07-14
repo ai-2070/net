@@ -1,0 +1,43 @@
+net/crates/net/src/adapter/net/behavior/sensing/mod.rs
+  s_c28bdf38c0df3a::t_4853e5ad65473b 82-84
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_c28bdf38c0df3a::t_452b462fc9dddb 342-468
+  s_c28bdf38c0df3a::t_4853e5ad65473b 175-181
+  s_c28bdf38c0df3a::t_383b51aac49b50 151-174,182-201
+net/crates/net/src/adapter/net/mod.rs
+  s_c28bdf38c0df3a::t_7f1c8498a1f4d1 129-130
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/mod.rs
+  s_c28bdf38c0df3a::t_e57714ab399800 24-27,45,63
+  s_c28bdf38c0df3a::t_f9edd3523cb5b9 29,31,33,35,37,39,41,43-44,46,49,51,53,55,57,59,61,64
+net/crates/net/src/adapter/net/behavior/sensing/controller.rs
+  s_c28bdf38c0df3a::t_4853e5ad65473b 305
+  s_c28bdf38c0df3a::t_0a399e5cfdeb1c 238-273
+  s_c28bdf38c0df3a::t_8b0a23fa061ebc 325-326,329-331,338
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_c28bdf38c0df3a::t_f9edd3523cb5b9 58-60
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/readiness.rs
+  s_c28bdf38c0df3a::t_03de23781b80c8 1-156
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_1744b9d8eac6ac 3385-3398
+  s_c28bdf38c0df3a::t_c760e39d1278c6 5692-5713,5715,5745-5799
+  s_c28bdf38c0df3a::t_b68bafeb1153c7 18223-18277
+net/crates/net/tests/sensing_scheduler_bridge.rs
+  s_c28bdf38c0df3a::t_4853e5ad65473b 130,323-326
+  s_c28bdf38c0df3a::t_c815268d76ce18 1-129,131-322,327-340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "79c15b5f0242a695991eb71535f31bc5096d4c6d",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
