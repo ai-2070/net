@@ -17,9 +17,13 @@ e2e) and all nine review items are closed as-built (§6);
 relay path and the remote-provider leader fan-out are VERIFIED, but
 the leader is a second relay implementation and several corrected
 mesh-relay invariants were not carried over (one P0 + eight P1s);
-**second closure round LANDED same day** — all nine items as-built
-in §6, red-green verified. Next: SI-4 re-re-review; SI-5 holds
-until it clears.
+**second closure round LANDED same day; SI-4 semantic re-review
+PASSED (2026-07-14)** — all nine items verified item-by-item; the
+one mechanical gate (strict-clippy type-complexity on the
+expectation-map tuple) is closed with the named
+`CapabilityInterestExpectation` record. **SI-4 COMPLETE; SI-5
+AUTHORIZED** ("no further SI-4 architectural review is required").
+Next: SI-5.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1549,7 +1553,27 @@ must exercise the real dispatch path.
   Verification: 4,904 lib tests all-features (143 sensing, +5
   units), 32 e2e across all nine sensing suites (7 in
   sensing_leader_delivery.rs), both clippy gates, fmt — green.
-  Awaiting the next re-review to lift the SI-5 hold.
+  *SI-4 semantic re-review (2026-07-14): PASSED — all nine items
+  verified item-by-item* (reviewer reran 143 sensing lib tests +
+  the sensing e2e suites directly). Highlighted closures: R == P is
+  a real topology; the seq gate is intentionally retained through
+  reclamation; the leader refusal path partitions consumer-specific
+  cadences, not the aggregate row; the survivor re-registration's
+  damper bypass is correct for the transition; both floor caches
+  invalidate on epoch movement; the strict single-owner limitation
+  stays honestly isolated. ONE mechanical gate: the reviewer's
+  strict clippy (`-D warnings`) flagged `clippy::type-complexity`
+  on the expanded expectation-map tuple type — fixed as requested
+  with the named record `CapabilityInterestExpectation`
+  (+ `CapabilityInterestExpectations` alias), which also makes the
+  security-load-bearing `audience` field explicit. Gate: SI-4
+  protocol semantics / production witnesses / bounded-state closure
+  / strict-owner boundary SIGNED OFF; repository closure PENDING
+  the clippy fix (this note lands with it); **SI-5 AUTHORIZED once
+  the stated clippy gates pass** — verified locally green at this
+  commit (`cargo clippy --all-features --lib -- -D warnings`, both
+  standing clippy gates, 4,904 lib tests, sensing e2e suites, fmt).
+  No further SI-4 architectural review required.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.

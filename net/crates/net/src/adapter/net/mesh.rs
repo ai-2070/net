@@ -1127,14 +1127,7 @@ struct DispatchCtx {
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-4 review P0: provider-free digest expectations. See the
     /// matching field on `MeshNode`.
-    sensing_capability_interests: Arc<
-        parking_lot::Mutex<
-            HashMap<
-                sensing::CapabilityInterestKey,
-                (Duration, Instant, sensing::AudienceScopeCommitment),
-            >,
-        >,
-    >,
+    sensing_capability_interests: CapabilityInterestExpectations,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
@@ -3140,6 +3133,26 @@ impl SensingObservations {
     }
 }
 
+/// SI-4 re-review items 8/9 (named per the sign-off's mechanical
+/// note): one provider-free digest expectation. The `audience` is
+/// the security-load-bearing field — intake admits a returning
+/// proof through the watch ONLY when the verified signer's pinned
+/// entity derives this owner root; a positional tuple hid that.
+#[derive(Clone, Copy)]
+struct CapabilityInterestExpectation {
+    /// The consumer's own requested D.
+    requested_sample_interval: Duration,
+    /// Soft-state expiry (`registration + min(ttl, local horizon)`).
+    expires_at: Instant,
+    /// The owner root this expectation solicits (item 8).
+    audience: sensing::AudienceScopeCommitment,
+}
+
+/// Shared handle to the provider-free expectation map — bounded at
+/// `max_interests_per_peer` (item 9), swept with the heartbeat.
+type CapabilityInterestExpectations =
+    Arc<parking_lot::Mutex<HashMap<sensing::CapabilityInterestKey, CapabilityInterestExpectation>>>;
+
 /// SI-2a: admit-or-drop for one upstream interest update (see
 /// [`SENSING_UPSTREAM_MIN_GAP`]). Same entry/and_modify shape as the
 /// RT-5 withdrawal damper, including the opportunistic size sweep —
@@ -3868,23 +3881,15 @@ pub struct MeshNode {
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-4 review P0: this node's PROVIDER-FREE interest
     /// registrations (`MeshNode::register_capability_interest`) —
-    /// digest-level expectations, value = (own D, expires_at,
-    /// expected audience). A returning leader fan-out for a
-    /// registered digest is solicited even though no provider-keyed
-    /// row exists (the consumer never chose the provider) — but ONLY
-    /// from a signer whose pinned entity derives the expectation's
-    /// owner root (SI-4 re-review item 8: a distinct signer that
-    /// merely knows the digest is refused). Bounded at
-    /// `max_interests_per_peer` (item 9); soft state: refreshed by
-    /// re-registration, expired by the sweep.
-    sensing_capability_interests: Arc<
-        parking_lot::Mutex<
-            HashMap<
-                sensing::CapabilityInterestKey,
-                (Duration, Instant, sensing::AudienceScopeCommitment),
-            >,
-        >,
-    >,
+    /// digest-level [`CapabilityInterestExpectation`]s. A returning
+    /// leader fan-out for a registered digest is solicited even
+    /// though no provider-keyed row exists (the consumer never chose
+    /// the provider) — but ONLY from a signer whose pinned entity
+    /// derives the expectation's owner root (SI-4 re-review item 8:
+    /// a distinct signer that merely knows the digest is refused).
+    /// Bounded at `max_interests_per_peer` (item 9); soft state:
+    /// refreshed by re-registration, expired by the sweep.
+    sensing_capability_interests: CapabilityInterestExpectations,
     /// SI-3c: the verified observation seam (decode → solicited
     /// check → signature → seq gate → here): latest admitted status
     /// per branch, refusal control responses kept apart (closure
@@ -5091,11 +5096,11 @@ impl MeshNode {
             // whose pinned entity derives this owner root.
             interests.insert(
                 key.clone(),
-                (
+                CapabilityInterestExpectation {
                     requested_sample_interval,
-                    Instant::now() + ttl,
-                    spec.audience,
-                ),
+                    expires_at: Instant::now() + ttl,
+                    audience: spec.audience,
+                },
             );
         }
         // SI-4 re-review item 5: a refreshed expectation can change
@@ -10139,7 +10144,9 @@ impl MeshNode {
                                 let mut interests =
                                     sensing_capability_interests.lock();
                                 interests
-                                    .retain(|_, (_, expires, _)| *expires > poll_now);
+                                    .retain(|_, expectation| {
+                                        expectation.expires_at > poll_now
+                                    });
                                 interests.keys().cloned().collect()
                             };
                             let branch_keys: std::collections::HashSet<
@@ -12811,11 +12818,10 @@ impl MeshNode {
         // VERIFIED signer below (re-review item 8).
         let watch_candidate: Option<(Duration, sensing::AudienceScopeCommitment)> = {
             let interests = ctx.sensing_capability_interests.lock();
-            interests
-                .get(&branch.interest)
-                .and_then(|(interval, expires, audience)| {
-                    (*expires > now).then_some((*interval, *audience))
-                })
+            interests.get(&branch.interest).and_then(|expectation| {
+                (expectation.expires_at > now)
+                    .then_some((expectation.requested_sample_interval, expectation.audience))
+            })
         };
         let has_rows = !ctx
             .sensing_interest_table
@@ -13140,7 +13146,7 @@ impl MeshNode {
             ctx.sensing_capability_interests
                 .lock()
                 .get(&branch.interest)
-                .is_some_and(|(_, expires, _)| *expires > Instant::now())
+                .is_some_and(|expectation| expectation.expires_at > Instant::now())
         }) || !ctx
             .sensing_interest_table
             .lock()
