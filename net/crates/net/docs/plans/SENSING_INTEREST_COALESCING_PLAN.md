@@ -42,8 +42,11 @@ mechanical net-only strict clippy; all red-green, §6).
 **Combined re-review (2026-07-15): SI-5 SIGNED OFF — COMPLETE; SI-6
 core items SIGNED OFF; SI-6.1 CHANGES REQUESTED** — two blocking
 edge cases (full active-set replacement loses consumer rows; fold
-reconciliation has no trailing-edge repair; disposition in §6).
-Next: SI-6.1 closure; SI-7 holds behind it.
+reconciliation has no trailing-edge repair; disposition in §6);
+**SI-6.1 closure LANDED same day (2026-07-15, §6)** — consumer-row
+union snapshotted before teardown, added-implies-demand + drain,
+dedicated leading+trailing fold coalescer, both notes taken.
+Next: SI-6.1 re-verification; SI-7 holds behind it.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1922,6 +1925,55 @@ must exercise the real dispatch path.
   reviewer: "a narrow SI-6.1 closure: snapshot consumer demand
   before teardown, correctly populate replacements, and give fold
   reconciliation a real trailing edge."
+
+  *SI-6.1 closure as-built (2026-07-15, d835326c0):* both blockers
+  and both non-blocking notes landed, each red-green verified
+  against the reviewer's exact assertions.
+  (1) `reconcile_with_snapshot` snapshots the DEDUPLICATED
+  consumer-row union across ALL old live branches BEFORE any
+  teardown (strictest interval / longest ttl where a consumer's
+  rows diverge); every replacement registers the surviving union;
+  `added` now means "acquired live downstream demand" — a
+  demandless replacement is removed on the spot, never recorded —
+  and an interest left with no demand-bearing branch DRAINS (the
+  sweep's rule). Witnesses (rendezvous units): the reviewer's exact
+  [A]→[B] unit red-fails as reviewed ("the replacement branch must
+  inherit the surviving consumer row" — left `[]`, right
+  `[Peer(193)]`); a non-identical-population unit proves the union
+  (red: only the first kept branch's rows, left `[Peer(1)]`); an
+  expired-demand unit proves drain-not-ghost (red: ghost `added`).
+  (2) fold reconciliation moved off the registration damper onto a
+  DEDICATED per-capability leading+trailing coalescer
+  (`SensingFoldGate` / `sensing_fold_gate_admit` / `_reclaim`):
+  first change reconciles immediately; an in-window change
+  schedules exactly ONE boundary run (a spawned sleeper owning a
+  `DispatchCtx` clone — the ctx now derives `Clone`; every field is
+  an Arc handle or small copy); further in-window changes coalesce;
+  the sleeper's claim is exactly-once, and a fresh out-of-window
+  run SUBSUMES a jitter-delayed sleeper. The boundary run takes a
+  FRESH snapshot at fire time (sees every coalesced change) and
+  bumps the unified scheduler-input generation itself. The
+  per-capability body is extracted as
+  `reconcile_sensing_leader_fold_one`, shared by both edges.
+  Witnesses: two gate units (leading/defer/coalesce independence;
+  exactly-once reclaim + subsumption) and the e2e
+  `suppressed_in_window_fold_change_reconciles_at_the_window_boundary`
+  — an unrelated announcement consumes C's leading edge, P's
+  membership change lands in-window (2 ms polls and an 80 ms
+  precondition assert pin the discrimination; a late landing would
+  take the leading edge and not exercise the fix), no later
+  announcement and no consumer refresh, and the leader branch +
+  origin stream retire off the trailing edge (red: the 3 s
+  trailing-edge await times out — the change never reconciles).
+  Notes taken: the 0x0C03 intake comment now states the stale-epoch
+  DROP (no longer "applies per-branch below"); the island→band map
+  derives from ONE literal `IslandQuery::All` snapshot instead of
+  per-island `Get` reads. A stray orphaned SI-4 doc fragment above
+  the fold hook was removed.
+  Verification: 4,916 lib all-features (5 new tests), leader
+  delivery 9/9, failure plane 5/5, scheduler bridge 1/1, both
+  strict clippy `-D warnings` gates, fmt, `git diff --check`.
+  Awaiting SI-6.1 re-verification; SI-7 holds.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
