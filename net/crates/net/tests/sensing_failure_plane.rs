@@ -292,7 +292,17 @@ async fn route_withdrawal_disrupts_provider_branches_at_remote_consumers() {
     let fleet_kp = EntityKeypair::generate();
     let fleet = AudienceScopeCommitment::owner_root(fleet_kp.entity_id());
     let c = sensing_node(EntityKeypair::generate(), fleet, None, FD_TIMEOUT).await;
-    let x = sensing_node(EntityKeypair::generate(), fleet, None, FD_TIMEOUT).await;
+    // X detects SLOWER than C's route age-out (3 × 300 ms = 900 ms),
+    // so the withdrawal deterministically arrives AFTER C's route to
+    // P is gone — pinning the ROUTELESS fallback (the SI-5 review P1
+    // path), not the route-drop path.
+    let x = sensing_node(
+        EntityKeypair::generate(),
+        fleet,
+        None,
+        Duration::from_millis(700),
+    )
+    .await;
     let p = sensing_node(
         EntityKeypair::generate(),
         fleet,
@@ -322,6 +332,23 @@ async fn route_withdrawal_disrupts_provider_branches_at_remote_consumers() {
     .await;
     let p_entity = p.entity_keypair().entity_id().clone();
     c.test_pin_peer_entity(p_id, p_entity);
+
+    // SI-5 review P1: C ALSO holds a RELAY-ROUTED session to P — its
+    // PeerInfo carries X's address, so `peers.contains_key(P)` is
+    // true throughout while no direct session to P exists. The old
+    // routeless fallback misread that as "live direct session" and
+    // skipped disruption whenever the route had aged out before the
+    // withdrawal arrived.
+    let x_bind = x.local_addr();
+    let p_pub = *p.public_key();
+    c.connect_via(x_bind, &p_pub, p_id)
+        .await
+        .expect("relay-routed connect_via");
+    assert_eq!(
+        c.peer_addr(p_id),
+        Some(x_bind),
+        "precondition: C's session to P rides the relay",
+    );
 
     let spec = shared_spec(fleet);
     let branch = ProviderInterestKey::new(spec.key(), p_id);
@@ -458,6 +485,20 @@ async fn epoch_supersession_disrupts_sibling_branches() {
         "the epoch-advancing beat's own branch re-establishes",
     );
 
+    // ── SI-5 review P0 (reviewer-reproduced): a NEWER-SEQ B beat
+    //    from the SUPERSEDED incarnation 5 — validly signed and
+    //    admissible at its own (origin, digest, incarnation) gate —
+    //    must be dropped at the provider-wide epoch check, never
+    //    resurrect the sibling the supersession expired ──
+    send(craft(&spec_b, 5, 1, 10)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        c.sensing_upstream_continuity(&branch_b),
+        Some(Continuity::Expired),
+        "a globally stale incarnation must not revive a sibling branch",
+    );
+    assert_eq!(c.sensing_projected(&branch_b), ProjectedReadiness::Unknown);
+
     // ── Re-establish B under the new incarnation ──
     for seq in 2..=3u64 {
         send(craft(&spec_b, 6, 1, seq)).await;
@@ -476,10 +517,20 @@ async fn epoch_supersession_disrupts_sibling_branches() {
         || c.sensing_upstream_continuity(&branch_b) == Some(Continuity::Expired),
     )
     .await;
+    // ── SI-5 review P0, generation axis: a newer-seq B beat from
+    //    the superseded (6, 1) definition is equally dead ──
+    send(craft(&spec_b, 6, 1, 4)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        c.sensing_upstream_continuity(&branch_b),
+        Some(Continuity::Expired),
+        "a globally stale generation must not revive a sibling branch",
+    );
+
     // §4.8: the interests and branches themselves SURVIVE the epoch
     // move — fresh new-epoch beats resume them without any
     // re-registration.
-    send(craft(&spec_b, 6, 2, 4)).await;
+    send(craft(&spec_b, 6, 2, 5)).await;
     await_condition(
         Duration::from_secs(5),
         "B resumes under the new epoch",

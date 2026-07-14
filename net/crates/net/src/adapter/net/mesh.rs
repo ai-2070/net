@@ -3166,6 +3166,51 @@ impl SensingObservations {
     }
 }
 
+/// SI-5 review P1: whether this node holds a LIVE, genuinely DIRECT
+/// session to `node`. Presence in `peers` is NOT that: a
+/// `connect_via` destination stores the RELAY's address in its
+/// `PeerInfo`, so it lingers in the map while being reachable only
+/// through the relay — and a Failed direct peer lingers for
+/// transient-partition recovery. Directness is the
+/// `promotable_direct_hop` discriminator — the session address must
+/// map BACK to the node in `addr_to_node` — and liveness is the
+/// failure detector's verdict where the caller has one (`None`
+/// inside the detector's own callback, where the failed peer is
+/// already handled by identity).
+fn sensing_live_direct_session(
+    peers: &DashMap<u64, PeerInfo>,
+    addr_to_node: &DashMap<SocketAddr, u64>,
+    failure_detector: Option<&FailureDetector>,
+    node: u64,
+) -> bool {
+    let Some(addr) = peers.get(&node).map(|p| p.value().addr) else {
+        return false;
+    };
+    sensing_addr_is_live_direct(addr_to_node, failure_detector, node, addr)
+}
+
+/// The address-level core of [`sensing_live_direct_session`]
+/// (unit-witnessed): DIRECT iff the session address reverse-maps to
+/// the node itself; LIVE iff the detector — where the caller has
+/// one — does not hold it Failed or Suspected.
+fn sensing_addr_is_live_direct(
+    addr_to_node: &DashMap<SocketAddr, u64>,
+    failure_detector: Option<&FailureDetector>,
+    node: u64,
+    addr: SocketAddr,
+) -> bool {
+    if addr_to_node.get(&addr).map(|e| *e.value()) != Some(node) {
+        return false;
+    }
+    match failure_detector {
+        Some(detector) => !matches!(
+            detector.status(node),
+            NodeStatus::Failed | NodeStatus::Suspected
+        ),
+        None => true,
+    }
+}
+
 /// SI-5 (§4.8): per-provider failure-plane disruption — force-expire
 /// every observation this hop holds toward `provider` (its upstream
 /// continuity cells AND the local consumer overlay), refresh the
@@ -4749,11 +4794,21 @@ impl MeshNode {
                     let through_failed = provider == node_id
                         || match sensing_router_failure.routing_table().lookup(provider) {
                             Some(next_hop) => failed_addr == Some(next_hop),
-                            // No route AND no live direct session:
-                            // the provider's reachability is simply
-                            // gone (the route age-out can beat the
-                            // failure edge here — same verdict).
-                            None => !peers_failure.contains_key(&provider),
+                            // No route AND no live, genuinely DIRECT
+                            // session: reachability is simply gone
+                            // (the route age-out can beat the
+                            // failure edge — same verdict). SI-5
+                            // review P1: a relayed PeerInfo is NOT a
+                            // direct session — the reverse mapping
+                            // decides. (No detector handle inside
+                            // its own callback; the failed peer
+                            // itself is the identity arm above.)
+                            None => !sensing_live_direct_session(
+                                &peers_failure,
+                                &sensing_addr_to_node_failure,
+                                None,
+                                provider,
+                            ),
                         };
                     if !through_failed {
                         continue;
@@ -12355,7 +12410,15 @@ impl MeshNode {
         if ctx.enable_sensing_coalescing
             && (route_dropped
                 || (ctx.router.routing_table().lookup(dest).is_none()
-                    && !ctx.peers.contains_key(&dest)))
+                    // SI-5 review P1: a relayed PeerInfo is NOT a
+                    // live direct session — the reverse mapping and
+                    // the failure detector decide.
+                    && !sensing_live_direct_session(
+                        &ctx.peers,
+                        &ctx.addr_to_node,
+                        Some(&ctx.failure_detector),
+                        dest,
+                    )))
         {
             disrupt_sensing_provider(
                 &ctx.sensing_interest_table,
@@ -13417,7 +13480,24 @@ impl MeshNode {
             attestation.origin_incarnation,
             attestation.capability_generation,
         );
-        let superseded: Option<(sensing::Incarnation, u64)> = {
+        // SI-5 review P0: the provider-wide epoch comparison has
+        // THREE explicit outcomes — advance (disrupt siblings, then
+        // process the arriving branch), equal (process normally),
+        // and STALE (drop before any state mutation). The old
+        // advance/no-op shape let a globally stale beat fall through
+        // to normal intake: the observer gate is per (origin,
+        // digest), so a delayed old-incarnation (or old-generation)
+        // beat on a SIBLING digest still admitted, and a
+        // continuity-bearing one re-Established the branch the
+        // supersession had just force-expired — a valid-but-obsolete
+        // signed Ready restoring optimism the provider's newer boot
+        // or capability definition globally invalidated.
+        enum EpochStanding {
+            Fresh,
+            Advanced((sensing::Incarnation, u64)),
+            Stale,
+        }
+        let standing = {
             let mut observations = ctx.sensing_observations.lock();
             match observations
                 .provider_epochs
@@ -13430,18 +13510,32 @@ impl MeshNode {
                     observations
                         .provider_epochs
                         .insert(attestation.origin, epoch);
-                    None
+                    EpochStanding::Fresh
                 }
                 Some(current) if epoch > current => {
                     observations
                         .provider_epochs
                         .insert(attestation.origin, epoch);
-                    Some(current)
+                    EpochStanding::Advanced(current)
                 }
-                Some(_) => None,
+                Some(current) if epoch == current => EpochStanding::Fresh,
+                Some(_) => EpochStanding::Stale,
             }
         };
-        if let Some(previous) = superseded {
+        if matches!(standing, EpochStanding::Stale) {
+            // Not protocol-invalid (a delayed valid packet) and not
+            // a refusal — just obsolete: nothing under a superseded
+            // epoch may touch latest, cells, forwarding, or the
+            // overlay.
+            tracing::trace!(
+                origin = format!("{:#x}", attestation.origin),
+                incarnation = attestation.origin_incarnation.get(),
+                generation = attestation.capability_generation,
+                "sensing: globally stale epoch dropped"
+            );
+            return;
+        }
+        if let EpochStanding::Advanced(previous) = standing {
             ctx.sensing_interest_table
                 .lock()
                 .invalidate_provider_floors(attestation.origin);
@@ -21211,6 +21305,53 @@ mod reclassify_override_race_tests {
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
+    }
+}
+
+#[cfg(test)]
+mod sensing_live_direct_session_tests {
+    //! SI-5 review P1 witnesses: `peers.contains_key` is NOT "live
+    //! direct session" — a `connect_via` destination stores the
+    //! RELAY's address in its `PeerInfo`, so it lingers in the map
+    //! while being reachable only through the relay, and both
+    //! routeless failure-plane fallbacks skipped disruption on it.
+    //! The reverse `addr_to_node` mapping is the directness
+    //! discriminator (`promotable_direct_hop`'s rule); the detector
+    //! arm mirrors that helper's liveness gate verbatim.
+
+    use super::*;
+
+    #[test]
+    fn relayed_session_address_is_not_a_live_direct_session() {
+        // Kyra's exact misclassification: provider P was connected
+        // via relay X — its PeerInfo carries X's ADDRESS, and the
+        // reverse mapping for that address names X, not P. The old
+        // `peers.contains_key(P)` predicate read this as a live
+        // direct session and skipped disruption.
+        let relay_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        addr_to_node.insert(relay_addr, 0xE0); // the RELAY's id
+        assert!(
+            !sensing_addr_is_live_direct(&addr_to_node, None, 0xF0, relay_addr),
+            "a relayed PeerInfo must never read as a live direct session",
+        );
+    }
+
+    #[test]
+    fn direct_session_reverse_maps_to_the_node_itself() {
+        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        addr_to_node.insert(addr, 0xD1);
+        assert!(sensing_addr_is_live_direct(&addr_to_node, None, 0xD1, addr));
+        // And an address nobody reverse-maps is not direct either
+        // (a torn/mid-eviction entry stays conservative).
+        let stale: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        assert!(!sensing_addr_is_live_direct(
+            &addr_to_node,
+            None,
+            0xD1,
+            stale
+        ));
     }
 }
 
