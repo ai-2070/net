@@ -1980,6 +1980,42 @@ must exercise the real dispatch path.
   delivery 9/9, failure plane 5/5, scheduler bridge 1/1, both
   strict clippy `-D warnings` gates, fmt, `git diff --check`.
   Awaiting SI-6.1 re-verification; SI-7 holds.
+
+  *SI-6.1 re-review disposition (2026-07-15): both original blockers
+  SIGNED OFF; one narrow P1 remains — CHANGES REQUESTED.* Reviewer-
+  verified at b9098b630: full-replacement union, cross-branch
+  consumer union, strictest-interval/longest-ttl merge,
+  demand-backed `added`, drain-not-ghost, the trailing-edge repair
+  (leading edge immediate / in-window transition eventually runs /
+  fresh snapshot at trailing execution / no-later-announcement
+  witness), and both non-blocking notes — all signed off. The one
+  open item: **the fold coalescer has a window-ownership race in the
+  jitter path it claims to handle.** A spawned sleeper carries only
+  the capability digest, and the gate records only `pending: bool` —
+  no generation token ties a sleeper to the pending state it
+  scheduled. Failing sequence: (T0) leading edge runs; (T10)
+  in-window event schedules sleeper S1 (`pending=true`); (T110) S1
+  is delayed, a fresh OUT-of-window event runs immediately and
+  clears the pending bit; (T120) a new-window event sets
+  `pending=true` and schedules S2; (T130) the stale S1 finally wakes,
+  sees `pending=true`, and reclaims it — stealing S2's pending run
+  and executing only 20 ms after the new leading edge, violating the
+  100 ms window. S2 later wakes without ownership. The latest fold
+  state is not lost (the stolen run takes a fresh snapshot), so this
+  is NOT a sensing safety failure — but it breaks the coalescer's
+  exactly-once / rate-bound contract (one trailing run per window,
+  at that window's boundary, honoring the advertised min-gap).
+  Required: give every deferred run explicit ownership — a
+  `SensingFoldGate { last_run, generation, pending: Option<u64> }`
+  where `Defer` mints a token (`Defer { remaining, token }`) the
+  sleeper captures, `reclaim(digest, token)` succeeds only when
+  `pending == Some(token)`, an out-of-window `RunNow` invalidates
+  the old token (`pending = None`), and a later `Defer` receives a
+  different token an old sleeper cannot claim. Add the exact
+  stale-sleeper / new-window witness alongside the two existing
+  deterministic gate units. "Genuinely tiny: attach a generation
+  token so an old sleeper cannot consume a newer window's pending
+  state." SI-7 HOLD behind it.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
