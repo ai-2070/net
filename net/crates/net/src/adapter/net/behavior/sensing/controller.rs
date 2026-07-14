@@ -235,6 +235,42 @@ pub enum AggregateView {
     PerProvider(Vec<(u64, ProjectedReadiness)>),
 }
 
+/// One branch's viability under a consumer budget — the SINGLE
+/// source of the rule [`project_aggregate`] applies, exposed for
+/// SI-6 so the scheduler-bridge candidate projection can never
+/// drift from the aggregate's own economics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BranchViability {
+    /// Projected Ready AND within the budget; carries the
+    /// consumer-local ranking cost (route + provider start
+    /// estimate).
+    Viable(Duration),
+    /// Unknown — or Ready OUTSIDE the budget (a route change could
+    /// still make it viable): never prune on it, never count it
+    /// toward NotReady.
+    Potential,
+    /// Explicitly NotReady.
+    NonViable,
+}
+
+/// Classify one branch view against this consumer's budget (SI-6;
+/// the §3.5 viability rule).
+pub fn classify_branch(branch: &BranchView, budget: &ConsumerLatencyBudget) -> BranchViability {
+    match branch.projection {
+        ProjectedReadiness::Ready
+            if budget.admits(branch.route_estimate, branch.estimated_start) =>
+        {
+            BranchViability::Viable(
+                branch
+                    .route_estimate
+                    .saturating_add(branch.estimated_start.unwrap_or(Duration::ZERO)),
+            )
+        }
+        ProjectedReadiness::NotReady => BranchViability::NonViable,
+        _ => BranchViability::Potential,
+    }
+}
+
 /// The LOCAL result-mode aggregate (plan §3.5). `viable` means
 /// projected Ready AND passing this consumer's budget over its
 /// current route estimate — which is why the same proofs can
@@ -266,7 +302,7 @@ pub fn project_aggregate(
                 .iter()
                 .map(|branch| {
                     let projection = if branch.projection == ProjectedReadiness::Ready
-                        && !budget.admits(branch.route_estimate, branch.estimated_start)
+                        && !matches!(classify_branch(branch, budget), BranchViability::Viable(_))
                     {
                         ProjectedReadiness::Unknown
                     } else {
@@ -286,27 +322,20 @@ pub fn project_aggregate(
     // consumer-LOCAL economics — the same quantity the budget
     // checks (route + provider start estimate) — with provider id
     // as a stable tie-break, so TopK is deterministic and locally
-    // ranked instead of map-order.
+    // ranked instead of map-order. SI-6: the classification is the
+    // shared [`classify_branch`] rule.
     let mut viable_ranked: Vec<(Duration, u64)> = branches
         .iter()
-        .filter(|branch| {
-            branch.projection == ProjectedReadiness::Ready
-                && budget.admits(branch.route_estimate, branch.estimated_start)
-        })
-        .map(|branch| {
-            (
-                branch
-                    .route_estimate
-                    .saturating_add(branch.estimated_start.unwrap_or(Duration::ZERO)),
-                branch.provider,
-            )
+        .filter_map(|branch| match classify_branch(branch, budget) {
+            BranchViability::Viable(cost) => Some((cost, branch.provider)),
+            _ => None,
         })
         .collect();
     viable_ranked.sort();
     let viable: Vec<u64> = viable_ranked.into_iter().map(|(_, id)| id).collect();
     let explicit_not_ready = branches
         .iter()
-        .filter(|branch| branch.projection == ProjectedReadiness::NotReady)
+        .filter(|branch| classify_branch(branch, budget) == BranchViability::NonViable)
         .count();
     let complete = search_complete && population_is_boundable(selector);
 

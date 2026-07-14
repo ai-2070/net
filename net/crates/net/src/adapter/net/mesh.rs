@@ -3382,6 +3382,20 @@ fn remove_sensing_leader_consumer(
     }
 }
 
+/// SI-6 (§4.9): one interest's two-level readiness overlay — the
+/// LOCAL result-mode aggregate plus the per-(provider, generation)
+/// observations behind it. A read-time JOIN over the consumer cells
+/// and the proximity plane, never fold state (see
+/// [`MeshNode::sensing_readiness_overlay`]).
+#[derive(Debug, Clone)]
+pub struct SensingReadinessOverlay {
+    /// The §3.5 consumer-local aggregate.
+    pub aggregate: sensing::AggregateView,
+    /// The observations behind it, keyed `(provider,
+    /// capability_generation)` and sorted for determinism.
+    pub candidates: Vec<((u64, u64), sensing::ReadinessObservation)>,
+}
+
 /// SI-4 re-review items 8/9 (named per the sign-off's mechanical
 /// note): one provider-free digest expectation. The `audience` is
 /// the security-load-bearing field — intake admits a returning
@@ -5675,9 +5689,30 @@ impl MeshNode {
         budget: &sensing::ConsumerLatencyBudget,
         resolved_population: Option<&[u64]>,
     ) -> sensing::AggregateView {
-        let interest = spec.key();
+        let branches = self.sensing_branch_views(&spec.key(), resolved_population);
+        sensing::project_aggregate(
+            &spec.providers,
+            spec.result_mode,
+            budget,
+            &branches,
+            resolved_population.is_some(),
+        )
+    }
+
+    /// The §3.5 branch views for one interest — consumer-cell
+    /// projections joined with LIVE route estimates, filtered and
+    /// completed by the resolved population (SI-4 re-review item 7:
+    /// `Some(set)` includes ONLY set members and inserts missing
+    /// ones as Unknown). Shared by [`Self::sensing_aggregate_view`]
+    /// and the SI-6 scheduler seams so aggregate, overlay, and
+    /// candidate order can never disagree on their inputs.
+    fn sensing_branch_views(
+        &self,
+        interest: &sensing::CapabilityInterestKey,
+        resolved_population: Option<&[u64]>,
+    ) -> Vec<sensing::BranchView> {
         let mut branches: Vec<sensing::BranchView> = self
-            .sensing_branch_projections(&interest)
+            .sensing_branch_projections(interest)
             .into_iter()
             .map(
                 |(provider, projection, estimated_start)| sensing::BranchView {
@@ -5692,10 +5727,6 @@ impl MeshNode {
             )
             .collect();
         if let Some(expected) = resolved_population {
-            // SI-4 re-review item 7: the resolved population FILTERS
-            // as well as completes — a stale or previously resolved
-            // provider whose cell still holds Ready must not satisfy
-            // Ready/Quorum/TopK/Each once it is outside the set.
             branches.retain(|branch| expected.contains(&branch.provider));
             for provider in expected {
                 if !branches.iter().any(|branch| branch.provider == *provider) {
@@ -5711,13 +5742,61 @@ impl MeshNode {
                 }
             }
         }
-        sensing::project_aggregate(
-            &spec.providers,
-            spec.result_mode,
-            budget,
-            &branches,
-            resolved_population.is_some(),
-        )
+        branches
+    }
+
+    /// SI-6 (§4.9): the TWO-LEVEL readiness overlay for one interest
+    /// — the LOCAL aggregate plus the per-(provider, generation)
+    /// observations behind it, joined AT READ TIME from the consumer
+    /// cells, route state, and the resolved population. Deliberately
+    /// never embedded into the capability fold entries: readiness is
+    /// consumer-relative (§3.5) and mutating fold state would break
+    /// the CRDT-grade AP semantics the liveness gate preserves; the
+    /// entry-level suspension flag stays reserved for UNCONDITIONAL
+    /// loss — one conditional observation never suspends the entry.
+    pub fn sensing_readiness_overlay(
+        &self,
+        spec: &sensing::InterestSpec,
+        budget: &sensing::ConsumerLatencyBudget,
+        resolved_population: Option<&[u64]>,
+    ) -> SensingReadinessOverlay {
+        let interest = spec.key();
+        let candidates: Vec<((u64, u64), sensing::ReadinessObservation)> = {
+            let observations = self.sensing_observations.lock();
+            let mut candidates: Vec<((u64, u64), sensing::ReadinessObservation)> = observations
+                .consumer_cells
+                .iter()
+                .filter(|(key, _)| key.interest == interest)
+                .filter_map(|(key, cell)| {
+                    cell.observation().map(|observation| {
+                        (
+                            (key.provider, observation.capability_generation),
+                            *observation,
+                        )
+                    })
+                })
+                .collect();
+            candidates.sort_by_key(|(key, _)| *key);
+            candidates
+        };
+        SensingReadinessOverlay {
+            aggregate: self.sensing_aggregate_view(spec, budget, resolved_population),
+            candidates,
+        }
+    }
+
+    /// SI-6: the Projection-6 sensed candidate delta for one
+    /// interest, assembled from this node's OWN overlay (the same
+    /// branch views the aggregate projects). The scheduler-bridge
+    /// projection is pure; this is its node-level input join.
+    pub fn sensed_candidates(
+        &self,
+        spec: &sensing::InterestSpec,
+        budget: &sensing::ConsumerLatencyBudget,
+        resolved_population: Option<&[u64]>,
+    ) -> super::behavior::scheduler_bridge::SensedCandidates {
+        let branches = self.sensing_branch_views(&spec.key(), resolved_population);
+        super::behavior::scheduler_bridge::project_sensed_candidates(&branches, budget)
     }
 
     /// SI-4b: subscribe to the §4.9 overlay change signal — the
@@ -18139,6 +18218,61 @@ impl MeshNode {
         down: std::collections::HashSet<super::behavior::fold::NodeId>,
     ) {
         self.liveness_down.store(Arc::new(down));
+    }
+
+    /// SI-6: [`Self::match_islands`] with this node's sensed
+    /// readiness for `spec` joined at the same seam as the liveness
+    /// gate (sensing plan §6 SI-6): providers sensed explicitly
+    /// NotReady for THIS interest are pruned from THIS match only —
+    /// never suspended (§4.9) — and sensed-viable providers' islands
+    /// lead the claim order in the aggregate's own consumer-local
+    /// economics. Unsensed and Unknown hosts are unaffected (absence
+    /// of evidence never prunes). Compound AND/gang policy stays
+    /// with the caller; re-matching on overlay movement rides
+    /// [`Self::subscribe_sensing_overlay_changes`].
+    pub fn match_islands_sensed(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        spec: &sensing::InterestSpec,
+        budget: &sensing::ConsumerLatencyBudget,
+        resolved_population: Option<&[u64]>,
+    ) -> Vec<super::behavior::fold::IslandId> {
+        let sensed = self.sensed_candidates(spec, budget, resolved_population);
+        let down = self.liveness_down.load();
+        let non_viable: std::collections::HashSet<super::behavior::fold::NodeId> =
+            sensed.non_viable.iter().copied().collect();
+        super::behavior::gang::match_islands_sensed(
+            &self.capability_fold,
+            &self.island_fold,
+            criteria,
+            &down,
+            &non_viable,
+            &sensed.viable,
+        )
+    }
+
+    /// SI-6: match with sensed readiness and reserve the first
+    /// available island — the sensed order makes the first success
+    /// target the SELECTED provider (the aggregate's best-ranked
+    /// viable candidate), falling through to the next candidate on
+    /// contention exactly like [`Self::claim_island`].
+    pub async fn claim_island_sensed(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        spec: &sensing::InterestSpec,
+        budget: &sensing::ConsumerLatencyBudget,
+        resolved_population: Option<&[u64]>,
+        until_unix_us: u64,
+    ) -> Result<Option<super::behavior::fold::IslandId>, AdapterError> {
+        for island in self.match_islands_sensed(criteria, spec, budget, resolved_population) {
+            if matches!(
+                self.reserve_island(island, until_unix_us).await?,
+                super::behavior::gang::ClaimOutcome::Won
+            ) {
+                return Ok(Some(island));
+            }
+        }
+        Ok(None)
     }
 
     /// Reserve `island` under this node's identity: apply the

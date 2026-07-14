@@ -126,8 +126,8 @@ pub use identity::{
     TokenScope,
 };
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingRegistrationError,
-    ACK_RANGES_CAPABILITY_TAG,
+    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
+    SensingRegistrationError, ACK_RANGES_CAPABILITY_TAG,
 };
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};

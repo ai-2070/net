@@ -79,8 +79,9 @@ pub use wire::{
 };
 
 pub use controller::{
-    population_is_boundable, project_aggregate, resolve_candidates, AggregateView, BranchView,
-    CandidatePolicy, CandidateProvider, ResolutionRefusal, ResolvedCandidates, TagAssertion,
+    classify_branch, population_is_boundable, project_aggregate, resolve_candidates, AggregateView,
+    BranchViability, BranchView, CandidatePolicy, CandidateProvider, ResolutionRefusal,
+    ResolvedCandidates, TagAssertion,
 };
 
 pub use delivery::{Attestation, Delivery, SensingConsumer, SensingRelay};

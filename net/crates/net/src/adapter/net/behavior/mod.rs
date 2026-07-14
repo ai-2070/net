@@ -55,7 +55,9 @@ pub mod query;
 pub mod required_capability;
 pub mod rules;
 pub mod safety;
-#[cfg(all(feature = "cortex", feature = "meshos"))]
+// The bridge SHELL is ungated: Projection 6 (sensed readiness →
+// candidate delta) depends only on fold + sensing; the daemon/
+// workflow projections inside stay gated on cortex + meshos.
 pub mod scheduler_bridge;
 pub mod schema;
 pub mod sensing;
