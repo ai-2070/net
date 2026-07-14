@@ -1117,6 +1117,9 @@ struct DispatchCtx {
     /// SI-3c: the 0x0C03 intake's §4.6 observer gate. See the
     /// matching field on `MeshNode`.
     sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
+    /// SI-4a: continuity factor k for this hop's upstream cells
+    /// (plan §4.5, `config.continuity_factor`).
+    sensing_continuity_factor: u32,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
@@ -2855,9 +2858,22 @@ fn sensing_interval_in_bounds(interval: Duration, ttl: Duration) -> bool {
 /// cadence.
 const MAX_SENSING_OBSERVATIONS: usize = 4096;
 
-/// SI-3c + closure items 3/6: the verified-observation seam behind
-/// the 0x0C03 intake. SI-4's relay caches (per-provider, keyed on
-/// the full `ProviderObservationKey`) subsume `latest`.
+/// SI-4a: one downstream's delivery schedule on one branch — the
+/// frozen SI-0f `DeliverySlot` semantics on real sessions: status
+/// edges flush immediately; unchanged beats travel at the
+/// downstream's own D; `pending` marks a newer-than-delivered beat
+/// waiting for the schedule (flushed by the sweep's poll).
+#[derive(Clone, Copy)]
+struct SensingDeliverySlot {
+    last_status: Option<sensing::AttestedStatus>,
+    last_delivered: Option<(sensing::Incarnation, u64)>,
+    next_due: Instant,
+    pending: bool,
+}
+
+/// SI-3c + closure items 3/6, grown by SI-4a into the relay
+/// delivery seam behind the 0x0C03 intake (the frozen SI-0f
+/// `SensingRelay` semantics on the mesh's own state).
 #[derive(Default)]
 struct SensingObservations {
     /// Latest ADMITTED ordinary attestation per branch — warm-start
@@ -2880,6 +2896,16 @@ struct SensingObservations {
     /// applies — a floor learned under an older boot or capability
     /// definition must not keep refusing registrations.
     provider_epochs: HashMap<u64, (sensing::Incarnation, u64)>,
+    /// SI-4a: this hop's OWN continuity toward each branch's origin
+    /// (§4.4 hop rule input, §4.5 clock-free stream suspicion). The
+    /// incoming envelope flag feeds the cell — a provisional
+    /// forward never establishes — and the OUTGOING bearing derives
+    /// from this cell, never from the incoming flag alone.
+    upstream: HashMap<sensing::ProviderInterestKey, sensing::ObservationCell>,
+    /// SI-4a: per-(branch, downstream) delivery schedules.
+    /// Reclaimed with the branch; per-downstream rows that die
+    /// while the branch survives leave inert slots the sweep GCs.
+    slots: HashMap<(sensing::ProviderInterestKey, sensing::DownstreamId), SensingDeliverySlot>,
 }
 
 impl SensingObservations {
@@ -2899,6 +2925,10 @@ impl SensingObservations {
     /// ages it out.
     fn reclaim_status(&mut self, key: &sensing::ProviderInterestKey) {
         self.latest.remove(key);
+        // SI-4a: a dead branch delivers to nobody — its continuity
+        // cell and every delivery slot reclaim with it.
+        self.upstream.remove(key);
+        self.slots.retain(|(branch, _), _| branch != key);
         self.reclaim_orphan_epochs([key.provider]);
     }
 
@@ -2987,6 +3017,7 @@ fn spawn_sensing_frame_send(
     partition_filter: &PartitionFilter,
     local_node_id: u64,
     target: u64,
+    stream_id: u64,
     subprotocol: u16,
     payload: Vec<u8>,
 ) {
@@ -3014,7 +3045,9 @@ fn spawn_sensing_frame_send(
     let socket = socket.clone();
     tokio::spawn(async move {
         let events = [Bytes::from(payload)];
-        let stream_id = subprotocol as u64;
+        // SI-4a: the stream id is the hop-authored ENVELOPE — for
+        // 0x0C03 it carries the §4.4 continuity-bearing flag (see
+        // `sensing::SENSING_PROVISIONAL_STREAM`).
         let seq = session.get_or_create_stream(stream_id).next_tx_seq();
         let packet = {
             let mut builder = session.thread_local_pool().get();
@@ -4722,6 +4755,7 @@ impl MeshNode {
                             &self.partition_filter,
                             self.node_id,
                             provider,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                             sensing::SUBPROTOCOL_SENSING_INTEREST,
                             bytes,
                         );
@@ -4836,6 +4870,20 @@ impl MeshNode {
     /// everything that justified it.
     pub fn sensing_provider_epoch_count(&self) -> usize {
         self.sensing_observations.lock().provider_epochs.len()
+    }
+
+    /// SI-4a: this hop's OWN continuity toward a branch's origin —
+    /// the §4.4 hop rule's input (tests and observability). `None`
+    /// until the first admitted beat creates the cell.
+    pub fn sensing_upstream_continuity(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<sensing::Continuity> {
+        self.sensing_observations
+            .lock()
+            .upstream
+            .get(key)
+            .map(sensing::ObservationCell::continuity)
     }
 
     /// SI-3c: whether this hop's observer gate poisoned an origin's
@@ -6282,6 +6330,7 @@ impl MeshNode {
                             &partition_filter,
                             local_node_id,
                             node,
+                            sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64,
                             sensing::SUBPROTOCOL_READINESS_ATTESTATION,
                             bytes.clone(),
                         );
@@ -6423,6 +6472,7 @@ impl MeshNode {
             signing_identity: self.identity.clone(),
             capability_version: self.capability_version.clone(),
             sensing_observer_gate: self.sensing_observer_gate.clone(),
+            sensing_continuity_factor: self.config.continuity_factor,
             sensing_observations: self.sensing_observations.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
@@ -7834,9 +7884,13 @@ impl MeshNode {
             if from_node == 0 {
                 return;
             }
+            // SI-4a: the §4.4 continuity-bearing flag rides the
+            // hop-authored session envelope — the stream id (see
+            // `sensing::SENSING_PROVISIONAL_STREAM`).
+            let provisional = parsed.header.stream_id == sensing::SENSING_PROVISIONAL_STREAM;
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
-                Self::handle_sensing_attestation_frame(&payload, from_node, ctx);
+                Self::handle_sensing_attestation_frame(&payload, from_node, provisional, ctx);
             }
             return;
         }
@@ -9178,6 +9232,7 @@ impl MeshNode {
                                             &partition_filter,
                                             local_node_id,
                                             key.provider,
+                                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                                             sensing::SUBPROTOCOL_SENSING_INTEREST,
                                         bytes,
                                         );
@@ -9225,6 +9280,121 @@ impl MeshNode {
                                 // too, or provider_epochs outlives
                                 // everything.
                                 observations.reclaim_orphan_epochs(providers);
+                            }
+
+                            // SI-4a poll (the frozen SI-0f
+                            // `SensingRelay::poll` on the mesh):
+                            // expire upstream continuity windows,
+                            // refresh the table's hop-rule input,
+                            // and flush pending down-sampled beats
+                            // whose schedule came due. Three
+                            // sequential lock phases — never
+                            // nested.
+                            let poll_now = Instant::now();
+                            let (continuities, pending) = {
+                                let mut observations = sensing_observations.lock();
+                                let mut continuities = Vec::new();
+                                for (branch, cell) in observations.upstream.iter_mut() {
+                                    cell.expire_if_due(poll_now);
+                                    continuities.push((branch.clone(), cell.continuity()));
+                                }
+                                let pending: Vec<(
+                                    sensing::ProviderInterestKey,
+                                    sensing::DownstreamId,
+                                )> = observations
+                                    .slots
+                                    .iter()
+                                    .filter(|(_, slot)| slot.pending)
+                                    .map(|(key, _)| key.clone())
+                                    .collect();
+                                (continuities, pending)
+                            };
+                            let mut live_pending = Vec::new();
+                            let mut dead_slots = Vec::new();
+                            {
+                                let mut table = sensing_interest_table.lock();
+                                for (branch, continuity) in continuities {
+                                    table.set_upstream_continuity(&branch, continuity);
+                                }
+                                for (branch, downstream) in pending {
+                                    match table.downstream_entry(&branch, downstream) {
+                                        Some(row) if row.expires_at > poll_now => {
+                                            live_pending.push((
+                                                branch,
+                                                downstream,
+                                                row.requested_sample_interval,
+                                            ));
+                                        }
+                                        // The row died while the
+                                        // branch survives: the slot
+                                        // is inert — GC it.
+                                        _ => dead_slots.push((branch, downstream)),
+                                    }
+                                }
+                            }
+                            let mut flushes: Vec<(u64, Vec<u8>, bool)> = Vec::new();
+                            {
+                                let mut observations = sensing_observations.lock();
+                                for key in dead_slots {
+                                    observations.slots.remove(&key);
+                                }
+                                for (branch, downstream, interval) in live_pending {
+                                    let bearing = observations
+                                        .upstream
+                                        .get(&branch)
+                                        .map(|cell| {
+                                            cell.continuity()
+                                                == sensing::Continuity::Established
+                                        })
+                                        .unwrap_or(false);
+                                    let Some(cached) =
+                                        observations.latest.get(&branch).cloned()
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(slot) = observations
+                                        .slots
+                                        .get_mut(&(branch.clone(), downstream))
+                                    else {
+                                        continue;
+                                    };
+                                    let newer = slot.last_delivered.is_none_or(|prev| {
+                                        (cached.origin_incarnation, cached.seq) > prev
+                                    });
+                                    if slot.pending && newer && poll_now >= slot.next_due {
+                                        slot.last_status = Some(cached.status);
+                                        slot.last_delivered =
+                                            Some((cached.origin_incarnation, cached.seq));
+                                        slot.next_due = poll_now + interval;
+                                        slot.pending = false;
+                                        if let sensing::DownstreamId::Peer(node) = downstream {
+                                            if let Ok(bytes) =
+                                                sensing::encode_attestation(&cached)
+                                            {
+                                                flushes.push((node, bytes, bearing));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (node, bytes, bearing) in flushes {
+                                let stream_id = if bearing {
+                                    sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64
+                                } else {
+                                    sensing::SENSING_PROVISIONAL_STREAM
+                                };
+                                spawn_sensing_frame_send(
+                                    &socket,
+                                    &peers,
+                                    &addr_to_node,
+                                    &router,
+                                    &partition_filter,
+                                    local_node_id,
+                                    node,
+                                    stream_id,
+                                    sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                                    bytes,
+                                );
                             }
                         }
 
@@ -11303,6 +11473,7 @@ impl MeshNode {
                                 &ctx.partition_filter,
                                 ctx.local_node_id,
                                 provider,
+                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                                 bytes,
                             );
@@ -11376,6 +11547,48 @@ impl MeshNode {
                             Self::send_sensing_deregister_upstream(ctx, &key);
                             return;
                         }
+                        // SI-4a warm-start (§4.4): every downstream
+                        // registration re-sends the cached latest —
+                        // ALWAYS provisional (cached optimism must
+                        // be earned by a live beat, never seeded by
+                        // a cache); the downstream's gate absorbs
+                        // duplicates as StaleSeq.
+                        let cached = {
+                            let mut observations = ctx.sensing_observations.lock();
+                            let cached = observations.latest.get(&key).cloned();
+                            if let Some(cached) = &cached {
+                                let slot = observations
+                                    .slots
+                                    .entry((key.clone(), sensing::DownstreamId::Peer(from_node)))
+                                    .or_insert(SensingDeliverySlot {
+                                        last_status: None,
+                                        last_delivered: None,
+                                        next_due: now,
+                                        pending: false,
+                                    });
+                                slot.last_status = Some(cached.status);
+                                slot.last_delivered = Some((cached.origin_incarnation, cached.seq));
+                                slot.next_due = now + validated.requested_sample_interval;
+                                slot.pending = false;
+                            }
+                            cached
+                        };
+                        if let Some(cached) = cached {
+                            if let Ok(bytes) = sensing::encode_attestation(&cached) {
+                                spawn_sensing_frame_send(
+                                    &ctx.socket,
+                                    &ctx.peers,
+                                    &ctx.addr_to_node,
+                                    &ctx.router,
+                                    &ctx.partition_filter,
+                                    ctx.local_node_id,
+                                    from_node,
+                                    sensing::SENSING_PROVISIONAL_STREAM,
+                                    sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                                    bytes,
+                                );
+                            }
+                        }
                         // SI-3 closure (item 2's principle at the
                         // damper seam): anti-entropy on EVERY
                         // admitted registration/refresh at the
@@ -11420,6 +11633,7 @@ impl MeshNode {
                                 &ctx.partition_filter,
                                 ctx.local_node_id,
                                 validated.target,
+                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                                 bytes,
                             );
@@ -11655,7 +11869,12 @@ impl MeshNode {
     ///    next downstream refresh repairs it.
     /// 8. **Store**: latest admitted attestation per branch;
     ///    refusals in their own control-response map.
-    fn handle_sensing_attestation_frame(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+    fn handle_sensing_attestation_frame(
+        payload: &[u8],
+        from_node: u64,
+        provisional: bool,
+        ctx: &DispatchCtx,
+    ) {
         let Ok(attestation) = sensing::decode_attestation(payload) else {
             ctx.sensing_counters
                 .protocol_invalid
@@ -11842,6 +12061,7 @@ impl MeshNode {
                     &ctx.partition_filter,
                     ctx.local_node_id,
                     *node,
+                    sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64,
                     sensing::SUBPROTOCOL_READINESS_ATTESTATION,
                     payload.to_vec(),
                 );
@@ -11857,17 +12077,131 @@ impl MeshNode {
             }
             return;
         }
-        let mut observations = ctx.sensing_observations.lock();
-        if observations.latest.len() >= MAX_SENSING_OBSERVATIONS
-            && !observations.latest.contains_key(&branch)
+        // SI-4a: the frozen SI-0f relay semantics on real sessions.
+        // Feed this hop's OWN continuity cell from the admitted beat
+        // — the INCOMING envelope flag feeds the cell (a provisional
+        // forward never establishes) — then derive the OUTGOING
+        // bearing from our continuity (the §4.4 hop rule) and
+        // schedule per-downstream forwards: status edges flush
+        // immediately; unchanged beats travel at each downstream's
+        // own D; forwards are the identical signed bytes.
+        let beat = sensing::DeliveredBeat {
+            attested_status: attestation.status,
+            estimated_start: attestation.estimated_start,
+            source_incarnation: attestation.origin_incarnation,
+            capability_generation: attestation.capability_generation,
+            seq: attestation.seq,
+            promised_cadence: attestation.promised_cadence,
+            continuity_bearing: !provisional,
+        };
+        let own_interval = ctx
+            .sensing_interest_table
+            .lock()
+            .aggregate(&branch, now)
+            .unwrap_or(attestation.promised_cadence);
+        let continuity = {
+            let mut observations = ctx.sensing_observations.lock();
+            if observations.latest.len() >= MAX_SENSING_OBSERVATIONS
+                && !observations.latest.contains_key(&branch)
+            {
+                tracing::debug!(
+                    origin = format!("{:#x}", attestation.origin),
+                    "sensing: observation store at cap, new branch dropped"
+                );
+                return;
+            }
+            observations
+                .latest
+                .insert(branch.clone(), attestation.clone());
+            let factor = ctx.sensing_continuity_factor;
+            let cell = observations
+                .upstream
+                .entry(branch.clone())
+                .or_insert_with(|| sensing::ObservationCell::register(now, own_interval, factor));
+            cell.on_admitted_beat(now, beat);
+            cell.continuity()
+        };
+        ctx.sensing_interest_table
+            .lock()
+            .set_upstream_continuity(&branch, continuity);
+        let bearing = continuity == sensing::Continuity::Established;
+        Self::schedule_sensing_forwards(ctx, &branch, &attestation, payload, bearing, now);
+    }
+
+    /// SI-4a: per-downstream forwarding of one admitted beat (the
+    /// frozen SI-0f `SensingRelay::on_attestation` scheduling on the
+    /// mesh's own state). Status edges flush to every live PEER
+    /// downstream immediately; unchanged beats go only to
+    /// downstreams whose schedule is due; the rest mark `pending`
+    /// for the sweep's poll. `Local` rows are the SI-4b consumer
+    /// overlay's intake — skipped here.
+    fn schedule_sensing_forwards(
+        ctx: &DispatchCtx,
+        branch: &sensing::ProviderInterestKey,
+        attestation: &sensing::ReadinessAttestation,
+        payload: &[u8],
+        bearing: bool,
+        now: Instant,
+    ) {
+        let rows: Vec<(sensing::DownstreamId, Duration)> = {
+            let table = ctx.sensing_interest_table.lock();
+            table
+                .downstreams(branch, now)
+                .into_iter()
+                .filter_map(|downstream| {
+                    table
+                        .downstream_entry(branch, downstream)
+                        .map(|row| (downstream, row.requested_sample_interval))
+                })
+                .collect()
+        };
+        let mut forwards: Vec<u64> = Vec::new();
         {
-            tracing::debug!(
-                origin = format!("{:#x}", attestation.origin),
-                "sensing: observation store at cap, new branch dropped"
-            );
-            return;
+            let mut observations = ctx.sensing_observations.lock();
+            for (downstream, interval) in rows {
+                let slot = observations
+                    .slots
+                    .entry((branch.clone(), downstream))
+                    .or_insert(SensingDeliverySlot {
+                        last_status: None,
+                        last_delivered: None,
+                        next_due: now,
+                        pending: false,
+                    });
+                let edge = slot.last_status != Some(attestation.status);
+                let due = now >= slot.next_due;
+                if edge || due {
+                    slot.last_status = Some(attestation.status);
+                    slot.last_delivered = Some((attestation.origin_incarnation, attestation.seq));
+                    slot.next_due = now + interval;
+                    slot.pending = false;
+                    if let sensing::DownstreamId::Peer(node) = downstream {
+                        forwards.push(node);
+                    }
+                } else {
+                    slot.pending = true;
+                }
+            }
         }
-        observations.latest.insert(branch, attestation);
+        let stream_id = if bearing {
+            sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64
+        } else {
+            sensing::SENSING_PROVISIONAL_STREAM
+        };
+        for node in forwards {
+            spawn_sensing_frame_send(
+                &ctx.socket,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                node,
+                stream_id,
+                sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                payload.to_vec(),
+            );
+        }
     }
 
     /// SI-3: sign one refusal beat and fan it to the given peers
@@ -11893,6 +12227,7 @@ impl MeshNode {
                 &ctx.partition_filter,
                 ctx.local_node_id,
                 node,
+                sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64,
                 sensing::SUBPROTOCOL_READINESS_ATTESTATION,
                 bytes.clone(),
             );
@@ -11919,6 +12254,7 @@ impl MeshNode {
                 &ctx.partition_filter,
                 ctx.local_node_id,
                 key.provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             );

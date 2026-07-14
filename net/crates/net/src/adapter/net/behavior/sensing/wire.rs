@@ -84,6 +84,22 @@ pub const SUBPROTOCOL_SENSING_INTEREST: u16 = 0x0C02;
 /// [`SUBPROTOCOL_SENSING_INTEREST`] (same mixed-version caveat).
 pub const SUBPROTOCOL_READINESS_ATTESTATION: u16 = 0x0C03;
 
+/// SI-4: the session stream a PROVISIONAL attestation forward rides
+/// (plan §4.2/§4.4 — "the continuity-bearing flag is relay-authored
+/// envelope metadata, never signed content"). The flag's wire
+/// encoding is the hop-authored session ENVELOPE itself: a live,
+/// continuity-bearing forward travels on the standard stream
+/// (`SUBPROTOCOL_READINESS_ATTESTATION as u64`); a provisional one —
+/// a warm-start re-send, or any forward while the relay's own
+/// upstream continuity is not Established (the §4.4 hop rule) —
+/// travels on THIS stream. Same subprotocol id, byte-identical
+/// committed codec: the payload the origin signed is never touched,
+/// and the flag is authenticated by the hop session exactly like
+/// every other envelope field. A hostile relay could lie about the
+/// flag on either encoding — the §4.5 stated v1 trust assumption
+/// inside the owner-root boundary.
+pub const SENSING_PROVISIONAL_STREAM: u64 = 0x0001_0C03;
+
 /// Hard cap on one encoded sensing payload (either subprotocol):
 /// 4 KiB. Inline constraints are capped at 1 KiB (plan §5) and every
 /// other field is bounded and small, so any larger payload is

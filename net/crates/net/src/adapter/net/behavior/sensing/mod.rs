@@ -73,8 +73,8 @@ pub use wire::{
     decode_attestation, decode_interest_frame, encode_attestation, encode_interest_frame,
     semantic_attestation, sign_attestation, verify_attestation, AttestationBridgeError,
     AttestationSignError, AttestationVerifyError, ReadinessAttestation, UnsignedAttestation,
-    WireError, ATTESTATION_SIG_DOMAIN, MAX_SENSING_FRAME_BYTES, SUBPROTOCOL_READINESS_ATTESTATION,
-    SUBPROTOCOL_SENSING_INTEREST,
+    WireError, ATTESTATION_SIG_DOMAIN, MAX_SENSING_FRAME_BYTES, SENSING_PROVISIONAL_STREAM,
+    SUBPROTOCOL_READINESS_ATTESTATION, SUBPROTOCOL_SENSING_INTEREST,
 };
 
 pub use controller::{
