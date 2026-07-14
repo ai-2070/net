@@ -1252,6 +1252,20 @@ must exercise the real dispatch path.
   derives branch demand ONLY from actual table aggregates over the
   admitted branches, fallback removed. "At least one branch exists
   globally" is not "this registration was admitted on a branch."
+  *Residual correction as-built (2026-07-14, 1534fcdce):* landed
+  exactly as spec'd — `admitted_branches` on `LeaderRegistration`,
+  empty ⇒ `AllBranchesRefused` (interest removed only when no
+  branch is live globally), mesh seam demand from real aggregates
+  only. Witnessed by: partial-admission unit (fanout 2, cap admits
+  one — admitted [B1] vs semantic [B1, B2], refused branch truly
+  rowless), refused-joiner-on-live-interest unit (Err while the
+  live consumer's demand stands), and coverage gap (b) closed —
+  the foreign-only resolver e2e now EXECUTES the
+  provider-appears-later transition (next refresh resolves the
+  newly authorized declarer). Gap (a) (direct remote at-capacity
+  e2e) accepted per the review. **SI-3 closure complete pending
+  reviewer confirmation of this one edge; SI-4 broad delivery
+  unblocks on it.**
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
