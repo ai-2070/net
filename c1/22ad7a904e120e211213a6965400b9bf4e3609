@@ -1,0 +1,21 @@
+net/crates/net/tests/sensing_leader_delivery.rs
+  s_c28bdf38c0df3a::t_22aff3ee394566 233-383
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_9452e6b6beadd6 6607-6608,6675,6682,6693-6701,6721-6730,6743-6775,12122-12141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "c122ad7a904e120e211213a6965400b9bf4e3609",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
