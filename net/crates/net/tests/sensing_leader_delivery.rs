@@ -232,6 +232,119 @@ async fn provider_free_proofs_fan_back_through_the_leader() {
 }
 
 #[tokio::test]
+async fn provider_free_ttl_half_refreshes_do_not_starve_leader_delivery() {
+    // SI-4 re-review P1: `SensingRelay::register_downstream` reset
+    // the existing delivery slot and warm-started on EVERY refresh —
+    // under D > TTL/2 with ttl/2 refreshes the leader pushed
+    // next_due forward forever and cleared pending live work, so a
+    // provider-free consumer saw only provisional snapshots and a
+    // healthy Ready degraded to permanent Unknown.
+    //
+    //   A (D = 1200 ms > TTL/2, refreshes every 750 ms) — R — P
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&a, &r, &p] {
+        node.start();
+    }
+    for node in [&a, &r] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, r_id, p_id) = (a.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    // D strictly greater than TTL/2 — every refresh lands while the
+    // previous delivery window is still open.
+    let d = Duration::from_millis(1200);
+    let refresh = {
+        let a = a.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = a.register_capability_interest(&spec, r_id, d, TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+
+    await_condition(Duration::from_secs(10), "A projects Ready", || {
+        a.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+
+    // Hold past the FULL starvation horizon: with the slot reset on
+    // every refresh, A's last continuity-bearing delivery is the
+    // first edge beat; its own upstream window (3 × 600 ms) carries
+    // provisional warm-starts as bearing feeds for at most another
+    // 1.8 s, and the consumer window (3 × 1200 ms) lapses at most
+    // ~5.1 s after establishment — inside this 6 s hold, a healthy
+    // Ready degrades to Unknown. Un-reset schedules keep live
+    // deliveries flowing at A's own D and Ready holds throughout.
+    let mut seqs = std::collections::HashSet::new();
+    for poll in 0..20u32 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            a.sensing_projected(&branch),
+            ProjectedReadiness::Ready,
+            "healthy stream starved at poll {poll}",
+        );
+        if let Some(proof) = a.sensing_latest_attestation(&branch) {
+            seqs.insert(proof.seq);
+        }
+    }
+    assert!(
+        seqs.len() >= 2,
+        "live deliveries kept flowing at A's own D (distinct seqs: {})",
+        seqs.len(),
+    );
+
+    refresh.abort();
+    a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}
+
+#[tokio::test]
 async fn leader_resolved_as_provider_serves_its_own_proofs() {
     // SI-4 re-review P0: the candidate snapshot permits the leader
     // node ITSELF to resolve as provider (R == P) — a Leader row on

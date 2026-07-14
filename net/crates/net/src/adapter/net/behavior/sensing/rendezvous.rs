@@ -529,12 +529,21 @@ impl SensingLeader {
     /// whose branches ALL lost their last downstream is removed —
     /// emitters die when the last interest dies, and an abandoned
     /// leader drains to empty (plan §4.1 failover/suppression).
+    ///
+    /// SI-4 re-review (leader relay reclamation): a branch whose
+    /// LAST row died reclaims the relay's private cache + schedule
+    /// state with it (a stale cache must never warm-start a later
+    /// same-key lifecycle, and distinct-key churn must stay
+    /// bounded); rows that died while their branch survives leave
+    /// inert slots, GC'd on the same clock — the mesh sweep's
+    /// all-slot rule.
     pub fn sweep(&mut self, now: Instant) {
         let actions = self.relay.table.expire(now);
         for (branch, action) in actions {
             if action != UpstreamAction::Deregister {
                 continue;
             }
+            self.relay.reclaim_branch(&branch);
             let interest = branch.interest.clone();
             let any_branch_live = self
                 .interests
@@ -550,6 +559,7 @@ impl SensingLeader {
                 self.interests.remove(&interest);
             }
         }
+        self.relay.gc_dead_slots(now);
     }
 
     /// Distinct coalesced interests currently held.
@@ -567,9 +577,11 @@ impl SensingLeader {
 
     /// Whether the leader holds no interests and no branch demand —
     /// the drained state an abandoned or superseded leader converges
-    /// to.
+    /// to. HONEST about the relay's private state (SI-4 re-review):
+    /// retained caches or schedules mean not-drained, table or no
+    /// table.
     pub fn is_drained(&self) -> bool {
-        self.interests.is_empty() && self.relay.table.is_empty()
+        self.interests.is_empty() && self.relay.is_drained()
     }
 }
 
@@ -801,6 +813,83 @@ mod tests {
             Some(ms(100)),
             "the live consumer's demand stands",
         );
+    }
+
+    /// SI-4 re-review (leader relay reclamation): the branch's last
+    /// row death must reclaim the relay's PRIVATE state with the
+    /// table — before the fix `is_drained` lied (empty table,
+    /// retained cache + slot) and the dead lifecycle's cache
+    /// warm-started the next same-key registration.
+    #[test]
+    fn sweep_reclaims_relay_state_and_re_registration_gets_no_stale_warm_start() {
+        let t0 = Instant::now();
+        let a = DownstreamId::Peer(0xA);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let snapshot = vec![provider(7, 10)];
+        let reg = leader
+            .register_capability_interest(&spec(), a, ms(100), TTL, root(), &snapshot, t0)
+            .unwrap();
+        let key = reg.interest.clone();
+        // A proof lands: the relay holds a branch cache + slot.
+        let out = leader.on_attestation(t0 + ms(100), &proof(&key, 7, 1, None), true);
+        assert!(!out.is_empty());
+        assert_eq!(leader.relay.retained_branches(), 1);
+        assert_eq!(leader.relay.retained_slots(), 1);
+
+        // The consumer stops refreshing; the row lapses.
+        leader.sweep(t0 + TTL + ms(1));
+        assert_eq!(leader.interest_count(), 0);
+        assert_eq!(leader.relay.retained_branches(), 0, "cache reclaimed");
+        assert_eq!(leader.relay.retained_slots(), 0, "slot reclaimed");
+        assert!(
+            leader.is_drained(),
+            "drained means EMPTY, private state included",
+        );
+
+        // A same-key re-registration is a FRESH lifecycle: nothing
+        // warm-starts it from the dead branch's cache.
+        let reg = leader
+            .register_capability_interest(
+                &spec(),
+                a,
+                ms(100),
+                TTL,
+                root(),
+                &snapshot,
+                t0 + TTL + ms(2),
+            )
+            .unwrap();
+        assert!(reg.newly_resolved, "candidates re-resolve from scratch");
+        assert!(
+            reg.warm_starts.is_empty(),
+            "no warm-start from a previous lifecycle",
+        );
+    }
+
+    /// SI-4 re-review: distinct expired-branch churn must not grow
+    /// retained relay state.
+    #[test]
+    fn distinct_branch_churn_leaves_no_retained_relay_state() {
+        let t0 = Instant::now();
+        let a = DownstreamId::Peer(0xA);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let snapshot = vec![provider(7, 10)];
+        for i in 0..50u64 {
+            let media = format!("size-{i}");
+            let mut varied = spec();
+            varied.constraints =
+                CanonicalConstraints::from_entries([("media", media.as_str())]).unwrap();
+            let reg = leader
+                .register_capability_interest(&varied, a, ms(100), TTL, root(), &snapshot, t0)
+                .unwrap();
+            let out = leader.on_attestation(t0 + ms(1), &proof(&reg.interest, 7, 1, None), true);
+            assert!(!out.is_empty());
+        }
+        assert_eq!(leader.relay.retained_branches(), 50);
+        leader.sweep(t0 + TTL + ms(1));
+        assert!(leader.is_drained(), "expired churn must not accumulate");
+        assert_eq!(leader.relay.retained_branches(), 0);
+        assert_eq!(leader.relay.retained_slots(), 0);
     }
 
     fn proof(

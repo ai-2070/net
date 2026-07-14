@@ -193,14 +193,16 @@ impl SensingRelay {
         }
     }
 
-    /// Register (or refresh) a downstream on a branch and warm-start
-    /// it from the cache: every registration re-sends the cached
-    /// latest (anti-entropy for forwards lost in transit; the
-    /// downstream's gate absorbs duplicates as StaleSeq) — ALWAYS as
-    /// provisional (`continuity_bearing = false`), regardless of the
-    /// relay's own continuity: the downstream's optimism must be
-    /// earned by a subsequent live beat, never seeded by a cache
-    /// (§4.4).
+    /// Register (or refresh) a downstream on a branch. ONLY a NEWLY
+    /// CREATED row is warm-started from the cache (SI-4 review P1,
+    /// carried into this relay by the re-review): a refresh resend
+    /// must never restart a live delivery clock, clear pending work,
+    /// or record itself as a live delivery — under D > ttl/2 with
+    /// ttl/2 refreshes that starved the downstream to permanent
+    /// provisional Unknown. The warm-start is ALWAYS provisional
+    /// (`continuity_bearing = false`), regardless of the relay's own
+    /// continuity: the downstream's optimism must be earned by a
+    /// subsequent live beat, never seeded by a cache (§4.4).
     pub fn register_downstream(
         &mut self,
         key: &ProviderInterestKey,
@@ -229,6 +231,7 @@ impl SensingRelay {
                 upstream: ObservationCell::register(now, requested_sample_interval, factor),
                 cached: None,
             });
+        let is_new_row = !self.slots.contains_key(&(key.clone(), downstream));
         let slot = self
             .slots
             .entry((key.clone(), downstream))
@@ -238,17 +241,21 @@ impl SensingRelay {
                 next_due: now,
                 pending: false,
             });
-        let warm_start = state.cached.as_ref().map(|cached| {
-            slot.last_status = Some(cached.status);
-            slot.last_delivered = Some((cached.origin_incarnation, cached.seq));
-            slot.next_due = now + requested_sample_interval;
-            slot.pending = false;
-            Delivery {
-                to: downstream,
-                attestation: cached.clone(),
-                continuity_bearing: false,
-            }
-        });
+        let warm_start = if is_new_row {
+            state.cached.as_ref().map(|cached| {
+                slot.last_status = Some(cached.status);
+                slot.last_delivered = Some((cached.origin_incarnation, cached.seq));
+                slot.next_due = now + requested_sample_interval;
+                slot.pending = false;
+                Delivery {
+                    to: downstream,
+                    attestation: cached.clone(),
+                    continuity_bearing: false,
+                }
+            })
+        } else {
+            None
+        };
         (outcome, warm_start)
     }
 
@@ -362,6 +369,49 @@ impl SensingRelay {
     /// introspection).
     pub fn upstream_continuity(&self, key: &ProviderInterestKey) -> Option<Continuity> {
         self.keys.get(key).map(|state| state.upstream.continuity())
+    }
+
+    /// SI-4 re-review (leader relay reclamation): drop every cached
+    /// and scheduling trace of a branch whose last table row died —
+    /// the cache must never warm-start a later same-key lifecycle,
+    /// and an abandoned relay must drain to EMPTY, not to "empty
+    /// table plus retained private state". The seq gate deliberately
+    /// stays: strictly-newer admission must survive branch churn (a
+    /// replayed old beat must not re-admit after a re-registration),
+    /// and it is LRU-bounded (SI-1c), so churn cannot grow it.
+    pub fn reclaim_branch(&mut self, key: &ProviderInterestKey) {
+        self.keys.remove(key);
+        self.slots.retain(|(branch, _), _| branch != key);
+    }
+
+    /// SI-4 re-review: GC delivery slots whose downstream row died
+    /// while the branch survives — the mesh sweep's all-slot
+    /// liveness rule, on the relay's own state.
+    pub fn gc_dead_slots(&mut self, now: Instant) {
+        let table = &self.table;
+        self.slots.retain(|(branch, downstream), _| {
+            table
+                .downstream_entry(branch, *downstream)
+                .is_some_and(|row| row.expires_at > now)
+        });
+    }
+
+    /// Whether the relay retains no table rows, no branch caches,
+    /// and no delivery schedules — the HONEST drained state (SI-4
+    /// re-review: draining must account for private state, not just
+    /// the table).
+    pub fn is_drained(&self) -> bool {
+        self.table.is_empty() && self.keys.is_empty() && self.slots.is_empty()
+    }
+
+    /// Retained branch caches (tests/observability).
+    pub fn retained_branches(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Retained delivery slots (tests/observability).
+    pub fn retained_slots(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -732,6 +782,51 @@ mod tests {
     }
 
     #[test]
+    fn refresh_never_resets_a_live_delivery_schedule() {
+        // SI-4 re-review P1 (the mesh relay's warm-start discipline,
+        // carried into this relay): a ttl/2 refresh must not
+        // warm-start, restart the delivery clock, or clear pending
+        // work — under D > ttl/2 that starved the downstream to
+        // permanent provisional Unknown.
+        let t0 = Instant::now();
+        let key = key_for("30");
+        let a = DownstreamId::Peer(1);
+        let mut origin = TestOrigin::new(1);
+        let mut relay = SensingRelay::new(K, 512);
+        relay.register_downstream(&key, a, ms(500), TTL, root(), t0);
+
+        // First live beat: an edge — delivered immediately, schedule
+        // re-arms to t1 + 500.
+        let t1 = t0 + ms(100);
+        let out = relay.on_attestation(t1, &origin.emit(&key, AttestedStatus::Ready), true);
+        assert_eq!(out.iter().filter(|d| d.to == a).count(), 1);
+
+        // A newer unchanged beat inside D parks as pending.
+        let t2 = t1 + ms(100);
+        let out = relay.on_attestation(t2, &origin.emit(&key, AttestedStatus::Ready), true);
+        assert!(out.is_empty(), "inside D: the beat waits for the schedule");
+
+        // The ttl/2-style refresh: no warm-start (the row exists),
+        // and the parked work + schedule survive untouched.
+        let t3 = t2 + ms(100);
+        let (outcome, warm) = relay.register_downstream(&key, a, ms(500), TTL, root(), t3);
+        assert!(matches!(outcome, RegisterOutcome::Registered(_)));
+        assert!(warm.is_none(), "a refresh must not re-send the cache");
+
+        // The pending beat flushes at the ORIGINAL schedule — a
+        // reset clock (t3 + 500) would still hold it parked here.
+        let t4 = t1 + ms(500);
+        let out = relay.poll(t4);
+        let flushed: Vec<&Delivery> = out.iter().filter(|d| d.to == a).collect();
+        assert_eq!(
+            flushed.len(),
+            1,
+            "pending live work flushes on the un-reset schedule",
+        );
+        assert_eq!(flushed[0].attestation.seq, 2);
+    }
+
+    #[test]
     fn multi_hop_cache_chain_cannot_launder_continuity() {
         // SI-0 test 13: X → C → B → A with staggered caches. C holds
         // cached seq 101, B holds cached seq 100, X is silent. A
@@ -748,17 +843,23 @@ mod tests {
         origin.seq = 99;
         let mut relay_c = SensingRelay::new(K, 512);
         let mut relay_b = SensingRelay::new(K, 512);
-        // B was subscribed at C all along (its earlier local watcher
-        // keeps the branch alive), and B has a local row too.
-        relay_c.register_downstream(&key, DownstreamId::Peer(0xB), ms(100), TTL, root(), t0);
+        // C's OWN local watcher keeps the branch (and its cache)
+        // alive; B's subscription at C carries a short ttl so its
+        // row can lapse and re-join below — after the SI-4
+        // re-review, a NEW row lifecycle is the only path to a
+        // cache warm-start (refreshes never re-send).
+        relay_c.register_downstream(&key, DownstreamId::Local, ms(100), TTL, root(), t0);
+        relay_c.register_downstream(&key, DownstreamId::Peer(0xB), ms(100), ms(500), root(), t0);
         relay_b.register_downstream(&key, DownstreamId::Local, ms(100), TTL, root(), t0);
 
         // Seq 100 flows the whole chain live.
         let t1 = t0 + ms(100);
         let att100 = origin.emit(&key, AttestedStatus::Ready);
         let out_c = relay_c.on_attestation(t1, &att100, true);
-        assert_eq!(out_c.len(), 1);
-        let to_b = &out_c[0];
+        let to_b = out_c
+            .iter()
+            .find(|d| d.to == DownstreamId::Peer(0xB))
+            .expect("C forwards the live beat to B");
         assert!(to_b.continuity_bearing);
         relay_b.on_attestation(t1, &to_b.attestation, to_b.continuity_bearing);
 
@@ -787,11 +888,16 @@ mod tests {
         a.on_delivery(t3, &warm);
         assert_eq!(a.projected(&key), ProjectedReadiness::Unknown);
 
-        // B refreshes upstream at C; C warm-starts B with its cached
-        // 101 — provisional (C's continuity is Expired).
+        // B's short-ttl row at C lapsed during the silence; the
+        // sweep shape GCs the dead row + slot while C's local
+        // watcher keeps the branch cache. B then RE-registers — a
+        // NEW row lifecycle, so C warm-starts it with its cached
+        // 101, provisional (C's continuity is Expired).
+        relay_c.table.expire(t3);
+        relay_c.gc_dead_slots(t3);
         let (_, warm_b) =
             relay_c.register_downstream(&key, DownstreamId::Peer(0xB), ms(100), TTL, root(), t3);
-        let warm_b = warm_b.expect("C's cache warm-starts B's refresh");
+        let warm_b = warm_b.expect("C's cache warm-starts B's re-registration");
         assert_eq!(warm_b.attestation.seq, 101);
         assert!(!warm_b.continuity_bearing);
         let out = relay_b.on_attestation(t3, &warm_b.attestation, warm_b.continuity_bearing);
