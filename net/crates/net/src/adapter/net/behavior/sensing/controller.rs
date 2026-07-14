@@ -256,10 +256,24 @@ pub fn project_aggregate(
     search_complete: bool,
 ) -> AggregateView {
     if result_mode == ResultMode::Each {
+        // SI-4 review P1: `Each` obeys the SAME viability contract
+        // as every other mode — a Ready proof that fails THIS
+        // consumer's budget is locally non-viable and projects
+        // Unknown, never Ready (a route change could still make it
+        // viable, so Unknown, not NotReady).
         return AggregateView::PerProvider(
             branches
                 .iter()
-                .map(|branch| (branch.provider, branch.projection))
+                .map(|branch| {
+                    let projection = if branch.projection == ProjectedReadiness::Ready
+                        && !budget.admits(branch.route_estimate, branch.estimated_start)
+                    {
+                        ProjectedReadiness::Unknown
+                    } else {
+                        branch.projection
+                    };
+                    (branch.provider, projection)
+                })
                 .collect(),
         );
     }
@@ -268,14 +282,28 @@ pub fn project_aggregate(
         ResultMode::Quorum(k) => k as usize,
         _ => 1,
     };
-    let viable: Vec<u64> = branches
+    // SI-4 review P1: viable branches are ranked by the
+    // consumer-LOCAL economics — the same quantity the budget
+    // checks (route + provider start estimate) — with provider id
+    // as a stable tie-break, so TopK is deterministic and locally
+    // ranked instead of map-order.
+    let mut viable_ranked: Vec<(Duration, u64)> = branches
         .iter()
         .filter(|branch| {
             branch.projection == ProjectedReadiness::Ready
                 && budget.admits(branch.route_estimate, branch.estimated_start)
         })
-        .map(|branch| branch.provider)
+        .map(|branch| {
+            (
+                branch
+                    .route_estimate
+                    .saturating_add(branch.estimated_start.unwrap_or(Duration::ZERO)),
+                branch.provider,
+            )
+        })
         .collect();
+    viable_ranked.sort();
+    let viable: Vec<u64> = viable_ranked.into_iter().map(|(_, id)| id).collect();
     let explicit_not_ready = branches
         .iter()
         .filter(|branch| branch.projection == ProjectedReadiness::NotReady)
@@ -342,6 +370,98 @@ mod tests {
             estimated_start: Some(ms(50)),
             route_estimate: ms(10),
         }
+    }
+
+    fn costed(
+        provider: u64,
+        projection: ProjectedReadiness,
+        route_ms: u64,
+        start_ms: Option<u64>,
+    ) -> BranchView {
+        BranchView {
+            provider,
+            projection,
+            estimated_start: start_ms.map(ms),
+            route_estimate: ms(route_ms),
+        }
+    }
+
+    /// SI-4 review P1: TopK is deterministic and LOCALLY ranked —
+    /// viable branches sort by this consumer's route + start
+    /// economics (the budget's own quantity), provider id breaking
+    /// ties — never by map iteration order.
+    #[test]
+    fn topk_ranks_viable_branches_by_local_economics() {
+        use ProjectedReadiness::Ready;
+        // Scrambled input: totals are 50 ms (p7), 15 ms (p5, tie),
+        // 15 ms (p3, tie), 100 ms (p9).
+        let branches = [
+            costed(7, Ready, 20, Some(30)),
+            costed(5, Ready, 15, None),
+            costed(9, Ready, 60, Some(40)),
+            costed(3, Ready, 10, Some(5)),
+        ];
+        let view = project_aggregate(
+            &ProviderSelector::AnyAuthorized,
+            ResultMode::TopK(2),
+            &ConsumerLatencyBudget::default(),
+            &branches,
+            false,
+        );
+        match view {
+            AggregateView::Scalar { status, supporting } => {
+                assert_eq!(status, Ready);
+                assert_eq!(
+                    supporting,
+                    vec![3, 5],
+                    "the two cheapest by local economics, id-tie-broken",
+                );
+            }
+            other => panic!("TopK aggregates to Scalar, got {other:?}"),
+        }
+        // Any mode reports the FULL ranked viable list.
+        let view = project_aggregate(
+            &ProviderSelector::AnyAuthorized,
+            ResultMode::Any,
+            &ConsumerLatencyBudget::default(),
+            &branches,
+            false,
+        );
+        match view {
+            AggregateView::Scalar { supporting, .. } => {
+                assert_eq!(supporting, vec![3, 5, 7, 9], "fully ranked");
+            }
+            other => panic!("Any aggregates to Scalar, got {other:?}"),
+        }
+    }
+
+    /// SI-4 review P1: `Each` obeys the same viability contract —
+    /// a Ready proof that fails THIS consumer's budget is locally
+    /// Unknown (a route change could revive it), never surfaced as
+    /// Ready.
+    #[test]
+    fn each_mode_budget_gates_ready_projections() {
+        use ProjectedReadiness::{NotReady, Ready, Unknown};
+        let budget = ConsumerLatencyBudget {
+            end_to_end_within: Some(ms(50)),
+        };
+        let branches = [
+            costed(1, Ready, 10, Some(10)),  // within budget
+            costed(2, Ready, 100, Some(10)), // over budget
+            costed(3, NotReady, 10, None),
+        ];
+        let view = project_aggregate(
+            &ProviderSelector::nodes(vec![1, 2, 3]),
+            ResultMode::Each,
+            &budget,
+            &branches,
+            true,
+        );
+        assert_eq!(
+            view,
+            AggregateView::PerProvider(vec![(1, Ready), (2, Unknown), (3, NotReady)]),
+            "over-budget Ready is locally non-viable, never Ready",
+        );
     }
 
     #[test]

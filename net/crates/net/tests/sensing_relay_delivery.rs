@@ -2,7 +2,8 @@
 //! relay delivery + overlay application on real sessions — the
 //! flagship two-watcher flow plus test 16b's real-path half.
 //!
-//! Topology — four real nodes:
+//! Topology — five real nodes (two watchers, a late joiner, the
+//! relay, and the origin):
 //!
 //! ```text
 //!   A (D = 100 ms) ─┐
@@ -221,42 +222,53 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
         assert_eq!(latest.status, AttestedStatus::Ready);
     }
 
-    // ── Phase 2: down-sampling at each watcher's own D. Each ttl/2
-    //    refresh ALSO warm-re-sends the cached latest (§4.4
-    //    anti-entropy — plan-correct), so B's count gets a small
-    //    allowance for those before the 2× separation is asserted. ──
+    // ── Phase 2: down-sampling PROVEN by inter-delivery spacing
+    //    (SI-4 review evidence correction): sample each watcher's
+    //    latest seq at 20 ms and record when it CHANGES — B's
+    //    deliveries must arrive on its 500 ms schedule, never the
+    //    origin cadence. (Warm resends no longer interleave: the
+    //    P1 warm-start discipline sends them only for NEW rows.) ──
     let mut seqs_a: HashSet<u64> = HashSet::new();
-    let mut seqs_b: HashSet<u64> = HashSet::new();
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut b_change_times: Vec<std::time::Instant> = Vec::new();
+    let mut last_b_seq: Option<u64> = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
         if let Some(latest) = a.sensing_latest_attestation(&branch) {
             seqs_a.insert(latest.seq);
         }
         if let Some(latest) = b.sensing_latest_attestation(&branch) {
-            seqs_b.insert(latest.seq);
+            if last_b_seq != Some(latest.seq) {
+                last_b_seq = Some(latest.seq);
+                b_change_times.push(std::time::Instant::now());
+            }
         }
     }
-    let warm_allowance = 3;
     assert!(
-        seqs_a.len() >= 2 * seqs_b.len().saturating_sub(warm_allowance),
-        "B must be down-sampled to its own D, not the origin cadence \
-         (A saw {} distinct beats, B saw {})",
-        seqs_a.len(),
-        seqs_b.len(),
+        b_change_times.len() >= 3,
+        "B receives its cadence ({} deliveries observed)",
+        b_change_times.len(),
+    );
+    let min_spacing = b_change_times
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .min()
+        .expect("at least two deliveries");
+    assert!(
+        min_spacing >= Duration::from_millis(400),
+        "B is delivered on its OWN 500 ms schedule — observed a gap of \
+         {min_spacing:?}",
     );
     assert!(
-        seqs_a.len() > seqs_b.len(),
-        "the strict watcher sees strictly more of the stream \
-         (A {}, B {})",
+        seqs_a.len() >= 2 * b_change_times.len(),
+        "the strict watcher sees the stream's cadence (A {} distinct, B {})",
         seqs_a.len(),
-        seqs_b.len(),
+        b_change_times.len(),
     );
-    assert!(!seqs_b.is_empty(), "B still receives its cadence");
 
     // ── Phase 3: LOCAL aggregate views (§3.5) + the §4.9 overlay
     //    change signal ──
     assert_eq!(a.sensing_projected(&branch), ProjectedReadiness::Ready);
-    let view = a.sensing_aggregate_view(&spec, &ConsumerLatencyBudget::default(), false);
+    let view = a.sensing_aggregate_view(&spec, &ConsumerLatencyBudget::default(), None);
     match view {
         AggregateView::Scalar { status, supporting } => {
             assert_eq!(status, ProjectedReadiness::Ready);
@@ -267,11 +279,19 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
     let mut overlay_rx = a.subscribe_sensing_overlay_changes();
     let overlay_before = *overlay_rx.borrow_and_update();
 
-    // ── Phase 4: a status edge reaches BOTH watchers well inside
-    //    B's 500 ms schedule — never held by the down-sampler ──
+    // ── Phase 4 (SI-4 review evidence correction): trigger the
+    //    edge IMMEDIATELY after a known ordinary B delivery, so B's
+    //    next due sits ~500 ms out — the edge arriving within
+    //    250 ms proves it was never held by the down-sampler ──
+    let b_seq_now = b.sensing_latest_attestation(&branch).expect("present").seq;
+    await_condition(Duration::from_secs(2), "a fresh B delivery lands", || {
+        b.sensing_latest_attestation(&branch)
+            .is_some_and(|latest| latest.seq != b_seq_now)
+    })
+    .await;
     ready.store(false, Ordering::Relaxed);
     p.notify_sensing_state_changed(&CapabilityId::new("print.document"));
-    await_condition(Duration::from_millis(400), "edge at both watchers", || {
+    await_condition(Duration::from_millis(250), "edge at both watchers", || {
         let edge = |node: &Arc<MeshNode>| {
             node.sensing_latest_attestation(&branch)
                 .is_some_and(|latest| {
@@ -330,12 +350,15 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
         AttestedStatus::Ready,
         "the cached proof itself is a verified Ready",
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // SI-4 review evidence correction: asserted IMMEDIATELY after
+    // receipt — a wrongly live-marked Ready would still be inside
+    // its continuity window here, so natural expiry cannot mask
+    // the defect.
     assert_eq!(
         c2.sensing_projected(&branch),
         ProjectedReadiness::Unknown,
         "real-path cache laundering: a provisional warm-start from a dead \
-         origin must never project optimism",
+         origin must never project optimism, even transiently",
     );
 
     // Nothing on the whole flow was protocol-invalid anywhere.
@@ -352,4 +375,104 @@ async fn flagship_two_watchers_one_stream_and_the_hop_rule() {
     b.shutdown().await.expect("shutdown B");
     c2.shutdown().await.expect("shutdown C2");
     r.shutdown().await.expect("shutdown R");
+}
+
+/// SI-4 review P1 regression (warm anti-entropy must not starve
+/// live continuity): with `D > ttl/2` and refreshes at exactly
+/// ttl/2, every refresh used to RESET the relay's delivery slot
+/// (next_due forward, pending cleared, last_delivered overwritten)
+/// before the schedule could fire — the downstream then received
+/// newer proofs only provisionally and sat at Unknown under a
+/// perfectly healthy stream. Warm-starts now fire only for NEWLY
+/// created rows, so the live schedule survives refreshes.
+#[tokio::test]
+async fn ttl_half_refreshes_do_not_starve_live_delivery() {
+    let fleet_kp = EntityKeypair::generate();
+    let fleet = AudienceScopeCommitment::owner_root(fleet_kp.entity_id());
+    let mk = |incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(fleet);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    };
+    let c = mk(None).await;
+    let r = mk(None).await;
+    let p = mk(Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(
+        CapabilityId::new("print.document"),
+        Arc::new(FlagEvaluator {
+            ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+    connect_pair(&c, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&c, &r, &p] {
+        node.start();
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    let (c_id, r_id, p_id) = (c.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "pins", || {
+        r.peer_entity_id(c_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    c.router().add_route(p_id, r.local_addr());
+    c.test_pin_peer_entity(p_id, p.entity_keypair().entity_id().clone());
+
+    let spec = shared_spec(fleet);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    // D = 1200 ms > ttl/2 = 750 ms: exactly the starvation shape.
+    let d = Duration::from_millis(1200);
+    let refresher = {
+        let c = c.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = c.register_sensing_interest(&spec, p_id, d, TTL);
+                tokio::time::sleep(TTL / 2).await;
+            }
+        })
+    };
+
+    await_condition(Duration::from_secs(10), "stream reaches C", || {
+        c.sensing_latest_attestation(&branch).is_some()
+    })
+    .await;
+    // A healthy unchanged Ready stream must ESTABLISH at C and stay
+    // Established across several refresh cycles — before the fix,
+    // every 750 ms refresh preempted the 1200 ms live schedule and
+    // C only ever saw provisional resends (permanent Unknown).
+    await_condition(Duration::from_secs(10), "C establishes", || {
+        c.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+    let seq_start = c.sensing_latest_attestation(&branch).expect("present").seq;
+    for _ in 0..12 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            c.sensing_projected(&branch),
+            ProjectedReadiness::Ready,
+            "continuity must hold across ttl/2 refreshes on a healthy stream",
+        );
+    }
+    let seq_end = c.sensing_latest_attestation(&branch).expect("present").seq;
+    assert!(
+        seq_end > seq_start,
+        "live deliveries keep flowing at D ({seq_start} → {seq_end})",
+    );
+
+    refresher.abort();
+    c.shutdown().await.expect("shutdown C");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
 }

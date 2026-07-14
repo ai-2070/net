@@ -216,6 +216,37 @@ impl ObservationCell {
             .saturating_mul(self.factor)
     }
 
+    /// SI-4 review (interval update): the consumer's — or the
+    /// relay's aggregate — own D moved. Recompute the CURRENT
+    /// deadline for the new window WITHOUT resetting continuity and
+    /// without waiting for a fresh beat: the deadline's anchor (the
+    /// last qualifying event) is preserved by shifting the deadline
+    /// by the window delta, so tightening pulls the deadline
+    /// earlier and loosening pushes it later, exactly. A no-op when
+    /// the interval is unchanged; skipped once Expired (the
+    /// deadline is meaningless there — the next beat rebuilds state
+    /// as usual).
+    pub fn update_interval(&mut self, own_interval: Duration) {
+        if own_interval == self.own_interval {
+            return;
+        }
+        let promised = self
+            .observation
+            .as_ref()
+            .map(|obs| obs.promised_cadence)
+            .unwrap_or(Duration::ZERO);
+        let old_window = self.window(promised);
+        self.own_interval = own_interval;
+        let new_window = self.window(promised);
+        if self.continuity != Continuity::Expired {
+            if new_window >= old_window {
+                self.deadline += new_window - old_window;
+            } else if let Some(deadline) = self.deadline.checked_sub(old_window - new_window) {
+                self.deadline = deadline;
+            }
+        }
+    }
+
     /// Apply one gate-admitted beat.
     ///
     /// - A **continuity-bearing** beat establishes (from
@@ -333,6 +364,49 @@ mod tests {
             promised_cadence: Duration::from_millis(100),
             continuity_bearing: bearing,
         }
+    }
+
+    /// SI-4 review P1: an interval change re-anchors the CURRENT
+    /// deadline for the new window without resetting continuity —
+    /// tightening pulls the deadline earlier, loosening pushes it
+    /// later, both exactly, and neither requires a fresh beat.
+    #[test]
+    fn interval_update_reanchors_deadline_without_resetting_continuity() {
+        let t0 = Instant::now();
+        // own D = 200 ms dominates the 100 ms promised cadence:
+        // window = 3 × 200 = 600 ms from the establishing beat.
+        let mut cell = ObservationCell::register(t0, Duration::from_millis(200), K);
+        let t1 = t0 + Duration::from_millis(50);
+        cell.on_admitted_beat(t1, beat(1, AttestedStatus::Ready, true));
+        assert_eq!(cell.continuity(), Continuity::Established);
+
+        // TIGHTEN to 100 ms: window becomes 3 × max(100, 100) =
+        // 300 ms, still anchored at t1 — continuity survives the
+        // update, and expiry honors the NEW deadline exactly.
+        cell.update_interval(Duration::from_millis(100));
+        assert_eq!(cell.continuity(), Continuity::Established);
+        cell.expire_if_due(t1 + Duration::from_millis(299));
+        assert_eq!(cell.continuity(), Continuity::Established);
+        cell.expire_if_due(t1 + Duration::from_millis(301));
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Expired,
+            "the tightened window expires at the re-anchored deadline",
+        );
+
+        // LOOSEN on a fresh established cell: 200 ms → 400 ms moves
+        // the deadline out to t1 + 1200 ms.
+        let mut cell = ObservationCell::register(t0, Duration::from_millis(200), K);
+        cell.on_admitted_beat(t1, beat(1, AttestedStatus::Ready, true));
+        cell.update_interval(Duration::from_millis(400));
+        cell.expire_if_due(t1 + Duration::from_millis(1199));
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Established,
+            "the loosened window holds past the old deadline",
+        );
+        cell.expire_if_due(t1 + Duration::from_millis(1201));
+        assert_eq!(cell.continuity(), Continuity::Expired);
     }
 
     #[test]

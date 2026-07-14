@@ -3051,6 +3051,10 @@ impl SensingObservations {
             .consumer_cells
             .entry(branch.clone())
             .or_insert_with(|| sensing::ObservationCell::register(now, own_interval, factor));
+        // SI-4 review P1: the consumer's own D can change across
+        // re-registrations — re-anchor the window without resetting
+        // continuity.
+        cell.update_interval(own_interval);
         let before = cell.projected();
         cell.on_admitted_beat(
             now,
@@ -4887,6 +4891,41 @@ impl MeshNode {
                 }
             }
         } else if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+            // SI-4 review P1 (Local warm-start): a Local row joining
+            // an already-cached relay branch warm-starts exactly
+            // like a peer — once, on row creation, always
+            // provisional.
+            {
+                let mut observations = self.sensing_observations.lock();
+                let slot_key = (key.clone(), sensing::DownstreamId::Local);
+                if !observations.slots.contains_key(&slot_key) {
+                    if let Some(cached) = observations.latest.get(&key).cloned() {
+                        observations.slots.insert(
+                            slot_key,
+                            SensingDeliverySlot {
+                                last_status: Some(cached.status),
+                                last_delivered: Some((cached.origin_incarnation, cached.seq)),
+                                next_due: now + requested_sample_interval,
+                                pending: false,
+                            },
+                        );
+                        let moved = observations.feed_consumer_cell(
+                            &key,
+                            &cached,
+                            false,
+                            requested_sample_interval,
+                            self.config.continuity_factor,
+                            now,
+                        );
+                        drop(observations);
+                        if moved {
+                            self.sensing_overlay_changed.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                    }
+                }
+            }
             if let Some(strictest) = aggregate {
                 if sensing_upstream_damper_admits(
                     &self.sensing_upstream_damper,
@@ -5158,14 +5197,23 @@ impl MeshNode {
     /// consumer cells with LIVE route estimates from the proximity
     /// plane; `search_complete` is the caller's resolution state
     /// (open-world selectors are never complete, §3.5).
+    /// SI-4 review P1 (completeness): a bare completeness flag over
+    /// only-materialized cells would mistake a MISSING expected
+    /// provider for NotReady evidence. Completeness is therefore
+    /// claimable only WITH the resolved expected population:
+    /// `Some(expected)` inserts providers with no observation yet
+    /// as Unknown branches (so the potential-count rule sees them)
+    /// and enables completeness; `None` refuses complete/NotReady
+    /// projection outright (open-world selectors additionally never
+    /// complete, §3.5 — enforced inside `project_aggregate`).
     pub fn sensing_aggregate_view(
         &self,
         spec: &sensing::InterestSpec,
         budget: &sensing::ConsumerLatencyBudget,
-        search_complete: bool,
+        resolved_population: Option<&[u64]>,
     ) -> sensing::AggregateView {
         let interest = spec.key();
-        let branches: Vec<sensing::BranchView> = self
+        let mut branches: Vec<sensing::BranchView> = self
             .sensing_branch_projections(&interest)
             .into_iter()
             .map(
@@ -5180,12 +5228,27 @@ impl MeshNode {
                 },
             )
             .collect();
+        if let Some(expected) = resolved_population {
+            for provider in expected {
+                if !branches.iter().any(|branch| branch.provider == *provider) {
+                    branches.push(sensing::BranchView {
+                        provider: *provider,
+                        projection: sensing::ProjectedReadiness::Unknown,
+                        estimated_start: None,
+                        route_estimate: sensing::proximity_route_estimate(
+                            &self.proximity_graph,
+                            *provider,
+                        ),
+                    });
+                }
+            }
+        }
         sensing::project_aggregate(
             &spec.providers,
             spec.result_mode,
             budget,
             &branches,
-            search_complete,
+            resolved_population.is_some(),
         )
     }
 
@@ -6549,6 +6612,9 @@ impl MeshNode {
         let router = self.router.clone();
         let partition_filter = self.partition_filter.clone();
         let local_node_id = self.node_id;
+        let observations = self.sensing_observations.clone();
+        let overlay = self.sensing_overlay_changed.clone();
+        let factor = self.config.continuity_factor;
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         Some(tokio::spawn(async move {
@@ -6603,23 +6669,29 @@ impl MeshNode {
                         }
                         continue;
                     }
+                    let mut local_interval: Option<Duration> = None;
                     let peer_downstreams: Vec<u64> = downstreams
                         .into_iter()
                         .filter_map(|downstream| match downstream {
                             sensing::DownstreamId::Peer(node) => Some(node),
-                            // Local: the self-provider watch (R-5
-                            // seam). Leader: a co-located origin +
-                            // leader — its fan-out rides the same
-                            // seam.
-                            sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
+                            // SI-4 review P1 (self-provider watch):
+                            // the origin's own Local row consumes
+                            // the SAME signed beats below. A
+                            // co-located leader's fan-out rides its
+                            // intake path.
+                            sensing::DownstreamId::Local => {
+                                local_interval = Some(
+                                    table
+                                        .lock()
+                                        .downstream_entry(&branch, sensing::DownstreamId::Local)
+                                        .map(|row| row.requested_sample_interval)
+                                        .unwrap_or(Duration::from_millis(50)),
+                                );
+                                None
+                            }
+                            sensing::DownstreamId::Leader => None,
                         })
                         .collect();
-                    if peer_downstreams.is_empty() {
-                        // Local-only interest: the stream stays
-                        // live (seq advances) but delivery to the
-                        // local overlay is SI-4.
-                        continue;
-                    }
                     // Phase 2 (NO emitter lock): run the user
                     // evaluator, then seal — `into_unsigned` is
                     // pure. Clone the Arc out of the map entry
@@ -6633,6 +6705,27 @@ impl MeshNode {
                     let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
                         continue;
                     };
+                    // SI-4 review P1: the self-provider Local watch
+                    // consumes the signed beat through the SAME
+                    // attestation + continuity semantics as any
+                    // consumer — the origin's own live stream is
+                    // continuity-bearing by definition.
+                    if let Some(interval) = local_interval {
+                        let moved = {
+                            let mut observations = observations.lock();
+                            observations.latest.insert(branch.clone(), signed.clone());
+                            observations
+                                .feed_consumer_cell(&branch, &signed, true, interval, factor, now)
+                        };
+                        if moved {
+                            overlay.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                    }
+                    if peer_downstreams.is_empty() {
+                        continue;
+                    }
                     let Ok(bytes) = sensing::encode_attestation(&signed) else {
                         continue;
                     };
@@ -8202,9 +8295,27 @@ impl MeshNode {
                 return;
             }
             // SI-4a: the §4.4 continuity-bearing flag rides the
-            // hop-authored session envelope — the stream id (see
-            // `sensing::SENSING_PROVISIONAL_STREAM`).
-            let provisional = parsed.header.stream_id == sensing::SENSING_PROVISIONAL_STREAM;
+            // hop-authored session envelope — the stream id.
+            // SI-4 review P2: match BOTH declared streams
+            // explicitly and drop everything else as malformed —
+            // unknown envelope metadata must never default to
+            // optimistic continuity.
+            let stream_id = parsed.header.stream_id;
+            let provisional = if stream_id == sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64 {
+                false
+            } else if stream_id == sensing::SENSING_PROVISIONAL_STREAM {
+                true
+            } else {
+                ctx.sensing_counters
+                    .protocol_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    stream_id,
+                    "sensing: unknown 0x0C03 envelope stream dropped"
+                );
+                return;
+            };
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_sensing_attestation_frame(&payload, from_node, provisional, ctx);
@@ -9657,16 +9768,21 @@ impl MeshNode {
                                     cell.expire_if_due(poll_now);
                                     overlay_moved |= cell.projected() != before;
                                 }
-                                let pending: Vec<(
-                                    sensing::ProviderInterestKey,
-                                    sensing::DownstreamId,
+                                // SI-4 review P1: EVERY slot is
+                                // checked for row liveness — a
+                                // downstream that deregistered
+                                // after an ordinary delivery left a
+                                // non-pending slot leaking as long
+                                // as the branch stayed alive.
+                                let slot_keys: Vec<(
+                                    (sensing::ProviderInterestKey, sensing::DownstreamId),
+                                    bool,
                                 )> = observations
                                     .slots
                                     .iter()
-                                    .filter(|(_, slot)| slot.pending)
-                                    .map(|(key, _)| key.clone())
+                                    .map(|(key, slot)| (key.clone(), slot.pending))
                                     .collect();
-                                (continuities, pending)
+                                (continuities, slot_keys)
                             };
                             let mut live_pending = Vec::new();
                             let mut dead_slots = Vec::new();
@@ -9675,18 +9791,21 @@ impl MeshNode {
                                 for (branch, continuity) in continuities {
                                     table.set_upstream_continuity(&branch, continuity);
                                 }
-                                for (branch, downstream) in pending {
+                                for ((branch, downstream), pending) in pending {
                                     match table.downstream_entry(&branch, downstream) {
                                         Some(row) if row.expires_at > poll_now => {
-                                            live_pending.push((
-                                                branch,
-                                                downstream,
-                                                row.requested_sample_interval,
-                                            ));
+                                            if pending {
+                                                live_pending.push((
+                                                    branch,
+                                                    downstream,
+                                                    row.requested_sample_interval,
+                                                ));
+                                            }
                                         }
                                         // The row died while the
                                         // branch survives: the slot
-                                        // is inert — GC it.
+                                        // is inert — GC it, pending
+                                        // or not.
                                         _ => dead_slots.push((branch, downstream)),
                                     }
                                 }
@@ -12057,31 +12176,40 @@ impl MeshNode {
                             Self::send_sensing_deregister_upstream(ctx, &key);
                             return;
                         }
-                        // SI-4a warm-start (§4.4): every downstream
-                        // registration re-sends the cached latest —
-                        // ALWAYS provisional (cached optimism must
-                        // be earned by a live beat, never seeded by
-                        // a cache); the downstream's gate absorbs
-                        // duplicates as StaleSeq.
+                        // SI-4a warm-start (§4.4), disciplined by
+                        // the SI-4 review (P1): ONLY a NEWLY
+                        // CREATED downstream row is warm-started —
+                        // a refresh resend must never restart a
+                        // live delivery clock, clear pending work,
+                        // or record itself as a live delivery
+                        // (under D = ttl with ttl/2 refreshes that
+                        // starved the downstream to permanent
+                        // provisional Unknown). The send is ALWAYS
+                        // provisional; the downstream's gate
+                        // absorbs duplicates as StaleSeq.
                         let cached = {
                             let mut observations = ctx.sensing_observations.lock();
-                            let cached = observations.latest.get(&key).cloned();
-                            if let Some(cached) = &cached {
-                                let slot = observations
-                                    .slots
-                                    .entry((key.clone(), sensing::DownstreamId::Peer(from_node)))
-                                    .or_insert(SensingDeliverySlot {
-                                        last_status: None,
-                                        last_delivered: None,
-                                        next_due: now,
-                                        pending: false,
-                                    });
-                                slot.last_status = Some(cached.status);
-                                slot.last_delivered = Some((cached.origin_incarnation, cached.seq));
-                                slot.next_due = now + validated.requested_sample_interval;
-                                slot.pending = false;
+                            let slot_key = (key.clone(), sensing::DownstreamId::Peer(from_node));
+                            if observations.slots.contains_key(&slot_key) {
+                                None
+                            } else {
+                                let cached = observations.latest.get(&key).cloned();
+                                if let Some(cached) = &cached {
+                                    observations.slots.insert(
+                                        slot_key,
+                                        SensingDeliverySlot {
+                                            last_status: Some(cached.status),
+                                            last_delivered: Some((
+                                                cached.origin_incarnation,
+                                                cached.seq,
+                                            )),
+                                            next_due: now + validated.requested_sample_interval,
+                                            pending: false,
+                                        },
+                                    );
+                                }
+                                cached
                             }
-                            cached
                         };
                         if let Some(cached) = cached {
                             if let Ok(bytes) = sensing::encode_attestation(&cached) {
@@ -12639,9 +12767,34 @@ impl MeshNode {
                 .upstream
                 .entry(branch.clone())
                 .or_insert_with(|| sensing::ObservationCell::register(now, own_interval, factor));
+            // SI-4 review P1: the aggregate D moves with downstream
+            // churn — re-anchor the window on every beat, never
+            // resetting continuity.
+            cell.update_interval(own_interval);
             cell.on_admitted_beat(now, beat);
             cell.continuity()
         };
+        // SI-4 review P1 (solicited/expiry race): the branch can
+        // expire between the solicited check and the store — the
+        // sweep would never see a branch-death event for the state
+        // just inserted, permanently consuming cap. Recheck before
+        // forwarding; if the branch vanished, reclaim and stop (an
+        // expiry AFTER this recheck is caught by the normal sweep,
+        // which now sees the state).
+        let still_solicited = digest_watch.is_some_and(|_| {
+            ctx.sensing_capability_interests
+                .lock()
+                .get(&branch.interest)
+                .is_some_and(|(_, expires)| *expires > Instant::now())
+        }) || !ctx
+            .sensing_interest_table
+            .lock()
+            .downstreams(&branch, Instant::now())
+            .is_empty();
+        if !still_solicited {
+            ctx.sensing_observations.lock().reclaim_branch(&branch);
+            return;
+        }
         ctx.sensing_interest_table
             .lock()
             .set_upstream_continuity(&branch, continuity);
