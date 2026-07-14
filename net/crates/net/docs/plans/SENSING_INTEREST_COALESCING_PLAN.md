@@ -1757,6 +1757,52 @@ must exercise the real dispatch path.
   Verification: 4,909 lib all-features + 2,621 net-only, 38 sensing
   e2e across eleven suites, both clippy gates (incl. `-D
   warnings`), fmt — green.
+  *SI-6 review disposition (2026-07-14): CHANGES REQUESTED.* Core
+  bridge SOUND (classify_branch as the single viability truth,
+  prune-not-mutate, stable banding, claim ordering, suspension
+  tripwire, feature layering — all signed off). Two reproduced
+  integration defects + one promoted item:
+  1. **(P1) scheduler wake-up misses economics-only rank changes:**
+     `feed_consumer_cell` compares only `projected()`, so
+     Ready→Ready with a changed signed `estimated_start`, a route
+     cost change, or a viable-rank exchange never bumps the watch —
+     the scheduler can target a stale selected provider
+     indefinitely (reviewer e2e: estimate 3 ms → 1000 ms flipped
+     `selected_provider()` correctly but the advertised wake-up
+     never fired). Closure: compare a scheduler-relevant tuple
+     (projection, estimated_start, generation) at intake, and
+     unify route/topology + fold-membership changes into ONE
+     scheduler-input generation (budget stays caller-owned).
+     Witnesses: Ready→Ready estimate flip reversing the selection;
+     rank-relevant topology/fold events firing without a status
+     edge.
+  2. **(P1) the two-level overlay ignores `resolved_population`:**
+     the aggregate half rides `sensing_branch_views` (filtered) but
+     the candidates half returned every retained cell for the
+     digest — an aggregate over {A} beside candidates {A, B},
+     contradicting "observations behind the aggregate". Closure:
+     filter candidates by the same resolved set (missing expected
+     providers stay absent — they are Unknown in the aggregate, not
+     observations). Witness: aggregate population == overlay
+     candidate population with retained out-of-population cells.
+  3. **(SI-6.1, promoted from the SI-6 bounds) leader
+     fold-membership reconciliation is SEMANTIC closure, not SI-7
+     observability:** a capability-fold change can alter the
+     leader's resolved set, active branches, the scheduler's
+     population, and the selected provider — it must join the same
+     rematch/reconciliation seam. (The gang matcher re-queries the
+     fold, so a removed host is not blindly claimable — bounded
+     damage — but the leader can hold stale demand until TTL.)
+  Non-blocking: precompute the island→band map in
+  `match_islands_sensed` from one topology snapshot (consistency +
+  no per-comparison fold queries). Mechanical: net-only STRICT
+  clippy fails at d8b9a76fc on three SI-5 callback bindings
+  (leader-only captures unused without redex; `providers` needs mut
+  only under redex) — close inside this round. Noted, not ours:
+  `test_failure_detector_failure` is timing-fragile on the
+  reviewer's machine.
+  Gate: SI-6 sign-off CHANGES REQUESTED; SI-7 HOLD until the SI-5 +
+  SI-6 closures.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
