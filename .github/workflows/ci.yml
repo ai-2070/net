@@ -515,7 +515,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -587,7 +587,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -1444,7 +1444,7 @@ jobs:
       # these, tests/typegen_downstream_{ts,python}.rs self-skip; installing
       # them here makes those checks actually run.
       - name: Install Node + TypeScript
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Install tsc
