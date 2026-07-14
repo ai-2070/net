@@ -46,7 +46,13 @@ reconciliation has no trailing-edge repair; disposition in §6);
 **SI-6.1 closure LANDED same day (2026-07-15, §6)** — consumer-row
 union snapshotted before teardown, added-implies-demand + drain,
 dedicated leading+trailing fold coalescer, both notes taken.
-Next: SI-6.1 re-verification; SI-7 holds behind it.
+**SI-7 COMPLETE as-built (2026-07-15, §6)** — the observability
+surface (refusals-by-kind incl. broad-selector; coalescing +
+delivery lifecycle counters; the divergent-resolution merge-miss
+rate that feeds the §4.1 future gate; leader-load snapshot) + the
+operator doc `docs/SENSING.md`, operator-directed. The slice
+sequence SI-0..SI-7 is now complete as-built.
+Next: SI-6.1 re-verification + SI-7 review by Kyra.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1979,6 +1985,57 @@ must exercise the real dispatch path.
   by kind (incl. broad-selector), candidate fanout, aggregate
   transitions, **and coalescing efficacy — the divergent-resolution
   merge-miss rate that feeds the §4.1 future gate.**
+
+  *SI-7 as-built (2026-07-15, ee58a5d43; operator-directed, semantic
+  review closed):* the observability surface + the docs. The
+  merge-miss (the one logic-bearing counter) is red-green verified;
+  the rest are direct `fetch_add`s positively witnessed on real
+  sessions.
+  `SensingCounters` grows from the SI-0 refusal subset to three
+  groups. (a) Refusals by kind, adding `broad_selector_refusals`
+  (the §4.7 each-mode amplification guard, on the leader intake's
+  `Resolution(SelectorTooBroad)` arm). (b) Coalescing + delivery
+  lifecycle: `interests_registered` / `interests_coalesced` (from
+  `LeaderRegistration.newly_resolved` — a joined row is a merge),
+  `candidate_fanout_total`, `attestations_emitted` (emitter loop,
+  post-sign — one per branch per tick, never × watchers),
+  `attestations_forwarded` (the relay `forwards` loop, per
+  downstream), `attestations_gated` (observer-gate drop),
+  `attestations_superseded` (the SI-5 P0 epoch-stale drop). (c)
+  Coalescing efficacy: `provider_free_registrations` (denominator)
+  and `divergent_resolution_merge_miss` (numerator).
+  MERGE-MISS (the §4.1 future-gate headline): counted at a PROVIDER
+  when a provider-free `ProviderRegistration` is admitted while the
+  branch already carries another distinct upstream — two independent
+  leaders resolved the same interest here (the split-brain /
+  election-propagation residual §4.1 tolerates).
+  `ProviderSelector::is_provider_free` scopes it: `Node`/`Nodes`
+  direct registrations are intended multi-surveillance, excluded.
+  Rate = miss / provider-free registrations. Leader load exposed via
+  `SensingLeader::load → SensingLeaderLoad { interests, branches,
+  downstream_rows }` + `MeshNode::sensing_leader_load` (§7 hotspot).
+  Witnesses: units (`is_provider_free` discriminates leader-routed
+  from direct; `load` counts interest/branch/row concentration); the
+  `provider_free_proofs_fan_back` e2e augmented with the
+  coalescing-efficacy asserts + a NEGATIVE merge-miss (one leader =
+  zero divergence); a new two-leader e2e
+  `divergent_leaders_at_one_provider_count_a_merge_miss` (both R1/R2
+  lead one P; P sees two distinct upstreams; miss ≥ 1 — red: the
+  await times out without the increment).
+  Docs: new `docs/SENSING.md` (operator/consumer view — model,
+  config surface, the full counter surface + how to read the
+  merge-miss rate and leader load), cross-linked from `BEHAVIOR.md`.
+  DEFERRED with rationale (flagged for review): continuity- and
+  aggregate-transition counters and a raw "expired" tally stay as
+  the existing hot-path `tracing` at their §4.5/§4.9 transition
+  points — promoting them to counters is additive and best scoped
+  against a defined read-side consumer; the operator efficacy
+  picture is served by the wired set.
+  Verification: 4,918 lib all-features, leader delivery 10/10,
+  failure plane 5/5, scheduler bridge 1/1, routed origin 1/1, both
+  strict clippy `-D warnings` gates, fmt, `git diff --check`.
+  Awaiting review; the plan's slice sequence (SI-0..SI-7) is now
+  complete as-built.
 
 Dependency order: SI-0 → SI-1 → SI-2 → SI-3 → SI-4; SI-5/SI-6 after
 SI-4; SI-7 last.
