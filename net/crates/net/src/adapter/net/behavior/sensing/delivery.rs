@@ -223,6 +223,7 @@ impl SensingRelay {
         if !matches!(outcome, RegisterOutcome::Registered(_)) {
             return (outcome, None);
         }
+        let aggregate = self.table.aggregate(key, now);
         let factor = self.factor;
         let state = self
             .keys
@@ -231,6 +232,12 @@ impl SensingRelay {
                 upstream: ObservationCell::register(now, requested_sample_interval, factor),
                 cached: None,
             });
+        // SI-4 re-review item 5: the registration can move the
+        // branch aggregate — re-anchor the relay's own continuity
+        // window immediately, never at the next beat.
+        if let Some(interval) = aggregate {
+            state.upstream.update_interval(interval);
+        }
         let is_new_row = !self.slots.contains_key(&(key.clone(), downstream));
         let slot = self
             .slots
@@ -382,6 +389,16 @@ impl SensingRelay {
     pub fn reclaim_branch(&mut self, key: &ProviderInterestKey) {
         self.keys.remove(key);
         self.slots.retain(|(branch, _), _| branch != key);
+    }
+
+    /// SI-4 re-review item 5: the branch's aggregate D moved through
+    /// a table mutation (refusal partition, row expiry) with no
+    /// registration in flight — re-anchor the relay's own continuity
+    /// window immediately, never at the next beat.
+    pub fn update_branch_interval(&mut self, key: &ProviderInterestKey, interval: Duration) {
+        if let Some(state) = self.keys.get_mut(key) {
+            state.upstream.update_interval(interval);
+        }
     }
 
     /// SI-4 re-review: GC delivery slots whose downstream row died
@@ -824,6 +841,44 @@ mod tests {
             "pending live work flushes on the un-reset schedule",
         );
         assert_eq!(flushed[0].attestation.seq, 2);
+    }
+
+    #[test]
+    fn registration_tightens_the_continuity_window_without_a_beat() {
+        // SI-4 re-review item 5: a strict consumer joining moves the
+        // branch aggregate — the relay's own continuity window must
+        // re-anchor IMMEDIATELY. On a quiet stream the old deadline
+        // would otherwise keep optimism alive past the new, stricter
+        // suspicion horizon.
+        let t0 = Instant::now();
+        let key = key_for("30");
+        let (a, b) = (DownstreamId::Peer(1), DownstreamId::Peer(2));
+        let mut origin = TestOrigin::new(1);
+        let mut relay = SensingRelay::new(K, 512);
+        relay.register_downstream(&key, a, ms(200), TTL, root(), t0);
+
+        // One live beat establishes: window = 3 × max(promised 100,
+        // aggregate 200) = 600 ms → deadline t1 + 600.
+        let t1 = t0 + ms(100);
+        relay.on_attestation(t1, &origin.emit(&key, AttestedStatus::Ready), true);
+        assert_eq!(
+            relay.upstream_continuity(&key),
+            Some(Continuity::Established)
+        );
+
+        // The origin goes silent; a STRICT consumer joins at
+        // D = 100 → aggregate 100 → window 300 ms, deadline t1 + 300
+        // — now, not at the next beat.
+        let t2 = t1 + ms(100);
+        relay.register_downstream(&key, b, ms(100), TTL, root(), t2);
+
+        // Inside the OLD window but past the tightened deadline.
+        relay.poll(t1 + ms(400));
+        assert_eq!(
+            relay.upstream_continuity(&key),
+            Some(Continuity::Expired),
+            "a tightened aggregate must move the deadline inward immediately",
+        );
     }
 
     #[test]

@@ -1325,3 +1325,100 @@ async fn at_capacity_registration_surfaced_and_rolled_back() {
 
     node.shutdown().await.expect("shutdown");
 }
+
+/// SI-4 re-review item 5: table mutations that move a branch's
+/// aggregate D must re-anchor the hop's continuity window
+/// IMMEDIATELY — production paths, with NO intervening beat (the
+/// origin is silenced by a real partition before the D changes).
+///
+/// Two interests on one provider, both established at D = 400 ms
+/// (window 3 × 400 = 1200 ms). After the partition:
+/// - one re-registers at D = 100 ms → window 3 × max(promised 200,
+///   100) = 600 ms → the deadline moves INWARD now (suspicion within
+///   ~700 ms; the stale window would have held ≥ 800 ms);
+/// - the other re-registers at D = 1200 ms → window 3600 ms → the
+///   deadline moves OUTWARD now (still Established at +1500 ms,
+///   where the stale window would already have expired).
+#[tokio::test]
+async fn interval_changes_re_anchor_windows_with_no_intervening_beat() {
+    let (c, p, fleet) = consumer_provider_pair(Some(Incarnation::new(9))).await;
+    let p_id = p.node_id();
+
+    let ready = Arc::new(AtomicBool::new(true));
+    p.register_readiness_evaluator(
+        CapabilityId::new("print.document"),
+        Arc::new(FlagEvaluator {
+            ready: ready.clone(),
+        }),
+    );
+
+    let spec_tight = shared_spec(fleet);
+    let spec_loose = {
+        let mut spec = shared_spec(fleet);
+        spec.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+        spec
+    };
+    let branch_tight = ProviderInterestKey::new(spec_tight.key(), p_id);
+    let branch_loose = ProviderInterestKey::new(spec_loose.key(), p_id);
+
+    // Establish BOTH branches at D = 400 ms (long ttl: no refresher —
+    // every later mutation below is an explicit registration).
+    let d0 = Duration::from_millis(400);
+    c.register_sensing_interest(&spec_tight, p_id, d0, LONG_TTL)
+        .expect("register tight");
+    c.register_sensing_interest(&spec_loose, p_id, d0, LONG_TTL)
+        .expect("register loose");
+    await_condition(Duration::from_secs(5), "both branches established", || {
+        use net::adapter::net::behavior::sensing::Continuity;
+        c.sensing_upstream_continuity(&branch_tight) == Some(Continuity::Established)
+            && c.sensing_upstream_continuity(&branch_loose) == Some(Continuity::Established)
+    })
+    .await;
+
+    // Silence the origin — from here on, NO beat reaches C.
+    chaos_partition(&c, &p);
+
+    // TIGHTEN: D 400 → 100. The window shrinks from 1200 ms to
+    // 600 ms; with the fix, suspicion fires within ~700 ms of the
+    // last beat — before the STALE deadline (≥ 800 ms out) could.
+    c.register_sensing_interest(&spec_tight, p_id, Duration::from_millis(100), LONG_TTL)
+        .expect("tighten");
+    // LOOSEN: D 400 → 1200. The window grows to 3600 ms.
+    c.register_sensing_interest(&spec_loose, p_id, Duration::from_millis(1200), LONG_TTL)
+        .expect("loosen");
+    let changed_at = std::time::Instant::now();
+
+    await_condition(
+        Duration::from_millis(700),
+        "tightened window expires early",
+        || {
+            use net::adapter::net::behavior::sensing::Continuity;
+            c.sensing_upstream_continuity(&branch_tight) == Some(Continuity::Expired)
+        },
+    )
+    .await;
+
+    // The loosened branch holds PAST its stale deadline…
+    tokio::time::sleep(Duration::from_millis(1500).saturating_sub(changed_at.elapsed())).await;
+    {
+        use net::adapter::net::behavior::sensing::Continuity;
+        assert_eq!(
+            c.sensing_upstream_continuity(&branch_loose),
+            Some(Continuity::Established),
+            "loosened window must move the deadline outward immediately",
+        );
+    }
+    // …and still expires honestly at the loosened horizon.
+    await_condition(
+        Duration::from_secs(4),
+        "loosened window expires eventually",
+        || {
+            use net::adapter::net::behavior::sensing::Continuity;
+            c.sensing_upstream_continuity(&branch_loose) == Some(Continuity::Expired)
+        },
+    )
+    .await;
+
+    c.shutdown().await.expect("shutdown C");
+    p.shutdown().await.expect("shutdown P");
+}

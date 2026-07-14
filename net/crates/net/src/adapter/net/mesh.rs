@@ -3087,6 +3087,51 @@ impl SensingObservations {
             }
         }
     }
+
+    /// SI-4 re-review item 5: the branch's aggregate D changed
+    /// through a TABLE mutation (registration, refresh, refusal
+    /// partition, deregistration, expiry) — re-anchor the hop's own
+    /// continuity window IMMEDIATELY, never at the next beat: on a
+    /// quiet stream the old deadline would otherwise keep optimism
+    /// alive too long (loose→strict) or expire continuity too early
+    /// (strict→loose).
+    fn update_upstream_interval(
+        &mut self,
+        branch: &sensing::ProviderInterestKey,
+        aggregate: Option<Duration>,
+    ) {
+        if let (Some(cell), Some(interval)) = (self.upstream.get_mut(branch), aggregate) {
+            cell.update_interval(interval);
+        }
+    }
+
+    /// SI-4 re-review item 5, consumer half: the LOCAL watch's own D
+    /// changed (Local re-registration or a provider-free expectation
+    /// refresh at a different D) — re-anchor the overlay cell now.
+    fn update_consumer_interval(
+        &mut self,
+        branch: &sensing::ProviderInterestKey,
+        interval: Duration,
+    ) {
+        if let Some(cell) = self.consumer_cells.get_mut(branch) {
+            cell.update_interval(interval);
+        }
+    }
+
+    /// [`Self::update_consumer_interval`] across every branch of one
+    /// interest — the digest-level provider-free expectation covers
+    /// any provider the leader resolved.
+    fn update_consumer_intervals(
+        &mut self,
+        interest: &sensing::CapabilityInterestKey,
+        interval: Duration,
+    ) {
+        for (key, cell) in self.consumer_cells.iter_mut() {
+            if &key.interest == interest {
+                cell.update_interval(interval);
+            }
+        }
+    }
 }
 
 /// SI-2a: admit-or-drop for one upstream interest update (see
@@ -4816,6 +4861,16 @@ impl MeshNode {
             );
             (outcome, table.aggregate(&key, now))
         };
+        if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+            // SI-4 re-review item 5: a (re-)registration can move
+            // both the branch aggregate (this hop's continuity
+            // window) and the Local watch's own D (the overlay
+            // cell's window) — re-anchor both immediately, never at
+            // the next beat.
+            let mut observations = self.sensing_observations.lock();
+            observations.update_upstream_interval(&key, aggregate);
+            observations.update_consumer_interval(&key, requested_sample_interval);
+        }
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) && provider == self.node_id {
             // SI-3: the node registered interest in ITSELF — feed
             // the origin emitter directly (no wire hop). An emitter
@@ -5003,6 +5058,12 @@ impl MeshNode {
             key.clone(),
             (requested_sample_interval, Instant::now() + ttl),
         );
+        // SI-4 re-review item 5: a refreshed expectation can change
+        // the consumer's D — every overlay cell under the digest
+        // re-anchors immediately, never at the next beat.
+        self.sensing_observations
+            .lock()
+            .update_consumer_intervals(&key, requested_sample_interval);
         if sensing_upstream_damper_admits(
             &self.sensing_upstream_damper,
             leader,
@@ -9708,6 +9769,17 @@ impl MeshNode {
                                 if action == sensing::UpstreamAction::Deregister {
                                     sensing_observations.lock().reclaim_branch(&key);
                                 }
+                                // SI-4 re-review item 5: a loosened
+                                // aggregate re-anchors the surviving
+                                // branch's continuity window NOW —
+                                // an expiry-shrunk demand must not
+                                // keep the stricter deadline on a
+                                // quiet stream.
+                                if let sensing::UpstreamAction::Register { strictest } = action {
+                                    sensing_observations
+                                        .lock()
+                                        .update_upstream_interval(&key, Some(strictest));
+                                }
                                 if key.provider == local_node_id {
                                     // SI-3: this node is the origin —
                                     // the last row's expiry retires
@@ -12122,6 +12194,13 @@ impl MeshNode {
                         if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
                             continue;
                         }
+                        // SI-4 re-review item 5: the Leader row's
+                        // demand can move the branch aggregate —
+                        // re-anchor the hop's continuity window
+                        // immediately.
+                        ctx.sensing_observations
+                            .lock()
+                            .update_upstream_interval(&key, aggregate);
                         // SI-4 re-review P0: the leader resolved
                         // THIS node as provider — there is no
                         // upstream hop; the Leader row feeds the
@@ -12313,6 +12392,13 @@ impl MeshNode {
                         else {
                             return;
                         };
+                        // SI-4 re-review item 5: the aggregate moved
+                        // with this registration — re-anchor the
+                        // hop's continuity window now, not at the
+                        // next beat.
+                        ctx.sensing_observations
+                            .lock()
+                            .update_upstream_interval(&key, Some(strictest));
                         if !sensing_upstream_damper_admits(
                             &ctx.sensing_upstream_damper,
                             validated.target,
@@ -12404,6 +12490,15 @@ impl MeshNode {
                     if action == sensing::UpstreamAction::Deregister {
                         ctx.sensing_observations.lock().reclaim_branch(&key);
                     }
+                    // SI-4 re-review item 5: a loosened aggregate
+                    // re-anchors the surviving branch's continuity
+                    // window immediately (the upstream RE-SEND is
+                    // still refresh-repaired — no spec cache here).
+                    if let sensing::UpstreamAction::Register { strictest } = action {
+                        ctx.sensing_observations
+                            .lock()
+                            .update_upstream_interval(&key, Some(strictest));
+                    }
                     if key.provider == ctx.local_node_id {
                         // SI-3: this node is the origin — the last
                         // downstream's death retires the emission
@@ -12422,8 +12517,9 @@ impl MeshNode {
                     if action == sensing::UpstreamAction::Deregister {
                         Self::send_sensing_deregister_upstream(ctx, &key);
                     }
-                    // Register (loosened aggregate): skipped in
-                    // SI-2a — see the method docs.
+                    // Register (loosened aggregate): the upstream
+                    // re-send stays skipped in SI-2a — see the
+                    // method docs.
                 }
             }
         }
@@ -12851,8 +12947,16 @@ impl MeshNode {
                     // now; the refusal tombstone above ages out via
                     // the sweep.
                     ctx.sensing_observations.lock().reclaim_status(&branch);
+                    return;
                 }
             }
+            // SI-4 re-review item 5: the partition (and any leader
+            // re-registration above) moved the surviving aggregate —
+            // re-anchor the hop's continuity window immediately.
+            let aggregate = ctx.sensing_interest_table.lock().aggregate(&branch, now);
+            ctx.sensing_observations
+                .lock()
+                .update_upstream_interval(&branch, aggregate);
             return;
         }
         // SI-4a: the frozen SI-0f relay semantics on real sessions.

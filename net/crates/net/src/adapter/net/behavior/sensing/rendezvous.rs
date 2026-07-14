@@ -578,8 +578,13 @@ impl SensingLeader {
             }
         } else {
             // Partitioned-out rows leave inert slots — GC on the
-            // same event (the sweep's all-slot rule).
+            // same event (the sweep's all-slot rule) — and the
+            // surviving aggregate re-anchors the relay's continuity
+            // window immediately (item 5).
             self.relay.gc_dead_slots(now);
+            if let Some(aggregate) = self.relay.table.aggregate(branch, now) {
+                self.relay.update_branch_interval(branch, aggregate);
+            }
         }
         LeaderRefusalPartition {
             refused: partition.refused,
@@ -621,6 +626,12 @@ impl SensingLeader {
     pub fn sweep(&mut self, now: Instant) {
         let actions = self.relay.table.expire(now);
         for (branch, action) in actions {
+            // SI-4 re-review item 5: an expiry-loosened aggregate
+            // re-anchors the surviving branch's continuity window
+            // immediately, never at the next beat.
+            if let UpstreamAction::Register { strictest } = action {
+                self.relay.update_branch_interval(&branch, strictest);
+            }
             if action != UpstreamAction::Deregister {
                 continue;
             }
@@ -944,6 +955,57 @@ mod tests {
         assert!(
             reg.warm_starts.is_empty(),
             "no warm-start from a previous lifecycle",
+        );
+    }
+
+    /// SI-4 re-review item 5: an expiry-LOOSENED aggregate must push
+    /// the relay's continuity deadline outward immediately — on a
+    /// quiet stream the stale strict deadline would otherwise expire
+    /// continuity the surviving loose consumer never demanded.
+    #[test]
+    fn expiry_loosened_aggregate_re_anchors_the_window_without_a_beat() {
+        use super::super::continuity::Continuity;
+        let t0 = Instant::now();
+        let (a, c) = (DownstreamId::Peer(0xA), DownstreamId::Peer(0xC));
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let snapshot = vec![provider(7, 10)];
+        // Strict A carries a short ttl; loose C holds the branch.
+        leader
+            .register_capability_interest(&spec(), a, ms(100), ms(300), root(), &snapshot, t0)
+            .unwrap();
+        let reg = leader
+            .register_capability_interest(&spec(), c, ms(400), TTL, root(), &snapshot, t0)
+            .unwrap();
+        let key = reg.interest.clone();
+        let branch = ProviderInterestKey::new(key.clone(), 7);
+
+        // One live beat establishes at aggregate 100: window =
+        // 3 × max(promised 100, aggregate 100) = 300 → deadline
+        // t1 + 300.
+        let t1 = t0 + ms(100);
+        leader.on_attestation(t1, &proof(&key, 7, 1, None), true);
+        assert_eq!(
+            leader.relay.upstream_continuity(&branch),
+            Some(Continuity::Established),
+        );
+
+        // A's row lapses; the sweep loosens the aggregate to 400 →
+        // window 1200 → the deadline shifts outward NOW.
+        leader.sweep(t0 + ms(350));
+
+        // Past the stale strict deadline, inside the loosened one:
+        // continuity must hold.
+        let _ = leader.poll(t1 + ms(400));
+        assert_eq!(
+            leader.relay.upstream_continuity(&branch),
+            Some(Continuity::Established),
+            "a loosened aggregate must move the deadline outward immediately",
+        );
+        // And the loosened window still expires honestly.
+        let _ = leader.poll(t1 + ms(1250));
+        assert_eq!(
+            leader.relay.upstream_continuity(&branch),
+            Some(Continuity::Expired),
         );
     }
 
