@@ -3087,6 +3087,39 @@ impl SensingObservations {
         }
     }
 
+    /// SI-5 (§4.8): force-expire every observation this hop holds
+    /// toward one provider — a failure-detector edge, an RT-5
+    /// withdrawal, or an epoch supersession. Cross-digest cells must
+    /// not keep vouching for a provider whose path or epoch died
+    /// until their own next beat happens to arrive. Returns the
+    /// disrupted upstream branches (the caller refreshes the table's
+    /// hop-rule input) and whether a visible projection changed (the
+    /// overlay signal's input). Recovery is the ordinary soft-state
+    /// machinery: the next admitted continuity-bearing beat
+    /// re-establishes.
+    fn disrupt_provider(
+        &mut self,
+        provider: u64,
+        reason: sensing::DisruptReason,
+    ) -> (Vec<sensing::ProviderInterestKey>, bool) {
+        let mut branches = Vec::new();
+        for (key, cell) in self.upstream.iter_mut() {
+            if key.provider == provider && cell.continuity() != sensing::Continuity::Expired {
+                cell.disrupt(reason);
+                branches.push(key.clone());
+            }
+        }
+        let mut overlay_moved = false;
+        for (key, cell) in self.consumer_cells.iter_mut() {
+            if key.provider == provider {
+                let before = cell.projected();
+                cell.disrupt(reason);
+                overlay_moved |= cell.projected() != before;
+            }
+        }
+        (branches, overlay_moved)
+    }
+
     /// SI-4 re-review item 5: the branch's aggregate D changed
     /// through a TABLE mutation (registration, refresh, refusal
     /// partition, deregistration, expiry) — re-anchor the hop's own
@@ -3129,6 +3162,222 @@ impl SensingObservations {
             if &key.interest == interest {
                 cell.update_interval(interval);
             }
+        }
+    }
+}
+
+/// SI-5 (§4.8): per-provider failure-plane disruption — force-expire
+/// every observation this hop holds toward `provider` (its upstream
+/// continuity cells AND the local consumer overlay), refresh the
+/// table's hop-rule input so subsequent forwards go provisional, and
+/// fire the overlay signal when a visible projection changed. The
+/// leader relay's own cells are the caller's `#[cfg(redex)]` hook
+/// (`SensingRelay::disrupt_provider`) — the second-relay lesson.
+/// Recovery needs no bespoke machinery: the next admitted
+/// continuity-bearing beat re-establishes, and registrations re-ride
+/// whatever route the failure plane promoted (ttl/2 anti-entropy).
+fn disrupt_sensing_provider(
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    overlay: &tokio::sync::watch::Sender<u64>,
+    provider: u64,
+    reason: sensing::DisruptReason,
+) {
+    let (branches, overlay_moved) = observations.lock().disrupt_provider(provider, reason);
+    if !branches.is_empty() {
+        let mut table = table.lock();
+        for branch in &branches {
+            table.set_upstream_continuity(branch, sensing::Continuity::Expired);
+        }
+    }
+    if overlay_moved {
+        overlay.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+/// SI-5 (§4.8): honor one mesh-table upstream consequence produced
+/// by an EVENT-DRIVEN row removal (peer failure, leader-demand
+/// death): a dead branch reclaims its observations, retires the
+/// local emission stream (stamped — a racing registration
+/// survives), and deregisters upstream (bypassing the damper, as
+/// every branch death does); a loosened aggregate re-anchors the
+/// branch's continuity window immediately (the upstream re-send
+/// rides the next refresh — no spec cache at this hop).
+#[allow(clippy::too_many_arguments)]
+fn apply_sensing_removal_action(
+    observations: &parking_lot::Mutex<SensingObservations>,
+    emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
+    emitter_stamp: Option<u64>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    router: &Arc<NetRouter>,
+    partition_filter: &PartitionFilter,
+    local_node_id: u64,
+    key: &sensing::ProviderInterestKey,
+    action: sensing::UpstreamAction,
+) {
+    match action {
+        sensing::UpstreamAction::Deregister => {
+            observations.lock().reclaim_branch(key);
+            if key.provider == local_node_id {
+                if let (Some(emitter), Some(stamp)) = (emitter.lock().as_mut(), emitter_stamp) {
+                    emitter.retire_if_stale(&key.interest.interest_digest, stamp);
+                }
+            } else {
+                let frame = sensing::SensingInterestFrame::Deregister {
+                    interest_digest: key.interest.interest_digest,
+                    target: Some(key.provider),
+                };
+                if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+                    spawn_sensing_frame_send(
+                        socket,
+                        peers,
+                        addr_to_node,
+                        router,
+                        partition_filter,
+                        local_node_id,
+                        key.provider,
+                        sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                        sensing::SUBPROTOCOL_SENSING_INTEREST,
+                        bytes,
+                    );
+                }
+            }
+        }
+        sensing::UpstreamAction::Register { strictest } => {
+            observations
+                .lock()
+                .update_upstream_interval(key, Some(strictest));
+        }
+        sensing::UpstreamAction::None => {}
+    }
+}
+
+/// SI-5 (§4.8 downstream loss): a failed peer's mesh-table rows drop
+/// NOW — derived aggregates recompute, dead branches reclaim +
+/// deregister upstream, and local emission streams retire with their
+/// last interest — never waiting for the ttl sweep.
+#[allow(clippy::too_many_arguments)]
+fn remove_sensing_downstream(
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    router: &Arc<NetRouter>,
+    partition_filter: &PartitionFilter,
+    local_node_id: u64,
+    failed: u64,
+    now: Instant,
+) {
+    // Closure item 7 discipline: stamp BEFORE the table mutation the
+    // retire decisions rest on.
+    let emitter_stamp = emitter.lock().as_ref().map(|e| e.stamp());
+    let actions = table
+        .lock()
+        .remove_downstream(sensing::DownstreamId::Peer(failed), now);
+    for (key, action) in actions {
+        apply_sensing_removal_action(
+            observations,
+            emitter,
+            emitter_stamp,
+            socket,
+            peers,
+            addr_to_node,
+            router,
+            partition_filter,
+            local_node_id,
+            &key,
+            action,
+        );
+    }
+}
+
+/// SI-5 (§4.8) at the leader: a failed consumer's leader-relay rows
+/// drop. A branch that lost its LAST consumer retires the mesh
+/// Leader row — and with it the upstream demand or the local
+/// stream; a merely-loosened branch re-registers the Leader row at
+/// the survivors' aggregate now (window re-anchored, item 5) while
+/// the upstream re-send rides the next consumer refresh (the
+/// sweep's loosened-aggregate rule).
+#[cfg(feature = "redex")]
+#[allow(clippy::too_many_arguments)]
+fn remove_sensing_leader_consumer(
+    leader: &parking_lot::Mutex<Option<sensing::SensingLeader>>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    router: &Arc<NetRouter>,
+    partition_filter: &PartitionFilter,
+    local_node_id: u64,
+    local_root: sensing::AudienceScopeCommitment,
+    ttl: Duration,
+    failed: u64,
+    now: Instant,
+) {
+    let actions = {
+        let mut slot = leader.lock();
+        match slot.as_mut() {
+            Some(leader) => leader.remove_downstream(sensing::DownstreamId::Peer(failed), now),
+            None => return,
+        }
+    };
+    for (branch, action) in actions {
+        match action {
+            sensing::UpstreamAction::Deregister => {
+                // The leader's demand for this branch died with its
+                // last consumer — retire the mesh Leader row through
+                // the ordinary event-driven consequences.
+                let emitter_stamp = emitter.lock().as_ref().map(|e| e.stamp());
+                let mesh_actions = table.lock().deregister(
+                    &branch.interest.interest_digest,
+                    Some(branch.provider),
+                    sensing::DownstreamId::Leader,
+                    now,
+                );
+                for (key, mesh_action) in mesh_actions {
+                    apply_sensing_removal_action(
+                        observations,
+                        emitter,
+                        emitter_stamp,
+                        socket,
+                        peers,
+                        addr_to_node,
+                        router,
+                        partition_filter,
+                        local_node_id,
+                        &key,
+                        mesh_action,
+                    );
+                }
+            }
+            sensing::UpstreamAction::Register { strictest } => {
+                let (outcome, aggregate) = {
+                    let mut table = table.lock();
+                    let outcome = table.register(
+                        &branch,
+                        sensing::DownstreamId::Leader,
+                        strictest,
+                        ttl,
+                        local_root,
+                        now,
+                    );
+                    (outcome, table.aggregate(&branch, now))
+                };
+                if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+                    observations
+                        .lock()
+                        .update_upstream_interval(&branch, aggregate);
+                }
+            }
+            sensing::UpstreamAction::None => {}
         }
     }
 }
@@ -4372,6 +4621,71 @@ impl MeshNode {
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
 
+        // SI-2a hoists, moved ahead of the failure detector for SI-5
+        // (§4.8): a Failed peer is a sensing event, so the detector's
+        // callback needs the sensing seams before it is constructed.
+        // The struct literal below reuses these bindings. The v1
+        // owner-root boundary (plan §4.10): the operator-supplied
+        // fleet root, or this node's own entity commitment when the
+        // node is its own owner.
+        let sensing_local_root = config
+            .sensing_owner_root
+            .unwrap_or_else(|| sensing::AudienceScopeCommitment::owner_root(identity.entity_id()));
+        let sensing_interest_table = Arc::new(parking_lot::Mutex::new(
+            sensing::InterestTable::new(config.max_interests_per_peer),
+        ));
+        // SI-3: the origin role exists only with BOTH the plane
+        // enabled and a caller-persisted incarnation (fail-closed,
+        // see the `sensing_incarnation` knob docs).
+        //
+        // Closure item 4: config-normalize the cadence floor —
+        // `0 < floor ≤ sensing_interest_ttl`. A zero floor would
+        // admit a zero cadence (hot loop); a floor beyond the
+        // soft-state lifetime cannot serve a continuity stream.
+        // (A zero ttl is operator pathology — every row would
+        // expire instantly — so it is left alone rather than
+        // "fixed" here.)
+        let sensing_cadence_floor = {
+            let floor = if config.attestation_cadence_floor.is_zero() {
+                sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR
+            } else {
+                config.attestation_cadence_floor
+            };
+            if config.sensing_interest_ttl.is_zero() {
+                floor
+            } else {
+                floor.min(config.sensing_interest_ttl)
+            }
+        };
+        let sensing_emitter = Arc::new(parking_lot::Mutex::new(
+            match (config.enable_sensing_coalescing, config.sensing_incarnation) {
+                (true, Some(incarnation)) => Some(sensing::OriginEmitter::new(
+                    node_id,
+                    incarnation,
+                    sensing_cadence_floor,
+                )),
+                _ => None,
+            },
+        ));
+        let sensing_observations: Arc<parking_lot::Mutex<SensingObservations>> =
+            Arc::new(parking_lot::Mutex::new(SensingObservations::default()));
+        let sensing_overlay_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
+        #[cfg(feature = "redex")]
+        let sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let sensing_table_failure = sensing_interest_table.clone();
+        let sensing_observations_failure = sensing_observations.clone();
+        let sensing_overlay_failure = sensing_overlay_changed.clone();
+        let sensing_emitter_failure = sensing_emitter.clone();
+        #[cfg(feature = "redex")]
+        let sensing_leader_failure = sensing_leader.clone();
+        let sensing_router_failure = router.clone();
+        let sensing_addr_to_node_failure = addr_to_node.clone();
+        let enable_sensing_failure = config.enable_sensing_coalescing;
+        let sensing_local_root_failure = sensing_local_root;
+        let sensing_interest_ttl_failure = config.sensing_interest_ttl;
+        let local_node_id_failure = node_id;
+
         // Direct-path upgrade throttle cache (Stage 3) — created here
         // (not in the struct literal) so the failure callback can drop
         // a dead peer's entry. Without that drop the cache grows
@@ -4391,6 +4705,94 @@ impl MeshNode {
             cleanup_interval: Duration::from_secs(60),
         })
         .on_failure(move |node_id| {
+            // SI-5 (§4.8): a Failed peer is a sensing event on BOTH
+            // sides — run BEFORE the reroute policy below mutates
+            // route state, so "next_hop(P) went through the failed
+            // peer" is judged against the routes the streams were
+            // actually riding.
+            if enable_sensing_failure {
+                let now = Instant::now();
+                // As PROVIDER — direct, or multi-hop through the
+                // failed peer: its observations expire (path
+                // failure); the local aggregate recomputes through
+                // the overlay signal; re-registration rides the
+                // ttl/2 refresh over whatever route gets promoted.
+                let failed_addr = peers_failure.get(&node_id).map(|p| p.value().addr);
+                let mut providers: std::collections::HashSet<u64> = {
+                    let observations = sensing_observations_failure.lock();
+                    observations
+                        .upstream
+                        .keys()
+                        .chain(observations.consumer_cells.keys())
+                        .map(|key| key.provider)
+                        .collect()
+                };
+                #[cfg(feature = "redex")]
+                if let Some(leader) = sensing_leader_failure.lock().as_ref() {
+                    providers.extend(leader.relay.branch_providers());
+                }
+                for provider in providers {
+                    let through_failed = provider == node_id
+                        || match sensing_router_failure.routing_table().lookup(provider) {
+                            Some(next_hop) => failed_addr == Some(next_hop),
+                            // No route AND no live direct session:
+                            // the provider's reachability is simply
+                            // gone (the route age-out can beat the
+                            // failure edge here — same verdict).
+                            None => !peers_failure.contains_key(&provider),
+                        };
+                    if !through_failed {
+                        continue;
+                    }
+                    disrupt_sensing_provider(
+                        &sensing_table_failure,
+                        &sensing_observations_failure,
+                        &sensing_overlay_failure,
+                        provider,
+                        sensing::DisruptReason::PathFailed,
+                    );
+                    #[cfg(feature = "redex")]
+                    if let Some(leader) = sensing_leader_failure.lock().as_mut() {
+                        leader
+                            .relay
+                            .disrupt_provider(provider, sensing::DisruptReason::PathFailed);
+                    }
+                }
+                // As DOWNSTREAM: its rows drop, aggregates
+                // recompute, dead branches deregister upstream, and
+                // local emission streams retire with their last
+                // interest — event-driven, never the ttl sweep.
+                remove_sensing_downstream(
+                    &sensing_table_failure,
+                    &sensing_observations_failure,
+                    &sensing_emitter_failure,
+                    &socket_failure,
+                    &peers_failure,
+                    &sensing_addr_to_node_failure,
+                    &sensing_router_failure,
+                    &partition_filter_failure,
+                    local_node_id_failure,
+                    node_id,
+                    now,
+                );
+                #[cfg(feature = "redex")]
+                remove_sensing_leader_consumer(
+                    &sensing_leader_failure,
+                    &sensing_table_failure,
+                    &sensing_observations_failure,
+                    &sensing_emitter_failure,
+                    &socket_failure,
+                    &peers_failure,
+                    &sensing_addr_to_node_failure,
+                    &sensing_router_failure,
+                    &partition_filter_failure,
+                    local_node_id_failure,
+                    sensing_local_root_failure,
+                    sensing_interest_ttl_failure,
+                    node_id,
+                    now,
+                );
+            }
             rp_failure.on_failure(node_id);
             let removed = roster_failure.remove_peer(node_id);
             if !removed.is_empty() {
@@ -4512,51 +4914,6 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
-        // SI-2a: hoisted ahead of the struct literal (which moves
-        // `identity` + `config` in its first fields). The v1
-        // owner-root boundary (plan §4.10): the operator-supplied
-        // fleet root, or this node's own entity commitment when the
-        // node is its own owner.
-        let sensing_local_root = config
-            .sensing_owner_root
-            .unwrap_or_else(|| sensing::AudienceScopeCommitment::owner_root(identity.entity_id()));
-        let sensing_interest_table = Arc::new(parking_lot::Mutex::new(
-            sensing::InterestTable::new(config.max_interests_per_peer),
-        ));
-        // SI-3: the origin role exists only with BOTH the plane
-        // enabled and a caller-persisted incarnation (fail-closed,
-        // see the `sensing_incarnation` knob docs).
-        //
-        // Closure item 4: config-normalize the cadence floor —
-        // `0 < floor ≤ sensing_interest_ttl`. A zero floor would
-        // admit a zero cadence (hot loop); a floor beyond the
-        // soft-state lifetime cannot serve a continuity stream.
-        // (A zero ttl is operator pathology — every row would
-        // expire instantly — so it is left alone rather than
-        // "fixed" here.)
-        let sensing_cadence_floor = {
-            let floor = if config.attestation_cadence_floor.is_zero() {
-                sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR
-            } else {
-                config.attestation_cadence_floor
-            };
-            if config.sensing_interest_ttl.is_zero() {
-                floor
-            } else {
-                floor.min(config.sensing_interest_ttl)
-            }
-        };
-        let sensing_emitter = Arc::new(parking_lot::Mutex::new(
-            match (config.enable_sensing_coalescing, config.sensing_incarnation) {
-                (true, Some(incarnation)) => Some(sensing::OriginEmitter::new(
-                    node_id,
-                    incarnation,
-                    sensing_cadence_floor,
-                )),
-                _ => None,
-            },
-        ));
-
         Ok(Self {
             identity: Arc::new(identity),
             static_keypair,
@@ -4611,16 +4968,16 @@ impl MeshNode {
             sensing_local_root,
             sensing_upstream_damper: Arc::new(DashMap::new()),
             #[cfg(feature = "redex")]
-            sensing_leader: Arc::new(parking_lot::Mutex::new(None)),
+            sensing_leader,
             sensing_emitter,
             sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
             sensing_evaluators: Arc::new(DashMap::new()),
             sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
                 sensing::IncarnationSeqGate::new(),
             )),
-            sensing_overlay_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
+            sensing_overlay_changed,
             sensing_capability_interests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            sensing_observations: Arc::new(parking_lot::Mutex::new(SensingObservations::default())),
+            sensing_observations,
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
@@ -11902,11 +12259,40 @@ impl MeshNode {
         // dest goes elsewhere, nothing changed for us and the
         // cascade stops here — that scoping is what makes the
         // whole scheme loop-safe.
-        if !ctx
+        let route_dropped = ctx
             .router
             .routing_table()
-            .remove_route_if_next_hop_is(dest, via_addr)
+            .remove_route_if_next_hop_is(dest, via_addr);
+        // SI-5 (§4.8): losing our route toward `dest` expires every
+        // observation we hold from it — continuity is a claim about
+        // the live stream's path, and the stream now rides an
+        // unknown one. The sensing consequence keys on
+        // REACHABILITY, not only on the exact (dest, via) pair:
+        // when our route was via the sender (just dropped) or had
+        // ALREADY aged out racing this frame — and no live direct
+        // session stands in — the withdrawal confirms the path
+        // died. Beats over the promoted alternate (below) or the
+        // anti-entropy refresh re-establish hop-by-hop.
+        if ctx.enable_sensing_coalescing
+            && (route_dropped
+                || (ctx.router.routing_table().lookup(dest).is_none()
+                    && !ctx.peers.contains_key(&dest)))
         {
+            disrupt_sensing_provider(
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                dest,
+                sensing::DisruptReason::PathFailed,
+            );
+            #[cfg(feature = "redex")]
+            if let Some(leader) = ctx.sensing_leader.lock().as_mut() {
+                leader
+                    .relay
+                    .disrupt_provider(dest, sensing::DisruptReason::PathFailed);
+            }
+        }
+        if !route_dropped {
             return;
         }
         tracing::debug!(
@@ -12952,7 +13338,7 @@ impl MeshNode {
             attestation.origin_incarnation,
             attestation.capability_generation,
         );
-        let epoch_advanced = {
+        let superseded: Option<(sensing::Incarnation, u64)> = {
             let mut observations = ctx.sensing_observations.lock();
             match observations
                 .provider_epochs
@@ -12965,18 +13351,18 @@ impl MeshNode {
                     observations
                         .provider_epochs
                         .insert(attestation.origin, epoch);
-                    false
+                    None
                 }
                 Some(current) if epoch > current => {
                     observations
                         .provider_epochs
                         .insert(attestation.origin, epoch);
-                    true
+                    Some(current)
                 }
-                Some(_) => false,
+                Some(_) => None,
             }
         };
-        if epoch_advanced {
+        if let Some(previous) = superseded {
             ctx.sensing_interest_table
                 .lock()
                 .invalidate_provider_floors(attestation.origin);
@@ -12993,6 +13379,31 @@ impl MeshNode {
                     .relay
                     .table
                     .invalidate_provider_floors(attestation.origin);
+            }
+            // SI-5 (§4.8 items 3+4): an epoch move supersedes EVERY
+            // observation this hop holds from the origin — a
+            // cross-digest cell must not keep vouching under the old
+            // boot (incarnation) or the old definition (generation)
+            // until its own next beat happens to arrive. The
+            // ARRIVING beat re-establishes/resets its own branch
+            // through the ordinary cell semantics right below; the
+            // interests and branches themselves survive (§4.8 —
+            // they never bound the epoch).
+            let reason = if attestation.origin_incarnation > previous.0 {
+                sensing::DisruptReason::IncarnationSuperseded
+            } else {
+                sensing::DisruptReason::GenerationChanged
+            };
+            disrupt_sensing_provider(
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                attestation.origin,
+                reason,
+            );
+            #[cfg(feature = "redex")]
+            if let Some(leader) = ctx.sensing_leader.lock().as_mut() {
+                leader.relay.disrupt_provider(attestation.origin, reason);
             }
         }
         if is_refusal {

@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::continuity::{
-    AttestedStatus, Continuity, DeliveredBeat, ObservationCell, ProjectedReadiness,
+    AttestedStatus, Continuity, DeliveredBeat, DisruptReason, ObservationCell, ProjectedReadiness,
 };
 use super::identity::{
     AudienceScopeCommitment, CapabilityInterestKey, Digest256, ProviderInterestKey,
@@ -401,6 +401,22 @@ impl SensingRelay {
         }
     }
 
+    /// SI-5 (§4.8): force-expire the relay's own continuity toward
+    /// every branch of one provider — failure edge, withdrawal, or
+    /// epoch supersession. The table's hop-rule input updates with
+    /// the cells, so subsequent forwards go PROVISIONAL until the
+    /// provider's new/rerouted stream re-establishes hop-by-hop; the
+    /// cache is deliberately kept (it warm-starts provisionally by
+    /// construction and the branch is still live).
+    pub fn disrupt_provider(&mut self, provider: u64, reason: DisruptReason) {
+        for (key, state) in self.keys.iter_mut() {
+            if key.provider == provider && state.upstream.continuity() != Continuity::Expired {
+                state.upstream.disrupt(reason);
+                self.table.set_upstream_continuity(key, Continuity::Expired);
+            }
+        }
+    }
+
     /// SI-4 re-review: GC delivery slots whose downstream row died
     /// while the branch survives — the mesh sweep's all-slot
     /// liveness rule, on the relay's own state.
@@ -424,6 +440,13 @@ impl SensingRelay {
     /// Retained branch caches (tests/observability).
     pub fn retained_branches(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Providers with retained branch state — the SI-5 failure
+    /// hook's scan input ("which providers could this dead peer's
+    /// next_hop have carried?").
+    pub fn branch_providers(&self) -> Vec<u64> {
+        self.keys.keys().map(|key| key.provider).collect()
     }
 
     /// Retained delivery slots (tests/observability).

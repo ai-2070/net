@@ -593,6 +593,49 @@ impl SensingLeader {
         }
     }
 
+    /// SI-5 (§4.8 downstream loss): a consumer session died — drop
+    /// every leader-relay row it held, event-driven, never waiting
+    /// for the ttl sweep. A branch that lost its LAST row reclaims
+    /// the relay's private state (a stale cache must not warm-start
+    /// a later lifecycle) and drops its interest when no other
+    /// branch keeps it; a merely-loosened branch re-anchors its
+    /// continuity window. Returns the branch consequences so the
+    /// caller can retire or re-scope its mesh Leader-row demand.
+    pub fn remove_downstream(
+        &mut self,
+        downstream: DownstreamId,
+        now: Instant,
+    ) -> Vec<(ProviderInterestKey, UpstreamAction)> {
+        let actions = self.relay.table.remove_downstream(downstream, now);
+        for (branch, action) in &actions {
+            match action {
+                UpstreamAction::Register { strictest } => {
+                    self.relay.update_branch_interval(branch, *strictest);
+                }
+                UpstreamAction::Deregister => {
+                    self.relay.reclaim_branch(branch);
+                    let interest = branch.interest.clone();
+                    let any_branch_live = self
+                        .interests
+                        .get(&interest)
+                        .map(|entry| {
+                            entry.active.iter().any(|provider| {
+                                let branch = ProviderInterestKey::new(interest.clone(), *provider);
+                                self.relay.table.aggregate(&branch, now).is_some()
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !any_branch_live {
+                        self.interests.remove(&interest);
+                    }
+                }
+                UpstreamAction::None => {}
+            }
+        }
+        self.relay.gc_dead_slots(now);
+        actions
+    }
+
     /// Ingest one provider attestation and fan it to the registered
     /// downstreams (delegates the whole store/pack/down-sample +
     /// hop-rule machinery).
