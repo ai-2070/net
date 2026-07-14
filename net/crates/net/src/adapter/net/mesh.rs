@@ -6604,6 +6604,8 @@ impl MeshNode {
         let notify = self.sensing_emitter_notify.clone();
         let evaluators = self.sensing_evaluators.clone();
         let table = self.sensing_interest_table.clone();
+        #[cfg(feature = "redex")]
+        let sensing_leader = self.sensing_leader.clone();
         let identity = self.identity.clone();
         let capability_version = self.capability_version.clone();
         let socket = self.socket.clone();
@@ -6670,15 +6672,14 @@ impl MeshNode {
                         continue;
                     }
                     let mut local_interval: Option<Duration> = None;
+                    let mut leader_row = false;
                     let peer_downstreams: Vec<u64> = downstreams
                         .into_iter()
                         .filter_map(|downstream| match downstream {
                             sensing::DownstreamId::Peer(node) => Some(node),
                             // SI-4 review P1 (self-provider watch):
                             // the origin's own Local row consumes
-                            // the SAME signed beats below. A
-                            // co-located leader's fan-out rides its
-                            // intake path.
+                            // the SAME signed beats below.
                             sensing::DownstreamId::Local => {
                                 local_interval = Some(
                                     table
@@ -6689,7 +6690,15 @@ impl MeshNode {
                                 );
                                 None
                             }
-                            sensing::DownstreamId::Leader => None,
+                            // SI-4 re-review P0 (leader-as-
+                            // provider): a co-located leader that
+                            // resolved THIS node consumes the same
+                            // signed beats — its relay fans them to
+                            // the real consumer rows below.
+                            sensing::DownstreamId::Leader => {
+                                leader_row = true;
+                                None
+                            }
                         })
                         .collect();
                     // Phase 2 (NO emitter lock): run the user
@@ -6709,11 +6718,19 @@ impl MeshNode {
                     // consumes the signed beat through the SAME
                     // attestation + continuity semantics as any
                     // consumer — the origin's own live stream is
-                    // continuity-bearing by definition.
+                    // continuity-bearing by definition. The wire
+                    // cache insert also serves the leader fan-out
+                    // below, which resolves its identical signed
+                    // bytes from `latest` on (incarnation, seq).
+                    if local_interval.is_some() || leader_row {
+                        observations
+                            .lock()
+                            .latest
+                            .insert(branch.clone(), signed.clone());
+                    }
                     if let Some(interval) = local_interval {
                         let moved = {
                             let mut observations = observations.lock();
-                            observations.latest.insert(branch.clone(), signed.clone());
                             observations
                                 .feed_consumer_cell(&branch, &signed, true, interval, factor, now)
                         };
@@ -6723,6 +6740,39 @@ impl MeshNode {
                             });
                         }
                     }
+                    // SI-4 re-review P0: locally signed beats
+                    // dispatch three-way like any delivery — the
+                    // Leader row hands the beat to the leader
+                    // relay, whose fan-out goes out as real frames.
+                    #[cfg(feature = "redex")]
+                    if leader_row {
+                        if let Ok(semantic) =
+                            sensing::semantic_attestation(&branch.interest, &signed)
+                        {
+                            let deliveries = {
+                                let mut slot = sensing_leader.lock();
+                                match slot.as_mut() {
+                                    Some(leader) => leader.on_attestation(now, &semantic, true),
+                                    None => Vec::new(),
+                                }
+                            };
+                            dispatch_sensing_leader_deliveries(
+                                &socket,
+                                &peers,
+                                &addr_to_node,
+                                &router,
+                                &partition_filter,
+                                local_node_id,
+                                &observations,
+                                &overlay,
+                                factor,
+                                deliveries,
+                                now,
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "redex"))]
+                    let _ = leader_row;
                     if peer_downstreams.is_empty() {
                         continue;
                     }
@@ -12069,16 +12119,31 @@ impl MeshNode {
                             );
                             (outcome, table.aggregate(&key, now))
                         };
+                        if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+                            continue;
+                        }
+                        // SI-4 re-review P0: the leader resolved
+                        // THIS node as provider — there is no
+                        // upstream hop; the Leader row feeds the
+                        // origin emitter directly, exactly like a
+                        // Local self-registration, and the emitter
+                        // loop dispatches its signed beats to the
+                        // leader relay's fan-out.
+                        if provider == ctx.local_node_id {
+                            Self::feed_sensing_origin(
+                                ctx,
+                                &key,
+                                &spec,
+                                sensing::DownstreamId::Leader,
+                                now,
+                            );
+                            continue;
+                        }
                         // Anti-entropy on every admitted refresh,
                         // min-gap damped — the exact
                         // `register_sensing_interest` shape, so a
                         // lost upstream frame is repaired by the
                         // consumer's next ttl/2 refresh.
-                        if !matches!(outcome, sensing::RegisterOutcome::Registered(_))
-                            || provider == ctx.local_node_id
-                        {
-                            continue;
-                        }
                         let Some(strictest) = aggregate else {
                             continue;
                         };
