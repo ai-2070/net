@@ -8,16 +8,16 @@ work, not signature verification … that preserves the core economic
 claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
 interest table + resolver + upstream propagation on real sessions,
 dark behind `enable_sensing_coalescing = false` (as-built note in
-§6); **SI-3 COMPLETE as-built (2026-07-13), REVIEWED — normal path
-WORKING, deviations ACCEPTED, robustness closure REQUIRED** (SI-3
-review disposition in §6: a seven-item bounded closure packet must
-land before broad SI-4; SI-4's first cleanup seam — observation
-reclamation — is allowed). Next: the SI-3 closure packet, then SI-4
-(relay delivery + overlay application). Authorization stance, kept
-honest: the SI-1 sign-off said SI-2+ was NOT implied, so SI-2/SI-3
-were not within the review-7 authorization — SI-2+ implementation is
-proceeding under the operator's direction; the semantic gate review
-remains closed.
+§6); **SI-3 COMPLETE, both closure rounds SIGNED OFF (2026-07-14; the
+partial-admission residual landed per the reviewer's "once that is
+removed, SI-4 can proceed")**; **SI-4 COMPLETE as-built
+(2026-07-14)** — relay delivery + consumer overlay + LOCAL
+aggregate views on real sessions, flagship + 16b witnessed
+(as-built note in §6, incl. the envelope-encoding decision to
+surface at review). Next: SI-5 (failure-plane integration).
+Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
+NOT implied — SI-2+ implementation is proceeding under the
+operator's direction; the semantic gate review remains closed.
 0x0C02 (`SensingInterestFrame`) and 0x0C03 (`ReadinessAttestation`)
 MAY be committed. SI-1 scope: canonical codecs, signing +
 verification honoring the transcript invariant below (§4.2),
@@ -1271,6 +1271,48 @@ must exercise the real dispatch path.
   apply, LOCAL aggregate views. Flagship three-node test from v3
   (two watchers, different D, branch-counted emission) plus test 16b
   on the real path.
+  *SI-4 as-built (2026-07-14, 65b47cf16 + 8c201b14a + 81cef561f;
+  the reviewer's partial-admission sign-off said "once that is
+  removed, SI-4 can proceed"):* the frozen SI-0f `SensingRelay` /
+  `SensingConsumer` semantics wired onto the mesh's own state
+  (delivery.rs stays the semantic reference; its tests the semantic
+  witnesses). SI-4a: per-branch upstream `ObservationCell` fed by
+  the admitted beat's INCOMING envelope flag; outgoing bearing from
+  our own continuity (the §4.4 hop rule); per-(branch, downstream)
+  delivery slots (edges flush immediately, unchanged beats at each
+  row's own D, forwards are the identical signed bytes); warm-start
+  re-send on every registration (always provisional); sweep-driven
+  poll (window expiry, due-slot flush, slot GC); cells/slots
+  reclaim with the branch. SI-4b: the Local row is the node's own
+  consumer — its delivery point feeds consumer cells with the
+  OUTGOING bearing (the local consumer obeys the same hop rule);
+  public Layer-1 surface `sensing_projected` /
+  `sensing_branch_projections` / `sensing_aggregate_view`
+  (project_aggregate over live proximity route estimates, viability
+  consumer-relative through the caller's budget); the §4.9 overlay
+  change signal as a subscribable watch counter
+  (`subscribe_sensing_overlay_changes` — the SI-6 wake-up seam).
+  SI-4c: the flagship five-node e2e — 16b demand-merge (one branch,
+  one provider stream, both watchers hop-verified), down-sampling
+  at each watcher's own D, edge immediacy inside the loose
+  watcher's schedule, aggregate views, and the test-13 laundering
+  tripwire on real sessions (a verified cached Ready arriving
+  provisional from a dead origin projects Unknown).
+  **Design decision to surface at review — the envelope encoding:**
+  §4.2/§4.4 defer how the relay-authored continuity-bearing flag
+  travels; it rides the hop-authored session ENVELOPE as the
+  STREAM ID — live forwards on 0x0C03's standard stream,
+  provisional ones on the named `SENSING_PROVISIONAL_STREAM` — so
+  the committed 0x0C03 codec stays byte-identical, "relays forward
+  identical signed bytes" holds literally, and the flag is
+  session-authenticated hop metadata exactly as §4.4 describes.
+  (A hostile relay could lie about the flag under ANY encoding —
+  the §4.5 stated v1 trust assumption.) **Bounds:** embedding the
+  readiness overlay inside fold capability entries is deferred to
+  the SI-6 representation work (no consumer exists yet); packing
+  stays one-beat-per-frame (multi-event frames are transport-ready
+  but unexercised); origin pins at non-adjacent verifying hops
+  remain the documented SI-3 seam bound.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
