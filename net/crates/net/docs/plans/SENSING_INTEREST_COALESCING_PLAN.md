@@ -12,8 +12,13 @@ dark behind `enable_sensing_coalescing = false` (as-built note in
 **SI-4 as-built + change-request closure LANDED (2026-07-14)** —
 the provider-free leader return path is connected
 (`DownstreamId::Leader`, `register_capability_interest`, production
-e2e) and all nine review items are closed as-built (§6). Next:
-SI-4 re-review; SI-5 holds until it clears.
+e2e) and all nine review items are closed as-built (§6);
+**SI-4 re-review (2026-07-14): REQUEST CHANGES again** — the direct
+relay path and the remote-provider leader fan-out are VERIFIED, but
+the leader is now a second relay implementation and several
+corrected mesh-relay invariants were not carried over (one P0 +
+eight P1s, disposition in §6). Next: land the second closure round;
+SI-5 holds until SI-4 clears.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1408,6 +1413,72 @@ must exercise the real dispatch path.
   4899 lib (138 sensing), 13 sensing e2e across four files, both
   clippy gates, fmt — green. Awaiting re-review to lift the SI-5
   hold.
+  *SI-4 re-review disposition (2026-07-14): REQUEST CHANGES.*
+  Verified: Leader/Local separation; remote-provider proofs reach
+  `SensingLeader` and fan out as real frames; wire lookup on
+  (incarnation, seq) preserves origin-signed bytes; mesh warm-starts
+  new-rows-only; all slots swept; self-provider Local consumption +
+  Local lifecycle; `update_interval` itself; TopK/Each corrections
+  inside the helper; unknown stream ids fail closed; strengthened
+  evidence proves what it claims. The central finding: **after
+  `DownstreamId::Leader`, the leader's internal `SensingRelay` is a
+  SECOND real relay implementation** — every invariant fixed on the
+  ordinary mesh relay (warm-start discipline, refusal partitioning,
+  lifecycle reclamation, capacity, Local/self delivery) must hold
+  there too. Nine-item closure, in order:
+  1. **(P0) leader-as-provider drops its own proofs:** the candidate
+     snapshot can resolve the leader node itself, but the origin
+     emitter filters `Leader => None` — locally signed beats must
+     dispatch three-way too (Peer→frame, Local→own overlay,
+     Leader→`on_attestation`→dispatch resulting frames). Test with
+     R == P.
+  2. **(P1) provider-free refresh starvation:**
+     `SensingRelay::register_downstream` still resets the slot +
+     warm-starts on every refresh — carry the new-row-only rule in;
+     run the D>TTL/2 regression through
+     `register_capability_interest`.
+  3. **(P1) leader relay state survives branch expiry:**
+     `SensingLeader::sweep` drops table rows/interests but the
+     private relay keeps keys/cache/slots — reclaim on final branch
+     row death; `is_drained` must be honest; same-key
+     re-registration gets no stale warm-start; churn bounded.
+  4. **(P1) refusals don't traverse the Leader path:** signed
+     refusals forward only to mesh Peer rows; the leader (holding
+     the REAL per-consumer cadences behind one aggregate row) never
+     partitions. Pass the exact signed refusal through Leader; the
+     leader partitions D<M consumers (forwarding the exact bytes),
+     retains D≥M, re-registers the surviving aggregate.
+     Provider-free mixed-cadence refusal e2e.
+  5. **(P1) interval updates wait for a beat:** propagate
+     aggregate-D changes into live cells at registration, refresh,
+     refusal partition, deregistration, expiry — test tighten/loosen
+     with NO intervening beat.
+  6. **(P1) watch expiry leaks observation state:** digest-watch
+     expiry removes the expectation + cells but not
+     latest/upstream/slots/epochs; provider-free branches have no
+     provider-keyed row to clean them later — reclaim unjustified
+     branches, rerun orphan-epoch reclamation, fire the overlay
+     signal. Expiry/drain/reuse test.
+  7. **(P1) resolved population doesn't filter:** materialized cells
+     outside `resolved_population` still satisfy
+     Ready/Quorum/TopK/Each — include ONLY set members (missing →
+     Unknown). Test: Ready A+B, expected [A] → B contributes
+     nowhere.
+  8. **(P1) provider-free solicitation too broad:** any signer
+     matching the digest is treated solicited — retain the expected
+     audience with the watch and require the origin's pinned entity
+     to derive the expected owner root (v1 single-owner, honest;
+     the distinct-device fleet relation stays outside sensing).
+  9. **(P1) expectation map unbounded:** cap
+     `sensing_capability_interests` at `max_interests_per_peer`;
+     existing-key refreshes allowed at capacity, new keys
+     AtCapacity.
+  Non-blocking accepted limitation (keep disclosed, don't solve in
+  sensing): the e2e proves provider identity == owner identity, not
+  authenticated fleet membership of a distinct provider identity.
+  Gate: direct provider-targeted delivery / Leader-Local separation /
+  remote-provider fan-out / strengthened evidence VERIFIED; SI-4
+  sign-off WITHHELD; SI-5 HOLD.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
