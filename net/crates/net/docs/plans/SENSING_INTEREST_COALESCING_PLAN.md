@@ -30,8 +30,12 @@ epoch-supersession seam (`sensing_failure_plane` suite);
 join gang candidate pruning through the Projection-4 seam
 (Projection 6 + `match_islands_sensed` + `claim_island_sensed`;
 the claim targets the selected provider; §4.9 overlay accessor,
-suspension flag untouched). Both as-built notes in §6, awaiting
-review. Next: SI-5/SI-6 review; then SI-7 (docs + observability).
+suspension flag untouched). **SI-5 review (2026-07-14): CHANGES
+REQUESTED — closure LANDED same day** (P0 stale-epoch sibling
+resurrection → three-way epoch standing with stale-drop; P1
+relayed-PeerInfo misclassification → shared live-direct-session
+predicate; both red-green verified, §6). Next: SI-5 re-review +
+SI-6 review (held behind it); then SI-7 (docs + observability).
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1674,6 +1678,34 @@ must exercise the real dispatch path.
   re-establishment, interest/branch survival; no additional
   lock-order or reclamation blockers found.
   Gate: SI-5 sign-off CHANGES REQUESTED; SI-6 HOLD.
+  *SI-5 review closure as-built (2026-07-14, fa92a56ff):* both
+  items landed, red-green verified.
+  (P0) THREE-way epoch standing at the 0x0C03 intake: `>` advances
+  (invalidate floors both tables, disrupt siblings, process the
+  arriving branch), `==` processes, `<` DROPS before latest / cells
+  / forwarding / overlay (trace-logged; a delayed valid packet is
+  obsolete, not protocol-invalid). Witnesses both axes in the epoch
+  e2e — a newer-seq SIBLING beat from the superseded incarnation
+  and from the superseded generation each stay Expired; the
+  red-check reproduces the reviewer's exact
+  Established-vs-Expired failure.
+  (P1) `sensing_live_direct_session` (+ addr-level core
+  `sensing_addr_is_live_direct`): directness = PeerInfo.addr
+  reverse-mapped through `addr_to_node` back to the node itself
+  (the `promotable_direct_hop` discriminator); liveness = the
+  failure detector's verdict where the caller has one (None inside
+  the detector's own callback — the failed peer is the identity
+  arm there). Wired at BOTH routeless fallbacks. Witnesses:
+  addr-level units of the exact relayed-address misclassification,
+  plus the withdrawal e2e hardened into a deterministic pin — C now
+  holds a real relay-routed session to P (peers.contains_key(P)
+  true throughout) and X detects slower than C's 3× route age-out,
+  so the withdrawal always lands on the ROUTELESS fallback
+  (red 3/3 under the old predicate, green 3/3 fixed).
+  Verification: 4,911 lib all-features (+2 units), 5/5
+  sensing_failure_plane (3× consecutive), both clippy gates incl.
+  `-D warnings`, fmt — green. Awaiting re-review; SI-6 review
+  queued behind it.
 - **SI-6 — scheduler bridge.** Aggregate views join candidate
   pruning through the same projection seam as local liveness;
   compound AND/gang semantics stay in the scheduler; claim targets
