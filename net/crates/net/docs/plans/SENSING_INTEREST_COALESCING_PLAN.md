@@ -1228,6 +1228,30 @@ must exercise the real dispatch path.
   origin-emitter e2e, all sensing suites, 4894 full lib, both
   clippy gates); awaiting reviewer verification to lift the SI-4
   hold.
+  *Second-round verification (2026-07-14):* all six fixes
+  **SIGNED OFF at 85328d59b**; docs verified at c6c25e94a. Two
+  non-blocking coverage gaps noted: (a) the remote at-capacity
+  rollback has no direct integration test (the local path does;
+  accepted — a wire-driven 1024-stream fill is heavy for what the
+  shared assertion adds), (b) the "provider appears later and the
+  next refresh resolves it" transition was asserted by reasoning
+  (closed below). **One residual partial-admission defect holds
+  SI-4:** `register_capability_interest` discards per-branch
+  `RegisterOutcome`s, so (i) a PARTIAL admission (P1 Registered,
+  P2/P3 OverCap) still returns all branches and the mesh seam's
+  `aggregate(..).unwrap_or(requested_sample_interval)` fallback
+  reconstructs demand for the refused branches; (ii) a new consumer
+  refused on EVERY branch of an interest other consumers keep live
+  passes the global any-branch-live check and appears successfully
+  registered while owning no downstream row — visible the moment
+  SI-4 delivers proofs. Correction: `LeaderRegistration` gains
+  `admitted_branches` (the branches where THIS registration's
+  outcome was `Registered`); empty admitted ⇒
+  `AllBranchesRefused` (the interest is removed only when no branch
+  is live globally — other consumers keep it); the mesh seam
+  derives branch demand ONLY from actual table aggregates over the
+  admitted branches, fallback removed. "At least one branch exists
+  globally" is not "this registration was admitted on a branch."
 - **SI-4 — relay delivery + overlay application.** Per-provider
   caches, packing, down-sampling, hop rule, admission gate, overlay
   apply, LOCAL aggregate views. Flagship three-node test from v3
