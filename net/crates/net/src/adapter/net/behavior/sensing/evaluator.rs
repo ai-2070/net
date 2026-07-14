@@ -175,11 +175,17 @@ pub const fn check_cadence(
     }
 }
 
-/// Sensing-plane counters (SI-0 subset — SI-7 grows the full stats
-/// surface). Shared-reference friendly: relaxed atomics, monotonic,
-/// diagnostics only.
+/// Sensing-plane counters (plan §6 SI-7 observability surface).
+/// Shared-reference friendly: relaxed atomics, monotonic,
+/// diagnostics only — never load-bearing for any decision. Read a
+/// snapshot through [`super::super::MeshNode::sensing_counters`].
+///
+/// The counters fall in three groups: refusals-by-kind (the SI-0
+/// subset), the coalescing / delivery lifecycle (SI-7), and the
+/// coalescing-efficacy headline (SI-7, plan §4.1 future gate).
 #[derive(Default, Debug)]
 pub struct SensingCounters {
+    // ── Refusals by kind (SI-0) ──
     /// Every constraint rejection (any [`ConstraintError`]).
     pub invalid_constraints: AtomicU64,
     /// The security-relevant subset: protocol-invalid input —
@@ -191,6 +197,62 @@ pub struct SensingCounters {
     /// Scope-validation refusals (plan §4.10) — every
     /// [`super::scope::ScopeError`], security-relevant or not.
     pub scope_refusals: AtomicU64,
+    /// Selector-too-broad refusals at the resolver (plan §4.7
+    /// each-mode amplification guard): an `Each`-mode selector
+    /// matched more providers than `each_mode_max_providers`.
+    pub broad_selector_refusals: AtomicU64,
+
+    // ── Coalescing + delivery lifecycle (SI-7) ──
+    /// Consumer capability-registrations admitted at THIS node's
+    /// sensing-leader role — the denominator for the local
+    /// coalescing ratio.
+    pub interests_registered: AtomicU64,
+    /// The subset of [`Self::interests_registered`] that JOINED an
+    /// existing coalesced interest row rather than resolving fresh
+    /// candidates — demand that merged at the leader BEFORE the
+    /// provider hop (plan §4.1 "scope-wide, pre-selection"
+    /// coalescing). `interests_coalesced / interests_registered` is
+    /// the local coalescing efficacy.
+    pub interests_coalesced: AtomicU64,
+    /// Sum of resolved active-branch counts across fresh interest
+    /// resolutions — the candidate fan-out the leader opened (plan
+    /// §4.7 bounded exploration).
+    pub candidate_fanout_total: AtomicU64,
+    /// Signed origin beats this node's origin emitter produced (plan
+    /// §4.4). One per branch per due tick, fanned to every
+    /// downstream by the relay machinery — NOT multiplied by
+    /// watchers (the coalescing economic claim, SI-1d).
+    pub attestations_emitted: AtomicU64,
+    /// Signed attestations this node forwarded VERBATIM as a relay
+    /// (plan §4.2 — relays never author), counted per downstream
+    /// forward, so the value is fan-out volume.
+    pub attestations_forwarded: AtomicU64,
+    /// Attestations dropped at the §4.6 observer gate (stale/rewound
+    /// sequence, duplicate) before touching latest/cells/overlay.
+    pub attestations_gated: AtomicU64,
+    /// Attestations dropped because their `(incarnation, generation)`
+    /// epoch was globally superseded (SI-5 review P0): a delayed
+    /// valid-but-obsolete beat under a provider's older boot or
+    /// capability definition.
+    pub attestations_superseded: AtomicU64,
+
+    // ── Coalescing efficacy: the §4.1 future-gate headline (SI-7) ──
+    /// Provider-FREE `ProviderRegistration`s this node admitted as
+    /// the target provider — the denominator for the merge-miss
+    /// rate. Provider-targeted (`Node`/`Nodes`) registrations are
+    /// excluded: multiple direct surveillants of one provider is
+    /// intended, not a coalescing failure.
+    pub provider_free_registrations: AtomicU64,
+    /// The divergent-resolution MERGE-MISS (plan §4.1): a
+    /// provider-free registration admitted while the branch already
+    /// carried another distinct upstream — two independent leaders
+    /// resolved the same interest to this provider (split-brain
+    /// islands, or the window while an election result propagates).
+    /// `divergent_resolution_merge_miss / provider_free_registrations`
+    /// is the residual-divergence rate that feeds the §4.1 future
+    /// gate: materially non-zero justifies a convergence refinement;
+    /// ~zero shows the split-brain tolerance is empirically cheap.
+    pub divergent_resolution_merge_miss: AtomicU64,
 }
 
 impl SensingCounters {

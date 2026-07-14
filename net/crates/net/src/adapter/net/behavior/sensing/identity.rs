@@ -582,6 +582,17 @@ pub enum ProviderSelector {
 }
 
 impl ProviderSelector {
+    /// Whether this selector names no explicit destination and so
+    /// routes through the scope-local sensing leader (plan §4.1
+    /// two routing stages). `AnyAuthorized`/`Group`/`Tags` are
+    /// provider-free; `Node`/`Nodes` carry explicit destinations and
+    /// skip the rendezvous. The SI-7 merge-miss metric scopes to the
+    /// provider-free set, where a second distinct upstream at one
+    /// provider means two leaders resolved the same interest.
+    pub fn is_provider_free(&self) -> bool {
+        matches!(self, Self::AnyAuthorized | Self::Group(_) | Self::Tags(_))
+    }
+
     /// Canonical `Nodes` selector: sorted and deduplicated, so
     /// authorship order can never split interest identity.
     pub fn nodes(mut ids: Vec<u64>) -> Self {
@@ -875,6 +886,23 @@ mod tests {
     #[test]
     fn digest_is_deterministic() {
         assert_eq!(spec().interest_digest(), spec().interest_digest());
+    }
+
+    /// SI-7: the merge-miss metric scopes to provider-free selectors
+    /// (routed through the leader). `Node`/`Nodes` name explicit
+    /// destinations and skip the rendezvous, so multiple direct
+    /// surveillants of one provider are intended, not a miss.
+    #[test]
+    fn provider_free_discriminates_leader_routed_from_direct() {
+        assert!(ProviderSelector::AnyAuthorized.is_provider_free());
+        assert!(ProviderSelector::Group(GroupRef::from_bytes([7; 32])).is_provider_free());
+        assert!(ProviderSelector::tags(vec![TagMatch {
+            key: "gpu".into(),
+            value: "h100".into(),
+        }])
+        .is_provider_free());
+        assert!(!ProviderSelector::Node(7).is_provider_free());
+        assert!(!ProviderSelector::nodes(vec![7, 9]).is_provider_free());
     }
 
     #[test]

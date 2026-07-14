@@ -278,6 +278,22 @@ pub struct LeaderRegistration {
     pub warm_starts: Vec<Delivery>,
 }
 
+/// SI-7 leader-load snapshot ([`SensingLeader::load`]). All three
+/// grow with the scope's demand the leader concentrates; a
+/// per-digest leader spread is a possible later refinement, not v1
+/// (plan §7 leader-hotspot note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensingLeaderLoad {
+    /// Distinct coalesced interests (one row per `(Y,C,L,selector,
+    /// mode)`).
+    pub interests: usize,
+    /// Distinct active branches with at least one live downstream.
+    pub branches: usize,
+    /// Total live per-consumer downstream rows across all branches —
+    /// the pre-coalescing demand the leader absorbs.
+    pub downstream_rows: usize,
+}
+
 /// The sensing-leader role (plan §4.1): coalesce equivalent
 /// capability interests BEFORE provider selection, resolve bounded
 /// candidates once per distinct interest, open provider-targeted
@@ -876,6 +892,33 @@ impl SensingLeader {
         self.interests.len()
     }
 
+    /// SI-7 (plan §7 "SI-7 must expose leader load"): a compact load
+    /// snapshot for the leader hotspot — distinct coalesced
+    /// interests, distinct active branches across them, and total
+    /// live per-consumer downstream rows the relay carries. Demand
+    /// concentrates here (bounded by scope size, per-downstream caps,
+    /// and coalescing), so operators watch these three to spot a hot
+    /// leader before it is a problem.
+    pub fn load(&self, now: Instant) -> SensingLeaderLoad {
+        let mut branches = 0usize;
+        let mut downstream_rows = 0usize;
+        for (interest, entry) in &self.interests {
+            for provider in &entry.active {
+                let branch = ProviderInterestKey::new(interest.clone(), *provider);
+                let rows = self.relay.table.downstreams(&branch, now).len();
+                if rows > 0 {
+                    branches += 1;
+                    downstream_rows += rows;
+                }
+            }
+        }
+        SensingLeaderLoad {
+            interests: self.interests.len(),
+            branches,
+            downstream_rows,
+        }
+    }
+
     /// Distinct capability ids with live interests — the SI-6.1
     /// fold-reconciliation scan input.
     pub fn interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
@@ -965,6 +1008,59 @@ mod tests {
             tags: Vec::new(),
             groups: Vec::new(),
         }
+    }
+
+    /// SI-7: the leader-load snapshot counts distinct interests,
+    /// distinct branches with live rows, and total downstream rows —
+    /// the demand a hot leader concentrates. Two consumers coalescing
+    /// on one interest is one interest, one branch, two rows.
+    #[test]
+    fn leader_load_snapshots_interest_branch_and_row_concentration() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        assert_eq!(
+            leader.load(now),
+            SensingLeaderLoad {
+                interests: 0,
+                branches: 0,
+                downstream_rows: 0,
+            },
+            "an idle leader has zero load",
+        );
+
+        let snapshot = [provider(0xB1, 5)];
+        leader
+            .register_capability_interest(
+                &spec(),
+                DownstreamId::Peer(0xC1),
+                ms(100),
+                TTL,
+                root(),
+                &snapshot,
+                now,
+            )
+            .expect("first consumer admits");
+        // A second consumer on the SAME interest coalesces: still one
+        // interest, one branch, now two downstream rows.
+        leader
+            .register_capability_interest(
+                &spec(),
+                DownstreamId::Peer(0xC2),
+                ms(100),
+                TTL,
+                root(),
+                &snapshot,
+                now,
+            )
+            .expect("second consumer coalesces");
+        assert_eq!(
+            leader.load(now),
+            SensingLeaderLoad {
+                interests: 1,
+                branches: 1,
+                downstream_rows: 2,
+            },
+        );
     }
 
     /// Standing SI-2 orphan-cap finding, closed in the SI-3 second

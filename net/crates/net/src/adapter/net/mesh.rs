@@ -6173,6 +6173,18 @@ impl MeshNode {
             .map(|leader| leader.interest_count())
     }
 
+    /// SI-7: this node's sensing-leader load snapshot (interests ×
+    /// branches × downstream rows) — `None` when the role is not
+    /// installed. Operators watch the leader hotspot through this
+    /// (plan §7).
+    #[cfg(feature = "redex")]
+    pub fn sensing_leader_load(&self) -> Option<sensing::SensingLeaderLoad> {
+        self.sensing_leader
+            .lock()
+            .as_ref()
+            .map(|leader| leader.load(Instant::now()))
+    }
+
     /// Active branch providers this node's sensing-leader role
     /// resolved for one coalesced interest — `None` when the role is
     /// not installed, empty when the interest is unknown (tests +
@@ -7421,6 +7433,7 @@ impl MeshNode {
         let observations = self.sensing_observations.clone();
         let overlay = self.sensing_overlay_changed.clone();
         let factor = self.config.continuity_factor;
+        let counters = self.sensing_counters.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         Some(tokio::spawn(async move {
@@ -7518,6 +7531,12 @@ impl MeshNode {
                     let Ok(signed) = sensing::sign_attestation(&identity, unsigned) else {
                         continue;
                     };
+                    // SI-7: one signed origin beat produced — fanned
+                    // to every downstream below, never multiplied by
+                    // watcher count (the coalescing economic claim).
+                    counters
+                        .attestations_emitted
+                        .fetch_add(1, Ordering::Relaxed);
                     // SI-4 review P1: the self-provider Local watch
                     // consumes the signed beat through the SAME
                     // attestation + continuity semantics as any
@@ -12939,6 +12958,20 @@ impl MeshNode {
                     ) {
                         Ok(registration) => registration,
                         Err(rejection) => {
+                            // SI-7: the §4.7 each-mode amplification
+                            // guard fired — surface it distinctly from
+                            // the scope/digest refusals its siblings
+                            // already count.
+                            if matches!(
+                                rejection,
+                                sensing::FrameRejection::Resolution(
+                                    sensing::ResolutionRefusal::SelectorTooBroad { .. }
+                                )
+                            ) {
+                                ctx.sensing_counters
+                                    .broad_selector_refusals
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             tracing::debug!(
                                 from_node = format!("{:#x}", from_node),
                                 rejection = %rejection,
@@ -12947,6 +12980,23 @@ impl MeshNode {
                             return;
                         }
                     };
+                    // SI-7 coalescing efficacy (local surface): every
+                    // admitted registration counts; the ones that
+                    // JOINED an existing interest are the merges, and
+                    // a fresh resolution's active set is the candidate
+                    // fan-out this leader opened.
+                    ctx.sensing_counters
+                        .interests_registered
+                        .fetch_add(1, Ordering::Relaxed);
+                    if registration.newly_resolved {
+                        ctx.sensing_counters
+                            .candidate_fanout_total
+                            .fetch_add(registration.branches.len() as u64, Ordering::Relaxed);
+                    } else {
+                        ctx.sensing_counters
+                            .interests_coalesced
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     // SI-4 review P0: the leader relay's warm-starts
                     // for the registering consumer go out as REAL
                     // provisional frames (§4.4 anti-entropy on the
@@ -13150,6 +13200,35 @@ impl MeshNode {
                         // there the registration feeds the origin
                         // emitter instead (SI-3).
                         if validated.target == ctx.local_node_id {
+                            // SI-7 coalescing-efficacy headline (plan
+                            // §4.1): this node is the PROVIDER. For a
+                            // provider-free interest, a second DISTINCT
+                            // upstream on the branch means two leaders
+                            // resolved the same interest here — the
+                            // residual divergent resolution the future
+                            // gate weighs. Provider-targeted
+                            // (`Node`/`Nodes`) registrations are
+                            // excluded: multiple direct surveillants
+                            // are intended, not a coalescing failure.
+                            if validated.spec.providers.is_provider_free() {
+                                ctx.sensing_counters
+                                    .provider_free_registrations
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let distinct_upstreams = ctx
+                                    .sensing_interest_table
+                                    .lock()
+                                    .downstreams(&key, now)
+                                    .into_iter()
+                                    .filter(|downstream| {
+                                        matches!(downstream, sensing::DownstreamId::Peer(_))
+                                    })
+                                    .count();
+                                if distinct_upstreams >= 2 {
+                                    ctx.sensing_counters
+                                        .divergent_resolution_merge_miss
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             Self::feed_sensing_origin(
                                 ctx,
                                 &key,
@@ -13677,6 +13756,9 @@ impl MeshNode {
             return;
         }
         if !admission.is_admitted() {
+            ctx.sensing_counters
+                .attestations_gated
+                .fetch_add(1, Ordering::Relaxed);
             tracing::trace!(
                 origin = format!("{:#x}", attestation.origin),
                 admission = ?admission,
@@ -13749,6 +13831,9 @@ impl MeshNode {
             // a refusal — just obsolete: nothing under a superseded
             // epoch may touch latest, cells, forwarding, or the
             // overlay.
+            ctx.sensing_counters
+                .attestations_superseded
+                .fetch_add(1, Ordering::Relaxed);
             tracing::trace!(
                 origin = format!("{:#x}", attestation.origin),
                 incarnation = attestation.origin_incarnation.get(),
@@ -14100,6 +14185,13 @@ impl MeshNode {
         } else {
             sensing::SENSING_PROVISIONAL_STREAM
         };
+        // SI-7: relay fan-out volume — the origin's SIGNED bytes go
+        // out verbatim to each downstream (plan §4.2).
+        if !forwards.is_empty() {
+            ctx.sensing_counters
+                .attestations_forwarded
+                .fetch_add(forwards.len() as u64, Ordering::Relaxed);
+        }
         for node in forwards {
             spawn_sensing_frame_send(
                 &ctx.socket,

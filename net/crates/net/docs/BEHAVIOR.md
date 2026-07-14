@@ -313,3 +313,4 @@ pub struct SafetyEnvelope {
 | `behavior/placement.rs` | `StandardPlacement` scorer, custom-filter callback dispatcher |
 | `behavior/proximity.rs` | `ProximityGraph`, `EnhancedPingwave`, latency edges |
 | `behavior/safety.rs` | `SafetyEnforcer`, `ResourceEnvelope`, `KillSwitchConfig` |
+| `behavior/sensing/` | Capability sensing — provider-free readiness interests, leader rendezvous, coalescing. See [`SENSING.md`](SENSING.md) |

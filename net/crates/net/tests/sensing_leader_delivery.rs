@@ -214,6 +214,40 @@ async fn provider_free_proofs_fan_back_through_the_leader() {
         assert_eq!(SensingCounters::get(&counters.scope_refusals), 0);
     }
 
+    // ── SI-7 observability: the coalescing-efficacy surface ──
+    let r_counters = r.sensing_counters();
+    // Both consumers' registrations reached the leader; the SECOND
+    // JOINED the first's coalesced interest (local coalescing), and
+    // the fresh resolution opened P as the one candidate branch.
+    assert!(
+        SensingCounters::get(&r_counters.interests_registered) >= 2,
+        "both provider-free registrations counted at the leader",
+    );
+    assert!(
+        SensingCounters::get(&r_counters.interests_coalesced) >= 1,
+        "the second consumer JOINED the first's interest — a merge, not a fresh row",
+    );
+    assert!(
+        SensingCounters::get(&r_counters.candidate_fanout_total) >= 1,
+        "the fresh resolution opened at least the one announced provider",
+    );
+    let p_counters = p.sensing_counters();
+    assert!(
+        SensingCounters::get(&p_counters.attestations_emitted) >= 1,
+        "P's origin emitter produced signed beats",
+    );
+    assert!(
+        SensingCounters::get(&p_counters.provider_free_registrations) >= 1,
+        "P admitted the leader's provider-free registration",
+    );
+    // ONE leader served the whole scope: no divergent resolution, so
+    // the merge-miss stays zero — the coalesced ideal (§4.1).
+    assert_eq!(
+        SensingCounters::get(&p_counters.divergent_resolution_merge_miss),
+        0,
+        "a single leader is the merged case — zero residual divergence",
+    );
+
     // ── Drain: consumers stop; the whole chain unwinds ──
     refresh_a.abort();
     refresh_b.abort();
@@ -229,6 +263,138 @@ async fn provider_free_proofs_fan_back_through_the_leader() {
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
     r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}
+
+/// SI-7 coalescing-efficacy headline (plan §4.1): the
+/// divergent-resolution MERGE-MISS. TWO leaders each resolve the
+/// same provider-free interest to ONE provider P — the split-brain
+/// residual §4.1 tolerates. P sees the same interest arrive from two
+/// distinct upstreams and counts the miss, while a `Node`-targeted
+/// direct registration to P (intended multi-surveillance, NOT a
+/// miss) leaves the merge-miss counter untouched.
+///
+/// ```text
+///   A1 ── R1 (leader) ─┐
+///                       P (provider, owner identity)
+///   A2 ── R2 (leader) ─┘
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn divergent_leaders_at_one_provider_count_a_merge_miss() {
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a1 = mk(EntityKeypair::generate(), None).await;
+    let a2 = mk(EntityKeypair::generate(), None).await;
+    let r1 = mk(EntityKeypair::generate(), None).await;
+    let r2 = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a1, &r1).await;
+    connect_pair(&a2, &r2).await;
+    connect_pair(&r1, &p).await;
+    connect_pair(&r2, &p).await;
+    for node in [&a1, &a2, &r1, &r2, &p] {
+        node.start();
+    }
+    for node in [&a1, &a2, &r1, &r2] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (r1_id, r2_id, p_id) = (r1.node_id(), r2.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r1.peer_entity_id(p_id).is_some()
+            && r2.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r1_id).is_some()
+            && p.peer_entity_id(r2_id).is_some()
+    })
+    .await;
+
+    // BOTH nodes assume the leader role — the split-brain condition
+    // the metric measures (two islands each electing their own).
+    assert!(r1.assume_sensing_leader(), "leader role installs at R1");
+    assert!(r2.assume_sensing_leader(), "leader role installs at R2");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "both leaders authorize P", || {
+        [&r1, &r2].iter().all(|r| {
+            r.sensing_candidate_snapshot(&cap)
+                .iter()
+                .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+        })
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+
+    // Each consumer registers its provider-free interest with its OWN
+    // leader; both leaders resolve P and register upstream at P.
+    let refresher = |consumer: Arc<MeshNode>, leader_id: u64| {
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = consumer.register_capability_interest(
+                    &spec,
+                    leader_id,
+                    Duration::from_millis(200),
+                    TTL,
+                );
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+    let refresh_1 = refresher(a1.clone(), r1_id);
+    let refresh_2 = refresher(a2.clone(), r2_id);
+
+    // P's branch carries BOTH leaders as distinct upstreams — the
+    // demand that failed to coalesce to one leader.
+    await_condition(
+        Duration::from_secs(10),
+        "two distinct leaders registered at the provider",
+        || {
+            p.sensing_downstreams(&branch)
+                .iter()
+                .filter(|d| matches!(d, DownstreamId::Peer(_)))
+                .count()
+                >= 2
+        },
+    )
+    .await;
+
+    let p_counters = p.sensing_counters();
+    await_condition(
+        Duration::from_secs(5),
+        "the divergent resolution is counted as a merge-miss",
+        || SensingCounters::get(&p_counters.divergent_resolution_merge_miss) >= 1,
+    )
+    .await;
+    assert!(
+        SensingCounters::get(&p_counters.provider_free_registrations) >= 2,
+        "both provider-free registrations counted as the merge-miss denominator",
+    );
+
+    refresh_1.abort();
+    refresh_2.abort();
+    a1.shutdown().await.expect("shutdown A1");
+    a2.shutdown().await.expect("shutdown A2");
+    r1.shutdown().await.expect("shutdown R1");
+    r2.shutdown().await.expect("shutdown R2");
     p.shutdown().await.expect("shutdown P");
 }
 
