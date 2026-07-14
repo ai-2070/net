@@ -8,13 +8,12 @@ work, not signature verification … that preserves the core economic
 claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
 interest table + resolver + upstream propagation on real sessions,
 dark behind `enable_sensing_coalescing = false` (as-built note in
-§6); **SI-3 COMPLETE, both closure rounds SIGNED OFF (2026-07-14; the
-partial-admission residual landed per the reviewer's "once that is
-removed, SI-4 can proceed")**; **SI-4 COMPLETE as-built
-(2026-07-14)** — relay delivery + consumer overlay + LOCAL
-aggregate views on real sessions, flagship + 16b witnessed
-(as-built note in §6, incl. the envelope-encoding decision to
-surface at review). Next: SI-5 (failure-plane integration).
+§6); **SI-3 COMPLETE, both closure rounds SIGNED OFF (2026-07-14)**;
+**SI-4 as-built (2026-07-14), REVIEWED: REQUEST CHANGES** — the
+direct provider-targeted path works and the envelope encoding is
+verified, but the provider-free leader RETURN path is missing and
+five lifecycle/aggregate defects stand (nine-item disposition in
+§6). Next: the SI-4 change-request closure; SI-5 HOLDS.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1313,6 +1312,63 @@ must exercise the real dispatch path.
   stays one-beat-per-frame (multi-event frames are transport-ready
   but unexercised); origin pins at non-adjacent verifying hops
   remain the documented SI-3 seam bound.
+  *SI-4 review disposition (2026-07-14): REQUEST CHANGES.* Verified:
+  identical-bytes forwarding, session-authenticated stream-id
+  envelope, incoming-flag→own-cell / outgoing-from-own-cell hop
+  rule, direct provider-targeted path, partial admission. Withheld
+  on nine items (SI-4 semantics, not SI-5):
+  1. **(P0) provider-free return path MISSING:** leader proofs
+     reach only the mesh table's Local row — never
+     `SensingLeader::on_attestation`, so registered consumers get
+     nothing back. `DownstreamId::Local` is overloaded (node-local
+     consumer vs internal leader subscription) — introduce
+     `DownstreamId::Leader`; delivery dispatches Peer→forward,
+     Local→overlay, Leader→leader relay fan-out to the real
+     consumer rows. Production e2e: provider-free A+B → leader R →
+     P → one stream → real signed 0x0C03 back through R → both
+     receive.
+  2. **(P1) warm anti-entropy starves live continuity:** every
+     refresh resend resets the slot (last_delivered/next_due/
+     pending) — under D=TTL, refresh=TTL/2 the downstream only ever
+     receives provisionally and stays Unknown on a healthy stream.
+     Warm-start only newly created rows; never preempt pending live
+     work. Regression: D>TTL/2, ttl/2 refreshes, unchanged Ready →
+     Established with live deliveries at D.
+  3. **(P1) slot leak under downstream churn:** the sweep checks
+     only `pending` slots; a deregistered downstream's non-pending
+     slot leaks while the branch stays alive. Sweep ALL slots for
+     row liveness.
+  4. **(P1) continuity cells pin their first interval:** cells
+     never learn aggregate/local D changes — add an
+     interval-update that recomputes the deadline from the last
+     live beat without resetting continuity; test tighten + loosen.
+  5. **(P1) local consumer lifecycle incomplete:** self-provider
+     Local watch never evaluates/signs/feeds locally (emitter
+     filters Local); Local rows get no warm-start; expired Local
+     rows leave cells + projections + no overlay notification.
+  6. **(P1) aggregate assembly wrong for TopK/Each/completeness:**
+     TopK takes first-K from HashMap order (nondeterministic — sort
+     viable by the consumer-local ranking key, provider-id
+     tie-break); Each returns raw projections without the budget
+     (Ready-but-over-budget must be locally non-viable); the bare
+     `search_complete` bool over materialized cells can mistake a
+     missing expected provider for NotReady evidence — take the
+     resolved expected set (missing → Unknown) or refuse
+     complete/NotReady.
+  7. **(P1) solicited-check/expiry race:** the branch can expire
+     between the solicited check and the store — the inserted
+     epoch/observation/cell has no later branch-death event and
+     permanently consumes cap. Recheck liveness before forwarding;
+     reclaim and stop if the branch disappeared.
+  8. **(P2) unknown 0x0C03 stream ids fail OPEN** (anything not
+     provisional is treated live) — match both streams explicitly,
+     drop others as malformed.
+  9. **Evidence:** laundering asserted before the continuity
+     deadline (not after a 300 ms sleep that would mask it);
+     down-sampling proven by inter-delivery spacing; edge
+     immediacy proven against B's known next-due; header node
+     count corrected.
+  Gate: SI-4 sign-off WITHHELD; SI-5 HOLD.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
