@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_c28bdf38c0df3a::t_d6b1b38ed725d5 4797-4805
+  s_c28bdf38c0df3a::t_63f4b174f5270f 3189-3201
+  s_c28bdf38c0df3a::t_09dfabd211374d 21319-21320,21325-21330,21333,21335,21345-21348
+  s_c28bdf38c0df3a::t_66e400395138b4 12413-12415
+  s_c28bdf38c0df3a::t_1e43ae01372e81 4806-4811,12416-12421,21349-21354
+  s_c28bdf38c0df3a::t_998c0ad3051a91 13483-13500,13513,13519,13521-13522,13526-13538
+  s_c28bdf38c0df3a::t_fa8ef1cbd6f102 13525
+  s_c28bdf38c0df3a::t_74c05101e6cc21 21312-21318,21321-21324,21331-21332,21334,21336-21344,21355-21357
+  s_c28bdf38c0df3a::t_9fc536af82503a 3169-3188,3202-3213
+  s_c28bdf38c0df3a::t_b66be8e69fa8bb 21311
+net/crates/net/tests/sensing_failure_plane.rs
+  s_c28bdf38c0df3a::t_64c8cadf26cc8c 295-305
+  s_c28bdf38c0df3a::t_f32df7a2ed43e2 520-529,533
+  s_c28bdf38c0df3a::t_6aad16b912806d 488-501
+  s_c28bdf38c0df3a::t_47830f750de704 336-352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "fa92a56ff1a921eb9b872d59bfc0f88ffed46e9d",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
