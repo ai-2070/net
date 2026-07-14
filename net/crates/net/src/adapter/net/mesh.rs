@@ -1120,6 +1120,11 @@ struct DispatchCtx {
     /// SI-4a: continuity factor k for this hop's upstream cells
     /// (plan §4.5, `config.continuity_factor`).
     sensing_continuity_factor: u32,
+    /// SI-4b: bumps whenever a LOCAL branch projection changes —
+    /// the §4.9 overlay change signal (SI-6's scheduler-bridge
+    /// wake-up seam). Subscribe via
+    /// `MeshNode::subscribe_sensing_overlay_changes`.
+    sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
@@ -2906,6 +2911,12 @@ struct SensingObservations {
     /// Reclaimed with the branch; per-downstream rows that die
     /// while the branch survives leave inert slots the sweep GCs.
     slots: HashMap<(sensing::ProviderInterestKey, sensing::DownstreamId), SensingDeliverySlot>,
+    /// SI-4b: the LOCAL consumer overlay — one `ObservationCell`
+    /// per branch this node's own `Local` row watches (the frozen
+    /// SI-0f `SensingConsumer` semantics; plan §3.5/§4.9). Fed at
+    /// the Local delivery point with the hop's OUTGOING bearing, so
+    /// the local consumer obeys the same hop rule as any peer.
+    consumer_cells: HashMap<sensing::ProviderInterestKey, sensing::ObservationCell>,
 }
 
 impl SensingObservations {
@@ -2925,11 +2936,47 @@ impl SensingObservations {
     /// ages it out.
     fn reclaim_status(&mut self, key: &sensing::ProviderInterestKey) {
         self.latest.remove(key);
-        // SI-4a: a dead branch delivers to nobody — its continuity
-        // cell and every delivery slot reclaim with it.
+        // SI-4a/b: a dead branch delivers to nobody — its continuity
+        // cell, every delivery slot, and the local consumer cell
+        // reclaim with it.
         self.upstream.remove(key);
         self.slots.retain(|(branch, _), _| branch != key);
+        self.consumer_cells.remove(key);
         self.reclaim_orphan_epochs([key.provider]);
+    }
+
+    /// SI-4b: feed one admitted beat into the LOCAL consumer cell
+    /// for a branch (lazily registered at the Local row's own D)
+    /// and report whether the branch's PROJECTION moved — the
+    /// overlay change signal's input (§4.9 "the fold change signal
+    /// fires on overlay updates").
+    fn feed_consumer_cell(
+        &mut self,
+        branch: &sensing::ProviderInterestKey,
+        attestation: &sensing::ReadinessAttestation,
+        bearing: bool,
+        own_interval: Duration,
+        factor: u32,
+        now: Instant,
+    ) -> bool {
+        let cell = self
+            .consumer_cells
+            .entry(branch.clone())
+            .or_insert_with(|| sensing::ObservationCell::register(now, own_interval, factor));
+        let before = cell.projected();
+        cell.on_admitted_beat(
+            now,
+            sensing::DeliveredBeat {
+                attested_status: attestation.status,
+                estimated_start: attestation.estimated_start,
+                source_incarnation: attestation.origin_incarnation,
+                capability_generation: attestation.capability_generation,
+                seq: attestation.seq,
+                promised_cadence: attestation.promised_cadence,
+                continuity_bearing: bearing,
+            },
+        );
+        cell.projected() != before
     }
 
     /// Second closure round, item 3: drop epoch records whose
@@ -3667,6 +3714,11 @@ pub struct MeshNode {
     /// its first live consumer. Keys on the transcript digest, so
     /// equivocation detection binds exactly the signed bytes.
     sensing_observer_gate: Arc<parking_lot::Mutex<sensing::IncarnationSeqGate>>,
+    /// SI-4b: the §4.9 overlay change signal — bumps whenever a
+    /// LOCAL branch projection changes (intake edge or continuity
+    /// expiry). The SI-6 scheduler bridge subscribes via
+    /// [`MeshNode::subscribe_sensing_overlay_changes`].
+    sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-3c: the verified observation seam (decode → solicited
     /// check → signature → seq gate → here): latest admitted status
     /// per branch, refusal control responses kept apart (closure
@@ -4395,6 +4447,7 @@ impl MeshNode {
             sensing_observer_gate: Arc::new(parking_lot::Mutex::new(
                 sensing::IncarnationSeqGate::new(),
             )),
+            sensing_overlay_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
             sensing_observations: Arc::new(parking_lot::Mutex::new(SensingObservations::default())),
             roster,
             channel_configs: None,
@@ -4884,6 +4937,89 @@ impl MeshNode {
             .upstream
             .get(key)
             .map(sensing::ObservationCell::continuity)
+    }
+
+    /// SI-4b: the LOCAL consumer's continuity-gated projection for
+    /// one branch (plan §3.4/§4.5). `Unknown` for an unwatched
+    /// branch — the conservative default.
+    pub fn sensing_projected(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> sensing::ProjectedReadiness {
+        self.sensing_observations
+            .lock()
+            .consumer_cells
+            .get(key)
+            .map(sensing::ObservationCell::projected)
+            .unwrap_or(sensing::ProjectedReadiness::Unknown)
+    }
+
+    /// SI-4b: per-provider projections (plus provider start
+    /// estimates) for one capability interest — the Layer-1
+    /// aggregate's input (§3.5; the frozen `SensingConsumer`
+    /// surface).
+    pub fn sensing_branch_projections(
+        &self,
+        interest: &sensing::CapabilityInterestKey,
+    ) -> Vec<(u64, sensing::ProjectedReadiness, Option<Duration>)> {
+        self.sensing_observations
+            .lock()
+            .consumer_cells
+            .iter()
+            .filter(|(key, _)| &key.interest == interest)
+            .map(|(key, cell)| {
+                (
+                    key.provider,
+                    cell.projected(),
+                    cell.observation().and_then(|obs| obs.estimated_start),
+                )
+            })
+            .collect()
+    }
+
+    /// SI-4b: the LOCAL result-mode aggregate for one interest
+    /// (plan §3.5 — local by definition: viability is
+    /// consumer-relative through `budget`). Branch views join the
+    /// consumer cells with LIVE route estimates from the proximity
+    /// plane; `search_complete` is the caller's resolution state
+    /// (open-world selectors are never complete, §3.5).
+    pub fn sensing_aggregate_view(
+        &self,
+        spec: &sensing::InterestSpec,
+        budget: &sensing::ConsumerLatencyBudget,
+        search_complete: bool,
+    ) -> sensing::AggregateView {
+        let interest = spec.key();
+        let branches: Vec<sensing::BranchView> = self
+            .sensing_branch_projections(&interest)
+            .into_iter()
+            .map(
+                |(provider, projection, estimated_start)| sensing::BranchView {
+                    provider,
+                    projection,
+                    estimated_start,
+                    route_estimate: sensing::proximity_route_estimate(
+                        &self.proximity_graph,
+                        provider,
+                    ),
+                },
+            )
+            .collect();
+        sensing::project_aggregate(
+            &spec.providers,
+            spec.result_mode,
+            budget,
+            &branches,
+            search_complete,
+        )
+    }
+
+    /// SI-4b: subscribe to the §4.9 overlay change signal — the
+    /// value bumps whenever a LOCAL branch projection changes
+    /// (intake edge or continuity expiry). The SI-6 scheduler
+    /// bridge's wake-up seam.
+    pub fn subscribe_sensing_overlay_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sensing_overlay_changed.subscribe()
     }
 
     /// SI-3c: whether this hop's observer gate poisoned an origin's
@@ -6473,6 +6609,7 @@ impl MeshNode {
             capability_version: self.capability_version.clone(),
             sensing_observer_gate: self.sensing_observer_gate.clone(),
             sensing_continuity_factor: self.config.continuity_factor,
+            sensing_overlay_changed: self.sensing_overlay_changed.clone(),
             sensing_observations: self.sensing_observations.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
@@ -9064,6 +9201,8 @@ impl MeshNode {
         let sensing_emitter = self.sensing_emitter.clone();
         let sensing_observations = self.sensing_observations.clone();
         let sensing_interest_ttl = self.config.sensing_interest_ttl;
+        let sensing_overlay_changed = self.sensing_overlay_changed.clone();
+        let continuity_factor = self.config.continuity_factor;
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -9291,12 +9430,23 @@ impl MeshNode {
                             // sequential lock phases — never
                             // nested.
                             let poll_now = Instant::now();
+                            let mut overlay_moved = false;
                             let (continuities, pending) = {
                                 let mut observations = sensing_observations.lock();
                                 let mut continuities = Vec::new();
                                 for (branch, cell) in observations.upstream.iter_mut() {
                                     cell.expire_if_due(poll_now);
                                     continuities.push((branch.clone(), cell.continuity()));
+                                }
+                                // SI-4b: local consumer cells run
+                                // the same clock — an expiry that
+                                // moves a projection (Ready →
+                                // Unknown) fires the overlay
+                                // signal.
+                                for cell in observations.consumer_cells.values_mut() {
+                                    let before = cell.projected();
+                                    cell.expire_if_due(poll_now);
+                                    overlay_moved |= cell.projected() != before;
                                 }
                                 let pending: Vec<(
                                     sensing::ProviderInterestKey,
@@ -9367,15 +9517,36 @@ impl MeshNode {
                                             Some((cached.origin_incarnation, cached.seq));
                                         slot.next_due = poll_now + interval;
                                         slot.pending = false;
-                                        if let sensing::DownstreamId::Peer(node) = downstream {
-                                            if let Ok(bytes) =
-                                                sensing::encode_attestation(&cached)
-                                            {
-                                                flushes.push((node, bytes, bearing));
+                                        match downstream {
+                                            sensing::DownstreamId::Peer(node) => {
+                                                if let Ok(bytes) =
+                                                    sensing::encode_attestation(&cached)
+                                                {
+                                                    flushes.push((node, bytes, bearing));
+                                                }
+                                            }
+                                            // SI-4b: the local
+                                            // consumer's due catch-
+                                            // up feeds its cell.
+                                            sensing::DownstreamId::Local => {
+                                                overlay_moved |= observations
+                                                    .feed_consumer_cell(
+                                                        &branch,
+                                                        &cached,
+                                                        bearing,
+                                                        interval,
+                                                        continuity_factor,
+                                                        poll_now,
+                                                    );
                                             }
                                         }
                                     }
                                 }
+                            }
+                            if overlay_moved {
+                                sensing_overlay_changed.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
                             }
                             for (node, bytes, bearing) in flushes {
                                 let stream_id = if bearing {
@@ -12156,6 +12327,7 @@ impl MeshNode {
                 .collect()
         };
         let mut forwards: Vec<u64> = Vec::new();
+        let mut overlay_moved = false;
         {
             let mut observations = ctx.sensing_observations.lock();
             for (downstream, interval) in rows {
@@ -12175,13 +12347,33 @@ impl MeshNode {
                     slot.last_delivered = Some((attestation.origin_incarnation, attestation.seq));
                     slot.next_due = now + interval;
                     slot.pending = false;
-                    if let sensing::DownstreamId::Peer(node) = downstream {
-                        forwards.push(node);
+                    match downstream {
+                        sensing::DownstreamId::Peer(node) => forwards.push(node),
+                        // SI-4b: the Local row IS this node's own
+                        // consumer — its delivery point feeds the
+                        // overlay cell with the hop's OUTGOING
+                        // bearing (the same §4.4 rule any peer
+                        // gets).
+                        sensing::DownstreamId::Local => {
+                            overlay_moved |= observations.feed_consumer_cell(
+                                branch,
+                                attestation,
+                                bearing,
+                                interval,
+                                ctx.sensing_continuity_factor,
+                                now,
+                            );
+                        }
                     }
                 } else {
                     slot.pending = true;
                 }
             }
+        }
+        if overlay_moved {
+            ctx.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
         }
         let stream_id = if bearing {
             sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64
