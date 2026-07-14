@@ -235,6 +235,23 @@ pub struct LeaderRefusalPartition {
     pub spec: Option<InterestSpec>,
 }
 
+/// Outcome of one SI-6.1 fold-membership reconciliation pass — the
+/// caller (the mesh hop hosting the leader) owns the mesh-table and
+/// upstream consequences for both lists, and bumps the unified
+/// scheduler-input generation when `changed`.
+#[derive(Debug, Default)]
+pub struct LeaderReconciliation {
+    /// Branches torn down (provider no longer eligible): retire the
+    /// mesh Leader row and the upstream demand.
+    pub torn_down: Vec<ProviderInterestKey>,
+    /// Branches newly opened (with the interest's cached spec):
+    /// register the mesh Leader row and the upstream demand.
+    pub added: Vec<(ProviderInterestKey, InterestSpec)>,
+    /// Whether anything scheduler-relevant moved (including
+    /// standby-list refreshes).
+    pub changed: bool,
+}
+
 /// One consumer registration's outcome at the leader.
 #[derive(Debug)]
 pub struct LeaderRegistration {
@@ -654,6 +671,129 @@ impl SensingLeader {
         self.relay.poll(now)
     }
 
+    /// SI-6.1 (§4.7 membership dynamics): reconcile every interest
+    /// on `capability_id` against a FRESH candidate snapshot — a
+    /// fold-membership change can alter the resolved set, the
+    /// active branches, the scheduler's population, and the
+    /// selected provider, so it joins the same reconciliation seam
+    /// as the failure plane instead of waiting for TTL.
+    ///
+    /// Per interest: providers no longer ELIGIBLE (absent from the
+    /// fresh resolution's active ∪ standby) are torn down — relay
+    /// branch state reclaims exactly as on branch death, and the
+    /// returned keys let the caller retire its mesh Leader rows and
+    /// upstream demand. When the active set is left UNDER the fresh
+    /// resolution's size, newly eligible providers fill it in
+    /// resolution order, with every existing consumer registered on
+    /// the new branch at the D/ttl its surviving rows carry; the
+    /// returned additions let the caller open mesh demand for them.
+    /// Standby lists refresh unconditionally. A fresh resolution
+    /// that REFUSES (e.g. a now-too-broad selector) leaves the
+    /// interest untouched — soft state drains it if consumers stop.
+    pub fn reconcile_with_snapshot(
+        &mut self,
+        capability_id: &super::identity::CapabilityId,
+        snapshot: &[CandidateProvider],
+        now: Instant,
+    ) -> LeaderReconciliation {
+        let mut reconciliation = LeaderReconciliation::default();
+        let keys: Vec<CapabilityInterestKey> = self
+            .interests
+            .iter()
+            .filter(|(_, entry)| entry.spec.capability_id == *capability_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let Some(entry) = self.interests.get(&key) else {
+                continue;
+            };
+            let Ok(resolved) = resolve_candidates(
+                &entry.spec.providers,
+                entry.spec.result_mode,
+                snapshot,
+                &self.owner_root,
+                &self.policy,
+            ) else {
+                continue;
+            };
+            let eligible: Vec<u64> = resolved
+                .active
+                .iter()
+                .chain(resolved.standby.iter())
+                .copied()
+                .collect();
+            let spec = entry.spec.clone();
+            let old_active = entry.active.clone();
+            let old_standby = entry.standby.clone();
+            // Tear down branches whose provider fell out of the
+            // eligible set.
+            let mut kept: Vec<u64> = Vec::new();
+            for provider in &old_active {
+                if eligible.contains(provider) {
+                    kept.push(*provider);
+                    continue;
+                }
+                let branch = ProviderInterestKey::new(key.clone(), *provider);
+                self.relay.table.remove_branch(&branch);
+                self.relay.reclaim_branch(&branch);
+                reconciliation.torn_down.push(branch);
+            }
+            // Fill an under-filled active set from the fresh
+            // resolution, registering every surviving consumer on
+            // the new branch at its existing D/ttl.
+            let consumer_rows: Vec<(DownstreamId, Duration, Duration)> = kept
+                .first()
+                .map(|provider| {
+                    let branch = ProviderInterestKey::new(key.clone(), *provider);
+                    self.relay
+                        .table
+                        .downstreams(&branch, now)
+                        .into_iter()
+                        .filter_map(|downstream| {
+                            self.relay
+                                .table
+                                .downstream_entry(&branch, downstream)
+                                .map(|row| {
+                                    (
+                                        downstream,
+                                        row.requested_sample_interval,
+                                        row.soft_state_ttl,
+                                    )
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for provider in &resolved.active {
+                if kept.len() >= resolved.active.len() {
+                    break;
+                }
+                if kept.contains(provider) {
+                    continue;
+                }
+                let branch = ProviderInterestKey::new(key.clone(), *provider);
+                for (downstream, interval, ttl) in &consumer_rows {
+                    let _ = self.relay.register_downstream(
+                        &branch,
+                        *downstream,
+                        *interval,
+                        *ttl,
+                        self.owner_root,
+                        now,
+                    );
+                }
+                kept.push(*provider);
+                reconciliation.added.push((branch, spec.clone()));
+            }
+            reconciliation.changed |= kept != old_active || old_standby != resolved.standby;
+            if let Some(entry) = self.interests.get_mut(&key) {
+                entry.active = kept;
+                entry.standby = resolved.standby;
+            }
+        }
+        reconciliation
+    }
+
     /// Sweep soft state: expired downstream rows drop; an interest
     /// whose branches ALL lost their last downstream is removed —
     /// emitters die when the last interest dies, and an abandoned
@@ -700,6 +840,18 @@ impl SensingLeader {
     /// Distinct coalesced interests currently held.
     pub fn interest_count(&self) -> usize {
         self.interests.len()
+    }
+
+    /// Distinct capability ids with live interests — the SI-6.1
+    /// fold-reconciliation scan input.
+    pub fn interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
+        let mut ids: Vec<super::identity::CapabilityId> = Vec::new();
+        for entry in self.interests.values() {
+            if !ids.contains(&entry.spec.capability_id) {
+                ids.push(entry.spec.capability_id.clone());
+            }
+        }
+        ids
     }
 
     /// Active branch providers for one interest.

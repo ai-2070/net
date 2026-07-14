@@ -3054,7 +3054,12 @@ impl SensingObservations {
         // re-registrations — re-anchor the window without resetting
         // continuity.
         cell.update_interval(own_interval);
-        let before = cell.projected();
+        // SI-6 review P1: movement is judged on the SCHEDULER-
+        // relevant tuple, not readiness alone — a Ready→Ready beat
+        // with a changed signed start estimate (or a generation
+        // move) reverses candidate economics and must wake the
+        // scheduler.
+        let before = sensing_scheduler_view(cell);
         cell.on_admitted_beat(
             now,
             sensing::DeliveredBeat {
@@ -3067,7 +3072,7 @@ impl SensingObservations {
                 continuity_bearing: bearing,
             },
         );
-        cell.projected() != before
+        sensing_scheduler_view(cell) != before
     }
 
     /// Second closure round, item 3: drop epoch records whose
@@ -3164,6 +3169,26 @@ impl SensingObservations {
             }
         }
     }
+}
+
+/// SI-6 review P1: the SCHEDULER-relevant view of one consumer cell
+/// — everything an admitted beat can carry that changes
+/// `SensedCandidates` (projection, the signed start estimate, the
+/// capability generation). Movement in ANY component wakes the
+/// scheduler; route estimates and fold membership ride the same
+/// unified generation through their own event bumps, and the budget
+/// stays caller-owned.
+fn sensing_scheduler_view(
+    cell: &sensing::ObservationCell,
+) -> (sensing::ProjectedReadiness, Option<Duration>, u64) {
+    let observation = cell.observation();
+    (
+        cell.projected(),
+        observation.and_then(|obs| obs.estimated_start),
+        observation
+            .map(|obs| obs.capability_generation)
+            .unwrap_or(0),
+    )
 }
 
 /// SI-5 review P1: whether this node holds a LIVE, genuinely DIRECT
@@ -4741,7 +4766,11 @@ impl MeshNode {
         let sensing_router_failure = router.clone();
         let sensing_addr_to_node_failure = addr_to_node.clone();
         let enable_sensing_failure = config.enable_sensing_coalescing;
+        let sensing_overlay_recovery = sensing_overlay_changed.clone();
+        let enable_sensing_recovery = config.enable_sensing_coalescing;
+        #[cfg(feature = "redex")]
         let sensing_local_root_failure = sensing_local_root;
+        #[cfg(feature = "redex")]
         let sensing_interest_ttl_failure = config.sensing_interest_ttl;
         let local_node_id_failure = node_id;
 
@@ -4777,7 +4806,7 @@ impl MeshNode {
                 // the overlay signal; re-registration rides the
                 // ttl/2 refresh over whatever route gets promoted.
                 let failed_addr = peers_failure.get(&node_id).map(|p| p.value().addr);
-                let mut providers: std::collections::HashSet<u64> = {
+                let providers: std::collections::HashSet<u64> = {
                     let observations = sensing_observations_failure.lock();
                     observations
                         .upstream
@@ -4787,9 +4816,13 @@ impl MeshNode {
                         .collect()
                 };
                 #[cfg(feature = "redex")]
-                if let Some(leader) = sensing_leader_failure.lock().as_ref() {
-                    providers.extend(leader.relay.branch_providers());
-                }
+                let providers = {
+                    let mut providers = providers;
+                    if let Some(leader) = sensing_leader_failure.lock().as_ref() {
+                        providers.extend(leader.relay.branch_providers());
+                    }
+                    providers
+                };
                 for provider in providers {
                     let through_failed = provider == node_id
                         || match sensing_router_failure.routing_table().lookup(provider) {
@@ -4861,6 +4894,12 @@ impl MeshNode {
                     node_id,
                     now,
                 );
+                // SI-6 review P1: a failure edge is scheduler-
+                // relevant even when no projection moved — bump the
+                // unified generation unconditionally.
+                sensing_overlay_failure.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
             }
             rp_failure.on_failure(node_id);
             let removed = roster_failure.remove_peer(node_id);
@@ -4955,6 +4994,14 @@ impl MeshNode {
                 // Recovery: no session-open race, so no second round.
                 false,
             );
+            // SI-6 review P1: a recovery edge is scheduler-relevant
+            // (routes and pins return) — bump the unified
+            // scheduler-input generation.
+            if enable_sensing_recovery {
+                sensing_overlay_recovery.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
+            }
         });
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
@@ -5821,7 +5868,19 @@ impl MeshNode {
             let mut candidates: Vec<((u64, u64), sensing::ReadinessObservation)> = observations
                 .consumer_cells
                 .iter()
-                .filter(|(key, _)| key.interest == interest)
+                .filter(|(key, _)| {
+                    key.interest == interest
+                        // SI-6 review P1: the candidates half rides
+                        // the SAME resolved-population seam as the
+                        // aggregate — a retained out-of-population
+                        // cell must not appear behind an aggregate
+                        // that excluded it. Missing expected
+                        // providers stay absent here (they are
+                        // Unknown branches in the aggregate, not
+                        // observations).
+                        && resolved_population
+                            .is_none_or(|expected| expected.contains(&key.provider))
+                })
                 .filter_map(|(key, cell)| {
                     cell.observation().map(|observation| {
                         (
@@ -5854,11 +5913,29 @@ impl MeshNode {
         super::behavior::scheduler_bridge::project_sensed_candidates(&branches, budget)
     }
 
-    /// SI-4b: subscribe to the §4.9 overlay change signal — the
-    /// value bumps whenever a LOCAL branch projection changes
-    /// (intake edge or continuity expiry). The SI-6 scheduler
-    /// bridge's wake-up seam.
+    /// SI-4b: subscribe to the §4.9 overlay change signal — since
+    /// the SI-6 review, the UNIFIED scheduler-input generation (see
+    /// [`Self::subscribe_sensing_scheduler_inputs`], the same
+    /// underlying watch).
     pub fn subscribe_sensing_overlay_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sensing_overlay_changed.subscribe()
+    }
+
+    /// SI-6 review P1: the UNIFIED scheduler-input generation — one
+    /// watch covering every plane that can change
+    /// [`super::behavior::scheduler_bridge::SensedCandidates`]:
+    /// observation movement on the SCHEDULER-relevant tuple
+    /// (projection, signed start estimate, generation), continuity
+    /// expiry and failure-plane disruption, discrete route/topology
+    /// events (session open, recovery, failure edges, route
+    /// withdrawals), and capability-fold membership (including the
+    /// SI-6.1 leader reconciliation). Continuous route-EWMA drift is
+    /// deliberately NOT event-bumped — bumping per pingwave sample
+    /// would fire at heartbeat rate; it is sampled at re-match.
+    /// Budget changes are the caller's own input. Alias of
+    /// [`Self::subscribe_sensing_overlay_changes`] — one underlying
+    /// generation.
+    pub fn subscribe_sensing_scheduler_inputs(&self) -> tokio::sync::watch::Receiver<u64> {
         self.sensing_overlay_changed.subscribe()
     }
 
@@ -11275,6 +11352,16 @@ impl MeshNode {
             &self.partition_filter,
             resend,
         );
+        // SI-6 review P1: every event-pingwave moment IS a discrete
+        // topology change (session open, recovery, change-driven
+        // announce) — scheduler-relevant route economics may have
+        // moved, so the unified scheduler-input generation bumps
+        // with it.
+        if self.config.enable_sensing_coalescing {
+            self.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
     }
 
     /// Local-only tool-descriptor registry. SDK-side `serve_tool`
@@ -12433,6 +12520,12 @@ impl MeshNode {
                     .relay
                     .disrupt_provider(dest, sensing::DisruptReason::PathFailed);
             }
+            // SI-6 review P1: a route/topology event is scheduler-
+            // relevant even when no projection moved — bump the
+            // unified generation unconditionally.
+            ctx.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
         }
         if !route_dropped {
             return;
@@ -13929,6 +14022,144 @@ impl MeshNode {
     }
 
     /// SI-4 re-review item 4: the mesh table's single AGGREGATE
+    /// SI-6.1: a capability-fold change reached this hop — when the
+    /// leader role is active, reconcile every affected interest
+    /// against a FRESH candidate snapshot (damped per capability id,
+    /// the RT-1 trailing-edge shape, so announcement storms cannot
+    /// thrash resolution), honor the reported branch consequences
+    /// (torn-down providers retire their mesh Leader rows + upstream
+    /// demand; newly eligible ones open them), and bump the unified
+    /// scheduler-input generation when anything scheduler-relevant
+    /// moved.
+    #[cfg(feature = "redex")]
+    fn reconcile_sensing_leader_fold(ctx: &DispatchCtx, now: Instant) {
+        let capability_ids: Vec<sensing::CapabilityId> = {
+            let slot = ctx.sensing_leader.lock();
+            match slot.as_ref() {
+                Some(leader) => leader.interest_capability_ids(),
+                None => return,
+            }
+        };
+        let mut moved = false;
+        for capability_id in capability_ids {
+            // Damped in the shared upstream damper under a sentinel
+            // "provider" no real registration targets — the same
+            // bounded map, a disjoint key space.
+            let key_digest = *blake3::hash(capability_id.as_str().as_bytes()).as_bytes();
+            if !sensing_upstream_damper_admits(
+                &ctx.sensing_upstream_damper,
+                u64::MAX,
+                key_digest,
+                SENSING_UPSTREAM_MIN_GAP,
+            ) {
+                continue;
+            }
+            let snapshot = sensing_candidate_snapshot_from_parts(
+                &ctx.capability_fold,
+                &ctx.proximity_graph,
+                &ctx.router,
+                &ctx.peers,
+                &ctx.peer_entity_ids,
+                ctx.local_node_id,
+                ctx.sensing_local_entity_root,
+                &ctx.sensing_local_root,
+                &capability_id,
+            );
+            let reconciliation = {
+                let mut slot = ctx.sensing_leader.lock();
+                match slot.as_mut() {
+                    Some(leader) => leader.reconcile_with_snapshot(&capability_id, &snapshot, now),
+                    None => return,
+                }
+            };
+            let emitter_stamp = ctx.sensing_emitter.lock().as_ref().map(|e| e.stamp());
+            for branch in reconciliation.torn_down {
+                let mesh_actions = ctx.sensing_interest_table.lock().deregister(
+                    &branch.interest.interest_digest,
+                    Some(branch.provider),
+                    sensing::DownstreamId::Leader,
+                    now,
+                );
+                for (key, action) in mesh_actions {
+                    apply_sensing_removal_action(
+                        &ctx.sensing_observations,
+                        &ctx.sensing_emitter,
+                        emitter_stamp,
+                        &ctx.socket,
+                        &ctx.peers,
+                        &ctx.addr_to_node,
+                        &ctx.router,
+                        &ctx.partition_filter,
+                        ctx.local_node_id,
+                        &key,
+                        action,
+                    );
+                }
+            }
+            for (branch, spec) in reconciliation.added {
+                let strictest = {
+                    let slot = ctx.sensing_leader.lock();
+                    slot.as_ref()
+                        .and_then(|leader| leader.relay.table.aggregate(&branch, now))
+                };
+                let Some(strictest) = strictest else {
+                    continue;
+                };
+                let ttl = ctx.sensing_interest_ttl;
+                let outcome = ctx.sensing_interest_table.lock().register(
+                    &branch,
+                    sensing::DownstreamId::Leader,
+                    strictest,
+                    ttl,
+                    ctx.sensing_local_root,
+                    now,
+                );
+                if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+                    continue;
+                }
+                ctx.sensing_observations
+                    .lock()
+                    .update_upstream_interval(&branch, Some(strictest));
+                if branch.provider == ctx.local_node_id {
+                    Self::feed_sensing_origin(
+                        ctx,
+                        &branch,
+                        &spec,
+                        sensing::DownstreamId::Leader,
+                        now,
+                    );
+                } else {
+                    let upstream = sensing::SensingInterestFrame::provider_registration(
+                        &spec,
+                        branch.provider,
+                        strictest,
+                        ttl,
+                    );
+                    if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                        spawn_sensing_frame_send(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            branch.provider,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST,
+                            bytes,
+                        );
+                    }
+                }
+            }
+            moved |= reconciliation.changed;
+        }
+        if moved {
+            ctx.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
+    }
+
     /// Leader row was refused at floor M — partition the leader
     /// relay's REAL per-consumer rows, forward the provider's exact
     /// signed refusal bytes to each refused consumer, and
@@ -14313,6 +14544,20 @@ impl MeshNode {
         }
         let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = ctx.capability_fold.apply(fold_ann);
+
+        // SI-6 review P1 (unified scheduler-input generation): fold
+        // membership is a scheduler-relevant plane — a changed
+        // capability set can alter the resolved population and the
+        // selected provider, so re-matchers wake here.
+        if ctx.enable_sensing_coalescing {
+            ctx.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+            // SI-6.1: reconcile live leader demand with the changed
+            // fold (damped inside).
+            #[cfg(feature = "redex")]
+            Self::reconcile_sensing_leader_fold(ctx, Instant::now());
+        }
 
         // R-5: the peer's capability set just changed in the fold, so
         // any cached ack-ranges gate verdict for it is now stale.

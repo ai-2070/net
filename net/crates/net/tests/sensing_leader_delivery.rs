@@ -982,3 +982,128 @@ async fn provider_free_expectation_map_is_capped() {
 
     node.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn fold_withdrawal_reconciles_leader_demand() {
+    // SI-6.1 (§4.7 membership dynamics, promoted by the SI-6
+    // review): a capability-fold change must reconcile the leader's
+    // resolved demand EVENT-DRIVEN — before the fix, a provider that
+    // stopped declaring the capability kept its leader branch, mesh
+    // Leader row, and origin stream alive until TTL.
+    //
+    //   A (provider-free, ONE long-ttl registration) — R — P
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner)
+            // RT-1 defers re-announcements by min_announce_interval
+            // (default 10 s) — the membership CHANGE below must
+            // flood inside the assertion window.
+            .with_min_announce_interval(Duration::from_millis(200));
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&a, &r, &p] {
+        node.start();
+    }
+    for node in [&a, &r] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, r_id, p_id) = (a.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let interest = spec.key();
+    // ONE registration, ttl far beyond the assertion window: nothing
+    // below can be soft-state expiry.
+    await_condition(Duration::from_secs(10), "provider-free path live", || {
+        let _ = a.register_capability_interest(&spec, r_id, Duration::from_millis(200), TTL * 6);
+        r.sensing_leader_branches(&interest) == Some(vec![p_id])
+            && p.sensing_live_streams() == 1
+            && a.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+
+    // ── The membership change: P stops declaring the capability.
+    //    (Announce in a retry loop: a bare-`start()` node DROPS an
+    //    in-window announce — the RT-1 deferral flush needs
+    //    `start_arc` — so the retries guarantee one out-of-window
+    //    broadcast actually floods the change.) ──
+    let reconciled_at = std::time::Instant::now();
+    await_condition(
+        Duration::from_secs(5),
+        "the fold change floods to the leader",
+        || {
+            let p = p.clone();
+            tokio::spawn(async move {
+                let _ = p.announce_capabilities(CapabilitySet::new()).await;
+            });
+            !r.sensing_candidate_snapshot(&cap)
+                .iter()
+                .any(|candidate| candidate.node_id == p_id)
+        },
+    )
+    .await;
+
+    // Event-driven teardown at the leader: the branch leaves the
+    // resolved set, the mesh Leader row retires, and the upstream
+    // deregister retires P's stream — far ahead of the 9 s ttl.
+    await_condition(
+        Duration::from_secs(5),
+        "leader demand reconciles with the fold",
+        || {
+            r.sensing_leader_branches(&interest)
+                .is_none_or(|branches| branches.is_empty())
+        },
+    )
+    .await;
+    await_condition(
+        Duration::from_secs(5),
+        "the withdrawn provider's stream retires",
+        || p.sensing_live_streams() == 0,
+    )
+    .await;
+    assert!(
+        reconciled_at.elapsed() < Duration::from_secs(7),
+        "reconciliation must be event-driven, never the ttl",
+    );
+
+    a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}

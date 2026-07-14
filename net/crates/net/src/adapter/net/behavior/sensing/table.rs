@@ -397,6 +397,22 @@ impl InterestTable {
         }
     }
 
+    /// SI-6.1 (fold-membership reconciliation): drop one branch
+    /// ENTIRELY — every downstream row and the cached floor —
+    /// releasing the per-downstream counts. For a provider the fold
+    /// no longer makes eligible, there is nothing to partition or
+    /// expire toward: the branch itself is dead. The caller owns
+    /// the upstream/observation consequences. Returns the rows that
+    /// were dropped.
+    pub fn remove_branch(&mut self, key: &ProviderInterestKey) -> Vec<DownstreamId> {
+        let Some(entry) = self.entries.remove(key) else {
+            return Vec::new();
+        };
+        let downstreams: Vec<DownstreamId> = entry.downstreams.keys().copied().collect();
+        self.release_rows(&downstreams);
+        downstreams
+    }
+
     /// Provider incarnation OR generation change: the floor may have
     /// changed with either (a restart reconfigures, a redefinition
     /// re-specs), so every cached M for that provider is invalidated

@@ -66,8 +66,8 @@ pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistra
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
-    closeness_score, sensing_leader, FrameRejection, LeaderRefusalPartition, LeaderRegistration,
-    SensingLeader,
+    closeness_score, sensing_leader, FrameRejection, LeaderReconciliation, LeaderRefusalPartition,
+    LeaderRegistration, SensingLeader,
 };
 pub use scope::{validate_subscriber_scope, ScopeError};
 pub use wire::{

@@ -20,7 +20,7 @@ use common::*;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,17 +67,20 @@ fn shared_spec(owner: AudienceScopeCommitment) -> InterestSpec {
     }
 }
 
-/// A's evaluator: flippable readiness with a CHEAP start estimate —
-/// self route is zero, so A ranks first while Ready.
+/// A's evaluator: flippable readiness with a MUTABLE start estimate
+/// (millis) — self route is zero, so A ranks first while Ready and
+/// cheap; raising the estimate reverses the rank with NO status
+/// edge (the SI-6 review's economics-only witness).
 struct FlagEvaluator {
     ready: Arc<AtomicBool>,
+    start_ms: Arc<AtomicU64>,
 }
 
 impl ReadinessEvaluator for FlagEvaluator {
     fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
         if self.ready.load(Ordering::Relaxed) {
             ReadinessEvaluation::Ready {
-                estimated_start: Some(Duration::from_millis(3)),
+                estimated_start: Some(Duration::from_millis(self.start_ms.load(Ordering::Relaxed))),
             }
         } else {
             ReadinessEvaluation::NotReady { reason: 7 }
@@ -167,10 +170,12 @@ async fn sensed_readiness_leads_the_claim_order_and_never_suspends() {
     let a = mk(EntityKeypair::generate(), Some(Incarnation::new(1))).await;
     let r = mk(owner_kp, Some(Incarnation::new(1))).await;
     let a_ready = Arc::new(AtomicBool::new(true));
+    let a_start_ms = Arc::new(AtomicU64::new(3));
     a.register_readiness_evaluator(
         CapabilityId::new("print.document"),
         Arc::new(FlagEvaluator {
             ready: a_ready.clone(),
+            start_ms: a_start_ms.clone(),
         }),
     );
     r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(SlowReady));
@@ -289,6 +294,83 @@ async fn sensed_readiness_leads_the_claim_order_and_never_suspends() {
         },
     );
     assert_eq!(overlay.candidates.len(), 2, "both observations joined");
+    // SI-6 review P1: the candidates half rides the SAME resolved-
+    // population seam as the aggregate — A's cell is live and
+    // retained, yet a population of [r_id] must exclude it from
+    // BOTH halves.
+    let scoped = a.sensing_readiness_overlay(&spec, &budget, Some(&[r_id]));
+    assert_eq!(
+        scoped.aggregate,
+        AggregateView::Scalar {
+            status: ProjectedReadiness::Ready,
+            supporting: vec![r_id],
+        },
+    );
+    assert_eq!(
+        scoped
+            .candidates
+            .iter()
+            .map(|((provider, _), _)| *provider)
+            .collect::<Vec<_>>(),
+        vec![r_id],
+        "resolved population must filter the overlay candidates",
+    );
+
+    // ── SI-6 review P1 (reviewer-reproduced): a Ready→Ready
+    //    ECONOMICS change must wake the scheduler. A's signed start
+    //    estimate rises 3 ms → 1000 ms (readiness unchanged); the
+    //    selection reverses to R and the unified scheduler-input
+    //    watch fires ──
+    let signal = a.subscribe_sensing_scheduler_inputs();
+    let generation_before = *signal.borrow();
+    a_start_ms.store(1000, Ordering::Relaxed);
+    a.notify_sensing_state_changed(&cap);
+    await_condition(
+        Duration::from_secs(5),
+        "economics flip reverses the selection",
+        || {
+            a.sensed_candidates(&spec, &budget, None)
+                .selected_provider()
+                == Some(r_id)
+        },
+    )
+    .await;
+    assert!(
+        *signal.borrow() > generation_before,
+        "a Ready→Ready economics change must wake the scheduler",
+    );
+
+    // ── SI-6 review P1, fold axis: a capability-fold membership
+    //    change fires the SAME unified watch with NO sensing-state
+    //    movement at all ──
+    let n = mk(EntityKeypair::generate(), None).await;
+    connect_pair(&a, &n).await;
+    n.start();
+    // Consume the session-open topology bump first, so the next
+    // assertion isolates the FOLD axis.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let generation_before = *signal.borrow();
+    let projections_before = (
+        a.sensing_projected(&self_branch),
+        a.sensing_projected(&leader_branch),
+    );
+    n.announce_capabilities(CapabilitySet::new().add_tag("unrelated:tag"))
+        .await
+        .expect("announce N");
+    await_condition(
+        Duration::from_secs(5),
+        "a fold membership change wakes the scheduler",
+        || *signal.borrow() > generation_before,
+    )
+    .await;
+    assert_eq!(
+        (
+            a.sensing_projected(&self_branch),
+            a.sensing_projected(&leader_branch),
+        ),
+        projections_before,
+        "the fold-axis wake carried no sensing-state movement",
+    );
 
     // ── The flip: A's own readiness goes NotReady — sensed prune,
     //    never a suspension ──
@@ -337,4 +419,5 @@ async fn sensed_readiness_leads_the_claim_order_and_never_suspends() {
     refresh_a.abort();
     a.shutdown().await.expect("shutdown A");
     r.shutdown().await.expect("shutdown R");
+    n.shutdown().await.expect("shutdown N");
 }

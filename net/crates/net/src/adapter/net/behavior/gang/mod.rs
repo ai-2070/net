@@ -181,21 +181,29 @@ pub fn match_islands_sensed(
     if sensed_viable_order.is_empty() || ordered.len() < 2 {
         return ordered;
     }
-    let band_of = |island: &IslandId| -> usize {
-        topology_fold
-            .query(IslandQuery::Get(*island))
-            .first()
-            .and_then(|(_, record)| {
-                sensed_viable_order
-                    .iter()
-                    .position(|provider| *provider == record.host)
-            })
-            // Unsensed / potential hosts form the trailing band, in
-            // the selection policy's own order.
-            .unwrap_or(usize::MAX)
-    };
+    // SI-6 review (non-blocking note, taken): precompute the
+    // island → band map from ONE topology snapshot — no per-
+    // comparison fold queries inside the O(n log n) sort, and the
+    // sort sees an internally consistent topology.
+    let bands: std::collections::HashMap<IslandId, usize> = ordered
+        .iter()
+        .map(|island| {
+            let band = topology_fold
+                .query(IslandQuery::Get(*island))
+                .first()
+                .and_then(|(_, record)| {
+                    sensed_viable_order
+                        .iter()
+                        .position(|provider| *provider == record.host)
+                })
+                // Unsensed / potential hosts form the trailing
+                // band, in the selection policy's own order.
+                .unwrap_or(usize::MAX);
+            (*island, band)
+        })
+        .collect();
     // Stable: within a band, the [3]-step selection order survives.
-    ordered.sort_by_key(band_of);
+    ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(usize::MAX));
     ordered
 }
 
