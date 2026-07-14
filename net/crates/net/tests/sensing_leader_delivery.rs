@@ -41,7 +41,7 @@ use net::adapter::net::behavior::sensing::{
     AttestedStatus, AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DownstreamId,
     EvaluationRequest, Incarnation, InterestSpec, ProjectedReadiness, ProviderInterestKey,
     ProviderSelector, ReadinessEvaluation, ReadinessEvaluator, ResultMode, SensingCounters,
-    WorkLatencyEnvelope,
+    StatusReason, WorkLatencyEnvelope,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 use net::adapter::Adapter;
@@ -340,6 +340,145 @@ async fn provider_free_ttl_half_refreshes_do_not_starve_leader_delivery() {
 
     refresh.abort();
     a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}
+
+#[tokio::test]
+async fn provider_refusal_partitions_the_leaders_real_consumer_rows() {
+    // SI-4 re-review item 4: the mesh holds ONE aggregate Leader row
+    // while the leader relay holds the real per-consumer cadences.
+    // Before the fix a provider refusal reached only mesh Peer rows —
+    // the leader never learned, so it could neither refuse its
+    // sub-floor consumer, retain the compliant one, nor re-register
+    // the surviving aggregate.
+    //
+    //   A (D = 10 ms  < floor 50 ms → refused, exact signed bytes)
+    //   B (D = 100 ms ≥ floor        → retained, live proofs)
+    //        └── R (leader) ── P (floor M = 50 ms, owner identity)
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let b = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&b, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&a, &b, &r, &p] {
+        node.start();
+    }
+    for node in [&a, &b, &r] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, b_id, r_id, p_id) = (a.node_id(), b.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(b_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    // Both consumers verify P's signatures (the SI-3 seam bound) —
+    // A for the forwarded signed REFUSAL, B for the proofs.
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+    b.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let refresher = |node: Arc<MeshNode>, interval: Duration| {
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = node.register_capability_interest(&spec, r_id, interval, TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+    // A demands 10 ms — below P's 50 ms attestation cadence floor.
+    let refresh_a = refresher(a.clone(), Duration::from_millis(10));
+    let refresh_b = refresher(b.clone(), Duration::from_millis(100));
+
+    // ── A receives P's EXACT signed refusal through the leader ──
+    await_condition(Duration::from_secs(10), "A holds the refusal", || {
+        a.sensing_latest_refusal(&branch).is_some()
+    })
+    .await;
+    let refusal = a.sensing_latest_refusal(&branch).expect("present");
+    assert_eq!(refusal.origin, p_id, "origin-authored, forwarded verbatim");
+    assert_eq!(
+        refusal.status_reason,
+        StatusReason::SamplingIntervalUnsupported,
+    );
+    assert_eq!(
+        refusal.promised_cadence,
+        Duration::from_millis(50),
+        "the tagged floor M rides promised_cadence",
+    );
+
+    // ── B is retained: the surviving 100 ms aggregate re-registers
+    //    and live proofs keep flowing ──
+    await_condition(Duration::from_secs(10), "B projects Ready", || {
+        b.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+    await_condition(Duration::from_secs(10), "one surviving stream at P", || {
+        p.sensing_live_streams() == 1
+    })
+    .await;
+    // Fresh beats past the refusal keep arriving for B.
+    let seq_mark = b
+        .sensing_latest_attestation(&branch)
+        .expect("B holds proofs")
+        .seq;
+    await_condition(Duration::from_secs(10), "B's proofs advance", || {
+        b.sensing_latest_attestation(&branch)
+            .is_some_and(|proof| proof.seq > seq_mark)
+    })
+    .await;
+    // A never earns a live projection: its cadence was refused and
+    // the leader's cached floor refuses its refreshes locally.
+    assert_ne!(a.sensing_projected(&branch), ProjectedReadiness::Ready);
+
+    // Honest counters: a refusal is an authorization/policy outcome,
+    // never protocol-invalid input.
+    for node in [&a, &b, &r, &p] {
+        let counters = node.sensing_counters();
+        assert_eq!(SensingCounters::get(&counters.protocol_invalid), 0);
+    }
+
+    refresh_a.abort();
+    refresh_b.abort();
+    a.shutdown().await.expect("shutdown A");
+    b.shutdown().await.expect("shutdown B");
     r.shutdown().await.expect("shutdown R");
     p.shutdown().await.expect("shutdown P");
 }

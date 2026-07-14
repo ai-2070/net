@@ -117,6 +117,11 @@ where
 }
 
 struct LeaderInterest {
+    /// The validated spec this interest coalesced under — cached so
+    /// a refusal-survivor re-registration can be authored HERE (the
+    /// mesh hop keeps no spec cache; the leader, as first-class
+    /// subscriber, must — SI-4 re-review item 4).
+    spec: InterestSpec,
     active: Vec<u64>,
     standby: Vec<u64>,
 }
@@ -208,6 +213,28 @@ impl fmt::Display for FrameRejection {
 
 impl std::error::Error for FrameRejection {}
 
+/// Result of a leader-level refusal partition (SI-4 re-review
+/// item 4): which REAL consumer rows fell below the provider floor
+/// (forward the provider's exact signed refusal bytes to each), the
+/// pending surviving transition for the mesh Leader row, and the
+/// interest's cached spec for authoring the re-registration (`None`
+/// once the interest itself is gone — nothing left to re-register).
+#[derive(Debug)]
+pub struct LeaderRefusalPartition {
+    /// Leader-relay consumer rows with `D < M`, now removed — the
+    /// refusal propagates to exactly these.
+    pub refused: Vec<DownstreamId>,
+    /// `Register { strictest }` = the surviving consumers' aggregate
+    /// to re-register the mesh Leader row (and upstream demand) at;
+    /// `Deregister` = every consumer was refused — the branch died
+    /// at this hop; `None` = nothing changed against what was last
+    /// advertised.
+    pub upstream: UpstreamAction,
+    /// The interest's cached spec (the leader is the spec-holding
+    /// subscriber; the mesh hop caches none).
+    pub spec: Option<InterestSpec>,
+}
+
 /// One consumer registration's outcome at the leader.
 #[derive(Debug)]
 pub struct LeaderRegistration {
@@ -295,6 +322,7 @@ impl SensingLeader {
             self.interests.insert(
                 key.clone(),
                 LeaderInterest {
+                    spec: spec.clone(),
                     active: resolved.active,
                     standby: resolved.standby,
                 },
@@ -505,6 +533,59 @@ impl SensingLeader {
             now,
         );
         Some((promoted, warm))
+    }
+
+    /// SI-4 re-review item 4 (leader refusal partitioning): apply a
+    /// provider floor M to the leader relay's REAL consumer rows.
+    /// The mesh table holds ONE aggregate Leader row per branch;
+    /// when the provider refuses it, the per-consumer partition must
+    /// happen here, where the actual cadences live: consumers with
+    /// D < M are refused (the caller forwards the provider's EXACT
+    /// signed refusal bytes to each), D ≥ M survive, and the
+    /// returned transition carries the surviving aggregate for the
+    /// mesh Leader row's re-registration (with the interest's cached
+    /// spec, so the caller can actually author it). A branch whose
+    /// consumers were ALL refused dies at this hop: its private
+    /// relay state reclaims and, if no other branch keeps it, the
+    /// interest drops — the sweep-death semantics on the refusal
+    /// path.
+    pub fn on_refusal(
+        &mut self,
+        branch: &ProviderInterestKey,
+        minimum_supported: Duration,
+        now: Instant,
+    ) -> LeaderRefusalPartition {
+        let spec = self
+            .interests
+            .get(&branch.interest)
+            .map(|entry| entry.spec.clone());
+        let partition = self.relay.table.on_refusal(branch, minimum_supported, now);
+        if partition.upstream == UpstreamAction::Deregister {
+            self.relay.reclaim_branch(branch);
+            let interest = branch.interest.clone();
+            let any_branch_live = self
+                .interests
+                .get(&interest)
+                .map(|entry| {
+                    entry.active.iter().any(|provider| {
+                        let branch = ProviderInterestKey::new(interest.clone(), *provider);
+                        self.relay.table.aggregate(&branch, now).is_some()
+                    })
+                })
+                .unwrap_or(false);
+            if !any_branch_live {
+                self.interests.remove(&interest);
+            }
+        } else {
+            // Partitioned-out rows leave inert slots — GC on the
+            // same event (the sweep's all-slot rule).
+            self.relay.gc_dead_slots(now);
+        }
+        LeaderRefusalPartition {
+            refused: partition.refused,
+            upstream: partition.upstream,
+            spec,
+        }
     }
 
     /// Ingest one provider attestation and fan it to the registered

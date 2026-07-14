@@ -12520,12 +12520,34 @@ impl MeshNode {
             beat
         };
         ctx.sensing_emitter_notify.notify_one();
-        Self::send_sensing_refusal_beat(ctx, beat, {
+        #[cfg(feature = "redex")]
+        let leader_refused = partition.refused.contains(&sensing::DownstreamId::Leader);
+        let signed_refusal = Self::send_sensing_refusal_beat(ctx, beat, {
             partition.refused.into_iter().filter_map(|d| match d {
                 sensing::DownstreamId::Peer(node) => Some(node),
                 sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
             })
         });
+        // SI-4 re-review item 4: a refused Leader row at the LOCAL
+        // origin (leader-as-provider) partitions the leader relay's
+        // real consumer rows with the same locally signed refusal —
+        // survivors re-register through the ordinary feed path
+        // (their aggregate is ≥ M ≥ the floor, so no re-refusal
+        // recursion is possible).
+        #[cfg(feature = "redex")]
+        if leader_refused {
+            if let Some(bytes) = signed_refusal {
+                Self::apply_sensing_leader_refusal(
+                    ctx,
+                    key,
+                    refusal.minimum_supported,
+                    &bytes,
+                    now,
+                );
+            }
+        }
+        #[cfg(not(feature = "redex"))]
+        let _ = signed_refusal;
     }
 
     /// SI-3c: the 0x0C03 verified intake (plan §4.2/§4.6) — the
@@ -12734,6 +12756,20 @@ impl MeshNode {
             ctx.sensing_interest_table
                 .lock()
                 .invalidate_provider_floors(attestation.origin);
+            // SI-4 re-review (the second-relay lesson, undeclared
+            // adjacent defect found while carrying item 4 over):
+            // the leader relay caches floors in its OWN table — a
+            // provider epoch advance must invalidate them there
+            // too, or the leader keeps refusing sub-M consumers
+            // against a floor the restarted provider no longer
+            // asserts.
+            #[cfg(feature = "redex")]
+            if let Some(leader) = ctx.sensing_leader.lock().as_mut() {
+                leader
+                    .relay
+                    .table
+                    .invalidate_provider_floors(attestation.origin);
+            }
         }
         if is_refusal {
             // Closure item 6: a refusal is a cadence-request-
@@ -12761,6 +12797,22 @@ impl MeshNode {
                 attestation.promised_cadence,
                 now,
             );
+            // SI-4 re-review item 4: a refused Leader row partitions
+            // the leader relay's REAL per-consumer rows FIRST — the
+            // exact signed refusal reaches every refused consumer,
+            // and the surviving consumers re-register a fresh Leader
+            // row at their aggregate, which supersedes the stale
+            // branch-death consequence below.
+            #[cfg(feature = "redex")]
+            if partition.refused.contains(&sensing::DownstreamId::Leader) {
+                Self::apply_sensing_leader_refusal(
+                    ctx,
+                    &branch,
+                    attestation.promised_cadence,
+                    payload,
+                    now,
+                );
+            }
             for downstream in &partition.refused {
                 let sensing::DownstreamId::Peer(node) = downstream else {
                     continue;
@@ -12781,13 +12833,25 @@ impl MeshNode {
                 );
             }
             if partition.upstream == sensing::UpstreamAction::Deregister {
-                if branch.provider != ctx.local_node_id {
-                    Self::send_sensing_deregister_upstream(ctx, &branch);
+                // Re-check liveness: the leader's surviving
+                // consumers may have re-registered above — the
+                // branch is then alive again and must not be torn
+                // down under the pre-partition consequence.
+                let still_dead = ctx
+                    .sensing_interest_table
+                    .lock()
+                    .downstreams(&branch, now)
+                    .is_empty();
+                if still_dead {
+                    if branch.provider != ctx.local_node_id {
+                        Self::send_sensing_deregister_upstream(ctx, &branch);
+                    }
+                    // The partition emptied the branch — the
+                    // warm-start status and epoch memory reclaim
+                    // now; the refusal tombstone above ages out via
+                    // the sweep.
+                    ctx.sensing_observations.lock().reclaim_status(&branch);
                 }
-                // The partition emptied the branch — the warm-start
-                // status and epoch memory reclaim now; the refusal
-                // tombstone above ages out via the sweep.
-                ctx.sensing_observations.lock().reclaim_status(&branch);
             }
             return;
         }
@@ -13017,16 +13081,19 @@ impl MeshNode {
     /// SI-3: sign one refusal beat and fan it to the given peers
     /// (0x0C03). Signing is ~13 µs (SI-1d) — fine inline on the
     /// dispatch path for a refusal, which is rare by construction.
+    /// Returns the encoded SIGNED bytes so a co-located leader
+    /// partition can forward the exact same refusal to its own
+    /// consumer rows (SI-4 re-review item 4).
     fn send_sensing_refusal_beat(
         ctx: &DispatchCtx,
         beat: sensing::UnsignedAttestation,
         peers: impl IntoIterator<Item = u64>,
-    ) {
+    ) -> Option<Vec<u8>> {
         let Ok(signed) = sensing::sign_attestation(&ctx.signing_identity, beat) else {
-            return;
+            return None;
         };
         let Ok(bytes) = sensing::encode_attestation(&signed) else {
-            return;
+            return None;
         };
         for node in peers {
             spawn_sensing_frame_send(
@@ -13040,6 +13107,110 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64,
                 sensing::SUBPROTOCOL_READINESS_ATTESTATION,
                 bytes.clone(),
+            );
+        }
+        Some(bytes)
+    }
+
+    /// SI-4 re-review item 4: the mesh table's single AGGREGATE
+    /// Leader row was refused at floor M — partition the leader
+    /// relay's REAL per-consumer rows, forward the provider's exact
+    /// signed refusal bytes to each refused consumer, and
+    /// re-register the surviving aggregate as a fresh Leader row
+    /// (feeding the origin emitter when this node IS the provider,
+    /// or authoring the upstream `ProviderRegistration` from the
+    /// leader's cached spec otherwise). The re-registration bypasses
+    /// the damper deliberately: a refusal usually lands inside the
+    /// min-gap of the registration that provoked it, and a
+    /// suppressed survivor transition would strand the surviving
+    /// consumers until their next ttl/2 refresh (the SI-3 closure's
+    /// damper-consumed-transition shape).
+    #[cfg(feature = "redex")]
+    fn apply_sensing_leader_refusal(
+        ctx: &DispatchCtx,
+        branch: &sensing::ProviderInterestKey,
+        minimum_supported: Duration,
+        signed_refusal: &[u8],
+        now: Instant,
+    ) {
+        let partition = {
+            let mut slot = ctx.sensing_leader.lock();
+            match slot.as_mut() {
+                Some(leader) => leader.on_refusal(branch, minimum_supported, now),
+                None => return,
+            }
+        };
+        for downstream in &partition.refused {
+            let sensing::DownstreamId::Peer(node) = downstream else {
+                continue;
+            };
+            // The origin's EXACT signed bytes — the leader never
+            // authors refusals for a foreign origin (§4.2).
+            spawn_sensing_frame_send(
+                &ctx.socket,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                *node,
+                sensing::SUBPROTOCOL_READINESS_ATTESTATION as u64,
+                sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                signed_refusal.to_vec(),
+            );
+        }
+        let sensing::UpstreamAction::Register { strictest } = partition.upstream else {
+            return;
+        };
+        let Some(spec) = partition.spec else {
+            return;
+        };
+        // Survivors re-register the mesh Leader row at their
+        // aggregate (strictest ≥ M by construction, so the cached
+        // floor cannot re-refuse it). `register()`'s internal diff
+        // commits the advertised transition — this caller then
+        // actually sends, so sender-commits holds.
+        let ttl = ctx.sensing_interest_ttl;
+        let (outcome, mesh_aggregate) = {
+            let mut table = ctx.sensing_interest_table.lock();
+            let outcome = table.register(
+                branch,
+                sensing::DownstreamId::Leader,
+                strictest,
+                ttl,
+                ctx.sensing_local_root,
+                now,
+            );
+            (outcome, table.aggregate(branch, now))
+        };
+        if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+            return;
+        }
+        if branch.provider == ctx.local_node_id {
+            Self::feed_sensing_origin(ctx, branch, &spec, sensing::DownstreamId::Leader, now);
+            return;
+        }
+        let Some(current) = mesh_aggregate else {
+            return;
+        };
+        let upstream = sensing::SensingInterestFrame::provider_registration(
+            &spec,
+            branch.provider,
+            current,
+            ttl,
+        );
+        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+            spawn_sensing_frame_send(
+                &ctx.socket,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                branch.provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
             );
         }
     }
