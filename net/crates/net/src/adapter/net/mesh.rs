@@ -940,6 +940,13 @@ impl RetainedChain {
 }
 
 /// Shared context for the packet dispatch loop.
+///
+/// `Clone`: every field is an `Arc` handle or a small config copy,
+/// so a clone is ~a round of refcount bumps. The SI-6.1 trailing-
+/// edge reconciliation task captures a clone — a boundary sleeper
+/// outlives the dispatch call that scheduled it, so it cannot
+/// borrow.
+#[derive(Clone)]
 struct DispatchCtx {
     local_node_id: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
@@ -1091,6 +1098,11 @@ struct DispatchCtx {
     /// on `MeshNode`.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// SI-6.1 closure: per-capability leading+trailing-edge gate for
+    /// fold-driven leader reconciliation. See the matching field on
+    /// `MeshNode`.
+    #[cfg(feature = "redex")]
+    sensing_fold_coalescer: Arc<DashMap<[u8; 32], SensingFoldGate>>,
     /// SI-2b: this node's OWN entity commitment. The candidate
     /// snapshot's §4.10 authorization reads each declarer's
     /// TOFU-pinned entity root from `peer_entity_ids`, which never
@@ -3529,6 +3541,108 @@ fn sensing_effective_min_gap(soft_state_ttl: Duration) -> Duration {
     SENSING_UPSTREAM_MIN_GAP.min(soft_state_ttl / 2)
 }
 
+/// SI-6.1 closure: one capability's fold-reconciliation gate. NOT
+/// the registration damper above — that is explicitly a leading-
+/// edge min-gap filter, and a REJECTED registration refresh is
+/// repaired by the next ttl/2 refresh, while a rejected fold
+/// reconciliation is a lost semantic state transition (nothing
+/// re-drives it before soft-state repair). This gate is the
+/// RT-1/RT-3 leading-plus-trailing shape: first change runs
+/// immediately, an in-window change schedules exactly ONE
+/// fresh-snapshot boundary run, further in-window changes coalesce
+/// into it.
+#[cfg(feature = "redex")]
+struct SensingFoldGate {
+    /// When a reconciliation for this capability last RAN.
+    last_run: std::time::Instant,
+    /// Whether a boundary run is already scheduled — further
+    /// in-window changes coalesce into it.
+    pending: bool,
+}
+
+/// SI-6.1 closure: the three outcomes of one fold change hitting a
+/// capability's gate.
+#[cfg(feature = "redex")]
+enum SensingFoldGateDecision {
+    /// First change, or out of window: reconcile immediately.
+    RunNow,
+    /// In-window with nothing scheduled: the caller must schedule
+    /// exactly one fresh-snapshot reconciliation after `remaining`.
+    Defer { remaining: Duration },
+    /// In-window with a boundary run already scheduled: this change
+    /// coalesces into it (the boundary run's snapshot will see it).
+    Coalesced,
+}
+
+#[cfg(feature = "redex")]
+fn sensing_fold_gate_admit(
+    coalescer: &DashMap<[u8; 32], SensingFoldGate>,
+    digest: [u8; 32],
+    min_gap: Duration,
+) -> SensingFoldGateDecision {
+    let now = std::time::Instant::now();
+    let mut decision = SensingFoldGateDecision::RunNow;
+    coalescer
+        .entry(digest)
+        .and_modify(|gate| {
+            let elapsed = now.saturating_duration_since(gate.last_run);
+            if elapsed >= min_gap {
+                gate.last_run = now;
+                // A still-sleeping boundary run is SUBSUMED by this
+                // fresh out-of-window run (scheduler jitter can hold
+                // a sleeper past its boundary): clearing `pending`
+                // makes the sleeper's reclaim find nothing to do —
+                // exactly-one stays exact.
+                gate.pending = false;
+                decision = SensingFoldGateDecision::RunNow;
+            } else if gate.pending {
+                decision = SensingFoldGateDecision::Coalesced;
+            } else {
+                gate.pending = true;
+                decision = SensingFoldGateDecision::Defer {
+                    remaining: min_gap - elapsed,
+                };
+            }
+        })
+        .or_insert_with(|| SensingFoldGate {
+            last_run: now,
+            pending: false,
+        });
+    // Bounded like the registration damper: keys are capability ids
+    // with live leader interests plus retired stragglers, swept
+    // opportunistically. A pending gate is never dropped — its
+    // sleeper still owns a boundary run.
+    if coalescer.len() > 4096 {
+        coalescer.retain(|_, gate| {
+            gate.pending || now.saturating_duration_since(gate.last_run) < min_gap
+        });
+    }
+    decision
+}
+
+/// The boundary sleeper's claim on its scheduled run: exactly ONE
+/// trailing reconciliation per window. Returns whether this sleeper
+/// still owns a pending run — a fresh out-of-window change may have
+/// subsumed it (`RunNow` clears `pending`).
+#[cfg(feature = "redex")]
+fn sensing_fold_gate_reclaim(
+    coalescer: &DashMap<[u8; 32], SensingFoldGate>,
+    digest: &[u8; 32],
+) -> bool {
+    coalescer
+        .get_mut(digest)
+        .map(|mut gate| {
+            if gate.pending {
+                gate.pending = false;
+                gate.last_run = std::time::Instant::now();
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
 /// SI-2a: send one encoded sensing payload (0x0C02 interest frame
 /// or, since SI-3, 0x0C03 attestation) toward `next_hop(target)`
 /// over the encrypted per-peer subprotocol path — the
@@ -4183,6 +4297,15 @@ pub struct MeshNode {
     /// rides the RedEX election, never a second election subsystem.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// SI-6.1 closure: per-capability leading+trailing-edge gate for
+    /// fold-driven leader reconciliation (see [`SensingFoldGate`]).
+    /// A DEDICATED map, deliberately not the registration damper: a
+    /// rejected registration refresh is repaired by the next ttl/2
+    /// refresh, while a rejected fold reconciliation is a lost
+    /// semantic state transition — it must instead coalesce into
+    /// exactly one boundary run.
+    #[cfg(feature = "redex")]
+    sensing_fold_coalescer: Arc<DashMap<[u8; 32], SensingFoldGate>>,
     /// SI-3: the origin-emission scheduler
     /// ([`sensing::OriginEmitter`]). `Some` only when the plane is
     /// enabled AND [`MeshNodeConfig::sensing_incarnation`] was
@@ -5085,6 +5208,8 @@ impl MeshNode {
             sensing_upstream_damper: Arc::new(DashMap::new()),
             #[cfg(feature = "redex")]
             sensing_leader,
+            #[cfg(feature = "redex")]
+            sensing_fold_coalescer: Arc::new(DashMap::new()),
             sensing_emitter,
             sensing_emitter_notify: Arc::new(tokio::sync::Notify::new()),
             sensing_evaluators: Arc::new(DashMap::new()),
@@ -7600,6 +7725,8 @@ impl MeshNode {
             sensing_upstream_damper: self.sensing_upstream_damper.clone(),
             #[cfg(feature = "redex")]
             sensing_leader: self.sensing_leader.clone(),
+            #[cfg(feature = "redex")]
+            sensing_fold_coalescer: self.sensing_fold_coalescer.clone(),
             #[cfg(feature = "redex")]
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
@@ -13567,8 +13694,10 @@ impl MeshNode {
         // generation), so incarnation dominates (generation
         // restarts under a new incarnation) — and invalidate
         // cached floors exactly then (§4.4/§4.8). A stale-epoch
-        // beat still applies per-branch below: its own gate
-        // admitted it.
+        // beat DROPS at the standing gate below before any state
+        // mutation (SI-5 review P0): its digest-local gate admitted
+        // it, but the provider-wide epoch supersedes that
+        // admission.
         let epoch = (
             attestation.origin_incarnation,
             attestation.capability_generation,
@@ -14021,16 +14150,26 @@ impl MeshNode {
         Some(bytes)
     }
 
-    /// SI-4 re-review item 4: the mesh table's single AGGREGATE
     /// SI-6.1: a capability-fold change reached this hop — when the
     /// leader role is active, reconcile every affected interest
-    /// against a FRESH candidate snapshot (damped per capability id,
-    /// the RT-1 trailing-edge shape, so announcement storms cannot
-    /// thrash resolution), honor the reported branch consequences
-    /// (torn-down providers retire their mesh Leader rows + upstream
-    /// demand; newly eligible ones open them), and bump the unified
-    /// scheduler-input generation when anything scheduler-relevant
-    /// moved.
+    /// against a FRESH candidate snapshot, honor the reported branch
+    /// consequences (torn-down providers retire their mesh Leader
+    /// rows + upstream demand; newly eligible ones open them), and
+    /// bump the unified scheduler-input generation when anything
+    /// scheduler-relevant moved.
+    ///
+    /// SI-6.1 closure (review): the per-capability gate is a
+    /// LEADING-plus-TRAILING-edge coalescer
+    /// ([`sensing_fold_gate_admit`]), never the registration damper.
+    /// Every announcement scans ALL capability ids with live
+    /// interests, so an unrelated announcement stamps this
+    /// capability's gate — under a plain min-gap damper the REAL
+    /// membership change arriving inside the window was silently
+    /// rejected with nothing re-driving it before soft-state repair.
+    /// Now: first change reconciles immediately; an in-window change
+    /// schedules exactly one fresh-snapshot reconciliation at the
+    /// window boundary (a spawned sleeper holding a `ctx` clone);
+    /// further in-window changes coalesce into that boundary run.
     #[cfg(feature = "redex")]
     fn reconcile_sensing_leader_fold(ctx: &DispatchCtx, now: Instant) {
         let capability_ids: Vec<sensing::CapabilityId> = {
@@ -14042,122 +14181,150 @@ impl MeshNode {
         };
         let mut moved = false;
         for capability_id in capability_ids {
-            // Damped in the shared upstream damper under a sentinel
-            // "provider" no real registration targets — the same
-            // bounded map, a disjoint key space.
             let key_digest = *blake3::hash(capability_id.as_str().as_bytes()).as_bytes();
-            if !sensing_upstream_damper_admits(
-                &ctx.sensing_upstream_damper,
-                u64::MAX,
+            match sensing_fold_gate_admit(
+                &ctx.sensing_fold_coalescer,
                 key_digest,
                 SENSING_UPSTREAM_MIN_GAP,
             ) {
-                continue;
+                SensingFoldGateDecision::RunNow => {
+                    moved |= Self::reconcile_sensing_leader_fold_one(ctx, &capability_id, now);
+                }
+                SensingFoldGateDecision::Defer { remaining } => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(remaining).await;
+                        // Exactly one boundary run: a fresh
+                        // out-of-window change may have subsumed
+                        // this sleeper while it slept.
+                        if !sensing_fold_gate_reclaim(&ctx.sensing_fold_coalescer, &key_digest) {
+                            return;
+                        }
+                        if Self::reconcile_sensing_leader_fold_one(
+                            &ctx,
+                            &capability_id,
+                            Instant::now(),
+                        ) {
+                            ctx.sensing_overlay_changed.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                    });
+                }
+                SensingFoldGateDecision::Coalesced => {}
             }
-            let snapshot = sensing_candidate_snapshot_from_parts(
-                &ctx.capability_fold,
-                &ctx.proximity_graph,
-                &ctx.router,
-                &ctx.peers,
-                &ctx.peer_entity_ids,
-                ctx.local_node_id,
-                ctx.sensing_local_entity_root,
-                &ctx.sensing_local_root,
-                &capability_id,
-            );
-            let reconciliation = {
-                let mut slot = ctx.sensing_leader.lock();
-                match slot.as_mut() {
-                    Some(leader) => leader.reconcile_with_snapshot(&capability_id, &snapshot, now),
-                    None => return,
-                }
-            };
-            let emitter_stamp = ctx.sensing_emitter.lock().as_ref().map(|e| e.stamp());
-            for branch in reconciliation.torn_down {
-                let mesh_actions = ctx.sensing_interest_table.lock().deregister(
-                    &branch.interest.interest_digest,
-                    Some(branch.provider),
-                    sensing::DownstreamId::Leader,
-                    now,
-                );
-                for (key, action) in mesh_actions {
-                    apply_sensing_removal_action(
-                        &ctx.sensing_observations,
-                        &ctx.sensing_emitter,
-                        emitter_stamp,
-                        &ctx.socket,
-                        &ctx.peers,
-                        &ctx.addr_to_node,
-                        &ctx.router,
-                        &ctx.partition_filter,
-                        ctx.local_node_id,
-                        &key,
-                        action,
-                    );
-                }
-            }
-            for (branch, spec) in reconciliation.added {
-                let strictest = {
-                    let slot = ctx.sensing_leader.lock();
-                    slot.as_ref()
-                        .and_then(|leader| leader.relay.table.aggregate(&branch, now))
-                };
-                let Some(strictest) = strictest else {
-                    continue;
-                };
-                let ttl = ctx.sensing_interest_ttl;
-                let outcome = ctx.sensing_interest_table.lock().register(
-                    &branch,
-                    sensing::DownstreamId::Leader,
-                    strictest,
-                    ttl,
-                    ctx.sensing_local_root,
-                    now,
-                );
-                if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
-                    continue;
-                }
-                ctx.sensing_observations
-                    .lock()
-                    .update_upstream_interval(&branch, Some(strictest));
-                if branch.provider == ctx.local_node_id {
-                    Self::feed_sensing_origin(
-                        ctx,
-                        &branch,
-                        &spec,
-                        sensing::DownstreamId::Leader,
-                        now,
-                    );
-                } else {
-                    let upstream = sensing::SensingInterestFrame::provider_registration(
-                        &spec,
-                        branch.provider,
-                        strictest,
-                        ttl,
-                    );
-                    if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                        spawn_sensing_frame_send(
-                            &ctx.socket,
-                            &ctx.peers,
-                            &ctx.addr_to_node,
-                            &ctx.router,
-                            &ctx.partition_filter,
-                            ctx.local_node_id,
-                            branch.provider,
-                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                            sensing::SUBPROTOCOL_SENSING_INTEREST,
-                            bytes,
-                        );
-                    }
-                }
-            }
-            moved |= reconciliation.changed;
         }
         if moved {
             ctx.sensing_overlay_changed.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
             });
         }
+    }
+
+    /// One capability's fresh snapshot + reconcile + branch
+    /// consequences; returns whether anything scheduler-relevant
+    /// moved. Runs on the dispatch path (leading edge) and on the
+    /// boundary sleeper (trailing edge) — BOTH snapshot at their own
+    /// run time, so a trailing run sees every in-window change it
+    /// coalesced.
+    #[cfg(feature = "redex")]
+    fn reconcile_sensing_leader_fold_one(
+        ctx: &DispatchCtx,
+        capability_id: &sensing::CapabilityId,
+        now: Instant,
+    ) -> bool {
+        let snapshot = sensing_candidate_snapshot_from_parts(
+            &ctx.capability_fold,
+            &ctx.proximity_graph,
+            &ctx.router,
+            &ctx.peers,
+            &ctx.peer_entity_ids,
+            ctx.local_node_id,
+            ctx.sensing_local_entity_root,
+            &ctx.sensing_local_root,
+            capability_id,
+        );
+        let reconciliation = {
+            let mut slot = ctx.sensing_leader.lock();
+            match slot.as_mut() {
+                Some(leader) => leader.reconcile_with_snapshot(capability_id, &snapshot, now),
+                None => return false,
+            }
+        };
+        let emitter_stamp = ctx.sensing_emitter.lock().as_ref().map(|e| e.stamp());
+        for branch in reconciliation.torn_down {
+            let mesh_actions = ctx.sensing_interest_table.lock().deregister(
+                &branch.interest.interest_digest,
+                Some(branch.provider),
+                sensing::DownstreamId::Leader,
+                now,
+            );
+            for (key, action) in mesh_actions {
+                apply_sensing_removal_action(
+                    &ctx.sensing_observations,
+                    &ctx.sensing_emitter,
+                    emitter_stamp,
+                    &ctx.socket,
+                    &ctx.peers,
+                    &ctx.addr_to_node,
+                    &ctx.router,
+                    &ctx.partition_filter,
+                    ctx.local_node_id,
+                    &key,
+                    action,
+                );
+            }
+        }
+        for (branch, spec) in reconciliation.added {
+            let strictest = {
+                let slot = ctx.sensing_leader.lock();
+                slot.as_ref()
+                    .and_then(|leader| leader.relay.table.aggregate(&branch, now))
+            };
+            let Some(strictest) = strictest else {
+                continue;
+            };
+            let ttl = ctx.sensing_interest_ttl;
+            let outcome = ctx.sensing_interest_table.lock().register(
+                &branch,
+                sensing::DownstreamId::Leader,
+                strictest,
+                ttl,
+                ctx.sensing_local_root,
+                now,
+            );
+            if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+                continue;
+            }
+            ctx.sensing_observations
+                .lock()
+                .update_upstream_interval(&branch, Some(strictest));
+            if branch.provider == ctx.local_node_id {
+                Self::feed_sensing_origin(ctx, &branch, &spec, sensing::DownstreamId::Leader, now);
+            } else {
+                let upstream = sensing::SensingInterestFrame::provider_registration(
+                    &spec,
+                    branch.provider,
+                    strictest,
+                    ttl,
+                );
+                if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                    spawn_sensing_frame_send(
+                        &ctx.socket,
+                        &ctx.peers,
+                        &ctx.addr_to_node,
+                        &ctx.router,
+                        &ctx.partition_filter,
+                        ctx.local_node_id,
+                        branch.provider,
+                        sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                        sensing::SUBPROTOCOL_SENSING_INTEREST,
+                        bytes,
+                    );
+                }
+            }
+        }
+        reconciliation.changed
     }
 
     /// Leader row was refused at floor M — partition the leader
@@ -21550,6 +21717,87 @@ mod reclassify_override_race_tests {
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
+    }
+}
+
+#[cfg(all(test, feature = "redex"))]
+mod sensing_fold_gate_tests {
+    //! SI-6.1 closure witnesses for the gate itself: leading edge
+    //! runs, in-window defers exactly once then coalesces, and the
+    //! boundary sleeper's claim is exactly-once (including the
+    //! subsumed-by-a-fresh-run jitter edge). The e2e in
+    //! `tests/sensing_leader_delivery.rs` witnesses the full
+    //! suppressed-change repair on real sessions.
+
+    use super::*;
+
+    /// Far out of reach: every second change is in-window.
+    const GAP: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn leading_edge_runs_then_defers_then_coalesces() {
+        let coalescer = DashMap::new();
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+            SensingFoldGateDecision::RunNow
+        ));
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+            SensingFoldGateDecision::Defer { .. }
+        ));
+        assert!(
+            matches!(
+                sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+                SensingFoldGateDecision::Coalesced
+            ),
+            "further in-window changes coalesce into the ONE scheduled boundary run",
+        );
+        // Distinct capabilities gate independently.
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [2; 32], GAP),
+            SensingFoldGateDecision::RunNow
+        ));
+    }
+
+    #[test]
+    fn boundary_reclaim_is_exactly_once_and_a_fresh_run_subsumes_the_sleeper() {
+        let coalescer = DashMap::new();
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+            SensingFoldGateDecision::RunNow
+        ));
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+            SensingFoldGateDecision::Defer { .. }
+        ));
+        assert!(
+            sensing_fold_gate_reclaim(&coalescer, &[1; 32]),
+            "the sleeper owns its scheduled boundary run",
+        );
+        assert!(
+            !sensing_fold_gate_reclaim(&coalescer, &[1; 32]),
+            "exactly one trailing run per window",
+        );
+
+        // Jitter edge: a fresh OUT-of-window change lands before the
+        // sleeper wakes (zero gap makes every change out-of-window)
+        // — the fresh run subsumes the sleeper's pending run.
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [2; 32], GAP),
+            SensingFoldGateDecision::RunNow
+        ));
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [2; 32], GAP),
+            SensingFoldGateDecision::Defer { .. }
+        ));
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [2; 32], Duration::ZERO),
+            SensingFoldGateDecision::RunNow
+        ));
+        assert!(
+            !sensing_fold_gate_reclaim(&coalescer, &[2; 32]),
+            "a fresh out-of-window run subsumes the sleeper's pending reconciliation",
+        );
     }
 }
 

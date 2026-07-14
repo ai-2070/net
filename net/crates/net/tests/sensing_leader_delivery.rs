@@ -1107,3 +1107,170 @@ async fn fold_withdrawal_reconciles_leader_demand() {
     r.shutdown().await.expect("shutdown R");
     p.shutdown().await.expect("shutdown P");
 }
+
+/// SI-6.1 closure (review, second blocker): the fold-reconciliation
+/// gate must have a TRAILING edge. Every announcement reconciles ALL
+/// capability ids with live interests, so an UNRELATED announcement
+/// stamps capability C's gate; under the plain leading-edge damper,
+/// C's real membership change arriving inside the 100 ms window was
+/// silently rejected — with no later announcement and no consumer
+/// refresh, the leader's branch set stayed stale until soft-state
+/// repair. Reviewer's witness, verbatim: consume C's leading edge
+/// with an unrelated fold announcement; mutate C's eligible
+/// population inside the gap; emit no later announcement and no
+/// consumer refresh; verify the trailing reconciliation
+/// replaces/retires branches after the gap.
+///
+/// Determinism note: the change must actually LAND in-window for the
+/// witness to discriminate (a late landing takes the leading edge
+/// and passes even without the fix), so the critical section polls
+/// at 2 ms and a precondition assert pins the landing time. Nodes
+/// are bare-`start()` (no keep-alive re-announce loop) and the one
+/// registration's ttl is 9 s — nothing re-drives reconciliation
+/// inside the assertion window except the trailing edge itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppressed_in_window_fold_change_reconciles_at_the_window_boundary() {
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner)
+            // Both critical announcements are seconds past the
+            // previous one — never deferred/dropped by RT-1.
+            .with_min_announce_interval(Duration::from_millis(200));
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&r, &p).await;
+    for node in [&a, &r, &p] {
+        node.start();
+    }
+    for node in [&a, &r] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, r_id, p_id) = (a.node_id(), r.node_id(), p.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+    })
+    .await;
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let branch = ProviderInterestKey::new(spec.key(), p_id);
+    let interest = spec.key();
+    // ONE registration, ttl far beyond every assertion below.
+    await_condition(Duration::from_secs(10), "provider-free path live", || {
+        let _ = a.register_capability_interest(&spec, r_id, Duration::from_millis(200), TTL * 6);
+        r.sensing_leader_branches(&interest) == Some(vec![p_id])
+            && p.sensing_live_streams() == 1
+            && a.sensing_projected(&branch) == ProjectedReadiness::Ready
+    })
+    .await;
+    // Let any setup-driven gate window at R lapse, so the unrelated
+    // announcement below is the LEADING edge of a fresh window.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // ── [1] Consume C's leading edge with an UNRELATED fold
+    //    announcement (A starts declaring an unrelated tag): the
+    //    all-ids reconciliation scan stamps C's gate with zero
+    //    sensing movement. ──
+    let unrelated = CapabilityId::new("unrelated.si61");
+    let t_stamp = std::time::Instant::now();
+    a.announce_capabilities(CapabilitySet::new().add_tag("unrelated.si61"))
+        .await
+        .expect("announce unrelated");
+    while !r
+        .sensing_candidate_snapshot(&unrelated)
+        .iter()
+        .any(|candidate| candidate.node_id == a_id)
+    {
+        assert!(
+            t_stamp.elapsed() < Duration::from_secs(2),
+            "harness: the unrelated announcement must reach R",
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        r.sensing_leader_branches(&interest),
+        Some(vec![p_id]),
+        "the unrelated announcement moves no sensing state",
+    );
+
+    // ── [2] C's REAL membership change, inside the stamped window:
+    //    P stops declaring the capability. ──
+    p.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce empty");
+    while r
+        .sensing_candidate_snapshot(&cap)
+        .iter()
+        .any(|candidate| candidate.node_id == p_id)
+    {
+        assert!(
+            t_stamp.elapsed() < Duration::from_secs(2),
+            "harness: the membership change must reach R",
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let landed = t_stamp.elapsed();
+    assert!(
+        landed < Duration::from_millis(80),
+        "harness precondition: the membership change must land inside the \
+         capability's 100 ms gate window to exercise the trailing edge \
+         (landed at {landed:?} — machine overloaded?)",
+    );
+
+    // ── [3] NO later announcement, NO consumer refresh: only the
+    //    trailing edge can repair the suppressed change. ──
+    await_condition(
+        Duration::from_secs(3),
+        "a fold change suppressed in-window reconciles at the window boundary (trailing edge)",
+        || {
+            r.sensing_leader_branches(&interest)
+                .is_none_or(|branches| branches.is_empty())
+        },
+    )
+    .await;
+    await_condition(
+        Duration::from_secs(3),
+        "the withdrawn provider's stream retires off the trailing reconciliation",
+        || p.sensing_live_streams() == 0,
+    )
+    .await;
+    assert!(
+        t_stamp.elapsed() < Duration::from_secs(7),
+        "reconciliation must be event-driven, never the ttl",
+    );
+
+    a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+}

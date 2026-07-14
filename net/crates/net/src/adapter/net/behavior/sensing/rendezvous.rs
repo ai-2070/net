@@ -684,12 +684,23 @@ impl SensingLeader {
     /// returned keys let the caller retire its mesh Leader rows and
     /// upstream demand. When the active set is left UNDER the fresh
     /// resolution's size, newly eligible providers fill it in
-    /// resolution order, with every existing consumer registered on
-    /// the new branch at the D/ttl its surviving rows carry; the
-    /// returned additions let the caller open mesh demand for them.
-    /// Standby lists refresh unconditionally. A fresh resolution
-    /// that REFUSES (e.g. a now-too-broad selector) leaves the
-    /// interest untouched — soft state drains it if consumers stop.
+    /// resolution order; the returned additions let the caller open
+    /// mesh demand for them. Standby lists refresh unconditionally.
+    /// A fresh resolution that REFUSES (e.g. a now-too-broad
+    /// selector) leaves the interest untouched — soft state drains
+    /// it if consumers stop.
+    ///
+    /// SI-6.1 closure (review): consumer demand is snapshotted as a
+    /// DEDUPLICATED union across ALL old live branches BEFORE any
+    /// teardown, and every replacement branch inherits that
+    /// surviving union — deriving rows from the first KEPT branch
+    /// handed a full replacement ([A] → [B]) zero downstream rows,
+    /// and lost consumers present only on another old branch
+    /// (partial refusals make branch populations non-identical). A
+    /// branch is reported `added` only when it actually acquired
+    /// live downstream demand; if NO branch holds live demand the
+    /// interest DRAINS (the sweep's rule) instead of recording a
+    /// ghost active set the mesh caller skips.
     pub fn reconcile_with_snapshot(
         &mut self,
         capability_id: &super::identity::CapabilityId,
@@ -725,6 +736,36 @@ impl SensingLeader {
             let spec = entry.spec.clone();
             let old_active = entry.active.clone();
             let old_standby = entry.standby.clone();
+            // SI-6.1 closure: the surviving consumer demand,
+            // deduplicated across ALL old live branches, captured
+            // BEFORE any teardown drops their rows. A consumer
+            // holding rows on several branches (with divergent D/ttl
+            // via partial refusals) keeps its strictest interval and
+            // longest ttl — the same direction the aggregate and the
+            // sweep already resolve toward.
+            let mut consumer_rows: Vec<(DownstreamId, Duration, Duration)> = Vec::new();
+            for provider in &old_active {
+                let branch = ProviderInterestKey::new(key.clone(), *provider);
+                for downstream in self.relay.table.downstreams(&branch, now) {
+                    let Some(row) = self.relay.table.downstream_entry(&branch, downstream) else {
+                        continue;
+                    };
+                    match consumer_rows
+                        .iter_mut()
+                        .find(|(existing, _, _)| *existing == downstream)
+                    {
+                        Some((_, interval, ttl)) => {
+                            *interval = (*interval).min(row.requested_sample_interval);
+                            *ttl = (*ttl).max(row.soft_state_ttl);
+                        }
+                        None => consumer_rows.push((
+                            downstream,
+                            row.requested_sample_interval,
+                            row.soft_state_ttl,
+                        )),
+                    }
+                }
+            }
             // Tear down branches whose provider fell out of the
             // eligible set.
             let mut kept: Vec<u64> = Vec::new();
@@ -739,31 +780,8 @@ impl SensingLeader {
                 reconciliation.torn_down.push(branch);
             }
             // Fill an under-filled active set from the fresh
-            // resolution, registering every surviving consumer on
-            // the new branch at its existing D/ttl.
-            let consumer_rows: Vec<(DownstreamId, Duration, Duration)> = kept
-                .first()
-                .map(|provider| {
-                    let branch = ProviderInterestKey::new(key.clone(), *provider);
-                    self.relay
-                        .table
-                        .downstreams(&branch, now)
-                        .into_iter()
-                        .filter_map(|downstream| {
-                            self.relay
-                                .table
-                                .downstream_entry(&branch, downstream)
-                                .map(|row| {
-                                    (
-                                        downstream,
-                                        row.requested_sample_interval,
-                                        row.soft_state_ttl,
-                                    )
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // resolution, registering the surviving union on the
+            // new branch at its captured D/ttl.
             for provider in &resolved.active {
                 if kept.len() >= resolved.active.len() {
                     break;
@@ -782,10 +800,26 @@ impl SensingLeader {
                         now,
                     );
                 }
+                // `added` means "acquired live downstream demand" —
+                // a demandless replacement would be a ghost active
+                // branch the mesh caller skips (`aggregate` None),
+                // recorded as coverage sensing never re-establishes.
+                if self.relay.table.aggregate(&branch, now).is_none() {
+                    self.relay.table.remove_branch(&branch);
+                    self.relay.reclaim_branch(&branch);
+                    continue;
+                }
                 kept.push(*provider);
                 reconciliation.added.push((branch, spec.clone()));
             }
             reconciliation.changed |= kept != old_active || old_standby != resolved.standby;
+            if kept.is_empty() {
+                // No branch holds live demand: the interest DRAINS —
+                // the sweep's own rule — never a ghost active set.
+                reconciliation.changed = true;
+                self.interests.remove(&key);
+                continue;
+            }
             if let Some(entry) = self.interests.get_mut(&key) {
                 entry.active = kept;
                 entry.standby = resolved.standby;
@@ -1843,5 +1877,177 @@ mod tests {
             assert!(!rejection.is_security_relevant());
         }
         assert_eq!(leader.interest_count(), 0);
+    }
+
+    /// SI-6.1 closure P1 (reviewer's exact sequence): when EVERY old
+    /// active provider disappears but a replacement is available,
+    /// the replacement branch must inherit the surviving consumer
+    /// rows — before the fix `consumer_rows` derived from
+    /// `kept.first()` AFTER teardown, so a full replacement handed
+    /// the new branch zero rows: the leader recorded B as active
+    /// while no aggregate, mesh Leader row, or upstream demand
+    /// existed behind it.
+    #[test]
+    fn full_active_replacement_inherits_the_surviving_consumer_rows() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        let consumer = DownstreamId::Peer(193);
+        let shared = spec();
+
+        leader
+            .register_capability_interest(
+                &shared,
+                consumer,
+                ms(100),
+                TTL,
+                root(),
+                &[provider(0xA1, 5)],
+                now,
+            )
+            .expect("registration admits");
+        assert_eq!(leader.branches(&shared.key()), vec![0xA1]);
+
+        // Fresh fold: A is gone entirely, B is the only eligible
+        // provider — old active [A], fresh active [B], kept [].
+        let reconciliation =
+            leader.reconcile_with_snapshot(&shared.capability_id, &[provider(0xB1, 5)], now);
+
+        let replacement = ProviderInterestKey::new(shared.key(), 0xB1);
+        assert_eq!(
+            leader.relay.table.downstreams(&replacement, now),
+            vec![consumer],
+            "the replacement branch must inherit the surviving consumer row",
+        );
+        assert_eq!(
+            reconciliation
+                .torn_down
+                .iter()
+                .map(|branch| branch.provider)
+                .collect::<Vec<_>>(),
+            vec![0xA1],
+        );
+        // `added` is backed by REAL demand the mesh caller can open
+        // a Leader row + upstream registration from.
+        assert_eq!(
+            reconciliation
+                .added
+                .iter()
+                .map(|(branch, _)| branch.provider)
+                .collect::<Vec<_>>(),
+            vec![0xB1],
+        );
+        assert_eq!(
+            leader.relay.table.aggregate(&replacement, now),
+            Some(ms(100)),
+        );
+        assert_eq!(leader.branches(&shared.key()), vec![0xB1]);
+        assert!(reconciliation.changed);
+    }
+
+    /// SI-6.1 closure P1, second witness: branch populations are
+    /// NON-IDENTICAL under partial refusals — a consumer whose row
+    /// lives only on a torn-down branch must still reach the
+    /// replacement. Old active [B1, B2] where only B1 carries C2
+    /// (C2's B2 registration was cap-refused); the fold drops B1
+    /// and offers B3 — the replacement must receive the surviving
+    /// UNION {C1, C2}, not the first kept branch's rows {C1}.
+    #[test]
+    fn replacement_receives_the_surviving_union_across_old_branches() {
+        let now = Instant::now();
+        let policy = CandidatePolicy {
+            initial_fanout: 2,
+            standby_count: 0,
+            maximum_fanout: 3,
+            each_mode_max_providers: 32,
+        };
+        let mut leader = SensingLeader::new(root(), policy, K, 3);
+        let snapshot = [provider(0xB1, 5), provider(0xB2, 7)];
+        let c1 = DownstreamId::Peer(1);
+        let c2 = DownstreamId::Peer(2);
+
+        let shared = spec();
+        leader
+            .register_capability_interest(&shared, c1, ms(100), TTL, root(), &snapshot, now)
+            .expect("C1 admits on both branches");
+        // Fill two of C2's three row slots elsewhere …
+        let mut filler = spec();
+        filler.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+        leader
+            .register_capability_interest(&filler, c2, ms(100), TTL, root(), &snapshot, now)
+            .expect("C2's filler admits on both branches");
+        // … so C2's join lands on B1 only (B2 cap-refused): the
+        // shared interest's populations are B1{C1,C2}, B2{C1}.
+        let join = leader
+            .register_capability_interest(&shared, c2, ms(50), TTL, root(), &snapshot, now)
+            .expect("a partially admitted join still succeeds");
+        assert_eq!(join.admitted_branches, vec![0xB1]);
+
+        // The fold drops B1 (the ONLY branch carrying C2) and
+        // offers B3; B2 — the branch that lacks C2 — is kept.
+        let reconciliation = leader.reconcile_with_snapshot(
+            &shared.capability_id,
+            &[provider(0xB2, 7), provider(0xB3, 9)],
+            now,
+        );
+
+        let replacement = ProviderInterestKey::new(shared.key(), 0xB3);
+        let mut downstreams = leader.relay.table.downstreams(&replacement, now);
+        downstreams.sort_by_key(|downstream| match downstream {
+            DownstreamId::Peer(node) => *node,
+            _ => 0,
+        });
+        assert_eq!(
+            downstreams,
+            vec![c1, c2],
+            "the replacement must receive the surviving union across \
+             ALL old branches, not the first kept branch's rows",
+        );
+        // C2's stricter D survives onto the replacement aggregate.
+        assert_eq!(
+            leader.relay.table.aggregate(&replacement, now),
+            Some(ms(50)),
+        );
+        assert_eq!(leader.branches(&shared.key()), vec![0xB2, 0xB3]);
+        assert!(reconciliation.changed);
+    }
+
+    /// SI-6.1 closure P1, drain arm: a replacement that acquires NO
+    /// live downstream demand (every surviving row already expired)
+    /// must not be reported `added`, and an interest left with no
+    /// demand-bearing branch DRAINS — the sweep's rule — instead of
+    /// recording a ghost active set the mesh caller skips.
+    #[test]
+    fn replacement_without_surviving_demand_drains_instead_of_ghosting() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        let shared = spec();
+        leader
+            .register_capability_interest(
+                &shared,
+                DownstreamId::Peer(0xC1),
+                ms(100),
+                TTL,
+                root(),
+                &[provider(0xA1, 5)],
+                now,
+            )
+            .expect("registration admits");
+
+        // Every consumer row is expired by reconciliation time.
+        let later = now + TTL * 2;
+        let reconciliation =
+            leader.reconcile_with_snapshot(&shared.capability_id, &[provider(0xB1, 5)], later);
+
+        assert!(
+            reconciliation.added.is_empty(),
+            "a replacement with no surviving demand is never reported added",
+        );
+        assert_eq!(
+            leader.interest_count(),
+            0,
+            "the interest drains rather than retaining a ghost active branch",
+        );
+        assert!(reconciliation.changed);
+        assert!(leader.is_drained());
     }
 }

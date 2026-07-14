@@ -181,20 +181,26 @@ pub fn match_islands_sensed(
     if sensed_viable_order.is_empty() || ordered.len() < 2 {
         return ordered;
     }
-    // SI-6 review (non-blocking note, taken): precompute the
-    // island → band map from ONE topology snapshot — no per-
-    // comparison fold queries inside the O(n log n) sort, and the
-    // sort sees an internally consistent topology.
+    // SI-6 review (non-blocking note, taken) + SI-6.1 closure
+    // refinement: derive the island → band map from ONE literal
+    // topology snapshot — a single `All` scan, not one `Get` per
+    // island (separate fold reads could interleave with concurrent
+    // updates and hand the sort a mixed-time view). No fold queries
+    // inside the O(n log n) sort.
+    let snapshot: std::collections::HashMap<IslandId, NodeId> = topology_fold
+        .query(IslandQuery::All)
+        .into_iter()
+        .map(|(island, record)| (island, record.host))
+        .collect();
     let bands: std::collections::HashMap<IslandId, usize> = ordered
         .iter()
         .map(|island| {
-            let band = topology_fold
-                .query(IslandQuery::Get(*island))
-                .first()
-                .and_then(|(_, record)| {
+            let band = snapshot
+                .get(island)
+                .and_then(|host| {
                     sensed_viable_order
                         .iter()
-                        .position(|provider| *provider == record.host)
+                        .position(|provider| provider == host)
                 })
                 // Unsensed / potential hosts form the trailing
                 // band, in the selection policy's own order.
