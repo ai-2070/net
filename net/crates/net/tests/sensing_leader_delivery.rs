@@ -38,10 +38,11 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::sensing::{
-    AttestedStatus, AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DownstreamId,
-    EvaluationRequest, Incarnation, InterestSpec, ProjectedReadiness, ProviderInterestKey,
-    ProviderSelector, ReadinessEvaluation, ReadinessEvaluator, ResultMode, SensingCounters,
-    StatusReason, WorkLatencyEnvelope,
+    encode_attestation, sign_attestation, AggregateView, AttestedStatus, AudienceScopeCommitment,
+    CanonicalConstraints, CapabilityId, ConsumerLatencyBudget, DownstreamId, EvaluationRequest,
+    Incarnation, InterestSpec, ProjectedReadiness, ProviderInterestKey, ProviderSelector,
+    ReadinessEvaluation, ReadinessEvaluator, ResultMode, SensingCounters, StatusReason,
+    UnsignedAttestation, WorkLatencyEnvelope, SUBPROTOCOL_READINESS_ATTESTATION,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 use net::adapter::Adapter;
@@ -448,10 +449,14 @@ async fn watch_expiry_fully_reclaims_provider_free_observation_state() {
 
     // ── Reuse: a fresh registration flows end-to-end again ──
     let refresh_a = refresher(a.clone());
-    await_condition(Duration::from_secs(10), "re-registration flows again", || {
-        a.sensing_observation_count() == 1
-            && a.sensing_projected(&branch) == ProjectedReadiness::Ready
-    })
+    await_condition(
+        Duration::from_secs(10),
+        "re-registration flows again",
+        || {
+            a.sensing_observation_count() == 1
+                && a.sensing_projected(&branch) == ProjectedReadiness::Ready
+        },
+    )
     .await;
 
     refresh_a.abort();
@@ -626,12 +631,15 @@ async fn leader_resolved_as_provider_serves_its_own_proofs() {
         }
         Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
     };
-    let a = mk(EntityKeypair::generate(), None).await;
+    // A also carries the origin role: the item-7 section below adds
+    // a SELF-provider Ready cell next to the leader-delivered one.
+    let a = mk(EntityKeypair::generate(), Some(Incarnation::new(1))).await;
     let b = mk(EntityKeypair::generate(), None).await;
     // R holds the owner identity AND the origin role: leader,
     // provider, and owner are one node (the v1 single-owner shape).
     let r = mk(owner_kp, Some(Incarnation::new(1))).await;
     r.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+    a.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
 
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
@@ -733,6 +741,41 @@ async fn leader_resolved_as_provider_serves_its_own_proofs() {
         assert_eq!(SensingCounters::get(&counters.scope_refusals), 0);
     }
 
+    // ── SI-4 re-review item 7: the resolved population FILTERS ──
+    // A adds a SELF-provider Ready cell next to the leader-delivered
+    // one: two materialized Ready branches under one digest.
+    a.register_sensing_interest(&spec, a_id, Duration::from_millis(100), TTL)
+        .expect("A self-registers");
+    let self_branch = ProviderInterestKey::new(spec.key(), a_id);
+    await_condition(Duration::from_secs(5), "A's own cell is Ready too", || {
+        a.sensing_projected(&self_branch) == ProjectedReadiness::Ready
+    })
+    .await;
+    let budget = ConsumerLatencyBudget::default();
+    // Expected population [r_id]: A's OWN Ready sits outside the
+    // resolved set and must contribute nowhere.
+    assert_eq!(
+        a.sensing_aggregate_view(&spec, &budget, Some(&[r_id])),
+        AggregateView::Scalar {
+            status: ProjectedReadiness::Ready,
+            supporting: vec![r_id],
+        },
+        "a materialized provider outside the population must not support",
+    );
+    // Expected population naming only an UNmaterialized provider:
+    // BOTH Ready cells are outside the set — nothing satisfies.
+    let phantom = 0xD00D;
+    assert_ne!(phantom, a_id);
+    assert_ne!(phantom, r_id);
+    assert_eq!(
+        a.sensing_aggregate_view(&spec, &budget, Some(&[phantom])),
+        AggregateView::Scalar {
+            status: ProjectedReadiness::Unknown,
+            supporting: vec![],
+        },
+        "stale Ready cells outside the population must not satisfy the aggregate",
+    );
+
     // ── Drain: consumers stop; the self-provider chain unwinds ──
     refresh_a.abort();
     refresh_b.abort();
@@ -748,4 +791,194 @@ async fn leader_resolved_as_provider_serves_its_own_proofs() {
     a.shutdown().await.expect("shutdown A");
     b.shutdown().await.expect("shutdown B");
     r.shutdown().await.expect("shutdown R");
+}
+
+#[tokio::test]
+async fn distinct_signer_that_knows_the_digest_is_not_solicited() {
+    // SI-4 re-review item 8: a digest expectation stores only "a
+    // local consumer registered this digest" — before the fix, ANY
+    // validly signed attestation matching the digest was treated as
+    // solicited. The expectation now retains its audience, and the
+    // verified signer's pinned entity must derive that owner root:
+    // X — honestly pinned at A, validly signing its OWN beat for the
+    // watched digest — is refused authorization (never stored, never
+    // projected), while P's real proofs keep flowing.
+    //
+    //   A (watch) — R (leader) — P (owner identity)
+    //   X (attacker adjacent to A, distinct identity)
+    let owner_kp = EntityKeypair::generate();
+    let owner_entity = owner_kp.entity_id().clone();
+    let owner = AudienceScopeCommitment::owner_root(&owner_entity);
+
+    let mk = |kp: EntityKeypair, incarnation: Option<Incarnation>| async move {
+        let mut cfg = base_config()
+            .with_sensing_coalescing(true)
+            .with_sensing_owner_root(owner);
+        if let Some(incarnation) = incarnation {
+            cfg = cfg.with_sensing_incarnation(incarnation);
+        }
+        Arc::new(MeshNode::new(kp, cfg).await.expect("MeshNode::new"))
+    };
+    let a = mk(EntityKeypair::generate(), None).await;
+    let r = mk(EntityKeypair::generate(), None).await;
+    let p = mk(owner_kp, Some(Incarnation::new(1))).await;
+    let x = mk(EntityKeypair::generate(), None).await;
+    p.register_readiness_evaluator(CapabilityId::new("print.document"), Arc::new(AlwaysReady));
+
+    connect_pair(&a, &r).await;
+    connect_pair(&r, &p).await;
+    connect_pair(&x, &a).await;
+    for node in [&a, &r, &p, &x] {
+        node.start();
+    }
+    for node in [&a, &r, &x] {
+        node.announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    p.announce_capabilities(CapabilitySet::new().add_tag("print.document"))
+        .await
+        .expect("announce P");
+
+    let (a_id, r_id, p_id, x_id) = (a.node_id(), r.node_id(), p.node_id(), x.node_id());
+    await_condition(Duration::from_secs(5), "entity pins established", || {
+        r.peer_entity_id(a_id).is_some()
+            && r.peer_entity_id(p_id).is_some()
+            && p.peer_entity_id(r_id).is_some()
+            && a.peer_entity_id(x_id).is_some()
+    })
+    .await;
+    a.test_pin_peer_entity(p_id, owner_entity.clone());
+
+    assert!(r.assume_sensing_leader(), "leader role installs at R");
+    let cap = CapabilityId::new("print.document");
+    await_condition(Duration::from_secs(5), "R's snapshot authorizes P", || {
+        r.sensing_candidate_snapshot(&cap)
+            .iter()
+            .any(|candidate| candidate.node_id == p_id && candidate.authorized)
+    })
+    .await;
+
+    let spec = shared_spec(owner);
+    let p_branch = ProviderInterestKey::new(spec.key(), p_id);
+    let x_branch = ProviderInterestKey::new(spec.key(), x_id);
+    let refresh_a = {
+        let a = a.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ =
+                    a.register_capability_interest(&spec, r_id, Duration::from_millis(200), TTL);
+                tokio::time::sleep(REFRESH).await;
+            }
+        })
+    };
+    // The REAL provider-free path is live before the attack.
+    await_condition(Duration::from_secs(10), "A projects P's proof", || {
+        a.sensing_projected(&p_branch) == ProjectedReadiness::Ready
+    })
+    .await;
+
+    // ── The attack: X validly signs its own Ready for the watched
+    //    digest and pushes it straight at A ──
+    let unsigned = UnsignedAttestation {
+        interest_digest: spec.key().interest_digest,
+        origin: x_id,
+        origin_incarnation: Incarnation::new(1),
+        capability_id: CapabilityId::new("print.document"),
+        capability_generation: 1,
+        status: AttestedStatus::Ready,
+        status_reason: StatusReason::None,
+        estimated_start: None,
+        seq: 1,
+        promised_cadence: Duration::from_millis(100),
+        audience_scope: owner,
+    };
+    let signed = sign_attestation(x.entity_keypair(), unsigned).expect("sign");
+    let bytes = encode_attestation(&signed).expect("encode");
+    let a_addr = a.local_addr();
+    let a_counters = a.sensing_counters();
+    await_condition(
+        Duration::from_secs(10),
+        "the watch refuses the foreign signer",
+        || {
+            if SensingCounters::get(&a_counters.scope_refusals) == 0 {
+                let x = x.clone();
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let _ = x
+                        .send_subprotocol(a_addr, SUBPROTOCOL_READINESS_ATTESTATION, &bytes)
+                        .await;
+                });
+                false
+            } else {
+                true
+            }
+        },
+    )
+    .await;
+    assert!(
+        a.sensing_latest_attestation(&x_branch).is_none(),
+        "a refused signer's beat must never be stored",
+    );
+    assert_eq!(
+        a.sensing_projected(&x_branch),
+        ProjectedReadiness::Unknown,
+        "a refused signer's beat must never project",
+    );
+    // Authorization refusal, not protocol-invalid input.
+    assert_eq!(SensingCounters::get(&a_counters.protocol_invalid), 0);
+    // The real path is unaffected.
+    assert!(a.sensing_latest_attestation(&p_branch).is_some());
+
+    refresh_a.abort();
+    a.shutdown().await.expect("shutdown A");
+    r.shutdown().await.expect("shutdown R");
+    p.shutdown().await.expect("shutdown P");
+    x.shutdown().await.expect("shutdown X");
+}
+
+#[tokio::test]
+async fn provider_free_expectation_map_is_capped() {
+    // SI-4 re-review item 9: `sensing_capability_interests` is
+    // bounded by `max_interests_per_peer` — soft-state expiry bounds
+    // lifetime, not cardinality inside a TTL window. New keys over
+    // the cap are refused; existing-key refreshes stay admitted.
+    let owner_kp = EntityKeypair::generate();
+    let owner = AudienceScopeCommitment::owner_root(owner_kp.entity_id());
+    let node = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            base_config()
+                .with_sensing_coalescing(true)
+                .with_sensing_owner_root(owner)
+                .with_max_interests_per_peer(3),
+        )
+        .await
+        .expect("MeshNode::new"),
+    );
+    let spec_n = |i: u64| {
+        let media = format!("size-{i}");
+        let mut spec = shared_spec(owner);
+        spec.constraints = CanonicalConstraints::from_entries([("media", media.as_str())]).unwrap();
+        spec
+    };
+    let leader = 0xBEEF;
+    for i in 0..3 {
+        node.register_capability_interest(&spec_n(i), leader, Duration::from_millis(100), TTL)
+            .expect("under the cap");
+    }
+    // A NEW key at capacity is refused…
+    assert!(
+        matches!(
+            node.register_capability_interest(&spec_n(3), leader, Duration::from_millis(100), TTL),
+            Err(net::adapter::net::SensingRegistrationError::AtCapacity)
+        ),
+        "a new expectation over the cap must surface AtCapacity",
+    );
+    // …while an existing-key refresh stays admitted.
+    node.register_capability_interest(&spec_n(0), leader, Duration::from_millis(100), TTL)
+        .expect("refresh admitted at capacity");
+
+    node.shutdown().await.expect("shutdown");
 }

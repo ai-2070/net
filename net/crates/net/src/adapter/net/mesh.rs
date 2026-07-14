@@ -1127,8 +1127,14 @@ struct DispatchCtx {
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-4 review P0: provider-free digest expectations. See the
     /// matching field on `MeshNode`.
-    sensing_capability_interests:
-        Arc<parking_lot::Mutex<HashMap<sensing::CapabilityInterestKey, (Duration, Instant)>>>,
+    sensing_capability_interests: Arc<
+        parking_lot::Mutex<
+            HashMap<
+                sensing::CapabilityInterestKey,
+                (Duration, Instant, sensing::AudienceScopeCommitment),
+            >,
+        >,
+    >,
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
@@ -3322,6 +3328,10 @@ pub enum SensingRegistrationError {
     /// Second closure round, item 5: the origin is at
     /// [`sensing::MAX_LIVE_SENSING_STREAMS`] live streams — the
     /// registration was rolled back; retry after capacity frees.
+    /// SI-4 re-review item 9 reuses the variant for a NEW
+    /// provider-free expectation over `max_interests_per_peer`
+    /// (existing-key refreshes stay admitted at capacity) — the
+    /// retry-after-frees contract is identical.
     AtCapacity,
 }
 
@@ -3858,13 +3868,23 @@ pub struct MeshNode {
     sensing_overlay_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// SI-4 review P0: this node's PROVIDER-FREE interest
     /// registrations (`MeshNode::register_capability_interest`) —
-    /// digest-level expectations, value = (own D, expires_at). A
-    /// returning leader fan-out for a registered digest is
-    /// solicited even though no provider-keyed row exists (the
-    /// consumer never chose the provider). Soft state: refreshed by
+    /// digest-level expectations, value = (own D, expires_at,
+    /// expected audience). A returning leader fan-out for a
+    /// registered digest is solicited even though no provider-keyed
+    /// row exists (the consumer never chose the provider) — but ONLY
+    /// from a signer whose pinned entity derives the expectation's
+    /// owner root (SI-4 re-review item 8: a distinct signer that
+    /// merely knows the digest is refused). Bounded at
+    /// `max_interests_per_peer` (item 9); soft state: refreshed by
     /// re-registration, expired by the sweep.
-    sensing_capability_interests:
-        Arc<parking_lot::Mutex<HashMap<sensing::CapabilityInterestKey, (Duration, Instant)>>>,
+    sensing_capability_interests: Arc<
+        parking_lot::Mutex<
+            HashMap<
+                sensing::CapabilityInterestKey,
+                (Duration, Instant, sensing::AudienceScopeCommitment),
+            >,
+        >,
+    >,
     /// SI-3c: the verified observation seam (decode → solicited
     /// check → signature → seq gate → here): latest admitted status
     /// per branch, refusal control responses kept apart (closure
@@ -5054,10 +5074,30 @@ impl MeshNode {
         .map_err(SensingRegistrationError::Scope)?;
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let key = spec.key();
-        self.sensing_capability_interests.lock().insert(
-            key.clone(),
-            (requested_sample_interval, Instant::now() + ttl),
-        );
+        {
+            let mut interests = self.sensing_capability_interests.lock();
+            // SI-4 re-review item 9: the expectation map is bounded
+            // by the same amplification cap as the table's
+            // per-downstream rows. Existing-key refreshes stay
+            // admitted at capacity; only NEW keys are refused —
+            // retry after one expires.
+            if !interests.contains_key(&key)
+                && interests.len() >= self.config.max_interests_per_peer
+            {
+                return Err(SensingRegistrationError::AtCapacity);
+            }
+            // SI-4 re-review item 8: the expectation retains the
+            // audience it solicits — intake admits only signers
+            // whose pinned entity derives this owner root.
+            interests.insert(
+                key.clone(),
+                (
+                    requested_sample_interval,
+                    Instant::now() + ttl,
+                    spec.audience,
+                ),
+            );
+        }
         // SI-4 re-review item 5: a refreshed expectation can change
         // the consumer's D — every overlay cell under the digest
         // re-anchors immediately, never at the next beat.
@@ -5290,6 +5330,11 @@ impl MeshNode {
             )
             .collect();
         if let Some(expected) = resolved_population {
+            // SI-4 re-review item 7: the resolved population FILTERS
+            // as well as completes — a stale or previously resolved
+            // provider whose cell still holds Ready must not satisfy
+            // Ready/Quorum/TopK/Each once it is outside the set.
+            branches.retain(|branch| expected.contains(&branch.provider));
             for provider in expected {
                 if !branches.iter().any(|branch| branch.provider == *provider) {
                     branches.push(sensing::BranchView {
@@ -10094,7 +10139,7 @@ impl MeshNode {
                                 let mut interests =
                                     sensing_capability_interests.lock();
                                 interests
-                                    .retain(|_, (_, expires)| *expires > poll_now);
+                                    .retain(|_, (_, expires, _)| *expires > poll_now);
                                 interests.keys().cloned().collect()
                             };
                             let branch_keys: std::collections::HashSet<
@@ -12762,20 +12807,22 @@ impl MeshNode {
         // SI-4 review P0: a PROVIDER-FREE registration solicits
         // proofs from any provider the leader resolved — the
         // digest-level expectation admits what no provider-keyed
-        // row can.
-        let digest_watch: Option<Duration> = {
+        // row can. The audience it retains is checked against the
+        // VERIFIED signer below (re-review item 8).
+        let watch_candidate: Option<(Duration, sensing::AudienceScopeCommitment)> = {
             let interests = ctx.sensing_capability_interests.lock();
             interests
                 .get(&branch.interest)
-                .and_then(|(interval, expires)| (*expires > now).then_some(*interval))
+                .and_then(|(interval, expires, audience)| {
+                    (*expires > now).then_some((*interval, *audience))
+                })
         };
-        if digest_watch.is_none()
-            && ctx
-                .sensing_interest_table
-                .lock()
-                .downstreams(&branch, now)
-                .is_empty()
-        {
+        let has_rows = !ctx
+            .sensing_interest_table
+            .lock()
+            .downstreams(&branch, now)
+            .is_empty();
+        if watch_candidate.is_none() && !has_rows {
             tracing::trace!(
                 origin = format!("{:#x}", attestation.origin),
                 "sensing: unsolicited attestation dropped"
@@ -12802,6 +12849,35 @@ impl MeshNode {
                 error = %error,
                 "sensing: attestation signature verification failed"
             );
+            return;
+        }
+        // SI-4 re-review item 8: a digest expectation solicits ONLY
+        // the audience it names — the VERIFIED origin's pinned
+        // entity must derive the expectation's owner root (the v1
+        // single-owner relation; the distinct-device fleet relation
+        // stays outside sensing). A signer that merely knows the
+        // digest loses the watch justification — an authorization
+        // refusal, not protocol-invalid input — and stops here
+        // unless a provider-keyed row solicits it independently.
+        let digest_watch: Option<Duration> = match watch_candidate {
+            Some((interval, audience)) => {
+                if sensing::AudienceScopeCommitment::owner_root(&origin_entity) == audience {
+                    Some(interval)
+                } else {
+                    ctx.sensing_counters
+                        .scope_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        origin = format!("{:#x}", attestation.origin),
+                        "sensing: signer does not derive the watch's owner root, \
+                         watch justification refused"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
+        if digest_watch.is_none() && !has_rows {
             return;
         }
         // Second closure round, item 1 (fail-closed ordering): every
@@ -13064,7 +13140,7 @@ impl MeshNode {
             ctx.sensing_capability_interests
                 .lock()
                 .get(&branch.interest)
-                .is_some_and(|(_, expires)| *expires > Instant::now())
+                .is_some_and(|(_, expires, _)| *expires > Instant::now())
         }) || !ctx
             .sensing_interest_table
             .lock()
