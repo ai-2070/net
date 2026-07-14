@@ -9,11 +9,11 @@ claim of coalescing"); **SI-2 COMPLETE as-built (2026-07-12/13)** —
 interest table + resolver + upstream propagation on real sessions,
 dark behind `enable_sensing_coalescing = false` (as-built note in
 §6); **SI-3 COMPLETE, both closure rounds SIGNED OFF (2026-07-14)**;
-**SI-4 as-built (2026-07-14), REVIEWED: REQUEST CHANGES** — the
-direct provider-targeted path works and the envelope encoding is
-verified, but the provider-free leader RETURN path is missing and
-five lifecycle/aggregate defects stand (nine-item disposition in
-§6). Next: the SI-4 change-request closure; SI-5 HOLDS.
+**SI-4 as-built + change-request closure LANDED (2026-07-14)** —
+the provider-free leader return path is connected
+(`DownstreamId::Leader`, `register_capability_interest`, production
+e2e) and all nine review items are closed as-built (§6). Next:
+SI-4 re-review; SI-5 holds until it clears.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1369,6 +1369,45 @@ must exercise the real dispatch path.
      immediacy proven against B's known next-due; header node
      count corrected.
   Gate: SI-4 sign-off WITHHELD; SI-5 HOLD.
+  *SI-4 change-request closure as-built (2026-07-14, b5665a459 +
+  e5bc51882):* all nine items landed in the reviewer's order.
+  (P0) `DownstreamId::Leader` separates the internal leader
+  subscription from node-local watches; delivery dispatches
+  three-way (Peer→frame, Local→overlay, Leader→leader relay
+  fan-out over the hop's latest wire cache, matched on
+  (incarnation, seq) so identical-signed-bytes holds on the leader
+  path); registration warm-starts and the leader's own poll
+  dispatch the same way; the consumer half is
+  `register_capability_interest` (provider-free digest
+  expectations, real CapabilityRegistration frames, digest-level
+  solicited admission feeding the overlay at the consumer's D,
+  sweep-expired). Production witness
+  `tests/sensing_leader_delivery.rs`: A+B provider-free → leader R
+  coalesces → resolves P from P's REAL announcement (P holds the
+  owner identity — the v1 single-owner shape where snapshot
+  authorization and signature verification agree) → ONE Leader row,
+  ONE stream → real signed 0x0C03 back through R → both consumers
+  receive, verify, AND project; chain drains. (2) warm-starts only
+  for newly created rows + the D>ttl/2 starvation regression e2e.
+  (3) every slot swept for row liveness. (4)
+  `ObservationCell::update_interval` re-anchors deadlines without
+  resetting continuity (tighten+loosen unit-tested); re-anchored on
+  every beat/feed. (5) self-provider Local watch consumes the
+  origin's signed beats (bearing by definition); Local warm-start;
+  cell survival sweep with overlay notification. (6) TopK sorts
+  viable by route+start economics with id tie-break; Each
+  budget-gates (over-budget Ready → locally Unknown);
+  `sensing_aggregate_view` takes the resolved expected population
+  (missing → Unknown branches; None refuses complete/NotReady).
+  (7) post-admission liveness recheck reclaims mid-intake-expired
+  branch state. (8) unknown 0x0C03 stream ids drop as malformed.
+  (9) flagship evidence: laundering asserted immediately on
+  provisional receipt, down-sampling by inter-delivery spacing
+  (min gap ≥ 400 ms on the 500 ms schedule), edge proven within
+  250 ms of a known delivery, header corrected. Verification:
+  4899 lib (138 sensing), 13 sensing e2e across four files, both
+  clippy gates, fmt — green. Awaiting re-review to lift the SI-5
+  hold.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
