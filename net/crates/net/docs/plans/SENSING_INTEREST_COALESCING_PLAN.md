@@ -38,8 +38,12 @@ predicate); **SI-6 review (2026-07-14): CHANGES REQUESTED — closure
 LANDED same day** (unified scheduler-input generation +
 scheduler-relevant intake tuple; overlay candidates ride the
 resolved-population seam; SI-6.1 leader fold reconciliation;
-mechanical net-only strict clippy; all red-green, §6). Next: SI-5 +
-SI-6 re-review; SI-7 holds behind both.
+mechanical net-only strict clippy; all red-green, §6).
+**Combined re-review (2026-07-15): SI-5 SIGNED OFF — COMPLETE; SI-6
+core items SIGNED OFF; SI-6.1 CHANGES REQUESTED** — two blocking
+edge cases (full active-set replacement loses consumer rows; fold
+reconciliation has no trailing-edge repair; disposition in §6).
+Next: SI-6.1 closure; SI-7 holds behind it.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1846,6 +1850,78 @@ must exercise the real dispatch path.
   (scheduler bridge 1, leader delivery 8, failure plane 5), both
   strict clippy gates, fmt. Awaiting re-review with the SI-5
   closure; SI-7 holds behind both.
+
+  *Combined re-review disposition (2026-07-15): SI-5 SIGNED OFF —
+  COMPLETE; SI-6 core items SIGNED OFF; SI-6.1 CHANGES REQUESTED;
+  SI-7 HOLD.* Reviewer-verified at cac8044d9 (clean detached
+  worktree: 4,911 lib all-features, all sensing suites, fmt, both
+  strict clippy `-D warnings` gates, `git diff --check`). SI-5
+  protocol semantics, failure-plane witnesses, and static gates all
+  signed off — the three-way epoch decision and the live
+  direct-session predicate (directness from `addr_to_node`,
+  liveness from the detector, mere `peers` presence insufficient)
+  are confirmed correct, with one non-blocking comment cleanup: the
+  0x0C03 intake comment still says a stale provider epoch "applies
+  per-branch below," which the code now correctly does NOT do.
+  SI-6 projection/classification, scheduler wake-up, overlay
+  population, and matcher/claim integration: signed off (tuple
+  comparison, unified generation, caller-owned budgets, and
+  rematch-sampled EWMA drift all confirmed). SI-6.1 provider
+  teardown: signed off. Two blocking SI-6.1 edge cases, closed in
+  the reviewer's order:
+  (1) *Full active-set replacement loses every consumer row*
+  (`reconcile_with_snapshot`). Consumer rows derive from
+  `kept.first()` AFTER teardown — when the whole old active set is
+  replaced (old [A], fresh [B]), `kept` is empty, so the
+  replacement branch acquires NO downstream rows; the mesh caller's
+  `aggregate` returns None and skips the Leader row + upstream
+  demand. The leader then claims B is active while no real consumer
+  rows, mesh row, or upstream registration exist — sensing does not
+  resume event-driven (a later consumer refresh is soft-state
+  repair, not the fold-reconciliation contract). Required: snapshot
+  a DEDUPLICATED consumer-row union across ALL old live branches
+  BEFORE removing any branch (partial refusals make branch
+  populations non-identical — a consumer present only on another
+  old branch must not be lost); every replacement receives the
+  surviving union; a branch is reported `added` only if it acquired
+  live downstream demand; with no surviving demand the interest
+  DRAINS rather than retaining a ghost active branch. Witnesses:
+  the reviewer's exact [A]→[B] full-replacement unit ("the
+  replacement branch must inherit the surviving consumer row" —
+  left `[]`, right `[Peer(193)]`), and multiple old branches with
+  non-identical downstream populations proving the surviving union.
+  (2) *Fold-reconciliation damper has no trailing-edge repair*
+  (`reconcile_sensing_leader_fold`). The hook reuses
+  `sensing_upstream_damper_admits` — explicitly a plain
+  leading-edge min-gap damper — so an in-window change is simply
+  rejected and nothing is scheduled at the window boundary.
+  Particularly exposed because every capability announcement scans
+  ALL capability ids with live interests: an unrelated announcement
+  stamps capability C's gate, C's real membership change arriving
+  inside the 100 ms window is suppressed, and with no later
+  announcement or consumer refresh C's branch set stays stale until
+  soft-state repair (the unified scheduler generation still wakes —
+  the leader's own resolution is what stays unreconciled).
+  Required: a DEDICATED per-capability leading-plus-trailing-edge
+  coalescer — first change reconciles immediately; in-window
+  changes mark exactly one pending reconciliation; exactly one
+  FRESH-snapshot reconciliation runs at the window boundary;
+  further in-window changes coalesce into it. Do not reuse the
+  registration damper for this semantic state transition. Witness:
+  consume C's leading edge with an unrelated fold announcement,
+  mutate C's eligible population inside the gap, emit no later
+  announcement and no consumer refresh, and verify the trailing
+  reconciliation replaces/retires branches after the gap.
+  Non-blocking note (to take): the island→band precompute removed
+  fold queries from the sort comparator, but still issues one
+  `IslandQuery::Get` per island — separate fold reads, so
+  concurrent updates can produce a mixed-time map; the comment's
+  "ONE topology snapshot" claim is stronger than the
+  implementation. Query the topology once (`IslandQuery::All`) and
+  derive every band from that single returned view. Scope, per the
+  reviewer: "a narrow SI-6.1 closure: snapshot consumer demand
+  before teardown, correctly populate replacements, and give fold
+  reconciliation a real trailing edge."
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
