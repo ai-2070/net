@@ -1636,6 +1636,44 @@ must exercise the real dispatch path.
   (§4.7 membership dynamics) likewise rides the SI-6 slice.
   Verification: 4,904 lib all-features, 37 sensing e2e across ten
   suites, both clippy gates (incl. `-D warnings`), fmt — green.
+  *SI-5 review disposition (2026-07-14): CHANGES REQUESTED.*
+  Architecture SOUND; landed witnesses green but incomplete; the
+  reviewer reran all gates against a clean worktree and dynamically
+  reproduced the P0. Two-item closure (bounded, not a rewrite):
+  1. **(P0, blocker) globally stale epoch resurrects a superseded
+     sibling:** the provider-wide epoch comparison had only
+     advance/no-op — an incoming epoch OLDER than
+     `provider_epochs[origin]` fell through to normal intake, and
+     because the observer gate is per (origin, digest), a delayed
+     old-incarnation (or old-generation) beat on ANOTHER digest
+     still admitted; a continuity-bearing one re-Established the
+     sibling the supersession just force-expired (reviewer repro:
+     establish A+B under inc 5 → advance A to 6 (B expires) →
+     newer-seq B beat from inc 5 → B came back Established). A
+     valid-but-obsolete signed Ready must not restore optimism the
+     provider's newer boot/definition globally invalidated.
+     Closure: THREE-way epoch standing — `incoming > current` =
+     advance + disrupt + process; `==` = process; `<` = DROP the
+     attestation before latest/cells/forwarding/overlay mutation.
+     Witnesses both axes (delayed old incarnation AND old
+     generation on a sibling after supersession).
+  2. **(P1) `peers.contains_key` is not "live direct session":** a
+     `connect_via` destination stays in `peers` with the RELAY's
+     address, so both routeless fallbacks (failure hook,
+     withdrawal intake) misclassified a relayed PeerInfo as a live
+     direct session and skipped disruption — defeating the
+     route-age-out race handling. Closure: one shared live-direct
+     predicate (PeerInfo.addr + `addr_to_node[addr] == provider`
+     reverse mapping — `promotable_direct_hop`'s discriminator —
+     plus failure-detector status where available), used at both
+     sites; unit witnesses of the misclassification + a
+     relayed-PeerInfo path regression.
+  Passed review: the shared disruption core, hop-rule/overlay
+  coherence, leader-relay parity, pre-reroute ordering, downstream
+  removal + stamped retirement, leader-row drain, newer-epoch
+  re-establishment, interest/branch survival; no additional
+  lock-order or reclamation blockers found.
+  Gate: SI-5 sign-off CHANGES REQUESTED; SI-6 HOLD.
 - **SI-6 — scheduler bridge.** Aggregate views join candidate
   pruning through the same projection seam as local liveness;
   compound AND/gang semantics stay in the scheduler; claim targets
