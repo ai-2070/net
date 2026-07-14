@@ -21,9 +21,13 @@ mesh-relay invariants were not carried over (one P0 + eight P1s);
 PASSED (2026-07-14)** — all nine items verified item-by-item; the
 one mechanical gate (strict-clippy type-complexity on the
 expectation-map tuple) is closed with the named
-`CapabilityInterestExpectation` record. **SI-4 COMPLETE; SI-5
-AUTHORIZED** ("no further SI-4 architectural review is required").
-Next: SI-5.
+`CapabilityInterestExpectation` record. **SI-4 COMPLETE** ("no
+further SI-4 architectural review is required"); **SI-5 COMPLETE
+as-built (2026-07-14)** — the §4.8 failure plane wired event-driven
+at the failure-detector edge, the RT-5 withdrawal intake, and the
+epoch-supersession seam, witnessed by the new
+`sensing_failure_plane` suite (as-built note in §6, awaiting
+review). Next: SI-5 review; then SI-6 (scheduler bridge).
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1577,6 +1581,57 @@ must exercise the real dispatch path.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
+  *SI-5 as-built (2026-07-14, 1e5f7981f; under the operator's
+  direction, per the SI-4 sign-off's "SI-5 is authorized"):* §4.8
+  wired event-driven at three seams over a shared disruption core
+  (`SensingObservations::disrupt_provider` +
+  `SensingRelay::disrupt_provider` — the leader relay carries every
+  rule, the second-relay lesson applied ahead of review; recovery is
+  the ordinary soft-state machinery, no bespoke re-establishment
+  protocol).
+  1. **Failure-detector edge** (items 1+2): the on_failure callback
+     (sensing state hoisted above the detector's construction, run
+     BEFORE the reroute policy mutates route state) treats a Failed
+     peer as a sensing event on both sides. As PROVIDER — direct,
+     next_hop-through-the-failed-peer, or already-routeless with no
+     live session (the 3× route age-out can beat the failure edge;
+     the reachability verdict is the same) — observations expire
+     (PathFailed). As DOWNSTREAM, its mesh rows drop (reclaim,
+     stamped emitter retire, upstream deregister, window re-anchor)
+     and its leader-relay rows drop
+     (`SensingLeader::remove_downstream`), with the mesh Leader row
+     retired or re-scoped at the survivors' aggregate.
+  2. **RT-5 withdrawal intake** (item 1): an admitted withdrawal
+     that dropped our route toward dest — or that confirms a dest
+     already routeless with no direct session — expires the
+     provider's observations here and at the co-located leader
+     relay. The sensing consequence keys on REACHABILITY, not only
+     the exact (dest, via) pair.
+  3. **Epoch supersession** (items 3+4): a provider epoch advance
+     disrupts ALL the origin's branches at this hop — incarnation
+     axis as IncarnationSuperseded, generation axis as
+     GenerationChanged — instead of each sibling cell waiting for
+     its own next beat; the arriving beat's own branch
+     re-establishes through the ordinary cell semantics, and
+     interests/branches survive (they never bound the epoch).
+  Witnesses (`tests/sensing_failure_plane.rs`, 5 e2e; LONG-ttl rows
+  + 6 s continuity windows make every disruption unambiguously
+  event-driven; each wiring red-verified independently): provider
+  failure → Expired/Unknown + overlay + origin retires the dead
+  consumer's stream ahead of ttl + heal/re-pin/re-register →
+  Ready; next_hop failure (failed peer ≠ provider); received
+  withdrawal (provider dead two hops away — the consumer's own
+  detector never fires); consumer failure drains leader demand +
+  retires the provider stream ahead of ttl; epoch supersession of
+  sibling branches, both axes, with new-epoch beats resuming.
+  Bounds: "Any fails over to standby / re-expands" stays the
+  Layer-1 consumer's move through the overlay signal + the
+  existing `expand_to_standby` seam (§4.7 exploration is owned by
+  the local resolver — SI-6's scheduler bridge consumes the
+  signal); leader candidate-set recomputation on fold changes
+  (§4.7 membership dynamics) likewise rides the SI-6 slice.
+  Verification: 4,904 lib all-features, 37 sensing e2e across ten
+  suites, both clippy gates (incl. `-D warnings`), fmt — green.
 - **SI-6 — scheduler bridge.** Aggregate views join candidate
   pruning through the same projection seam as local liveness;
   compound AND/gang semantics stay in the scheduler; claim targets
