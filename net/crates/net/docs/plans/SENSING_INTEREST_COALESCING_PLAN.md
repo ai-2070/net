@@ -15,10 +15,11 @@ the provider-free leader return path is connected
 e2e) and all nine review items are closed as-built (§6);
 **SI-4 re-review (2026-07-14): REQUEST CHANGES again** — the direct
 relay path and the remote-provider leader fan-out are VERIFIED, but
-the leader is now a second relay implementation and several
-corrected mesh-relay invariants were not carried over (one P0 +
-eight P1s, disposition in §6). Next: land the second closure round;
-SI-5 holds until SI-4 clears.
+the leader is a second relay implementation and several corrected
+mesh-relay invariants were not carried over (one P0 + eight P1s);
+**second closure round LANDED same day** — all nine items as-built
+in §6, red-green verified. Next: SI-4 re-re-review; SI-5 holds
+until it clears.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
 operator's direction; the semantic gate review remains closed.
@@ -1479,6 +1480,76 @@ must exercise the real dispatch path.
   Gate: direct provider-targeted delivery / Leader-Local separation /
   remote-provider fan-out / strengthened evidence VERIFIED; SI-4
   sign-off WITHHELD; SI-5 HOLD.
+  *SI-4 second closure round as-built (2026-07-14, 76b267f11 docs +
+  c122ad7a9 / 044a4fbe3 / 2a48ff922 / f96b92f1b / 26f87296a /
+  b18e80970):* all nine items landed in the reviewer's order, each
+  red-green verified against the pre-fix behavior.
+  (1 P0) Leader-as-provider: the leader intake feeds a locally
+  resolved provider's Leader row into the origin emitter
+  (`feed_sensing_origin`), and the emitter loop dispatches locally
+  signed beats three-way — Peer→frame, Local→own overlay,
+  Leader→`on_attestation`→real frames (wire bytes from the latest
+  cache on (incarnation, seq)). E2e
+  `leader_resolved_as_provider_serves_its_own_proofs` (R == P; both
+  consumers receive/verify/project; chain drains).
+  (2) `SensingRelay::register_downstream` warm-starts ONLY newly
+  created rows; the D>TTL/2 starvation regression runs through
+  `register_capability_interest`
+  (`provider_free_ttl_half_refreshes_do_not_starve_leader_delivery`,
+  6 s hold past the full starvation horizon). The SI-0 laundering
+  test re-specced: the cached-101 hop rides an expired-row re-join.
+  (3) `SensingRelay` gains `reclaim_branch` (final row death drops
+  cache + slots; the LRU-bounded seq gate deliberately stays so
+  replayed beats can't re-admit), `gc_dead_slots`, and an honest
+  `is_drained`; `SensingLeader::sweep` drives both. Units: same-key
+  re-registration gets no stale warm-start; 50-key churn retains
+  nothing; the two existing drain tests now check honestly.
+  (4) `SensingLeader::on_refusal` partitions the REAL consumer rows
+  on floor M (`LeaderInterest` caches the validated spec — the
+  leader is the spec-holding subscriber);
+  `apply_sensing_leader_refusal` forwards the provider's EXACT
+  signed bytes to refused consumers and re-registers the survivors'
+  aggregate (damper deliberately bypassed — the refusal lands inside
+  the provoking registration's min-gap), wired at BOTH refusal sites
+  (0x0C03 intake with a liveness re-check superseding the stale
+  branch-death teardown; local-origin feed via the returned signed
+  bytes). E2e: A@10ms refused with P's exact signed refusal (tagged
+  floor 50ms), B@100ms retained with fresh proofs advancing.
+  UNDECLARED ADJACENT DEFECT found + fixed: provider epoch advance
+  invalidated cached floors in the mesh table only — the leader
+  relay's table now invalidates too.
+  (5) aggregate-D changes re-anchor live cells at EVERY table
+  mutation (registration/refresh at both intakes and both APIs,
+  leader-row demand, refusal partitions, deregister, sweep expiry;
+  `SensingRelay::register_downstream`/`update_branch_interval` on
+  the leader relay). Units tighten (relay) + loosen (leader sweep);
+  e2e `interval_changes_re_anchor_windows_with_no_intervening_beat`
+  silences the origin with a real partition, then proves the
+  deadline moves inward (suspicion at +700 ms where the stale window
+  held ≥ 800 ms) and outward (Established at +1500 ms where the
+  stale window had expired; honest expiry later).
+  (6) the sweep classifies EVERY materialized branch: a live watch
+  or any live row preserves the branch, live watch or Local row
+  preserves the consumer cell, neither → full `reclaim_branch` +
+  overlay signal on disappearing projections. E2e: expiry drains
+  observations + epochs to zero with the overlay fired, then a fresh
+  registration flows again (reuse).
+  (7) `sensing_aggregate_view(Some(set))` FILTERS to set members
+  before completing with Unknowns — witnessed with two Ready cells
+  (self-provider + leader-delivered): population [r] supports
+  exactly [r]; a phantom-only population projects Unknown/[].
+  (8) the expectation retains its audience; after signature
+  verification the origin's pinned entity must derive that owner
+  root (v1 single-owner, matching the disclosed e2e assumption) —
+  a distinct signer that merely knows the digest is a scope refusal,
+  never stored/projected (e2e with an honestly pinned attacker).
+  (9) `sensing_capability_interests` capped at
+  `max_interests_per_peer` (new keys AtCapacity, refreshes admitted
+  at capacity).
+  Verification: 4,904 lib tests all-features (143 sensing, +5
+  units), 32 e2e across all nine sensing suites (7 in
+  sensing_leader_delivery.rs), both clippy gates, fmt — green.
+  Awaiting the next re-review to lift the SI-5 hold.
 - **SI-5 — failure-plane integration.** Withdrawal / Failed /
   incarnation / generation → per-provider expiry + local aggregate
   recompute + re-registration.
