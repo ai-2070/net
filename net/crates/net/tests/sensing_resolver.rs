@@ -346,6 +346,43 @@ async fn foreign_only_population_resolves_no_branches() {
     );
     assert!(r.sensing_table_is_empty(), "no branch rows remain either");
 
+    // Coverage gap closed (second-round review): the refusal
+    // retained ZERO state precisely so the next refresh
+    // RE-RESOLVES — when an authorized provider appears later, the
+    // consumer's very next re-registration picks it up. The
+    // declarer pins under the OWNER entity (the root R serves), so
+    // §4.10 authorizes it.
+    let owner_entity = a.entity_keypair().entity_id().clone();
+    inject_declarer(
+        &r,
+        D1_AUTHORIZED,
+        &owner_entity,
+        1,
+        &["print.document"],
+        1_000,
+    );
+
+    let mut resolved = false;
+    for _ in 0..40 {
+        a.send_subprotocol(r_addr, SUBPROTOCOL_SENSING_INTEREST, &bytes)
+            .await
+            .expect("A re-sends the registration");
+        if poll_until(Duration::from_millis(250), || {
+            r.sensing_leader_interest_count() == Some(1)
+        })
+        .await
+        {
+            resolved = true;
+            break;
+        }
+    }
+    assert!(resolved, "a later-announced provider resolves on refresh");
+    assert_eq!(
+        r.sensing_leader_branches(&key),
+        Some(vec![D1_AUTHORIZED]),
+        "the refresh resolved the newly authorized declarer",
+    );
+
     a.shutdown().await.expect("shutdown A");
     r.shutdown().await.expect("shutdown R");
 }

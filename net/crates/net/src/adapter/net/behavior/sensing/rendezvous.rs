@@ -49,7 +49,7 @@ use super::identity::{
     ProviderInterestKey,
 };
 use super::scope::{validate_subscriber_scope, ScopeError};
-use super::table::{DownstreamId, UpstreamAction};
+use super::table::{DownstreamId, RegisterOutcome, UpstreamAction};
 
 /// Observer id fed to [`elect`]: never a member, so the
 /// self-RTT-zero bias can't fire and the ranking is identical for
@@ -214,8 +214,18 @@ pub struct LeaderRegistration {
     /// The coalescing identity this registration joined.
     pub interest: CapabilityInterestKey,
     /// The providers this interest actively senses (leader-resolved,
-    /// bounded).
+    /// bounded) — the SEMANTIC branch set, which other consumers may
+    /// be keeping alive.
     pub branches: Vec<u64>,
+    /// The branches on which THIS registration was actually admitted
+    /// (`RegisterOutcome::Registered`) — the partial-admission
+    /// distinction from the SI-3 sign-off residual: "at least one
+    /// branch exists globally" is not "this registration was
+    /// admitted on a branch". Never empty (an all-refused
+    /// registration errs with
+    /// [`ResolutionRefusal::AllBranchesRefused`] instead); demand
+    /// derivation must use THIS set, never `branches`.
+    pub admitted_branches: Vec<u64>,
     /// Whether this registration triggered candidate resolution
     /// (first consumer) or joined an existing row (coalesced).
     pub newly_resolved: bool,
@@ -296,12 +306,10 @@ impl SensingLeader {
             .map(|entry| entry.active.clone())
             .unwrap_or_default();
         let mut warm_starts = Vec::new();
+        let mut admitted_branches = Vec::new();
         for provider in &branches {
             let branch = ProviderInterestKey::new(key.clone(), *provider);
-            // A refused registration (cached floor, cap) simply
-            // yields no warm-start; the outcome surfaces through the
-            // table exactly as it does for any relay.
-            let (_outcome, warm) = self.relay.register_downstream(
+            let (outcome, warm) = self.relay.register_downstream(
                 &branch,
                 downstream,
                 requested_sample_interval,
@@ -309,29 +317,43 @@ impl SensingLeader {
                 proven_root,
                 now,
             );
+            // SI-3 sign-off residual: record which branches admitted
+            // THIS registration — a refused branch (cached floor,
+            // per-downstream cap) yields no warm-start AND no
+            // admitted entry, so the caller can never reconstruct
+            // demand for it.
+            if matches!(outcome, RegisterOutcome::Registered(_)) {
+                admitted_branches.push(*provider);
+            }
             if let Some(delivery) = warm {
                 warm_starts.push(delivery);
             }
         }
-        // Standing SI-2 orphan-cap finding, closed in the SI-3
-        // second closure round: the sweep drains interests ONLY
-        // through branch-table expiry, so an interest with zero
-        // live branch rows (every registration refused — per-
-        // downstream cap, cached floor) would sit outside expiry
-        // forever. Admit the interest only while at least one
-        // branch row is live; otherwise remove it and refuse —
-        // soft state, the consumer's refresh retries.
-        let any_branch_live = branches.iter().any(|provider| {
-            let branch = ProviderInterestKey::new(key.clone(), *provider);
-            self.relay.table.aggregate(&branch, now).is_some()
-        });
-        if !any_branch_live {
-            self.interests.remove(&key);
+        // A registration admitted on NO branch is refused — even
+        // when other consumers keep the interest's branches live
+        // (the sign-off residual's second manifestation: a ghost
+        // registration would look successful while owning no
+        // downstream row, visible the moment SI-4 delivers proofs).
+        // Soft state: the consumer's refresh retries.
+        if admitted_branches.is_empty() {
+            // Standing SI-2 orphan-cap rule: the interest itself is
+            // removed only when NO branch row is live globally —
+            // the sweep drains interests only through branch-table
+            // expiry, so a fully rowless interest would sit outside
+            // expiry forever. Other consumers' live rows keep it.
+            let any_branch_live = branches.iter().any(|provider| {
+                let branch = ProviderInterestKey::new(key.clone(), *provider);
+                self.relay.table.aggregate(&branch, now).is_some()
+            });
+            if !any_branch_live {
+                self.interests.remove(&key);
+            }
             return Err(ResolutionRefusal::AllBranchesRefused);
         }
         Ok(LeaderRegistration {
             interest: key,
             branches,
+            admitted_branches,
             newly_resolved,
             warm_starts,
         })
@@ -663,6 +685,122 @@ mod tests {
             .register_capability_interest(&second, other, ms(100), TTL, root(), &snapshot, now)
             .expect("fresh downstream admits");
         assert_eq!(leader.interest_count(), 2);
+    }
+
+    /// SI-3 sign-off residual: a PARTIAL admission must report
+    /// exactly the branches this registration was admitted on —
+    /// `branches` is the semantic set, `admitted_branches` is what
+    /// the caller may derive demand from. Before the fix the caller
+    /// saw all branches and reconstructed demand for the refused
+    /// ones from the request interval.
+    #[test]
+    fn partial_admission_records_only_admitted_branches() {
+        let now = Instant::now();
+        // Fanout 2 → two active branches per interest; a per-
+        // downstream cap of 3 leaves room for exactly ONE more row
+        // after the first interest's two.
+        let policy = CandidatePolicy {
+            initial_fanout: 2,
+            standby_count: 0,
+            maximum_fanout: 3,
+            each_mode_max_providers: 32,
+        };
+        let mut leader = SensingLeader::new(root(), policy, K, 3);
+        let snapshot = [provider(0xB1, 5), provider(0xB2, 7)];
+        let consumer = DownstreamId::Peer(0xC1);
+
+        let first = spec();
+        let full = leader
+            .register_capability_interest(&first, consumer, ms(100), TTL, root(), &snapshot, now)
+            .expect("both branches admit under the cap");
+        assert_eq!(full.branches, vec![0xB1, 0xB2]);
+        assert_eq!(full.admitted_branches, vec![0xB1, 0xB2]);
+
+        // Second interest: the third row admits, the fourth is
+        // OverCap — a PARTIAL admission.
+        let mut second = spec();
+        second.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+        let partial = leader
+            .register_capability_interest(&second, consumer, ms(100), TTL, root(), &snapshot, now)
+            .expect("a partially admitted registration still succeeds");
+        assert_eq!(partial.branches, vec![0xB1, 0xB2], "semantic set intact");
+        assert_eq!(
+            partial.admitted_branches,
+            vec![0xB1],
+            "demand may derive only from the admitted branch",
+        );
+        // The refused branch really has no row behind it — the old
+        // fallback would have re-manufactured its demand.
+        let refused_branch = ProviderInterestKey::new(second.key(), 0xB2);
+        assert_eq!(leader.relay.table.aggregate(&refused_branch, now), None);
+    }
+
+    /// SI-3 sign-off residual, second manifestation: a consumer
+    /// refused on EVERY branch of an interest that OTHER consumers
+    /// keep live must be refused — not ghost-registered ("at least
+    /// one branch exists globally" is not "this registration was
+    /// admitted on a branch"). The interest itself stays: the live
+    /// consumer owns it.
+    #[test]
+    fn refused_joiner_on_live_interest_is_refused_not_ghosted() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1);
+        let snapshot = [provider(0xB1, 5)];
+        let live_consumer = DownstreamId::Peer(0xC1);
+        let full_consumer = DownstreamId::Peer(0xC2);
+
+        let shared = spec();
+        leader
+            .register_capability_interest(
+                &shared,
+                live_consumer,
+                ms(100),
+                TTL,
+                root(),
+                &snapshot,
+                now,
+            )
+            .expect("the live consumer admits");
+
+        // Fill the joiner's per-downstream cap elsewhere …
+        let mut other = spec();
+        other.constraints = CanonicalConstraints::from_entries([("media", "letter")]).unwrap();
+        leader
+            .register_capability_interest(
+                &other,
+                full_consumer,
+                ms(100),
+                TTL,
+                root(),
+                &snapshot,
+                now,
+            )
+            .expect("the joiner's own interest admits");
+
+        // … then join the LIVE shared interest: every branch refuses
+        // (cap), so the registration must err even though the
+        // interest's branch is globally live.
+        let ghost = leader.register_capability_interest(
+            &shared,
+            full_consumer,
+            ms(100),
+            TTL,
+            root(),
+            &snapshot,
+            now,
+        );
+        assert!(
+            matches!(ghost, Err(ResolutionRefusal::AllBranchesRefused)),
+            "expected AllBranchesRefused, got {ghost:?}",
+        );
+        // The live consumer's interest and row are untouched.
+        assert_eq!(leader.interest_count(), 2);
+        let branch = ProviderInterestKey::new(shared.key(), 0xB1);
+        assert_eq!(
+            leader.relay.table.aggregate(&branch, now),
+            Some(ms(100)),
+            "the live consumer's demand stands",
+        );
     }
 
     fn proof(

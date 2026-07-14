@@ -11215,22 +11215,30 @@ impl MeshNode {
                     // Demand thus merges at the leader BEFORE the
                     // provider hop: N consumers → one Local row →
                     // one upstream registration.
+                    //
+                    // SI-3 sign-off residual: demand derives ONLY
+                    // from the branches THIS registration was
+                    // admitted on, and ONLY from actual table
+                    // aggregates. The former
+                    // `unwrap_or(requested_sample_interval)`
+                    // fallback reconstructed demand for branches
+                    // whose registration was REFUSED (a partial
+                    // admission's rowless branches read back as the
+                    // refused request) and pushed it upstream
+                    // anyway.
                     let branch_demands: Vec<(u64, Duration)> = registration
-                        .branches
+                        .admitted_branches
                         .iter()
-                        .map(|provider| {
+                        .filter_map(|provider| {
                             let branch = sensing::ProviderInterestKey::new(
                                 registration.interest.clone(),
                                 *provider,
                             );
-                            (
-                                *provider,
-                                leader
-                                    .relay
-                                    .table
-                                    .aggregate(&branch, now)
-                                    .unwrap_or(*requested_sample_interval),
-                            )
+                            leader
+                                .relay
+                                .table
+                                .aggregate(&branch, now)
+                                .map(|strictest| (*provider, strictest))
                         })
                         .collect();
                     drop(slot);
