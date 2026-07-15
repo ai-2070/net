@@ -575,10 +575,19 @@ impl SensingLeader {
         now: Instant,
     ) -> Option<(u64, Option<Delivery>)> {
         let entry = self.interests.get_mut(key)?;
-        if entry.standby.is_empty() {
-            return None;
-        }
-        let promoted = entry.standby.remove(0);
+        // Promote the first standby provider that is not ALREADY
+        // active. reconcile_with_snapshot keeps active and standby
+        // disjoint, so this skip is defence-in-depth against a stale
+        // overlap — promoting an already-active provider would push a
+        // duplicate into `active` (double-counted load, a redundant
+        // branch re-registration).
+        let promoted = loop {
+            let candidate = *entry.standby.first()?;
+            entry.standby.remove(0);
+            if !entry.active.contains(&candidate) {
+                break candidate;
+            }
+        };
         entry.active.push(promoted);
         let branch = ProviderInterestKey::new(key.clone(), promoted);
         let (_, warm) = self.relay.register_downstream(
@@ -852,7 +861,20 @@ impl SensingLeader {
                 kept.push(*provider);
                 reconciliation.added.push((branch, spec.clone()));
             }
-            reconciliation.changed |= kept != old_active || old_standby != resolved.standby;
+            // A provider retained in `active` (`kept`) must never also
+            // sit in `standby`: `resolved.standby` is the fresh
+            // resolution's standby, computed independently of the
+            // incumbents we kept, so the two CAN overlap (e.g. a fold
+            // shift re-ranks an active provider into standby while it
+            // stays eligible). Filter `kept` out — otherwise
+            // expand_to_standby would later promote an already-active
+            // provider and duplicate the branch in `active`.
+            let new_standby: Vec<u64> = resolved
+                .standby
+                .into_iter()
+                .filter(|provider| !kept.contains(provider))
+                .collect();
+            reconciliation.changed |= kept != old_active || old_standby != new_standby;
             if kept.is_empty() {
                 // No branch holds live demand: the interest DRAINS —
                 // the sweep's own rule — never a ghost active set.
@@ -862,7 +884,7 @@ impl SensingLeader {
             }
             if let Some(entry) = self.interests.get_mut(&key) {
                 entry.active = kept;
-                entry.standby = resolved.standby;
+                entry.standby = new_standby;
             }
         }
         reconciliation
@@ -1602,6 +1624,70 @@ mod tests {
         assert_eq!(healed1, Some(1));
         leader2.sweep(t0 + TTL);
         assert!(leader2.is_drained(), "the losing island's leader drains");
+    }
+
+    #[test]
+    fn reconcile_keeps_active_and_standby_disjoint_so_expansion_never_duplicates() {
+        // 2026-07-15 review §4: when a fold re-ranks an active provider
+        // below a standby one while the incumbent stays eligible,
+        // reconcile keeps the incumbent active BUT `resolved.standby`
+        // (computed independently) names that same incumbent. Assigning
+        // it unfiltered left the provider in BOTH sets, and a later
+        // expand_to_standby then promoted it into `active` a second
+        // time (active = [A, A]). The sets must stay disjoint.
+        let t0 = Instant::now();
+        let policy = CandidatePolicy {
+            initial_fanout: 1,
+            standby_count: 2,
+            maximum_fanout: 1,
+            each_mode_max_providers: 32,
+        };
+        let mut leader = SensingLeader::new(root(), policy, K, 3, TTL);
+        let c = DownstreamId::Peer(1);
+        let spec = spec();
+        let key = spec.key();
+
+        // A is closest → active=[A]; B waits in standby.
+        leader
+            .register_capability_interest(
+                &spec,
+                c,
+                ms(100),
+                TTL,
+                root(),
+                &[provider(0xA, 10), provider(0xB, 20)],
+                t0,
+            )
+            .expect("A resolves");
+        assert_eq!(leader.branches(&key), vec![0xA]);
+
+        // The fold re-ranks: B is now closest, but A stays eligible,
+        // so incumbency keeps A active and resolution offers A back as
+        // standby — exactly the overlap the fix must filter out.
+        leader.reconcile_with_snapshot(
+            &spec.capability_id,
+            &[provider(0xA, 30), provider(0xB, 5)],
+            t0 + ms(10),
+        );
+        assert_eq!(
+            leader.branches(&key),
+            vec![0xA],
+            "incumbent A stays active exactly once",
+        );
+
+        // A was filtered out of standby, so there is nothing to
+        // promote — and, crucially, A is never duplicated into active.
+        assert!(
+            leader
+                .expand_to_standby(&key, c, ms(100), TTL, root(), t0 + ms(20))
+                .is_none(),
+            "the re-ranked incumbent is not a promotable standby",
+        );
+        assert_eq!(
+            leader.branches(&key),
+            vec![0xA],
+            "active still holds A exactly once — no standby re-promotion duplicated it",
+        );
     }
 
     #[test]
