@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_20457e56f05db2::t_79ab7a88ef5b9a 5095-5112,5123-5130
+  s_20457e56f05db2::t_242b3258e428a1 4850
+net/crates/net/tests/route_withdraw.rs
+  s_20457e56f05db2::t_e4c9b4bee35c84 207,217,225,230,238-244,248-257,278,284,289-290,293-310
+  s_20457e56f05db2::t_cd800b1c53bdb6 208-216,218-224,226-229,231-237,245-247,258-277,279-283,285-288,291-292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a8d9f1bba3ba60d770d6f09d3f71d64c5cfdca06",
+  "prompts": {},
+  "sessions": {
+    "s_20457e56f05db2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "304d82b1-ccb6-4126-8be7-640b4a26ff5b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
