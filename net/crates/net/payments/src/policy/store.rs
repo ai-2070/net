@@ -197,6 +197,38 @@ where
     Ok(result)
 }
 
+/// Like [`mutate_json`], but the closure returns `(R, dirty)`: the store is
+/// serialized + fsync'd + renamed **only when `dirty` is true**. A read-only
+/// outcome — e.g. a payment-redemption *denial*, which inspects a record but
+/// changes nothing — pays the lock + load, not a whole-file durable write.
+///
+/// This closes a write-amplification / denial-of-service surface: with plain
+/// `mutate_json`, an outcome that mutates nothing still re-serializes and
+/// `fsync`s the entire store, so a caller spraying (say) unknown quote ids
+/// could force one global-lock + fsync per attempt. See
+/// `docs/performance/payments-redeem-write-amplification.md`.
+///
+/// **At-most-once is unchanged.** The load, decision, and conditional save
+/// all run under the *same* advisory lock, so a check-and-set
+/// (settled-and-not-yet-redeemed → mark redeemed → `dirty = true`) is still
+/// atomic across processes; we only skip the write when the closure reports
+/// there was nothing to persist. A closure that mutates state but returns
+/// `dirty = false` would silently drop that mutation — so the dirty flag
+/// must be derived from the same branch that did the mutating.
+pub async fn mutate_json_if_changed<T, R, F>(path: &Path, f: F) -> Result<R, StoreError>
+where
+    T: DeserializeOwned + Serialize + Default,
+    F: FnOnce(&mut T) -> (R, bool),
+{
+    let _guard = LockGuard::acquire(path).await?;
+    let mut state: T = load_json(path).await?;
+    let (result, dirty) = f(&mut state);
+    if dirty {
+        save_json(path, &state).await?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +283,55 @@ mod tests {
             let name = name.to_string_lossy();
             name == "state.json" || name == "state.json.lock"
         }));
+    }
+
+    /// `mutate_json_if_changed` writes on a dirty pass and skips the write
+    /// on a clean one. "Skips the write" is checked by the store inode: a
+    /// save renames a fresh temp over the file (new inode), so a clean pass
+    /// that leaves the inode is proof no serialize/fsync/rename happened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutate_if_changed_writes_only_when_dirty() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // A dirty pass creates the file.
+        mutate_json_if_changed::<Counters, _, _>(&path, |s| {
+            s.counts.insert("a".into(), 1);
+            ((), true)
+        })
+        .await
+        .unwrap();
+        let ino0 = std::fs::metadata(&path).unwrap().ino();
+
+        // A clean pass reads and returns dirty=false → no rewrite.
+        let seen = mutate_json_if_changed::<Counters, _, _>(&path, |s| {
+            (s.counts.get("a").copied(), false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, Some(1));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino0,
+            "a clean (dirty=false) pass must not rewrite the store"
+        );
+
+        // A dirty pass persists (rename → new inode) and the mutation lands.
+        mutate_json_if_changed::<Counters, _, _>(&path, |s| {
+            s.counts.insert("b".into(), 2);
+            ((), true)
+        })
+        .await
+        .unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino0,
+            "a dirty pass must persist the store"
+        );
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(loaded.counts.len(), 2);
     }
 
     /// The pin store's lost-update regression, on this machinery: two
