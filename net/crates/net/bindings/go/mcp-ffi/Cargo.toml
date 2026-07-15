@@ -1,6 +1,6 @@
 [package]
 name = "net-mcp-ffi"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI for the MCP bridge pure helpers + consent/pin surface (Go binding of Net)"
@@ -31,8 +31,8 @@ default = []
 # (`bindings/python/src/{consent,mcp_helpers}.rs`) and Node
 # (`bindings/node/src/{consent,mcp_helpers}.rs`) bindings expose — the
 # one Rust implementation, three faces.
-net-sdk = { package = "net-mesh-sdk", version = "0.32.0", path = "../../../sdk", default-features = false }
-net-mcp = { package = "net-mesh-mcp", version = "0.32.0", path = "../../../adapters/mcp" }
+net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../../../sdk", default-features = false }
+net-mcp = { package = "net-mesh-mcp", version = "0.33.0", path = "../../../adapters/mcp" }
 # `block_on` the async `PinStore::mutate` / `load` from the blocking C
 # ABI entry points. A multi-thread runtime so concurrent FFI calls (the
 # C ABI is called from any thread) can `block_on` the shared runtime

@@ -1,6 +1,6 @@
 [package]
 name = "net-python"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for Net event bus"
@@ -202,13 +202,13 @@ publish = ["mcp", "delegation", "cortex"]
 a2a = ["delegation", "cortex"]
 
 [dependencies]
-net = { package = "net-mesh", version = "0.32.0", path = "../..", default-features = false }
-net-sdk = { package = "net-mesh-sdk", version = "0.32.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.33.0", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../../sdk", default-features = false, optional = true }
 # The MCP bridge adapter, for the two pure helpers only (feature `mcp`).
-net-mcp = { package = "net-mesh-mcp", version = "0.32.0", path = "../../adapters/mcp", optional = true }
+net-mcp = { package = "net-mesh-mcp", version = "0.33.0", path = "../../adapters/mcp", optional = true }
 # The payments layer (feature `payments`): the caller flow + spend
 # engine the gateway's payment gate clears paid capabilities through.
-net-payments = { version = "0.32.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
+net-payments = { version = "0.33.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 # `extension-module` is NOT hardcoded here — see the feature of the

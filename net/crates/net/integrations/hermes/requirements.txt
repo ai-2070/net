@@ -1,4 +1,4 @@
 # The plugin depends only on the public Net Python SDK, which pulls the native
 # `net-mesh` wheel. Pinned per release (the plugin never floats the SDK) — the
 # mirror at github.com/hermes-pro/net re-pins this for each build.
-net-mesh-sdk==0.32.0
+net-mesh-sdk==0.33.0

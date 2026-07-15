@@ -2688,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "net-aggregator-daemon"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "assert_cmd",
  "blake3",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "net-cli"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "net-compute-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "net-deck"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "net-deck-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "futures",
  "net-mesh",
@@ -2784,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "net-mcp-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "net-mesh-mcp",
  "net-mesh-sdk",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-mcp"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-sdk"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-sdk-macros"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "net-meshdb-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "futures",
  "net-mesh",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "net-meshos-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bytes",
  "net-mesh",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "net-node"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "net-payments"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "net-python"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "net-rpc-ffi"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "async-trait",
  "bytes",

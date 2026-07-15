@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-sdk"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ name = "net_sdk"
 [dependencies]
 # `version` is required for `cargo publish` to resolve the dep on
 # crates.io; the `path` is preferred during local workspace builds.
-net = { package = "net-mesh", version = "0.32.0", path = "..", features = [] }
+net = { package = "net-mesh", version = "0.33.0", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
@@ -48,7 +48,7 @@ schemars = { version = "1", optional = true }
 # `net-mesh-sdk-macros` ships the `#[tool]` attribute proc-macro.
 # Gated by the `macros` feature so users who don't want the
 # proc-macro2 / syn / quote dep tree don't pay for it.
-net-mesh-sdk-macros = { version = "0.32.0", path = "../sdk-macros", optional = true }
+net-mesh-sdk-macros = { version = "0.33.0", path = "../sdk-macros", optional = true }
 # OS file-change events for the pin-store change subscription
 # (`PinStore::watch`) — a true push watcher (inotify / FSEvents /
 # ReadDirectoryChangesW), so a cross-process `net mcp pin approve`

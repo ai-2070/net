@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-mcp"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 description = "MCP (Model Context Protocol) edge adapter for the Net mesh — net wrap / net mcp serve"
 license = "Apache-2.0"
@@ -48,7 +48,7 @@ keychain = [
 # `serve_tool` / `call_tool` provider+caller verbs the announce/invoke
 # slices need; it pulls `net` (the SDK tool module is written against the
 # mesh-RPC surface) and `cortex`.
-net-mesh-sdk = { version = "0.32.0", path = "../../sdk", default-features = false, features = [
+net-mesh-sdk = { version = "0.33.0", path = "../../sdk", default-features = false, features = [
     "net",
     "tool",
 ] }
