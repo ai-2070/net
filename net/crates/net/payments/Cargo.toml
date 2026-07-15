@@ -137,6 +137,10 @@ tempfile = "3"
 # only (the `admission` bars). Same criterion 0.8 as the core + sdk crates.
 criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
+# The duplicate-storm bench wraps the mock facilitator to count verify/settle
+# calls (proving "settle once" under a concurrent storm); implementing the
+# async `Facilitator` trait needs the same async-trait the crate already uses.
+async-trait = "0.1"
 # The mesh e2e test builds real two-node meshes (MeshBuilder + typed
 # nRPC); tests can't reach transitive deps, so the SDK appears here
 # with the transport features on. `tool` powers the mega-e2e's
@@ -181,6 +185,13 @@ harness = false
 # Custom harness (public reporter).
 [[bench]]
 name = "redeem_matrix"
+harness = false
+
+# P3 — duplicate acceptance + redemption storms (custom harness): the
+# money-path concurrency invariants (settle once / one billing; exactly one
+# Admitted / one handler run) measured and asserted at c16/c128.
+[[bench]]
+name = "duplicate_storm"
 harness = false
 
 # B7 — spend-policy contention: concurrent check_and_reserve against one

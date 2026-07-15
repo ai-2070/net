@@ -491,8 +491,10 @@ impl BenchMetadata {
             p99 = to_us(hist.value_at_quantile(0.99)),
             max = to_us(hist.max()),
         );
+        // Two decimals so a storm's sub-1/s admissions/unique-payments read
+        // honestly (e.g. 0.20/s) instead of rounding to 0.
         println!(
-            "      throughput: attempts/s={:.0} admissions/s={:.0} unique_payments/s={:.0}",
+            "      throughput: attempts/s={:.2} admissions/s={:.2} unique_payments/s={:.2}",
             tput.attempts_per_s, tput.admissions_per_s, tput.unique_payments_per_s,
         );
         println!(

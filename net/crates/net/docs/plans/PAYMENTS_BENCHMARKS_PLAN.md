@@ -374,7 +374,13 @@ event-bus workstream). It leads the strategic story but does not live here.
       high-volume ceiling — ~15 ms (empty) → ~55 ms (1 000 records); the
       storage move is to stop re-serializing the whole store per write, not
       more incremental locking.
-- [ ] **P3 — Separate acceptance & redemption duplicate storms** (B4, B5).
+- [x] **P3 — Separate acceptance & redemption duplicate storms** (B4, B5).
+      `benches/duplicate_storm.rs`: invariants asserted (verify/settle once +
+      one billing, timing-tolerant InProgress retry; exactly one Admitted +
+      one handler run) with a counting facilitator. Finding: correctness
+      holds, but throughput ceilings at ~26/s and p50 grows 280 ms→2 s
+      (c16→c128) — one exclusive fs2 lock + backoff serializes every attempt
+      (denials too). Baseline: `docs/performance/payments-duplicate-storms.md`.
 - [ ] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
 - [ ] **P5 — Spend contention at 0 / 100 / 1 000** (+ opt-in slow 10 000) (B7).
 - [ ] **P6 — Quote-to-billing + quote-to-handler-response mock lifecycle** (B6).
