@@ -1,0 +1,28 @@
+net/crates/net/tests/sensing_origin_emitter.rs
+  s_c28bdf38c0df3a::t_1382993b38021b 1059
+  s_c28bdf38c0df3a::t_a3cc58f0fd7aa7 499,503-508,519,521
+  s_c28bdf38c0df3a::t_19320e60ecea55 1046
+  s_c28bdf38c0df3a::t_0febd6d8b86986 1090
+net/crates/net/src/adapter/net/behavior/sensing/wire.rs
+  s_c28bdf38c0df3a::t_d72e476686f87e 814-815
+net/crates/net/src/adapter/net/behavior/sensing/frames.rs
+  s_c28bdf38c0df3a::t_43b31aab899c47 545-546
+net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs
+  s_c28bdf38c0df3a::t_2d05743768b31d 1691-1692
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "68b9d89b6752c25441498184e481fdcb9ee034fe",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
