@@ -624,6 +624,55 @@ mod tests {
     }
 
     #[test]
+    fn an_attestation_only_ever_touches_its_own_provider_branch() {
+        // A provider's readiness identity IS its branch key
+        // (`ProviderObservationKey.provider`): an attestation is
+        // keyed, gated, and stored under `key.provider`, so a signed
+        // stream from provider X can never attach to a branch
+        // registered for provider P. (At the wire hop the branch is
+        // built from the SIGNED origin and the signature is verified
+        // against that origin's pinned entity, so `origin` and
+        // `key.provider` are one identity — this is the structural
+        // reason a foreign origin cannot publish onto P's key.)
+        let t0 = Instant::now();
+        let interest = key_for("30").interest;
+        let branch_p = ProviderInterestKey::new(interest.clone(), 0xAA);
+        let branch_x = ProviderInterestKey::new(interest, 0xBB);
+        let a = DownstreamId::Peer(1);
+
+        let mut relay = SensingRelay::new(K, 512);
+        relay.register_downstream(&branch_p, a, ms(100), TTL, root(), t0);
+        assert_eq!(
+            relay.upstream_continuity(&branch_p),
+            Some(Continuity::Unestablished),
+        );
+
+        // A live, continuity-bearing Ready for provider X — the SAME
+        // interest, a DIFFERENT provider — arrives.
+        let mut origin_x = TestOrigin::new(1);
+        let out = relay.on_attestation(
+            t0 + CADENCE,
+            &origin_x.emit(&branch_x, AttestedStatus::Ready),
+            true,
+        );
+
+        assert!(
+            out.is_empty(),
+            "an attestation for an unregistered provider branch delivers nothing",
+        );
+        assert_eq!(
+            relay.upstream_continuity(&branch_p),
+            Some(Continuity::Unestablished),
+            "provider P's branch is untouched — X's stream cannot establish it",
+        );
+        assert_eq!(
+            relay.upstream_continuity(&branch_x),
+            None,
+            "no branch state is fabricated for an unregistered provider",
+        );
+    }
+
+    #[test]
     fn two_interests_on_one_capability_stay_independent() {
         // SI-0 test 7: 720p@30 and 4K@60 are two keys, two
         // observations, two lifecycles — one going Unknown never
