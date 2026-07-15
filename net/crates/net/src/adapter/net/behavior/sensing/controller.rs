@@ -212,7 +212,9 @@ pub fn resolve_candidates(
                     cap: policy.maximum_fanout,
                 });
             }
-            required.max(policy.initial_fanout).min(policy.maximum_fanout)
+            required
+                .max(policy.initial_fanout)
+                .min(policy.maximum_fanout)
         }
         ResultMode::Each => {
             if matched > policy.each_mode_max_providers {
