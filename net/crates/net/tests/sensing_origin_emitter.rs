@@ -1073,8 +1073,14 @@ async fn malformed_refusals_and_stale_epochs_touch_nothing() {
         }
     );
 
-    // ── Item 4: a STALE-epoch beat on a fresh digest neither
-    //    regresses the epoch nor flushes the floor ──
+    // ── Item 4 (updated for SI-5R P0): a globally STALE-epoch beat
+    //    on a FRESH digest is DROPPED before it can touch state —
+    //    the three-way epoch standing supersedes its digest-local
+    //    gate admission. It never becomes an observation, and it
+    //    neither regresses the provider epoch nor flushes the floor.
+    //    (Under the old SI-3R2 semantics it admitted on its fresh
+    //    digest; SI-5R P0 tightened that to a drop so a stale beat on
+    //    a sibling digest cannot re-establish a superseded branch.) ──
     await_condition(Duration::from_secs(10), "row on branch B", || {
         if c.sensing_downstreams(&branch_b).is_empty() {
             let _ = c.register_sensing_interest(&spec_b, p_id, D, LONG_TTL);
@@ -1084,10 +1090,15 @@ async fn malformed_refusals_and_stale_epochs_touch_nothing() {
         }
     })
     .await;
+    let superseded_before = SensingCounters::get(&c.sensing_counters().attestations_superseded);
     send_until!(
         beat(&spec_b, 5, 0, false, 100, 3),
-        "old-incarnation beat admits on its fresh digest",
-        c.sensing_latest_attestation(&branch_b).is_some()
+        "stale-epoch beat dropped at the provider-wide epoch gate",
+        SensingCounters::get(&c.sensing_counters().attestations_superseded) > superseded_before
+    );
+    assert!(
+        c.sensing_latest_attestation(&branch_b).is_none(),
+        "a globally stale epoch never becomes an observation (SI-5R P0)",
     );
     assert!(
         floor_cached(),
