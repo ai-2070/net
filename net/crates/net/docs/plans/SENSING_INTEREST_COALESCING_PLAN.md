@@ -52,6 +52,11 @@ delivery lifecycle counters; the divergent-resolution merge-miss
 rate that feeds the §4.1 future gate; leader-load snapshot) + the
 operator doc `docs/SENSING.md`, operator-directed. The slice
 sequence SI-0..SI-7 is now complete as-built.
+**SI-6.1 re-review (2026-07-15): both original blockers SIGNED OFF;
+one P1 (fold-coalescer sleeper-ownership race) — closure LANDED
+same day (§6)**: a generation token binds each deferred
+reconciliation to its window, so a jitter-delayed stale sleeper
+cannot steal a newer window's pending run. SI-6.1 now fully closed.
 Next: SI-6.1 re-verification + SI-7 review by Kyra.
 Authorization stance, kept honest: the SI-1 sign-off said SI-2+ was
 NOT implied — SI-2+ implementation is proceeding under the
@@ -2016,6 +2021,29 @@ must exercise the real dispatch path.
   deterministic gate units. "Genuinely tiny: attach a generation
   token so an old sleeper cannot consume a newer window's pending
   state." SI-7 HOLD behind it.
+
+  *SI-6.1 re-review closure as-built (2026-07-15, edb7b1589):* the
+  token fix, red-green against the reviewer's exact assertion.
+  `SensingFoldGate` now holds `{ last_run, generation, pending:
+  Option<u64> }`. `Defer` mints the next `generation` as an
+  ownership token and returns `Defer { remaining, token }`; the
+  spawned sleeper captures it; `sensing_fold_gate_reclaim(digest,
+  token)` succeeds ONLY when `pending == Some(token)`. An
+  out-of-window `RunNow` sets `pending = None` (invalidates the old
+  token), and a later `Defer` mints a distinct token — so a
+  jitter-delayed stale sleeper from a superseded window can neither
+  reclaim a subsumed run nor STEAL a newer window's pending run;
+  exactly-one holds across successive windows. Witness: her exact
+  `a_stale_sleeper_cannot_steal_a_newer_windows_pending_reconciliation`
+  gate unit (T0 leading edge / T10 S1 / T110 out-of-window subsume /
+  T120 S2 / T130 stale S1 must not reclaim S2's token), with the two
+  existing subsumption/exactly-once units updated to bind and pass
+  the token. Red under a token-blind reclaim reproduces her message
+  verbatim. Verification: 4,919 lib all-features, leader delivery
+  10/10 (the trailing-edge e2e drives the real token path), failure
+  plane 5/5, scheduler bridge 1/1, both strict clippy `-D warnings`
+  gates, fmt, `git diff --check`. SI-6.1 is now fully closed;
+  awaiting re-verification, SI-7 review holds behind it.
 - **SI-7 — docs + observability.** Stats: interests, attestations
   emitted/forwarded/gated/expired, continuity transitions, refusals
   by kind (incl. broad-selector), candidate fanout, aggregate
