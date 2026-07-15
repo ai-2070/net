@@ -1,6 +1,6 @@
 # Net v0.33 — "Circus Maximus"
 
-*Named after Rome's largest arena — where the whole city converged on one track to watch a single race resolve — and nodding to JVZEL & Neon Haze's "Circus Minimus" off the Cyberpunk 2077 Night City Radio soundtrack, whose title plays the same trick in reverse. The metaphor does the release's work: many consumers converge on one rendezvous, ask one existential question, and coalesce into a single answer — the provider running the race once, no matter how large the crowd. Maximus in demand, minimus in the load it costs.*
+*Named after Rome's largest arena — where the whole city converged on one track to watch a single race resolve — and carried by two tracks that share the name: Travis Scott's Utopia-era "Circus Maximus," and JVZEL & Neon Haze's "Circus Minimus" off the Cyberpunk 2077 Night City Radio soundtrack, whose title plays the same trick in reverse. The metaphor does the release's work: many consumers converge on one rendezvous, ask one existential question, and coalesce into a single answer — the provider running the race once, no matter how large the crowd. Maximus in demand, minimus in the load it costs.*
 
 Three tracks land, all in the network layer:
 
