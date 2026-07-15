@@ -185,6 +185,39 @@ pub async fn routed_chain(cfg: &BenchConfig) -> (Arc<MeshNode>, Arc<MeshNode>, A
     (a, r, b)
 }
 
+/// A↔B with the session + entity pin established but NO capability
+/// announced yet — the setup for a COLD publication sample (C9). The
+/// handshake/pin cost is paid here, OUTSIDE the timed region, so the
+/// first announce a caller makes is a genuine cold fold insert on B.
+pub async fn established_pair(cfg: &BenchConfig) -> (Arc<MeshNode>, Arc<MeshNode>) {
+    let a = node(cfg).await;
+    let b = node(cfg).await;
+    connect(&a, &b).await;
+    a.start_arc();
+    b.start_arc();
+    // The session is up once connect()/accept() return; peer_count is
+    // the transport-level readiness sentinel and, unlike the entity pin,
+    // does NOT require a prior capability announce — so the first announce
+    // a caller makes is a genuine cold fold insert.
+    let ok = wait_until(Duration::from_secs(5), || {
+        a.peer_count() >= 1 && b.peer_count() >= 1
+    })
+    .await;
+    assert!(ok, "session not established (peer_count) within 5s");
+    (a, b)
+}
+
+/// A small manifest carrying an explicit set of tags — used to model an
+/// update that preserves service membership (a stable service tag) while
+/// a per-iteration discriminator tag proves the exact new version landed.
+pub fn manifest_tags(tags: &[&str]) -> CapabilitySet {
+    let mut caps = CapabilitySet::new();
+    for tag in tags {
+        caps = caps.add_tag(tag.to_string());
+    }
+    caps
+}
+
 /// Warm a publisher→observer relationship: `a` announces a sentinel
 /// manifest; wait (bounded) until `b`'s fold exposes `a`'s node id.
 /// Panics on non-convergence so a broken topology fails loud.
