@@ -386,6 +386,12 @@ impl LatencyReport {
         self.hist.len()
     }
 
+    /// Quantile value in microseconds — for benches (e.g. CPB-4) that
+    /// print their own composite line instead of the standard row.
+    pub fn quantile_us(&self, q: f64) -> f64 {
+        self.hist.value_at_quantile(q) as f64 / 1_000.0
+    }
+
     /// Print a self-describing result block: what was measured, the
     /// sampling protocol, then the distribution. p99.9 is suppressed
     /// below [`P999_MIN_SAMPLES`].

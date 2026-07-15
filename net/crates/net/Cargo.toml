@@ -455,6 +455,12 @@ name = "capability_scheduler_reaction"
 harness = false
 required-features = ["net", "redex"]
 
+# CPB-4 drives real tool-registry mutations (RT-3) + explicit announces (RT-1).
+[[bench]]
+name = "capability_burst"
+harness = false
+required-features = ["net", "tool"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
