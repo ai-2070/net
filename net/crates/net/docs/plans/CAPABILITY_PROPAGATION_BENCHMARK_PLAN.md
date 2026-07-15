@@ -1,8 +1,9 @@
 # Capability Propagation Benchmark Plan (CPB) — v0.2
 
-**Status:** v0.2 — revised per Kyra's 2026-07-15 HOLD review. CPB-0 authorized (Kyra:
-"After those edits, I approve the implementation sequence"). Plan direction SOUND; D1
-APPROVED, D3 APPROVED, D2 REJECTED-as-written → revised in §3.
+**Status:** v0.2 AS-BUILT — CPB-0..6 landed. Revised per Kyra's 2026-07-15 HOLD review; all
+twelve corrections + D2 applied (§0). Baselines + data-derived thresholds in §7. CPB-0
+authorized (Kyra: "After those edits, I approve the implementation sequence"). Plan direction
+SOUND; D1 APPROVED, D3 APPROVED, D2 REJECTED-as-written → revised in §3.
 **Provenance:** Kyra's 2026-07-15 review. Sibling to `SENSING_INTEREST_COALESCING_PLAN.md`.
 The burst benchmark (CPB-4) is a **coalescing-efficiency** benchmark — *not* a stale-sleeper
 correctness guard (that needs a deterministic time-controlled regression test; see §0 C7).
@@ -196,3 +197,71 @@ is the tail figure.
   benchmark.
 - Any live GPU registry signal (C4) or other production-behavior change. Benches are dev-only,
   observation-only, and add no new plumbing.
+
+---
+
+## 7. As-built (CPB-6) — files, baselines, thresholds, CI
+
+### 7.1 Files (all under `net/crates/net/`)
+- `benches/bench_mesh_pair/mod.rs` — shared harness: `BenchConfig` presets, node-pair / chain /
+  `fan_out(n)` / `intake(n)` builders (public API, `start_arc()`), manifest fixtures,
+  `await_capability_state`, `LatencyReport` (hdrhistogram + sample protocol).
+- `benches/capability_propagation.rs` — CPB-1 (wire-floor matrix), CPB-5 (topology), CPB-3
+  (RT-3, `#[cfg(feature = "tool")]`). `required-features = ["net"]`; CPB-3 rides `--features "net tool"`.
+- `benches/capability_scheduler_reaction.rs` — CPB-2a/2b. `required-features = ["net", "redex"]`.
+- `benches/capability_burst.rs` — CPB-4 (RT-3 + RT-1 coalescing). `required-features = ["net", "tool"]`.
+- `hdrhistogram` added to `[dev-dependencies]`.
+
+### 7.2 Reference baselines
+Localhost, single machine (both endpoints share a monotonic clock — the whole point of the
+localhost run), 4 worker threads, wire-floor unless noted. **Orientation, not CI gates** — benches
+do not run in CI (§7.4). Numbers are the reference-machine snapshot the thresholds derive from.
+
+| Boundary (row) | p50 | p99 | n | notes |
+|---|---|---|---|---|
+| CPB-1 warm update small, direct | ~124 µs | ~187 µs | 180 | exact-state endpoint |
+| CPB-1 warm update GPU (529 B), direct | ~142 µs | ~221 µs | 180 | |
+| CPB-1 warm update small, routed A→R→B | ~150 µs | ~212 µs | 180 | +hop |
+| CPB-1 warm update GPU, routed | ~234 µs | ~290 µs | 180 | +hop, +payload |
+| CPB-1 warm add / remove, direct | ~88 / 89 µs | ~133 / 189 µs | 90 ea | membership flip |
+| CPB-1 cold publication (first insert) | ~111 µs | ~172 µs | 30 | fresh pair/sample |
+| CPB-2a publication → scheduler-input wake | ~138 µs | ~338 µs | 180 | attributed via fold gen |
+| CPB-2b island appears/disappears, direct | ~90 µs | ~166–204 µs | 90 ea | real match change |
+| CPB-2b island appears/disappears, routed | ~162–167 µs | ~268–281 µs | 90 ea | +hop |
+| CPB-3 RT-3 debounce-only | ~101.6 ms | ~102.6 ms | 35 | debounce-dominated |
+| CPB-3 RT-3 default-policy | ~10.0 s | — | 3 | **rate-limit-dominated (100× debounce)** |
+| CPB-4 RT-3 burst 1/16/128 | conv ~101.6 ms | — | 20 ea | 1 call, 1 broadcast, 20/20 correct |
+| CPB-4 RT-1 burst 16/128 | conv ~251 ms | — | 20 ea | 16/128 calls → 2 broadcasts, 20/20 correct |
+| CPB-5 fan-out first-visible (A→16) | ~142 µs | ~216 µs | 50 | fastest consumer |
+| CPB-5 fan-out all-16-visible | ~355 µs | ~441 µs | 50 | batch completion ≠ first wake |
+| CPB-5 intake all-16-visible (16→B) | ~3.3 ms | ~11.4 ms | 50 | concurrent churn, population 16 |
+
+### 7.3 Regression thresholds (derived from 7.2, per C11 — data, not invented)
+Manual comparison on the reference machine; generous multiples of observed p99 so ordinary
+machine/scheduler variance never trips them. A regression is a *sustained* breach, not one sample.
+- Wire-floor visibility (CPB-1/2b direct): **p99 < 1 ms** (observed ≤ ~290 µs → ~3–5×).
+- Routed adds a **bounded hop cost**: routed p50 ≤ 2 × direct p50 (observed ~1.2–1.6×).
+- Scheduler-input wake (CPB-2a): **p99 < 1 ms** (observed ~338 µs).
+- RT-3 debounce (CPB-3/4): convergence **within debounce + 20 ms** (observed ~101.6 ms @ 100 ms).
+- Coalescing contracts (CPB-4): RT-3 burst → **1 broadcast applied**; RT-1 burst → **≤ 2**;
+  final-state correctness **must be N/N** (a hard invariant, not a latency threshold).
+- Fan-out all-16-visible: **p99 < 2 ms**; intake all-16-visible: **p99 < 30 ms** (observed ~11.4 ms).
+
+### 7.4 CI (D3)
+The `clippy` job already runs `cargo clippy --all-features --all-targets`, and `--all-features`
+enables `tool` + `redex`, so **all four CPB bench targets are already compile-gated** (harness=false
+benches are checked as targets) — no separate step added (Kyra D3: don't add a redundant broad
+gate; the broad gate already exists). The benches themselves are `cargo bench`-only and are not
+executed in CI. Targeted local compile, for the record:
+```
+cargo bench -p net-mesh --bench capability_propagation        --features net        --no-run
+cargo bench -p net-mesh --bench capability_scheduler_reaction --features "net redex" --no-run
+cargo bench -p net-mesh --bench capability_burst              --features "net tool"  --no-run
+```
+
+### 7.5 The five equivalences, as-built
+`watch wake ≠ query visibility` (exact-state await, 0 timeouts everywhere) · `version delta ≠
+packets emitted` (CPB-4: 128 calls vs 2 broadcasts) · `encoded size ≠ bytes sent` (no bytes-sent
+reported) · `capability query ≠ scheduler decision` (CPB-2b ends on `match_islands` change) ·
+`ordinary burst ≠ stale-sleeper ownership` (CPB-4 makes no such claim). Every published row names
+its exact start event and endpoint and carries the sample protocol.

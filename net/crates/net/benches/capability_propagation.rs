@@ -324,7 +324,7 @@ async fn fanout_all_visible() {
         // Await each consumer's exact-state concurrently; each task records
         // its own elapsed at its own completion.
         let mut handles = Vec::with_capacity(consumers.len());
-        for (c, mut rx) in consumers.iter().cloned().zip(subs.into_iter()) {
+        for (c, mut rx) in consumers.iter().cloned().zip(subs) {
             let tag = tag.clone();
             handles.push(tokio::spawn(async move {
                 let ok = tokio::time::timeout(
