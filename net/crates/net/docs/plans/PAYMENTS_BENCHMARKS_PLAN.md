@@ -381,7 +381,15 @@ event-bus workstream). It leads the strategic story but does not live here.
       holds, but throughput ceilings at ~26/s and p50 grows 280 ms→2 s
       (c16→c128) — one exclusive fs2 lock + backoff serializes every attempt
       (denials too). Baseline: `docs/performance/payments-duplicate-storms.md`.
-- [ ] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
+- [x] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
+      `benches/mesh_paid_invoke.rs` (feature mesh): apples-to-apples
+      `serve_tool` vs `serve_tool_paid`, bearer, fixed cardinality (all quotes
+      pre-minted). Finding: ~10.7 ms payment tax at c1 (450-record store), but
+      it collapses under concurrency — paid p50 ~2.9 s at c128 (p95 1.88 s at
+      c16) while unpaid stays ~1.7 ms/50 k/s. The delta is dominated by the
+      redeem's exclusive store lock, not crypto/transport — the P2/P3/P5
+      storage conclusion, application-facing. Baseline:
+      `docs/performance/payments-paid-vs-unpaid.md`.
 - [x] **P5 — Spend contention** (B7). `benches/spend_contention.rs`:
       same-counter (ample + near-limit K, cardinality 0/100/1 000), shared
       parent cap (P5b), independent (P5c), approval contention (P5d),
