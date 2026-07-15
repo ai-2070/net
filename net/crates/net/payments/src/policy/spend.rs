@@ -308,25 +308,24 @@ impl SpendPolicyEngine {
 
             // The model-reachable side writes a pending approval — but only
             // when one is not already recorded. Sets `*dirty` iff it inserts.
-            let require =
-                |s: &mut SpendPolicyFile, dirty: &mut bool, policy_reason: String| {
-                    if !s.approvals.contains_key(&quote_id) {
-                        s.approvals.insert(
-                            quote_id.clone(),
-                            ApprovalRecord {
-                                state: ApprovalState::Pending,
-                                capability: capability.clone(),
-                                quote_b64: quote_b64.clone(),
-                            },
-                        );
-                        *dirty = true;
-                    }
-                    SpendDecision::RequiresPaymentApproval {
-                        quote_id: quote_id.clone(),
-                        policy_reason,
-                        approve_hint: approve_hint.clone(),
-                    }
-                };
+            let require = |s: &mut SpendPolicyFile, dirty: &mut bool, policy_reason: String| {
+                if !s.approvals.contains_key(&quote_id) {
+                    s.approvals.insert(
+                        quote_id.clone(),
+                        ApprovalRecord {
+                            state: ApprovalState::Pending,
+                            capability: capability.clone(),
+                            quote_b64: quote_b64.clone(),
+                        },
+                    );
+                    *dirty = true;
+                }
+                SpendDecision::RequiresPaymentApproval {
+                    quote_id: quote_id.clone(),
+                    policy_reason,
+                    approve_hint: approve_hint.clone(),
+                }
+            };
 
             let decision: SpendDecision = 'decision: {
                 // Real networks are config-enabled, never ambient — the

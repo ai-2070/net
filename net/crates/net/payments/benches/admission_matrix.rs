@@ -58,7 +58,10 @@ fn samples() -> usize {
 
 /// Author a payload whose `accepted` is `reqs` (used to force a
 /// payload↔requirements mismatch, and for the shared-nonce replay input).
-fn payload_accepting(reqs: &X402Carry<PaymentRequirements>, nonce: &str) -> X402Carry<PaymentPayload> {
+fn payload_accepting(
+    reqs: &X402Carry<PaymentRequirements>,
+    nonce: &str,
+) -> X402Carry<PaymentPayload> {
     X402Carry::author(&PaymentPayload {
         x402_version: 2,
         resource: None,
@@ -114,16 +117,28 @@ fn main() {
                 let elapsed = t.elapsed().as_nanos() as u64;
                 hist.record(elapsed).expect("record");
 
-                assert!(matches!(decision, PaymentDecision::Served { .. }), "accept must Serve");
-                assert!(matches!(redeem, RedeemDecision::Admitted), "redeem must Admit");
+                assert!(
+                    matches!(decision, PaymentDecision::Served { .. }),
+                    "accept must Serve"
+                );
+                assert!(
+                    matches!(redeem, RedeemDecision::Admitted),
+                    "redeem must Admit"
+                );
                 admits += 1;
             }
             (hist, admits, start.elapsed().as_secs_f64())
         });
 
         // Each timed op transitions the store seed → seed+1.
-        base.for_row(format!("accept+redeem {seed}->{}", seed + 1), n, 1, false, &fx)
-            .report(&hist, &Throughput::uniform(admits as f64 / wall));
+        base.for_row(
+            format!("accept+redeem {seed}->{}", seed + 1),
+            n,
+            1,
+            false,
+            &fx,
+        )
+        .report(&hist, &Throughput::uniform(admits as f64 / wall));
     }
 
     // ======================================================================
@@ -153,7 +168,10 @@ fn main() {
                     .await
                     .expect("redeem_for_invocation");
                 hist.record(t.elapsed().as_nanos() as u64).expect("record");
-                assert!(matches!(redeem, RedeemDecision::Admitted), "redeem must Admit");
+                assert!(
+                    matches!(redeem, RedeemDecision::Admitted),
+                    "redeem must Admit"
+                );
                 admits += 1;
             }
             (hist, admits, start.elapsed().as_secs_f64())
@@ -187,7 +205,10 @@ fn main() {
             NOW + 5_000_001,
             n,
         ));
-        assert!(matches!(reason, Some(RejectReason::PayloadMismatch)), "got {reason:?}");
+        assert!(
+            matches!(reason, Some(RejectReason::PayloadMismatch)),
+            "got {reason:?}"
+        );
         base_pre
             .for_row("reject: payload_mismatch [pre-state]", n, 1, false, &fx_pre)
             .report(&hist, &Throughput::denial(tput));
@@ -200,7 +221,10 @@ fn main() {
         let past = NOW + 5_100_000 + TTL_NS + 86_400_000_000_000;
         let (hist, tput, reason) =
             rt.block_on(repeat_accept(&fx_pre.engine, &quote, &proof, past, n));
-        assert!(matches!(reason, Some(RejectReason::QuoteExpired)), "got {reason:?}");
+        assert!(
+            matches!(reason, Some(RejectReason::QuoteExpired)),
+            "got {reason:?}"
+        );
         base_pre
             .for_row("reject: expired [pre-state]", n, 1, false, &fx_pre)
             .report(&hist, &Throughput::denial(tput));
@@ -212,9 +236,17 @@ fn main() {
         let foreign = build_engine();
         let fq = issue(&foreign, AMOUNT, NOW + 5_200_000);
         let fproof = payload_for(&fq);
-        let (hist, tput, reason) =
-            rt.block_on(repeat_accept(&fx_pre.engine, &fq, &fproof, NOW + 5_200_001, n));
-        assert!(matches!(reason, Some(RejectReason::BadQuote(_))), "got {reason:?}");
+        let (hist, tput, reason) = rt.block_on(repeat_accept(
+            &fx_pre.engine,
+            &fq,
+            &fproof,
+            NOW + 5_200_001,
+            n,
+        ));
+        assert!(
+            matches!(reason, Some(RejectReason::BadQuote(_))),
+            "got {reason:?}"
+        );
         base_pre
             .for_row("reject: bad_quote [pre-state]", n, 1, false, &fx_pre)
             .report(&hist, &Throughput::denial(tput));
@@ -248,9 +280,18 @@ fn main() {
             NOW + 5_300_001,
             n,
         ));
-        assert!(matches!(reason, Some(RejectReason::VerifyRejected(_))), "got {reason:?}");
-        base.for_row("reject: verify_rejected [claims+releases]", n, 1, false, &fx)
-            .report(&hist, &Throughput::denial(tput));
+        assert!(
+            matches!(reason, Some(RejectReason::VerifyRejected(_))),
+            "got {reason:?}"
+        );
+        base.for_row(
+            "reject: verify_rejected [claims+releases]",
+            n,
+            1,
+            false,
+            &fx,
+        )
+        .report(&hist, &Throughput::denial(tput));
     }
 
     // already_served — re-submit a settled quote+payload → Served via the
@@ -261,7 +302,10 @@ fn main() {
         rt.block_on(mint_n_settled(&fx, 100));
         let quote = issue(&fx, AMOUNT, NOW + 5_400_000);
         let proof = payload_for(&quote);
-        let first = rt.block_on(fx.engine.accept_payment(&quote, &proof, OBS, NOW + 5_400_001));
+        let first = rt.block_on(
+            fx.engine
+                .accept_payment(&quote, &proof, OBS, NOW + 5_400_001),
+        );
         assert!(matches!(first, Ok(PaymentDecision::Served { .. })));
         let prep = prep_start.elapsed();
         let baseline = snapshot_state(fx.state_path());
@@ -319,7 +363,10 @@ fn main() {
             NOW + 6_000_003,
             n,
         ));
-        assert!(matches!(reason, Some(RejectReason::Replay)), "got {reason:?}");
+        assert!(
+            matches!(reason, Some(RejectReason::Replay)),
+            "got {reason:?}"
+        );
         base.for_row("reject: replay [replay state]", n, 1, false, &fx)
             .report(&hist, &Throughput::denial(tput));
     }
@@ -333,7 +380,10 @@ fn main() {
         let quote = issue(&fx, AMOUNT, NOW + 6_100_000);
         let payload1 = payload_with_nonce(&quote, "paid-1");
         let payload2 = payload_with_nonce(&quote, "paid-2");
-        let first = rt.block_on(fx.engine.accept_payment(&quote, &payload1, OBS, NOW + 6_100_001));
+        let first = rt.block_on(
+            fx.engine
+                .accept_payment(&quote, &payload1, OBS, NOW + 6_100_001),
+        );
         assert!(matches!(first, Ok(PaymentDecision::Served { .. })));
         let prep = prep_start.elapsed();
         let baseline = snapshot_state(fx.state_path());
@@ -347,7 +397,10 @@ fn main() {
             NOW + 6_100_002,
             n,
         ));
-        assert!(matches!(reason, Some(RejectReason::QuoteAlreadyPaid)), "got {reason:?}");
+        assert!(
+            matches!(reason, Some(RejectReason::QuoteAlreadyPaid)),
+            "got {reason:?}"
+        );
         base.for_row("reject: quote_already_paid [quote state]", n, 1, false, &fx)
             .report(&hist, &Throughput::denial(tput));
     }

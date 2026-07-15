@@ -94,7 +94,10 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
         .unwrap();
     let p1 = payload(&quote, &quote.quote_id);
     assert!(matches!(
-        engine.accept_payment(&quote, &p1, VerificationTier::Observed, NOW + 1).await.unwrap(),
+        engine
+            .accept_payment(&quote, &p1, VerificationTier::Observed, NOW + 1)
+            .await
+            .unwrap(),
         PaymentDecision::Served { .. }
     ));
     let ino0 = ino(&path);
@@ -106,19 +109,41 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
         .accept_payment(&quote, &p2, VerificationTier::Observed, NOW + 2)
         .await
         .unwrap();
-    assert!(matches!(denied, PaymentDecision::Rejected { reason: RejectReason::QuoteAlreadyPaid }));
-    assert_eq!(ino(&path), ino0, "QuoteAlreadyPaid must not rewrite the store");
+    assert!(matches!(
+        denied,
+        PaymentDecision::Rejected {
+            reason: RejectReason::QuoteAlreadyPaid
+        }
+    ));
+    assert_eq!(
+        ino(&path),
+        ino0,
+        "QuoteAlreadyPaid must not rewrite the store"
+    );
 
     // Dirty witness: a genuinely fresh admission persists (rename → new inode).
     let quote2 = engine
-        .issue_quote(caller.entity_id().clone(), CAP, mock_reqs("2500"), NOW + 1000, TTL)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAP,
+            mock_reqs("2500"),
+            NOW + 1000,
+            TTL,
+        )
         .unwrap();
     let pf = payload(&quote2, &quote2.quote_id);
     assert!(matches!(
-        engine.accept_payment(&quote2, &pf, VerificationTier::Observed, NOW + 1001).await.unwrap(),
+        engine
+            .accept_payment(&quote2, &pf, VerificationTier::Observed, NOW + 1001)
+            .await
+            .unwrap(),
         PaymentDecision::Served { .. }
     ));
-    assert_ne!(ino(&path), ino0, "a fresh admission must persist the claim + completion");
+    assert_ne!(
+        ino(&path),
+        ino0,
+        "a fresh admission must persist the claim + completion"
+    );
 }
 
 /// Regression guard for Kyra's caveat: `verify_rejected` is NOT a dirty-flag
@@ -149,19 +174,35 @@ async fn accept_verify_rejected_still_persists_claim_and_release() {
         .unwrap();
     let p1 = payload(&q1, &q1.quote_id);
     assert!(matches!(
-        engine.accept_payment(&q1, &p1, VerificationTier::Observed, NOW + 1).await.unwrap(),
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(_) }
+        engine
+            .accept_payment(&q1, &p1, VerificationTier::Observed, NOW + 1)
+            .await
+            .unwrap(),
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(_)
+        }
     ));
     let ino0 = ino(&path);
 
     // A second verify_rejected still writes (claim + release) → inode moves.
     let q2 = engine
-        .issue_quote(caller.entity_id().clone(), CAP, mock_reqs("2500"), NOW + 1000, TTL)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAP,
+            mock_reqs("2500"),
+            NOW + 1000,
+            TTL,
+        )
         .unwrap();
     let p2 = payload(&q2, &q2.quote_id);
     assert!(matches!(
-        engine.accept_payment(&q2, &p2, VerificationTier::Observed, NOW + 1001).await.unwrap(),
-        PaymentDecision::Rejected { reason: RejectReason::VerifyRejected(_) }
+        engine
+            .accept_payment(&q2, &p2, VerificationTier::Observed, NOW + 1001)
+            .await
+            .unwrap(),
+        PaymentDecision::Rejected {
+            reason: RejectReason::VerifyRejected(_)
+        }
     ));
     assert_ne!(
         ino(&path),
@@ -177,7 +218,12 @@ async fn accept_verify_rejected_still_persists_claim_and_release() {
 /// Build a production engine (unsafe mock auto-allow, so a mock spend lands
 /// silently) whose registry also knows USDC-on-Base — so a real-network deny
 /// is the enablement deny, not a registry miss.
-fn spend_engine(path: &Path) -> (SpendPolicyEngine, net_payments::core::registry::AssetRegistry) {
+fn spend_engine(
+    path: &Path,
+) -> (
+    SpendPolicyEngine,
+    net_payments::core::registry::AssetRegistry,
+) {
     let provider = EntityKeypair::generate();
     let mut registry = default_mock_registry(provider.entity_id().clone());
     registry.assets.push(AssetEntry {
@@ -193,10 +239,7 @@ fn spend_engine(path: &Path) -> (SpendPolicyEngine, net_payments::core::registry
     (engine, registry)
 }
 
-fn real_quote(
-    registry: &net_payments::core::registry::AssetRegistry,
-    issued: u64,
-) -> PaymentQuote {
+fn real_quote(registry: &net_payments::core::registry::AssetRegistry, issued: u64) -> PaymentQuote {
     let reqs = X402Carry::author(&PaymentRequirements {
         scheme: "exact".into(),
         network: "eip155:8453".into(),
@@ -219,10 +262,7 @@ fn real_quote(
     )
 }
 
-fn mock_quote(
-    registry: &net_payments::core::registry::AssetRegistry,
-    issued: u64,
-) -> PaymentQuote {
+fn mock_quote(registry: &net_payments::core::registry::AssetRegistry, issued: u64) -> PaymentQuote {
     PaymentQuote::new(
         EntityKeypair::generate().entity_id().clone(),
         EntityKeypair::generate().entity_id().clone(),
@@ -255,8 +295,15 @@ async fn spend_hard_denial_is_clean_but_reservation_persists() {
         .check_and_reserve(&real_quote(&registry, NOW), &registry, NOW)
         .await
         .unwrap();
-    assert!(matches!(denied, SpendDecision::Denied { .. }), "got {denied:?}");
-    assert_eq!(ino(&path), ino0, "a hard spend denial (no prune) must not rewrite");
+    assert!(
+        matches!(denied, SpendDecision::Denied { .. }),
+        "got {denied:?}"
+    );
+    assert_eq!(
+        ino(&path),
+        ino0,
+        "a hard spend denial (no prune) must not rewrite"
+    );
 
     // Dirty: a mock spend auto-allows and reserves the day counter.
     let allowed = engine
@@ -293,7 +340,10 @@ async fn spend_housekeeping_prune_persists_on_an_otherwise_clean_denial() {
         .check_and_reserve(&real_quote(&registry, future), &registry, future)
         .await
         .unwrap();
-    assert!(matches!(denied, SpendDecision::Denied { .. }), "got {denied:?}");
+    assert!(
+        matches!(denied, SpendDecision::Denied { .. }),
+        "got {denied:?}"
+    );
     assert_ne!(
         ino(&path),
         ino0,

@@ -211,7 +211,11 @@ fn main() {
                 }
 
                 // Invariants: settle once, one billing, all retries identical.
-                assert_eq!(cf.verifies.load(Ordering::SeqCst), 1, "verify must run once");
+                assert_eq!(
+                    cf.verifies.load(Ordering::SeqCst),
+                    1,
+                    "verify must run once"
+                );
                 assert_eq!(cf.settles.load(Ordering::SeqCst), 1, "settle must run once");
                 assert_eq!(
                     billing_ids.len(),
@@ -228,8 +232,14 @@ fn main() {
             admissions_per_s: total_served as f64 / wall,
             unique_payments_per_s: unique_payments as f64 / wall,
         };
-        base.for_row(format!("accept_storm c{conc}"), total_attempts, conc, false, &cf.fx)
-            .report(&hist, &tput);
+        base.for_row(
+            format!("accept_storm c{conc}"),
+            total_attempts,
+            conc,
+            false,
+            &cf.fx,
+        )
+        .report(&hist, &tput);
         println!(
             "      invariant: {m} storms · verify/settle once each · unique_payments={unique_payments} (== storms)"
         );
@@ -285,7 +295,11 @@ fn main() {
                 }
 
                 assert_eq!(admitted, 1, "exactly one redemption admits");
-                assert_eq!(handler.load(Ordering::SeqCst), 1, "the handler runs exactly once");
+                assert_eq!(
+                    handler.load(Ordering::SeqCst),
+                    1,
+                    "the handler runs exactly once"
+                );
                 total_admitted += admitted;
             }
         });
@@ -296,8 +310,14 @@ fn main() {
             admissions_per_s: total_admitted as f64 / wall,
             unique_payments_per_s: total_admitted as f64 / wall, // one invocation admitted per storm
         };
-        base.for_row(format!("redeem_storm c{conc}"), total_attempts, conc, false, &cf.fx)
-            .report(&hist, &tput);
+        base.for_row(
+            format!("redeem_storm c{conc}"),
+            total_attempts,
+            conc,
+            false,
+            &cf.fx,
+        )
+        .report(&hist, &tput);
         println!("      invariant: {m} storms · exactly one Admitted + one handler run each");
     }
 }

@@ -408,7 +408,14 @@ event-bus workstream). It leads the strategic story but does not live here.
       asserted (verify/settle once, one billing, handler once, replay doesn't
       re-run, retry same billing). Zero-delay mock; external rail excluded.
       Baseline: `docs/performance/payments-mock-lifecycle.md`.
-- [ ] **P7 — External-rail telemetry documentation** (B-ext).
+- [x] **P7 — External-rail telemetry documentation** (B-ext).
+      `docs/performance/payments-external-rail-telemetry.md`: a telemetry
+      CONTRACT (no numbers) — the two-span stage model (provider-local vs
+      external rail; missing stages absent, not synthesized), required fields,
+      metric-label cardinality rules, security/privacy ([REDACTED] credentials,
+      no raw proofs/tx-ids as labels), and the reporting contract (public
+      tables exclude rail latency; operational reports separate; no invented
+      baselines). Gathered via the `live-testnet` conformance path.
 
 **Acceptance for P1–P6:** the relevant `cargo bench --no-run` compiles
 clean; each committed bench prints its p50/p95/p99 + throughput table with
@@ -432,3 +439,38 @@ durable-store cost.
   only.
 - **Capability propagation + scheduler-reaction bench** — Kyra's #1
   priority, but the `MESH_SCHEDULER_*` workstream, not this crate.
+
+---
+
+## As-built (suite close-out)
+
+The suite is complete. Benches live in `net/crates/net/payments/benches/`;
+every one has a `--no-run` CI compile gate on the net-payments job.
+
+| bench | phase | what it establishes |
+|---|---|---|
+| `admission.rs` | P1 diagnostics | criterion smoke bars (pre-state rejection; unknown-quote redeem denial) |
+| `admission_matrix.rs` | P2 | boundary-2 headline (accept+redeem, ~15–55 ms), boundary-1 gate, the rejection matrix |
+| `redeem_matrix.rs` | (defect) | the read-only-denial write-amplification before/after |
+| `duplicate_storm.rs` | P3 | at-most-once under c16/c128; the ~26 attempts/s exclusive-lock ceiling |
+| `spend_contention.rs` | P5 | no-overspend under contention; independent traffic serializes = the lock, not accounting |
+| `mesh_paid_invoke.rs` | P4 | ready-settled redemption tax (~10.7 ms @ c1; ~2.9 s @ c128) vs unpaid ~1.7 ms/50 k/s |
+| `mock_lifecycle.rs` | P6 | quote→billing (~14 ms) and quote→handler (~20 ms), all lifecycle invariants |
+
+**Baselines** (`docs/performance/`): `payments-admission-matrix.md`,
+`payments-redeem-write-amplification.md`, `payments-duplicate-storms.md`,
+`payments-spend-contention.md`, `payments-paid-vs-unpaid.md`,
+`payments-mock-lifecycle.md`, `payments-external-rail-telemetry.md` (contract).
+
+**Decision:** `PAYMENTS_STORAGE_DISPOSITION.md` — whole-file store REJECTED as
+the target; global lock REJECTED as the authority boundary; logical
+partitioning REQUIRED; storage engine UNDECIDED; implementation NOT
+AUTHORIZED. Shared-read (#12): do not implement except as a tactical stopgap.
+
+**Production change landed by the suite:** read-only redemption/accept/spend
+denials no longer rewrite the durable store (`store::mutate_json_if_changed`),
+closing a write-amplification / DoS surface while preserving at-most-once
+(witnessed by `tests/read_only_writes_audit.rs`, red-verified).
+
+**Not done here (by disposition):** storage replacement, shared-read fast
+path, per-scheme signing micro-benches, real-rail baselines (no samples yet).

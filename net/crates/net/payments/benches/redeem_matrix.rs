@@ -14,12 +14,12 @@
 //! three throughputs, and full environment metadata.
 //!
 //! Rows (per cardinality × concurrency):
-//!   - `unknown`          — earliest-exit denial (id not in the store)
-//!   - `wrong_tool`       — settled quote redeemed for the wrong tool
-//!   - `invalid_binding`  — settled quote with a bad ed25519 binding sig
-//!   - `already_redeemed` — a quote consumed once, redeemed again
-//!   - `valid_admitted`   — a fresh settled quote (single-use; the honest
-//!                          durable write that must stay ~unchanged)
+//! - `unknown` — earliest-exit denial (id not in the store)
+//! - `wrong_tool` — settled quote redeemed for the wrong tool
+//! - `invalid_binding` — settled quote with a bad ed25519 binding sig
+//! - `already_redeemed` — a quote consumed once, redeemed again
+//! - `valid_admitted` — a fresh settled quote (single-use; the honest durable
+//!   write that must stay ~unchanged)
 //!
 //! Store cardinality 1 / 100 / 1 000; concurrency 1 / 16 / 128. Denial rows
 //! are repeatable (no state consumed) so they take `NET_PAY_BENCH_SAMPLES`
@@ -133,8 +133,13 @@ fn main() {
         for &conc in CONCURRENCY {
             // unknown — id absent from the store (earliest-exit denial).
             let targets = Arc::new(vec!["no-such-quote".to_string(); denial_n]);
-            let (h, tput, _) =
-                rt.block_on(run_cell(engine.clone(), TOOL_ID.into(), targets, None, conc));
+            let (h, tput, _) = rt.block_on(run_cell(
+                engine.clone(),
+                TOOL_ID.into(),
+                targets,
+                None,
+                conc,
+            ));
             base.for_row(format!("unknown c{conc}"), denial_n, conc, false, &fx)
                 .report(&h, &Throughput::denial(tput));
 
@@ -144,8 +149,13 @@ fn main() {
                     .map(|i| quotes[i % quotes.len()].quote_id.clone())
                     .collect::<Vec<_>>(),
             );
-            let (h, tput, _) =
-                rt.block_on(run_cell(engine.clone(), "other-tool".into(), targets, None, conc));
+            let (h, tput, _) = rt.block_on(run_cell(
+                engine.clone(),
+                "other-tool".into(),
+                targets,
+                None,
+                conc,
+            ));
             base.for_row(format!("wrong_tool c{conc}"), denial_n, conc, false, &fx)
                 .report(&h, &Throughput::denial(tput));
 
@@ -162,15 +172,32 @@ fn main() {
                 Some(vec![0u8; 64]),
                 conc,
             ));
-            base.for_row(format!("invalid_binding c{conc}"), denial_n, conc, true, &fx)
-                .report(&h, &Throughput::denial(tput));
+            base.for_row(
+                format!("invalid_binding c{conc}"),
+                denial_n,
+                conc,
+                true,
+                &fx,
+            )
+            .report(&h, &Throughput::denial(tput));
 
             // already_redeemed — the consumed victim, redeemed again.
             let targets = Arc::new(vec![victim.clone(); denial_n]);
-            let (h, tput, _) =
-                rt.block_on(run_cell(engine.clone(), TOOL_ID.into(), targets, None, conc));
-            base.for_row(format!("already_redeemed c{conc}"), denial_n, conc, false, &fx)
-                .report(&h, &Throughput::denial(tput));
+            let (h, tput, _) = rt.block_on(run_cell(
+                engine.clone(),
+                TOOL_ID.into(),
+                targets,
+                None,
+                conc,
+            ));
+            base.for_row(
+                format!("already_redeemed c{conc}"),
+                denial_n,
+                conc,
+                false,
+                &fx,
+            )
+            .report(&h, &Throughput::denial(tput));
         }
 
         // valid_admitted — the fresh quotes[1..], each redeemed exactly once
@@ -188,7 +215,10 @@ fn main() {
                 None,
                 VALID_CONCURRENCY,
             ));
-            assert_eq!(admits, n, "valid_admitted must admit every fresh quote once");
+            assert_eq!(
+                admits, n,
+                "valid_admitted must admit every fresh quote once"
+            );
             base.for_row(
                 format!("valid_admitted c{VALID_CONCURRENCY} (n={n})"),
                 n,

@@ -71,8 +71,16 @@ struct EchoResp {
 /// and start both — the same dance the SDK's nrpc bench harness uses.
 async fn handshaken_pair() -> (Mesh, Mesh) {
     let psk = [0x42u8; 32];
-    let server = MeshBuilder::new("127.0.0.1:0", &psk).unwrap().build().await.unwrap();
-    let caller = MeshBuilder::new("127.0.0.1:0", &psk).unwrap().build().await.unwrap();
+    let server = MeshBuilder::new("127.0.0.1:0", &psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let caller = MeshBuilder::new("127.0.0.1:0", &psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
     let server_addr = server.local_addr().to_string();
     let server_pub = *server.public_key();
     let server_id = server.node_id();
@@ -98,7 +106,9 @@ fn serve_both(provider: &Mesh, fx: &EngineFixture) -> (ToolServeHandle, ToolServ
         .build();
     let free_h = provider
         .serve_tool::<EchoReq, EchoResp, _, _>(free, |req: EchoReq| async move {
-            Ok::<_, String>(EchoResp { echoed: req.message })
+            Ok::<_, String>(EchoResp {
+                echoed: req.message,
+            })
         })
         .expect("serve free tool");
 
@@ -110,7 +120,8 @@ fn serve_both(provider: &Mesh, fx: &EngineFixture) -> (ToolServeHandle, ToolServ
         vec![template],
         fx.registry.reference().expect("registry reference"),
     );
-    let announced = String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+    let announced =
+        String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
     let gate = Arc::new(EngineToolPaymentGate::new(fx.engine.clone()));
     let paid = metadata_for::<EchoReq, EchoResp>(PAID_TOOL)
         .description("Echo, for money.")
@@ -118,7 +129,9 @@ fn serve_both(provider: &Mesh, fx: &EngineFixture) -> (ToolServeHandle, ToolServ
         .build();
     let paid_h = provider
         .serve_tool_paid::<EchoReq, EchoResp, _, _>(paid, gate, |req: EchoReq| async move {
-            Ok::<_, String>(EchoResp { echoed: req.message })
+            Ok::<_, String>(EchoResp {
+                echoed: req.message,
+            })
         })
         .expect("serve paid tool");
     (free_h, paid_h)
@@ -157,8 +170,14 @@ async fn run_calls(
             None => vec![],
         };
         handles.push(tokio::spawn(async move {
-            let body = serde_json::to_vec(&EchoReq { message: "hi".into() }).unwrap();
-            let opts = CallOptions { request_headers: headers, ..CallOptions::default() };
+            let body = serde_json::to_vec(&EchoReq {
+                message: "hi".into(),
+            })
+            .unwrap();
+            let opts = CallOptions {
+                request_headers: headers,
+                ..CallOptions::default()
+            };
             let t = Instant::now();
             let reply = caller
                 .call(provider_id, service, Bytes::from(body), opts)
@@ -198,7 +217,15 @@ fn main() {
     rt.block_on(async {
         let warm_ids = mint_batch(&fx, &mut idx, 8).await;
         for id in &warm_ids {
-            let _ = run_calls(Arc::clone(&caller), provider_id, PAID_TOOL, Some(Arc::new(vec![id.clone()])), 1, 1).await;
+            let _ = run_calls(
+                Arc::clone(&caller),
+                provider_id,
+                PAID_TOOL,
+                Some(Arc::new(vec![id.clone()])),
+                1,
+                1,
+            )
+            .await;
         }
         let _ = run_calls(Arc::clone(&caller), provider_id, FREE_TOOL, None, 1, 8).await;
     });
@@ -212,18 +239,33 @@ fn main() {
     let base = BenchMetadata::base(&fx, Duration::ZERO); // records_before == total (held)
 
     println!("mesh_paid_invoke — samples={n}, controlled localhost mesh, binding=off (bearer)");
-    println!("fixed store cardinality={total} records; delta = ready-settled payment-gate overhead");
+    println!(
+        "fixed store cardinality={total} records; delta = ready-settled payment-gate overhead"
+    );
 
     for (level, &conc) in CONCURRENCY.iter().enumerate() {
         // Unpaid — the shared baseline (touches no engine).
-        let (uh, ut) = rt.block_on(run_calls(Arc::clone(&caller), provider_id, FREE_TOOL, None, conc, n));
+        let (uh, ut) = rt.block_on(run_calls(
+            Arc::clone(&caller),
+            provider_id,
+            FREE_TOOL,
+            None,
+            conc,
+            n,
+        ));
         base.for_row(format!("unpaid c{conc}"), n, conc, false, &fx)
             .report(&uh, &Throughput::uniform(ut));
 
         // Paid — this level's disjoint slice of pre-minted quotes.
         let ids = Arc::new(all_ids[level * n..(level + 1) * n].to_vec());
-        let (ph, pt) =
-            rt.block_on(run_calls(Arc::clone(&caller), provider_id, PAID_TOOL, Some(ids), conc, n));
+        let (ph, pt) = rt.block_on(run_calls(
+            Arc::clone(&caller),
+            provider_id,
+            PAID_TOOL,
+            Some(ids),
+            conc,
+            n,
+        ));
         base.for_row(format!("paid c{conc}"), n, conc, false, &fx)
             .report(&ph, &Throughput::uniform(pt));
 

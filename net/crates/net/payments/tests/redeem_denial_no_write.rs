@@ -47,7 +47,13 @@ async fn mint_settled(engine: &Arc<PaymentEngine>, caller: &EntityKeypair) -> St
     })
     .expect("author requirements");
     let quote = engine
-        .issue_quote(caller.entity_id().clone(), CAPABILITY, requirements, NOW, 60_000_000_000)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements,
+            NOW,
+            60_000_000_000,
+        )
         .expect("issue_quote");
     let payload = X402Carry::author(&PaymentPayload {
         x402_version: 2,

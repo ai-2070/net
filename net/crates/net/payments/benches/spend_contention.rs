@@ -41,7 +41,9 @@ use tokio::sync::Barrier;
 #[path = "bench_common/mod.rs"]
 mod bench_common;
 
-use bench_common::{new_hist, restore_state, runtime, snapshot_state, state_bytes, state_placement};
+use bench_common::{
+    new_hist, restore_state, runtime, snapshot_state, state_bytes, state_placement,
+};
 
 const NOW: u64 = 1_000_000_000_000_000;
 const NS_PER_DAY: u64 = 86_400_000_000_000;
@@ -95,7 +97,13 @@ fn reqs(asset: &str, amount: u128) -> X402Carry<PaymentRequirements> {
 
 /// A distinct quote (unique caller ⇒ unique quote id) for `capability` paying
 /// `amount` of `asset`, issued at `issued`.
-fn quote(reg: &AssetRegistry, capability: &str, asset: &str, amount: u128, issued: u64) -> PaymentQuote {
+fn quote(
+    reg: &AssetRegistry,
+    capability: &str,
+    asset: &str,
+    amount: u128,
+    issued: u64,
+) -> PaymentQuote {
     PaymentQuote::new(
         EntityKeypair::generate().entity_id().clone(),
         EntityKeypair::generate().entity_id().clone(),
@@ -144,7 +152,10 @@ async fn storm(
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let t = Instant::now();
-            let d = engine.check_and_reserve(&q, &reg, now).await.expect("check_and_reserve");
+            let d = engine
+                .check_and_reserve(&q, &reg, now)
+                .await
+                .expect("check_and_reserve");
             (t.elapsed().as_nanos() as u64, d)
         }));
     }
@@ -156,7 +167,10 @@ async fn storm(
 }
 
 fn admitted(results: &[(u64, SpendDecision)]) -> usize {
-    results.iter().filter(|(_, d)| matches!(d, SpendDecision::Allowed)).count()
+    results
+        .iter()
+        .filter(|(_, d)| matches!(d, SpendDecision::Allowed))
+        .count()
 }
 
 /// Seed `n` pending approvals into the store (the history bulk): a Production
@@ -175,7 +189,7 @@ async fn seed_approvals(path: &Path, reg: &Arc<AssetRegistry>, n: usize) -> Vec<
 }
 
 fn storms_for(n: usize) -> usize {
-    (target_samples() + n - 1) / n
+    target_samples().div_ceil(n)
 }
 
 // ---- reporting -------------------------------------------------------------
@@ -205,7 +219,11 @@ fn report(
 ) {
     let us = |q: f64| hist.value_at_quantile(q) as f64 / 1000.0;
     // p99 only when the sample count is credible (>= 500).
-    let p99 = if samples >= 500 { format!("{:.1}", us(0.99)) } else { "n/a".into() };
+    let p99 = if samples >= 500 {
+        format!("{:.1}", us(0.99))
+    } else {
+        "n/a".into()
+    };
     println!(
         "  {label:<34} p50={:>9.1}us p95={:>9.1}us p99={p99:>9}us max={:>9.1}us",
         us(0.50),
@@ -272,7 +290,15 @@ fn main() {
                     for s in 0..m {
                         restore_state(&path, &ample_baseline);
                         let qs: Vec<_> = (0..conc)
-                            .map(|i| quote(&reg, "cap-a", ASSET, AMOUNT, NOW + 1_000 * s as u64 + i as u64))
+                            .map(|i| {
+                                quote(
+                                    &reg,
+                                    "cap-a",
+                                    ASSET,
+                                    AMOUNT,
+                                    NOW + 1_000 * s as u64 + i as u64,
+                                )
+                            })
                             .collect();
                         let res = storm(Arc::clone(&engine), Arc::clone(&reg), qs, NOW).await;
                         let adm = admitted(&res);
@@ -322,14 +348,14 @@ fn main() {
                 let cap = k as u128 * AMOUNT;
                 restore_state(&path, &base_card);
                 let cfg = SpendPolicyEngine::new(&path, SpendProfile::DevTest);
-                rt.block_on(cfg.configure(|d, _| d.max_per_day = Some(AtomicAmount::from_u128(cap))))
-                    .unwrap();
+                rt.block_on(
+                    cfg.configure(|d, _| d.max_per_day = Some(AtomicAmount::from_u128(cap))),
+                )
+                .unwrap();
                 let near_baseline = snapshot_state(&path);
                 let bytes_before = state_bytes(&path);
                 let cards_before = approval_count(&path);
-                let engine = Arc::new(
-                    SpendPolicyEngine::new(&path, SpendProfile::DevTest),
-                );
+                let engine = Arc::new(SpendPolicyEngine::new(&path, SpendProfile::DevTest));
                 let mut hist = new_hist();
                 let (mut attempts, mut reservations, mut denials) = (0usize, 0usize, 0usize);
                 let start = Instant::now();
@@ -337,7 +363,15 @@ fn main() {
                     for s in 0..m {
                         restore_state(&path, &near_baseline);
                         let qs: Vec<_> = (0..conc)
-                            .map(|i| quote(&reg, "cap-a", ASSET, AMOUNT, NOW + 1_000 * s as u64 + i as u64))
+                            .map(|i| {
+                                quote(
+                                    &reg,
+                                    "cap-a",
+                                    ASSET,
+                                    AMOUNT,
+                                    NOW + 1_000 * s as u64 + i as u64,
+                                )
+                            })
                             .collect();
                         let res = storm(Arc::clone(&engine), Arc::clone(&reg), qs, NOW).await;
                         let adm = admitted(&res);
@@ -468,7 +502,13 @@ fn main() {
                 // distinct capability AND distinct asset → distinct counter keys.
                 let qs: Vec<_> = (0..conc)
                     .map(|i| {
-                        quote(&reg, &format!("cap-{i}"), &format!("musd{i}"), AMOUNT, NOW + 1_000 * s as u64 + i as u64)
+                        quote(
+                            &reg,
+                            &format!("cap-{i}"),
+                            &format!("musd{i}"),
+                            AMOUNT,
+                            NOW + 1_000 * s as u64 + i as u64,
+                        )
                     })
                     .collect();
                 let res = storm(Arc::clone(&engine), Arc::clone(&reg), qs, NOW).await;
@@ -476,8 +516,15 @@ fn main() {
                 assert_eq!(adm, conc, "P5c: all admit (independent counters)");
                 // each asset counter holds exactly one amount.
                 for i in 0..conc {
-                    let s = engine.spent_today(NET, &format!("musd{i}"), NOW).await.unwrap();
-                    assert_eq!(s, AtomicAmount::from_u128(AMOUNT), "P5c: each independent counter exact");
+                    let s = engine
+                        .spent_today(NET, &format!("musd{i}"), NOW)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        s,
+                        AtomicAmount::from_u128(AMOUNT),
+                        "P5c: each independent counter exact"
+                    );
                 }
                 for (ns, _) in &res {
                     hist.record(*ns).unwrap();
@@ -537,7 +584,11 @@ fn main() {
                 // No reservation (all held); one logical pending approval.
                 assert_eq!(admitted(&res), 0, "approval contention: nothing reserves");
                 let pending = engine.pending().await.unwrap();
-                assert_eq!(pending.len(), 1, "exactly one logical pending approval, no duplicates");
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "exactly one logical pending approval, no duplicates"
+                );
                 let uniq: HashSet<_> = pending.into_iter().collect();
                 assert_eq!(uniq.len(), 1);
                 assert_eq!(

@@ -53,7 +53,12 @@ fn bench_admission(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let d = fx
                 .engine
-                .accept_payment(&expired, &expired_proof, VerificationTier::Observed, way_past)
+                .accept_payment(
+                    &expired,
+                    &expired_proof,
+                    VerificationTier::Observed,
+                    way_past,
+                )
                 .await
                 .expect("accept_payment (expired)");
             std::hint::black_box(d);

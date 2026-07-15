@@ -119,17 +119,34 @@ fn build_fixture() -> Fixture {
         )
         .expect("engine"),
     );
-    Fixture { engine, caller, verifies, settles, state_file, placement }
+    Fixture {
+        engine,
+        caller,
+        verifies,
+        settles,
+        state_file,
+        placement,
+    }
 }
 
 /// Issue + settle one quote (baseline seeding / setup — not timed).
 async fn settle_one(fx: &Fixture, idx: u64) {
     let quote = fx
         .engine
-        .issue_quote(fx.caller.entity_id().clone(), CAPABILITY, mock_requirements(AMOUNT), NOW + idx, TTL_NS)
+        .issue_quote(
+            fx.caller.entity_id().clone(),
+            CAPABILITY,
+            mock_requirements(AMOUNT),
+            NOW + idx,
+            TTL_NS,
+        )
         .expect("issue");
     let proof = payload_for(&quote);
-    let d = fx.engine.accept_payment(&quote, &proof, OBS, NOW + idx + 1).await.expect("accept");
+    let d = fx
+        .engine
+        .accept_payment(&quote, &proof, OBS, NOW + idx + 1)
+        .await
+        .expect("accept");
     assert!(matches!(d, PaymentDecision::Served { .. }));
 }
 
@@ -144,7 +161,13 @@ async fn lifecycle(
 ) -> (u64, u64, String) {
     let start = Instant::now();
     let quote = engine
-        .issue_quote(caller_id, CAPABILITY, mock_requirements(AMOUNT), NOW + idx, TTL_NS)
+        .issue_quote(
+            caller_id,
+            CAPABILITY,
+            mock_requirements(AMOUNT),
+            NOW + idx,
+            TTL_NS,
+        )
         .expect("issue_quote");
     let proof = payload_for(&quote);
     let decision = engine
@@ -160,7 +183,10 @@ async fn lifecycle(
         .redeem_for_invocation(TOOL_ID, &quote.quote_id, None)
         .await
         .expect("redeem");
-    assert!(matches!(redeem, RedeemDecision::Admitted), "lifecycle redeem must admit");
+    assert!(
+        matches!(redeem, RedeemDecision::Admitted),
+        "lifecycle redeem must admit"
+    );
     handler_runs.fetch_add(1, Ordering::SeqCst); // "handler executes" (trivial body)
     let b = start.elapsed().as_nanos() as u64; // endpoint B: quote → handler response
     (a, b, billing_id)
@@ -173,27 +199,49 @@ async fn replay_witness(fx: &Fixture, idx: u64) {
     let engine = &fx.engine;
     let caller = fx.caller.entity_id().clone();
     let quote = engine
-        .issue_quote(caller, CAPABILITY, mock_requirements(AMOUNT), NOW + idx, TTL_NS)
+        .issue_quote(
+            caller,
+            CAPABILITY,
+            mock_requirements(AMOUNT),
+            NOW + idx,
+            TTL_NS,
+        )
         .expect("issue");
     let proof = payload_for(&quote);
-    let id1 = match engine.accept_payment(&quote, &proof, OBS, NOW + idx + 1).await.expect("accept") {
+    let id1 = match engine
+        .accept_payment(&quote, &proof, OBS, NOW + idx + 1)
+        .await
+        .expect("accept")
+    {
         PaymentDecision::Served { billing, .. } => billing.billing_event_id.clone(),
         other => panic!("witness accept not Served: {other:?}"),
     };
     assert!(matches!(
-        engine.redeem_for_invocation(TOOL_ID, &quote.quote_id, None).await.expect("redeem"),
+        engine
+            .redeem_for_invocation(TOOL_ID, &quote.quote_id, None)
+            .await
+            .expect("redeem"),
         RedeemDecision::Admitted
     ));
     // Replay: redeem again → AlreadyRedeemed; the handler must NOT run again.
     let mut handler_ran_again = false;
-    if let RedeemDecision::Admitted =
-        engine.redeem_for_invocation(TOOL_ID, &quote.quote_id, None).await.expect("redeem2")
+    if let RedeemDecision::Admitted = engine
+        .redeem_for_invocation(TOOL_ID, &quote.quote_id, None)
+        .await
+        .expect("redeem2")
     {
         handler_ran_again = true;
     }
-    assert!(!handler_ran_again, "replay must not re-admit / re-run the handler");
+    assert!(
+        !handler_ran_again,
+        "replay must not re-admit / re-run the handler"
+    );
     // Retry accept → Served via AlreadyServed, SAME billing identity.
-    let id2 = match engine.accept_payment(&quote, &proof, OBS, NOW + idx + 2).await.expect("reaccept") {
+    let id2 = match engine
+        .accept_payment(&quote, &proof, OBS, NOW + idx + 2)
+        .await
+        .expect("reaccept")
+    {
         PaymentDecision::Served { billing, .. } => billing.billing_event_id.clone(),
         other => panic!("witness reaccept not Served: {other:?}"),
     };
@@ -227,7 +275,7 @@ fn main() {
         let mut hist_a = new_hist();
         let mut hist_b = new_hist();
         let mut idx = 1_000u64;
-        let rounds = (n + conc - 1) / conc;
+        let rounds = n.div_ceil(conc);
         let (mut billings, mut handlers) = (0usize, 0usize);
 
         let start = Instant::now();
@@ -255,10 +303,26 @@ fn main() {
                     hist_b.record(b).unwrap();
                     billing_ids.insert(id);
                 }
-                assert_eq!(fx.verifies.load(Ordering::SeqCst), conc, "verify once per lifecycle");
-                assert_eq!(fx.settles.load(Ordering::SeqCst), conc, "settle once per lifecycle");
-                assert_eq!(billing_ids.len(), conc, "one stable billing identity per lifecycle");
-                assert_eq!(handler_runs.load(Ordering::SeqCst), conc, "handler once per lifecycle");
+                assert_eq!(
+                    fx.verifies.load(Ordering::SeqCst),
+                    conc,
+                    "verify once per lifecycle"
+                );
+                assert_eq!(
+                    fx.settles.load(Ordering::SeqCst),
+                    conc,
+                    "settle once per lifecycle"
+                );
+                assert_eq!(
+                    billing_ids.len(),
+                    conc,
+                    "one stable billing identity per lifecycle"
+                );
+                assert_eq!(
+                    handler_runs.load(Ordering::SeqCst),
+                    conc,
+                    "handler once per lifecycle"
+                );
                 billings += billing_ids.len();
                 handlers += handler_runs.load(Ordering::SeqCst);
             }
@@ -279,8 +343,20 @@ fn main() {
         let cards_after = record_count(&fx.state_file);
         let bytes_after = state_bytes(&fx.state_file);
         println!("\n== concurrency {conc} ==");
-        report("A quote->billing", &hist_a, total, conc, billings as f64 / wall);
-        report("B quote->handler", &hist_b, total, conc, handlers as f64 / wall);
+        report(
+            "A quote->billing",
+            &hist_a,
+            total,
+            conc,
+            billings as f64 / wall,
+        );
+        report(
+            "B quote->handler",
+            &hist_b,
+            total,
+            conc,
+            handlers as f64 / wall,
+        );
         println!(
             "      lifecycle_attempts/s={:.1} conc={conc} samples={n} records={cards_before}->{cards_after} \
              bytes={bytes_before}->{bytes_after} binding=off facilitator=in-process-zero-delay-mock timeouts=0",
@@ -290,9 +366,19 @@ fn main() {
     }
 }
 
-fn report(label: &str, hist: &hdrhistogram::Histogram<u64>, total: usize, _conc: usize, completed_per_s: f64) {
+fn report(
+    label: &str,
+    hist: &hdrhistogram::Histogram<u64>,
+    total: usize,
+    _conc: usize,
+    completed_per_s: f64,
+) {
     let us = |q: f64| hist.value_at_quantile(q) as f64 / 1000.0;
-    let p99 = if total >= 500 { format!("{:.1}", us(0.99)) } else { "n/a".into() };
+    let p99 = if total >= 500 {
+        format!("{:.1}", us(0.99))
+    } else {
+        "n/a".into()
+    };
     println!(
         "  {label:<18} p50={:>9.1}us p95={:>9.1}us p99={p99:>9}us max={:>9.1}us  completed/s={completed_per_s:.1}",
         us(0.50),
