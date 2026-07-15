@@ -233,6 +233,31 @@ impl EnhancedPingwave {
     }
 }
 
+/// Outcome of admitting an inbound pingwave into the proximity graph
+/// ([`ProximityGraph::admit_pingwave_from`]).
+///
+/// The variant is what lets the receive path order dedup BEFORE any
+/// routing-table mutation (RT-5 review: duplicate pingwave resurrects a
+/// withdrawn route). A `Option<EnhancedPingwave>` return conflated
+/// "rejected duplicate" with "accepted but expired" — both mapped to
+/// `None` — so a caller could not tell whether it was safe to install
+/// or refresh a route. It never is for a duplicate.
+#[derive(Debug)]
+pub enum PingwaveAdmission {
+    /// The `(origin, seq)` pair was already seen — rejected before any
+    /// node/edge mutation. The receive path MUST NOT install or refresh
+    /// a route for it, or a byte-identical replay would undo a
+    /// withdrawal that just removed the route + edge.
+    RejectedDuplicate,
+    /// A new pingwave whose local node/edge state was updated, but which
+    /// is TTL-expired and so must NOT be re-broadcast. A route to the
+    /// origin may still be installed/refreshed from it.
+    AcceptedNoForward,
+    /// A new, non-expired pingwave: update local state, install/refresh
+    /// the route, AND re-broadcast the returned (hop-advanced) pingwave.
+    AcceptedAndForward(EnhancedPingwave),
+}
+
 /// Proximity node info combining discovery and capability data
 #[derive(Debug)]
 pub struct ProximityNode {
@@ -601,29 +626,56 @@ impl ProximityGraph {
     /// from its origin) they match.
     ///
     /// Returns `Some(pingwave)` if it should be forwarded, `None`
-    /// otherwise.
+    /// otherwise. Thin back-compat wrapper over
+    /// [`Self::admit_pingwave_from`] for callers (the shim above, tests,
+    /// benches) that only care about the forward decision; the receive
+    /// path uses the richer [`PingwaveAdmission`] so it can gate route
+    /// installation on admission (RT-5 review: a duplicate must not
+    /// resurrect a withdrawn route).
     pub fn on_pingwave_from(
+        &self,
+        pw: EnhancedPingwave,
+        from_node: NodeId,
+        from_addr: SocketAddr,
+    ) -> Option<EnhancedPingwave> {
+        match self.admit_pingwave_from(pw, from_node, from_addr) {
+            PingwaveAdmission::AcceptedAndForward(fwd) => Some(fwd),
+            PingwaveAdmission::RejectedDuplicate | PingwaveAdmission::AcceptedNoForward => None,
+        }
+    }
+
+    /// Admit an inbound pingwave: dedup, then (only for a NEW pingwave)
+    /// update node + edge state and report whether the caller may
+    /// install a route and/or re-broadcast.
+    ///
+    /// Dedup precedes every mutation: a [`PingwaveAdmission::RejectedDuplicate`]
+    /// is returned before any node/edge is touched, so the receive path
+    /// that gates route installation on the result cannot reinstall a
+    /// route (or re-add an edge) that a withdrawal just removed when a
+    /// byte-identical pingwave is replayed or duplicated (RT-5 review).
+    pub fn admit_pingwave_from(
         &self,
         mut pw: EnhancedPingwave,
         from_node: NodeId,
         from_addr: SocketAddr,
-    ) -> Option<EnhancedPingwave> {
+    ) -> PingwaveAdmission {
         self.stats
             .pingwaves_received
             .fetch_add(1, Ordering::Relaxed);
 
         // Ignore our own pingwaves (origin self-check — also defends
         // against a buffered pingwave we emitted earlier being replayed
-        // back at us by a partitioned-then-healed peer).
+        // back at us by a partitioned-then-healed peer). Treated as a
+        // duplicate for admission purposes: no mutation, no forward.
         if pw.origin_id == self.my_id {
-            return None;
+            return PingwaveAdmission::RejectedDuplicate;
         }
 
         // Check dedup cache
         let key = (pw.origin_id, pw.seq);
         if self.seen_pingwaves.contains_key(&key) {
             self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return PingwaveAdmission::RejectedDuplicate;
         }
         // Key the dedup-count bump on the insert result (None == new key) so
         // it stays exact even under a concurrent insert of the same key.
@@ -680,9 +732,10 @@ impl ProximityGraph {
             self.insert_or_update_edge(from_node, pw.origin_id, sample_us);
         }
 
-        // Check if should forward
+        // Check if should forward. Expired = accepted (local state was
+        // updated above) but not re-broadcast.
         if pw.is_expired() {
-            return None;
+            return PingwaveAdmission::AcceptedNoForward;
         }
 
         // Forward
@@ -690,7 +743,7 @@ impl ProximityGraph {
         self.stats
             .pingwaves_forwarded
             .fetch_add(1, Ordering::Relaxed);
-        Some(pw)
+        PingwaveAdmission::AcceptedAndForward(pw)
     }
 
     /// Latency of the directed edge `from → to`, if the graph holds
@@ -890,6 +943,27 @@ impl ProximityGraph {
     /// it (RT-5 review: withdrawal suppression, cubic P1).
     pub fn path_to_excluding_direct(&self, dest: &NodeId) -> Option<Vec<NodeId>> {
         self.bfs_path_to(dest, Some((self.my_id, *dest)))
+    }
+
+    /// Shortest path from self to `dest` that does NOT start with the
+    /// `self → excluded_first_hop` edge — an alternate through a
+    /// DIFFERENT direct neighbor, even a longer one.
+    ///
+    /// When a peer withdraws its route toward `dest`, the withdrawing
+    /// first hop is no longer usable, but the UNRESTRICTED shortest path
+    /// may still start with it — and a caller that bails the moment
+    /// `path[1] == withdrawing_peer` would ignore a perfectly good
+    /// longer route through another neighbor and cascade a needless
+    /// withdrawal (RT-5 review: alternate search considers only one
+    /// shortest path). Excluding just the first-hop edge forces the BFS
+    /// to leave through some other neighbor. `dest` reachable only
+    /// through `excluded_first_hop` yields `None`.
+    pub fn path_to_excluding_first_hop(
+        &self,
+        dest: &NodeId,
+        excluded_first_hop: &NodeId,
+    ) -> Option<Vec<NodeId>> {
+        self.bfs_path_to(dest, Some((self.my_id, *excluded_first_hop)))
     }
 
     /// BFS shortest path from self to `dest`, optionally dropping one
@@ -1570,6 +1644,51 @@ mod tests {
         assert_eq!(path, vec![my_id, z, y]);
     }
 
+    /// RT-5 review witness: a byte-identical replay of an already-seen
+    /// pingwave must be rejected by dedup BEFORE it can re-add the edge
+    /// (or, in the receive path, reinstall the route) that a withdrawal
+    /// removed. Admission is checked ahead of every node/edge mutation.
+    #[test]
+    fn duplicate_pingwave_is_rejected_before_resurrecting_an_edge() {
+        let my_id = make_node_id(1);
+        let z = make_node_id(2); // forwarding direct peer
+        let y = make_node_id(3); // origin
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+
+        // Accept pingwave P (origin Y via Z). Byte-identical replay
+        // means identical (origin, seq) — capture the exact bytes and
+        // re-parse so the replay is provably the same frame.
+        let mut p = EnhancedPingwave::new(y, 7, 3).with_load(0, HealthStatus::Healthy);
+        p.hop_count = 1;
+        let p_bytes = p.to_bytes();
+
+        match graph.admit_pingwave_from(p, z, from) {
+            PingwaveAdmission::AcceptedAndForward(_) => {}
+            other => panic!("first receipt should be accepted+forwarded, got {other:?}"),
+        }
+        assert!(
+            graph.edge_latency(z, y).is_some(),
+            "accepting P installs the Z→Y edge",
+        );
+
+        // Withdraw Y: the withdrawal path removes the Z→Y edge (and, in
+        // the mesh, the route through Z).
+        assert!(graph.remove_edge(z, y), "edge should have existed");
+        assert!(graph.edge_latency(z, y).is_none());
+
+        // Replay the byte-identical P.
+        let replay = EnhancedPingwave::from_bytes(&p_bytes).expect("re-parse P");
+        match graph.admit_pingwave_from(replay, z, from) {
+            PingwaveAdmission::RejectedDuplicate => {}
+            other => panic!("byte-identical replay must be a duplicate, got {other:?}"),
+        }
+        assert!(
+            graph.edge_latency(z, y).is_none(),
+            "the removed edge must stay absent — a duplicate must not resurrect it",
+        );
+    }
+
     #[test]
     fn path_to_excluding_direct_routes_around_the_direct_edge() {
         // A dest reachable BOTH directly (self→Y) and indirectly
@@ -1599,6 +1718,60 @@ mod tests {
             graph.path_to_excluding_direct(&y),
             Some(vec![my_id, z, y]),
             "excluding the direct edge forces the indirect route",
+        );
+    }
+
+    /// RT-5 review P2: when the SHORTEST path to a dest starts with the
+    /// withdrawing peer, the alternate search must still find a LONGER
+    /// valid route through a different first hop instead of giving up.
+    #[test]
+    fn path_to_excluding_first_hop_finds_the_longer_route_through_another_peer() {
+        // Short:  self→B→X→D   (first hop B, the withdrawing peer)
+        // Long:   self→C→Y→Z→D (first hop C)
+        let my_id = make_node_id(1);
+        let b = make_node_id(2);
+        let x = make_node_id(3);
+        let c = make_node_id(4);
+        let y = make_node_id(5);
+        let z = make_node_id(6);
+        let d = make_node_id(7);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        // Build both paths by hand via the edge test-seam.
+        graph.test_insert_edge(my_id, b, 100);
+        graph.test_insert_edge(b, x, 100);
+        graph.test_insert_edge(x, d, 100);
+        graph.test_insert_edge(my_id, c, 100);
+        graph.test_insert_edge(c, y, 100);
+        graph.test_insert_edge(y, z, 100);
+        graph.test_insert_edge(z, d, 100);
+
+        assert_eq!(
+            graph.path_to(&d),
+            Some(vec![my_id, b, x, d]),
+            "unrestricted search takes the shorter path via B",
+        );
+        assert_eq!(
+            graph.path_to_excluding_first_hop(&d, &b),
+            Some(vec![my_id, c, y, z, d]),
+            "excluding B as a first hop must find the longer route via C, not cascade",
+        );
+    }
+
+    #[test]
+    fn path_to_excluding_first_hop_none_when_only_via_excluded_peer() {
+        let my_id = make_node_id(1);
+        let b = make_node_id(2);
+        let d = make_node_id(7);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        graph.test_insert_edge(my_id, b, 100);
+        graph.test_insert_edge(b, d, 100);
+
+        assert_eq!(graph.path_to(&d), Some(vec![my_id, b, d]));
+        assert_eq!(
+            graph.path_to_excluding_first_hop(&d, &b),
+            None,
+            "a dest reachable only through the excluded first hop has no alternate",
         );
     }
 
