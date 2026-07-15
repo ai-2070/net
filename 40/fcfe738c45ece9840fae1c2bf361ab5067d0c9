@@ -1,0 +1,30 @@
+net/crates/net/docs/performance/payments-duplicate-storms.md
+  s_49cc2ab0880501::t_d3af159019a1a2 1-90
+net/crates/net/payments/Cargo.toml
+  s_49cc2ab0880501::t_02e4a96028208a 140-143
+  s_49cc2ab0880501::t_f1118dd75eee77 190-196
+.github/workflows/ci.yml
+  s_49cc2ab0880501::t_2c679d56497139 554
+net/crates/net/payments/benches/bench_common/mod.rs
+  s_49cc2ab0880501::t_e09eeba3704a3a 494-495,497
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_362a0f129bc504 377-383
+net/crates/net/payments/benches/duplicate_storm.rs
+  s_49cc2ab0880501::t_8532eb7acef0be 1-303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "40fcfe738c45ece9840fae1c2bf361ab5067d0c9",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
