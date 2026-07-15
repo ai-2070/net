@@ -58,7 +58,9 @@ use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
-use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
+use super::behavior::proximity::{
+    EnhancedPingwave, PingwaveAdmission, ProximityConfig, ProximityGraph,
+};
 // SI-2a (SENSING_INTEREST_COALESCING_PLAN v4.3): the sensing plane's
 // dispatch wiring. Imported as a module (not item-by-item) so every
 // sensing type reads `sensing::…` at its use site — the plane is new
@@ -8014,24 +8016,44 @@ impl MeshNode {
                     None => return,
                 };
 
-                // Install an indirect route `(origin, via=source)`
-                // with metric `hop_count + 2`. The `+2` keeps direct
-                // routes (metric 1) strictly better than any pingwave
-                // route — `add_route_with_metric` preserves the
-                // better entry.
+                // Metric for the indirect route `(origin, via=source)`:
+                // `hop_count + 2`. The `+2` keeps direct routes
+                // (metric 1) strictly better than any pingwave route —
+                // `add_route_with_metric` preserves the better entry.
+                // Captured from the ORIGINAL hop_count before `pw` is
+                // moved into admission (which advances it on forward).
                 let metric = (pw.hop_count as u16).saturating_add(2);
-                ctx.router
-                    .routing_table()
-                    .add_route_with_metric(origin_nid, source, metric);
 
-                // Hand to the proximity graph to update nodes +
+                // Hand to the proximity graph to dedup + update nodes +
                 // edges. `source` is guaranteed registered at this
                 // point, so `from_graph_id` faithfully attributes
                 // the edge to the forwarding peer's node_id.
+                //
+                // Admission MUST precede the route install: a duplicate
+                // / byte-identical replay is rejected here BEFORE any
+                // routing mutation, so it cannot resurrect a route (or
+                // edge) that a withdrawal just removed (RT-5 review). We
+                // install/refresh the route only for an ACCEPTED
+                // pingwave, and forward only an accepted-and-live one.
                 let from_graph_id = node_id_to_graph_id(from_node_id);
-                if let Some(fwd_pw) =
-                    ctx.proximity_graph
-                        .on_pingwave_from(pw, from_graph_id, source)
+                let admission = ctx
+                    .proximity_graph
+                    .admit_pingwave_from(pw, from_graph_id, source);
+                let fwd_pw = match admission {
+                    PingwaveAdmission::RejectedDuplicate => return,
+                    PingwaveAdmission::AcceptedNoForward => {
+                        ctx.router
+                            .routing_table()
+                            .add_route_with_metric(origin_nid, source, metric);
+                        return;
+                    }
+                    PingwaveAdmission::AcceptedAndForward(fwd_pw) => {
+                        ctx.router
+                            .routing_table()
+                            .add_route_with_metric(origin_nid, source, metric);
+                        fwd_pw
+                    }
+                };
                 {
                     let fwd_bytes = fwd_pw.to_bytes();
                     let socket = ctx.socket.clone();
