@@ -259,8 +259,13 @@ impl ObservationCell {
     ///   must neither establish nor postpone expiry (SI-0 tests
     ///   13/14).
     /// - Continuity never carries across an incarnation boundary: a
-    ///   warm-started beat from a NEW incarnation expires the cell
-    ///   (§4.7) until the new stream itself establishes.
+    ///   warm-started beat from a NEW incarnation expires ESTABLISHED
+    ///   continuity (§4.7) — the earned optimism the old stream can
+    ///   no longer vouch for — until the new stream establishes on
+    ///   its own live beat. An Unestablished cell has no earned
+    ///   optimism to revoke: a cached Ready still projects Unknown
+    ///   and a cached NotReady still projects NotReady (pessimism is
+    ///   safe), both bounded by the unchanged establishment deadline.
     /// - Continuity never carries across a GENERATION boundary
     ///   either (v4.1, §3.4) — but a generation change is a
     ///   *redefinition*, not a failure signal: the cell resets to a
@@ -611,6 +616,63 @@ mod tests {
         live.source_incarnation = Incarnation::new(2);
         cell.on_admitted_beat(t0 + D * 2, live);
         assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+    }
+
+    #[test]
+    fn incarnation_crossing_expires_only_established_optimism() {
+        // The incarnation-crossing disruption targets ESTABLISHED
+        // continuity — the earned optimism the old stream can no
+        // longer vouch for. An UNESTABLISHED cell has none to revoke,
+        // so a cached new-incarnation beat must NOT force-expire it:
+        // a warm-started NotReady keeps projecting NotReady (pessimism
+        // is safe), bounded by the unchanged establishment deadline.
+        let t0 = Instant::now();
+
+        // Unestablished NotReady, then a new-incarnation warm-start:
+        // stays NotReady, NO IncarnationSuperseded disruption.
+        let mut cell = ObservationCell::register(t0, D, K);
+        cell.on_admitted_beat(t0, beat(1, AttestedStatus::NotReady, false));
+        assert_eq!(cell.continuity(), Continuity::Unestablished);
+        assert_eq!(cell.projected(), ProjectedReadiness::NotReady);
+        let mut restarted = beat(2, AttestedStatus::NotReady, false);
+        restarted.source_incarnation = Incarnation::new(2);
+        cell.on_admitted_beat(t0 + D, restarted);
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Unestablished,
+            "a new-incarnation warm-start does not force-expire an unestablished cell",
+        );
+        assert_eq!(
+            cell.projected(),
+            ProjectedReadiness::NotReady,
+            "cached pessimism still projects — pessimism is safe across the boundary",
+        );
+        assert_eq!(
+            cell.last_disrupt(),
+            None,
+            "no established optimism was revoked",
+        );
+        // …but it is NOT permanent: the ORIGINAL establishment
+        // deadline (unchanged by the warm-start) still fires.
+        cell.expire_if_due(t0 + D * K);
+        assert_eq!(cell.continuity(), Continuity::Expired);
+        assert_eq!(cell.projected(), ProjectedReadiness::Unknown);
+
+        // The ESTABLISHED case is the one that revokes: an
+        // established Ready loses continuity on the incarnation
+        // boundary (the covered `continuity_never_carries_across_
+        // incarnations` path — asserted here for the contrast).
+        let mut established = ObservationCell::register(t0, D, K);
+        established.on_admitted_beat(t0, beat(1, AttestedStatus::Ready, true));
+        assert_eq!(established.projected(), ProjectedReadiness::Ready);
+        let mut warm_new_inc = beat(2, AttestedStatus::Ready, false);
+        warm_new_inc.source_incarnation = Incarnation::new(2);
+        established.on_admitted_beat(t0 + D, warm_new_inc);
+        assert_eq!(established.continuity(), Continuity::Expired);
+        assert_eq!(
+            established.last_disrupt(),
+            Some(DisruptReason::IncarnationSuperseded),
+        );
     }
 
     #[test]
