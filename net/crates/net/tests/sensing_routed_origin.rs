@@ -268,6 +268,7 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
         CandidatePolicy::default(),
         3,
         512,
+        TTL,
     )));
     let outcomes: Arc<Mutex<Vec<Outcome>>> = Arc::new(Mutex::new(Vec::new()));
     let decode_failures = Arc::new(Mutex::new(0u32));

@@ -6175,6 +6175,7 @@ impl MeshNode {
             sensing::CandidatePolicy::default(),
             self.config.continuity_factor,
             self.config.max_interests_per_peer,
+            self.config.sensing_interest_ttl,
         );
         *self.sensing_leader.lock() = Some(leader);
         true

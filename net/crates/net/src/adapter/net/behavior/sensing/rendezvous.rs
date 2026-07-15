@@ -302,6 +302,13 @@ pub struct SensingLeaderLoad {
 pub struct SensingLeader {
     owner_root: AudienceScopeCommitment,
     policy: CandidatePolicy,
+    /// The node's soft-state lifetime bound (`sensing_interest_ttl`).
+    /// A wire `soft_state_ttl` is clamped to this at intake so no
+    /// remote value ever reaches `Instant + Duration` scheduling
+    /// unbounded (an over-long ttl would otherwise panic the leader
+    /// on overflow, or pin a row past the configured lifetime) —
+    /// the same cap every local registration path already applies.
+    max_soft_state_ttl: Duration,
     /// Branch-level machinery: per-downstream tables, caches,
     /// schedules, and the hop-by-hop continuity rule.
     pub relay: SensingRelay,
@@ -315,10 +322,12 @@ impl SensingLeader {
         policy: CandidatePolicy,
         continuity_factor: u32,
         max_interests_per_peer: usize,
+        max_soft_state_ttl: Duration,
     ) -> Self {
         Self {
             owner_root,
             policy,
+            max_soft_state_ttl,
             relay: SensingRelay::new(continuity_factor, max_interests_per_peer),
             interests: HashMap::new(),
         }
@@ -521,13 +530,24 @@ impl SensingLeader {
         )
         .map_err(FrameRejection::Scope)?;
 
-        // (5) The validated registration joins the ordinary
-        // coalescing path under the authenticated origin.
+        // (5) Clamp the wire `soft_state_ttl` to this node's
+        // soft-state lifetime bound BEFORE it reaches any
+        // `Instant + Duration` scheduling — a near-`u64::MAX` ttl is
+        // not part of `interest_digest`, so it rides the frame
+        // unvalidated, and an unclamped value would overflow-panic
+        // the leader (or pin a row past the configured lifetime).
+        // This mirrors the cap every local registration path applies
+        // (`MeshNode::register_*`); the interest interval is already
+        // range-checked at the 0x0C02 dispatch gate.
+        let soft_state_ttl = (*soft_state_ttl).min(self.max_soft_state_ttl);
+
+        // The validated registration joins the ordinary coalescing
+        // path under the authenticated origin.
         self.register_capability_interest(
             &spec,
             DownstreamId::Peer(authenticated_origin),
             *requested_sample_interval,
-            *soft_state_ttl,
+            soft_state_ttl,
             proven_root,
             snapshot,
             now,
@@ -1017,7 +1037,7 @@ mod tests {
     #[test]
     fn leader_load_snapshots_interest_branch_and_row_concentration() {
         let now = Instant::now();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4, TTL);
         assert_eq!(
             leader.load(now),
             SensingLeaderLoad {
@@ -1074,7 +1094,7 @@ mod tests {
         let now = Instant::now();
         // Per-downstream cap of ONE row: the second distinct
         // interest from the same consumer has nowhere to register.
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1, TTL);
         let snapshot = [provider(0xB1, 5)];
         let consumer = DownstreamId::Peer(0xC1);
 
@@ -1134,7 +1154,7 @@ mod tests {
             maximum_fanout: 3,
             each_mode_max_providers: 32,
         };
-        let mut leader = SensingLeader::new(root(), policy, K, 3);
+        let mut leader = SensingLeader::new(root(), policy, K, 3, TTL);
         let snapshot = [provider(0xB1, 5), provider(0xB2, 7)];
         let consumer = DownstreamId::Peer(0xC1);
 
@@ -1173,7 +1193,7 @@ mod tests {
     #[test]
     fn refused_joiner_on_live_interest_is_refused_not_ghosted() {
         let now = Instant::now();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 1, TTL);
         let snapshot = [provider(0xB1, 5)];
         let live_consumer = DownstreamId::Peer(0xC1);
         let full_consumer = DownstreamId::Peer(0xC2);
@@ -1241,7 +1261,7 @@ mod tests {
     fn sweep_reclaims_relay_state_and_re_registration_gets_no_stale_warm_start() {
         let t0 = Instant::now();
         let a = DownstreamId::Peer(0xA);
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10)];
         let reg = leader
             .register_capability_interest(&spec(), a, ms(100), TTL, root(), &snapshot, t0)
@@ -1292,7 +1312,7 @@ mod tests {
         use super::super::continuity::Continuity;
         let t0 = Instant::now();
         let (a, c) = (DownstreamId::Peer(0xA), DownstreamId::Peer(0xC));
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10)];
         // Strict A carries a short ttl; loose C holds the branch.
         leader
@@ -1340,7 +1360,7 @@ mod tests {
     fn distinct_branch_churn_leaves_no_retained_relay_state() {
         let t0 = Instant::now();
         let a = DownstreamId::Peer(0xA);
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10)];
         for i in 0..50u64 {
             let media = format!("size-{i}");
@@ -1406,7 +1426,7 @@ mod tests {
         // branch, ONE signed stream, the identical proof to both.
         let t0 = Instant::now();
         let (a, c) = (DownstreamId::Peer(0xA), DownstreamId::Peer(0xC));
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10), provider(8, 40)];
 
         let reg_a = leader
@@ -1458,7 +1478,7 @@ mod tests {
         // registrations.
         let t0 = Instant::now();
         let a = DownstreamId::Peer(0xA);
-        let mut new_leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut new_leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         assert!(new_leader.is_drained());
         let reg = new_leader
             .register_capability_interest(&spec(), a, ms(100), TTL, root(), &[provider(7, 10)], t0)
@@ -1498,7 +1518,7 @@ mod tests {
         // Old leader had live demand…
         let t0 = Instant::now();
         let a = DownstreamId::Peer(0xA);
-        let mut old_leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut old_leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         old_leader
             .register_capability_interest(&spec(), a, ms(100), TTL, root(), &[provider(7, 10)], t0)
             .unwrap();
@@ -1533,8 +1553,8 @@ mod tests {
         // Both islands' leaders open a branch to the SAME provider.
         let t0 = Instant::now();
         let snapshot = vec![provider(7, 10)];
-        let mut leader1 = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
-        let mut leader2 = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader1 = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
+        let mut leader2 = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let reg1 = leader1
             .register_capability_interest(
                 &spec(),
@@ -1589,7 +1609,7 @@ mod tests {
         // never claims a universal end-to-end result.
         let t0 = Instant::now();
         let (a, c) = (DownstreamId::Peer(0xA), DownstreamId::Peer(0xC));
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         // P7 ranks first at the leader; P8 is the warm standby.
         let snapshot = vec![provider(7, 10), provider(8, 20)];
         let reg = leader
@@ -1747,7 +1767,7 @@ mod tests {
         // into ONE row on the RE-DERIVED identity.
         let t0 = Instant::now();
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10), provider(8, 40)];
 
         let reg_a = leader
@@ -1802,12 +1822,53 @@ mod tests {
     }
 
     #[test]
+    fn frame_intake_clamps_an_over_long_soft_state_ttl() {
+        // 2026-07-15 review §1 (leader-crash DoS): `soft_state_ttl` is
+        // NOT bound by `interest_digest`, so a peer can ride any value
+        // on the frame unvalidated. An unclamped near-`u64::MAX` ttl
+        // reaches `now + soft_state_ttl` (InterestTable::register) and
+        // overflow-panics the leader. Intake must clamp the wire value
+        // to the node's soft-state ceiling — here `TTL` — exactly as
+        // every local registration path does; the frame is admitted,
+        // never rejected, and never panics.
+        let t0 = Instant::now();
+        let counters = SensingCounters::default();
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
+        let snapshot = vec![provider(7, 10)];
+
+        let frame = SensingInterestFrame::capability_registration(
+            &spec(),
+            ms(100),
+            Duration::from_secs(u64::MAX),
+            0xA,
+        );
+        let reg = leader
+            .register_from_frame(&frame, 0xA, &root(), &root(), &counters, &snapshot, t0)
+            .expect("an over-long ttl is clamped, not rejected — and never panics");
+
+        // The stored row reflects the CLAMPED lifetime, so
+        // `expires_at = now + TTL` is representable and the row
+        // expires on the configured schedule rather than never.
+        let branch = ProviderInterestKey::new(reg.interest.clone(), 7);
+        let row = leader
+            .relay
+            .table
+            .downstream_entry(&branch, DownstreamId::Peer(0xA))
+            .expect("the authenticated origin holds a row on the branch");
+        assert_eq!(
+            row.soft_state_ttl, TTL,
+            "the wire ttl was clamped to the ceiling",
+        );
+        assert_eq!(row.expires_at, t0 + TTL);
+    }
+
+    #[test]
     fn frame_intake_rejects_a_consumer_field_mismatch() {
         // §4.10 review 7: the frame claims a consumer the routed
         // session did not authenticate — protocol-invalid, refused
         // before any predicate work.
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let rejection = leader
             .register_from_frame(
                 &frame_for(&spec(), 0xBAD, ms(100)),
@@ -1839,7 +1900,7 @@ mod tests {
         // digest never becomes an identity.
         let t0 = Instant::now();
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let snapshot = vec![provider(7, 10)];
 
         let forged_claim = Digest256::from_bytes([0xEE; 32]);
@@ -1884,7 +1945,7 @@ mod tests {
         // claim matches its own proven root) is refused — an
         // authorization outcome, not a security event.
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let mut foreign_spec = spec();
         foreign_spec.audience = other_root();
         let rejection = leader
@@ -1914,7 +1975,7 @@ mod tests {
         // constraints digest are tampered/malformed protocol input —
         // both the invalid-constraints and security counters move.
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let mut frame = frame_for(&spec(), 0xA, ms(100));
         let SensingInterestFrame::CapabilityRegistration {
             constraints_digest, ..
@@ -1950,7 +2011,7 @@ mod tests {
         // Provider-addressed and deregister frames have no business
         // at the registration intake.
         let counters = SensingCounters::default();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 512, TTL);
         let not_leader_addressed = [
             SensingInterestFrame::provider_registration(&spec(), 7, ms(100), TTL),
             SensingInterestFrame::Deregister {
@@ -1987,7 +2048,7 @@ mod tests {
     #[test]
     fn full_active_replacement_inherits_the_surviving_consumer_rows() {
         let now = Instant::now();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4, TTL);
         let consumer = DownstreamId::Peer(193);
         let shared = spec();
 
@@ -2057,7 +2118,7 @@ mod tests {
             maximum_fanout: 3,
             each_mode_max_providers: 32,
         };
-        let mut leader = SensingLeader::new(root(), policy, K, 3);
+        let mut leader = SensingLeader::new(root(), policy, K, 3, TTL);
         let snapshot = [provider(0xB1, 5), provider(0xB2, 7)];
         let c1 = DownstreamId::Peer(1);
         let c2 = DownstreamId::Peer(2);
@@ -2116,7 +2177,7 @@ mod tests {
     #[test]
     fn replacement_without_surviving_demand_drains_instead_of_ghosting() {
         let now = Instant::now();
-        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4);
+        let mut leader = SensingLeader::new(root(), CandidatePolicy::default(), K, 4, TTL);
         let shared = spec();
         leader
             .register_capability_interest(
