@@ -98,7 +98,7 @@
 //!
 //! The mesh bounds wire intervals at intake
 //! (`0 < D ≤ sensing_interest_ttl`), but this module never trusts
-//! that: all scheduling uses [`schedule_after`] (checked add,
+//! that: all scheduling uses `schedule_after` (checked add,
 //! far-future park on overflow) and a zero cadence floor is
 //! normalized to the default at construction, so no cadence value —
 //! however malformed — can panic or hot-loop the emitter task.

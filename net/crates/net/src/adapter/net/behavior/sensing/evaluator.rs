@@ -178,7 +178,7 @@ pub const fn check_cadence(
 /// Sensing-plane counters (plan §6 SI-7 observability surface).
 /// Shared-reference friendly: relaxed atomics, monotonic,
 /// diagnostics only — never load-bearing for any decision. Read a
-/// snapshot through [`super::super::MeshNode::sensing_counters`].
+/// snapshot through [`super::super::super::MeshNode::sensing_counters`].
 ///
 /// The counters fall in three groups: refusals-by-kind (the SI-0
 /// subset), the coalescing / delivery lifecycle (SI-7), and the

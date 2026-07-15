@@ -124,7 +124,7 @@ macro_rules! impl_hex32_serde {
 }
 
 /// A 256-bit sensing digest (blake3 output). Serializes as a hex
-/// string (see [`impl_hex32_serde`] note above).
+/// string (see the `impl_hex32_serde` note above).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest256([u8; 32]);
 
@@ -211,7 +211,7 @@ impl DisclosureClass {
 /// diligence. Digest inclusion *separates semantic identities after
 /// validation* — it never replaces the authenticated-session
 /// identity check (plan §4.9). Serializes as a hex string (see the
-/// [`impl_hex32_serde`] note on [`Digest256`]).
+/// `impl_hex32_serde` note on [`Digest256`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudienceScopeCommitment([u8; 32]);
 
@@ -518,7 +518,7 @@ fn read_string(cursor: &mut &[u8]) -> Result<String, ConstraintError> {
 /// list; local folds materialize membership. The commitment is an
 /// opaque 32-byte identity — the fold's group machinery resolves it;
 /// it is never a bearer secret. Serializes as a hex string (see the
-/// [`impl_hex32_serde`] note on [`Digest256`]).
+/// `impl_hex32_serde` note on [`Digest256`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupRef([u8; 32]);
 

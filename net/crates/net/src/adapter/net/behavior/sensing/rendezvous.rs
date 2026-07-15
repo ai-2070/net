@@ -3,7 +3,7 @@
 //!
 //! Provider-free capability interests need a destination; Net
 //! already ships the primitive. This module REUSES
-//! [`elect`](super::super::super::redex::elect) — the pure,
+//! [`elect`] — the pure,
 //! deterministic, health-filtered `(key, NodeId)` ranking whose
 //! "next-ranked healthy node wins on leader loss" is exactly the
 //! bully fallback — with two parameter changes and zero algorithm
@@ -64,7 +64,7 @@ const UNKNOWN_EDGE_PENALTY: Duration = Duration::from_secs(3600);
 
 /// Closeness-centrality score for one member over the SHARED
 /// proximity view: the sum of its RTTs to every other member
-/// (missing samples take [`UNKNOWN_EDGE_PENALTY`]). Lower = more
+/// (missing samples take `UNKNOWN_EDGE_PENALTY`). Lower = more
 /// central. Computed over the full member set — health changes
 /// affect *eligibility*, never scores, so a leader loss reorders
 /// nothing and the next-ranked member wins deterministically.
@@ -710,7 +710,7 @@ impl SensingLeader {
     /// DEDUPLICATED union across ALL old live branches BEFORE any
     /// teardown, and every replacement branch inherits that
     /// surviving union — deriving rows from the first KEPT branch
-    /// handed a full replacement ([A] → [B]) zero downstream rows,
+    /// handed a full replacement (old \[A\] → fresh \[B\]) zero rows,
     /// and lost consumers present only on another old branch
     /// (partial refusals make branch populations non-identical). A
     /// branch is reported `added` only when it actually acquired
