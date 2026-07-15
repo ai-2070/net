@@ -506,6 +506,113 @@ async fn scenario_6_callee_side_defense_in_depth_rejects() {
     }
 }
 
+/// Scenario 6, **streaming** mirror — the callee-side gate on
+/// `serve_rpc_streaming`'s inbound bridge (RT-6 hardening: the
+/// streaming bridge previously lacked the `may_execute` gate the
+/// unary bridge has had since v0.4, so a caller could bypass
+/// capability auth entirely by opening a streaming call). The deny
+/// arrives as a terminal `CapabilityDenied` frame on the caller's
+/// stream; the handler never runs. A subsequent permissive
+/// announcement re-opens the gate for the same service, pinning
+/// that the gate doesn't break legitimate streaming callers.
+#[tokio::test]
+async fn scenario_6_streaming_callee_side_defense_in_depth_rejects() {
+    use futures::StreamExt;
+    use net::adapter::net::cortex::{RpcResponseSink, RpcStreamingHandler};
+
+    let target = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &target).await;
+
+    struct StreamEcho;
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for StreamEcho {
+        async fn call(
+            &self,
+            ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            sink.send(ctx.payload.body);
+            Ok(())
+        }
+    }
+
+    let _serve = target
+        .serve_rpc_streaming("echo_stream", Arc::new(StreamEcho))
+        .expect("serve_rpc_streaming");
+
+    // Restrictive announcement in the target's OWN index only —
+    // supersedes the permissive self-index `serve_rpc_streaming`
+    // installed (version-space contract: pick >= 100).
+    let restrictive = target_announcement(
+        &target,
+        100,
+        "nrpc:echo_stream",
+        vec![0xDEAD_BEEF_BAAD_F00D],
+        vec![],
+        vec![],
+    );
+    target.test_inject_capability_announcement(restrictive);
+
+    // Direct `call_streaming` bypasses the caller-side
+    // `call_service_streaming` gate; the callee-side bridge must
+    // catch the bypass with a terminal CapabilityDenied frame.
+    let mut stream = caller
+        .call_streaming(
+            target.node_id(),
+            "echo_stream",
+            Bytes::from_static(b"bypass"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_streaming opens; the deny arrives as a terminal frame");
+    let first = stream.next().await.expect("one terminal item");
+    match first {
+        Err(RpcError::ServerError {
+            status, message, ..
+        }) => {
+            // RpcStatus::CapabilityDenied = 0x0008.
+            assert_eq!(
+                status, 0x0008,
+                "expected CapabilityDenied wire status, got {status:#06x}",
+            );
+            assert!(
+                message.contains("nrpc:echo_stream"),
+                "diagnostic must name the denied tag: {message}",
+            );
+        }
+        other => panic!("expected terminal ServerError(CapabilityDenied), got {other:?}"),
+    }
+    assert!(
+        stream.next().await.is_none(),
+        "deny must terminate the stream",
+    );
+
+    // Permissive re-announcement (higher version) re-opens the
+    // gate — the legit streaming path still round-trips.
+    let permissive = target_announcement(&target, 200, "nrpc:echo_stream", vec![], vec![], vec![]);
+    target.test_inject_capability_announcement(permissive);
+    let mut stream = caller
+        .call_streaming(
+            target.node_id(),
+            "echo_stream",
+            Bytes::from_static(b"ok"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_streaming");
+    let first = stream
+        .next()
+        .await
+        .expect("echoed chunk")
+        .expect("Ok chunk");
+    assert_eq!(first.as_ref(), b"ok");
+    assert!(
+        stream.next().await.is_none(),
+        "clean END after the echoed chunk",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sanity: the helper functions used above behave as documented.
 // ---------------------------------------------------------------------------

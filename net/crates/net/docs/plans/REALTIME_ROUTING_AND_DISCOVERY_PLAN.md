@@ -1,7 +1,7 @@
 # Real-Time Routing & Capability Discovery Plan
 
-Status: RT-1..RT-5 implemented (2026-07-11); RT-6 (remote watch stream) and
-RT-7 (docs) open
+Status: COMPLETE — RT-1..RT-5 implemented (2026-07-11); RT-6 and
+RT-7 done (2026-07-12)
 Owner: TBD
 Related: `POLLING_TO_EVENT_DRIVEN_SDK_PLAN.md` (predecessor — made *local*
 watch surfaces push), `CAPABILITY_BROADCAST_PLAN.md` (the announcement
@@ -305,12 +305,38 @@ exactly as today.
   `disabled_receiver_keeps_route_until_age_out` (route_withdraw.rs —
   receiver's sweep parked at 30 s so the flood is the only possible
   cause).
-- **RT-6 — nRPC streaming remote watch + Go binding cutover (C).** OPEN.
-  Depends RT-3 for end-to-end value, technically independent. Includes
-  the overflow/resync contract test.
-- **RT-7 — docs.** OPEN. Replace the `discover.md` poll loop with
-  `watchTools`; document the new knobs and the push-plus-anti-entropy
-  model in `TRANSPORT.md` / `BEHAVIOR.md`.
+- **RT-6 — nRPC streaming remote watch + Go binding cutover (C).**
+  ✅ DONE (2026-07-12), in two halves with one premise correction:
+  the Go RPC binding's `ListTools` is a LOCAL fold read over FFI (the
+  §2.5 "over nRPC" phrasing was loose), so the ticker's fix is the
+  existing event-driven FFI watch — `bindings/go/net/tool.go`
+  `WatchTools` now consumes `net_rpc_watch_tools` (mirroring the
+  repo-root Go binding), diff computed substrate-side,
+  `WatchOptions.Interval` demoted to the staleness ceiling. The
+  remote half is `TOOL_WATCH_SERVICE = "tool.watch"`: a
+  server-streaming nRPC service forwarding `MeshNode::watch_tools`
+  as `ToolWatchFrame::{Change, Resync}` (JSON identical to the FFI
+  `ToolListChange` shape); per-subscriber 64-slot bounded buffer —
+  overflow drops THAT subscriber's queued deltas and emits `Resync`
+  (client re-baselines from its own mesh-replicated fold via
+  `list_tools`); never a silent delta loss (`RpcResponseSink` grew a
+  non-dropping `send_wait` because the pump queue silently drops at
+  capacity). **Bonus hardening:** `serve_rpc_streaming`'s inbound
+  bridge now runs the same callee-side `may_execute` capability gate
+  as unary — the streaming path previously had caller-side gating
+  only. Contract tests: `sdk/tests/nrpc_tool_watch.rs` (change
+  frames, deterministic overflow → Resync → consistent re-baseline,
+  callee-gate deny) + auth-conformance scenario 6.
+- **RT-7 — docs.** ✅ DONE (2026-07-12). All four SDK `discover.md`
+  poll loops (typescript/python/go/rust) replaced with the
+  event-driven watch surfaces (baseline via list, then pushed
+  `ToolListChange`s; interval documented as a staleness ceiling, not
+  a poll rate); `TRANSPORT.md` §Routing gained the RT-4/RT-5
+  paragraphs (event pingwaves incl. the two-round divergence,
+  withdrawal semantics + knobs); `BEHAVIOR.md` gained the
+  "Real-time propagation: push + anti-entropy" section with the knob
+  table and the invariant statement (timers guarantee convergence,
+  pushes only make it faster).
 
 Dependency order: RT-1 → RT-2 → RT-3; RT-4 and RT-5 independent of the
 announce track (RT-5 benefits from RT-4's recovery pingwave); RT-6, RT-7

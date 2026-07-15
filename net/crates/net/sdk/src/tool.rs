@@ -32,9 +32,12 @@ pub use net::adapter::net::behavior::fold::capability_aggregation::{TagMatcher, 
 pub use net::adapter::net::cortex::tool::{
     description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
     tags_metadata_key, ToolDescriptor, ToolEvent, ToolListChange, ToolListWatch,
-    ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
+    ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse, ToolWatchFrame,
+    WatchToolsRequest, TOOL_METADATA_FETCH_SERVICE, TOOL_WATCH_SERVICE,
 };
 
+#[cfg(feature = "cortex")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "cortex")]
 use std::sync::Arc;
 
@@ -42,11 +45,22 @@ use std::sync::Arc;
 use crate::mesh::Mesh;
 #[cfg(feature = "cortex")]
 use crate::mesh_rpc::{
-    Codec, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus, ServeError,
-    ServeHandle, NRPC_TYPED_BAD_REQUEST, NRPC_TYPED_HANDLER_ERROR,
+    Codec, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink, RpcStatus,
+    RpcStreamingHandler, ServeError, ServeHandle, NRPC_TYPED_BAD_REQUEST, NRPC_TYPED_HANDLER_ERROR,
 };
 #[cfg(feature = "cortex")]
+use net::adapter::net::MeshNode;
+#[cfg(feature = "cortex")]
 use serde::{de::DeserializeOwned, Serialize};
+
+/// Bound (in frames) of the per-subscriber queue between the
+/// serving node's local `watch_tools` and the `tool.watch`
+/// wire-forwarding loop. When a subscriber falls this far behind
+/// (on top of the wire path's own buffering), its queued deltas are
+/// dropped and one [`ToolWatchFrame::Resync`] is emitted instead —
+/// see the resync contract on [`ToolWatchFrame`].
+#[cfg(feature = "cortex")]
+pub const TOOL_WATCH_SUBSCRIBER_BUFFER: usize = 64;
 
 /// Builder for a [`ToolDescriptor`] that derives its JSON Schema
 /// from Rust type parameters. Construct via [`metadata_for`], then
@@ -356,8 +370,11 @@ impl Mesh {
         // Step 3: lazy auto-install of `tool.metadata.fetch`. The
         // handler answers `{ name } -> ToolMetadataResponse` for
         // any caller that wants the full descriptor (for schemas
-        // too large to fit in the capability-fold payload).
+        // too large to fit in the capability-fold payload). The
+        // `tool.watch` remote-watch subscription (RT-6) installs on
+        // the same trigger.
         self.ensure_tool_metadata_fetch_installed();
+        self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
             inner,
@@ -445,8 +462,10 @@ impl Mesh {
             }
         };
 
-        // Step 3: lazy `tool.metadata.fetch` install, as `serve_tool`.
+        // Step 3: lazy `tool.metadata.fetch` + `tool.watch`
+        // install, as `serve_tool`.
         self.ensure_tool_metadata_fetch_installed();
+        self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
             inner,
@@ -553,8 +572,10 @@ impl Mesh {
             }
         };
 
-        // Step 3: lazy auto-install of `tool.metadata.fetch`.
+        // Step 3: lazy auto-install of `tool.metadata.fetch` +
+        // `tool.watch`.
         self.ensure_tool_metadata_fetch_installed();
+        self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
             inner,
@@ -726,6 +747,219 @@ impl Mesh {
         ) {
             *slot = Some(handle);
         }
+    }
+
+    /// Serve the [`TOOL_WATCH_SERVICE`] (`tool.watch`) streaming
+    /// nRPC service — the RT-6 remote-watch subscription — without
+    /// serving any tool.
+    ///
+    /// Every `serve_tool*` call auto-installs this service, so most
+    /// hosts never need to call it. Use it when a node should act
+    /// as a discovery relay: it serves no tools itself, but remote
+    /// subscribers can stream [`ToolWatchFrame`]s diffed from this
+    /// node's (mesh-replicated) capability fold.
+    ///
+    /// Protocol: the subscriber sends one JSON-encoded
+    /// [`WatchToolsRequest`] and receives one JSON-encoded
+    /// [`ToolWatchFrame`] per chunk (open it with
+    /// `call_streaming_typed::<WatchToolsRequest, ToolWatchFrame>`
+    /// or the service-routed sibling). Deltas ride a bounded
+    /// per-subscriber buffer ([`TOOL_WATCH_SUBSCRIBER_BUFFER`]); on
+    /// overflow the queued deltas are dropped and one
+    /// [`ToolWatchFrame::Resync`] is emitted — the client
+    /// re-baselines from its own local fold via
+    /// [`Self::list_tools`]. A delta is never lost silently.
+    ///
+    /// Idempotent: the first caller through installs the handler;
+    /// subsequent calls (including the `serve_tool*` auto-install
+    /// path) are no-ops. The service stays registered for the
+    /// lifetime of the `Mesh`. Auth rides the standard callee-side
+    /// nRPC capability gate (`nrpc:tool.watch`).
+    pub fn serve_tool_watch(&self) {
+        self.ensure_tool_watch_installed();
+    }
+
+    /// Idempotent — installs the `tool.watch` streaming service
+    /// handler if not yet present. Same slot pattern and
+    /// silent-failure policy as
+    /// [`Self::ensure_tool_metadata_fetch_installed`]: an install
+    /// conflict (service name already taken by a manual
+    /// registration) leaves the slot `None` and later callers
+    /// retry.
+    fn ensure_tool_watch_installed(&self) {
+        let mut slot = self.tool_watch.lock();
+        if slot.is_some() {
+            return;
+        }
+        let handler = Arc::new(ToolWatchHandler {
+            node: self.node_arc(),
+        });
+        if let Ok(handle) = self.serve_rpc_streaming(TOOL_WATCH_SERVICE, handler) {
+            *slot = Some(handle);
+        }
+    }
+}
+
+// ============================================================================
+// tool.watch server handler (RT-6 remote watch)
+// ============================================================================
+
+/// Streaming handler behind [`TOOL_WATCH_SERVICE`]. Implements the
+/// raw [`RpcStreamingHandler`] contract rather than riding
+/// `serve_rpc_streaming_typed` for two verified reasons:
+///
+/// 1. **Cancellation.** The typed streaming layer neither exposes
+///    nor observes `ctx.cancellation`, so a typed handler for an
+///    endless stream would keep its substrate watch (and task) alive
+///    after the caller cancels or drops the stream. The raw
+///    contract's `select!` on `ctx.cancellation` is the sanctioned
+///    termination path.
+/// 2. **Backpressure.** The typed sink's `send` lowers to the
+///    drop-on-full [`RpcResponseSink::send`] — silent delta loss,
+///    which the resync contract forbids. The raw sink's
+///    `send_wait` parks on pump-queue room instead, making the
+///    bounded per-subscriber queue here the operative overflow
+///    point.
+///
+/// The wire shape is exactly what
+/// `serve_rpc_streaming_typed::<WatchToolsRequest, ToolWatchFrame>(Codec::Json)`
+/// would produce — JSON request body in, one JSON
+/// [`ToolWatchFrame`] per chunk out — so typed clients consume it
+/// with `call_streaming_typed::<WatchToolsRequest, ToolWatchFrame>`
+/// unchanged.
+#[cfg(feature = "cortex")]
+struct ToolWatchHandler {
+    node: Arc<MeshNode>,
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl RpcStreamingHandler for ToolWatchHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: RpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        // Decode with the typed-layer conventions (bad body →
+        // NRPC_TYPED_BAD_REQUEST) so callers can't tell this apart
+        // from a typed registration.
+        let req: WatchToolsRequest = match Codec::Json.decode(&ctx.payload.body) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(RpcHandlerError::Application {
+                    code: NRPC_TYPED_BAD_REQUEST,
+                    message: format!("typed streaming handler: bad request body: {e}"),
+                })
+            }
+        };
+        // Validate the matcher up front: `list_tools` (which
+        // `watch_tools` calls for its baseline) PANICS on a matcher
+        // this binary can't evaluate (e.g. `Regex` without the
+        // `regex` feature). A wire caller must never be able to
+        // panic the host — refuse the call instead.
+        if let Some(m) = req.matcher.as_ref() {
+            if let Err(e) = m.validate() {
+                return Err(RpcHandlerError::Application {
+                    code: NRPC_TYPED_BAD_REQUEST,
+                    message: format!("tool.watch: unevaluable matcher: {e}"),
+                });
+            }
+        }
+        let interval = req.interval_ms.map(std::time::Duration::from_millis);
+        let mut watch = self.node.watch_tools(req.matcher, interval);
+        // Cancel handle survives moving the watch into the pump
+        // task; fired on every exit path so the substrate diff task
+        // ends promptly instead of parking on the fold change
+        // signal until the next unrelated mutation.
+        let watch_cancel = watch.cancel_handle();
+
+        // Inner pump: substrate watch → bounded per-subscriber
+        // queue. `try_send` so a stalled subscriber NEVER
+        // backpressures the substrate diff task; on overflow the
+        // delta is dropped and the shared flag set — the outer loop
+        // converts that into one Resync frame.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<ToolListChange>(TOOL_WATCH_SUBSCRIBER_BUFFER);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let overflow_pump = Arc::clone(&overflow);
+        let pump = tokio::spawn(async move {
+            while let Some(change) = watch.recv().await {
+                match tx.try_send(change) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        overflow_pump.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
+        // Outer loop: queue → wire. `send_wait` (not `send`) so a
+        // full pump queue blocks HERE — filling the bounded queue
+        // above and tripping the overflow flag — rather than
+        // silently dropping frames at the wire layer.
+        let result: std::result::Result<(), RpcHandlerError> = loop {
+            if overflow.swap(false, Ordering::AcqRel) {
+                // Overflow: this subscriber's queued deltas are
+                // stale-by-contract. Drop them, then tell the
+                // client to re-baseline. (Deltas enqueued after
+                // the drain arrive after the Resync — the client's
+                // fresh baseline may already reflect them, which
+                // the frame contract requires it to tolerate.)
+                while rx.try_recv().is_ok() {}
+                let bytes = match Codec::Json.encode(&ToolWatchFrame::Resync) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        break Err(RpcHandlerError::Internal(format!(
+                            "tool.watch: resync frame encode: {e}"
+                        )))
+                    }
+                };
+                tokio::select! {
+                    _ = ctx.cancellation.cancelled() => break Ok(()),
+                    sent = sink.send_wait(bytes) => {
+                        if sent.is_err() {
+                            break Ok(());
+                        }
+                    }
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = ctx.cancellation.cancelled() => break Ok(()),
+                item = rx.recv() => {
+                    let Some(change) = item else {
+                        // Pump ended and the queue is drained — the
+                        // substrate watch closed (node teardown).
+                        break Ok(());
+                    };
+                    let bytes = match Codec::Json.encode(&ToolWatchFrame::Change(change)) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            break Err(RpcHandlerError::Internal(format!(
+                                "tool.watch: change frame encode: {e}"
+                            )))
+                        }
+                    };
+                    tokio::select! {
+                        _ = ctx.cancellation.cancelled() => break Ok(()),
+                        sent = sink.send_wait(bytes) => {
+                            if sent.is_err() {
+                                break Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Teardown: wake the substrate diff task out of its park so
+        // it exits now; the pump then observes the closed watch and
+        // ends. Await it so the watch is fully torn down before the
+        // terminal frame goes out.
+        watch_cancel.notify_one();
+        let _ = pump.await;
+        result
     }
 }
 

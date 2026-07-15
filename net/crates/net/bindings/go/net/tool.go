@@ -7,8 +7,11 @@
 // provider tool-call replies back into nRPC dispatches.
 //
 // This is the Wave 3 / D-1 starting point. v1 covers unary
-// register + invoke + format conversion. Streaming and discovery
-// follow once the underlying CGO surface exposes them.
+// register + invoke + format conversion. Discovery (D-2) consumes
+// the rpc-ffi surface: `ListTools` via mesh_rpc.go's
+// `net_rpc_list_tools`, and `WatchTools` via the event-driven
+// `net_rpc_watch_tools` / `_next` / `_close` / `_free` handle
+// declared in this file's cgo prelude.
 //
 // Plan: see
 // `crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
@@ -19,14 +22,49 @@
 
 package net
 
+/*
+#include <stdint.h>
+#include <stdlib.h>
+
+// Forward-declared opaque MeshRpcHandle (defined in mesh_rpc.go).
+typedef struct MeshRpcHandle MeshRpcHandle;
+
+// Re-declared here because cgo preludes don't cross files —
+// `mesh_rpc.go`'s prelude already declares this, but tool.go's
+// watch loop also needs to free each change's JSON buffer.
+extern void net_rpc_response_free(uint8_t* ptr, size_t len);
+
+// AI-tool dynamic discovery — event-driven watch (E-3 of
+// POLLING_TO_EVENT_DRIVEN_SDK_PLAN). Opaque handle wrapping the
+// substrate `MeshNode::watch_tools` stream. `net_rpc_watch_tools_next`
+// blocks until the next change (or close); `net_rpc_watch_tools_close`
+// fires a cancel that unblocks a parked `next`. See the Rust
+// `ToolWatchHandleC` for the contract.
+typedef struct ToolWatchHandleC ToolWatchHandleC;
+extern int net_rpc_watch_tools(
+    const MeshRpcHandle* handle,
+    uint64_t interval_ms,
+    ToolWatchHandleC** out_watch,
+    char** out_err
+);
+extern int net_rpc_watch_tools_next(
+    ToolWatchHandleC* watch,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err
+);
+extern void net_rpc_watch_tools_close(ToolWatchHandleC* watch);
+extern void net_rpc_watch_tools_free(ToolWatchHandleC* watch);
+*/
+import "C"
+
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // =============================================================================
@@ -841,128 +879,152 @@ type ToolListChange struct {
 	PrevNodeCount uint32         `json:"prev_node_count,omitempty"`
 }
 
+// cRPCStreamDone is the rpc-ffi return code (NET_RPC_ERR_STREAM_DONE)
+// signalling a streaming surface produced its last item — a clean end
+// or a cancel. The substrate codes are not otherwise enumerated in Go
+// (mesh_rpc.go uses the bare literal with a comment); named here for
+// the watch loop's switch below.
+const cRPCStreamDone = -6
+
 // WatchOptions configures WatchTools.
 type WatchOptions struct {
-	// Interval between polls. Defaults to 1s if zero — matches
-	// the Rust SDK's `watch_tools` default + the Node/Python
-	// polling implementations.
+	// Interval is the debounce ceiling for the substrate watch.
+	//
+	// Zero (the default) is pure event-driven: a change is
+	// delivered the moment the capability fold mutates, and an
+	// idle fold does zero periodic work. A non-zero value arms a
+	// safety-net re-diff at least every Interval, independent of
+	// the change signal — only needed if you want a hard upper
+	// bound on staleness.
 	Interval time.Duration
 }
 
-// WatchTools polls the local capability fold and emits a
-// ToolListChange on `<-changes` whenever a tool is added,
-// removed, or its node_count changes. Cancel via `ctx`. Errors
-// during polling are emitted on `<-errs` so the caller decides
-// whether to log + continue or stop.
+// WatchTools emits a ToolListChange on `<-changes` whenever a tool
+// is added, removed, or its node_count changes in the local
+// capability fold. Cancel via `ctx`. Errors are emitted on
+// `<-errs` so the caller decides whether to log + continue or stop.
 //
-// Caller-side polling-backed mirror of the Rust SDK's
-// `Mesh::watch_tools(None, interval)`. Same Diff-on-poll
-// semantics as Node TS `watchTools` + Python `watch_tools`.
+// Event-driven: consumes the substrate's `MeshNode::watch_tools`
+// stream (push-driven off the capability fold's change signal) via
+// the rpc-ffi watch surface — no client-side ticker or diff. The
+// diff happens substrate-side; this just decodes each emitted
+// ToolListChange. Mirror of the Rust SDK's
+// `Mesh::watch_tools(None, interval)` and the Node/Python watchers.
 //
 // Returns the two channels + a baseline snapshot taken before the
-// goroutine starts (so initial state can be reasoned about without
-// racing with the first poll).
+// watch opens, so initial state can be reasoned about without
+// racing the first change.
 func WatchTools(
 	ctx context.Context,
 	rpc *TypedMeshRpc,
 	opts WatchOptions,
 ) (changes <-chan ToolListChange, errs <-chan error, baseline []ToolDescriptor, err error) {
-	if opts.Interval <= 0 {
-		opts.Interval = time.Second
+	// interval_ms == 0 → pure event-driven; non-zero → ceiling.
+	var intervalMs C.uint64_t
+	if opts.Interval > 0 {
+		// Round UP to whole milliseconds. A sub-millisecond ceiling
+		// (e.g. 500µs) must not truncate to 0, which the substrate
+		// reads as "no ceiling" — silently discarding the caller's
+		// staleness bound. The FFI's unit is whole ms.
+		ms := (opts.Interval + time.Millisecond - 1) / time.Millisecond
+		intervalMs = C.uint64_t(ms)
 	}
+
+	var wh *C.ToolWatchHandleC
+	var openErr *C.char
+	var code C.int
+	if e := rpc.raw.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_watch_tools(h, intervalMs, &wh, &openErr)
+	}); e != nil {
+		return nil, nil, nil, e
+	}
+	if code != 0 {
+		return nil, nil, nil, parseRpcError(readCError(openErr))
+	}
+
+	// Capture the baseline AFTER the substrate watch is open, never
+	// before. The substrate takes its OWN diff-basis snapshot inside
+	// net_rpc_watch_tools and emits deltas relative to THAT; a
+	// baseline snapshotted earlier (a separate, earlier ListTools)
+	// would miss any tool added or removed between the two snapshots
+	// — already in the substrate baseline (so no delta is ever
+	// emitted) yet absent from ours — a permanently stale view.
+	// Taken after, the baseline and the delta stream OVERLAP instead
+	// of gapping: a change in the (tiny) window shows up in BOTH, and
+	// idempotent reconciliation (a map keyed by tool id) absorbs the
+	// redundant delta. No misses either way.
 	baseline, err = rpc.raw.ListTools()
 	if err != nil {
+		// The watch is open but the caller gets no channels — cancel
+		// the substrate task and free the handle here (no watcher
+		// goroutine has touched it yet, so this is its only owner).
+		C.net_rpc_watch_tools_close(wh)
+		C.net_rpc_watch_tools_free(wh)
 		return nil, nil, nil, err
 	}
+
 	changeCh := make(chan ToolListChange, 16)
 	errCh := make(chan error, 4)
-	prev := indexDescriptors(baseline)
+	// Closed by the watcher goroutine once it stops touching `wh`.
+	watcherDone := make(chan struct{})
+
+	// Closer + freer. `net_rpc_watch_tools_next` blocks in the
+	// substrate recv, so ctx cancellation can't be observed from
+	// inside the watcher loop — this goroutine fires the cancel
+	// (safe to call concurrently with a blocked next: it only
+	// touches the atomic done-flag + the cancel Notify), which
+	// exits the substrate diff task, drops its sender, and unblocks
+	// the parked recv with STREAM_DONE. `wh` is freed exactly once,
+	// here, only after the watcher has stopped using it AND any
+	// close call has returned — so there's no use-after-free.
 	go func() {
+		select {
+		case <-ctx.Done():
+			C.net_rpc_watch_tools_close(wh)
+			<-watcherDone
+		case <-watcherDone:
+			// Watcher already stopped (stream ended / decode error)
+			// — nothing to cancel.
+		}
+		C.net_rpc_watch_tools_free(wh)
+	}()
+
+	go func() {
+		defer close(watcherDone)
 		defer close(changeCh)
 		defer close(errCh)
-		ticker := time.NewTicker(opts.Interval)
-		defer ticker.Stop()
 		for {
-			select {
-			case <-ctx.Done():
+			var outJSON *C.uint8_t
+			var outLen C.size_t
+			var nextErr *C.char
+			rc := C.net_rpc_watch_tools_next(wh, &outJSON, &outLen, &nextErr)
+			switch {
+			case rc == 0:
+				body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+				C.net_rpc_response_free(outJSON, outLen)
+				var change ToolListChange
+				if uerr := json.Unmarshal(body, &change); uerr != nil {
+					select {
+					case errCh <- fmt.Errorf("watch_tools: decode change: %w", uerr):
+					default:
+					}
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case changeCh <- change:
+				}
+			case rc == cRPCStreamDone: // clean end / cancelled
 				return
-			case <-ticker.C:
-				next, e := rpc.raw.ListTools()
-				if e != nil {
-					select {
-					case errCh <- e:
-					default: // drop if caller isn't draining
-					}
-					continue
+			default:
+				select {
+				case errCh <- parseRpcError(readCError(nextErr)):
+				default:
 				}
-				nextIdx := indexDescriptors(next)
-				for _, change := range diffToolIndex(prev, nextIdx) {
-					select {
-					case <-ctx.Done():
-						return
-					case changeCh <- change:
-					}
-				}
-				prev = nextIdx
+				return
 			}
 		}
 	}()
 	return changeCh, errCh, baseline, nil
-}
-
-// indexDescriptors keys each descriptor by (tool_id, version) so
-// diffToolIndex can compare set-membership + per-key node_count.
-func indexDescriptors(descs []ToolDescriptor) map[string]ToolDescriptor {
-	idx := make(map[string]ToolDescriptor, len(descs))
-	for _, d := range descs {
-		idx[d.ToolID+"\x00"+d.Version] = d
-	}
-	return idx
-}
-
-// diffToolIndex computes the ToolListChange events that take
-// `prev` to `next`. Emits Added for new keys, Removed for missing
-// keys, NodeCountChanged for keys present in both with a different
-// NodeCount. Sort output deterministically by key so tests don't
-// flake.
-func diffToolIndex(prev, next map[string]ToolDescriptor) []ToolListChange {
-	var changes []ToolListChange
-	// Added + NodeCountChanged
-	keys := make([]string, 0, len(next))
-	for k := range next {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		n := next[k]
-		p, existed := prev[k]
-		if !existed {
-			changes = append(changes, ToolListChange{
-				Type:       "added",
-				Descriptor: n,
-			})
-		} else if p.NodeCount != n.NodeCount {
-			changes = append(changes, ToolListChange{
-				Type:          "node_count_changed",
-				Descriptor:    n,
-				PrevNodeCount: p.NodeCount,
-			})
-		}
-	}
-	// Removed
-	keys = keys[:0]
-	for k := range prev {
-		if _, still := next[k]; !still {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		p := prev[k]
-		changes = append(changes, ToolListChange{
-			Type:       "removed",
-			Descriptor: p,
-		})
-	}
-	return changes
 }

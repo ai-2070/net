@@ -335,6 +335,8 @@ impl MeshBuilder {
             identity: sdk_identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "tool")]
+            tool_watch: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 }
@@ -377,6 +379,16 @@ pub struct Mesh {
     /// without an accessor stub.
     #[cfg(feature = "tool")]
     pub(crate) tool_metadata_fetch: Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
+    /// Lazy auto-install state for the `tool.watch` streaming nRPC
+    /// service (RT-6 remote watch). Same lifecycle as
+    /// `tool_metadata_fetch`: first installer through the mutex
+    /// wins, the handle lives for the lifetime of the `Mesh`, and
+    /// the service is harmless while no tools are registered (a
+    /// subscriber just sees no `Change` frames until one appears).
+    /// Installed by every `serve_tool*` path and by the explicit
+    /// [`Mesh::serve_tool_watch`].
+    #[cfg(feature = "tool")]
+    pub(crate) tool_watch: Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
 }
 
 impl Mesh {
@@ -1128,6 +1140,8 @@ impl Mesh {
             identity,
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "tool")]
+            tool_watch: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 

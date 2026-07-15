@@ -270,6 +270,17 @@ impl<'a> Claimant<'a> {
     /// its single generation owner and calls this for every reserve /
     /// epoch / release announcement, so they stay strictly-monotonic
     /// (the reservation fold's anti-reorder rule).
+    //
+    // Every non-test caller lives in the cortex workflow layer, so a
+    // plain `--features net` build sees this as dead — expected, not
+    // a defect (surfaced once SI-2a fixed the net-only build).
+    #[cfg_attr(
+        not(any(test, feature = "cortex")),
+        expect(
+            dead_code,
+            reason = "only the cortex GangClaimPipeline calls this in lib code"
+        )
+    )]
     pub(crate) fn next_gen(&mut self) -> u64 {
         let g = self.generation;
         self.generation = self.generation.saturating_add(1);

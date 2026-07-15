@@ -163,6 +163,8 @@ jobs:
           --test proxy_coverage_gaps
           --test stream_config_and_error_display
           --test error_kind_mirror
+          --test event_pingwave
+          --test route_withdraw
 
       # === NAT traversal ==================================================
       - name: NAT traversal
@@ -178,6 +180,11 @@ jobs:
           --test reflex_override
           --test rendezvous_ack
           --test rendezvous_coordinator
+          --test coordinator_selection
+          --test direct_upgrade
+          --test nat_matrix
+          --test rendezvous_introduce_validation
+          --test traversal_observability
 
       # === Port mapping (UPnP-IGD / NAT-PMP / PCP) ========================
       - name: Port mapping
@@ -227,6 +234,35 @@ jobs:
           --test queue_group_dispatch
           --test aggregator_fold_query
           --test aggregator_registry_rpc
+
+      # === Sensing (SENSING_INTEREST_COALESCING_PLAN) =====================
+      # The SI-* sensing-interest suite. Reuses the CortEX crate build:
+      # `cortex` chains cortex → redex → net, which covers every sensing
+      # gate — `net` alone (dispatch, failure_plane, fallback,
+      # origin_emitter, relay_delivery), `net + redex` (e2e_registration,
+      # leader_delivery, rendezvous, resolver, scheduler_bridge), and
+      # `net + redex + cortex` (routed_origin). Matching the prior step's
+      # `cortex tool` feature set means the crate lib is already built, so
+      # only the sensing test binaries compile here (no fresh crate pass;
+      # `tool` is inert for these). These are auto-discovered targets with
+      # no `required-features`, so they MUST run under a feature set that
+      # satisfies their `#![cfg]` — otherwise they build to empty (0-test)
+      # binaries that pass without asserting anything.
+      - name: Sensing
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features "cortex tool"
+          --test sensing_dispatch
+          --test sensing_failure_plane
+          --test sensing_fallback
+          --test sensing_origin_emitter
+          --test sensing_relay_delivery
+          --test sensing_e2e_registration
+          --test sensing_leader_delivery
+          --test sensing_rendezvous
+          --test sensing_resolver
+          --test sensing_scheduler_bridge
+          --test sensing_routed_origin
 
       # === NetDB ==========================================================
       - name: NetDB

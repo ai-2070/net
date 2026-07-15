@@ -41,6 +41,12 @@ pub mod claim;
 pub mod contention;
 pub mod filter;
 pub mod multi;
+// Ties the island's replica placement to RedEX's `ReplicationConfig`
+// / `PlacementStrategy` (plan §5), so it rides the `redex` feature —
+// a plain `--features net` build has no replication layer to
+// configure. (Pre-SI-2a this was ungated and broke the net-only
+// build; every other gang module is fold-only and stays ungated.)
+#[cfg(feature = "redex")]
 pub mod placement;
 pub mod quorum;
 pub mod schedule;
@@ -59,6 +65,7 @@ pub use filter::{
     SelectionPolicy,
 };
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
+#[cfg(feature = "redex")]
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 pub use schedule::{
@@ -139,6 +146,71 @@ pub fn match_islands(
         criteria.selection,
         criteria.prefer_capability.clone(),
     )
+}
+
+/// SI-6 (sensing plan §6/§4.9): [`match_islands`] with the sensed
+/// per-interest candidate delta joined at the SAME seam as the
+/// liveness gate. Hosts in `sensed_non_viable` (explicitly NotReady
+/// for THIS interest) are pruned from THIS match exactly like down
+/// hosts — the fold state stays byte-identical and the entry-level
+/// suspension flag is never touched (§4.9 reserves it for
+/// *unconditional* loss: one conditional observation must never
+/// suspend the capability entry or affect any OTHER match). The
+/// final claim order is then re-ranked so islands hosted by
+/// `sensed_viable_order` providers come first, in that order (the
+/// aggregate's own consumer-local economics — which is what makes
+/// the first successful claim target the SELECTED provider); the
+/// re-rank is STABLE, so islands within one band — and every island
+/// of an unsensed/potential host — keep the selection policy's
+/// order. Both inputs empty ⇒ byte-identical to [`match_islands`]:
+/// absence of evidence never prunes and never reorders.
+pub fn match_islands_sensed(
+    capability_fold: &Fold<CapabilityFold>,
+    topology_fold: &Fold<IslandTopologyFold>,
+    criteria: &MatchCriteria,
+    down_nodes: &HashSet<NodeId>,
+    sensed_non_viable: &HashSet<NodeId>,
+    sensed_viable_order: &[NodeId],
+) -> Vec<IslandId> {
+    let pruned: HashSet<NodeId> = if sensed_non_viable.is_empty() {
+        down_nodes.clone()
+    } else {
+        down_nodes.union(sensed_non_viable).copied().collect()
+    };
+    let mut ordered = match_islands(capability_fold, topology_fold, criteria, &pruned);
+    if sensed_viable_order.is_empty() || ordered.len() < 2 {
+        return ordered;
+    }
+    // SI-6 review (non-blocking note, taken) + SI-6.1 closure
+    // refinement: derive the island → band map from ONE literal
+    // topology snapshot — a single `All` scan, not one `Get` per
+    // island (separate fold reads could interleave with concurrent
+    // updates and hand the sort a mixed-time view). No fold queries
+    // inside the O(n log n) sort.
+    let snapshot: std::collections::HashMap<IslandId, NodeId> = topology_fold
+        .query(IslandQuery::All)
+        .into_iter()
+        .map(|(island, record)| (island, record.host))
+        .collect();
+    let bands: std::collections::HashMap<IslandId, usize> = ordered
+        .iter()
+        .map(|island| {
+            let band = snapshot
+                .get(island)
+                .and_then(|host| {
+                    sensed_viable_order
+                        .iter()
+                        .position(|provider| provider == host)
+                })
+                // Unsensed / potential hosts form the trailing
+                // band, in the selection policy's own order.
+                .unwrap_or(usize::MAX);
+            (*island, band)
+        })
+        .collect();
+    // Stable: within a band, the [3]-step selection order survives.
+    ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(usize::MAX));
+    ordered
 }
 
 #[cfg(test)]
@@ -279,6 +351,133 @@ mod tests {
         // by load>0.5. Remaining: A's 0xA5 (0.2) then B's 0xB0 (0.4),
         // least-loaded first.
         assert_eq!(order, vec![0xA5, 0xB0]);
+    }
+
+    #[test]
+    fn sensed_match_prunes_non_viable_and_ranks_viable_first() {
+        // SI-6: three hosts carry the tag; the sensed delta says C is
+        // best-ranked viable, A is viable second, B is explicitly
+        // NotReady for THIS interest. B's islands are pruned exactly
+        // like a down host's; C's islands lead the claim order even
+        // where the selection policy (least-loaded) would have put A
+        // first — the first claim targets the SELECTED provider.
+        let caps: Fold<CapabilityFold> = new_fold();
+        let topo: Fold<IslandTopologyFold> = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let kp_c = EntityKeypair::generate();
+        let (na, nb, nc) = (
+            kp_a.entity_id().node_id(),
+            kp_b.entity_id().node_id(),
+            kp_c.entity_id().node_id(),
+        );
+        for (kp, node) in [(&kp_a, na), (&kp_b, nb), (&kp_c, nc)] {
+            announce_capability(&caps, kp, node, vec!["gpu:h100".into()]);
+        }
+        announce_island(&topo, &kp_a, na, 0xA0, 8, 0.1);
+        announce_island(&topo, &kp_b, nb, 0xB0, 8, 0.2);
+        announce_island(&topo, &kp_c, nc, 0xC0, 8, 0.3);
+
+        let criteria = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            numeric: NumericFilter {
+                min_units: 8,
+                ..Default::default()
+            },
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        };
+
+        // Baseline (no sensing): least-loaded order.
+        assert_eq!(
+            match_islands(&caps, &topo, &criteria, &HashSet::new()),
+            vec![0xA0, 0xB0, 0xC0],
+        );
+
+        let non_viable: HashSet<NodeId> = [nb].into_iter().collect();
+        let order = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &non_viable,
+            &[nc, na],
+        );
+        assert_eq!(
+            order,
+            vec![0xC0, 0xA0],
+            "NotReady host pruned; sensed rank leads the claim order",
+        );
+
+        // The §4.9 tripwire: the sensed prune is PER-MATCH state —
+        // no fold was mutated, so the plain match (any other
+        // interest, any other consumer) still sees every host.
+        assert_eq!(
+            match_islands(&caps, &topo, &criteria, &HashSet::new()),
+            vec![0xA0, 0xB0, 0xC0],
+            "one interest's NotReady never suspends the entry",
+        );
+    }
+
+    #[test]
+    fn sensed_match_with_empty_delta_is_identical_and_potential_is_never_pruned() {
+        // Absence of evidence never prunes and never reorders: an
+        // empty sensed delta must reproduce match_islands exactly,
+        // and hosts OUTSIDE the viable order (potential/unsensed)
+        // keep the selection policy's order behind the viable band.
+        let caps: Fold<CapabilityFold> = new_fold();
+        let topo: Fold<IslandTopologyFold> = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let (na, nb) = (kp_a.entity_id().node_id(), kp_b.entity_id().node_id());
+        announce_capability(&caps, &kp_a, na, vec!["gpu:h100".into()]);
+        announce_capability(&caps, &kp_b, nb, vec!["gpu:h100".into()]);
+        announce_island(&topo, &kp_a, na, 0xA0, 8, 0.1);
+        announce_island(&topo, &kp_b, nb, 0xB0, 8, 0.2);
+
+        let criteria = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            numeric: NumericFilter {
+                min_units: 8,
+                ..Default::default()
+            },
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        };
+
+        let plain = match_islands(&caps, &topo, &criteria, &HashSet::new());
+        assert_eq!(
+            match_islands_sensed(
+                &caps,
+                &topo,
+                &criteria,
+                &HashSet::new(),
+                &HashSet::new(),
+                &[],
+            ),
+            plain,
+            "empty sensed delta ⇒ byte-identical to match_islands",
+        );
+        // B sensed viable, A unsensed (potential): B's band leads,
+        // A is retained behind it — never pruned.
+        assert_eq!(
+            match_islands_sensed(
+                &caps,
+                &topo,
+                &criteria,
+                &HashSet::new(),
+                &HashSet::new(),
+                &[nb],
+            ),
+            vec![0xB0, 0xA0],
+            "potential hosts trail the viable band but are never pruned",
+        );
     }
 
     #[test]
