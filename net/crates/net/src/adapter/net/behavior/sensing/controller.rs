@@ -106,6 +106,21 @@ pub enum ResolutionRefusal {
     /// standing SI-2 orphan-cap finding, closed in the SI-3 second
     /// closure round). Soft state: the consumer's refresh retries.
     AllBranchesRefused,
+    /// A `Quorum(k)` requires k providers ready SIMULTANEOUSLY, but k
+    /// exceeds the policy's `maximum_fanout`, so the active set can
+    /// never hold k branches and the quorum is *permanently*
+    /// unsatisfiable. Refused at resolution — the same discipline as
+    /// `SelectorTooBroad` — rather than silently under-sensing and
+    /// pinning the interest at Unknown/NotReady forever (plan §4.7).
+    /// (A merely-transient shortfall — fewer than k *eligible*
+    /// providers right now — is NOT refused: the population may grow,
+    /// and it correctly resolves once k providers appear.)
+    QuorumExceedsFanout {
+        /// The quorum threshold k.
+        required: usize,
+        /// The configured `maximum_fanout`.
+        cap: usize,
+    },
 }
 
 /// The bounded outcome of one resolution pass.
@@ -177,9 +192,28 @@ pub fn resolve_candidates(
     let matched = eligible.len();
     let active_bound = match result_mode {
         ResultMode::Any => policy.initial_fanout,
-        ResultMode::TopK(k) | ResultMode::Quorum(k) => (k as usize)
+        // `TopK` is best-effort ("up to k"): capping the active set at
+        // `maximum_fanout` yields fewer than k results, which is a
+        // valid degradation — no refusal.
+        ResultMode::TopK(k) => (k as usize)
             .max(policy.initial_fanout)
             .min(policy.maximum_fanout),
+        // `Quorum` is a hard threshold: `project_aggregate` requires k
+        // viable branches, so the active set must be able to hold k.
+        // If k exceeds the static `maximum_fanout`, the quorum can
+        // never be met — refuse the misconfiguration explicitly
+        // instead of silently sensing too few branches (which pins the
+        // interest at Unknown/NotReady with no signal).
+        ResultMode::Quorum(k) => {
+            let required = k as usize;
+            if required > policy.maximum_fanout {
+                return Err(ResolutionRefusal::QuorumExceedsFanout {
+                    required,
+                    cap: policy.maximum_fanout,
+                });
+            }
+            required.max(policy.initial_fanout).min(policy.maximum_fanout)
+        }
         ResultMode::Each => {
             if matched > policy.each_mode_max_providers {
                 return Err(ResolutionRefusal::SelectorTooBroad {
@@ -583,6 +617,48 @@ mod tests {
                 matched: 40,
                 cap: 32,
             }),
+        );
+    }
+
+    #[test]
+    fn quorum_exceeding_max_fanout_is_refused_not_silently_unsatisfiable() {
+        // 2026-07-15 review §3: Quorum(k) is a hard threshold —
+        // project_aggregate needs k viable branches. maximum_fanout
+        // (default 3) capped the active set below k, so a Quorum(5)
+        // could never reach Ready even with an ample ready population
+        // and — unlike Each — produced NO refusal, pinning the
+        // interest at Unknown/NotReady forever. It must be refused at
+        // resolution, carrying the required count and the cap.
+        let snapshot: Vec<CandidateProvider> = (1..=8).map(|id| provider(id, id)).collect();
+        let policy = CandidatePolicy::default(); // maximum_fanout = 3
+        let refusal = resolve_candidates(
+            &ProviderSelector::AnyAuthorized,
+            ResultMode::Quorum(5),
+            &snapshot,
+            &root(),
+            &policy,
+        );
+        assert_eq!(
+            refusal,
+            Err(ResolutionRefusal::QuorumExceedsFanout {
+                required: 5,
+                cap: policy.maximum_fanout,
+            }),
+        );
+
+        // A quorum WITHIN the fanout budget resolves and activates at
+        // least k branches, so it can actually reach the threshold.
+        let resolved = resolve_candidates(
+            &ProviderSelector::AnyAuthorized,
+            ResultMode::Quorum(3),
+            &snapshot,
+            &root(),
+            &policy,
+        )
+        .expect("a quorum within the fanout budget resolves");
+        assert!(
+            resolved.active.len() >= 3,
+            "the active set must be able to hold the full quorum",
         );
     }
 

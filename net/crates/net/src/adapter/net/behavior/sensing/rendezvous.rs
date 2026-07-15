@@ -207,6 +207,10 @@ impl fmt::Display for FrameRejection {
             Self::Resolution(ResolutionRefusal::AllBranchesRefused) => f.write_str(
                 "every resolved branch refused the registration — interest not admitted",
             ),
+            Self::Resolution(ResolutionRefusal::QuorumExceedsFanout { required, cap }) => write!(
+                f,
+                "candidate resolution refused: quorum of {required} exceeds the fanout cap {cap}"
+            ),
         }
     }
 }
