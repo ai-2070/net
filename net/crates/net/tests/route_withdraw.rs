@@ -204,3 +204,107 @@ async fn withdrawal_is_not_undone_by_relayed_session_promotion() {
          withdrawal",
     );
 }
+
+/// A `node_id_to_graph_id` clone for tests: the proximity graph keys
+/// nodes by a 32-byte id that is the u64 node_id (LE) zero-padded into
+/// its first 8 bytes (see `mesh.rs::node_id_to_graph_id`).
+fn graph_id(node_id: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0..8].copy_from_slice(&node_id.to_le_bytes());
+    id
+}
+
+/// RT-5 addendum review P1: a REAL node death must not be masked by a
+/// stale soft-state graph path. In the review's triangle A/B/C, B holds
+/// both a direct edge B→A and an indirect edge B→C→A. When A dies the
+/// indirect edge has not yet aged out (its sweep is 3× session_timeout
+/// out), so the PRE-FIX failure path treated it as evidence A was still
+/// reachable and SUPPRESSED B's withdrawal — pinning downstream nodes to
+/// a dead route and risking a B↔C micro-loop. B must withdraw on the
+/// authoritative direct-peer failure regardless of the graph snapshot.
+///
+/// Topology: A↔B (so B is A's direct peer and its detector notices the
+/// death), B↔C (a real peer C, giving B a natural B→C edge), observer
+/// D↔B (learns `(A via B)`). D keeps a 10 s session_timeout so its own
+/// 30 s age-out sweep cannot explain an in-window drop.
+///
+/// The stale C→A edge is INJECTED rather than grown from live traffic:
+/// on localhost A's 1-hop direct pingwave always beats C's 2-hop forward
+/// of the same seq to B, so dedup drops the forward and B never records
+/// C→A naturally. The injected edge models the real transient the review
+/// targets — B learned A via C before the direct A↔B link came up (or
+/// during a flap) and that soft state has not yet swept. C is a genuine
+/// peer, so it is an indirect path the pre-fix code would suppress on.
+#[tokio::test]
+async fn node_death_withdraws_even_with_a_stale_graph_alternate() {
+    let a = build_node_with(base_config()).await;
+    let b = build_node_with(detector_config()).await;
+    let c = build_node_with(base_config()).await;
+    let d = build_node_with(base_config()).await;
+
+    // Every handshake runs BEFORE any `start()`: an unstarted node can
+    // `accept`, a started one (its dispatch loop owns the socket) can
+    // only initiate.
+    connect_pair(&a, &b).await;
+    connect_pair(&b, &c).await;
+    connect_pair(&b, &d).await;
+
+    a.start();
+    b.start();
+    c.start();
+    d.start();
+
+    let a_id = a.node_id();
+    let c_id = c.node_id();
+    let a_graph_id = graph_id(a_id);
+
+    // Precondition part 1: D learned `(A via B)`, and B has grown its
+    // natural direct B→A and B→C edges from the pingwave floods.
+    assert!(
+        wait_until(
+            || {
+                d.router().routing_table().lookup(a_id) == Some(b.local_addr())
+                    && b.proximity_graph().path_to(&a_graph_id).is_some()
+                    && b.proximity_graph()
+                        .edge_latency(b.proximity_graph().my_id(), graph_id(c_id))
+                        .is_some()
+            },
+            Duration::from_secs(6),
+        )
+        .await,
+        "precondition: D never learned (A via B), or B never built its \
+         B→A / B→C edges from the pingwave flood",
+    );
+
+    // Inject the stale indirect edge C→A into B's graph, then confirm B
+    // now holds an INDIRECT alternate to A (B→C→A) — exactly the soft
+    // state the pre-fix code suppressed the withdrawal on.
+    b.proximity_graph()
+        .test_insert_edge(graph_id(c_id), a_graph_id, 500);
+    assert!(
+        b.proximity_graph()
+            .path_to_excluding_direct(&a_graph_id)
+            .is_some(),
+        "precondition: B must hold an indirect B→C→A alternate to A",
+    );
+
+    // Kill A. B (tight detector) marks it Failed in ~2 s — with the
+    // B→C→A edge still present, i.e. the pre-fix suppression window open.
+    a.shutdown().await.expect("shutdown A");
+
+    // The fix: B floods the withdrawal despite holding the graph
+    // alternate, so D drops `(A via B)`. Pre-fix, B stayed quiet and D
+    // kept the dead route until its 30 s sweep.
+    assert!(
+        wait_until(
+            || d.router().routing_table().lookup(a_id).is_none(),
+            Duration::from_secs(8),
+        )
+        .await,
+        "D kept its route to dead A — B suppressed its withdrawal on the \
+         stale B→C→A graph path (D's own age-out sweep is 30 s out, so it \
+         cannot mask this)",
+    );
+
+    drop((b, c, d));
+}

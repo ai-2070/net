@@ -4847,6 +4847,7 @@ impl MeshNode {
         let socket_failure = socket.clone();
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
+        let proximity_graph_failure = proximity_graph.clone();
 
         // SI-2a hoists, moved ahead of the failure detector for SI-5
         // (§4.8): a Failed peer is a sensing event, so the detector's
@@ -5091,19 +5092,24 @@ impl MeshNode {
             // one flood instead of waiting for the 3× session_timeout
             // age-out sweep.
             //
-            // ...but ONLY when we have no genuine alternate path to
-            // it (RT-5 review Finding 5). If the proximity graph
-            // still offers a topological alternate — the peer is
-            // reachable through another of our peers, i.e. this is a
-            // partial or transient failure of our direct link, not a
-            // node death — then "unreachable via me" is false:
-            // flooding it would poison working routes to a live node,
-            // and the origin-scoped recovery pingwave can't repair
-            // third parties' routes. In that case we stay quiet and
-            // let `rp_failure.on_failure` reroute us locally; a true
-            // node death still emits, because no peer then has a path
-            // to it (the chain case that RT-5 targets).
-            if enable_route_withdraw && !rp_failure.has_graph_path_alternate(node_id) {
+            // Pessimistically UNCONDITIONAL on an authoritative
+            // direct-peer failure (RT-5 addendum review P1). The prior
+            // gate suppressed the flood whenever the proximity graph
+            // still offered a topological alternate to the failed peer.
+            // But at the instant of detection that alternate can be a
+            // stale SOFT-STATE path that has not yet aged out: in a
+            // fully-connected triangle A/B/C, when A dies both B and C
+            // still hold the pingwave-derived indirect edges B→C→A and
+            // C→B→A, so both suppressed their withdrawal and could route
+            // B→C and C→B on the same dead snapshot — nobody told
+            // upstream that A was gone until graph/route expiry. A
+            // pre-failure graph snapshot is not evidence the failed
+            // destination is live. So we withdraw on the failure, remove
+            // the now-dead direct edge, and let a subsequent FRESH
+            // pingwave re-advertise reachability if the peer really
+            // remains reachable through another path — `rp_failure` still
+            // reroutes us locally in the meantime.
+            if enable_route_withdraw {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,
                     &route_withdraw_damper_failure,
@@ -5114,6 +5120,14 @@ impl MeshNode {
                     None,
                 );
             }
+            // Remove our now-dead direct edge to the failed peer so a
+            // stale `(self → node_id)` edge can't keep masquerading as a
+            // live hop in later `path_to` queries; a real fresh pingwave
+            // re-inserts it if the peer comes back through some path.
+            proximity_graph_failure.remove_edge(
+                node_id_to_graph_id(local_node_id_failure),
+                node_id_to_graph_id(node_id),
+            );
             // Drop the dead peer's direct-path upgrade throttle entry,
             // in lockstep with the maps above (see the `upgrade_cache`
             // creation comment).
