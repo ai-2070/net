@@ -565,7 +565,15 @@ pub struct TagMatch {
 /// with "printer-7 only". Serde is the SI-0 semantic form (plan
 /// §4.2); identity always hashes [`Self::canonical_bytes`], never a
 /// serde encoding.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `PartialEq`/`Eq`/`Hash` are defined over [`Self::canonical_bytes`]
+/// — NOT derived structurally — so equality and hashing agree with
+/// the interest-digest identity: two selectors that differ only in
+/// `Nodes`/`Tags` authorship order (e.g. `Nodes([7, 9])` vs
+/// `Nodes([9, 1])` reordered) are digest-identical and must compare
+/// and hash identically, or a caller keying/deduping on the selector
+/// (rather than the digest) would split one interest into two.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ProviderSelector {
     /// Any provider the authority scope admits.
     AnyAuthorized,
@@ -649,6 +657,27 @@ impl ProviderSelector {
             }
         }
         out
+    }
+}
+
+/// Canonical equality: two selectors are equal iff their
+/// [`ProviderSelector::canonical_bytes`] match, so `Nodes`/`Tags`
+/// authorship order never splits interest identity (the derived
+/// structural `Eq` compared the raw `Vec`s and disagreed with the
+/// digest).
+impl PartialEq for ProviderSelector {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_bytes() == other.canonical_bytes()
+    }
+}
+
+impl Eq for ProviderSelector {}
+
+/// Hashes the canonical encoding, so `Hash` is consistent with the
+/// canonical `Eq` above (equal selectors hash equal).
+impl std::hash::Hash for ProviderSelector {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.canonical_bytes().hash(state);
     }
 }
 
@@ -1037,6 +1066,52 @@ mod tests {
         let mut spec_t3 = spec();
         spec_t3.providers = t3;
         assert_ne!(spec_t1.interest_digest(), spec_t3.interest_digest());
+    }
+
+    #[test]
+    fn selector_eq_and_hash_track_canonical_identity_not_authorship_order() {
+        // 2026-07-15 review §8: Eq/Hash must agree with
+        // canonical_bytes()/interest_digest(), so RAW-variant selectors
+        // (built WITHOUT the canonicalizing constructors) that differ
+        // only in authorship order still compare and hash equal —
+        // otherwise a caller keying/deduping on the selector rather
+        // than the digest splits one interest into two.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |sel: &ProviderSelector| {
+            let mut h = DefaultHasher::new();
+            sel.hash(&mut h);
+            h.finish()
+        };
+        let tag = |k: &str, v: &str| TagMatch {
+            key: k.into(),
+            value: v.into(),
+        };
+
+        // Raw variants, reordered + duplicated — bypassing `nodes()`.
+        let a = ProviderSelector::Nodes(vec![9, 7, 3, 3]);
+        let b = ProviderSelector::Nodes(vec![3, 7, 9]);
+        assert_eq!(a, b, "reordered node sets are one identity");
+        assert_eq!(hash(&a), hash(&b), "equal selectors must hash equal");
+        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+
+        let t1 = ProviderSelector::Tags(vec![tag("site", "f7"), tag("modality", "thermal")]);
+        let t2 = ProviderSelector::Tags(vec![tag("modality", "thermal"), tag("site", "f7")]);
+        assert_eq!(t1, t2);
+        assert_eq!(hash(&t1), hash(&t2));
+
+        // Genuinely different populations stay distinct.
+        assert_ne!(a, ProviderSelector::Nodes(vec![3, 7]));
+
+        // A spec keyed via the raw-variant selector coalesces with one
+        // built through the canonicalizing constructor.
+        let mut spec_raw = spec();
+        spec_raw.providers = ProviderSelector::Nodes(vec![9, 7, 3]);
+        let mut spec_ctor = spec();
+        spec_ctor.providers = ProviderSelector::nodes(vec![3, 9, 7]);
+        assert_eq!(spec_raw.providers, spec_ctor.providers);
+        assert_eq!(spec_raw.interest_digest(), spec_ctor.interest_digest());
     }
 
     #[test]
