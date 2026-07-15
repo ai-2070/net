@@ -861,6 +861,47 @@ impl SensingLeader {
                 kept.push(*provider);
                 reconciliation.added.push((branch, spec.clone()));
             }
+            // 2026-07-15 review §6: a consumer that lived ONLY on a
+            // torn-down branch (partial admission makes branch
+            // populations non-identical) can end up with a row on NO
+            // surviving branch — the fill loop adds the union only to
+            // NEW branches, so when `kept` already fills
+            // `resolved.active` no replacement is opened and the
+            // orphan receives no proofs until its own ttl/2 refresh.
+            // Re-register any such orphan onto a surviving branch NOW,
+            // trying each until one admits (cap/floor may refuse some;
+            // soft state retries the rest). Consumers still covered by
+            // a surviving branch — e.g. those the fill loop just placed
+            // on a replacement — are skipped, so this never diverts a
+            // consumer off the branch it already reached.
+            if !kept.is_empty() {
+                for (downstream, interval, ttl) in &consumer_rows {
+                    let still_covered = kept.iter().any(|provider| {
+                        let branch = ProviderInterestKey::new(key.clone(), *provider);
+                        self.relay
+                            .table
+                            .downstream_entry(&branch, *downstream)
+                            .is_some()
+                    });
+                    if still_covered {
+                        continue;
+                    }
+                    for provider in &kept {
+                        let branch = ProviderInterestKey::new(key.clone(), *provider);
+                        let (outcome, _) = self.relay.register_downstream(
+                            &branch,
+                            *downstream,
+                            *interval,
+                            *ttl,
+                            self.owner_root,
+                            now,
+                        );
+                        if matches!(outcome, RegisterOutcome::Registered(_)) {
+                            break;
+                        }
+                    }
+                }
+            }
             // A provider retained in `active` (`kept`) must never also
             // sit in `standby`: `resolved.standby` is the fresh
             // resolution's standby, computed independently of the
@@ -2257,6 +2298,69 @@ mod tests {
         );
         assert_eq!(leader.branches(&shared.key()), vec![0xB2, 0xB3]);
         assert!(reconciliation.changed);
+    }
+
+    #[test]
+    fn reconcile_re_registers_a_torn_down_only_consumer_onto_a_kept_branch() {
+        // 2026-07-15 review §6: a consumer present ONLY on a torn-down
+        // branch (partial admission makes branch populations
+        // non-identical) must not go dark until its own ttl/2 refresh.
+        // When the fold keeps a branch and opens no replacement, the
+        // orphan is re-registered onto the surviving branch NOW.
+        let now = Instant::now();
+        let policy = CandidatePolicy {
+            initial_fanout: 2,
+            standby_count: 0,
+            maximum_fanout: 2,
+            each_mode_max_providers: 32,
+        };
+        // Per-downstream cap 3.
+        let mut leader = SensingLeader::new(root(), policy, K, 3, TTL);
+        let c1 = DownstreamId::Peer(1);
+        let c2 = DownstreamId::Peer(2);
+
+        // B is closer than A → active order [B, A].
+        let snapshot = [provider(0xA, 10), provider(0xB, 5)];
+        let shared = spec();
+
+        leader
+            .register_capability_interest(&shared, c1, ms(100), TTL, root(), &snapshot, now)
+            .expect("C1 admits on both branches");
+        // Consume two of C2's three slots on a DIFFERENT capability, so
+        // reconcile (filtered by the shared capability) never touches
+        // them while the per-downstream cap still counts them.
+        let mut filler = spec();
+        filler.capability_id = CapabilityId::new("scan.document");
+        leader
+            .register_capability_interest(&filler, c2, ms(100), TTL, root(), &snapshot, now)
+            .expect("C2's filler admits on both branches");
+        // C2's shared join lands on B only (active[0]); A is cap-refused.
+        let join = leader
+            .register_capability_interest(&shared, c2, ms(50), TTL, root(), &snapshot, now)
+            .expect("a partially admitted join still succeeds");
+        assert_eq!(join.admitted_branches, vec![0xB]);
+
+        let branch_a = ProviderInterestKey::new(shared.key(), 0xA);
+        assert!(
+            leader.relay.table.downstream_entry(&branch_a, c2).is_none(),
+            "precondition: C2 holds no row on branch A",
+        );
+
+        // The fold drops B (C2's ONLY shared branch) and keeps A; no
+        // replacement is opened (kept already fills resolved.active).
+        leader.reconcile_with_snapshot(&shared.capability_id, &[provider(0xA, 10)], now);
+
+        assert_eq!(
+            leader.branches(&shared.key()),
+            vec![0xA],
+            "A is kept and no replacement is opened",
+        );
+        assert!(
+            leader.relay.table.downstream_entry(&branch_a, c2).is_some(),
+            "the orphaned C2 was re-registered onto the surviving branch immediately",
+        );
+        // C1, already on A, is untouched (it stayed covered).
+        assert!(leader.relay.table.downstream_entry(&branch_a, c1).is_some());
     }
 
     /// SI-6.1 closure P1, drain arm: a replacement that acquires NO
