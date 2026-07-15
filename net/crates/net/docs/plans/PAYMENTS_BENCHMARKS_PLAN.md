@@ -382,7 +382,16 @@ event-bus workstream). It leads the strategic story but does not live here.
       (c16→c128) — one exclusive fs2 lock + backoff serializes every attempt
       (denials too). Baseline: `docs/performance/payments-duplicate-storms.md`.
 - [ ] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
-- [ ] **P5 — Spend contention at 0 / 100 / 1 000** (+ opt-in slow 10 000) (B7).
+- [x] **P5 — Spend contention** (B7). `benches/spend_contention.rs`:
+      same-counter (ample + near-limit K, cardinality 0/100/1 000), shared
+      parent cap (P5b), independent (P5c), approval contention (P5d),
+      housekeeping (P5e). Every accounting invariant asserted (overspend=0,
+      exactly-K, one approval, prune persists). **Decisive finding:** P5c
+      (independent, no shared counter) == P5a (max contention) in throughput
+      & tail — the global file lock, not accounting authority, imposes the
+      coupling; the atomic unit is the (day,network,asset) counter row (shared
+      across capabilities, independent across assets). Baseline:
+      `docs/performance/payments-spend-contention.md`.
 - [ ] **P6 — Quote-to-billing + quote-to-handler-response mock lifecycle** (B6).
 - [ ] **P7 — External-rail telemetry documentation** (B-ext).
 

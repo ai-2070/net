@@ -52,8 +52,12 @@ At-most-once holds under contention. The CAS under the shared lock is correct.
 | redemption | 16 | 226 ms | 591 ms | 593 ms | 642 ms |
 | redemption | 128 | **1.89 s** | 4.69 s | 5.21 s | 5.47 s |
 
-Throughput is pinned at **~26/s regardless of concurrency**, and per-attempt
-p50 grows from ~280 ms (c16) to ~2 s (c128), p99 to ~5 s. Every attempt —
+**Attempts/s** (the whole-storm lock-serialized-op rate — one `accept_payment`
+call = one exclusive-lock acquisition) is pinned at **~26 attempts/s
+regardless of concurrency**; it is *not* an unlabeled "payment throughput"
+(admissions/s and unique-payments/s are the separate columns above).
+Per-attempt p50 grows from ~280 ms (c16) to ~2 s (c128), p99 to ~5 s. Every
+attempt —
 including the read-only losers (`InProgress` / `AlreadyServed` /
 `AlreadyRedeemed`), which after the write-amplification fix no longer fsync —
 must still acquire the **one exclusive `fs2` advisory lock**, whose
