@@ -919,15 +919,15 @@ func WatchTools(
 	rpc *TypedMeshRpc,
 	opts WatchOptions,
 ) (changes <-chan ToolListChange, errs <-chan error, baseline []ToolDescriptor, err error) {
-	baseline, err = rpc.raw.ListTools()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
 	// interval_ms == 0 → pure event-driven; non-zero → ceiling.
 	var intervalMs C.uint64_t
 	if opts.Interval > 0 {
-		intervalMs = C.uint64_t(opts.Interval / time.Millisecond)
+		// Round UP to whole milliseconds. A sub-millisecond ceiling
+		// (e.g. 500µs) must not truncate to 0, which the substrate
+		// reads as "no ceiling" — silently discarding the caller's
+		// staleness bound. The FFI's unit is whole ms.
+		ms := (opts.Interval + time.Millisecond - 1) / time.Millisecond
+		intervalMs = C.uint64_t(ms)
 	}
 
 	var wh *C.ToolWatchHandleC
@@ -940,6 +940,27 @@ func WatchTools(
 	}
 	if code != 0 {
 		return nil, nil, nil, parseRpcError(readCError(openErr))
+	}
+
+	// Capture the baseline AFTER the substrate watch is open, never
+	// before. The substrate takes its OWN diff-basis snapshot inside
+	// net_rpc_watch_tools and emits deltas relative to THAT; a
+	// baseline snapshotted earlier (a separate, earlier ListTools)
+	// would miss any tool added or removed between the two snapshots
+	// — already in the substrate baseline (so no delta is ever
+	// emitted) yet absent from ours — a permanently stale view.
+	// Taken after, the baseline and the delta stream OVERLAP instead
+	// of gapping: a change in the (tiny) window shows up in BOTH, and
+	// idempotent reconciliation (a map keyed by tool id) absorbs the
+	// redundant delta. No misses either way.
+	baseline, err = rpc.raw.ListTools()
+	if err != nil {
+		// The watch is open but the caller gets no channels — cancel
+		// the substrate task and free the handle here (no watcher
+		// goroutine has touched it yet, so this is its only owner).
+		C.net_rpc_watch_tools_close(wh)
+		C.net_rpc_watch_tools_free(wh)
+		return nil, nil, nil, err
 	}
 
 	changeCh := make(chan ToolListChange, 16)
