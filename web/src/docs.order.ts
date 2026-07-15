@@ -136,6 +136,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.33_CIRCUS_MAXIMUS",
       "RELEASE_v0.32_SUMMER_MADNESS",
       "RELEASE_v0.31_HOLD_THE_LINE",
       "RELEASE_v0.30_FINAL_COUNTDOWN",
@@ -293,6 +294,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "releases/RELEASE_v0.33_CIRCUS_MAXIMUS": "v0.33.0 — Circus Maximus",
     "releases/RELEASE_v0.32_SUMMER_MADNESS": "v0.32.0 — Summer Madness",
     "releases/RELEASE_v0.31_HOLD_THE_LINE": "v0.31.0 — Hold the Line",
     "releases/RELEASE_v0.30_FINAL_COUNTDOWN": "v0.30.0 — Final Countdown",
