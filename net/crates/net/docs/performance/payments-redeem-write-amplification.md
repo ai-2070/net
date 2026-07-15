@@ -111,4 +111,47 @@ own per-branch dirty determination — done deliberately, not by reflex.
 
 ## After-fix rerun
 
-_(filled in after the fix lands — same command, same host.)_
+Same command, same host. Denials now pay only the lock + load; they no
+longer serialize/fsync/rename. `valid_admitted` (the one real write) is
+unchanged, as intended.
+
+### Per-op denial cost, concurrency 1 (the clean signal)
+
+| store (bytes) | denial p50 before | denial p50 after | speed-up | throughput before → after |
+|---|---:|---:|---:|---:|
+| 3.1 KB | ~5,040 µs | **~60 µs** | **~84×** | ~200/s → **~14,000/s** |
+| 309 KB | ~6,070 µs | ~590 µs | ~10× | ~165/s → ~1,630/s |
+| 3.09 MB | ~19,530 µs | ~5,460 µs | ~3.6× | ~51/s → ~181/s |
+
+The write (serialize + fsync + rename) is gone from the denial path. What
+remains is `load_json` + parse of the whole file — which is why the gain
+shrinks as the store grows (at 3 MB, parsing 3 MB of JSON is ~5.5 ms and now
+dominates). The earliest-exit `unknown` denial still loads the whole file;
+avoiding that needs an indexed store (follow-up, below).
+
+### The honest write path is unchanged
+
+| store | `valid_admitted` c16 before | after |
+|---|---:|---:|
+| 309 KB (n=99) | ~6,816 µs (78/s) | ~6,328 µs (78/s) |
+| 3.09 MB (n=999) | ~17,252 µs (56/s) | ~17,383 µs (56/s) |
+
+Admission still serializes + fsyncs the store (at-most-once must survive a
+restart), so its cost — and its file-size scaling — are preserved. That is
+the *operational durability cost* the headline should report honestly; the
+fix removed only the amplification, not the real write.
+
+### Two residual bottlenecks the rerun exposed (follow-ups, not this change)
+
+1. **Denial cost still scales with file size** (5.5 ms at 3 MB) because a
+   denial loads + parses the entire JSON store. An indexed / sharded store
+   (or a cheap existence check before the full load) would flatten this.
+2. **Lock-acquire backoff dominates at high concurrency.** Even with no
+   write, denials at c128 still show ~1 s p50 (down from ~2.9 s, but high):
+   `mutate_json_if_changed` still takes the one advisory lock and holds it
+   across the load, and the 1 ms→50 ms async backoff balloons under 128-way
+   contention. A read path that never takes the write lock (redemption
+   *reads* under a shared lock, or a lock-free load for the denial
+   fast-path) would remove this. Tracked separately; the write-amplification
+   DoS — one fsync per sprayed denial — is closed.
+
