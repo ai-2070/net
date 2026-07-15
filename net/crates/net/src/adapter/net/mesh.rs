@@ -12603,13 +12603,25 @@ impl MeshNode {
         from_node: u64,
         via_addr: SocketAddr,
     ) -> bool {
-        let Some(path) = proximity_graph.path_to(&node_id_to_graph_id(dest)) else {
+        // Exclude the withdrawing peer as a first hop: the UNRESTRICTED
+        // shortest path to `dest` may still start with `from_node` (it
+        // withdrew only its OWN route, other edges through it can
+        // survive), and taking the shortest path alone would bail here
+        // and cascade even when a longer route through a DIFFERENT
+        // direct peer exists (RT-5 review P2). The `(from_node, dest)`
+        // edge itself was already removed by the caller, so no path can
+        // reach `dest` through the withdrawn hop.
+        let Some(path) = proximity_graph
+            .path_to_excluding_first_hop(&node_id_to_graph_id(dest), &node_id_to_graph_id(from_node))
+        else {
             return false;
         };
         // path[0] is self, path[1] the first hop.
         let Some(first_hop) = path.get(1).map(graph_id_to_node_id) else {
             return false;
         };
+        // Excluding the first-hop edge means `path[1]` can no longer be
+        // `from_node`; keep the guard as a cheap invariant assertion.
         if first_hop == from_node {
             return false;
         }

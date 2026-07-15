@@ -945,6 +945,27 @@ impl ProximityGraph {
         self.bfs_path_to(dest, Some((self.my_id, *dest)))
     }
 
+    /// Shortest path from self to `dest` that does NOT start with the
+    /// `self → excluded_first_hop` edge — an alternate through a
+    /// DIFFERENT direct neighbor, even a longer one.
+    ///
+    /// When a peer withdraws its route toward `dest`, the withdrawing
+    /// first hop is no longer usable, but the UNRESTRICTED shortest path
+    /// may still start with it — and a caller that bails the moment
+    /// `path[1] == withdrawing_peer` would ignore a perfectly good
+    /// longer route through another neighbor and cascade a needless
+    /// withdrawal (RT-5 review: alternate search considers only one
+    /// shortest path). Excluding just the first-hop edge forces the BFS
+    /// to leave through some other neighbor. `dest` reachable only
+    /// through `excluded_first_hop` yields `None`.
+    pub fn path_to_excluding_first_hop(
+        &self,
+        dest: &NodeId,
+        excluded_first_hop: &NodeId,
+    ) -> Option<Vec<NodeId>> {
+        self.bfs_path_to(dest, Some((self.my_id, *excluded_first_hop)))
+    }
+
     /// BFS shortest path from self to `dest`, optionally dropping one
     /// directed `(from, to)` edge from the adjacency so the search
     /// routes around it. Shared by [`Self::path_to`] (no exclusion)
@@ -1697,6 +1718,60 @@ mod tests {
             graph.path_to_excluding_direct(&y),
             Some(vec![my_id, z, y]),
             "excluding the direct edge forces the indirect route",
+        );
+    }
+
+    /// RT-5 review P2: when the SHORTEST path to a dest starts with the
+    /// withdrawing peer, the alternate search must still find a LONGER
+    /// valid route through a different first hop instead of giving up.
+    #[test]
+    fn path_to_excluding_first_hop_finds_the_longer_route_through_another_peer() {
+        // Short:  self→B→X→D   (first hop B, the withdrawing peer)
+        // Long:   self→C→Y→Z→D (first hop C)
+        let my_id = make_node_id(1);
+        let b = make_node_id(2);
+        let x = make_node_id(3);
+        let c = make_node_id(4);
+        let y = make_node_id(5);
+        let z = make_node_id(6);
+        let d = make_node_id(7);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        // Build both paths by hand via the edge test-seam.
+        graph.test_insert_edge(my_id, b, 100);
+        graph.test_insert_edge(b, x, 100);
+        graph.test_insert_edge(x, d, 100);
+        graph.test_insert_edge(my_id, c, 100);
+        graph.test_insert_edge(c, y, 100);
+        graph.test_insert_edge(y, z, 100);
+        graph.test_insert_edge(z, d, 100);
+
+        assert_eq!(
+            graph.path_to(&d),
+            Some(vec![my_id, b, x, d]),
+            "unrestricted search takes the shorter path via B",
+        );
+        assert_eq!(
+            graph.path_to_excluding_first_hop(&d, &b),
+            Some(vec![my_id, c, y, z, d]),
+            "excluding B as a first hop must find the longer route via C, not cascade",
+        );
+    }
+
+    #[test]
+    fn path_to_excluding_first_hop_none_when_only_via_excluded_peer() {
+        let my_id = make_node_id(1);
+        let b = make_node_id(2);
+        let d = make_node_id(7);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        graph.test_insert_edge(my_id, b, 100);
+        graph.test_insert_edge(b, d, 100);
+
+        assert_eq!(graph.path_to(&d), Some(vec![my_id, b, d]));
+        assert_eq!(
+            graph.path_to_excluding_first_hop(&d, &b),
+            None,
+            "a dest reachable only through the excluded first hop has no alternate",
         );
     }
 
