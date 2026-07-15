@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::store::{load_json, mutate_json, StoreError};
+use super::store::{load_json, mutate_json, mutate_json_if_changed, StoreError};
 use crate::core::quote::PaymentQuote;
 use crate::core::registry::AssetRegistry;
 use crate::core::units::AtomicAmount;
@@ -279,10 +279,22 @@ impl SpendPolicyEngine {
         let approve_hint =
             format!("approve quote {quote_id} via the payments consent API (operator surface)");
 
-        let decision = mutate_json::<SpendPolicyFile, _, _>(&self.path, |s| {
+        // Conditional-save: only persist when this transaction actually
+        // changed durable state. Three independent sources of change, tracked
+        // explicitly so a "clean" denial that skips the write can never drop a
+        // real mutation:
+        //   * housekeeping pruned an expired counter (the trap: a nominal
+        //     denial is still dirty if retention removed anything);
+        //   * `require` inserted a NEW pending approval (an identical
+        //     already-pending record is a no-op → clean);
+        //   * a reservation landed in the day counter (always dirty).
+        let decision = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, |s| {
             // Housekeeping: drop counters beyond the retention horizon.
+            // `retain` only ever removes, so a shrink means we pruned.
+            let counters_before = s.counters.len();
             s.counters
                 .retain(|k, _| counter_day(k).is_some_and(|d| d + COUNTER_RETAIN_DAYS >= day));
+            let mut dirty = s.counters.len() != counters_before;
 
             let approved = s
                 .approvals
@@ -294,111 +306,131 @@ impl SpendPolicyEngine {
                 .unwrap_or(&s.defaults)
                 .clone();
 
-            let require = |s: &mut SpendPolicyFile, policy_reason: String| {
-                // The model-reachable side writes pending only.
-                s.approvals
-                    .entry(quote_id.clone())
-                    .or_insert(ApprovalRecord {
-                        state: ApprovalState::Pending,
-                        capability: capability.clone(),
-                        quote_b64: quote_b64.clone(),
-                    });
-                SpendDecision::RequiresPaymentApproval {
-                    quote_id: quote_id.clone(),
-                    policy_reason,
-                    approve_hint: approve_hint.clone(),
-                }
-            };
-
-            // Real networks are config-enabled, never ambient — the
-            // network must be EXPLICITLY listed in the effective limits'
-            // allowed_networks (an empty allowlist enables nothing real),
-            // and neither profiles, unsafe flags, nor approvals bypass
-            // network enablement itself. This replaced P0's hard deny:
-            // config, not code — but default remains deny-all.
-            if !is_mock && !limits.allowed_networks.contains(&network) {
-                return SpendDecision::Denied {
-                    policy_reason: format!(
-                        "real network `{network}` is not enabled for `{capability}` — add it \
-                         to allowed_networks (plus a signer + facilitator config) to enable; \
-                         the default is deny"
-                    ),
+            // The model-reachable side writes a pending approval — but only
+            // when one is not already recorded. Sets `*dirty` iff it inserts.
+            let require =
+                |s: &mut SpendPolicyFile, dirty: &mut bool, policy_reason: String| {
+                    if !s.approvals.contains_key(&quote_id) {
+                        s.approvals.insert(
+                            quote_id.clone(),
+                            ApprovalRecord {
+                                state: ApprovalState::Pending,
+                                capability: capability.clone(),
+                                quote_b64: quote_b64.clone(),
+                            },
+                        );
+                        *dirty = true;
+                    }
+                    SpendDecision::RequiresPaymentApproval {
+                        quote_id: quote_id.clone(),
+                        policy_reason,
+                        approve_hint: approve_hint.clone(),
+                    }
                 };
-            }
 
-            if !approved {
-                if is_mock {
-                    if !profile_admits_mock {
-                        return require(
-                            s,
-                            "mock-network auto-allow requires a dev/test profile or the explicit \
-                             unsafe flag; production profile requires approval per spend"
-                                .to_string(),
-                        );
-                    }
-                    if !limits.allowed_networks.is_empty()
-                        && !limits.allowed_networks.contains(&network)
-                    {
-                        return require(
-                            s,
-                            format!("network `{network}` is not in allowed_networks"),
-                        );
-                    }
+            let decision: SpendDecision = 'decision: {
+                // Real networks are config-enabled, never ambient — the
+                // network must be EXPLICITLY listed in the effective limits'
+                // allowed_networks (an empty allowlist enables nothing real),
+                // and neither profiles, unsafe flags, nor approvals bypass
+                // network enablement itself. This replaced P0's hard deny:
+                // config, not code — but default remains deny-all.
+                if !is_mock && !limits.allowed_networks.contains(&network) {
+                    break 'decision SpendDecision::Denied {
+                        policy_reason: format!(
+                            "real network `{network}` is not enabled for `{capability}` — add it \
+                             to allowed_networks (plus a signer + facilitator config) to enable; \
+                             the default is deny"
+                        ),
+                    };
                 }
-                if !limits.allowed_assets.is_empty() && !limits.allowed_assets.contains(&asset_caip)
-                {
-                    return require(s, format!("asset `{asset_caip}` is not in allowed_assets"));
-                }
-                if let Some(cap) = &limits.max_per_call {
-                    if amount > *cap {
-                        return require(
-                            s,
-                            format!(
-                                "amount {amount} exceeds max_per_call {cap} for `{capability}`"
-                            ),
-                        );
-                    }
-                }
-            }
 
-            // Per-day counter: read, check, reserve — all under this lock.
-            let spent = match s.counters.get(&counter_key) {
-                Some(raw) => match AtomicAmount::parse(raw) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return SpendDecision::Denied {
-                            policy_reason: format!("spend counter corrupt: {e}"),
+                if !approved {
+                    if is_mock {
+                        if !profile_admits_mock {
+                            break 'decision require(
+                                s,
+                                &mut dirty,
+                                "mock-network auto-allow requires a dev/test profile or the \
+                                 explicit unsafe flag; production profile requires approval per \
+                                 spend"
+                                    .to_string(),
+                            );
+                        }
+                        if !limits.allowed_networks.is_empty()
+                            && !limits.allowed_networks.contains(&network)
+                        {
+                            break 'decision require(
+                                s,
+                                &mut dirty,
+                                format!("network `{network}` is not in allowed_networks"),
+                            );
                         }
                     }
-                },
-                None => AtomicAmount::from_u128(0),
-            };
-            let new_total = match spent.checked_add(&amount) {
-                Ok(t) => t,
-                Err(_) => {
-                    return SpendDecision::Denied {
-                        policy_reason: "per-day counter overflow".to_string(),
-                    }
-                }
-            };
-            if !approved {
-                if let Some(cap) = &limits.max_per_day {
-                    if new_total > *cap {
-                        return require(
+                    if !limits.allowed_assets.is_empty()
+                        && !limits.allowed_assets.contains(&asset_caip)
+                    {
+                        break 'decision require(
                             s,
-                            format!(
-                                "spending {amount} would take today's `{}` total on `{network}` \
-                                 to {new_total}, over max_per_day {cap}",
-                                counter_key.split('|').nth(2).unwrap_or("?")
-                            ),
+                            &mut dirty,
+                            format!("asset `{asset_caip}` is not in allowed_assets"),
                         );
                     }
+                    if let Some(cap) = &limits.max_per_call {
+                        if amount > *cap {
+                            break 'decision require(
+                                s,
+                                &mut dirty,
+                                format!(
+                                    "amount {amount} exceeds max_per_call {cap} for `{capability}`"
+                                ),
+                            );
+                        }
+                    }
                 }
-            }
-            // Approved spend is still spending: it lands in the counter.
-            s.counters
-                .insert(counter_key.clone(), new_total.to_canonical_string());
-            SpendDecision::Allowed
+
+                // Per-day counter: read, check, reserve — all under this lock.
+                let spent = match s.counters.get(&counter_key) {
+                    Some(raw) => match AtomicAmount::parse(raw) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            break 'decision SpendDecision::Denied {
+                                policy_reason: format!("spend counter corrupt: {e}"),
+                            }
+                        }
+                    },
+                    None => AtomicAmount::from_u128(0),
+                };
+                let new_total = match spent.checked_add(&amount) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        break 'decision SpendDecision::Denied {
+                            policy_reason: "per-day counter overflow".to_string(),
+                        }
+                    }
+                };
+                if !approved {
+                    if let Some(cap) = &limits.max_per_day {
+                        if new_total > *cap {
+                            break 'decision require(
+                                s,
+                                &mut dirty,
+                                format!(
+                                    "spending {amount} would take today's `{}` total on \
+                                     `{network}` to {new_total}, over max_per_day {cap}",
+                                    counter_key.split('|').nth(2).unwrap_or("?")
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Approved spend is still spending: it lands in the counter.
+                s.counters
+                    .insert(counter_key.clone(), new_total.to_canonical_string());
+                dirty = true;
+                SpendDecision::Allowed
+            };
+            (decision, dirty)
         })
         .await?;
         Ok(decision)

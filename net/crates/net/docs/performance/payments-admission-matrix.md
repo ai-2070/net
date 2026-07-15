@@ -77,11 +77,14 @@ redemption persistence, or whole-file growth? The matrix answers it:
    the store, so it stays bounded regardless of history — the cost boundary
    is well defended there.
 4. **A verify rejection is as expensive as a full acceptance (~14 ms):** it
-   claims durable state, then releases it — two writes. A caller who can
-   drive facilitator-verify failures forces claim+release persistence per
-   attempt. (Lesser than the — now fixed — redeem write-amplification, since
-   it requires a valid quote+payload, but the same category. Tracked with the
-   accept/spend read-only audit.)
+   claims durable state, then releases it — two writes. Both are semantically
+   real (in-flight persistence for concurrency; release because value did not
+   move and a retry may succeed), so the read-only audit deliberately did
+   **not** touch it: `verify_rejected` still persists its claim + release
+   (guarded by `tests/read_only_writes_audit.rs`). A caller who can drive
+   facilitator-verify failures with valid quote+payloads still forces
+   claim+release persistence per attempt — a real cost, but not write
+   amplification (the writes are needed).
 
 **Implication:** the next storage move is not more incremental locking around
 one JSON file — it is to stop re-serializing the whole store per write.

@@ -505,54 +505,69 @@ impl PaymentEngine {
                 billing: None,
                 billing_published: false,
             };
-            mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
-                if let Some(rec) = s.quotes.get_mut(&quote_id) {
-                    if let Some(reason) = &rec.frozen {
-                        return Claim::Frozen(reason.clone());
-                    }
-                    if rec.payload_hash != payload_hash {
-                        return Claim::QuoteAlreadyPaid;
-                    }
-                    if let Some(billing) = &rec.billing {
-                        return Claim::AlreadyServed(
-                            Box::new(billing.clone()),
-                            last_verified_tier(&rec.chain),
-                            rec.billing_published,
-                        );
-                    }
-                    if rec.in_flight {
-                        // Completion is atomic (chain push + in_flight=false
-                        // in one commit), so an in_flight record has an
-                        // empty chain: a prior attempt claimed it and then
-                        // crashed (or is still running) before completing.
-                        // Reclaim only after the TTL, refreshing the clock
-                        // so a concurrent retry still sees InProgress and
-                        // only one attempt re-runs verify/settle.
-                        let stale = rec
-                            .in_flight_since_ns
-                            .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
-                            .unwrap_or(true);
-                        if !stale {
-                            return Claim::InProgress;
+            // Only the three `Claim::Fresh` paths mutate state (insert a new
+            // record, mark an existing record in_flight, or reclaim a stale
+            // in_flight); every other outcome is a read-only inspection.
+            // `mutate_json_if_changed` therefore skips the durable write on
+            // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
+            // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
+            // flag is `matches!(_, Fresh)`, derived from the SAME branch that
+            // mutated — so it can never diverge from the mutation. The later
+            // writes (completion, `release_claim`, billing republish) are
+            // separate calls and remain unconditional, so a `verify_rejected`
+            // still persists both its claim (a Fresh here) and its release.
+            mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+                let claim: Claim = 'claim: {
+                    if let Some(rec) = s.quotes.get_mut(&quote_id) {
+                        if let Some(reason) = &rec.frozen {
+                            break 'claim Claim::Frozen(reason.clone());
                         }
+                        if rec.payload_hash != payload_hash {
+                            break 'claim Claim::QuoteAlreadyPaid;
+                        }
+                        if let Some(billing) = &rec.billing {
+                            break 'claim Claim::AlreadyServed(
+                                Box::new(billing.clone()),
+                                last_verified_tier(&rec.chain),
+                                rec.billing_published,
+                            );
+                        }
+                        if rec.in_flight {
+                            // Completion is atomic (chain push + in_flight=false
+                            // in one commit), so an in_flight record has an
+                            // empty chain: a prior attempt claimed it and then
+                            // crashed (or is still running) before completing.
+                            // Reclaim only after the TTL, refreshing the clock
+                            // so a concurrent retry still sees InProgress and
+                            // only one attempt re-runs verify/settle.
+                            let stale = rec
+                                .in_flight_since_ns
+                                .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
+                                .unwrap_or(true);
+                            if !stale {
+                                break 'claim Claim::InProgress;
+                            }
+                            rec.in_flight_since_ns = Some(now_ns);
+                            break 'claim Claim::Fresh;
+                        }
+                        if !rec.chain.is_empty() {
+                            break 'claim Claim::AlreadySettled;
+                        }
+                        rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
-                        return Claim::Fresh;
+                        break 'claim Claim::Fresh;
                     }
-                    if !rec.chain.is_empty() {
-                        return Claim::AlreadySettled;
+                    if let Some(other) = s.consumed.get(&payload_hash) {
+                        if *other != quote_id {
+                            break 'claim Claim::ReplayOtherQuote;
+                        }
                     }
-                    rec.in_flight = true;
-                    rec.in_flight_since_ns = Some(now_ns);
-                    return Claim::Fresh;
-                }
-                if let Some(other) = s.consumed.get(&payload_hash) {
-                    if *other != quote_id {
-                        return Claim::ReplayOtherQuote;
-                    }
-                }
-                s.consumed.insert(payload_hash, quote_id.clone());
-                s.quotes.insert(quote_id.clone(), record);
-                Claim::Fresh
+                    s.consumed.insert(payload_hash, quote_id.clone());
+                    s.quotes.insert(quote_id.clone(), record);
+                    Claim::Fresh
+                };
+                let dirty = matches!(claim, Claim::Fresh);
+                (claim, dirty)
             })
             .await?
         };

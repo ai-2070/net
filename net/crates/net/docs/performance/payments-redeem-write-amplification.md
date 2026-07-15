@@ -101,13 +101,27 @@ unchanged**; we only stop rewriting the file when nothing changed.
 Guarded by a regression test (`tests/redeem_denial_no_write.rs`): a denial
 leaves the store inode unchanged (no rename), an admission changes it.
 
-### Follow-up audit (tracked, not in this change)
+### Follow-up audit — done
 
-The same read-only-branch analysis applies to other `mutate_json` closures
-and should follow: `accept_payment`'s claim outcomes (`InProgress`,
-`AlreadyServed`; `engine/mod.rs:508`) and hard spend-policy denials that
-create no approval and alter no counter (`spend.rs:282`). Each needs its
-own per-branch dirty determination — done deliberately, not by reflex.
+The same read-only-branch analysis was applied to `accept_payment`'s claim
+transaction (`engine/mod.rs:508`) and `check_and_reserve` (`spend.rs:282`)
+via `mutate_json_if_changed`, with per-branch dirty determination:
+
+- **accept claim:** every mutating path returns `Claim::Fresh` (new insert /
+  mark in-flight / stale reclaim), so `dirty = matches!(_, Fresh)`; the six
+  read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed / InProgress
+  / AlreadySettled / ReplayOtherQuote) skip the write. The completion write,
+  `release_claim`, and billing republish are separate calls and stay
+  unconditional — so `verify_rejected` still persists **both** its claim and
+  its release (both are semantically real; not a dirty-flag target).
+- **spend:** `dirty = pruned_a_stale_counter || inserted_a_new_pending_
+  approval || reserved_the_counter`. The housekeeping trap is handled — a
+  nominal denial that pruned an expired counter is dirty; an identical
+  already-pending approval is clean.
+
+Witnessed by `tests/read_only_writes_audit.rs` (inode unchanged on clean
+branches, changed on dirty), red-verified against unconditional save, with
+the adversarial / spend_policy / native_tool_gate invariants kept green.
 
 ## After-fix rerun
 
