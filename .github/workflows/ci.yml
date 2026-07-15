@@ -553,8 +553,8 @@ jobs:
           cargo bench --bench redeem_matrix --no-run
           cargo bench --bench duplicate_storm --no-run
           cargo bench --bench spend_contention --no-run
+          cargo bench --bench mock_lifecycle --no-run
           cargo bench --features mesh --bench mesh_paid_invoke --no-run
-          cargo bench --features mesh --bench mock_lifecycle --no-run
 
   node-tests:
     name: Node bindings tests (vitest)

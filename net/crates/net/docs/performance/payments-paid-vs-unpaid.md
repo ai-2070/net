@@ -1,11 +1,24 @@
 # Payments — paid vs. unpaid nRPC delta (P4)
 
-> The admission overhead an application actually pays: the same tool served
-> two ways — `serve_tool` (unpaid) vs `serve_tool_paid` (paid) — with
-> identical request/response types, identical handler body, and the same JSON
-> codec and transport. The **only** difference is the payment gate, so
-> `delta = paid_p50 − unpaid_p50` is attributable to payment admission
-> (the provider-side redeem).
+> **Ready-settled payment-gate overhead** an application actually pays: the
+> same tool served two ways — `serve_tool` (unpaid) vs `serve_tool_paid`
+> (paid) — with identical request/response types, identical handler body, and
+> the same JSON codec and transport. The **only** difference is the payment
+> gate, so `delta = paid_p50 − unpaid_p50` is the provider-side
+> `redeem_for_invocation` cost when the caller already holds a settled quote.
+>
+> This is **not** the full proof-present acceptance boundary
+> (`accept_payment` + `redeem_for_invocation`) — **P2 owns that**. Here the
+> caller presents an already-settled quote id and the provider only runs the
+> redemption transaction (lock → load → redeemed check-and-set → whole-file
+> persist).
+>
+> **Headline (controlled localhost, fixed 450-record store):** ordinary
+> invocation remains ~1.7 ms and reaches ~50 k attempts/s at c128, while
+> adding the current ready-settled payment gate reduces paid invocation to
+> ~23 admissions/s and pushes median latency to ~2.9 s. The handler and codec
+> are identical; the difference is the globally serialized redemption
+> transaction over the 1.4 MB whole-file store.
 >
 > Bench: `net/crates/net/payments/benches/mesh_paid_invoke.rs`
 > (`--features mesh`), warm two-node loopback mesh, `NET_PAY_BENCH_SAMPLES=150`,
@@ -35,11 +48,11 @@ concurrency. Paid ~140/s (c1) → ~23/s (c128) — it *anti*-scales.
 
 ## Findings
 
-1. **A ~10.7 ms per-invocation payment tax at c1** (at a 450-record / 1.4 MB
-   store): the redeem gate's `fs2` lock + JSON read-modify-write + fsync. At a
-   smaller store it is smaller (P2's boundary-1 redeem is ~4.8 ms at 1 record,
-   ~19 ms at 1 000) — the tax scales with store size, and this run fixes it at
-   450 records.
+1. **A ~10.7 ms per-invocation ready-settled redemption tax at c1** (at a
+   450-record / 1.4 MB store): the redeem gate's `fs2` lock + JSON
+   read-modify-write + fsync. At a smaller store it is smaller (P2's boundary-1
+   redeem is ~4.8 ms at 1 record, ~19 ms at 1 000) — the tax scales with store
+   size, and this run fixes it at 450 records.
 2. **The delta is not a fixed cost — it collapses under concurrency.** The
    median holds ~11 ms at c1/c16, but the paid **tail** explodes (p95 1.88 s at
    c16) and by c128 even the **median** is ~2.9 s. Meanwhile the unpaid path

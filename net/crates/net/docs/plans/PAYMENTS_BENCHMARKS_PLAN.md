@@ -384,12 +384,13 @@ event-bus workstream). It leads the strategic story but does not live here.
 - [x] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
       `benches/mesh_paid_invoke.rs` (feature mesh): apples-to-apples
       `serve_tool` vs `serve_tool_paid`, bearer, fixed cardinality (all quotes
-      pre-minted). Finding: ~10.7 ms payment tax at c1 (450-record store), but
-      it collapses under concurrency — paid p50 ~2.9 s at c128 (p95 1.88 s at
-      c16) while unpaid stays ~1.7 ms/50 k/s. The delta is dominated by the
-      redeem's exclusive store lock, not crypto/transport — the P2/P3/P5
-      storage conclusion, application-facing. Baseline:
-      `docs/performance/payments-paid-vs-unpaid.md`.
+      pre-minted). The delta is the **ready-settled redemption tax**
+      (redeem-only; P2 owns the full accept+redeem boundary). Finding: ~10.7 ms
+      at c1 (450-record store), but it collapses under concurrency — paid p50
+      ~2.9 s at c128 (p95 1.88 s at c16) while unpaid stays ~1.7 ms/50 k/s. The
+      delta is dominated by the redeem's exclusive store lock, not
+      crypto/transport — the P2/P3/P5 storage conclusion, application-facing.
+      Baseline: `docs/performance/payments-paid-vs-unpaid.md`.
 - [x] **P5 — Spend contention** (B7). `benches/spend_contention.rs`:
       same-counter (ample + near-limit K, cardinality 0/100/1 000), shared
       parent cap (P5b), independent (P5c), approval contention (P5d),
@@ -400,7 +401,13 @@ event-bus workstream). It leads the strategic story but does not live here.
       coupling; the atomic unit is the (day,network,asset) counter row (shared
       across capabilities, independent across assets). Baseline:
       `docs/performance/payments-spend-contention.md`.
-- [ ] **P6 — Quote-to-billing + quote-to-handler-response mock lifecycle** (B6).
+- [x] **P6 — Quote-to-billing + quote-to-handler-response mock lifecycle** (B6).
+      `benches/mock_lifecycle.rs` (in-process, non-mesh): one lifecycle, two
+      endpoints from the same start — A quote→billing (~14 ms @ c1), B
+      quote→handler (~20 ms @ c1); redeem+handler adds ~6 ms. All invariants
+      asserted (verify/settle once, one billing, handler once, replay doesn't
+      re-run, retry same billing). Zero-delay mock; external rail excluded.
+      Baseline: `docs/performance/payments-mock-lifecycle.md`.
 - [ ] **P7 — External-rail telemetry documentation** (B-ext).
 
 **Acceptance for P1–P6:** the relevant `cargo bench --no-run` compiles

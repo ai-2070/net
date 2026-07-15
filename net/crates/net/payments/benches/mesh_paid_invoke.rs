@@ -6,7 +6,12 @@
 //!
 //!     delta = paid_p50 − unpaid_p50
 //!
-//! is attributable to payment admission (the provider-side redeem).
+//! is the **ready-settled payment-gate overhead**: the caller presents an
+//! already-settled quote id and the provider runs `redeem_for_invocation`
+//! (lock → load → redeemed check-and-set → whole-file persist). This is NOT
+//! the full proof-present acceptance boundary (`accept_payment` +
+//! `redeem_for_invocation`) — P2 owns that. Measured on a controlled
+//! localhost mesh at a fixed 450-record store.
 //!
 //! Quotes are at-most-once and there is no proof-reuse API, so N distinct
 //! settled quotes are **pre-minted in-process** (issue + accept on the
@@ -206,8 +211,8 @@ fn main() {
     let all_ids = rt.block_on(mint_batch(&fx, &mut idx, total));
     let base = BenchMetadata::base(&fx, Duration::ZERO); // records_before == total (held)
 
-    println!("mesh_paid_invoke — samples={n}, warm two-node loopback mesh, binding=off (bearer)");
-    println!("fixed store cardinality={total} records; delta = paid_p50 - unpaid_p50 (admission)");
+    println!("mesh_paid_invoke — samples={n}, controlled localhost mesh, binding=off (bearer)");
+    println!("fixed store cardinality={total} records; delta = ready-settled payment-gate overhead");
 
     for (level, &conc) in CONCURRENCY.iter().enumerate() {
         // Unpaid — the shared baseline (touches no engine).
@@ -224,6 +229,6 @@ fn main() {
 
         let delta_us =
             (ph.value_at_quantile(0.50) as f64 - uh.value_at_quantile(0.50) as f64) / 1000.0;
-        println!("      >> DELTA c{conc}: paid_p50 - unpaid_p50 = {delta_us:.2}us (payment admission)");
+        println!("      >> DELTA c{conc}: paid_p50 - unpaid_p50 = {delta_us:.2}us (ready-settled redemption tax)");
     }
 }

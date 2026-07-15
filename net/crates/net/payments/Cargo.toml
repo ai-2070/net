@@ -208,8 +208,9 @@ name = "mesh_paid_invoke"
 harness = false
 required-features = ["mesh"]
 
-# B6 — full in-process + mesh mock lifecycle (software path, not x402/chain).
+# B6 — full in-process mock lifecycle (software path, not x402/chain): one
+# lifecycle, two timer endpoints (quote→billing, quote→handler). In-process
+# composition — no mesh needed.
 [[bench]]
 name = "mock_lifecycle"
 harness = false
-required-features = ["mesh"]
