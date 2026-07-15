@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 
 use bench_mesh_pair::*;
 use net::adapter::net::behavior::capability::CapabilitySet;
+#[cfg(feature = "tool")]
+use net::adapter::net::cortex::tool::ToolDescriptor;
 use net::adapter::net::MeshNode;
 
 const ITERS: u64 = 200;
@@ -52,6 +54,9 @@ fn main() {
         warm_update_matrix().await;
         warm_add_remove_direct().await;
         cold_publication_direct().await;
+        // CPB-3: RT-3 registry-driven convergence (feature "tool").
+        #[cfg(feature = "tool")]
+        rt3_registry_convergence().await;
     });
 }
 
@@ -274,4 +279,110 @@ async fn cold_publication_direct() {
         timeouts,
         outliers: 0,
     });
+}
+
+// ============================================================================
+// CPB-3 — RT-3 registry mutation -> remote visibility, two policy modes
+// (C4/C5). Driven by a real tool-registry mutation (tool_registry().insert),
+// which fires the local-caps change signal and settles through start_arc()'s
+// change-driven auto-announcer — NOT an explicit announce. So the measured
+// latency INCLUDES the RT-3 debounce (and, in default-policy, the rate-limit
+// floor). Feature "tool"; otherwise this whole section is cfg'd out and the
+// bench stays a pure --features net wire-floor suite.
+// ============================================================================
+
+/// Longer deadline: default-policy's rate-limit floor can push a trailing
+/// flush toward `min_announce_interval` (10 s default).
+#[cfg(feature = "tool")]
+const DEADLINE_RT3: Duration = Duration::from_secs(20);
+
+#[cfg(feature = "tool")]
+async fn rt3_registry_convergence() {
+    println!("=== CPB-3 RT-3 registry mutation -> remote visibility ===\n");
+    // debounce-only: isolates RT-3 burst settling (100 ms debounce, no rate limit).
+    run_rt3("RT-3 debounce-only", &BenchConfig::debounce_only(), 40, 5).await;
+    // default-policy: rate-limit-dominated. A SMALL labeled scenario — thousands
+    // of ~10 s samples are impractical (C5). NOT "production defaults".
+    run_rt3(
+        "RT-3 default-policy (min_interval 10s)",
+        &BenchConfig::default_policy(),
+        3,
+        0,
+    )
+    .await;
+}
+
+#[cfg(feature = "tool")]
+async fn run_rt3(label: &str, cfg: &BenchConfig, iters: u64, warmup: u64) {
+    let (a, b) = direct_pair(cfg).await;
+    let a_id = a.node_id();
+    let mut report = LatencyReport::new();
+    let mut timeouts = 0u64;
+    let version_before = a.capability_announce_version();
+
+    for i in 0..iters {
+        let tool_id = format!("bench.tool.{i}");
+        let tag = format!("ai-tool:{tool_id}");
+        let mut rx = b.capability_fold().subscribe_changes();
+        let descriptor = tool_descriptor(&tool_id);
+        let t0 = Instant::now();
+        // The RT-3 trigger: a registry mutation, not an explicit announce. The
+        // change-driven announcer (running because of start_arc) debounces then
+        // announces; the measured latency includes that policy window.
+        a.tool_registry().insert(descriptor);
+        let visible = tokio::time::timeout(
+            DEADLINE_RT3,
+            await_capability_state(&mut rx, || {
+                b.find_nodes_by_filter(&require_tag(&tag)).contains(&a_id)
+            }),
+        )
+        .await;
+        match visible {
+            Ok(()) => {
+                if i >= warmup {
+                    report.record(t0.elapsed().as_nanos() as u64);
+                }
+            }
+            Err(_) => timeouts += 1,
+        }
+    }
+
+    let candidate_pop = b
+        .find_nodes_by_filter(&require_tag(&format!("ai-tool:bench.tool.{}", iters - 1)))
+        .len();
+    report.print_row(RowMeta {
+        label,
+        start_event: "registry mutation (tool_registry.insert)",
+        endpoint: "exact-state read (ai-tool tag via find_nodes_by_filter)",
+        topology: "A->B direct",
+        hop_count: 0,
+        manifest_bytes: manifest_bytes(&manifest_tags(&["ai-tool:bench.tool.0"])),
+        version_delta: a.capability_announce_version() - version_before,
+        candidate_pop,
+        warmup,
+        workers: WORKER_THREADS,
+        topology_reused: true,
+        timeouts,
+        outliers: 0,
+    });
+    drop((a, b));
+}
+
+#[cfg(feature = "tool")]
+fn tool_descriptor(tool_id: &str) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_id: tool_id.to_string(),
+        name: "bench tool".to_string(),
+        version: "1.0".to_string(),
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        requires: Vec::new(),
+        estimated_time_ms: 0,
+        stateless: true,
+        streaming: false,
+        tags: Vec::new(),
+        pricing_terms: None,
+        node_count: 0,
+    }
 }
