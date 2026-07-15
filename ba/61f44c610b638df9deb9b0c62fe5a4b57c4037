@@ -1,0 +1,37 @@
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_a0122cceed6e80 404-410
+  s_49cc2ab0880501::t_01e14ee3458cbc 387-393
+net/crates/net/docs/performance/payments-mock-lifecycle.md
+  s_49cc2ab0880501::t_c2f2d5525c997e 1-63
+net/crates/net/payments/benches/mock_lifecycle.rs
+  s_49cc2ab0880501::t_8167dc28ce1ace 1-2,4-10,15,21-26,28,30-42,45-49,51-59,62-96,98-123,136,138-140,142-153,155-164,166,201-202,208-212,215-219,221-222,224,226,229-230,232-235,237-243,250-260,262,264-268,270-278,280,288,290-292,294-296,298-300
+  s_49cc2ab0880501::t_e366b1e3611d92 11-14,16-20,27,29,43-44,50,60-61,97,125-135,137,141,154,165,167-200,203-205,213-214,220,223,225,227-228,231,236,244-249,261,263,269,279,281-287,289,293,297
+  s_49cc2ab0880501::t_0feb237c31323d 124
+net/crates/net/docs/performance/payments-paid-vs-unpaid.md
+  s_49cc2ab0880501::t_27411c98744958 51-55
+  s_49cc2ab0880501::t_a74b3ad2c48c5e 3-21
+net/crates/net/payments/benches/mesh_paid_invoke.rs
+  s_49cc2ab0880501::t_cfc530d74cf5df 214-215
+  s_49cc2ab0880501::t_d50c3f7b656d73 232
+  s_49cc2ab0880501::t_eef13bb76774da 9-14
+net/crates/net/payments/Cargo.toml
+  s_49cc2ab0880501::t_535b6a4abc9786 211-213
+.github/workflows/ci.yml
+  s_49cc2ab0880501::t_3c1ceefe5f7418 556
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ba61f44c610b638df9deb9b0c62fe5a4b57c4037",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
