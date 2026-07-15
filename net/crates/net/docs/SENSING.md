@@ -169,7 +169,8 @@ wake, not the wake alone). Under `net/crates/net/benches/`:
   scheduler-input wake, and → a real `match_islands` decision change.
 - `capability_burst` (`--features "net tool"`) — coalescing efficiency: an RT-3
   registry burst collapses to one publication; an RT-1 explicit-announce burst
-  to one leading + one trailing broadcast.
+  to one leading + one trailing publication (observed as ~2 remote updates
+  applied at the consumer).
 
 See `plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md` §7 for the reference
 baselines and the data-derived regression thresholds.

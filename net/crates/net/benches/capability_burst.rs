@@ -9,18 +9,18 @@
 //! - **RT-3 debounce group** — N rapid REGISTRY mutations (re-versions of
 //!   one tool, so the registry never bloats) that all land inside the
 //!   100 ms debounce window should collapse to ~one publication. The
-//!   honest coalescing figure is **broadcasts the consumer actually
-//!   applied** (B's capability-fold generation delta), because A's
-//!   `capability_announce_version` counts announce *calls*, not wire
-//!   broadcasts (D2).
+//!   honest coalescing figure is **remote updates the consumer actually
+//!   applied** (B's capability-fold generation delta) — what B accepted,
+//!   NOT what A sent on the wire — because A's
+//!   `capability_announce_version` counts announce *calls* (D2).
 //! - **RT-1 rate-limit group** — one leading EXPLICIT announce + many
 //!   in-window explicit announces coalesce to ~one leading + one
-//!   trailing broadcast. Again measured as broadcasts B applied
+//!   trailing publication. Again measured as remote updates B applied
 //!   (~2), vs the M+1 announce calls A made.
 //!
 //! Both groups also verify **final-state correctness** (B converges to
 //! the exact last version) and report **logical payload bytes accepted
-//! by one direct consumer** (per-announce bytes × broadcasts applied) —
+//! by one direct consumer** (per-announce bytes × remote updates applied) —
 //! never "bytes sent" (D2).
 //!
 //! Run: `cargo bench --features "net tool" --bench capability_burst`
@@ -55,8 +55,8 @@ fn main() {
 /// Accumulated over `ITERS` bursts of one size.
 struct BurstStats {
     burst: u64,
-    announce_calls: u64, // Σ A version delta (announce CALLS, not broadcasts)
-    broadcasts: u64,     // Σ B fold-gen delta (broadcasts B actually applied)
+    announce_calls: u64, // Σ A version delta (announce CALLS, not remote-applied updates)
+    remote_updates: u64, // Σ B fold-gen delta (remote updates B actually APPLIED, not wire sends)
     correct: u64,        // final-state-correct count
     per_announce_bytes: usize,
     latency: LatencyReport,
@@ -67,7 +67,7 @@ impl BurstStats {
         Self {
             burst,
             announce_calls: 0,
-            broadcasts: 0,
+            remote_updates: 0,
             correct: 0,
             per_announce_bytes,
             latency: LatencyReport::new(),
@@ -76,14 +76,14 @@ impl BurstStats {
 
     fn print(&self, group: &str) {
         let per = |n: u64| n as f64 / ITERS as f64;
-        let bytes_per_burst = self.per_announce_bytes as f64 * per(self.broadcasts);
+        let bytes_per_burst = self.per_announce_bytes as f64 * per(self.remote_updates);
         println!(
             "[{group}] burst={:>3}  calls/burst={:>5.1} (delta,not emissions)  \
-             broadcasts_applied/burst={:>4.1}  final_correct={}/{}  \
+             remote_updates_applied/burst={:>4.1}  final_correct={}/{}  \
              logical_bytes_accepted/burst={:>6.0}  conv p50={:.1}ms p99={:.1}ms",
             self.burst,
             per(self.announce_calls),
-            per(self.broadcasts),
+            per(self.remote_updates),
             self.correct,
             ITERS,
             bytes_per_burst,
@@ -134,7 +134,7 @@ async fn rt3_debounce_group() {
                 stats.correct += 1;
             }
             stats.announce_calls += a.capability_announce_version() - v0;
-            stats.broadcasts += b.capability_fold().change_generation() - g0;
+            stats.remote_updates += b.capability_fold().change_generation() - g0;
             let _ = a_id;
         }
         stats.print("RT-3 debounce");
@@ -198,7 +198,7 @@ async fn rt1_rate_limit_group() {
                 stats.correct += 1;
             }
             stats.announce_calls += a.capability_announce_version() - v0;
-            stats.broadcasts += b.capability_fold().change_generation() - g0;
+            stats.remote_updates += b.capability_fold().change_generation() - g0;
         }
         stats.print("RT-1 rate-limit");
     }

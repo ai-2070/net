@@ -99,11 +99,16 @@ report *logical payload bytes accepted by one direct consumer* — never called 
 
 **D3 — Targeted compile gate: APPROVED.** Compile only the new targets with their exact features:
 ```
-cargo bench -p net-mesh --bench capability_propagation        --features net  --no-run
-cargo bench -p net-mesh --bench capability_scheduler_reaction --features net  --no-run
-cargo bench -p net-mesh --bench capability_burst              --features "net tool" --no-run
+cargo bench -p net-mesh --bench capability_propagation        --features net         --no-run
+cargo bench -p net-mesh --bench capability_scheduler_reaction --features "net redex" --no-run
+cargo bench -p net-mesh --bench capability_burst              --features "net tool"  --no-run
 ```
 Do **not** compile every existing bench on every PR.
+
+**As-built override:** the repository already had a broad `--all-features --all-targets` Clippy gate
+(the `clippy` CI job) covering these targets. D3's intent — prevent benchmark rot without adding
+redundant CI work — is therefore satisfied by the existing gate; the targeted commands above remain
+**local** verification commands, and no CI step was added. See §7.4.
 
 ---
 
@@ -230,8 +235,8 @@ do not run in CI (§7.4). Numbers are the reference-machine snapshot the thresho
 | CPB-2b island appears/disappears, routed | ~162–167 µs | ~268–281 µs | 90 ea | +hop |
 | CPB-3 RT-3 debounce-only | ~101.6 ms | ~102.6 ms | 35 | debounce-dominated |
 | CPB-3 RT-3 default-policy | ~10.0 s | — | 3 | **rate-limit-dominated (100× debounce)** |
-| CPB-4 RT-3 burst 1/16/128 | conv ~101.6 ms | — | 20 ea | 1 call, 1 broadcast, 20/20 correct |
-| CPB-4 RT-1 burst 16/128 | conv ~251 ms | — | 20 ea | 16/128 calls → 2 broadcasts, 20/20 correct |
+| CPB-4 RT-3 burst 1/16/128 | conv ~101.6 ms | — | 20 ea | 1 call, 1 remote update applied, 20/20 correct |
+| CPB-4 RT-1 burst 16/128 | conv ~251 ms | — | 20 ea | 16/128 calls → 2 remote updates applied, 20/20 correct |
 | CPB-5 fan-out first-visible (A→16) | ~142 µs | ~216 µs | 50 | fastest consumer |
 | CPB-5 fan-out all-16-visible | ~355 µs | ~441 µs | 50 | batch completion ≠ first wake |
 | CPB-5 intake all-16-visible (16→B) | ~3.3 ms | ~11.4 ms | 50 | concurrent churn, population 16 |
@@ -243,13 +248,15 @@ machine/scheduler variance never trips them. A regression is a *sustained* breac
 - Routed adds a **bounded hop cost**: routed p50 ≤ 2 × direct p50 (observed ~1.2–1.6×).
 - Scheduler-input wake (CPB-2a): **p99 < 1 ms** (observed ~338 µs).
 - RT-3 debounce (CPB-3/4): convergence **within debounce + 20 ms** (observed ~101.6 ms @ 100 ms).
-- Coalescing contracts (CPB-4): RT-3 burst → **1 broadcast applied**; RT-1 burst → **≤ 2**;
-  final-state correctness **must be N/N** (a hard invariant, not a latency threshold).
+- Coalescing contracts (CPB-4): RT-3 burst → **1 remote update applied**; RT-1 burst → **≤ 2
+  remote updates applied** (a fold-generation delta at B counts updates the consumer *accepted*,
+  not origin broadcasts/packets); final-state correctness **must be N/N** (a hard invariant, not a
+  latency threshold).
 - Fan-out all-16-visible: **p99 < 2 ms**; intake all-16-visible: **p99 < 30 ms** (observed ~11.4 ms).
 
 ### 7.4 CI (D3)
 The `clippy` job already runs `cargo clippy --all-features --all-targets`, and `--all-features`
-enables `tool` + `redex`, so **all four CPB bench targets are already compile-gated** (harness=false
+enables `tool` + `redex`, so **all three CPB bench targets are already compile-gated** (harness=false
 benches are checked as targets) — no separate step added (Kyra D3: don't add a redundant broad
 gate; the broad gate already exists). The benches themselves are `cargo bench`-only and are not
 executed in CI. Targeted local compile, for the record:
@@ -261,7 +268,7 @@ cargo bench -p net-mesh --bench capability_burst              --features "net to
 
 ### 7.5 The five equivalences, as-built
 `watch wake ≠ query visibility` (exact-state await, 0 timeouts everywhere) · `version delta ≠
-packets emitted` (CPB-4: 128 calls vs 2 broadcasts) · `encoded size ≠ bytes sent` (no bytes-sent
+packets emitted` (CPB-4: 128 calls vs 2 remote updates applied) · `encoded size ≠ bytes sent` (no bytes-sent
 reported) · `capability query ≠ scheduler decision` (CPB-2b ends on `match_islands` change) ·
 `ordinary burst ≠ stale-sleeper ownership` (CPB-4 makes no such claim). Every published row names
 its exact start event and endpoint and carries the sample protocol.
