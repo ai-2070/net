@@ -1057,7 +1057,7 @@ struct DispatchCtx {
     /// RT-5: seq for cascaded withdrawals this node re-authors.
     route_withdraw_seq: Arc<AtomicU64>,
     /// RT-5: per-dest damping for cascaded withdrawals.
-    route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
+    route_withdraw_damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
     /// RT-5: inbound-withdrawal seq ordering gate.
     route_withdraw_gate: Arc<WithdrawalSeqGate>,
     /// RT-5: count of dispatch-path cascade tasks currently in
@@ -2768,19 +2768,27 @@ const MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES: usize = 64;
 /// cascade on the single receive loop — never blocks on encryption
 /// or socket I/O (RT-5 review Finding 4; mirrors
 /// `forward_capability_announcement`, which also builds in-task).
-fn spawn_route_withdrawal_flood(
-    seq_counter: &Arc<AtomicU64>,
-    damper: &Arc<DashMap<u64, std::time::Instant>>,
-    socket: &Arc<NetSocket>,
-    peers: &Arc<DashMap<u64, PeerInfo>>,
-    partition_filter: &PartitionFilter,
-    dest: u64,
-    exclude: Option<u64>,
-) {
-    let now = std::time::Instant::now();
+/// Damper admission for one route-withdrawal flood, keyed by
+/// `(dest, exclude)`.
+///
+/// `exclude` is the split-horizon neighbor a cascade was learned from,
+/// so `(dest, exclude)` fixes the intended recipient set (every peer but
+/// `dest` and `exclude`). Keying on `dest` alone collapsed two DISTINCT
+/// recipient sets: a cascade learned from B (excludes B, notifies C)
+/// would suppress a later cascade learned from C (must notify B) inside
+/// the window, so B never heard about the loss (RT-5 review P2).
+///
+/// Returns `true` (and stamps `now`) iff no flood for this key has
+/// stamped within [`ROUTE_WITHDRAW_DAMP_WINDOW`]. Split out from the
+/// flood so the keying is unit-testable without a socket.
+fn route_withdraw_damp_admit(
+    damper: &DashMap<(u64, Option<u64>), std::time::Instant>,
+    key: (u64, Option<u64>),
+    now: std::time::Instant,
+) -> bool {
     let mut fresh = false;
     damper
-        .entry(dest)
+        .entry(key)
         .and_modify(|t| {
             if now.saturating_duration_since(*t) >= ROUTE_WITHDRAW_DAMP_WINDOW {
                 *t = now;
@@ -2791,12 +2799,25 @@ fn spawn_route_withdrawal_flood(
             fresh = true;
             now
         });
-    if !fresh {
+    fresh
+}
+
+fn spawn_route_withdrawal_flood(
+    seq_counter: &Arc<AtomicU64>,
+    damper: &Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    partition_filter: &PartitionFilter,
+    dest: u64,
+    exclude: Option<u64>,
+) {
+    let now = std::time::Instant::now();
+    if !route_withdraw_damp_admit(damper, (dest, exclude), now) {
         return;
     }
     // Opportunistic bound: the damper only grows with distinct
-    // withdrawn dests; a churn storm across many dests still can't
-    // grow it past this sweep.
+    // `(dest, exclude)` pairs; a churn storm across many dests still
+    // can't grow it past this sweep.
     if damper.len() > 1024 {
         damper.retain(|_, t| now.saturating_duration_since(*t) < ROUTE_WITHDRAW_DAMP_WINDOW);
     }
@@ -4271,7 +4292,7 @@ pub struct MeshNode {
     /// most once per `ROUTE_WITHDRAW_DAMP_WINDOW`. Bounds cascade /
     /// flap storms without a flood seen-cache (each hop re-authors
     /// its withdrawal, so there is no flood identity to dedup on).
-    route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>>,
+    route_withdraw_damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
     /// Inbound-withdrawal ordering gate: strictly-newer seq per
     /// (sender, dest). Purged per sender on (re-)handshake and
     /// dead-peer eviction so a fresh incarnation's reset counter
@@ -4840,7 +4861,8 @@ impl MeshNode {
         // RT-5: route-withdrawal state + the clones the `on_failure`
         // closure captures.
         let route_withdraw_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-        let route_withdraw_damper: Arc<DashMap<u64, std::time::Instant>> = Arc::new(DashMap::new());
+        let route_withdraw_damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>> =
+            Arc::new(DashMap::new());
         let enable_route_withdraw = config.enable_route_withdraw;
         let route_withdraw_seq_failure = route_withdraw_seq.clone();
         let route_withdraw_damper_failure = route_withdraw_damper.clone();
@@ -22603,6 +22625,31 @@ mod route_withdrawal_promotion_tests {
             !MeshNode::promotable_direct_hop(&a2n, &fd, hop, via_addr, via_addr),
             "promoting the withdrawing sender's own address reinstalls the dropped route"
         );
+    }
+
+    /// RT-5 review P2: the withdrawal damper keys on `(dest, exclude)`,
+    /// not `dest` alone. Two cascades for the same dest but different
+    /// split-horizon neighbors reach different recipient sets and must
+    /// not suppress one another inside the damp window.
+    #[test]
+    fn withdraw_damper_keys_on_dest_and_exclude() {
+        let damper: DashMap<(u64, Option<u64>), std::time::Instant> = DashMap::new();
+        let dest = 0xD;
+        let t0 = std::time::Instant::now();
+
+        // A cascade learned from B: admitted, stamps (D, Some(B)).
+        assert!(route_withdraw_damp_admit(&damper, (dest, Some(0xB)), t0));
+        // The identical key again inside the window: damped.
+        assert!(!route_withdraw_damp_admit(&damper, (dest, Some(0xB)), t0));
+        // A second loss learned from C must still notify B — a different
+        // recipient set, admitted despite (D, Some(B)) being stamped.
+        assert!(route_withdraw_damp_admit(&damper, (dest, Some(0xC)), t0));
+        // The failure-detector flood (exclude = None) is independent too.
+        assert!(route_withdraw_damp_admit(&damper, (dest, None), t0));
+
+        // Once the window elapses, the original key re-admits.
+        let t1 = t0 + ROUTE_WITHDRAW_DAMP_WINDOW;
+        assert!(route_withdraw_damp_admit(&damper, (dest, Some(0xB)), t1));
     }
 }
 
