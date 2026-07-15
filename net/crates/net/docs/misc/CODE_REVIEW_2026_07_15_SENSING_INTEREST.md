@@ -1,5 +1,14 @@
 # CODE REVIEW 2026-07-15 — Sensing Interest Coalescing (`sensing-interest-plan`)
 
+> **Status: all 8 findings RESOLVED on this branch** (commits `a52973c9b`
+> §1, `82cedcf7b` §3, `02ee2590d` §4, `cb31e59c8` §6, `83f5d17a8` §7,
+> `0dc22dc88` §8, `720536c47` §2+§5). Each Rust fix ships a regression test;
+> the crate passes `cargo fmt`, the strict `--lib --bins` and the
+> `--all-targets` clippy gates, and the full sensing unit + integration
+> suites. The Go fixes (§2, §5) are gofmt-clean and manually verified — the
+> Go binding's `.go` files are not built in CI (only the Rust `net-rpc-ffi`
+> shim is linted) and the CGO harness is not wired locally.
+
 Review of branch `sensing-interest-plan` against `master`: 57 files, +28.5k/−481.
 The change lands the SI (Sensing Interest Coalescing) subsystem — a new
 `adapter/net/behavior/sensing/` module tree, ~5.7k lines of `mesh.rs`
