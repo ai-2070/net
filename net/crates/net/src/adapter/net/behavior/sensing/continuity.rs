@@ -230,19 +230,50 @@ impl ObservationCell {
         if own_interval == self.own_interval {
             return;
         }
-        let promised = self
-            .observation
-            .as_ref()
-            .map(|obs| obs.promised_cadence)
-            .unwrap_or(Duration::ZERO);
-        let old_window = self.window(promised);
+        // The deadline is meaningless once Expired (the next beat
+        // rebuilds state) — just record the new interval.
+        if self.continuity == Continuity::Expired {
+            self.own_interval = own_interval;
+            return;
+        }
+        // Re-anchor against the window that ACTUALLY backs the current
+        // deadline (2026-07-15 review §7): the ESTABLISHMENT deadline
+        // (Unestablished) is `own D × factor` and ignores
+        // `promised_cadence` — there is no live stream to suspect yet,
+        // so `register`/generation-reset never fold the promised
+        // cadence in — while the SUSPICION deadline (Established) is
+        // the `k × max(promised, own)` continuity window. Using the
+        // Established window for BOTH left an Unestablished cell that
+        // had warm-started a beat whose `promised_cadence` exceeds
+        // own D with a deadline that failed to move on an interval
+        // change (the max term absorbed the delta).
+        let old_window = self.deadline_window(self.own_interval);
         self.own_interval = own_interval;
-        let new_window = self.window(promised);
-        if self.continuity != Continuity::Expired {
-            if new_window >= old_window {
-                self.deadline += new_window - old_window;
-            } else if let Some(deadline) = self.deadline.checked_sub(old_window - new_window) {
-                self.deadline = deadline;
+        let new_window = self.deadline_window(own_interval);
+        if new_window >= old_window {
+            self.deadline += new_window - old_window;
+        } else if let Some(deadline) = self.deadline.checked_sub(old_window - new_window) {
+            self.deadline = deadline;
+        }
+    }
+
+    /// The window backing the CURRENT deadline for a candidate own D.
+    /// Unestablished → the establishment deadline `own D × factor`
+    /// (the promised cadence is irrelevant before a live stream
+    /// exists); Established → the `k × max(promised, own)` suspicion
+    /// window. Meaningless once Expired (unused there).
+    fn deadline_window(&self, own_interval: Duration) -> Duration {
+        match self.continuity {
+            Continuity::Established => {
+                let promised = self
+                    .observation
+                    .as_ref()
+                    .map(|obs| obs.promised_cadence)
+                    .unwrap_or(Duration::ZERO);
+                promised.max(own_interval).saturating_mul(self.factor)
+            }
+            Continuity::Unestablished | Continuity::Expired => {
+                own_interval.saturating_mul(self.factor)
             }
         }
     }
@@ -412,6 +443,44 @@ mod tests {
         );
         cell.expire_if_due(t1 + Duration::from_millis(1201));
         assert_eq!(cell.continuity(), Continuity::Expired);
+    }
+
+    #[test]
+    fn interval_update_reanchors_an_unestablished_deadline_by_own_d_not_promised() {
+        // 2026-07-15 review §7: the ESTABLISHMENT deadline is
+        // own D × factor and ignores promised_cadence (there is no
+        // live stream to suspect yet). A warm-start beat can carry a
+        // promised_cadence far LARGER than own D; an interval change
+        // must still re-anchor the establishment deadline by the own-D
+        // window delta, not the max(promised, own) window — otherwise
+        // the max term absorbs the delta and the deadline never moves.
+        let t0 = Instant::now();
+        // own D = 100 ms, factor 3 → establishment deadline t0 + 300 ms.
+        let mut cell = ObservationCell::register(t0, D, K);
+        // A warm-start (non-bearing) beat with a promised cadence far
+        // above own D: updates content only — still Unestablished, and
+        // the establishment deadline stays t0 + 300 ms.
+        let mut warm = beat(1, AttestedStatus::NotReady, false);
+        warm.promised_cadence = Duration::from_secs(1);
+        cell.on_admitted_beat(t0, warm);
+        assert_eq!(cell.continuity(), Continuity::Unestablished);
+
+        // Loosen own D to 200 ms → the establishment deadline must move
+        // to t0 + 200 × 3 = 600 ms (own D drives it), NOT stay at
+        // 300 ms as it would if the 1 s promised cadence dominated.
+        cell.update_interval(Duration::from_millis(200));
+        cell.expire_if_due(t0 + Duration::from_millis(599));
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Unestablished,
+            "the loosened establishment deadline has not fired yet",
+        );
+        cell.expire_if_due(t0 + Duration::from_millis(600));
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Expired,
+            "the establishment deadline re-anchored to own D × factor",
+        );
     }
 
     #[test]
