@@ -2753,21 +2753,6 @@ const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
 /// convergence under a cascade storm — never a correctness loss.
 const MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES: usize = 64;
 
-/// RT-5 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): flood a
-/// poison-reverse [`RouteWithdrawal`] — "`dest` is unreachable via
-/// ME" — to every connected peer except `dest` itself and
-/// `exclude` (split horizon toward the peer we learned the loss
-/// from). Free function so the failure-detector `on_failure`
-/// closure (which runs before `Self` exists in `MeshNode::new`) and
-/// the dispatch-path cascade share one implementation.
-///
-/// The caller only snapshots the target peers' `(addr, session)`
-/// pairs synchronously (cheap `Arc` clones); the per-peer AEAD
-/// packet build AND the sends both run on the spawned task, so a
-/// sync caller — the failure-detector callback or the dispatch-path
-/// cascade on the single receive loop — never blocks on encryption
-/// or socket I/O (RT-5 review Finding 4; mirrors
-/// `forward_capability_announcement`, which also builds in-task).
 /// Damper admission for one route-withdrawal flood, keyed by
 /// `(dest, exclude)`.
 ///
@@ -2802,17 +2787,31 @@ fn route_withdraw_damp_admit(
     fresh
 }
 
-fn spawn_route_withdrawal_flood(
-    seq_counter: &Arc<AtomicU64>,
-    damper: &Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
-    socket: &Arc<NetSocket>,
-    peers: &Arc<DashMap<u64, PeerInfo>>,
-    partition_filter: &PartitionFilter,
+/// RT-5 (REALTIME_ROUTING_AND_DISCOVERY_PLAN): flood a poison-reverse
+/// [`RouteWithdrawal`] — "`dest` is unreachable via ME" — to every
+/// connected peer except `dest` itself and `exclude` (split horizon
+/// toward the peer we learned the loss from). Damper-gated on
+/// `(dest, exclude)`; a suppressed flood returns early.
+///
+/// Free `async` function so both entry points share one implementation:
+/// the failure-detector `on_failure` closure (which runs before `Self`
+/// exists in `MeshNode::new`) fires it via [`spawn_route_withdrawal_flood`]
+/// on a detached task, while the dispatch-path cascade `await`s it
+/// DIRECTLY inside its in-flight-capped task so the AEAD-build + send
+/// work is counted against the cap instead of escaping into an untracked
+/// child (RT-5 review P2). The target snapshot is taken synchronously
+/// (cheap `Arc` clones); only the per-peer build + send await.
+async fn run_route_withdrawal_flood(
+    seq_counter: Arc<AtomicU64>,
+    damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
+    socket: Arc<NetSocket>,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    partition_filter: PartitionFilter,
     dest: u64,
     exclude: Option<u64>,
 ) {
     let now = std::time::Instant::now();
-    if !route_withdraw_damp_admit(damper, (dest, exclude), now) {
+    if !route_withdraw_damp_admit(&damper, (dest, exclude), now) {
         return;
     }
     // Opportunistic bound: the damper only grows with distinct
@@ -2846,24 +2845,45 @@ fn spawn_route_withdrawal_flood(
     }
     .to_bytes();
     let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
-    let socket = socket.clone();
-    tokio::spawn(async move {
-        let events = [Bytes::copy_from_slice(&payload)];
-        for (addr, session) in targets {
-            let seq = session.get_or_create_stream(stream_id).next_tx_seq();
-            let packet = {
-                let mut builder = session.thread_local_pool().get();
-                builder.build_subprotocol(
-                    stream_id,
-                    seq,
-                    &events,
-                    PacketFlags::NONE,
-                    SUBPROTOCOL_ROUTE_WITHDRAW,
-                )
-            };
-            let _ = socket.send_to(&packet, addr).await;
-        }
-    });
+    let events = [Bytes::copy_from_slice(&payload)];
+    for (addr, session) in targets {
+        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let packet = {
+            let mut builder = session.thread_local_pool().get();
+            builder.build_subprotocol(
+                stream_id,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_ROUTE_WITHDRAW,
+            )
+        };
+        let _ = socket.send_to(&packet, addr).await;
+    }
+}
+
+/// Fire-and-forget wrapper over [`run_route_withdrawal_flood`] for sync
+/// callers — the failure-detector `on_failure` callback, which must not
+/// block on socket I/O. The cascade path awaits the flood directly (see
+/// that fn's note on the in-flight cap), so it does NOT use this.
+fn spawn_route_withdrawal_flood(
+    seq_counter: &Arc<AtomicU64>,
+    damper: &Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
+    socket: &Arc<NetSocket>,
+    peers: &Arc<DashMap<u64, PeerInfo>>,
+    partition_filter: &PartitionFilter,
+    dest: u64,
+    exclude: Option<u64>,
+) {
+    tokio::spawn(run_route_withdrawal_flood(
+        seq_counter.clone(),
+        damper.clone(),
+        socket.clone(),
+        peers.clone(),
+        partition_filter.clone(),
+        dest,
+        exclude,
+    ));
 }
 
 /// SI-2a: minimum gap between upstream sensing-interest updates for
@@ -12847,16 +12867,21 @@ impl MeshNode {
             if !promoted {
                 // No alternate: cascade our own withdrawal so upstream
                 // nodes stop routing through us. Split horizon: never
-                // back toward the peer that told us.
-                spawn_route_withdrawal_flood(
-                    &route_withdraw_seq,
-                    &route_withdraw_damper,
-                    &socket,
-                    &peers,
-                    &partition_filter,
+                // back toward the peer that told us. AWAITED here (not
+                // spawned) so the flood's build+send work is held under
+                // this task's in-flight permit — a spawned child would
+                // decrement the counter immediately and let unbounded
+                // per-dest floods escape the cap (RT-5 review P2).
+                run_route_withdrawal_flood(
+                    route_withdraw_seq,
+                    route_withdraw_damper,
+                    socket,
+                    peers,
+                    partition_filter,
                     dest,
                     Some(from_node),
-                );
+                )
+                .await;
             }
             inflight.fetch_sub(1, Ordering::AcqRel);
         });
