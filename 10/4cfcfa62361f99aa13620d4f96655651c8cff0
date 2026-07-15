@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md
+  s_c28bdf38c0df3a::t_bdd06c0ed512e4 1-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "104cfcfa62361f99aa13620d4f96655651c8cff0",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
