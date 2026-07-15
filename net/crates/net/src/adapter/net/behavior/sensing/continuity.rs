@@ -456,6 +456,49 @@ mod tests {
     }
 
     #[test]
+    fn live_beat_under_a_new_generation_establishes_immediately() {
+        // A generation change resets a WARM-START to Unestablished
+        // (covered by `generation_change_starts_a_fresh_observation`)
+        // — but a CONTINUITY-BEARING beat is live evidence of a
+        // stream under the new generation, so it establishes at once,
+        // exactly like a live beat crossing an incarnation. The
+        // continuity_bearing branch is checked FIRST by design: a
+        // live beat IS the establishment, never "wait for the next
+        // one." (Guards against turning generation-crossing into a
+        // spurious Unknown gap on live streams.)
+        let t0 = Instant::now();
+        let mut cell = ObservationCell::register(t0, D, K);
+        cell.on_admitted_beat(t0, beat(10, AttestedStatus::Ready, true));
+        assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+
+        // Live (bearing) Ready under a NEW generation: establishes
+        // immediately, projects Ready, no disruption recorded.
+        let mut live_regen = beat(11, AttestedStatus::Ready, true);
+        live_regen.capability_generation = 5;
+        cell.on_admitted_beat(t0 + D, live_regen);
+        assert_eq!(
+            cell.continuity(),
+            Continuity::Established,
+            "a live beat under the new generation IS the establishment",
+        );
+        assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+        assert_eq!(cell.last_disrupt(), None);
+        assert_eq!(
+            cell.observation().unwrap().capability_generation,
+            5,
+            "the observation tracks the new generation",
+        );
+
+        // The re-armed suspicion deadline runs from this live beat
+        // (promised_cadence == D == 100 ms → window 300 ms), not from
+        // the old generation's beat.
+        cell.expire_if_due(t0 + D + Duration::from_millis(299));
+        assert_eq!(cell.projected(), ProjectedReadiness::Ready);
+        cell.expire_if_due(t0 + D + Duration::from_millis(300));
+        assert_eq!(cell.projected(), ProjectedReadiness::Unknown);
+    }
+
+    #[test]
     fn projection_table_is_pinned_exactly() {
         use AttestedStatus::*;
         use Continuity::*;
