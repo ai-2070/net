@@ -115,24 +115,43 @@ one process serialize like two processes. Consequences:
     `NET_PAY_BENCH_STATE_TMPFS=1` to assert memory-backed). We **never**
     infer memory-backed from a path; `temp_dir()` is **not** assumed tmpfs
     (on macOS it is not).
-  - Every row reports: absolute state path, memory-backed (y/n as
-    asserted), filesystem type where cheaply available, **state bytes
-    before** and **after** the measured op.
+  - **Memory-backing is tri-state, and we only ever *assert*, never infer.**
+    The row prints `memory-backed: asserted` or `memory-backed: not
+    asserted` — the latter means only that no assertion was made, **not**
+    that the path is proven disk-backed. `NET_PAY_BENCH_STATE_TMPFS=1`
+    supplied *without* `NET_PAY_BENCH_STATE_DIR` **fails the run loudly**
+    (we refuse to assert memory-backed for the default OS temp dir).
+  - `state_bytes()` returns 0 **only** for a NotFound file (first-run);
+    permission / metadata errors **fail the bench**, never masquerade as
+    empty state.
+  - Every row reports: absolute state path, the memory-backing assertion,
+    **records before / after**, and **state bytes before / after** the
+    measured op.
 - **D2 — Headline = boundary 2 (accept + redeem).** Boundary 1 (redeem
   alone) is reported separately as "ready-settled invocation gate
   overhead." (The v0.1 "redeem = headline" is withdrawn.)
-- **D3 — Harness split (modified): custom hdrhistogram harness for ALL
-  stateful cases**, criterion only for stateless/repeatable ones.
-  - *Custom harness (stateful, single-use, fixed cardinality):*
-    `accept_payment` success, `redeem` success, both duplicate storms, the
-    paid-invocation delta, spend contention.
-  - *Criterion (stateless / repeatable):* quote-integrity verify,
-    invalid-signature rejection, canonical decode, unknown-quote redemption
-    denial, expired-quote rejection.
+- **D3 — Harness split (corrected): every *public* result runs through the
+  custom hdrhistogram harness + `BenchMetadata::report`.** Criterion's output
+  is a bootstrap confidence interval (`[lo mid hi]`), **not** a per-op
+  p50/p95/p99, so it cannot satisfy the public-output contract. Criterion
+  stays only for *repeatable diagnostic* microbenchmarks.
+  - *Criterion diagnostics (reject before any state access):* bad signature,
+    payload mismatch, expired quote. (`benches/admission.rs`.)
+  - *Custom harness (everything published):* the accept + redeem totals
+    (boundary 2) and redeem-only (boundary 1), the **stateful** rejection
+    rows that touch or claim state — `verify rejected` (claims then releases),
+    `already served`, `replay`, `quote already paid` (all consult durable
+    state), `in-progress` (needs a concurrent active claim) — both duplicate
+    storms, the paid-invocation delta, and spend contention.
+  - **Even the three pre-state rejections are re-run through the custom
+    harness for the *published* matrix**, so all rows are directly
+    comparable; their Criterion bars remain as separate diagnostics.
+  - Note: an unknown-quote redemption is a *repeatable logical denial*, not
+    "stateless" — it loads + parses the durable store to look the id up
+    (post the write-amplification fix it no longer writes).
   - Rationale: successful accept/redeem consume persistent state and are
     single-use; they need fresh prepared inputs while **holding store
-    cardinality constant** — a protocol criterion's stateless `iter` loop
-    cannot express.
+    cardinality constant across the transition** — see the fixture protocol.
 
 ---
 
@@ -145,10 +164,24 @@ Payment operations are **stateful and single-use**; the nRPC suite's
   count.** If a bench mints one quote per measured invocation, then sample
   count → records in store → JSON parse/serialize/fsync cost, and the
   result becomes a function of how many samples were requested. Forbidden.
-- Each stateful row **prepares a fixed-cardinality store before timing**
-  and holds it across the timed batch. Successful redemption may flip an
-  existing `redeemed` field but must **not grow the record count**.
-- Cardinality cases: **1 / 100 / 1 000** (redemption, contention).
+- Each stateful row **prepares a fixed-cardinality baseline before timing**.
+  Two transition shapes, and they differ:
+  - **Redemption-only (boundary 1) holds cardinality constant** across the
+    batch: `1 000 → 1 000`. A redeem flips an existing `redeemed` field, adds
+    no record. But a *successful* redeem is single-use, so the baseline must
+    be **restored to an unredeemed state before every timed sample**
+    (`snapshot_state` / `restore_state`, outside the timer) — otherwise every
+    sample after the first is `AlreadyRedeemed`, a different code path.
+  - **Exact-proof acceptance (boundary 2) cannot hold cardinality constant**
+    — `accept_payment` **inserts** a new quote record. Its honest axis is a
+    *transition*: `0 → 1`, `99 → 100`, `999 → 1 000`. Every sample begins from
+    the same prepared baseline (restore the snapshot + author a fresh
+    quote/proof **outside** the timer), then times `accept_payment` +
+    `redeem_for_invocation`. Report `records before → after` and
+    `bytes before → after`; the v0.1 "held unchanged across the batch"
+    wording is valid for redemption cardinality, **not** for acceptance.
+- Cardinality cases: **1 / 100 / 1 000** (redemption, contention);
+  **0→1 / 99→100 / 999→1 000** (acceptance).
   **10 000** is an *explicitly slow, opt-in diagnostic* only, run after
   measuring setup cost — seeding it via 10 000 durable `check_and_reserve`
   calls is ~quadratic in bytes written. If 10 000 is strategically needed,
@@ -162,16 +195,21 @@ Payment operations are **stateful and single-use**; the nRPC suite's
 
 ## Metadata — every payment row reports
 
-sample count · warm-up count · concurrency · runtime worker count · store
-cardinality (records) · state bytes before/after · filesystem/path class +
-memory-backed · mock-facilitator delay · **binding-signature on/off** ·
-billing sink on/off.
+sample count · warm-up count · concurrency · runtime worker count · records
+before/after · state bytes before/after · state path · memory-backing
+assertion · mock-facilitator delay · **binding-signature on/off** · billing
+sink on/off · fixture-prep duration.
 
+- **One shared reporter, not per-phase formatting.** Every custom-harness
+  result is a `BenchMetadata` printed through `BenchMetadata::report` (the
+  struct + method live in `bench_common`). Later phases construct a
+  `BenchMetadata` and call `report`; they must not hand-format a subset.
 - **Binding signature is its own axis for redemption** — ed25519 verify is
   optional and changes the gate cost.
-- **Throughput is three numbers, not one:** attempts/s · admissions/s ·
-  successful-unique-payments/s. (A duplicate storm yields high attempts/s
-  but one admission — reporting a single "throughput" would lie.)
+- **Throughput is three explicit fields, not one** (`Throughput {
+  attempts_per_s, admissions_per_s, unique_payments_per_s }`). Ordinary
+  successful rows have all three equal; a duplicate storm yields high
+  attempts/s but one admission — a single "throughput" would lie.
 
 ---
 
@@ -179,23 +217,31 @@ billing sink on/off.
 
 ### B1 — `benches/admission.rs` — exact-proof admission + rejection matrix
 
-**Stateful (custom harness):** boundary-2 headline = `accept_payment`
-success **then** `redeem_for_invocation` admit, plus boundary-1 = redeem
-alone, at fixed store cardinality. Report **totals only** — acceptance
-total and redemption total. **No internal sub-cost breakdown** (see below).
+**Custom harness (the published rows):** boundary-2 headline =
+`accept_payment` success **then** `redeem_for_invocation` admit (the
+`0→1 / 99→100 / 999→1 000` acceptance transition, restore-per-sample), plus
+boundary-1 = redeem alone (cardinality held). Report **totals only** —
+acceptance total and redemption total. **No internal sub-cost breakdown**
+(see below).
 
-**Stateless (criterion), each a separate row with its own decision path:**
+**Rejection matrix — split by whether the row touches state**
+(`state?` = does the decision reach the durable store / facilitator):
 
-| case | input | expected |
-|---|---|---|
-| bad signature | corrupted provider sig on the quote | `Rejected{BadQuote}` — must **not** reach state file or facilitator (adversarial cost boundary) |
-| payload mismatch | payload accepts different requirements | `Rejected{PayloadMismatch}` |
-| verify rejected | mock facilitator returns invalid | `Rejected{VerifyRejected}` |
-| expired | `now ≥ expires + tolerance` | `Rejected{QuoteExpired}` |
-| already served | same quote + same completed payload | `Served` via `AlreadyServed` |
-| replay | same payload under a *different* quote | `Rejected{Replay}` |
-| quote already paid | same quote with a *different* payload | `Rejected{QuoteAlreadyPaid}` |
-| in-progress | concurrent duplicate while the first is active | `InProgress` |
+| case | input | expected | state? | harness |
+|---|---|---|---|---|
+| bad signature | corrupted provider sig on the quote | `Rejected{BadQuote}` — must **not** reach state file or facilitator (adversarial cost boundary) | pre-state | Criterion diag + custom (published) |
+| payload mismatch | payload accepts different requirements | `Rejected{PayloadMismatch}` | pre-state | Criterion diag + custom (published) |
+| expired | `now ≥ expires + tolerance` | `Rejected{QuoteExpired}` | pre-state | Criterion diag + custom (published) |
+| verify rejected | mock facilitator returns invalid | `Rejected{VerifyRejected}` | **claims then releases state** | custom |
+| already served | same quote + same completed payload | `Served` via `AlreadyServed` | **reads durable state** | custom |
+| replay | same payload under a *different* quote | `Rejected{Replay}` | **consults replay state** | custom |
+| quote already paid | same quote with a *different* payload | `Rejected{QuoteAlreadyPaid}` | **consults quote state** | custom |
+| in-progress | concurrent duplicate while the first is active | `InProgress` | **needs a concurrent active claim** | custom |
+
+Only the three **pre-state** rejections reject before any state access, so
+they alone are honest Criterion diagnostics; they are *also* re-run through
+the custom harness for the published matrix (all rows comparable). The other
+five touch or claim state and are custom-harness-only.
 
 **No sub-cost breakdown.** A bench is a separate crate and cannot time the
 internal claim RMW / completion RMW / billing construction / publish mark /
@@ -288,6 +334,7 @@ rail performance, never in a headline. This plan only documents the split.
 
   ```
   cargo bench -p net-payments --bench admission --no-run
+  cargo bench -p net-payments --bench redeem_matrix --no-run
   cargo bench -p net-payments --bench spend_contention --no-run
   cargo bench -p net-payments --features mesh --bench mesh_paid_invoke --no-run
   cargo bench -p net-payments --features mesh --bench mock_lifecycle --no-run
@@ -301,15 +348,27 @@ Kyra's #1 strategic priority — **capability propagation + scheduler
 reaction** — is **out of scope for this crate** (the `MESH_SCHEDULER_*` /
 event-bus workstream). It leads the strategic story but does not live here.
 
-- [ ] **P0 — Correct boundaries + state-placement labels.** This doc (v0.2).
-- [ ] **P1 — Harness, fixed-cardinality state fixtures, targeted CI
+- [x] **P0 — Correct boundaries + state-placement labels.** This doc (v0.2),
+      re-blessed. Architecture approved; no further design re-review needed.
+- [x] **P1 — Harness, fixed-cardinality state fixtures, targeted CI
       compilation.** `bench_common` (operational-primary state placement +
       labeling + bytes reporting + fixture builders), Cargo wiring, the
-      four `--no-run` CI gates, a stateless smoke bar so `cargo bench
-      --no-run` is green.
+      `--no-run` CI gates, a diagnostic smoke bar so `cargo bench --no-run`
+      is green.
+- [x] **P1.1 — Reporter + fixed-transition sampling corrections** (bounded,
+      post-narrow-review). Custom public-result reporter
+      (`BenchMetadata::report`); three explicit throughput fields
+      (`Throughput`); unified metadata; `snapshot_state` / `restore_state`
+      for single-use sampling; `record_count` + records-before/after;
+      tri-state memory-backing + fail-loud + `state_bytes` error handling;
+      corrected stateless/repeatable terminology; stale Cargo/plan comments
+      fixed. `redeem_matrix` migrated to the reporter. Not a design cycle —
+      an implementation-contract correction; P2 proceeds without re-routing.
 - [ ] **P2 — Acceptance + redemption totals + corrected rejection matrix.**
-      Boundary-2 headline and boundary-1 gate (totals only); the eight-row
-      stateless matrix.
+      Boundary-2 headline (accept `0→1/99→100/999→1 000` transition, restore-
+      per-sample) and boundary-1 gate (totals only); the rejection matrix,
+      published through the custom harness (three pre-state rows also kept as
+      Criterion diagnostics).
 - [ ] **P3 — Separate acceptance & redemption duplicate storms** (B4, B5).
 - [ ] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
 - [ ] **P5 — Spend contention at 0 / 100 / 1 000** (+ opt-in slow 10 000) (B7).

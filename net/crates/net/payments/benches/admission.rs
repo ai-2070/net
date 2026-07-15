@@ -1,29 +1,28 @@
-//! B1 — exact-proof provider admission (headline) + the rejection matrix,
-//! and B2/B4/B5 (ready-settled gate, duplicate storms) land here too.
+//! Admission diagnostics (Criterion) — two repeatable microbenchmarks that
+//! validate the non-mesh harness and give a quick crypto-vs-store signal.
 //!
-//! Boundaries (see `docs/plans/PAYMENTS_BENCHMARKS_PLAN.md`):
-//!   - boundary 2 (headline): quote+proof received → `accept_payment`
-//!     completes → `redeem_for_invocation` admits the handler. Zero-delay
-//!     mock facilitator, so what remains is the Net payment tax.
-//!   - boundary 1: `redeem_for_invocation` alone on a ready-settled quote —
-//!     "ready-settled invocation gate overhead."
+//! **These are diagnostics, not public results.** Criterion reports a
+//! bootstrap confidence interval, not a per-op p50/p95/p99, so it cannot
+//! satisfy the plan's public-output contract; every *published* payment
+//! number goes through the custom histogram harness + `BenchMetadata::report`
+//! (see `redeem_matrix.rs`). Criterion stays for repeatable diagnostics.
 //!
-//! Per decision D3, the *successful* accept/redeem totals and the duplicate
-//! storms are STATEFUL and single-use; they land on the custom hdrhistogram
-//! harness in P2/P3 (fresh inputs per sample, store cardinality held fixed).
-//!
-//! This P1 cut lands only the two *stateless, repeatable* smoke bars that
-//! validate the non-mesh harness end to end — one down each gate:
+//! Two bars, one down each gate:
 //!   - `reject_expired`      — `accept_payment` on an expired quote. The
 //!     quote signature is verified, then expiry rejects BEFORE any state
-//!     claim or facilitator call, so it is repeatable and bounded (payment
-//!     admission is an adversarial public surface — rejection stays cheap).
-//!   - `redeem_unknown_quote`— `redeem_for_invocation` for a quote id that
-//!     was never issued: a structured `Denied`, no mutation.
+//!     access or facilitator call — a genuine *pre-state* crypto diagnostic,
+//!     repeatable and bounded (payment admission is an adversarial public
+//!     surface; rejection stays cheap).
+//!   - `redeem_unknown_quote`— `redeem_for_invocation` for an id that was
+//!     never issued: a *repeatable logical denial*. It is NOT stateless — it
+//!     loads + parses the durable store to look the id up (finds nothing);
+//!     post the write-amplification fix it does not *write*. So it is
+//!     repeatable, but its cost is a store read, not pure logic.
 //!
-//! P2 adds the full eight-row rejection matrix (bad-sig / payload-mismatch /
-//! verify-rejected / expired / already-served / replay / quote-already-paid
-//! / in-progress) plus the boundary-1 and boundary-2 totals.
+//! The full, stateful admission story — the boundary-2 accept+redeem totals,
+//! the boundary-1 ready-settled gate, the eight-row rejection matrix, and the
+//! duplicate storms — lives on the custom harness (P2/P3), where store
+//! cardinality is held constant per sample via snapshot/restore.
 //!
 //! Run: cargo bench -p net-payments --bench admission
 
@@ -40,16 +39,16 @@ fn bench_admission(c: &mut Criterion) {
     let fx = build_engine();
 
     // An expired quote + its proof. accept_payment verifies the quote
-    // signature then rejects on expiry before claiming any state, so this
-    // never mutates the store and can be iterated freely.
+    // signature then rejects on expiry before any state access, so this
+    // never touches the store and can be iterated freely.
     let expired = issue(&fx, AMOUNT, NOW);
     let expired_proof = payload_for(&expired);
     let way_past = NOW + TTL_NS + 86_400_000_000_000; // a day past expiry + tolerance
 
-    let mut g = c.benchmark_group("admission_stateless");
+    let mut g = c.benchmark_group("admission_diagnostics");
     g.sample_size(50);
 
-    // Down the acceptance gate: a cheap, bounded rejection.
+    // Down the acceptance gate: a cheap, bounded, pre-state rejection.
     g.bench_function("reject_expired", |b| {
         b.to_async(&rt).iter(|| async {
             let d = fx
@@ -61,8 +60,9 @@ fn bench_admission(c: &mut Criterion) {
         });
     });
 
-    // Down the redemption gate: an unknown quote is a structured denial,
-    // not a panic — repeatable, no state consumed.
+    // Down the redemption gate: an unknown quote is a structured denial. It
+    // reads (loads + parses) the store but, post-fix, does not write — a
+    // repeatable logical denial.
     g.bench_function("redeem_unknown_quote", |b| {
         b.to_async(&rt).iter(|| async {
             let d = fx

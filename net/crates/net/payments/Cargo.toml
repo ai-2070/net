@@ -129,12 +129,12 @@ unsafe-dev-signer = ["dep:k256", "dep:sha3"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3"
-# Benchmark harness. `criterion` (async_tokio) drives the point-latency
-# benches (admission accept/redeem/rejections, mock lifecycle); the
-# concurrency / tail benches (paid-vs-unpaid, spend contention, the
-# duplicate storm) use a custom `hdrhistogram` loop for real p99 —
-# exactly the split the SDK's nRPC bench suite uses (nrpc_unary vs
-# nrpc_tail). Same criterion 0.8 as the core + sdk crates.
+# Benchmark harness. Every *public* payment result runs through the custom
+# `hdrhistogram` harness + `BenchMetadata::report` (per-op p50/p95/p99, three
+# throughputs, environment metadata) — a Criterion bootstrap confidence
+# interval is not a per-op percentile and cannot satisfy that contract.
+# `criterion` (async_tokio) stays for repeatable *diagnostic* microbenchmarks
+# only (the `admission` bars). Same criterion 0.8 as the core + sdk crates.
 criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 # The mesh e2e test builds real two-node meshes (MeshBuilder + typed
@@ -161,34 +161,36 @@ tracing-subscriber = "0.3"
 # See `docs/plans/PAYMENTS_BENCHMARKS_PLAN.md`.
 # ---------------------------------------------------------------------------
 
-# B1 + B5 — provider admission overhead + the duplicate-storm invariant.
-# The headline: how much latency Net adds when a proof is already available.
-# In-process, no mesh, no network — needs no extra features.
+# B1 exact-proof admission + B2 ready-settled redemption gate (+ B4/B5
+# duplicate storms). Criterion diagnostics live here; the stateful public
+# rows (accept/redeem totals, rejection matrix, storms) run on the custom
+# harness. In-process, no mesh, no network — needs no extra features.
 [[bench]]
 name = "admission"
 harness = false
 
 # Redemption-gate matrix (before/after the read-only-denial write-
 # amplification fix): redeem outcomes × store cardinality × concurrency.
+# Custom harness (public reporter).
 [[bench]]
 name = "redeem_matrix"
 harness = false
 
-# B3 — spend-policy contention: concurrent check_and_reserve against one
+# B7 — spend-policy contention: concurrent check_and_reserve against one
 # shared JSON store under the fs2 lock, across store history sizes.
 [[bench]]
 name = "spend_contention"
 harness = false
 
-# B2 — paid vs unpaid nRPC over a warm two-node mesh at c1/16/128. The
-# mesh wire (serve_payments / MeshPaymentChannel / serve_tool_paid) is
-# behind the `mesh` feature.
+# B3 — paid vs unpaid nRPC over a warm two-node mesh at c1/16/128, apples-
+# to-apples (serve_tool vs serve_tool_paid). The mesh wire (serve_payments /
+# MeshPaymentChannel / serve_tool_paid) is behind the `mesh` feature.
 [[bench]]
 name = "mesh_paid_invoke"
 harness = false
 required-features = ["mesh"]
 
-# B4 — full in-process + mesh mock lifecycle (software path, not x402/chain).
+# B6 — full in-process + mesh mock lifecycle (software path, not x402/chain).
 [[bench]]
 name = "mock_lifecycle"
 harness = false

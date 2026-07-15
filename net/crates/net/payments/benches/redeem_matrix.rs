@@ -1,20 +1,17 @@
 //! Redemption-gate matrix — the before/after baseline for the read-only-
 //! denial write-amplification finding.
 //!
-//! The `admission` smoke bar exposed it: `redeem_unknown_quote` costs ~5 ms
-//! against ~44 µs for a pure-crypto rejection, because `redeem_for_invocation`
-//! runs `mutate_json` (`policy/store.rs`), which **always** serializes +
-//! fsyncs + renames the whole state file — even when the closure only reads
-//! (every `Denied{..}` branch; `engine/mod.rs:1500-1567`). Only the
-//! `Admitted` branch (`mod.rs:1568`) actually mutates. So a caller who can
-//! guess/spray quote ids forces a global-lock + whole-file-fsync per attempt:
-//! write amplification and a denial-of-service surface.
+//! The `admission` diagnostics exposed it: `redeem_unknown_quote` cost ~5 ms
+//! (host-dependent) against ~44 µs for a pure-crypto rejection, because
+//! `redeem_for_invocation` ran `mutate_json`, which serialized + fsync'd +
+//! renamed the whole state file even for read-only `Denied{..}` outcomes.
+//! Fixed by `mutate_json_if_changed` (denials no longer write); see
+//! `docs/performance/payments-redeem-write-amplification.md`.
 //!
-//! This bench captures the *before* state (run it, preserve the numbers),
-//! then the same rows are rerun after the `mutate_json_if_changed` fix. It
-//! is a custom hdrhistogram harness because successful admission is stateful
-//! and single-use, and store cardinality is a controlled axis, not a side
-//! effect of sample count (decision D3 + the fixture protocol in the plan).
+//! Custom hdrhistogram harness (successful admission is stateful and
+//! single-use; store cardinality is a controlled axis), reporting through
+//! the shared `BenchMetadata::report` so every row carries p50/p95/p99, the
+//! three throughputs, and full environment metadata.
 //!
 //! Rows (per cardinality × concurrency):
 //!   - `unknown`          — earliest-exit denial (id not in the store)
@@ -42,7 +39,9 @@ use tokio::sync::Semaphore;
 #[path = "bench_common/mod.rs"]
 mod bench_common;
 
-use bench_common::{build_engine, mint_n_settled, new_hist, print_header, print_row, runtime, TOOL_ID};
+use bench_common::{
+    build_engine, mint_n_settled, new_hist, runtime, BenchMetadata, Throughput, TOOL_ID,
+};
 
 const CARDINALITIES: &[u64] = &[1, 100, 1000];
 const CONCURRENCY: &[usize] = &[1, 16, 128];
@@ -57,8 +56,8 @@ fn denial_samples() -> usize {
 }
 
 /// Redeem `targets.len()` times at concurrency `conc`, recording per-call
-/// latency. Returns the histogram, throughput (attempts/s), and the number
-/// of `Admitted` outcomes (0 for a denial row; == n for `valid_admitted`).
+/// latency. Returns the histogram, attempts/s, and the number of `Admitted`
+/// outcomes (0 for a denial row; == n for `valid_admitted`).
 async fn run_cell(
     engine: Arc<PaymentEngine>,
     tool: String,
@@ -106,28 +105,24 @@ fn main() {
     let denial_n = denial_samples();
 
     println!("redeem_matrix — denial_samples={denial_n}, valid_concurrency={VALID_CONCURRENCY}, tool={TOOL_ID}");
-    println!("throughput is attempts/s (denials admit 0; valid_admitted admits every fresh quote once)");
 
     for &card in CARDINALITIES {
-        // Fresh engine seeded to a FIXED cardinality of `card` settled
-        // quotes (the store history that every row below measures against).
+        // Fresh engine seeded to a FIXED cardinality of `card` settled quotes
+        // (timed, outside the measured region → fixture_prep).
+        let seed_start = Instant::now();
         let (fx, quotes) = rt.block_on(async {
             let fx = build_engine();
             let quotes = mint_n_settled(&fx, card).await;
             (fx, quotes)
         });
+        let fixture_prep = seed_start.elapsed();
         let engine = Arc::clone(&fx.engine);
-        let bytes_seeded = fx.state_bytes();
+        let base = BenchMetadata::base(&fx, fixture_prep);
 
-        println!(
-            "\n== cardinality {card} · state_bytes(seeded)={bytes_seeded} · placement={} ==",
-            fx.placement_label()
-        );
-        print_header("");
+        println!("\n== cardinality {card} ==");
 
         // Consume quotes[0] once, OUTSIDE timing, as the already-redeemed
-        // victim. Denials never consume state, so quotes[1..] stay fresh for
-        // valid_admitted.
+        // victim. Denials never consume state, so quotes[1..] stay fresh.
         let victim = quotes[0].quote_id.clone();
         let consumed = rt.block_on(engine.redeem_for_invocation(TOOL_ID, &victim, None));
         assert!(
@@ -140,7 +135,8 @@ fn main() {
             let targets = Arc::new(vec!["no-such-quote".to_string(); denial_n]);
             let (h, tput, _) =
                 rt.block_on(run_cell(engine.clone(), TOOL_ID.into(), targets, None, conc));
-            print_row(&format!("unknown c{conc}"), &h, tput);
+            base.for_row(format!("unknown c{conc}"), denial_n, conc, false, &fx)
+                .report(&h, &Throughput::denial(tput));
 
             // wrong_tool — settled quote redeemed for a different tool.
             let targets = Arc::new(
@@ -150,9 +146,10 @@ fn main() {
             );
             let (h, tput, _) =
                 rt.block_on(run_cell(engine.clone(), "other-tool".into(), targets, None, conc));
-            print_row(&format!("wrong_tool c{conc}"), &h, tput);
+            base.for_row(format!("wrong_tool c{conc}"), denial_n, conc, false, &fx)
+                .report(&h, &Throughput::denial(tput));
 
-            // invalid_binding — settled quote, malformed-but-64-byte sig.
+            // invalid_binding — settled quote, 64-byte sig that won't verify.
             let targets = Arc::new(
                 (0..denial_n)
                     .map(|i| quotes[i % quotes.len()].quote_id.clone())
@@ -165,18 +162,20 @@ fn main() {
                 Some(vec![0u8; 64]),
                 conc,
             ));
-            print_row(&format!("invalid_binding c{conc}"), &h, tput);
+            base.for_row(format!("invalid_binding c{conc}"), denial_n, conc, true, &fx)
+                .report(&h, &Throughput::denial(tput));
 
             // already_redeemed — the consumed victim, redeemed again.
             let targets = Arc::new(vec![victim.clone(); denial_n]);
             let (h, tput, _) =
                 rt.block_on(run_cell(engine.clone(), TOOL_ID.into(), targets, None, conc));
-            print_row(&format!("already_redeemed c{conc}"), &h, tput);
+            base.for_row(format!("already_redeemed c{conc}"), denial_n, conc, false, &fx)
+                .report(&h, &Throughput::denial(tput));
         }
 
         // valid_admitted — the fresh quotes[1..], each redeemed exactly once
-        // (single-use), at a representative concurrency. This is the honest
-        // durable write that the fix must leave ~unchanged.
+        // (single-use). The honest durable write the fix must leave alone.
+        // Records stay at `card` (redeem flips a flag, adds no record).
         let fresh: Vec<String> = quotes[1..].iter().map(|q| q.quote_id.clone()).collect();
         if fresh.is_empty() {
             println!("  valid_admitted: skipped (no fresh quotes at cardinality {card})");
@@ -190,9 +189,14 @@ fn main() {
                 VALID_CONCURRENCY,
             ));
             assert_eq!(admits, n, "valid_admitted must admit every fresh quote once");
-            print_row(&format!("valid_admitted c{VALID_CONCURRENCY} (n={n})"), &h, tput);
+            base.for_row(
+                format!("valid_admitted c{VALID_CONCURRENCY} (n={n})"),
+                n,
+                VALID_CONCURRENCY,
+                false,
+                &fx,
+            )
+            .report(&h, &Throughput::uniform(tput));
         }
-
-        println!("  state_bytes(final)={}", fx.state_bytes());
     }
 }
