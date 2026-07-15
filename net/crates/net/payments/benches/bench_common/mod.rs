@@ -40,7 +40,7 @@ use net_payments::core::quote::PaymentQuote;
 use net_payments::core::registry::{default_mock_registry, AssetRegistry};
 use net_payments::core::verification::VerificationTier;
 use net_payments::engine::{AdmitAll, PaymentDecision, PaymentEngine};
-use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+use net_payments::facilitator::mock::{MockFacilitator, MockMode, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::x402::payload::PaymentPayload;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
@@ -224,9 +224,17 @@ impl EngineFixture {
     }
 }
 
-/// Build a fresh engine over its own state file. Cheap enough to call once
-/// per bench — never inside a timed loop (it does filesystem + keygen work).
+/// Build a fresh engine over its own state file, with the mock facilitator
+/// in `Success` mode. Cheap enough to call once per bench — never inside a
+/// timed loop (it does filesystem + keygen work).
 pub fn build_engine() -> EngineFixture {
+    build_engine_with_mode(MockMode::Success)
+}
+
+/// As [`build_engine`], but the mock facilitator runs in `mode` — e.g.
+/// `MockMode::WrongAmount` makes `verify` return invalid, so `accept_payment`
+/// rejects with `VerifyRejected` (the rejection-matrix `verify_rejected` row).
+pub fn build_engine_with_mode(mode: MockMode) -> EngineFixture {
     let provider = Arc::new(EntityKeypair::generate());
     let caller = EntityKeypair::generate();
     let registry = default_mock_registry(provider.entity_id().clone());
@@ -235,7 +243,7 @@ pub fn build_engine() -> EngineFixture {
     let engine = Arc::new(
         PaymentEngine::new(
             provider.clone(),
-            Arc::new(MockFacilitator::new()),
+            Arc::new(MockFacilitator::new().with_default_mode(mode)),
             Arc::new(AdmitAll),
             registry.clone(),
             state_file.clone(),
@@ -285,19 +293,28 @@ pub fn issue(fx: &EngineFixture, amount: &str, issued_ns: u64) -> PaymentQuote {
         .expect("issue_quote")
 }
 
-/// Author the payment proof for `quote`. The authorization nonce is the
-/// quote id, so each distinct quote gets a distinct replay key (no
-/// cross-quote replay), while re-authoring the SAME quote reproduces the
-/// SAME proof — exactly the duplicate-storm input.
-pub fn payload_for(quote: &PaymentQuote) -> X402Carry<PaymentPayload> {
+/// Author the payment proof for `quote` with an explicit authorization
+/// `nonce`. The replay key is a hash of the canonical payload bytes, so the
+/// nonce controls replay identity: a shared fixed nonce across two distinct
+/// quotes (with identical requirements) yields the SAME replay key — the
+/// input for the `replay` rejection row.
+pub fn payload_with_nonce(quote: &PaymentQuote, nonce: &str) -> X402Carry<PaymentPayload> {
     X402Carry::author(&PaymentPayload {
         x402_version: 2,
         resource: None,
         accepted: quote.requirements.view().clone(),
-        payload: serde_json::json!({ "mock_authorization": quote.quote_id }),
+        payload: serde_json::json!({ "mock_authorization": nonce }),
         extensions: None,
     })
     .expect("author payload")
+}
+
+/// Author the payment proof for `quote` with the quote id as the nonce, so
+/// each distinct quote gets a distinct replay key (no cross-quote replay),
+/// while re-authoring the SAME quote reproduces the SAME proof — the
+/// duplicate-storm input.
+pub fn payload_for(quote: &PaymentQuote) -> X402Carry<PaymentPayload> {
+    payload_with_nonce(quote, &quote.quote_id)
 }
 
 /// Issue a quote and settle it through `accept_payment` (mock verify +

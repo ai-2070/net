@@ -364,11 +364,16 @@ event-bus workstream). It leads the strategic story but does not live here.
       corrected stateless/repeatable terminology; stale Cargo/plan comments
       fixed. `redeem_matrix` migrated to the reporter. Not a design cycle —
       an implementation-contract correction; P2 proceeds without re-routing.
-- [ ] **P2 — Acceptance + redemption totals + corrected rejection matrix.**
-      Boundary-2 headline (accept `0→1/99→100/999→1 000` transition, restore-
-      per-sample) and boundary-1 gate (totals only); the rejection matrix,
-      published through the custom harness (three pre-state rows also kept as
-      Criterion diagnostics).
+- [x] **P2 — Acceptance + redemption totals + corrected rejection matrix.**
+      `benches/admission_matrix.rs`: boundary-2 headline (accept `0→1/99→100/
+      999→1 000` transition, restore-per-sample) + boundary-1 gate; the
+      rejection matrix on the custom harness (pre-state rows also kept as
+      Criterion diagnostics in `admission.rs`). Baseline in
+      `docs/performance/payments-admission-matrix.md`. Finding: acceptance
+      persistence (several whole-file writes) + whole-file growth is the
+      high-volume ceiling — ~15 ms (empty) → ~55 ms (1 000 records); the
+      storage move is to stop re-serializing the whole store per write, not
+      more incremental locking.
 - [ ] **P3 — Separate acceptance & redemption duplicate storms** (B4, B5).
 - [ ] **P4 — Equivalent paid-tool vs unpaid-tool mesh delta** (B3).
 - [ ] **P5 — Spend contention at 0 / 100 / 1 000** (+ opt-in slow 10 000) (B7).

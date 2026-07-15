@@ -549,6 +549,7 @@ jobs:
         working-directory: net/crates/net/payments
         run: |
           cargo bench --bench admission --no-run
+          cargo bench --bench admission_matrix --no-run
           cargo bench --bench redeem_matrix --no-run
           cargo bench --bench spend_contention --no-run
           cargo bench --features mesh --bench mesh_paid_invoke --no-run

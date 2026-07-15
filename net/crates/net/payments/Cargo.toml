@@ -169,6 +169,13 @@ tracing-subscriber = "0.3"
 name = "admission"
 harness = false
 
+# P2 — the published admission matrix (custom harness): boundary 2 (accept +
+# redeem, the 0→1/99→100/999→1000 transition), boundary 1 (ready-settled
+# redemption), and the accept_payment rejection matrix. Concurrency 1.
+[[bench]]
+name = "admission_matrix"
+harness = false
+
 # Redemption-gate matrix (before/after the read-only-denial write-
 # amplification fix): redeem outcomes × store cardinality × concurrency.
 # Custom harness (public reporter).
