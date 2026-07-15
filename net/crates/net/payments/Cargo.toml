@@ -2,6 +2,11 @@
 name = "net-payments"
 version = "0.33.0"
 edition = "2021"
+# Benches are registered explicitly with `[[bench]]` (see the bottom of
+# this file). `autobenches = false` keeps Cargo from auto-discovering
+# `benches/*.rs`, so the shared `benches/bench_common/` harness directory
+# is never mistaken for a bench target — the same regime as `sdk/Cargo.toml`.
+autobenches = false
 description = "x402-native payments layer for the Net mesh: signed envelopes around x402 v2, tiered verification, spend policy, billing events"
 license = "Apache-2.0"
 repository = "https://github.com/ai-2070/net"
@@ -124,6 +129,14 @@ unsafe-dev-signer = ["dep:k256", "dep:sha3"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3"
+# Benchmark harness. `criterion` (async_tokio) drives the point-latency
+# benches (admission accept/redeem/rejections, mock lifecycle); the
+# concurrency / tail benches (paid-vs-unpaid, spend contention, the
+# duplicate storm) use a custom `hdrhistogram` loop for real p99 —
+# exactly the split the SDK's nRPC bench suite uses (nrpc_unary vs
+# nrpc_tail). Same criterion 0.8 as the core + sdk crates.
+criterion = { version = "0.8", features = ["async_tokio"] }
+hdrhistogram = "7"
 # The mesh e2e test builds real two-node meshes (MeshBuilder + typed
 # nRPC); tests can't reach transitive deps, so the SDK appears here
 # with the transport features on. `tool` powers the mega-e2e's
@@ -140,3 +153,37 @@ bytes = "1"
 # structured `tracing` fields (`reason` / `stage` / `recovery_class`) by
 # key+value, so operators' grep contract is a test, not a hope.
 tracing-subscriber = "0.3"
+
+# ---------------------------------------------------------------------------
+# Benchmarks. All `harness = false` — each bench owns its `main` (criterion
+# or a custom hdrhistogram loop). The shared setup lives in the
+# `benches/bench_common/` directory (not a bench target; see `autobenches`).
+# See `docs/plans/PAYMENTS_BENCHMARKS_PLAN.md`.
+# ---------------------------------------------------------------------------
+
+# B1 + B5 — provider admission overhead + the duplicate-storm invariant.
+# The headline: how much latency Net adds when a proof is already available.
+# In-process, no mesh, no network — needs no extra features.
+[[bench]]
+name = "admission"
+harness = false
+
+# B3 — spend-policy contention: concurrent check_and_reserve against one
+# shared JSON store under the fs2 lock, across store history sizes.
+[[bench]]
+name = "spend_contention"
+harness = false
+
+# B2 — paid vs unpaid nRPC over a warm two-node mesh at c1/16/128. The
+# mesh wire (serve_payments / MeshPaymentChannel / serve_tool_paid) is
+# behind the `mesh` feature.
+[[bench]]
+name = "mesh_paid_invoke"
+harness = false
+required-features = ["mesh"]
+
+# B4 — full in-process + mesh mock lifecycle (software path, not x402/chain).
+[[bench]]
+name = "mock_lifecycle"
+harness = false
+required-features = ["mesh"]

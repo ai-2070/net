@@ -540,6 +540,19 @@ jobs:
         working-directory: net/crates/net/payments
         run: cargo test --all-features
 
+      # net-payments benchmark-rot gate: compile (do not run) every bench so
+      # a harness/API drift breaks CI, not the next person to run numbers.
+      # See docs/plans/PAYMENTS_BENCHMARKS_PLAN.md. Shares the cargo cache
+      # above; --no-run means no measurement, just typeck + link.
+      - name: Compile net-payments benches (--no-run)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          cargo bench --bench admission --no-run
+          cargo bench --bench spend_contention --no-run
+          cargo bench --features mesh --bench mesh_paid_invoke --no-run
+          cargo bench --features mesh --bench mock_lifecycle --no-run
+
   node-tests:
     name: Node bindings tests (vitest)
     runs-on: ubuntu-latest
