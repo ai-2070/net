@@ -51,7 +51,7 @@ use crate::core::verification::{
 };
 use crate::core::versioning::{TAG_BILLING_EVENT, TAG_PAYMENT_VERIFICATION};
 use crate::facilitator::{Facilitator, FacilitatorErrorKind};
-use crate::policy::store::{load_json, mutate_json, StoreError};
+use crate::policy::store::{load_json, mutate_json, mutate_json_if_changed, StoreError};
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::{X402Carry, X402Error};
@@ -505,54 +505,69 @@ impl PaymentEngine {
                 billing: None,
                 billing_published: false,
             };
-            mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
-                if let Some(rec) = s.quotes.get_mut(&quote_id) {
-                    if let Some(reason) = &rec.frozen {
-                        return Claim::Frozen(reason.clone());
-                    }
-                    if rec.payload_hash != payload_hash {
-                        return Claim::QuoteAlreadyPaid;
-                    }
-                    if let Some(billing) = &rec.billing {
-                        return Claim::AlreadyServed(
-                            Box::new(billing.clone()),
-                            last_verified_tier(&rec.chain),
-                            rec.billing_published,
-                        );
-                    }
-                    if rec.in_flight {
-                        // Completion is atomic (chain push + in_flight=false
-                        // in one commit), so an in_flight record has an
-                        // empty chain: a prior attempt claimed it and then
-                        // crashed (or is still running) before completing.
-                        // Reclaim only after the TTL, refreshing the clock
-                        // so a concurrent retry still sees InProgress and
-                        // only one attempt re-runs verify/settle.
-                        let stale = rec
-                            .in_flight_since_ns
-                            .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
-                            .unwrap_or(true);
-                        if !stale {
-                            return Claim::InProgress;
+            // Only the three `Claim::Fresh` paths mutate state (insert a new
+            // record, mark an existing record in_flight, or reclaim a stale
+            // in_flight); every other outcome is a read-only inspection.
+            // `mutate_json_if_changed` therefore skips the durable write on
+            // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
+            // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
+            // flag is `matches!(_, Fresh)`, derived from the SAME branch that
+            // mutated — so it can never diverge from the mutation. The later
+            // writes (completion, `release_claim`, billing republish) are
+            // separate calls and remain unconditional, so a `verify_rejected`
+            // still persists both its claim (a Fresh here) and its release.
+            mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+                let claim: Claim = 'claim: {
+                    if let Some(rec) = s.quotes.get_mut(&quote_id) {
+                        if let Some(reason) = &rec.frozen {
+                            break 'claim Claim::Frozen(reason.clone());
                         }
+                        if rec.payload_hash != payload_hash {
+                            break 'claim Claim::QuoteAlreadyPaid;
+                        }
+                        if let Some(billing) = &rec.billing {
+                            break 'claim Claim::AlreadyServed(
+                                Box::new(billing.clone()),
+                                last_verified_tier(&rec.chain),
+                                rec.billing_published,
+                            );
+                        }
+                        if rec.in_flight {
+                            // Completion is atomic (chain push + in_flight=false
+                            // in one commit), so an in_flight record has an
+                            // empty chain: a prior attempt claimed it and then
+                            // crashed (or is still running) before completing.
+                            // Reclaim only after the TTL, refreshing the clock
+                            // so a concurrent retry still sees InProgress and
+                            // only one attempt re-runs verify/settle.
+                            let stale = rec
+                                .in_flight_since_ns
+                                .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
+                                .unwrap_or(true);
+                            if !stale {
+                                break 'claim Claim::InProgress;
+                            }
+                            rec.in_flight_since_ns = Some(now_ns);
+                            break 'claim Claim::Fresh;
+                        }
+                        if !rec.chain.is_empty() {
+                            break 'claim Claim::AlreadySettled;
+                        }
+                        rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
-                        return Claim::Fresh;
+                        break 'claim Claim::Fresh;
                     }
-                    if !rec.chain.is_empty() {
-                        return Claim::AlreadySettled;
+                    if let Some(other) = s.consumed.get(&payload_hash) {
+                        if *other != quote_id {
+                            break 'claim Claim::ReplayOtherQuote;
+                        }
                     }
-                    rec.in_flight = true;
-                    rec.in_flight_since_ns = Some(now_ns);
-                    return Claim::Fresh;
-                }
-                if let Some(other) = s.consumed.get(&payload_hash) {
-                    if *other != quote_id {
-                        return Claim::ReplayOtherQuote;
-                    }
-                }
-                s.consumed.insert(payload_hash, quote_id.clone());
-                s.quotes.insert(quote_id.clone(), record);
-                Claim::Fresh
+                    s.consumed.insert(payload_hash, quote_id.clone());
+                    s.quotes.insert(quote_id.clone(), record);
+                    Claim::Fresh
+                };
+                let dirty = matches!(claim, Claim::Fresh);
+                (claim, dirty)
             })
             .await?
         };
@@ -1496,40 +1511,64 @@ impl PaymentEngine {
         let binding = binding.map(<[u8]>::to_vec);
         let tool_id = tool_id.to_string();
         let quote_id = quote_id.to_string();
-        let decision = mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
+        // Only the `Admitted` arm mutates state (`rec.redeemed = true`);
+        // every `Denied{..}` arm is read-only. `mutate_json_if_changed` skips
+        // the durable write (serialize + fsync + rename) on the read-only
+        // arms — closing the write-amplification / DoS surface where a caller
+        // could force one fsync per denied attempt — while keeping the
+        // check-and-set atomic under the same lock (at-most-once is
+        // unchanged). The `bool` in each returned tuple is `dirty`: it is
+        // `true` on exactly the one arm that mutated. See
+        // `docs/performance/payments-redeem-write-amplification.md`.
+        let decision = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
             let Some(rec) = s.quotes.get_mut(&quote_id) else {
-                return RedeemDecision::Denied {
-                    reason: RedeemDenialReason::UnknownQuote,
-                };
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::UnknownQuote,
+                    },
+                    false,
+                );
             };
             if let Some(sig) = &binding {
                 let Ok(sig_bytes) = <&[u8; 64]>::try_from(sig.as_slice()) else {
-                    return RedeemDecision::Denied {
-                        reason: RedeemDenialReason::BindingMalformed,
-                    };
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::BindingMalformed,
+                        },
+                        false,
+                    );
                 };
                 let payer = hex::decode(&rec.caller_hex)
                     .ok()
                     .and_then(|b| <[u8; 32]>::try_from(b).ok())
                     .map(EntityId::from_bytes);
                 let Some(payer) = payer else {
-                    return RedeemDecision::Denied {
-                        reason: RedeemDenialReason::PayerRecordCorrupt,
-                    };
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::PayerRecordCorrupt,
+                        },
+                        false,
+                    );
                 };
                 let transcript = invocation_binding_transcript(&quote_id, &tool_id);
                 if payer.verify_bytes(&transcript, sig_bytes).is_err() {
-                    return RedeemDecision::Denied {
-                        reason: RedeemDenialReason::BindingRejected,
-                    };
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::BindingRejected,
+                        },
+                        false,
+                    );
                 }
             }
             if let Some(reason) = &rec.frozen {
-                return RedeemDecision::Denied {
-                    reason: RedeemDenialReason::QuoteFrozen {
-                        freeze_reason: reason.clone(),
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::QuoteFrozen {
+                            freeze_reason: reason.clone(),
+                        },
                     },
-                };
+                    false,
+                );
             }
             if rec.billing.is_none() {
                 // "Never paid" and "paid, awaiting confidence" route
@@ -1542,7 +1581,7 @@ impl PaymentEngine {
                 } else {
                     RedeemDenialReason::SettlementPending
                 };
-                return RedeemDecision::Denied { reason };
+                return (RedeemDecision::Denied { reason }, false);
             }
             // The capability binds `provider/tool`; the tool segment is
             // everything after the first `/` (tool ids may themselves
@@ -1553,20 +1592,26 @@ impl PaymentEngine {
                 .map(|(_, tool)| tool)
                 .unwrap_or(rec.capability.as_str());
             if bound_tool != tool_id {
-                return RedeemDecision::Denied {
-                    reason: RedeemDenialReason::WrongToolBinding {
-                        capability: rec.capability.clone(),
-                        tool_id: tool_id.clone(),
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::WrongToolBinding {
+                            capability: rec.capability.clone(),
+                            tool_id: tool_id.clone(),
+                        },
                     },
-                };
+                    false,
+                );
             }
             if rec.redeemed {
-                return RedeemDecision::Denied {
-                    reason: RedeemDenialReason::AlreadyRedeemed,
-                };
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::AlreadyRedeemed,
+                    },
+                    false,
+                );
             }
             rec.redeemed = true;
-            RedeemDecision::Admitted
+            (RedeemDecision::Admitted, true)
         })
         .await?;
         Ok(decision)
