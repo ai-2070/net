@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/sensing/controller.rs
+  s_55e949a455a65a::t_43e2f8c87e7a94 215-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a3a7192c1802513aa340ab5aaa1f8c37fa3acb84",
+  "prompts": {},
+  "sessions": {
+    "s_55e949a455a65a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d43bc436-0ca9-4951-8c4a-7484aacbc488",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
