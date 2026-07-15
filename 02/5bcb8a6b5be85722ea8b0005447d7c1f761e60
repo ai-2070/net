@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.33_CIRCUS_MAXIMUS.md
+  s_194734e88f5f20::t_2cdc18bfafb0b4 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "025bcb8a6b5be85722ea8b0005447d7c1f761e60",
+  "prompts": {},
+  "sessions": {
+    "s_194734e88f5f20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b105284e-cf63-4195-a44b-3da9b5a80a29",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
