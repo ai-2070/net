@@ -3555,9 +3555,16 @@ fn sensing_effective_min_gap(soft_state_ttl: Duration) -> Duration {
 struct SensingFoldGate {
     /// When a reconciliation for this capability last RAN.
     last_run: std::time::Instant,
-    /// Whether a boundary run is already scheduled — further
-    /// in-window changes coalesce into it.
-    pending: bool,
+    /// Monotonic token source: each `Defer` mints the NEXT value as
+    /// the scheduled sleeper's ownership token (SI-6.1 re-review).
+    generation: u64,
+    /// The token of the boundary run currently scheduled, if any.
+    /// `None` = no sleeper owns a run (never scheduled, already run,
+    /// or subsumed by an out-of-window `RunNow`). A sleeper reclaims
+    /// ONLY when its captured token still matches — so a stale
+    /// sleeper from a superseded window cannot steal a newer
+    /// window's pending run.
+    pending: Option<u64>,
 }
 
 /// SI-6.1 closure: the three outcomes of one fold change hitting a
@@ -3567,8 +3574,10 @@ enum SensingFoldGateDecision {
     /// First change, or out of window: reconcile immediately.
     RunNow,
     /// In-window with nothing scheduled: the caller must schedule
-    /// exactly one fresh-snapshot reconciliation after `remaining`.
-    Defer { remaining: Duration },
+    /// exactly one fresh-snapshot reconciliation after `remaining`,
+    /// and pass `token` back to [`sensing_fold_gate_reclaim`] so the
+    /// run is bound to THIS window.
+    Defer { remaining: Duration, token: u64 },
     /// In-window with a boundary run already scheduled: this change
     /// coalesces into it (the boundary run's snapshot will see it).
     Coalesced,
@@ -3590,23 +3599,28 @@ fn sensing_fold_gate_admit(
                 gate.last_run = now;
                 // A still-sleeping boundary run is SUBSUMED by this
                 // fresh out-of-window run (scheduler jitter can hold
-                // a sleeper past its boundary): clearing `pending`
-                // makes the sleeper's reclaim find nothing to do —
-                // exactly-one stays exact.
-                gate.pending = false;
+                // a sleeper past its boundary): INVALIDATE its token
+                // so a delayed wake — even one that races a later
+                // window's `Defer` — reclaims nothing. Exactly-one
+                // stays exact across successive windows.
+                gate.pending = None;
                 decision = SensingFoldGateDecision::RunNow;
-            } else if gate.pending {
+            } else if gate.pending.is_some() {
                 decision = SensingFoldGateDecision::Coalesced;
             } else {
-                gate.pending = true;
+                gate.generation = gate.generation.wrapping_add(1);
+                let token = gate.generation;
+                gate.pending = Some(token);
                 decision = SensingFoldGateDecision::Defer {
                     remaining: min_gap - elapsed,
+                    token,
                 };
             }
         })
         .or_insert_with(|| SensingFoldGate {
             last_run: now,
-            pending: false,
+            generation: 0,
+            pending: None,
         });
     // Bounded like the registration damper: keys are capability ids
     // with live leader interests plus retired stragglers, swept
@@ -3614,26 +3628,30 @@ fn sensing_fold_gate_admit(
     // sleeper still owns a boundary run.
     if coalescer.len() > 4096 {
         coalescer.retain(|_, gate| {
-            gate.pending || now.saturating_duration_since(gate.last_run) < min_gap
+            gate.pending.is_some() || now.saturating_duration_since(gate.last_run) < min_gap
         });
     }
     decision
 }
 
 /// The boundary sleeper's claim on its scheduled run: exactly ONE
-/// trailing reconciliation per window. Returns whether this sleeper
-/// still owns a pending run — a fresh out-of-window change may have
-/// subsumed it (`RunNow` clears `pending`).
+/// trailing reconciliation per window. Returns whether THIS sleeper
+/// — identified by the `token` it captured at `Defer` time — still
+/// owns its pending run. It does not when the run was subsumed by an
+/// out-of-window `RunNow` (token invalidated) OR a later window has
+/// since minted a fresh token (`pending == Some(newer)` ≠ this
+/// sleeper's `token`) — the SI-6.1 re-review stale-sleeper race.
 #[cfg(feature = "redex")]
 fn sensing_fold_gate_reclaim(
     coalescer: &DashMap<[u8; 32], SensingFoldGate>,
     digest: &[u8; 32],
+    token: u64,
 ) -> bool {
     coalescer
         .get_mut(digest)
         .map(|mut gate| {
-            if gate.pending {
-                gate.pending = false;
+            if gate.pending == Some(token) {
+                gate.pending = None;
                 gate.last_run = std::time::Instant::now();
                 true
             } else {
@@ -14282,14 +14300,21 @@ impl MeshNode {
                 SensingFoldGateDecision::RunNow => {
                     moved |= Self::reconcile_sensing_leader_fold_one(ctx, &capability_id, now);
                 }
-                SensingFoldGateDecision::Defer { remaining } => {
+                SensingFoldGateDecision::Defer { remaining, token } => {
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(remaining).await;
-                        // Exactly one boundary run: a fresh
-                        // out-of-window change may have subsumed
-                        // this sleeper while it slept.
-                        if !sensing_fold_gate_reclaim(&ctx.sensing_fold_coalescer, &key_digest) {
+                        // Exactly one boundary run per window: reclaim
+                        // with the token THIS window minted, so a
+                        // fresh out-of-window subsumption OR a later
+                        // window's own pending run (which a delayed
+                        // wake could otherwise steal) leaves this
+                        // sleeper with nothing to do.
+                        if !sensing_fold_gate_reclaim(
+                            &ctx.sensing_fold_coalescer,
+                            &key_digest,
+                            token,
+                        ) {
                             return;
                         }
                         if Self::reconcile_sensing_leader_fold_one(
@@ -21851,6 +21876,14 @@ mod sensing_fold_gate_tests {
         ));
     }
 
+    /// Bind the token a `Defer` minted (panics on any other decision).
+    fn defer_token(decision: SensingFoldGateDecision) -> u64 {
+        match decision {
+            SensingFoldGateDecision::Defer { token, .. } => token,
+            _ => panic!("expected Defer"),
+        }
+    }
+
     #[test]
     fn boundary_reclaim_is_exactly_once_and_a_fresh_run_subsumes_the_sleeper() {
         let coalescer = DashMap::new();
@@ -21858,16 +21891,13 @@ mod sensing_fold_gate_tests {
             sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
             SensingFoldGateDecision::RunNow
         ));
-        assert!(matches!(
-            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
-            SensingFoldGateDecision::Defer { .. }
-        ));
+        let token = defer_token(sensing_fold_gate_admit(&coalescer, [1; 32], GAP));
         assert!(
-            sensing_fold_gate_reclaim(&coalescer, &[1; 32]),
+            sensing_fold_gate_reclaim(&coalescer, &[1; 32], token),
             "the sleeper owns its scheduled boundary run",
         );
         assert!(
-            !sensing_fold_gate_reclaim(&coalescer, &[1; 32]),
+            !sensing_fold_gate_reclaim(&coalescer, &[1; 32], token),
             "exactly one trailing run per window",
         );
 
@@ -21878,17 +21908,50 @@ mod sensing_fold_gate_tests {
             sensing_fold_gate_admit(&coalescer, [2; 32], GAP),
             SensingFoldGateDecision::RunNow
         ));
-        assert!(matches!(
-            sensing_fold_gate_admit(&coalescer, [2; 32], GAP),
-            SensingFoldGateDecision::Defer { .. }
-        ));
+        let subsumed = defer_token(sensing_fold_gate_admit(&coalescer, [2; 32], GAP));
         assert!(matches!(
             sensing_fold_gate_admit(&coalescer, [2; 32], Duration::ZERO),
             SensingFoldGateDecision::RunNow
         ));
         assert!(
-            !sensing_fold_gate_reclaim(&coalescer, &[2; 32]),
+            !sensing_fold_gate_reclaim(&coalescer, &[2; 32], subsumed),
             "a fresh out-of-window run subsumes the sleeper's pending reconciliation",
+        );
+    }
+
+    /// SI-6.1 re-review P1: a stale sleeper scheduled in an OLD window
+    /// (whose run was subsumed out-of-window) must not steal a NEWER
+    /// window's pending run when scheduler jitter delays its wake past
+    /// the new window's `Defer`. Reviewer's exact sequence.
+    #[test]
+    fn a_stale_sleeper_cannot_steal_a_newer_windows_pending_reconciliation() {
+        let coalescer = DashMap::new();
+        // (T0) leading edge runs.
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], GAP),
+            SensingFoldGateDecision::RunNow
+        ));
+        // (T10) in-window event schedules sleeper S1.
+        let s1 = defer_token(sensing_fold_gate_admit(&coalescer, [1; 32], GAP));
+        // (T110) S1 is delayed; a fresh OUT-of-window event runs
+        // immediately and invalidates S1's token.
+        assert!(matches!(
+            sensing_fold_gate_admit(&coalescer, [1; 32], Duration::ZERO),
+            SensingFoldGateDecision::RunNow
+        ));
+        // (T120) a new-window in-window event schedules S2.
+        let s2 = defer_token(sensing_fold_gate_admit(&coalescer, [1; 32], GAP));
+        assert_ne!(s1, s2, "each window mints a distinct ownership token");
+        // (T130) the stale S1 finally wakes: it must NOT reclaim S2's
+        // pending run.
+        assert!(
+            !sensing_fold_gate_reclaim(&coalescer, &[1; 32], s1),
+            "a stale sleeper must not steal a newer window's pending reconciliation",
+        );
+        // S2, at its own boundary, still owns and runs its window.
+        assert!(
+            sensing_fold_gate_reclaim(&coalescer, &[1; 32], s2),
+            "the current window's sleeper still owns its run",
         );
     }
 }
