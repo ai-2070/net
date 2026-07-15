@@ -1,0 +1,35 @@
+net/crates/net/payments/benches/redeem_matrix.rs
+  s_49cc2ab0880501::t_5c01ebb704e408 4-9,11-14,42-44,59-60,110-112,118,120,122,125,138-139,149-150,152,165-166,172-173,177-178,192-199
+net/crates/net/payments/benches/bench_common/mod.rs
+  s_49cc2ab0880501::t_fd5e24fe78dd35 12-22,28-29,35,64-66,69,72-90,93,97-105,107-109,116-120,123-133,137-139,141-191,221-223,323-325,336,364-376,379-499
+net/crates/net/payments/benches/admission.rs
+  s_49cc2ab0880501::t_e5c882dd940e64 1-2,4-8,10,13-20,22-25,42-43,48,51,63-65
+net/crates/net/payments/Cargo.toml
+  s_49cc2ab0880501::t_e96c0fe24d5114 132-137
+  s_49cc2ab0880501::t_802a9aa4d61776 164-167,174
+  s_49cc2ab0880501::t_9f6542f847ddef 179,185-187,193
+net/crates/net/docs/plans/PAYMENTS_BENCHMARKS_PLAN.md
+  s_49cc2ab0880501::t_95439dd3ba200a 167-184
+  s_49cc2ab0880501::t_71381fd26f9e0b 118-129
+  s_49cc2ab0880501::t_bc72906822cdda 351-353,356-366,368-371
+  s_49cc2ab0880501::t_302c87fa04252b 220-225,227-228,230-244
+  s_49cc2ab0880501::t_0e35ff55f07d1f 337
+  s_49cc2ab0880501::t_a10bd90f98f965 198-201,203-206,209-212
+  s_49cc2ab0880501::t_e569d9d8c492fe 133-151,154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5fdd8c5b55798eacc5e504dff70a9eaf6f4ea5aa",
+  "prompts": {},
+  "sessions": {
+    "s_49cc2ab0880501": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bc5d9ed-b590-4842-a9b4-43f10e352741",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
