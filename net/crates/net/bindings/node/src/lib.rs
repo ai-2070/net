@@ -2116,27 +2116,56 @@ mod mesh_bindings {
         }
 
         /// Shutdown the mesh node.
+        ///
+        /// Requires sole ownership of the `Arc<MeshNode>` (via
+        /// `try_unwrap`). SDK serve handles — nRPC `serve_rpc`, the
+        /// `PaymentProvider` quote/pay wire — release their node clone
+        /// via ASYNC task teardown: dropping a `ServeHandle` closes its
+        /// dispatcher channel, and the bridge / response-drain tasks then
+        /// exit and drop their `Arc<MeshNode>` clones on the next
+        /// scheduler tick (Drop deliberately never aborts them, so
+        /// in-flight responses aren't killed). A `shutdown()` invoked
+        /// right after such a handle is dropped (e.g. `provider.close()`
+        /// then `mesh.shutdown()`) can momentarily still observe those
+        /// clones, so we retry `try_unwrap` across a bounded grace window
+        /// to let the teardown drain. A GENUINE outstanding reference
+        /// still fails — just after the window, never hanging.
         #[napi]
         pub async fn shutdown(&self) -> Result<()> {
-            let node_arc = self
+            // ~250 ms total (50 × 5 ms) — imperceptible in the common
+            // path (first `try_unwrap` succeeds), ample for a handful of
+            // serve-task teardown ticks in the race path.
+            const DRAIN_ATTEMPTS: u32 = 50;
+            const DRAIN_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+            let mut node_arc = self
                 .node
                 .swap(None)
                 .ok_or_else(|| Error::from_reason("already shut down"))?;
 
-            match Arc::try_unwrap(node_arc) {
-                Ok(node) => {
-                    node.shutdown()
-                        .await
-                        .map_err(|e| Error::from_reason(format!("shutdown failed: {}", e)))?;
+            let mut attempt = 0u32;
+            let node = loop {
+                match Arc::try_unwrap(node_arc) {
+                    Ok(node) => break node,
+                    Err(arc) => {
+                        if attempt >= DRAIN_ATTEMPTS {
+                            // Genuine outstanding reference — put it back
+                            // so a later shutdown (after the caller
+                            // releases it) can still succeed.
+                            self.node.store(Some(arc));
+                            return Err(Error::from_reason(
+                                "cannot shutdown: outstanding references exist",
+                            ));
+                        }
+                        node_arc = arc;
+                        attempt += 1;
+                        tokio::time::sleep(DRAIN_STEP).await;
+                    }
                 }
-                Err(arc) => {
-                    // Put it back if there are outstanding references
-                    self.node.store(Some(arc));
-                    return Err(Error::from_reason(
-                        "cannot shutdown: outstanding references exist",
-                    ));
-                }
-            }
+            };
+            node.shutdown()
+                .await
+                .map_err(|e| Error::from_reason(format!("shutdown failed: {}", e)))?;
             Ok(())
         }
 
