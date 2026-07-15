@@ -54,6 +54,8 @@ fn main() {
         warm_update_matrix().await;
         warm_add_remove_direct().await;
         cold_publication_direct().await;
+        // CPB-5: fan-out + intake, batch-completion semantics.
+        fan_out_and_intake().await;
         // CPB-3: RT-3 registry-driven convergence (feature "tool").
         #[cfg(feature = "tool")]
         rt3_registry_convergence().await;
@@ -279,6 +281,162 @@ async fn cold_publication_direct() {
         timeouts,
         outliers: 0,
     });
+}
+
+// ============================================================================
+// CPB-5 — fan-out all-visible + intake all-visible (batch completion, C12).
+// ============================================================================
+
+const TOPO_N: usize = 16;
+const TOPO_ITERS: u64 = 50;
+
+async fn fan_out_and_intake() {
+    println!("=== CPB-5 topology matrix (batch completion) ===\n");
+    fanout_all_visible().await;
+    intake_all_visible().await;
+}
+
+/// A → 16 consumers. Report first-consumer-visible, all-16-visible, and
+/// the per-consumer distribution (C12: never treat the first wake as
+/// completion).
+async fn fanout_all_visible() {
+    let (a, consumers) = fan_out(&BenchConfig::wire_floor(), TOPO_N).await;
+    let a_id = a.node_id();
+    let manifest_bytes = manifest_bytes(&manifest_tags(&["fanout:svc", "gen:0"]));
+
+    let mut per_consumer = LatencyReport::new();
+    let mut first_visible = LatencyReport::new();
+    let mut all_visible = LatencyReport::new();
+    let mut timeouts = 0u64;
+    let version_before = a.capability_announce_version();
+
+    for k in 0..TOPO_ITERS {
+        let tag = format!("gen:{k}");
+        // Subscribe every consumer BEFORE the announce (no missed wakes).
+        let subs: Vec<_> = consumers
+            .iter()
+            .map(|c| c.capability_fold().subscribe_changes())
+            .collect();
+        let t0 = Instant::now();
+        a.announce_capabilities(manifest_tags(&["fanout:svc", &tag]))
+            .await
+            .expect("announce");
+        // Await each consumer's exact-state concurrently; each task records
+        // its own elapsed at its own completion.
+        let mut handles = Vec::with_capacity(consumers.len());
+        for (c, mut rx) in consumers.iter().cloned().zip(subs.into_iter()) {
+            let tag = tag.clone();
+            handles.push(tokio::spawn(async move {
+                let ok = tokio::time::timeout(
+                    DEADLINE,
+                    await_capability_state(&mut rx, || {
+                        c.find_nodes_by_filter(&require_tag(&tag)).contains(&a_id)
+                    }),
+                )
+                .await
+                .is_ok();
+                (t0.elapsed(), ok)
+            }));
+        }
+        let mut elapsed = Vec::with_capacity(consumers.len());
+        for h in handles {
+            let (d, ok) = h.await.expect("join");
+            if ok {
+                elapsed.push(d);
+            }
+        }
+        if elapsed.len() == consumers.len() {
+            for d in &elapsed {
+                per_consumer.record(d.as_nanos() as u64);
+            }
+            first_visible.record(elapsed.iter().min().expect("min").as_nanos() as u64);
+            all_visible.record(elapsed.iter().max().expect("max").as_nanos() as u64);
+        } else {
+            timeouts += 1;
+        }
+    }
+
+    let version_delta = a.capability_announce_version() - version_before;
+    let row = |label: &'static str| RowMeta {
+        label,
+        start_event: "publish_call (announce_capabilities)",
+        endpoint: "exact-state read per consumer (find_nodes_by_filter)",
+        topology: "A->16 consumers",
+        hop_count: 0,
+        manifest_bytes,
+        version_delta,
+        candidate_pop: consumers.len(),
+        warmup: 0,
+        workers: WORKER_THREADS,
+        topology_reused: true,
+        timeouts,
+        outliers: 0,
+    };
+    per_consumer.print_row(row("fan-out per-consumer"));
+    first_visible.print_row(row("fan-out first-visible"));
+    all_visible.print_row(row("fan-out all-16-visible"));
+    drop((a, consumers));
+}
+
+/// 16 providers → B. Endpoint is ALL 16 exact provider versions visible
+/// (C12: one watch generation can coalesce several changes, so the first
+/// wake is NOT completion), then the candidate population equals 16.
+async fn intake_all_visible() {
+    let (b, providers) = intake(&BenchConfig::wire_floor(), TOPO_N).await;
+    let manifest_bytes = manifest_bytes(&manifest_tags(&["intake:svc", "p0.k0"]));
+    let mut all_visible = LatencyReport::new();
+    let mut timeouts = 0u64;
+    let mut population = 0usize;
+
+    for k in 0..TOPO_ITERS {
+        let mut rx = b.capability_fold().subscribe_changes();
+        let t0 = Instant::now();
+        // Concurrent announces from all providers — intake pressure.
+        let mut ann = Vec::with_capacity(providers.len());
+        for (i, p) in providers.iter().cloned().enumerate() {
+            let caps = manifest_tags(&["intake:svc", &format!("p{i}.k{k}")]);
+            ann.push(tokio::spawn(async move {
+                let _ = p.announce_capabilities(caps).await;
+            }));
+        }
+        for h in ann {
+            let _ = h.await;
+        }
+        let ok = tokio::time::timeout(
+            DEADLINE,
+            await_capability_state(&mut rx, || {
+                (0..TOPO_N).all(|i| {
+                    !b.find_nodes_by_filter(&require_tag(&format!("p{i}.k{k}")))
+                        .is_empty()
+                })
+            }),
+        )
+        .await
+        .is_ok();
+        if ok {
+            all_visible.record(t0.elapsed().as_nanos() as u64);
+        } else {
+            timeouts += 1;
+        }
+        population = b.find_nodes_by_filter(&require_tag("intake:svc")).len();
+    }
+
+    all_visible.print_row(RowMeta {
+        label: "intake all-16-visible",
+        start_event: "16x publish_call (concurrent)",
+        endpoint: "all 16 exact provider versions visible (batch completion)",
+        topology: "16 providers->B",
+        hop_count: 0,
+        manifest_bytes,
+        version_delta: 0, // per-provider; not a single origin counter
+        candidate_pop: population,
+        warmup: 0,
+        workers: WORKER_THREADS,
+        topology_reused: true,
+        timeouts,
+        outliers: 0,
+    });
+    drop((b, providers));
 }
 
 // ============================================================================

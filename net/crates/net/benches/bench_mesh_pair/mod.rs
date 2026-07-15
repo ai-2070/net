@@ -218,6 +218,68 @@ pub fn manifest_tags(tags: &[&str]) -> CapabilitySet {
     caps
 }
 
+/// Star with `a` at the centre and `n` consumer leaves (each a direct
+/// peer of `a`), all started, warmed so every consumer's fold already
+/// knows `a`. Fan-out topology (CPB-5): one announce on `a` fans to all
+/// `n` consumers.
+pub async fn fan_out(cfg: &BenchConfig, n: usize) -> (Arc<MeshNode>, Vec<Arc<MeshNode>>) {
+    let a = node(cfg).await;
+    let mut consumers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let c = node(cfg).await;
+        connect(&a, &c).await;
+        consumers.push(c);
+    }
+    a.start_arc();
+    for c in &consumers {
+        c.start_arc();
+    }
+    a.announce_capabilities(CapabilitySet::new().add_tag("cpb:warmup"))
+        .await
+        .expect("warm announce");
+    let a_id = a.node_id();
+    for c in &consumers {
+        let ok = wait_until(Duration::from_secs(10), || {
+            c.find_nodes_by_filter(&permissive()).contains(&a_id)
+        })
+        .await;
+        assert!(ok, "fan-out warm: a consumer never learned A within 10s");
+    }
+    (a, consumers)
+}
+
+/// Star with observer `b` at the centre and `n` provider leaves (each a
+/// direct peer of `b`), all started, warmed so `b` already knows every
+/// provider. Intake-pressure topology (CPB-5): `n` providers announce
+/// concurrently and `b` must converge to the full population.
+pub async fn intake(cfg: &BenchConfig, n: usize) -> (Arc<MeshNode>, Vec<Arc<MeshNode>>) {
+    let b = node(cfg).await;
+    let mut providers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let p = node(cfg).await;
+        connect(&p, &b).await;
+        providers.push(p);
+    }
+    b.start_arc();
+    for p in &providers {
+        p.start_arc();
+    }
+    for p in &providers {
+        p.announce_capabilities(CapabilitySet::new().add_tag("cpb:warmup"))
+            .await
+            .expect("warm announce");
+    }
+    for p in &providers {
+        let pid = p.node_id();
+        let ok = wait_until(Duration::from_secs(10), || {
+            b.find_nodes_by_filter(&permissive()).contains(&pid)
+        })
+        .await;
+        assert!(ok, "intake warm: B never learned a provider within 10s");
+    }
+    (b, providers)
+}
+
 /// Warm a publisher→observer relationship: `a` announces a sentinel
 /// manifest; wait (bounded) until `b`'s fold exposes `a`'s node id.
 /// Panics on non-convergence so a broken topology fails loud.
