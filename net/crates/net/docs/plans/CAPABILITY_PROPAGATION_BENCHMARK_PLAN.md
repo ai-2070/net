@@ -1,206 +1,198 @@
-# Capability Propagation Benchmark Plan (CPB) — v0.1 DRAFT
+# Capability Propagation Benchmark Plan (CPB) — v0.2
 
-**Status:** DRAFT — awaiting sign-off on the three decisions in §3 before CPB-0 starts.
-**Provenance:** Kyra's 2026-07-15 review ("we want these benchmarks now"). Sibling to
-`SENSING_INTEREST_COALESCING_PLAN.md`; the burst/coalescing benchmark (CPB-4) is the
-standing regression guard for the delayed-sleeper ownership fixes shipped in PR #557
-(SI-6.1 / SI-6.1R2 fold-gate token work).
+**Status:** v0.2 — revised per Kyra's 2026-07-15 HOLD review. CPB-0 authorized (Kyra:
+"After those edits, I approve the implementation sequence"). Plan direction SOUND; D1
+APPROVED, D3 APPROVED, D2 REJECTED-as-written → revised in §3.
+**Provenance:** Kyra's 2026-07-15 review. Sibling to `SENSING_INTEREST_COALESCING_PLAN.md`.
+The burst benchmark (CPB-4) is a **coalescing-efficiency** benchmark — *not* a stale-sleeper
+correctness guard (that needs a deterministic time-controlled regression test; see §0 C7).
+
+---
+
+## 0. v0.2 disposition — the five equivalences and the twelve corrections
+
+Kyra's thesis: v0.1 mislabeled what its timestamps and counters actually prove. Five false
+equivalences must never appear in a published row:
+
+```
+watch wake              ≠ query visibility          (C1)
+version delta           ≠ packets emitted           (D2, C4-note)
+encoded payload size    ≠ bytes sent                (D2)
+capability query        ≠ scheduler decision        (C3)
+ordinary burst behavior ≠ stale-sleeper ownership   (C7)
+```
+
+| # | Correction | Landing |
+|---|---|---|
+| D2 | "bytes sent = count × encoded size" is dishonest (variable sizes, version≠emissions, serve_rpc over-bumps, fan-out/relay copies, framing/encryption/retransmits excluded). | Drop "bytes sent". Report instead: **remote fold updates accepted**, **final-state convergence**, **manifest size of the tested state**, and **origin version delta labeled as a version delta** (`capability_announce_version()`), never "emissions". §3 D2. |
+| C1 | `signal_changed()` fires while the fold write locks are still held; a waiter can wake *before* it can read. | The measured endpoint is **watch wake → exact target state read successfully → stop timer**, never `rx.changed()` alone. Realized as `await_capability_state(rx, predicate)`; the timer stops only after the predicate's exact fold/query check returns true. Still poll-free. §2, CPB-0. |
+| C2 | Public API can't timestamp the internal commit inside `announce_from_baseline`. | Start boundary is **publication/mutation API invocation**, not "commit". Headline reworded (§1). Every row named by its exact start event. |
+| C3 | `find_nodes_by_filter` = capability-index reaction, not a scheduling decision. | CPB-2 ends a sample only after `match_islands`/`match_islands_sensed` returns a **changed** result over seeded island topology. Cases: viable island appears / island disappears. **Rank-change removed** (separate inputs; not smuggled in). Split CPB-2a (→ scheduler-input wake) / CPB-2b (→ recomputed match changes; the headline). |
+| C4 | RT-3 auto-announce covers **tool-registry + nRPC service** mutations only; a GPU manifest baseline does not generate that local signal. | CPB-3 drives a **tool / nRPC service** mutation and says so. No live GPU registry (would change production behavior — non-goal). Note: `serve_tool` may install an RPC metadata service → another reason version-delta ≠ emission count. |
+| C5 | With `min_announce_interval = 10 s`, the trailing flush can be delayed toward the 10 s floor — not "~100 ms". | Split: **debounce-only** (`announce_debounce = 100 ms`, `min_announce_interval = 0`) isolates RT-3 burst settling; **default-policy** (both default) as a *small* labeled scenario. Do not call the first "production defaults". |
+| C6 | CPB-4 conflated RT-3 registry debounce with RT-1 explicit-announce rate limiting (different contracts). | Two separate benchmark groups. RT-3: 128 rapid registry mutations → ~one publication after debounce. RT-1: one leading + many in-window explicit announces → one trailing. Outcome is **not** universally "1 leading + 1 trailing". |
+| C7 | An ordinary burst bench stays green while a stale delayed sleeper still owns a newer window. | CPB-4 is a coalescing-efficiency benchmark only. **Removed** the "guards PR #557" claim. Provenance corrected: PR #557's RT-1/RT-4 token fixes and SI-6.1's fold-reconciliation token work are *related patterns*, not this slice. The real guard is a deterministic time-controlled regression test (out of CPB scope). |
+| C8 | Exact-state verification differs by operation. | add/remove where the tag controls membership → `find_nodes_by_filter` suffices. **update preserving membership** → read the exact fold entry / synthesized set and assert the exact version/tag/metadata. Every await loop: await change → read exact target → if absent, await next change. |
+| C9 | A single node pair yields only one *cold* insert per provider; the rest are replacements. | Label samples: **cold publication** (fresh provider insert; fixture setup excluded from timing; smaller N, stated), **warm update** (existing provider replaced with newer version), **warm add/remove** (alternate equal-sized states to flip membership). Never report thousands of replacements as "cold/added". |
+| C10 | p99.9 promised everywhere with no sample protocol. | Every row states: warm-up count, measured sample count, worker count, topology-reused flag, timeout count, rejected/outlier count. **p99.9 only for sufficiently large wire-floor runs**; small policy runs report p99 (p99.9 shown as `-`). |
+| C11 | CPB-1 "sub-ms" acceptance conflicts with CPB-6 "derive thresholds after measurement". | Pre-CPB-6 acceptance = valid distributions, exact-state correctness, zero timeouts, clean mechanism/policy separation, routed reported separately. "sub-ms / low single-digit ms" are **orientation only** (§1), not gates. |
+| C12 | Fan-out/intake need batch-completion, not first-wake. | A→16: report first-visible, **all-16-visible**, and the per-consumer distribution. 16→B: endpoint = **all 16 exact provider versions visible** → scheduler recompute sees the expected population. First scheduler-input wake ≠ completion (one watch generation coalesces several changes). |
 
 ---
 
 ## 1. Intent — the number we cannot currently quote
 
 The existing suite measures announcement *construction*, serialization, fold *insertion*,
-queries, and placement *scoring* (all Criterion microbenches in `net/crates/net/benches/`).
-None of them measures the latency a user actually experiences:
+queries, and placement *scoring*. None measures the latency a user experiences. Reworded per
+C2 (start boundary is an API invocation, not an internal commit):
 
-> A capability changes on node A. How long until node B can make a different scheduling
-> decision because of it?
+> A capability **mutation begins** on node A (a publish call, or a registry mutation). How long
+> until node B can make a different **scheduling decision** because of it?
 
-Integration tests prove *convergence* but poll every 20–25 ms against multi-second
-deadlines — they cannot tell us whether a path takes 400 µs, 8 ms, or 80 ms. This plan
-adds end-to-end latency benchmarks that measure from **local mutation commit** through
-**remote scheduling visibility**, so the public claim is a measured boundary, never
-"capability announcements take X."
+Integration tests prove convergence but poll every 20–25 ms against multi-second deadlines —
+they cannot resolve 400 µs vs 8 ms vs 80 ms. **Orientation only, not acceptance gates** (C11):
+wire-floor visibility sub-ms locally · one-hop scheduler reaction low single-digit ms · routed =
+bounded additive hop cost · default-policy convergence debounce/rate-limit-dominated.
 
-The deliverable sentence this evidence must support:
+Deliverable sentence this evidence must support:
 
-> Net measures capability changes from publication through remote scheduling visibility,
-> rather than quoting serialization or in-process scheduler overhead as end-to-end latency.
-
----
-
-## 2. Grounding — the measurement is already honest without new plumbing
-
-The pivotal correctness question (Kyra: "polling `find_nodes_by_filter` would quantize the
-measurement and make the result dishonest") is **already answered by public API**. No new
-subscription surface is needed. Every endpoint below is `pub` and reachable from a bench
-(integration tests already use them the same way).
-
-| Boundary | Poll-free endpoint | Location | Notes |
-|---|---|---|---|
-| Remote fold exposes the new version | `Fold::subscribe_changes() -> watch::Receiver<u64>` | `behavior/fold/mod.rs:321` | `signal_changed()` fires **after** the entry is inserted and query-visible (`apply` Insert `:383`, Replace `:439`) — the wake marks the exact instant B can observe it. Missed-wakeup-safe (`tokio::sync::watch`). |
-| Scheduler input regenerated | `MeshNode::subscribe_sensing_scheduler_inputs() -> watch::Receiver<u64>` | `mesh.rs:6081` | Bumped from the inbound capability handler at `mesh.rs:14837`, **gated on `enable_sensing_coalescing`** (config default `false`) — B must be built `.with_sensing_coalescing(true)`. Aggregates several planes, so a wake is attributed to the capability change by re-checking the fold generation. |
-| Candidate population (recompute) | `find_nodes_by_filter(&filter)` / `sensed_candidates(...)` | `mesh.rs:18064` / `6049` | Population is recomputed on demand — one recompute post-wake, never a poll loop. |
-| Announcements actually emitted | `MeshNode::capability_version()` (delta) | `mesh.rs:11496` | Doc: "delta as an announce-call count (e.g. proving the RT-3 debounce)." Origin-side coalescing efficacy = version delta over N mutations. |
-| Bytes sent | derived: `announcements_emitted × encoded_announcement_bytes` | — | Encode a `CapabilityAnnouncement` and take `.len()`; the honest coalescing/traffic figure. No transport byte-counter required (see Decision D2). |
-
-Supporting fixtures (all public API):
-- `connect_pair(&a, &b)` pattern (`tests/common/mod.rs:115`) — accept+connect+start, public-API
-  only (`node_id`/`public_key`/`local_addr`/`accept`/`connect`). Replicated into the bench
-  fixture (benches cannot `mod` a `tests/` module).
-- `announce_capabilities(caps)` (`mesh.rs:16769`) broadcasts **immediately**, bypassing the
-  debounced auto-announcer — the wire-floor driver. The change-driven auto-announcer
-  (`spawn_capability_announce_on_change_loop`, `mesh.rs:7310`, parks on
-  `subscribe_local_caps_changes`) with default `announce_debounce = 100 ms` /
-  `min_announce_interval = 10 s` is the production-convergence driver.
-- hdrhistogram print pattern: `sdk/benches/nrpc_churn.rs` (`Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)`, record ns, `value_at_quantile` for p50/p95/p99/p99.9 + `max()`/`mean()`).
+> Net measures capability changes from publication through remote scheduling visibility, rather
+> than quoting serialization or in-process scheduler overhead as end-to-end latency.
 
 ---
 
-## 3. Decisions to confirm before CPB-0
+## 2. Grounding — honest boundaries, no new plumbing
 
-**D1 — Location: honor Kyra's named paths (`net/crates/net/benches/`).**
-The two-node latency-bench pattern (hdrhistogram + a handshaken `Pair`) currently lives only
-in the **SDK crate** (`sdk/benches/nrpc_common`), which wraps `Mesh`, not `MeshNode`. But the
-`net` crate demonstrably stands up two transport-connected `MeshNode`s through public API
-(`tests/common::connect_pair`), and hdrhistogram is a one-line dev-dep add. Kyra was explicit:
-"the first belongs to the mesh/capability layer; the second should exercise the real fold and
-scheduler bridge." Both point at the `net` crate.
-→ **Recommendation:** put the benches in `net/crates/net/benches/` (Kyra's paths), with a
-self-contained node-pair fixture (a `#[path]`-included `bench_mesh_pair/mod.rs`, mirroring how
-`sdk/benches` includes `nrpc_common`). *Alternative:* SDK crate reusing `Pair` — rejected, wrong
-layer and reaches the fold only via `.inner()`.
+Every endpoint is public; no subscription surface needs to be added. The corrections below are
+about **where the timer stops** and **what a counter is allowed to claim**.
 
-**D2 — "Bytes sent" for the burst bench: derived, not a new transport counter.**
-Report `bytes_sent = announcements_emitted × encoded_announcement_bytes`. This is the honest
-coalescing/traffic-reduction figure and needs no new observability. *Alternative:* wire a real
-socket byte-counter — rejected as scope creep unless you want true on-wire bytes (including
-retransmits/framing); say so and I'll check `control_plane_stats`/`traversal_stats` for an
-existing counter first.
+| Boundary | Endpoint | Discipline |
+|---|---|---|
+| Remote state query-visible | `capability_fold().subscribe_changes()` **wake** + an **exact-state read** | C1: `signal_changed()` runs under the write locks, so stop the timer only after `await_capability_state(rx, predicate)` returns — the predicate performing the exact fold/query check. The watch is the wake mechanism; the read is the endpoint. |
+| Scheduler decision changed | `match_islands(criteria)` / `match_islands_sensed(...)` returns a **changed** result | C3: `find_nodes_by_filter` is index reaction, not a decision. Seed real `island_fold` topology; sample ends on a changed match. |
+| Scheduler-input wake (CPB-2a only) | `subscribe_sensing_scheduler_inputs()` | Needs `.with_sensing_coalescing(true)`; aggregates several planes → attribute by re-checking the fold generation. |
+| Origin **version delta** (NOT emissions) | `capability_announce_version()` delta | D2/C4: labeled "version delta"; over-bumps on `serve_rpc` nodes; not a packet count. |
+| Candidate/consumer population | `find_nodes_by_filter` | A recompute after the endpoint read — reporting context, not the endpoint itself. |
+| Manifest size of tested state | `postcard`-encoded `CapabilitySet` length | The size of the *state*, reported as such; not "bytes sent". |
 
-**D3 — CI: add a `cargo bench --no-run` compile gate, do not run benches in CI.**
-Benches are `cargo bench` only and never run in CI today (so `sensing_signature` etc. can
-bit-rot). These new benches gate PR #557's fixes, so a cheap compile check is worth it.
-→ **Recommendation:** add one `cargo bench --no-run` step over the new bench targets to the
-existing bench/build job. *Alternative:* leave CI untouched — rejected, invites silent rot.
-
-**Naming:** phases `CPB-0..6`. Plan doc: this file. Prefix chosen to sit beside `SI-*`/`RT-*`.
+Harness discipline (D1): use **`start_arc()`** (installs the weak self-ref; spawns the
+change-driven announcer + deferred flush) for any RT-3 / deferred-announcement scenario. The
+node-pair build (`accept`/`connect`, public-API only) mirrors `tests/common::connect_pair`.
+Start boundary (C2): timer starts immediately before `announce_capabilities(...)` (publication)
+or the registry mutation (`serve_tool`), never claimed as an internal commit.
 
 ---
 
-## 4. Phase breakdown
+## 3. Decisions (v0.2)
 
-Each phase is one reviewable unit with a red-green acceptance check, following the standing
-working pattern (disposition-first, one commit per sub-phase, as-built note at close).
+**D1 — Location: core `net` crate. APPROVED.** Files:
+`benches/capability_propagation.rs`, `benches/capability_scheduler_reaction.rs`,
+`benches/capability_burst.rs`, `benches/bench_mesh_pair/mod.rs`. Correct layer — direct access
+to `MeshNode`, the capability fold, and the scheduler bridge. Harness uses `start_arc()`.
 
-### CPB-0 — Shared harness + reporting spine
-`benches/bench_mesh_pair/mod.rs` (`#[path]`-included by every capability bench). Contents:
-- Node-pair / node-chain builders on public API (adapt `connect_pair`): `pair()` (A↔B direct),
-  `chain()` (A↔R↔B routed), `fan_out(n)` (A + n consumers), `intake(n)` (n providers + 1 consumer).
-- Config builder exposing the knobs Kyra requires: `sensing_coalescing`, `announce_debounce`,
-  `min_announce_interval`.
-- GPU capability-manifest fixtures: `manifest_small()` and `manifest_realistic_gpu()` (a
-  plausible multi-tag GPU worker: model tags, VRAM/hardware summary, service readiness), with
-  their encoded byte sizes exposed.
-- `LatencyReport` wrapping hdrhistogram: `record(ns)`, and a `print_row` emitting
-  **p50/p95/p99/p99.9/max/mean** plus the metadata columns Kyra requires on every result:
-  **topology, manifest bytes, hop count, debounce config, announcement count, candidate population.**
-- `hdrhistogram = "7"` added to `[dev-dependencies]` of `net/crates/net/Cargo.toml`.
+**D2 — "bytes sent": REJECTED as written.** Not reported. Replaced by (a) remote fold updates
+accepted, (b) final-state convergence, (c) manifest size of the tested state, (d) origin
+**version delta** labeled as such. If a phase uses a constant-size mutation fixture it may
+report *logical payload bytes accepted by one direct consumer* — never called "wire bytes" or
+"total bytes sent". A true byte figure would require an exact packet/payload counter (not in v0.1).
 
-**Acceptance:** fixture compiles under `cargo bench --no-run`; a smoke run stands up A↔B and
-records one non-zero sample.
+**D3 — Targeted compile gate: APPROVED.** Compile only the new targets with their exact features:
+```
+cargo bench -p net-mesh --bench capability_propagation        --features net  --no-run
+cargo bench -p net-mesh --bench capability_scheduler_reaction --features net  --no-run
+cargo bench -p net-mesh --bench capability_burst              --features "net tool" --no-run
+```
+Do **not** compile every existing bench on every PR.
 
-### CPB-1 — Capability propagation latency (mechanism / wire floor)
-`benches/capability_propagation.rs`, wire-floor mode: `announce_capabilities` direct (or knobs
-= 0). On B: snapshot `subscribe_changes()`, trigger A's mutation, `rx.changed().await`, record
-**local-commit → wake** ns; confirm the new version with one `find_nodes_by_filter` post-wake.
-- Cases: **added / updated / removed** × **{direct A→B, two-hop A→R→B}** × **{small, realistic GPU}**.
-- Report hop count + manifest bytes per row.
+---
 
-**Acceptance:** all six-plus cases produce distributions; direct-added wire floor is sub-ms
-locally (Kyra's target hierarchy); two-hop shows a bounded additive hop cost.
+## 4. Phase breakdown (v0.2)
 
-### CPB-2 — Scheduler reaction latency (the commercially meaningful number)
-`benches/capability_scheduler_reaction.rs`. B built `.with_sensing_coalescing(true)`. Continue
-the CPB-1 measurement to `subscribe_sensing_scheduler_inputs()` wake, attribute the wake to the
-capability change by re-checking the fold generation, then recompute candidate population and
-classify the effect: **provider appears / disappears / changes rank**.
-- Cases: appears / disappears / rank-change × {one-hop, routed}. Report candidate population
-  before → after.
+### CPB-0 — Harness, exact-state await helper, reporting + sample protocol
+`benches/bench_mesh_pair/mod.rs` (`#[path]`-included). Node-pair / chain builders on public API
+via `start_arc()`; `BenchConfig` presets (`wire_floor`, `wire_floor_scheduler`, `debounce_only`,
+`default_policy`); manifest fixtures (small + realistic GPU) with encoded size; the
+`await_capability_state(rx, predicate)` helper (C1); and a `LatencyReport` that prints
+p50/p95/p99/p99.9/max/mean **plus** the C10 sample protocol (warm-up, samples, workers,
+topology-reused, timeouts, outliers) and the C2/D2 metadata (start-event label, topology, hop
+count, manifest bytes, version delta, candidate population). p99.9 suppressed below a sample-count
+floor. `hdrhistogram` added to `[dev-dependencies]`.
+**Acceptance:** targeted `--no-run` compiles; a smoke run records a valid distribution via the
+exact-state endpoint (warm replacement, membership-controlling tag), zero timeouts.
 
-**Acceptance:** one-hop reaction is low single-digit ms; routed = one-hop + bounded hop cost;
-population transitions match the injected mutation.
+### CPB-1 — Publication call → remote exact-state visibility
+`benches/capability_propagation.rs`, wire-floor. Timer: just before `announce_capabilities` →
+`await_capability_state`. Per C8/C9:
+- **warm update** (membership preserved): read the exact fold entry/version, assert the new
+  version (large N).
+- **warm add / remove** (membership flip via alternating equal-sized states): `find_nodes_by_filter`.
+- **cold publication** (fresh provider insert; setup excluded from timing): smaller N, stated.
+Axes: {direct A→B, two-hop A→R→B} × {small, realistic GPU}. Routed reported separately.
+**Acceptance (C11):** valid distributions, exact-state correctness, zero timeouts, routed separate.
 
-### CPB-3 — Production-convergence mode
-Second mode in `capability_propagation.rs`: drive a **real tool/service/GPU registry mutation**
-(`serve_tool`) through the change-driven auto-announcer with **normal** debounce/coalescing.
-Report the configured `announce_debounce` **beside** the result so a deliberate 100 ms policy
-window is never mistaken for transport latency.
+### CPB-2 — Publication call → real match-result change
+`benches/capability_scheduler_reaction.rs`. B built `.with_sensing_coalescing(true)`; seed
+`island_fold` topology.
+- **CPB-2a:** publication → `subscribe_sensing_scheduler_inputs()` wake (attributed via fold gen).
+- **CPB-2b (headline):** publication → `match_islands`/`match_islands_sensed` returns a **changed**
+  result. Cases: provider's viable island **appears** / **disappears**. No rank-change (C3).
+**Acceptance:** match result provably changes; 2a/2b reported distinctly; routed separate.
 
-**Acceptance:** production-convergence latency is debounce-dominated and reported next to the
-debounce value; wire-floor and production numbers are clearly labeled as mechanism vs policy.
+### CPB-3 — RT-3 registry mutation: debounce-only and default-policy
+Second mode in `capability_propagation.rs`, driven by a **tool / nRPC service** mutation through
+`start_arc()`'s change-driven announcer (C4). Two configs (C5):
+- **debounce-only** (`announce_debounce = 100 ms`, `min_announce_interval = 0`) — isolates RT-3
+  burst settling.
+- **default-policy** (both default) — small labeled scenario (10 s samples are impractical; report
+  a small distribution and say so).
+Report the configured debounce/interval beside each result; never label debounce-only as
+"production defaults".
+**Acceptance:** mutation is registry-driven and described as such; the two policy modes are
+distinctly labeled; no production behavior changed.
 
-### CPB-4 — Burst / coalescing benchmark (guards PR #557)
-`benches/capability_burst.rs`. Bursts of **1 / 16 / 128** related mutations (model loaded →
-VRAM changed → cache warm → service ready). Measure:
-- time until B sees the **final state** (await fold generation, then verify the re-queried
-  membership equals the final version — not merely "a wake happened");
-- **announcements emitted** (`capability_version` delta on the origin);
-- **bytes sent** (D2 derivation);
-- **final-version correctness** (B's membership == the last mutation);
-- **leading-to-trailing convergence** — assert the burst collapses toward **one leading + one
-  trailing** emission (the coalescer's contract, and the delayed-sleeper ownership guarantee).
+### CPB-4 — Coalescing efficiency: RT-3 debounce group + RT-1 rate-limit group (SEPARATE)
+`benches/capability_burst.rs`. Two groups (C6), not merged:
+- **RT-3 debounce:** 1 / 16 / 128 rapid **registry** mutations → expect ≈ one publication after
+  the debounce; report the origin **version delta** (labeled) + remote **final-state convergence**
+  (await exact final version on B).
+- **RT-1 rate limit:** one leading + many in-window **explicit** announces → expect one trailing;
+  report the version-delta shape.
+Not a stale-sleeper guard (C7): no such claim; provenance corrected. Optional: *logical payload
+bytes accepted by one direct consumer* for a constant-size fixture (D2), never "bytes sent".
+**Acceptance:** the two groups are separate; final state correct; version-delta shapes reported;
+green under repeat (efficiency, not correctness-of-ownership).
 
-**Acceptance:** 128-mutation burst yields ≈1 leading + 1 trailing announcement (not 128),
-final state correct, and stays green under repeat runs (the anti-flake guard for #557).
+### CPB-5 — Fan-out all-visible + intake all-visible (batch completion, C12)
+Extend the fixture: **A → 16 consumers** — report first-visible, **all-16-visible**, and the
+per-consumer distribution. **16 providers → B** — endpoint is **all 16 exact provider versions
+visible** → scheduler recompute sees population = 16 (never first-wake). Multi-machine out of scope.
+**Acceptance:** all-visible endpoints (not first-wake); per-consumer spread reported; intake sees
+the full expected population.
 
-### CPB-5 — Topology matrix: fan-out + intake pressure
-Extend the fixture: **A → 16 direct consumers** (per-consumer propagation distribution across
-16 `subscribe_changes` receivers) and **16 providers → 1 consumer** (scheduler-input reaction
-under concurrent fold churn; candidate population = 16). Multi-machine rack-level runs are
-explicitly out of scope for v0.1 (localhost first: both endpoints share a monotonic clock,
-eliminating clock-sync error).
-
-**Acceptance:** fan-out distribution reported as a percentile spread; intake-pressure reaction
-stays bounded as concurrent providers scale.
-
-### CPB-6 — Baselines, thresholds, close-out
-- Run each bench on a quiet machine; capture observed distributions into a short results section
-  (this doc or `docs/`), **per Kyra: do not invent hard budgets first** — derive regression
-  thresholds from observed behavior.
-- Cargo `[[bench]]` entries + minimal `required-features` (confirmed at impl; D3 CI gate).
-- Cross-link from `docs/SENSING.md` / `docs/BEHAVIOR.md`; plan as-built; memory update; full
-  check pass (fmt + both clippy steps + rustdoc gate); push.
-
-**Acceptance:** baseline table recorded; thresholds justified by data, not asserted a priori;
-all gates green.
+### CPB-6 — Baselines, thresholds, targeted gates, docs
+Run each bench on a quiet machine; capture distributions; **derive** regression thresholds from
+observed data (never invented). Cargo `[[bench]]` entries + minimal `required-features`; the D3
+targeted `--no-run` gates into CI. Cross-link `docs/SENSING.md` / `docs/BEHAVIOR.md`; plan
+as-built; memory; full check pass (fmt + both clippy steps + rustdoc); push.
+**Acceptance:** baseline table recorded; thresholds data-justified; targeted gates green.
 
 ---
 
 ## 5. What we measure vs. what we report
 
-Every published row states **exactly which boundary was measured**. Two modes are always kept
-separate so policy latency never masquerades as mechanism latency:
-
-- **Wire floor** (mechanism): explicit announce, `min_announce_interval = 0`,
-  `announce_debounce = 0` — isolates transport, decode, fold apply (and, in CPB-2, scheduler wake).
-- **Production convergence** (policy): real registry mutation, normal debounce/coalescing —
-  what an application actually sees, with the debounce printed alongside.
-
-Reported columns per result: p50 / p95 / p99 / p99.9 / max / mean, plus topology, manifest bytes,
-hop count, debounce config, announcement count, candidate population.
-
-Initial target hierarchy (from Kyra — orientation only, not regression gates):
-wire-floor propagation sub-ms locally · one-hop scheduler reaction low single-digit ms · routed
-reaction bounded additive hop cost · production convergence debounce-dominated & explicit · burst
-final-state one leading + one trailing emission.
+Every row names its **exact start event** and **exact endpoint**, keeps **mechanism** (wire floor)
+separate from **policy** (debounce / rate limit), and carries the C10 sample protocol. Columns:
+p50 / p95 / p99 / p99.9* / max / mean, plus start-event, topology, hop count, manifest bytes,
+version delta (labeled), candidate population, and (warm-up, samples, workers, topology-reused,
+timeouts, outliers). *p99.9 only when samples exceed the wire-floor floor; otherwise `-` and p99
+is the tail figure.
 
 ---
 
 ## 6. Non-goals (v0.1)
-- Multi-machine / rack-level runs (localhost only, for clock fidelity — revisit later).
-- Real on-wire byte accounting (framing/retransmits) — derived bytes only unless D2 is overridden.
-- New subscription/observability plumbing — none required (§2); if a phase turns out to need it,
-  that becomes a flagged mini-disposition, not a silent addition.
-- Changing any production behavior or default. Benches are `dev`-only, observation-only.
+- Multi-machine / rack-level runs (localhost only — clock fidelity; revisit later).
+- Real on-wire byte accounting (D2) — not reported; no synthetic "bytes sent".
+- Stale-sleeper ownership correctness (C7) — a deterministic time-controlled regression test, not a
+  benchmark.
+- Any live GPU registry signal (C4) or other production-behavior change. Benches are dev-only,
+  observation-only, and add no new plumbing.
