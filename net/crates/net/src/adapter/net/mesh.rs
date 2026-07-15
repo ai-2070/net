@@ -7358,13 +7358,25 @@ impl MeshNode {
     /// each cycle rather than snapshotting it at spawn, so a bare
     /// [`Self::start`] followed by a later [`Self::start_arc`] enables
     /// the announcer instead of parking it forever (RT-3 review
-    /// Finding 7). A change that fires before the weak is set is
-    /// skipped — same outcome as today, the initial explicit
-    /// announce covers pre-`start` registrations.
+    /// Finding 7). A change that fires before the weak is set is NOT
+    /// consumed: the loop parks (re-checking every
+    /// [`Self::CHANGE_ANNOUNCE_START_ARC_POLL`]) until `start_arc` installs
+    /// the weak, then announces the current baseline — so a mutation
+    /// landing between a bare `start()` and a later `start_arc()`
+    /// survives instead of being marked-seen-and-dropped (RT-3 review
+    /// P2). Consuming before the weak check dropped it permanently.
     ///
     /// Announce TTL matches the re-announce keep-alive's
     /// (`capability_reannounce_ttl`) so a change-driven entry
     /// survives until the keep-alive refreshes it.
+    ///
+    /// Poll cadence for the "wait until `start_arc` installs the weak"
+    /// park. Only ticks when a change is pending AND the node was
+    /// bare-`start()`ed without `start_arc` yet — a narrow, transient
+    /// window — so the cost is a single sleeping timer, and the announce
+    /// latency after `start_arc` is bounded by this.
+    const CHANGE_ANNOUNCE_START_ARC_POLL: Duration = Duration::from_millis(200);
+
     fn spawn_capability_announce_on_change_loop(&self) -> JoinHandle<()> {
         let debounce = self.config.announce_debounce;
         let reannounce_interval = self.config.capability_reannounce_interval;
@@ -7394,22 +7406,42 @@ impl MeshNode {
                             // Sender dropped — node is gone.
                             return;
                         }
+                        // Resolve the node BEFORE consuming the change.
+                        // A mutation that lands between a bare `start()`
+                        // and a later `start_arc()` must survive for
+                        // start_arc's announcer — the old order called
+                        // `borrow_and_update` first, marking it seen, so
+                        // when `self_weak` was still `None` the change
+                        // was dropped permanently (until the next
+                        // reannounce or another mutation). Park here,
+                        // WITHOUT consuming, re-checking the weak until
+                        // start_arc installs it.
+                        let node = loop {
+                            match self_weak.get() {
+                                Some(weak) => match weak.upgrade() {
+                                    Some(node) => break node,
+                                    None => return, // node dropped
+                                },
+                                None => {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(
+                                            Self::CHANGE_ANNOUNCE_START_ARC_POLL) => {}
+                                        _ = shutdown_notify.notified() => return,
+                                    }
+                                }
+                            }
+                        };
                         // Debounce: let the burst settle so N rapid
                         // registrations coalesce into one broadcast.
                         tokio::select! {
                             _ = tokio::time::sleep(debounce) => {}
                             _ = shutdown_notify.notified() => return,
                         }
-                        // Mark everything that landed during the
-                        // debounce as seen — it's covered by the
-                        // announce below. Later bumps get their own
-                        // cycle (missed-wakeup-safe generation).
+                        // Mark everything that landed during the wait +
+                        // debounce as seen — it's covered by the announce
+                        // below. Later bumps get their own cycle
+                        // (missed-wakeup-safe generation).
                         let _ = change_rx.borrow_and_update();
-                        // Re-read the weak each cycle: `None` = not
-                        // started via `start_arc` (yet). Skip this
-                        // change; a later `start_arc` enables the loop.
-                        let Some(weak) = self_weak.get() else { continue };
-                        let Some(node) = weak.upgrade() else { return };
                         // Re-announce the CURRENT baseline (None) so a
                         // concurrent explicit announce isn't clobbered
                         // by a stale snapshot (Finding 8); the merged
@@ -11554,6 +11586,15 @@ impl MeshNode {
         *self.local_caps_changed.borrow()
     }
 
+    /// Test seam: fire the RT-2 local-caps change signal as if a local
+    /// registry mutation happened, without standing up the cortex/tool
+    /// registries. Drives the change-driven announce loop in unit tests.
+    #[cfg(test)]
+    pub(crate) fn test_bump_local_caps_changed(&self) {
+        self.local_caps_changed
+            .send_modify(|g| *g = g.wrapping_add(1));
+    }
+
     /// Monotonic capability-version counter — the version stamped into
     /// the most recent `CapabilityAnnouncement`. Every
     /// `announce_capabilities_with` call bumps it, broadcast and
@@ -12653,9 +12694,10 @@ impl MeshNode {
         // direct peer exists (RT-5 review P2). The `(from_node, dest)`
         // edge itself was already removed by the caller, so no path can
         // reach `dest` through the withdrawn hop.
-        let Some(path) = proximity_graph
-            .path_to_excluding_first_hop(&node_id_to_graph_id(dest), &node_id_to_graph_id(from_node))
-        else {
+        let Some(path) = proximity_graph.path_to_excluding_first_hop(
+            &node_id_to_graph_id(dest),
+            &node_id_to_graph_id(from_node),
+        ) else {
             return false;
         };
         // path[0] is self, path[1] the first hop.
@@ -21635,7 +21677,9 @@ mod reclassify_override_race_tests {
         let node = build_node_for_test().await;
 
         // Before any announce the pingwave carries the default summary.
-        let before = node.proximity_graph().create_pingwave(HealthStatus::Healthy);
+        let before = node
+            .proximity_graph()
+            .create_pingwave(HealthStatus::Healthy);
         assert_eq!(before.capability_hash, 0, "no caps announced yet");
         assert_eq!(before.capability_version, 0);
 
@@ -21645,7 +21689,9 @@ mod reclassify_override_race_tests {
 
         // The pingwave now carries the announced caps' hash and a bumped
         // version — the summary event pingwaves piggyback.
-        let after = node.proximity_graph().create_pingwave(HealthStatus::Healthy);
+        let after = node
+            .proximity_graph()
+            .create_pingwave(HealthStatus::Healthy);
         assert_ne!(
             after.capability_hash, 0,
             "pingwave must carry the announced capability hash, not the default"
@@ -21653,6 +21699,59 @@ mod reclassify_override_race_tests {
         assert!(
             after.capability_version > before.capability_version,
             "announcing capabilities must bump the pingwave capability version",
+        );
+    }
+
+    /// RT-3 review P2: a capability mutation that lands between a bare
+    /// `start()` and a later `start_arc()` must survive. The change loop
+    /// used to `borrow_and_update` (mark the signal seen) BEFORE checking
+    /// whether `self_weak` was installed, so a mutation in that window
+    /// was dropped permanently until the next reannounce. The landed
+    /// Finding-7 test called `start_arc` before mutating, so it missed
+    /// this ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bare_start_then_mutate_then_start_arc_still_announces() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x23u8; 32])
+            // Enable the change-driven announcer with a snappy debounce…
+            .with_announce_debounce(Duration::from_millis(20))
+            // …and DISABLE the keep-alive reannounce so the ONLY thing
+            // that can bump capability_version after start_arc is the
+            // change-driven announce we are testing.
+            .with_capability_reannounce_interval(Duration::MAX);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+
+        // Bare start: spawns the change loop with `self_weak` still None.
+        node.start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A local-caps mutation lands BEFORE start_arc.
+        node.test_bump_local_caps_changed();
+        // Give the loop time to (pre-fix) consume + drop the signal.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let v_before = node.capability_version.load(Ordering::Relaxed);
+
+        // Enable the Arc-started announcer. The parked mutation must now
+        // drive an announce, bumping capability_version.
+        node.start_arc();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut announced = false;
+        while tokio::time::Instant::now() < deadline {
+            if node.capability_version.load(Ordering::Relaxed) > v_before {
+                announced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            announced,
+            "the mutation made between bare start() and start_arc() was dropped — \
+             capability_version never advanced after start_arc"
         );
     }
 
