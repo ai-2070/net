@@ -168,6 +168,12 @@ tracing-subscriber = "0.3"
 name = "admission"
 harness = false
 
+# Redemption-gate matrix (before/after the read-only-denial write-
+# amplification fix): redeem outcomes × store cardinality × concurrency.
+[[bench]]
+name = "redeem_matrix"
+harness = false
+
 # B3 — spend-policy contention: concurrent check_and_reserve against one
 # shared JSON store under the fs2 lock, across store history sizes.
 [[bench]]
