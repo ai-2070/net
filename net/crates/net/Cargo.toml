@@ -364,6 +364,10 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
+# Custom-main latency benches (CPB capability-propagation suite) print
+# p50…p99.9 tails; Criterion is mediocre at p99.9. Same recipe as the
+# SDK crate's nrpc_tail/nrpc_churn benches.
+hdrhistogram = "7"
 rand = "0.10"
 # Already normal (feature-gated) deps; declared here too so the
 # `dir_transfer` integration test can hand-craft a manifest blob to
@@ -436,6 +440,26 @@ required-features = ["net"]
 name = "sensing_signature"
 harness = false
 required-features = ["net"]
+
+# CPB — capability propagation benchmark suite (custom main + hdrhistogram).
+# See docs/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md.
+[[bench]]
+name = "capability_propagation"
+harness = false
+required-features = ["net"]
+
+# CPB-2 exercises the gang island matcher + scheduler-input plane, which
+# ride the redex-gated island topology fold (mirrors sensing_scheduler_bridge).
+[[bench]]
+name = "capability_scheduler_reaction"
+harness = false
+required-features = ["net", "redex"]
+
+# CPB-4 drives real tool-registry mutations (RT-3) + explicit announces (RT-1).
+[[bench]]
+name = "capability_burst"
+harness = false
+required-features = ["net", "tool"]
 
 [[test]]
 name = "integration_redis"

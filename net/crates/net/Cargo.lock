@@ -2816,6 +2816,7 @@ dependencies = [
  "fastcdc",
  "futures",
  "getrandom 0.4.3",
+ "hdrhistogram",
  "hex",
  "igd-next",
  "libc",

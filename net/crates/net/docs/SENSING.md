@@ -151,9 +151,34 @@ by scope size, per-downstream caps, and coalescing — so watch these
 three to spot a hot leader before it is a problem. A per-digest
 leader spread is a possible later refinement, not v1.
 
+### Benchmarks — capability propagation latency (CPB)
+
+The counters above answer *how much* diverges; the **CPB benchmark suite**
+answers *how fast* a capability change reaches a remote scheduling decision —
+from publication through remote visibility, never quoting serialization or
+in-process overhead as end-to-end latency. Poll-free throughout (each sample
+stops on an exact-state read after a `capability_fold().subscribe_changes()`
+wake, not the wake alone). Under `net/crates/net/benches/`:
+
+- `capability_propagation` — publication → remote exact-state visibility
+  (warm update / add / remove / cold; direct + routed; small + GPU manifests),
+  plus RT-3 registry-driven convergence (`--features "net tool"`, debounce-only
+  vs default-policy — the latter is rate-limit-dominated, ~100× the debounce),
+  and fan-out (A→16) batch completion.
+- `capability_scheduler_reaction` (`--features "net redex"`) — publication →
+  scheduler-input wake, and → a real `match_islands` decision change.
+- `capability_burst` (`--features "net tool"`) — coalescing efficiency: an RT-3
+  registry burst collapses to one publication; an RT-1 explicit-announce burst
+  to one leading + one trailing publication (observed as ~2 remote updates
+  applied at the consumer).
+
+See `plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md` §7 for the reference
+baselines and the data-derived regression thresholds.
+
 ## Related
 
 - `plans/SENSING_INTEREST_COALESCING_PLAN.md` — full design + rationale.
+- `plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md` — the CPB latency suite (above).
 - `CONTINUITY.md` — the §4.5 continuity state machine the readiness
   projection rides.
 - `BEHAVIOR.md` — capability announcements (the *who can* input the
