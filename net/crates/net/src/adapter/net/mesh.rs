@@ -17092,6 +17092,19 @@ impl MeshNode {
                 (next, reflex)
             };
 
+            // Push the fully-merged capability set into the proximity
+            // graph so origin pingwaves — the heartbeat tick AND the
+            // change-driven `emit_event_pingwave` the RT-3/RT-4 loop
+            // fires right after this announce — piggyback the CURRENT
+            // capability hash / version / primary summary instead of the
+            // graph's default (0, 0, empty). `set_local_capabilities`
+            // was previously dead code, so every event pingwave carried
+            // a stale summary (RT-5 review P2). Runs before the
+            // rate-limit branch, same as the self-index below, so a
+            // coalesced announce still refreshes the local pingwave
+            // state.
+            self.proximity_graph.set_local_capabilities(caps.clone());
+
             let mut ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
@@ -21610,6 +21623,37 @@ mod reclassify_override_race_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// RT-5 review P2: `ProximityGraph::set_local_capabilities` had no
+    /// caller, so origin pingwaves (the heartbeat tick AND the
+    /// change-driven event pingwave) carried the graph's default
+    /// capability summary (hash 0 / version 0). An announce must now push
+    /// the merged caps into the graph so the pingwave piggybacks them.
+    #[tokio::test]
+    async fn announced_capabilities_reach_the_origin_pingwave() {
+        let node = build_node_for_test().await;
+
+        // Before any announce the pingwave carries the default summary.
+        let before = node.proximity_graph().create_pingwave(HealthStatus::Healthy);
+        assert_eq!(before.capability_hash, 0, "no caps announced yet");
+        assert_eq!(before.capability_version, 0);
+
+        node.announce_capabilities(CapabilitySet::new().add_tag("svc:demo".to_string()))
+            .await
+            .expect("announce");
+
+        // The pingwave now carries the announced caps' hash and a bumped
+        // version — the summary event pingwaves piggyback.
+        let after = node.proximity_graph().create_pingwave(HealthStatus::Healthy);
+        assert_ne!(
+            after.capability_hash, 0,
+            "pingwave must carry the announced capability hash, not the default"
+        );
+        assert!(
+            after.capability_version > before.capability_version,
+            "announcing capabilities must bump the pingwave capability version",
+        );
     }
 
     /// Regression for the capability re-announce loop. A node's own
