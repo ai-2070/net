@@ -144,26 +144,6 @@ async fn train_fired(listener: &UdpSocket, limit: Duration) -> bool {
         .is_ok()
 }
 
-/// Count the datagrams `listener` receives within `limit` (drains
-/// until the window closes). Used to measure how many trains landed
-/// under the per-source cap.
-async fn count_datagrams(listener: &UdpSocket, limit: Duration) -> usize {
-    let mut buf = [0u8; 64];
-    let mut n = 0usize;
-    let deadline = tokio::time::Instant::now() + limit;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, listener.recv_from(&mut buf)).await {
-            Ok(Ok(_)) => n += 1,
-            _ => break,
-        }
-    }
-    n
-}
-
 /// Four-node topology: R + X both bridge A and B (A and B are NOT
 /// directly connected). X is the injector — an authenticated session
 /// peer of B — and also the second classification/announcement relay.
@@ -337,36 +317,50 @@ async fn unsolicited_introduce_flood_from_one_source_is_capped() {
     let a = build_node().await;
     let (_a, _r, b, x) = topology(a).await;
 
-    let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let victim_addr = victim.local_addr().unwrap();
-
     // Fire six introduces from the same source (X) for six distinct
-    // uncached counterparts, all inside one window. Cap is 4 → four
-    // trains of three keep-alives (12 datagrams), never six (18).
+    // uncached counterparts inside one window — but each to its OWN
+    // victim socket. The per-source cap (4 / 10 s window) is keyed by
+    // the introducing SOURCE (X), not by the punch target, so exactly
+    // four trains are ever admitted regardless of where they punch;
+    // the remaining two introduces are dropped over budget.
+    //
+    // We count admitted trains by how many victims receive ANY
+    // keep-alive — NOT by raw datagram count. An accepted keep-alive
+    // train re-fires at its 250 ms cadence until `punch_deadline`
+    // (the cone-NAT latch sustain), so a single train delivers many
+    // datagrams; "did this victim get a train at all" is the robust,
+    // timing-independent signal for the cap.
+    let mut victims = Vec::new();
+    for _ in 0..6u64 {
+        victims.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    }
     let fire_at = now_unix_ms();
-    for i in 0..6u64 {
+    for (i, victim) in victims.iter().enumerate() {
         inject_introduce(
             &x,
             b.local_addr(),
             PunchIntroduce {
-                peer: 0xABCD_0000_0000_0000 | i,
-                peer_reflex: victim_addr,
+                peer: 0xABCD_0000_0000_0000 | i as u64,
+                peer_reflex: victim.local_addr().unwrap(),
                 fire_at_ms: fire_at,
             },
         )
         .await;
     }
 
-    // Each accepted introduce emits exactly three keep-alives
-    // (offsets 0/100/250 ms). Drain for a bit over the train span.
-    let got = count_datagrams(&victim, Duration::from_millis(1500)).await;
+    let mut trains = 0usize;
+    for victim in &victims {
+        if train_fired(victim, Duration::from_millis(1200)).await {
+            trains += 1;
+        }
+    }
     assert!(
-        got <= 12,
-        "per-source cap should admit at most 4 trains (12 datagrams); got {got}",
+        trains <= 4,
+        "per-source cap should admit at most 4 trains; got {trains}",
     );
     assert!(
-        got >= 3,
-        "at least the first introduce must punch (control against a vacuous cap); got {got}",
+        trains >= 1,
+        "at least the first introduce must punch (control against a vacuous cap); got {trains}",
     );
 }
 
