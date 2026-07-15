@@ -120,6 +120,6 @@ pub use identity::{
     strictest_sample_interval, AudienceScopeCommitment, CanonicalConstraints, CapabilityId,
     CapabilityInterestKey, ConstraintError, ConsumerLatencyBudget, Digest256, DisclosureClass,
     GroupRef, InterestRegistration, InterestSpec, ProviderInterestKey, ProviderObservationKey,
-    ProviderSelector, ResultMode, TagMatch, WorkLatencyEnvelope, INTEREST_DIGEST_DOMAIN,
-    MAX_CONSTRAINT_BYTES,
+    ProviderSelector, ResultMode, TagMatch, WorkLatencyEnvelope, CONSTRAINTS_DIGEST_DOMAIN,
+    INTEREST_DIGEST_DOMAIN, MAX_CONSTRAINT_BYTES,
 };

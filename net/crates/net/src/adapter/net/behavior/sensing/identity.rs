@@ -888,6 +888,22 @@ mod tests {
         assert_eq!(spec().interest_digest(), spec().interest_digest());
     }
 
+    /// The two digest domains are distinct blake3 derive-keys, so the
+    /// interest digest and the constraints digest live in separate
+    /// hash spaces — a constraints digest can never be mistaken for
+    /// (or collide with) an interest digest. Both are `pub` and
+    /// re-exported through `super::super` for symmetry.
+    #[test]
+    fn digest_domains_are_separated() {
+        assert_ne!(INTEREST_DIGEST_DOMAIN, CONSTRAINTS_DIGEST_DOMAIN);
+        // Reachable through the umbrella module path, not only the
+        // identity submodule.
+        assert_eq!(
+            super::super::CONSTRAINTS_DIGEST_DOMAIN,
+            CONSTRAINTS_DIGEST_DOMAIN,
+        );
+    }
+
     /// SI-7: the merge-miss metric scopes to provider-free selectors
     /// (routed through the leader). `Node`/`Nodes` name explicit
     /// destinations and skip the rendezvous, so multiple direct
