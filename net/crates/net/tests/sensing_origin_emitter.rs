@@ -496,18 +496,16 @@ async fn tampered_and_equivocating_attestations_refused() {
 #[tokio::test]
 async fn reentrant_evaluator_cannot_deadlock_the_emitter() {
     struct ReentrantEvaluator {
-        node: std::sync::Mutex<Option<Arc<MeshNode>>>,
+        node: parking_lot::Mutex<Option<Arc<MeshNode>>>,
     }
     impl ReadinessEvaluator for ReentrantEvaluator {
         fn evaluate(&self, _request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
-            if let Ok(slot) = self.node.lock() {
-                if let Some(node) = slot.as_ref() {
-                    // Both re-enter MeshNode; the notify path takes
-                    // the emitter mutex this very loop iteration
-                    // released before calling us.
-                    node.notify_sensing_state_changed(&CapabilityId::new("print.document"));
-                    let _ = node.sensing_live_streams();
-                }
+            if let Some(node) = self.node.lock().as_ref() {
+                // Both re-enter MeshNode; the notify path takes the
+                // emitter mutex this very loop iteration released
+                // before calling us.
+                node.notify_sensing_state_changed(&CapabilityId::new("print.document"));
+                let _ = node.sensing_live_streams();
             }
             ReadinessEvaluation::Ready {
                 estimated_start: None,
@@ -518,9 +516,9 @@ async fn reentrant_evaluator_cannot_deadlock_the_emitter() {
     let (c, p, fleet) = consumer_provider_pair(Some(Incarnation::new(1))).await;
     let p_id = p.node_id();
     let evaluator = Arc::new(ReentrantEvaluator {
-        node: std::sync::Mutex::new(None),
+        node: parking_lot::Mutex::new(None),
     });
-    *evaluator.node.lock().expect("fresh lock") = Some(p.clone());
+    *evaluator.node.lock() = Some(p.clone());
     p.register_readiness_evaluator(CapabilityId::new("print.document"), evaluator);
 
     let spec = shared_spec(fleet);
@@ -1045,7 +1043,7 @@ async fn malformed_refusals_and_stale_epochs_touch_nothing() {
     send_until!(
         beat(&spec_a, 6, 0, false, 100, 3),
         "Ready (inc 6) admits",
-        { c.sensing_latest_attestation(&branch_a).is_some() }
+        c.sensing_latest_attestation(&branch_a).is_some()
     );
     send_until!(beat(&spec_a, 6, 1, true, 50, 0), "refusal caches floor", {
         c.sensing_latest_refusal(&branch_a).is_some()
@@ -1058,7 +1056,7 @@ async fn malformed_refusals_and_stale_epochs_touch_nothing() {
     send_until!(
         beat(&spec_a, 7, 2, true, 0, 0),
         "malformed refusal counted",
-        { SensingCounters::get(&c.sensing_counters().protocol_invalid) > invalid_before }
+        SensingCounters::get(&c.sensing_counters().protocol_invalid) > invalid_before
     );
     assert!(
         floor_cached(),
@@ -1089,7 +1087,7 @@ async fn malformed_refusals_and_stale_epochs_touch_nothing() {
     send_until!(
         beat(&spec_b, 5, 0, false, 100, 3),
         "old-incarnation beat admits on its fresh digest",
-        { c.sensing_latest_attestation(&branch_b).is_some() }
+        c.sensing_latest_attestation(&branch_b).is_some()
     );
     assert!(
         floor_cached(),

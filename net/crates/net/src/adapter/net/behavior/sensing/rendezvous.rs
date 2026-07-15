@@ -1688,7 +1688,8 @@ mod tests {
         // call across score spreads, ties, health filtering, and the
         // empty case — the rendezvous is a parameterization of the
         // existing election, not a second algorithm.
-        let cases: &[(&[u64], &[(u64, u64, u64)], fn(u64) -> bool)] = &[
+        type ElectionCase<'a> = (&'a [u64], &'a [(u64, u64, u64)], fn(u64) -> bool);
+        let cases: &[ElectionCase] = &[
             (MEMBERS, EDGES, all_alive),
             // Tie on score: symmetric triangle → NodeId tiebreak.
             (MEMBERS, &[(1, 2, 100), (1, 3, 100), (2, 3, 100)], all_alive),

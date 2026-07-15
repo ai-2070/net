@@ -811,7 +811,8 @@ mod tests {
         // Flip each signed field (and the signature) one at a time:
         // verification must fail for every mutation — the transcript
         // binds EXACTLY the §4.2 list, so nothing here is malleable.
-        let mutations: [(&str, fn(&mut ReadinessAttestation)); 12] = [
+        type AttestationMutation = fn(&mut ReadinessAttestation);
+        let mutations: [(&str, AttestationMutation); 12] = [
             ("interest_digest", |a| {
                 a.interest_digest = Digest256::from_bytes([0xFF; 32]);
             }),

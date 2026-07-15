@@ -542,7 +542,8 @@ mod tests {
                 Duration::from_secs(30),
             )
         };
-        let mutations: [(&str, fn(&mut SensingInterestFrame)); 3] = [
+        type FrameMutation = fn(&mut SensingInterestFrame);
+        let mutations: [(&str, FrameMutation); 3] = [
             ("providers", |frame| {
                 let SensingInterestFrame::ProviderRegistration { providers, .. } = frame else {
                     panic!("helper builds the provider leg");
