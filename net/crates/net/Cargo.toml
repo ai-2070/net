@@ -474,6 +474,13 @@ name = "island_claim_match"
 harness = false
 required-features = ["net"]
 
+# ICB-2 single-claimant claim boundaries: local commit / API return /
+# remote visibility, from one common start (+ required witnesses).
+[[bench]]
+name = "island_claim_boundaries"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
