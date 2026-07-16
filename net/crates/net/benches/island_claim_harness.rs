@@ -11,6 +11,7 @@
 #[path = "bench_island_claim/mod.rs"]
 mod bench_island_claim;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ fn main() {
         w_malformed_not_counted();
         w_duplicate_not_incremented();
         w_wrong_island_not_incremented();
+        w_exact_barrier_rejects_overshoot().await;
 
         // Exact-holder discipline (local fold, deterministic).
         w_exact_holder_wake().await;
@@ -40,6 +42,10 @@ fn main() {
         w_direct_observer_smoke().await;
         w_routed_chain_not_reported().await;
         w_claimant_n_minus_1_observer_n().await;
+
+        // Fixture-reset safety (fail-loud).
+        w_reset_succeeds().await;
+        w_reset_failure_fails_loud().await;
 
         println!("\nICB-0 harness witnesses: ALL PASS\n");
     });
@@ -289,30 +295,153 @@ async fn w_claimant_n_minus_1_observer_n() {
             c.reserve_island(island, deadline).await
         }));
     }
+    // Every concurrent fresh LOCAL claim must optimistically Win — the
+    // premise ICB-3 later reports (item 7).
     for h in handles {
-        let _ = h.await.expect("claim task join");
+        let outcome = h.await.expect("claim task join").expect("claim call");
+        assert_eq!(
+            outcome,
+            ClaimOutcome::Won,
+            "each concurrent fresh local claim must optimistically Win"
+        );
     }
 
     // Each claimant receives the OTHER two claimants' reservations (N-1);
-    // its own local apply never traverses its own inbound router.
+    // its own local apply never traverses its own inbound router. The
+    // barrier is EXACT — an unexpected extra unique delivery fails here.
     for (i, cc) in ccs.iter().enumerate() {
         assert!(
             wait_count(cc, 2, Duration::from_secs(5)).await,
-            "claimant {i}: expected N-1=2 foreign deliveries, got {}",
+            "claimant {i}: expected EXACTLY N-1=2 foreign deliveries, got {}",
             cc.count()
-        );
-        assert_eq!(
-            cc.count(),
-            2,
-            "claimant {i} must NOT count its own local apply"
         );
     }
     // The non-claiming observer receives all N = 3.
     assert!(
         wait_count(&cobs, 3, Duration::from_secs(5)).await,
-        "observer: expected N=3 deliveries, got {}",
+        "observer: expected EXACTLY N=3 deliveries, got {}",
         cobs.count()
     );
-    assert_eq!(cobs.count(), 3, "observer must count every claimant");
-    println!("  [PASS] claimant counts N-1 (=2), observer counts N (=3)");
+
+    // Prove the EXACT expected publisher SET was delivered, not merely the
+    // cardinality (a matching count with a wrong publisher would be a
+    // silent hole). Exact-set + exact-count together pin the endpoint.
+    let claimant_ids: Vec<u64> = claimants.iter().map(|c| c.node_id()).collect();
+    for (i, cc) in ccs.iter().enumerate() {
+        let expected: HashSet<u64> = claimant_ids
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            cc.seen_publishers(),
+            expected,
+            "claimant {i} must observe EXACTLY the other claimants' reservations"
+        );
+    }
+    let all_claimants: HashSet<u64> = claimant_ids.iter().copied().collect();
+    assert_eq!(
+        cobs.seen_publishers(),
+        all_claimants,
+        "observer must observe EXACTLY all claimants"
+    );
+    println!(
+        "  [PASS] claimant counts N-1 (=2) & observer counts N (=3), exact publisher sets, all claims Won"
+    );
+}
+
+// ============================================================================
+// Exact-count barrier (Kyra ICB-0 Blocker 1).
+// ============================================================================
+
+async fn w_exact_barrier_rejects_overshoot() {
+    let island = 0x7Au64;
+    let (cr, _fold) = unit_router(island);
+    // Record TWO unique verified deliveries for the tracked island.
+    let a = EntityKeypair::generate();
+    let b = EntityKeypair::generate();
+    let _ = cr.try_route(a.entity_id(), &reserve_bytes(&a, island, 1));
+    let _ = cr.try_route(b.entity_id(), &reserve_bytes(&b, island, 1));
+    assert_eq!(cr.count(), 2, "two distinct deliveries recorded");
+    // An EXACT barrier with expected=1 must REJECT the overshoot...
+    assert!(
+        !wait_count(&cr, 1, Duration::from_millis(200)).await,
+        "exact-count barrier must reject overshoot (count 2, expected 1)"
+    );
+    // ...and accept an exact match.
+    assert!(
+        wait_count(&cr, 2, Duration::from_millis(200)).await,
+        "exact-count barrier must accept an exact match (count 2, expected 2)"
+    );
+    println!("  [PASS] exact-count barrier rejects overshoot (2 > 1 -> false)");
+}
+
+// ============================================================================
+// Fixture-reset safety (Kyra ICB-0 Blocker 2).
+// ============================================================================
+
+async fn w_reset_succeeds() {
+    let (h, o) = pair().await;
+    let island = 0x9Bu64;
+    assert_eq!(
+        h.reserve_island(island, far_deadline())
+            .await
+            .expect("reserve"),
+        ClaimOutcome::Won
+    );
+    // O converges to holder H...
+    let mut rxo = o.reservation_fold().subscribe_changes();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        await_reservation_holder(&mut rxo, o.reservation_fold(), island, h.node_id()),
+    )
+    .await
+    .expect("observer must see H as holder");
+    // ...then a fail-loud reset reaches exact Free on both H and O.
+    release_and_await_free(&h, &[&o], island, Duration::from_secs(5)).await;
+    assert_eq!(
+        holder_of(h.reservation_fold(), island),
+        None,
+        "holder fold must be Free after reset"
+    );
+    assert_eq!(
+        holder_of(o.reservation_fold(), island),
+        None,
+        "observer fold must be Free after reset"
+    );
+    println!("  [PASS] fixture reset reaches exact Free on holder + observer");
+}
+
+async fn w_reset_failure_fails_loud() {
+    let (h, _peer) = pair().await;
+    let island = 0x9Au64;
+    assert_eq!(
+        h.reserve_island(island, far_deadline())
+            .await
+            .expect("reserve"),
+        ClaimOutcome::Won
+    );
+    // An isolated observer: the island is held locally by a FOREIGN
+    // publisher and it is NOT connected to H, so H's release never reaches
+    // it → reset must fail loud. A short timeout keeps the harness fast.
+    let o = node().await;
+    o.start_arc();
+    let foreign = EntityKeypair::generate();
+    apply_reserve(o.reservation_fold(), &foreign, island, 1);
+    let h2 = h.clone();
+    let o2 = o.clone();
+    // Suppress the expected panic's default output.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let handle = tokio::spawn(async move {
+        release_and_await_free(&h2, &[&o2], island, Duration::from_millis(300)).await
+    });
+    let res = handle.await;
+    std::panic::set_hook(prev);
+    assert!(
+        matches!(&res, Err(e) if e.is_panic()),
+        "fixture reset must fail loud when an observer never reaches Free (got {res:?})"
+    );
+    println!("  [PASS] fixture reset fails loud when an observer stays held");
 }

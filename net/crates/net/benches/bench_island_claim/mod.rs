@@ -46,6 +46,7 @@ use net::adapter::net::behavior::fold::{
     FoldStats, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationState,
     SignedAnnouncement,
 };
+use net::adapter::net::behavior::gang::ClaimOutcome;
 use net::adapter::net::{EntityId, EntityKeypair, MeshNode, MeshNodeConfig};
 
 /// Shared PSK across every ICB node (matches the CPB / chaos harness).
@@ -271,23 +272,49 @@ pub async fn await_reservation_free(
 }
 
 /// Fixture reset for an UNCONTENDED sample: the holder releases, then we
-/// await exact `Free` on every relevant observer (best-effort bounded).
-/// Distributed-race samples must use FRESH island ids instead (item 11),
-/// since divergent local views are not releasable by one holder.
+/// require exact `Free` on the holder's own fold AND every relevant
+/// observer within `timeout` — FAIL-LOUD. A failed release or a stuck
+/// observer must abort the sample, never silently contaminate the next
+/// one. Distributed-race samples must use FRESH island ids instead
+/// (item 11), since divergent local views are not releasable by one holder.
 pub async fn release_and_await_free(
     holder: &Arc<MeshNode>,
     observers: &[&Arc<MeshNode>],
     island: u64,
+    timeout: Duration,
 ) {
-    holder.release_island(island).await.expect("release");
+    let outcome = holder
+        .release_island(island)
+        .await
+        .expect("release transport/API");
+    assert_eq!(
+        outcome,
+        ClaimOutcome::Won,
+        "fixture holder must successfully release island {island:#x}"
+    );
+    // The holder's OWN fold must reach exact Free, whether or not the
+    // caller listed it among `observers`.
+    await_free_or_panic(holder, island, timeout).await;
     for obs in observers {
-        let mut rx = obs.reservation_fold().subscribe_changes();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            await_reservation_free(&mut rx, obs.reservation_fold(), island),
-        )
-        .await;
+        await_free_or_panic(obs, island, timeout).await;
     }
+}
+
+/// Await exact `Free` for `island` on `node`'s reservation fold within
+/// `timeout`, or panic (fail-loud reset).
+async fn await_free_or_panic(node: &Arc<MeshNode>, island: u64, timeout: Duration) {
+    let mut rx = node.reservation_fold().subscribe_changes();
+    tokio::time::timeout(
+        timeout,
+        await_reservation_free(&mut rx, node.reservation_fold(), island),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "node {} did not reach exact Free for island {island:#x} within {timeout:?}",
+            node.node_id()
+        )
+    });
 }
 
 // ============================================================================
@@ -389,6 +416,20 @@ impl CountingRouter {
         self.state.lock().count
     }
 
+    /// Snapshot of the distinct publishers whose verified reservation
+    /// deliveries were counted for the tracked island — so a witness can
+    /// prove the EXPECTED participant set was delivered, not merely the
+    /// cardinality (a matching count with a wrong publisher would be a
+    /// silent hole otherwise).
+    pub fn seen_publishers(&self) -> HashSet<u64> {
+        self.state
+            .lock()
+            .seen
+            .iter()
+            .map(|(publisher, _, _)| *publisher)
+            .collect()
+    }
+
     /// Reset for a fresh sample: clear the seen set + count and retarget
     /// the tracked island (distributed-race samples use fresh islands).
     pub fn reset(&self, tracked_island: u64) {
@@ -461,26 +502,33 @@ pub fn install_counter(node: &Arc<MeshNode>, island: u64) -> Arc<CountingRouter>
     counter
 }
 
-/// Delivery barrier: await the counting router reaching `expected`
-/// unique verified deliveries within `deadline`. Poll-free (parks on the
-/// count watch). Returns whether the cardinality was reached.
+/// EXACT delivery barrier: await the counting router reaching EXACTLY
+/// `expected` unique verified deliveries within `deadline`. Poll-free
+/// (parks on the count watch). Returns `true` only on an exact match;
+/// **overshoot returns `false`** — an unexpected extra unique reservation
+/// announcement must fail the sample, not satisfy it (Kyra ICB-0 Blocker
+/// 1). A timeout (never reaching `expected`) also returns `false`.
 pub async fn wait_count(
     counter: &Arc<CountingRouter>,
     expected: usize,
     deadline: Duration,
 ) -> bool {
+    use std::cmp::Ordering;
     let mut rx = counter.subscribe();
     let fut = async {
         loop {
-            if counter.count() >= expected {
-                return;
-            }
-            if rx.changed().await.is_err() {
-                return;
+            match counter.count().cmp(&expected) {
+                Ordering::Equal => return true,
+                Ordering::Greater => return false, // overshoot fails the sample
+                Ordering::Less => {
+                    if rx.changed().await.is_err() {
+                        return false;
+                    }
+                }
             }
         }
     };
-    tokio::time::timeout(deadline, fut).await.is_ok() && counter.count() >= expected
+    (tokio::time::timeout(deadline, fut).await).unwrap_or(false)
 }
 
 /// Reservation-delivery PREFLIGHT: does a reservation published by `src`
