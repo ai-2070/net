@@ -1,4 +1,4 @@
-# Organization Capability Auth Plan
+# Organization Capability Auth Plan (OA)
 
 **Version:** v1.3 — applies review-7: the legacy-gate integration
 correction for OA-2 (`may_execute` aggregates allow-lists
