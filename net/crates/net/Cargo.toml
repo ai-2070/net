@@ -468,6 +468,12 @@ name = "island_claim_harness"
 harness = false
 required-features = ["net"]
 
+# ICB-1 ordinary matcher scaling: match_islands over a static fixture.
+[[bench]]
+name = "island_claim_match"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
