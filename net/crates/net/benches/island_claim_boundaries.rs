@@ -10,8 +10,10 @@
 //!   B. API return          — `reserve_island` returns `ClaimOutcome::Won`
 //!      (this includes local apply + peer fan-out work).
 //!   C. direct remote        — the direct observer's fold reads holder ==
-//!      claimant AND its CountingRouter proves exactly one verified
-//!      delivery from the claimant.
+//!      claimant AND its CountingRouter records exactly one verified
+//!      delivery from the claimant, BOTH halves INSIDE the timed endpoint.
+//!      Bare exact state does not stop the remote timer: the router applies
+//!      to the fold (whose watcher wakes) and THEN records the delivery.
 //!
 //! Critical terminology (Kyra ICB-2): `ClaimOutcome::Won` is NOT local
 //! exact commit and NOT remote exact visibility — they are three distinct
@@ -65,6 +67,7 @@ fn main() {
         w7_raw_chain_no_routed_row().await;
         w8_reset_failure_blocks_timing().await;
         w9_final_state_exact().await;
+        w10_combined_remote_endpoint_needs_delivery().await;
 
         println!("\n-- measurement (direct row) --");
         measure_direct().await;
@@ -89,7 +92,7 @@ async fn measure_direct() {
     let mut local = LatencyReport::new();
     let mut api = LatencyReport::new();
     let mut remote = LatencyReport::new();
-    let mut timeouts = 0u64;
+    let mut joint_timeouts = 0u64;
 
     for i in 0..ITERS {
         let island = ISLAND_BASE + i;
@@ -101,24 +104,27 @@ async fn measure_direct() {
                     remote.record(dr.as_nanos() as u64);
                 }
             }
-            None => timeouts += 1, // delivery timeout: NOT printed
+            None => joint_timeouts += 1, // joint-sample timeout: omitted from all three
         }
     }
 
     print_endpoint(
         &local,
         "single claimant: invocation start → local exact holder observed",
-        timeouts,
+        joint_timeouts,
+        "paired sample postcondition",
     );
     print_endpoint(
         &api,
         "single claimant: invocation start → reserve_island API returns Won",
-        timeouts,
+        joint_timeouts,
+        "paired sample postcondition",
     );
     print_endpoint(
         &remote,
-        "single claimant: invocation start → direct observer exact holder observed",
-        timeouts,
+        "single claimant: invocation start → direct observer exact holder + verified claimant delivery observed",
+        joint_timeouts,
+        "part of the timed endpoint",
     );
     println!(
         "   routed row: NOT emitted — a routed reservation row needs a proven logical-peer delivery; a raw A↔R↔B chain is refused (W7). No logical routed peer in ICB-2's baseline."
@@ -152,11 +158,18 @@ async fn one_sample(
     let mut rx_local = claimant.reservation_fold().subscribe_changes();
     let mut rx_remote = observer.reservation_fold().subscribe_changes();
 
-    // Common start; three endpoints measured independently from t0.
+    // The deadline policy is constructed OUTSIDE the timed region: the arg
+    // is evaluated before `reserve_island` is entered, so its
+    // `SystemTime::now()` cost must not sit inside any endpoint's boundary.
+    let claim_deadline = far_deadline();
+
+    // Common start; three endpoints measured independently from t0. The
+    // remote endpoint's verified-delivery barrier is INSIDE its timed
+    // future (`remote_endpoint`), not a post-join postcondition.
     let t0 = Instant::now();
     let claim_fut = async {
         let out = claimant
-            .reserve_island(island, far_deadline())
+            .reserve_island(island, claim_deadline)
             .await
             .expect("reserve API");
         (t0.elapsed(), out)
@@ -166,33 +179,34 @@ async fn one_sample(
         t0.elapsed()
     };
     let remote_fut = async {
-        await_reservation_holder(&mut rx_remote, observer.reservation_fold(), island, cid).await;
+        remote_endpoint(
+            &mut rx_remote,
+            observer.reservation_fold(),
+            island,
+            cid,
+            ocount,
+        )
+        .await;
         t0.elapsed()
     };
+    // Joint ceiling over ALL THREE endpoints. A timeout omits the sample
+    // from all three paired distributions — it is a JOINT-sample timeout,
+    // not specifically a delivery timeout.
     let joined = tokio::time::timeout(SAMPLE_DEADLINE, async {
         tokio::join!(claim_fut, local_fut, remote_fut)
     })
     .await;
     let ((api_dt, outcome), local_dt, remote_dt) = match joined {
         Ok(v) => v,
-        Err(_) => return None, // delivery timeout: skip
+        Err(_) => return None, // joint-sample timeout: omit from all three
     };
 
-    // Hard invariants — no sample prints after any of these.
+    // Postconditions (paired sample checks). The verified-delivery barrier
+    // is already timed inside `remote_fut`; these are redundant final state.
     assert_eq!(
         outcome,
         ClaimOutcome::Won,
         "uncontended single claim must Win (not Lost)"
-    );
-    assert!(
-        wait_count(ocount, 1, SAMPLE_DEADLINE).await,
-        "observer must have EXACTLY one verified delivery (got {})",
-        ocount.count()
-    );
-    assert_eq!(
-        ocount.seen_publishers(),
-        HashSet::from([cid]),
-        "the verified delivery's publisher must be the claimant"
     );
     assert_eq!(
         holder_of(claimant.reservation_fold(), island),
@@ -208,19 +222,46 @@ async fn one_sample(
     Some((local_dt, api_dt, remote_dt))
 }
 
-fn print_endpoint(report: &LatencyReport, label: &str, timeouts: u64) {
+/// The combined REMOTE endpoint: block until the observer's reservation
+/// fold reads holder == `cid` AND its counting router has recorded exactly
+/// one verified delivery from `cid`. BOTH halves must hold — bare exact
+/// state does NOT complete this endpoint, because the exact-holder watcher
+/// can wake before the counting router records the delivery (the router
+/// applies to the fold, whose watcher fires, THEN records the delivery).
+/// Fail-loud on overshoot or a wrong publisher.
+async fn remote_endpoint(
+    rx: &mut tokio::sync::watch::Receiver<u64>,
+    fold: &Arc<Fold<ReservationFold>>,
+    island: u64,
+    cid: u64,
+    ocount: &Arc<CountingRouter>,
+) {
+    await_reservation_holder(rx, fold, island, cid).await;
+    assert!(
+        wait_count(ocount, 1, SAMPLE_DEADLINE).await,
+        "observer must receive EXACTLY one verified delivery (got {})",
+        ocount.count()
+    );
+    assert_eq!(
+        ocount.seen_publishers(),
+        HashSet::from([cid]),
+        "the verified delivery's publisher must be the claimant"
+    );
+}
+
+fn print_endpoint(report: &LatencyReport, label: &str, joint_timeouts: u64, delivery_role: &str) {
     println!("── {label} ──");
     println!(
         "   topology=claimant↔observer · claimants=1 · mode=direct · logical_peers=1 · fan_out_peers=1(observer) · workers={WORKER_THREADS}"
     );
     println!(
-        "   island_units=n/a (raw reservation CAS; units are an ICB-1 matcher concept) · deadline=far-future (no takeover — ICB-6 owns it) · fixture=fresh-island-per-sample (no in-timing reset)"
+        "   island_units=n/a (raw reservation CAS; units are an ICB-1 matcher concept) · deadline=far-future (precomputed outside timing; no takeover — ICB-6 owns it) · fixture=fresh-island-per-sample (no in-timing reset)"
     );
     println!(
-        "   preflight=PASS(direct reservation delivery proven) · exact_state_assertion=enforced(local+remote exact-holder + final holder on both folds) · verified_delivery_assertion=enforced(count==1, publisher==claimant)"
+        "   preflight=PASS(direct reservation delivery proven) · exact_state=enforced · verified_delivery={delivery_role}"
     );
     println!(
-        "   completed_samples={} · timeouts={timeouts}",
+        "   completed_samples={} · joint_sample_timeouts={joint_timeouts} (joint ceiling covers all three endpoints; timed-out samples omitted from all three paired distributions)",
         report.samples()
     );
     println!(
@@ -421,4 +462,66 @@ async fn w9_final_state_exact() {
     assert_eq!(holder_of(claimant.reservation_fold(), island), Some(cid));
     assert_eq!(holder_of(observer.reservation_fold(), island), Some(cid));
     println!("  [PASS] W9 final state exact on claimant + observer");
+}
+
+/// W10 — the combined remote endpoint requires verified delivery, not bare
+/// exact state. Applying the reservation directly to the observer fold
+/// (bypassing the CountingRouter) makes the exact holder visible but leaves
+/// the verified-delivery count at zero, so `remote_endpoint` must NOT
+/// complete; routing the same signed frame through the counting router
+/// (Rejected-but-counted) then completes it with the expected publisher.
+async fn w10_combined_remote_endpoint_needs_delivery() {
+    let observer = node().await;
+    let island = 0x2C0Au64;
+    let ocount = install_counter(&observer, island);
+    let kp = EntityKeypair::generate();
+    let cid = kp.node_id();
+
+    // 1. Apply directly to the observer fold, BYPASSING the counting router.
+    observer
+        .reservation_fold()
+        .apply(reserve_ann(&kp, island, 1))
+        .expect("direct apply");
+    // 2. The observer's exact-holder read succeeds.
+    assert_eq!(
+        holder_of(observer.reservation_fold(), island),
+        Some(cid),
+        "exact holder must be visible"
+    );
+    // 3. The combined endpoint does NOT complete on bare exact state: the
+    //    verified-delivery count is still zero, so `remote_endpoint` blocks.
+    let mut rx = observer.reservation_fold().subscribe_changes();
+    let bare = tokio::time::timeout(
+        Duration::from_millis(200),
+        remote_endpoint(&mut rx, observer.reservation_fold(), island, cid, &ocount),
+    )
+    .await;
+    assert!(
+        bare.is_err(),
+        "bare exact state must NOT complete the combined remote endpoint"
+    );
+    assert_eq!(ocount.count(), 0, "no verified delivery recorded yet");
+
+    // 4. Route the signed frame THROUGH the counting router. The fold
+    //    Rejects (state already present) but the delivery still counts.
+    let out = ocount.try_route(kp.entity_id(), &reserve_bytes(&kp, island, 1));
+    assert!(
+        out.is_ok(),
+        "verified route must dispatch (Rejected ok), got {out:?}"
+    );
+
+    // 5. The combined endpoint now completes with the expected publisher.
+    let mut rx2 = observer.reservation_fold().subscribe_changes();
+    let done = tokio::time::timeout(
+        Duration::from_millis(500),
+        remote_endpoint(&mut rx2, observer.reservation_fold(), island, cid, &ocount),
+    )
+    .await;
+    assert!(
+        done.is_ok(),
+        "combined endpoint must complete once verified delivery is recorded"
+    );
+    println!(
+        "  [PASS] W10 combined remote endpoint requires verified delivery, not bare exact state"
+    );
 }
