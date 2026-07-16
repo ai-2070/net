@@ -488,6 +488,13 @@ name = "island_claim_divergence"
 harness = false
 required-features = ["net"]
 
+# ICB-4 known-state fallback (SINGLE CLAIMANT): claim loop walks past one
+# pre-converged held island to the next free one; nine per-sample assertions.
+[[bench]]
+name = "island_claim_fallback"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
