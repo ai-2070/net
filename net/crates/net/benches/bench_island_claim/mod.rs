@@ -384,6 +384,17 @@ struct CountState {
     count: usize,
 }
 
+/// An atomic snapshot of a counter's delivery endpoint — the unique
+/// verified-delivery `count` and the distinct `publishers` behind it, read
+/// together under ONE lock so an endpoint verifier sees a coherent
+/// `(count, publisher-set)` pair (never a torn read across two separate lock
+/// acquisitions, where a late unique tuple could land between them).
+#[derive(Debug, Clone)]
+pub struct DeliverySnapshot {
+    pub count: usize,
+    pub publishers: HashSet<u64>,
+}
+
 pub struct CountingRouter {
     inner: FoldRegistry,
     state: Mutex<CountState>,
@@ -428,6 +439,19 @@ impl CountingRouter {
             .iter()
             .map(|(publisher, _, _)| *publisher)
             .collect()
+    }
+
+    /// Atomic `(count, publishers)` snapshot for the tracked island — the
+    /// endpoint verifier's single source of truth. Acquires the state lock
+    /// ONCE so the count and its publisher set cannot tear across two reads
+    /// (closing the window where a late unique tuple could land between a
+    /// separate `count()` and `seen_publishers()`).
+    pub fn delivery_snapshot(&self) -> DeliverySnapshot {
+        let st = self.state.lock();
+        DeliverySnapshot {
+            count: st.count,
+            publishers: st.seen.iter().map(|(publisher, _, _)| *publisher).collect(),
+        }
     }
 
     /// Reset for a fresh sample: clear the seen set + count and retarget
@@ -634,9 +658,6 @@ pub struct DivergenceReport {
     pub logical_sessions: usize,
     pub observation_window: Duration,
     pub optimistic_local_won: usize,
-    pub distinct_holders_at_delivery: usize,
-    pub distinct_holders_at_window_end: usize,
-    pub largest_agreement_cohort: usize,
     pub claimant_self_belief: usize,
     pub foreign_rejected: usize,
     /// Agreement RATIOS reported three ways (M7-3): claimants only,
@@ -659,12 +680,12 @@ impl DivergenceReport {
             "   claimants={} logical_sessions={} window={:?}",
             self.claimants, self.logical_sessions, self.observation_window
         );
+        // Holder shape is NOT reported here as singular extrema — the
+        // separate HolderShapeAggregate range line is the sole holder-shape
+        // output (Kyra ICB-3 closure: no unlabeled singular holder values).
         println!(
-            "   optimistic_local_won={} distinct_holders(delivery)={} distinct_holders(end-W)={} largest_cohort={}",
-            self.optimistic_local_won,
-            self.distinct_holders_at_delivery,
-            self.distinct_holders_at_window_end,
-            self.largest_agreement_cohort,
+            "   optimistic_local_won={} claimant_self_belief={} foreign_rejected={} (holder-shape ranges printed separately)",
+            self.optimistic_local_won, self.claimant_self_belief, self.foreign_rejected,
         );
         println!(
             "   agreement: claimant={:.2} observer={:.2} all-node={:.2}",

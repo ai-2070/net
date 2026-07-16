@@ -237,6 +237,51 @@ async fn build_topology(n: usize) -> Option<Topology> {
     })
 }
 
+/// Shared complete-delivery endpoint proof — used by BOTH the production
+/// measurement ([`delivery_round_timed`]) and the W13 witness, so disabling
+/// the publisher check here breaks W13 (Kyra ICB-3 closure: W13 must pin the
+/// production endpoint). Given the per-counter `(count, publishers)` snapshots,
+/// it re-proves EXACTLY the expected cardinality AND the expected publisher set
+/// together:
+///   - each claimant `i`: exactly N-1 unique deliveries, publishers = every
+///     OTHER claimant id;
+///   - the observer: exactly N unique deliveries, publishers = all claimant ids.
+///
+/// Counts are monotonic within a round (reset only at its start), so a snapshot
+/// count above target can only be a late unique tuple that landed after the
+/// count barrier returned at equality — a [`InvalidReason::CountOvershoot`]. A
+/// matching cardinality with the wrong sources is a
+/// [`InvalidReason::PublisherMismatch`].
+fn verify_delivery_endpoint(
+    claimant_snapshots: &[DeliverySnapshot],
+    observer_snapshot: &DeliverySnapshot,
+    claimant_ids: &[u64],
+) -> Result<(), InvalidReason> {
+    let n = claimant_ids.len();
+    for (i, snap) in claimant_snapshots.iter().enumerate() {
+        if snap.count != n - 1 {
+            return Err(InvalidReason::CountOvershoot);
+        }
+        let expected: HashSet<u64> = claimant_ids
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, id)| *id)
+            .collect();
+        if snap.publishers != expected {
+            return Err(InvalidReason::PublisherMismatch);
+        }
+    }
+    if observer_snapshot.count != n {
+        return Err(InvalidReason::CountOvershoot);
+    }
+    let all_ids: HashSet<u64> = claimant_ids.iter().copied().collect();
+    if observer_snapshot.publishers != all_ids {
+        return Err(InvalidReason::PublisherMismatch);
+    }
+    Ok(())
+}
+
 /// One synchronized concurrent-claim round on `island`: every claimant claims
 /// together from a common t0, then we await the complete verified-delivery
 /// endpoint — each claimant reaches EXACTLY N-1 and the observer EXACTLY N AND
@@ -317,25 +362,20 @@ async fn delivery_round_timed(
         });
     }
 
-    // Exact expected publisher sets — proven BEFORE the endpoint timestamp
-    // (cardinality alone does not complete the combined delivery endpoint).
-    for (i, cc) in claimant_counters.iter().enumerate() {
-        let expected: HashSet<u64> = claimant_ids
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, id)| *id)
-            .collect();
-        if cc.seen_publishers() != expected {
-            return Err(InvalidReason::PublisherMismatch);
-        }
-    }
-    let all_ids: HashSet<u64> = claimant_ids.iter().copied().collect();
-    if observer_counter.seen_publishers() != all_ids {
-        return Err(InvalidReason::PublisherMismatch);
-    }
+    // Re-prove EXACT count AND EXACT publisher set together, atomically per
+    // counter (one lock per snapshot), immediately before the endpoint
+    // timestamp — via the SAME `verify_delivery_endpoint` the W13 witness
+    // pins. This also closes the interval between the count barrier returning
+    // at equality and this capture: a late unique (publisher, generation)
+    // tuple surfaces here as a CountOvershoot rather than slipping in unseen.
+    let claimant_snaps: Vec<DeliverySnapshot> = claimant_counters
+        .iter()
+        .map(|cc| cc.delivery_snapshot())
+        .collect();
+    let observer_snap = observer_counter.delivery_snapshot();
+    verify_delivery_endpoint(&claimant_snaps, &observer_snap, claimant_ids)?;
     // Endpoint 2 (complete verified delivery): exact count AND exact publisher
-    // sets both proven — capture only now.
+    // sets both re-proven atomically — capture only now.
     let complete_delivery_dt = t0.elapsed();
 
     // Endpoint 1 (all claim APIs returned) + Won validity. Claims returned
@@ -382,6 +422,72 @@ async fn delivery_round(
 /// Minimum agreement-duration samples before percentiles are credible.
 const AGREEMENT_MIN_SAMPLES: u64 = 30;
 
+/// Per-topology holder-shape aggregate — RANGES + uniform-shape incidence.
+/// The production measurement AND the W14 witness both record into this SAME
+/// type and render via [`HolderShapeAggregate::format_line`], so a collapsed
+/// range (in recording OR formatting) fails the witness (Kyra ICB-3 closure:
+/// the holder-shape witness must pin the production aggregate/formatter).
+#[derive(Default)]
+struct HolderShapeAggregate {
+    distinct_delivery_min: usize,
+    distinct_delivery_max: usize,
+    distinct_window_min: usize,
+    distinct_window_max: usize,
+    cohort_min: usize,
+    cohort_max: usize,
+    uniform_shape: usize, // samples with distinct == N && largest_cohort == 2
+    samples: usize,
+}
+
+impl HolderShapeAggregate {
+    /// Fold one sample's holder shape into the running ranges. The first
+    /// sample seeds min == max, so `#[derive(Default)]`'s zeroed mins are
+    /// never mistaken for a real minimum.
+    fn record(
+        &mut self,
+        claimants: usize,
+        distinct_delivery: usize,
+        distinct_window: usize,
+        largest_cohort: usize,
+    ) {
+        if self.samples == 0 {
+            self.distinct_delivery_min = distinct_delivery;
+            self.distinct_delivery_max = distinct_delivery;
+            self.distinct_window_min = distinct_window;
+            self.distinct_window_max = distinct_window;
+            self.cohort_min = largest_cohort;
+            self.cohort_max = largest_cohort;
+        } else {
+            self.distinct_delivery_min = self.distinct_delivery_min.min(distinct_delivery);
+            self.distinct_delivery_max = self.distinct_delivery_max.max(distinct_delivery);
+            self.distinct_window_min = self.distinct_window_min.min(distinct_window);
+            self.distinct_window_max = self.distinct_window_max.max(distinct_window);
+            self.cohort_min = self.cohort_min.min(largest_cohort);
+            self.cohort_max = self.cohort_max.max(largest_cohort);
+        }
+        if distinct_delivery == claimants && largest_cohort == 2 {
+            self.uniform_shape += 1;
+        }
+        self.samples += 1;
+    }
+
+    /// The SOLE holder-shape output line — ranges + uniform-shape incidence.
+    /// A collapsed min..min / max..max here fails W14.
+    fn format_line(&self) -> String {
+        format!(
+            "holder_shape: distinct@delivery[min={} max={}] distinct@end-W[min={} max={}] largest_cohort[min={} max={}] · uniform(distinct=N,cohort=2)={}/{}",
+            self.distinct_delivery_min,
+            self.distinct_delivery_max,
+            self.distinct_window_min,
+            self.distinct_window_max,
+            self.cohort_min,
+            self.cohort_max,
+            self.uniform_shape,
+            self.samples,
+        )
+    }
+}
+
 #[derive(Default)]
 struct Agg {
     samples: usize, // valid divergence observations
@@ -395,14 +501,8 @@ struct Agg {
     claimant_agree: usize,
     observer_agree: usize,
     all_node_agree: usize,
-    // Holder-shape ranges (min/max) — never a single hidden extremum.
-    distinct_delivery_min: usize,
-    distinct_delivery_max: usize,
-    distinct_window_min: usize,
-    distinct_window_max: usize,
-    cohort_min: usize,
-    cohort_max: usize,
-    uniform_shape: usize, // samples with distinct == N && largest_cohort == 2
+    // Holder shapes recorded through the SAME aggregate the W14 witness pins.
+    shape: HolderShapeAggregate,
 }
 
 impl Agg {
@@ -426,12 +526,9 @@ async fn measure_topology(n: usize) {
     let mut complete_delivery = LatencyReport::new();
     // Completed time-to-agreement (only AgreedDuringWindow contributes).
     let mut agreement_dur = LatencyReport::new();
-    let mut agg = Agg {
-        distinct_delivery_min: usize::MAX,
-        distinct_window_min: usize::MAX,
-        cohort_min: usize::MAX,
-        ..Default::default()
-    };
+    // HolderShapeAggregate::record seeds min == max on the first sample, so a
+    // plain Default (zeroed mins) is correct.
+    let mut agg = Agg::default();
 
     for s in 0..SAMPLES {
         let island = ISLAND_BASE + s;
@@ -487,17 +584,11 @@ async fn measure_topology(n: usize) {
         let obs_final = holder_of(topo.observer.reservation_fold(), island);
         let (distinct1, _) = holder_stats(&final_c, obs_final);
 
-        // Aggregate the architecture outcomes — RANGES, never a hidden extremum.
+        // Aggregate the architecture outcomes. Holder shapes go through the
+        // SAME HolderShapeAggregate::record the W14 witness pins — RANGES,
+        // never a hidden extremum.
         agg.samples += 1;
-        agg.distinct_delivery_min = agg.distinct_delivery_min.min(distinct0);
-        agg.distinct_delivery_max = agg.distinct_delivery_max.max(distinct0);
-        agg.distinct_window_min = agg.distinct_window_min.min(distinct1);
-        agg.distinct_window_max = agg.distinct_window_max.max(distinct1);
-        agg.cohort_min = agg.cohort_min.min(cohort0);
-        agg.cohort_max = agg.cohort_max.max(cohort0);
-        if distinct0 == n && cohort0 == 2 {
-            agg.uniform_shape += 1;
-        }
+        agg.shape.record(n, distinct0, distinct1, cohort0);
         if common_holder(&initial, initial.first().copied().flatten()).is_some() {
             agg.claimant_agree += 1;
         }
@@ -525,16 +616,12 @@ async fn measure_topology(n: usize) {
     // Architecture outcomes (incidence + ranges; no latency percentiles).
     let denom = agg.samples.max(1) as f64;
     let invalid = agg.invalid();
-    let zero_if_unset = |v: usize| if v == usize::MAX { 0 } else { v };
     let report = DivergenceReport {
         label: format!("N={n} claimants (+1 observer)"),
         claimants: n,
         logical_sessions: logical_sessions(n + 1),
         observation_window: WINDOW,
-        optimistic_local_won: n, // per sample — N/N
-        distinct_holders_at_delivery: agg.distinct_delivery_max,
-        distinct_holders_at_window_end: agg.distinct_window_max,
-        largest_agreement_cohort: agg.cohort_max,
+        optimistic_local_won: n,     // per sample — N/N
         claimant_self_belief: n,     // each claimant holds itself locally
         foreign_rejected: n * n - 1, // (N-1) per claimant + (N-1) at observer
         claimant_holder_agreement: agg.claimant_agree as f64 / denom,
@@ -545,19 +632,10 @@ async fn measure_topology(n: usize) {
         invalid_samples: invalid,
     };
     report.print();
-    // Holder-shape RANGES + uniform-shape incidence — proves the every-sample
-    // claim (a lone extreme sample cannot masquerade as the singular value).
-    println!(
-        "   holder_shape: distinct@delivery[min={} max={}] distinct@end-W[min={} max={}] largest_cohort[min={} max={}] · uniform(distinct=N,cohort=2)={}/{}",
-        zero_if_unset(agg.distinct_delivery_min),
-        agg.distinct_delivery_max,
-        zero_if_unset(agg.distinct_window_min),
-        agg.distinct_window_max,
-        zero_if_unset(agg.cohort_min),
-        agg.cohort_max,
-        agg.uniform_shape,
-        agg.samples,
-    );
+    // Holder-shape RANGES + uniform-shape incidence — the SOLE holder-shape
+    // output, rendered via the same HolderShapeAggregate::format_line the W14
+    // witness pins (a lone extreme sample cannot masquerade as a singular value).
+    println!("   {}", agg.shape.format_line());
     // Invalid-sample reason breakdown (NOT timeouts; disagreement is NEVER invalid).
     println!(
         "   invalid_samples={invalid}: delivery_timeout={} overshoot={} claim_not_won={} publisher_mismatch={} · (persistent disagreement is right-censored, never invalid)",
@@ -772,39 +850,84 @@ async fn w5_missing_delivery_invalidates() {
 }
 
 /// W13 — same cardinality with a WRONG publisher cannot complete the combined
-/// delivery endpoint: cardinality alone does not prove the expected sources.
+/// delivery endpoint. Drives a REAL [`CountingRouter`] to the exact target
+/// cardinality (n-1) via an unexpected publisher, snapshots it with the
+/// production `delivery_snapshot`, and feeds it through the SAME
+/// `verify_delivery_endpoint` the measurement uses — which must reject it as
+/// [`InvalidReason::PublisherMismatch`]. Disabling the production publisher
+/// check inside `verify_delivery_endpoint` breaks this witness.
 fn w13_wrong_publisher_same_cardinality() {
     let island = 0x3C0Du64;
-    let (cr, _fold) = unit_router(island);
+    let a = EntityKeypair::generate();
+    let b = EntityKeypair::generate();
+    let claimant_ids = vec![a.node_id(), b.node_id()];
+
+    // Claimant 0's slot: a real router that reached the exact target
+    // cardinality (n-1 = 1) but from an UNEXPECTED publisher (neither claimant
+    // identity). Snapshot count + publishers together, exactly as production.
+    let (cr0, _fold) = unit_router(island);
     let unexpected = EntityKeypair::generate();
-    let _ = cr.try_route(
+    let _ = cr0.try_route(
         unexpected.entity_id(),
         &reserve_bytes(&unexpected, island, 1),
     );
-    assert_eq!(cr.count(), 1, "cardinality target reached");
-    // The delivery endpoint proves an EXPECTED publisher set; a wrong publisher
-    // at the same cardinality fails that proof (-> InvalidReason::PublisherMismatch).
-    let expected: HashSet<u64> = HashSet::from([0xDEAD_BEEFu64]);
-    assert_ne!(
-        cr.seen_publishers(),
-        expected,
-        "same cardinality but the wrong publisher set — endpoint must not complete"
+    let snap0 = cr0.delivery_snapshot();
+    assert_eq!(snap0.count, 1, "cardinality target (n-1) reached");
+
+    // Claimant 1's slot + the observer: correct cardinalities/publisher sets.
+    let snap1 = DeliverySnapshot {
+        count: 1,
+        publishers: HashSet::from([a.node_id()]),
+    };
+    let observer = DeliverySnapshot {
+        count: 2,
+        publishers: HashSet::from([a.node_id(), b.node_id()]),
+    };
+
+    // The SAME endpoint verifier production uses must reject the wrong
+    // publisher at matching cardinality.
+    assert_eq!(
+        verify_delivery_endpoint(&[snap0, snap1], &observer, &claimant_ids),
+        Err(InvalidReason::PublisherMismatch),
+        "same cardinality but the wrong publisher must fail the shared endpoint verifier"
     );
-    println!("  [PASS] W13 same cardinality + wrong publisher cannot complete delivery");
+    println!(
+        "  [PASS] W13 same cardinality + wrong publisher cannot complete delivery (shared verifier)"
+    );
 }
 
-/// W14 — mixed holder shapes are reported as a RANGE, so a lone extreme sample
-/// cannot masquerade as the singular value.
+/// W14 — mixed per-sample holder shapes are recorded AND formatted as a RANGE,
+/// so a lone extreme sample cannot masquerade as a singular value. Feeds mixed
+/// samples through the SAME `HolderShapeAggregate::record` + `format_line` the
+/// production measurement uses, so collapsing EITHER the recording or the
+/// formatter breaks this witness.
 fn w14_mixed_shapes_not_collapsed() {
-    let per_sample_distinct = [3usize, 1, 2];
-    let min = *per_sample_distinct.iter().min().unwrap();
-    let max = *per_sample_distinct.iter().max().unwrap();
-    assert_eq!((min, max), (1, 3), "range must expose both extremes");
-    assert_ne!(
-        min, max,
-        "a mixed-shape aggregate must NOT collapse into one misleading value"
+    let mut shape = HolderShapeAggregate::default();
+    shape.record(4, 3, 3, 2); // distinct@delivery = 3
+    shape.record(4, 1, 1, 4); // distinct@delivery = 1 (coincidental agreement)
+    shape.record(4, 2, 2, 3); // distinct@delivery = 2
+
+    // Recording must retain BOTH extremes, never collapse to one value.
+    assert_eq!(
+        (shape.distinct_delivery_min, shape.distinct_delivery_max),
+        (1, 3),
+        "recorded distinct-holder range must expose both extremes"
     );
-    println!("  [PASS] W14 mixed holder shapes → min/max range, not a hidden singular extremum");
+    assert_eq!(
+        (shape.cohort_min, shape.cohort_max),
+        (2, 4),
+        "recorded cohort range must expose both extremes"
+    );
+    // The SOLE holder-shape output line (same formatter production prints) must
+    // emit the full range — a collapsed min..min / max..max fails here.
+    let line = shape.format_line();
+    assert!(
+        line.contains("distinct@delivery[min=1 max=3]"),
+        "formatter must emit the full range, not a collapsed extremum: {line}"
+    );
+    println!(
+        "  [PASS] W14 mixed holder shapes → recorded + formatted as a range, not a hidden extremum"
+    );
 }
 
 /// W12 — a raw chain topology cannot enter the matrix: the sentinel delivery
