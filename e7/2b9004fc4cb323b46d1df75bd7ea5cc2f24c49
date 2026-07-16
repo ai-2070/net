@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/ORG_CAPABILITY_AUTH_PLAN.md
+  s_c28bdf38c0df3a::t_0ada2f7ebeeeb7 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "e72b9004fc4cb323b46d1df75bd7ea5cc2f24c49",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
