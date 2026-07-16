@@ -69,7 +69,9 @@ pub struct AdoptArgs {
     pub floors: Option<PathBuf>,
 
     /// Clock-skew tolerance (seconds) for the certificate window
-    /// check. Strict by default, mirroring the token module.
+    /// check. Strict by default, mirroring the token module;
+    /// hard-capped at the token ceiling (300 s) — larger values
+    /// are rejected before anything is written.
     #[arg(long = "skew-secs", default_value_t = 0)]
     pub skew_secs: u64,
 
@@ -86,6 +88,18 @@ pub async fn run(cmd: NodeCommand, output: Option<OutputFormat>) -> Result<(), C
 }
 
 async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    // Enforce the token-module clock-skew ceiling BEFORE touching
+    // anything (review-8 §11): the library would refuse too, but a
+    // misuse this plain is argument validation, not a ceremony
+    // failure.
+    if args.skew_secs > net_sdk::org::MAX_TOKEN_CLOCK_SKEW_SECS {
+        return Err(invalid_args(format!(
+            "--skew-secs {} exceeds the ceiling of {} seconds (MAX_TOKEN_CLOCK_SKEW_SECS)",
+            args.skew_secs,
+            net_sdk::org::MAX_TOKEN_CLOCK_SKEW_SECS
+        )));
+    }
+
     // Resolve the node's entity id.
     let entity: EntityId = match (&args.identity, &args.entity) {
         (Some(identity_path), None) => {
@@ -122,23 +136,13 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         )));
     }
 
-    let dir = args
-        .authority_dir
-        .clone()
-        .unwrap_or_else(default_authority_dir);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| generic(format!("failed to create {}: {e}", dir.display())))?;
-
-    // Adopt — verifies before writing; loud on any refusal. Sync
-    // file I/O on a oneshot CLI path; the same pattern as
-    // `identity revoke`'s store write.
-    let authority = NodeAuthority::adopt(&dir, cert_file.cert, &entity, args.skew_secs)
-        .map_err(|e| sdk(format!("adopt refused: {e}")))?;
-
-    // Optionally merge an operator floors bundle (monotone; a
-    // lower bundle is a no-op, never an error).
-    let floors_applied = match &args.floors {
+    // Parse the optional floors bundle BEFORE the ceremony — it
+    // participates in pre-write certificate validation inside
+    // `NodeAuthority::adopt` (review-8 §7): a certificate the
+    // resulting floors would immediately revoke never adopts, and
+    // a bundle signed by any org other than the candidate owner is
+    // refused before durable state changes (§6).
+    let floors_bundle = match &args.floors {
         Some(bundle_path) => {
             let text = tokio::fs::read_to_string(bundle_path).await.map_err(|e| {
                 generic(format!(
@@ -159,14 +163,32 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
                     floors_file.version
                 )));
             }
-            let raised = authority
-                .revocation
-                .apply_bundle(&floors_file.bundle)
-                .map_err(|e| sdk(format!("floors bundle rejected: {e}")))?;
-            Some(raised)
+            Some(floors_file.bundle)
         }
         None => None,
     };
+
+    let dir = args
+        .authority_dir
+        .clone()
+        .unwrap_or_else(default_authority_dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| generic(format!("failed to create {}: {e}", dir.display())))?;
+
+    // Adopt — the ceremony validates EVERYTHING (including the
+    // supplied bundle's resulting floors) before writing, applies
+    // floors durably, and publishes membership last. Sync file I/O
+    // on a oneshot CLI path; the same pattern as `identity
+    // revoke`'s store write.
+    let authority = NodeAuthority::adopt(
+        &dir,
+        cert_file.cert,
+        &entity,
+        args.skew_secs,
+        floors_bundle.as_ref(),
+    )
+    .map_err(|e| sdk(format!("adopt refused: {e}")))?;
 
     let summary = AdoptOutput {
         authority_dir: dir.display().to_string(),
@@ -175,7 +197,7 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         generation: authority.config.owner_cert.generation,
         not_after: authority.config.owner_cert.not_after,
         files: NodeAuthority::file_names(),
-        floors_raised: floors_applied,
+        floors_applied: floors_bundle.as_ref().map(|b| b.floors().len()),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &summary)
         .map_err(|e| generic(format!("write summary: {e}")))?;
@@ -191,7 +213,7 @@ struct AdoptOutput {
     not_after: u64,
     files: [&'static str; 3],
     #[serde(skip_serializing_if = "Option::is_none")]
-    floors_raised: Option<usize>,
+    floors_applied: Option<usize>,
 }
 
 fn default_authority_dir() -> PathBuf {

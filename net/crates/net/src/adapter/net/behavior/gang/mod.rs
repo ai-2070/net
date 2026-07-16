@@ -259,7 +259,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
-            owner_org: None,
+            owner: None,
         };
         let ann = SignedAnnouncement::sign(
             kp,

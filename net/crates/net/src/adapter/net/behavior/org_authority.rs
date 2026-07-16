@@ -39,8 +39,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::org::{OrgError, OrgId, OrgMembershipCert};
-use super::org_revocation::{write_atomic, OrgRevocationError, OrgRevocationStore};
+use super::org::{OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
+use super::org_revocation::{
+    write_atomic, OrgRevocationError, OrgRevocationState, OrgRevocationStore,
+};
 use crate::adapter::net::identity::EntityId;
 
 /// File name of the membership config inside the authority dir.
@@ -92,11 +94,16 @@ impl NodeAuthorityConfig {
     /// order: config consistency (`owner_org == owner_cert.org_id`)
     /// → member binding (`owner_cert.member == local_entity`) →
     /// certificate signature + TTL ceiling + validity window →
-    /// persisted revocation floor.
+    /// revocation floor against the supplied state.
+    ///
+    /// Takes an [`OrgRevocationState`] (not the store) so the
+    /// adoption ceremony can verify against CANDIDATE floors —
+    /// persisted maxima plus a not-yet-applied operator bundle —
+    /// before any durable state changes (review-8 §7).
     pub fn self_verify(
         &self,
         local_entity: &EntityId,
-        floors: &OrgRevocationStore,
+        floors: &OrgRevocationState,
         skew_secs: u64,
     ) -> Result<(), OrgAuthorityError> {
         if self.version != NODE_AUTHORITY_CONFIG_VERSION {
@@ -302,6 +309,32 @@ pub enum OrgAuthorityError {
         /// The org the new certificate names.
         requested: OrgId,
     },
+    /// An adopt-time floor bundle was signed by an organization
+    /// other than the candidate owner. Signed receipt is not trust
+    /// establishment (review-8 §6): the owner-adoption ceremony
+    /// tracks exactly one root, and foreign relying-party floors
+    /// need their own explicitly pinned surface in a later phase.
+    ForeignFloorBundle {
+        /// The org that signed the supplied bundle.
+        bundle_org: OrgId,
+        /// The candidate owner org.
+        owner_org: OrgId,
+    },
+    /// `owner-audience.key` is group/other-readable. Creation-time
+    /// 0600 is insufficient — config management, copying, or manual
+    /// edits can weaken it later — so both startup and re-adoption
+    /// re-check and refuse (review-8 §10).
+    PermissiveAudienceFile {
+        /// The key file's path.
+        path: String,
+        /// The observed mode bits.
+        mode: u32,
+    },
+    /// Owner-cert emission was enabled on a node with no installed
+    /// [`NodeAuthority`]. Emission is sourced EXCLUSIVELY from the
+    /// loaded, self-verified authority (review-8 §3) — there is no
+    /// raw-certificate bypass.
+    NoAuthorityInstalled,
     /// Filesystem failure.
     Io {
         /// The path involved.
@@ -351,6 +384,25 @@ impl std::fmt::Display for OrgAuthorityError {
                 "node already owned by org {existing}; refusing adoption by {requested} \
                  (one node one owner — remove the existing authority explicitly to transfer)"
             ),
+            Self::ForeignFloorBundle {
+                bundle_org,
+                owner_org,
+            } => write!(
+                f,
+                "floor bundle signed by org {bundle_org} but the candidate owner is \
+                 {owner_org}; the adoption ceremony tracks only the owner root"
+            ),
+            Self::PermissiveAudienceFile { path, mode } => write!(
+                f,
+                "owner audience key {path} has permissive mode {mode:#o} (group/other \
+                 readable); tighten to 0600 — refusing to treat a possibly-disclosed \
+                 audience key as installed"
+            ),
+            Self::NoAuthorityInstalled => write!(
+                f,
+                "owner-cert emission requires an installed node authority; run \
+                 `net node adopt` and configure the authority directory first"
+            ),
             Self::Io { path, reason } => write!(f, "authority I/O at {path}: {reason}"),
             Self::Revocation(e) => write!(f, "{e}"),
         }
@@ -380,32 +432,56 @@ pub struct NodeAuthority {
 
 impl NodeAuthority {
     /// `net node adopt` — provision `dir` with the three authority
-    /// files, verifying BEFORE writing (a cert that wouldn't pass
-    /// startup must not be installed):
+    /// files under the review-8 ceremony order: EVERYTHING is
+    /// validated before anything durable changes, floors advance
+    /// before membership, and membership publishes LAST — a failed
+    /// re-adoption never advertises a renewal whose supporting
+    /// state failed validation.
     ///
-    /// - `owner-membership.json` — written from `owner_cert`.
-    ///   Refuses a DIFFERENT org's cert while an owner is
-    ///   installed (loud [`OrgAuthorityError::AlreadyOwned`]);
-    ///   same-org renewal overwrites.
+    /// ```text
+    /// validate existing membership (one node one owner)
+    /// → validate existing audience credential (codec + 0600 mode)
+    /// → strictly load persisted floor maxima (no creation yet)
+    /// → verify the optional owner floor bundle
+    ///    (signature + bundle.org_id == candidate owner — signed
+    ///     receipt is never trust establishment)
+    /// → compute CANDIDATE floors (persisted ∪ bundle)
+    /// → verify the candidate certificate against candidate state
+    /// → create/open the revocation store; durably apply the bundle
+    /// → re-verify the cert against the store's post-apply view
+    /// → write the audience file if it didn't exist
+    /// → publish membership LAST
+    /// → final full self-verification via [`Self::open`]
+    /// ```
+    ///
+    /// A refused adoption before the store-creation step leaves the
+    /// directory byte-for-byte untouched. Once a valid monotone
+    /// bundle has been durably applied, a LATER failure does not
+    /// roll it back (revocation is monotone; that is fail-closed).
+    ///
+    /// - `owner-membership.json` — refuses a DIFFERENT org's cert
+    ///   while an owner is installed; same-org renewal overwrites.
     /// - `owner-audience.key` — generated fresh on first adopt,
-    ///   PRESERVED on re-adopt (audience rotation is config
-    ///   management, not certificate renewal).
-    /// - `revocation-state.json` — initialized empty on first
-    ///   adopt, PRESERVED on re-adopt (floor monotonicity survives
+    ///   PRESERVED on re-adopt; a corrupt or group/other-readable
+    ///   existing credential refuses the ceremony.
+    /// - `revocation-state.json` — initialized on first adopt,
+    ///   PRESERVED on re-adopt (floor monotonicity survives
     ///   re-adoption).
-    ///
-    /// Returns the loaded authority, self-verified end-to-end.
     pub fn adopt(
         dir: &Path,
         owner_cert: OrgMembershipCert,
         local_entity: &EntityId,
         skew_secs: u64,
+        owner_floors: Option<&OrgRevocationBundle>,
     ) -> Result<Self, OrgAuthorityError> {
         let membership_path = dir.join(OWNER_MEMBERSHIP_FILE);
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
 
-        // One node, one owner: a different installed org refuses.
+        // 1. One node, one owner: a different installed org
+        //    refuses; a corrupt membership file refuses too (the
+        //    check cannot be evaluated against garbage — the
+        //    operator removes it explicitly).
         if let Some(existing) = read_optional(&membership_path)? {
             let existing: NodeAuthorityConfig = parse_membership(&existing, &membership_path)?;
             if existing.owner_org != owner_cert.org_id {
@@ -416,14 +492,76 @@ impl NodeAuthority {
             }
         }
 
-        // Revocation store first: adopt preserves existing maxima,
-        // and the new cert must clear the floors we already know.
-        let revocation = Arc::new(OrgRevocationStore::init(&revocation_path)?);
+        // 2. Validate any preserved audience credential BEFORE the
+        //    ceremony commits anything: strict codec AND the 0600
+        //    mode gate (a possibly-disclosed key must not be
+        //    silently re-blessed by a renewal).
+        let have_audience = match read_optional(&audience_path)? {
+            Some(bytes) => {
+                check_audience_permissions(&audience_path)?;
+                let _ = OwnerAudienceCredential::decode_config(&bytes)?;
+                true
+            }
+            None => false,
+        };
 
+        // 3. Strictly load persisted floor maxima if present — no
+        //    store creation yet; a refused adoption must leave a
+        //    fresh directory untouched.
+        let persisted = OrgRevocationState::load_if_exists(&revocation_path)?
+            .unwrap_or_else(OrgRevocationState::empty);
+
+        // 4. Verify the optional owner floor bundle and bind it to
+        //    the candidate owner root. Signed receipt is not trust
+        //    establishment: only the org that issued the candidate
+        //    certificate may seed floors through THIS ceremony.
+        if let Some(bundle) = owner_floors {
+            bundle
+                .verify()
+                .map_err(|e| OrgAuthorityError::Revocation(OrgRevocationError::InvalidBundle(e)))?;
+            if bundle.org_id != owner_cert.org_id {
+                return Err(OrgAuthorityError::ForeignFloorBundle {
+                    bundle_org: bundle.org_id,
+                    owner_org: owner_cert.org_id,
+                });
+            }
+        }
+
+        // 5. Candidate floors = persisted maxima ∪ supplied bundle.
+        let mut candidate_floors = persisted;
+        if let Some(bundle) = owner_floors {
+            candidate_floors.merge_bundle(bundle);
+        }
+
+        // 6. Verify the candidate certificate against the candidate
+        //    state — a cert the resulting floors would immediately
+        //    revoke must never adopt successfully (review-8 §7).
         let config = NodeAuthorityConfig::new(owner_cert);
-        config.self_verify(local_entity, &revocation, skew_secs)?;
+        config.self_verify(local_entity, &candidate_floors, skew_secs)?;
 
-        // Membership: atomic write (verified above).
+        // 7. All validation passed — durable changes begin.
+        //    Revocation first (monotone, never rolled back): create
+        //    or open the store and apply the bundle through the
+        //    locked reread path.
+        let revocation = Arc::new(OrgRevocationStore::init(&revocation_path)?);
+        if let Some(bundle) = owner_floors {
+            revocation.apply_bundle(bundle)?;
+        }
+        // Re-verify against the store's post-apply live view: a
+        // concurrent writer may have advanced floors between the
+        // candidate check and the locked apply. Membership has not
+        // been written yet, so a refusal here still publishes
+        // nothing.
+        config.self_verify(local_entity, &revocation.snapshot(), skew_secs)?;
+
+        // 8. Audience material: preserved, or created and written
+        //    now (0600, atomic, fresh temp inode).
+        if !have_audience {
+            let audience = OwnerAudienceCredential::generate();
+            write_atomic(&audience_path, &audience.encode_config())?;
+        }
+
+        // 9. Membership LAST.
         let membership_bytes =
             serde_json::to_vec_pretty(&config).map_err(|e| OrgAuthorityError::Io {
                 path: membership_path.display().to_string(),
@@ -431,28 +569,21 @@ impl NodeAuthority {
             })?;
         write_atomic(&membership_path, &membership_bytes)?;
 
-        // Audience credential: fresh on first adopt, preserved on
-        // re-adopt.
-        let audience = match read_optional(&audience_path)? {
-            Some(bytes) => OwnerAudienceCredential::decode_config(&bytes)?,
-            None => {
-                let audience = OwnerAudienceCredential::generate();
-                write_atomic(&audience_path, &audience.encode_config())?;
-                audience
-            }
-        };
-
-        Ok(Self {
-            config,
-            audience,
-            revocation,
-        })
+        // 10. Final self-verification through the real startup
+        //     loader — the ceremony's result is exactly what the
+        //     node will load, or the ceremony failed.
+        Self::open(dir, local_entity, skew_secs)
     }
 
     /// Startup: load the three files LOUDLY (missing or corrupt is
     /// a refusal, never a default) and self-verify the membership
     /// for `local_entity`. A node that cannot prove its ownership
     /// does not get a `NodeAuthority`.
+    ///
+    /// The audience key file's mode is re-checked here (review-8
+    /// §10): creation-time 0600 is insufficient because config
+    /// management, copying, or manual edits can weaken it later —
+    /// a group/other-readable key refuses startup.
     pub fn open(
         dir: &Path,
         local_entity: &EntityId,
@@ -466,12 +597,15 @@ impl NodeAuthority {
         let config = parse_membership(&membership_bytes, &membership_path)?;
 
         let audience_bytes = read_required(&audience_path)?;
+        check_audience_permissions(&audience_path).inspect_err(|e| {
+            tracing::error!("{e}");
+        })?;
         let audience = OwnerAudienceCredential::decode_config(&audience_bytes)?;
 
         let revocation = Arc::new(OrgRevocationStore::open_existing(&revocation_path)?);
 
         config
-            .self_verify(local_entity, &revocation, skew_secs)
+            .self_verify(local_entity, &revocation.snapshot(), skew_secs)
             .inspect_err(|e| {
                 tracing::error!("node authority self-verification failed: {e}");
             })?;
@@ -521,6 +655,39 @@ fn parse_membership(bytes: &[u8], path: &Path) -> Result<NodeAuthorityConfig, Or
         });
     }
     Ok(config)
+}
+
+/// The ssh-style mode gate for the audience key: refuse any
+/// group/other bits. Re-checked on every load, not just at
+/// creation (review-8 §10).
+#[cfg(unix)]
+fn check_audience_permissions(path: &Path) -> Result<(), OrgAuthorityError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(OrgAuthorityError::PermissiveAudienceFile {
+            path: path.display().to_string(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// Non-Unix: NTFS ACLs have no clean 0o600 analog reachable from
+/// `std::fs`; surface a stderr warning (mirrors the CLI identity
+/// gate) rather than a silent no-op.
+#[cfg(not(unix))]
+fn check_audience_permissions(path: &Path) -> Result<(), OrgAuthorityError> {
+    eprintln!(
+        "warning: audience-key permission gate is a no-op on this platform; \
+         ACLs on {} are not validated — manage them out-of-band.",
+        path.display()
+    );
+    Ok(())
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityError> {
@@ -600,8 +767,9 @@ mod tests {
         let scratch = Scratch::new();
         let kp = node_identity();
 
-        let authority = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0)
-            .expect("adopt");
+        let authority =
+            NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+                .expect("adopt");
         assert_eq!(authority.owner_org(), org().org_id());
         for name in NodeAuthority::file_names() {
             assert!(
@@ -628,7 +796,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         let kp = node_identity();
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
         let mode = std::fs::metadata(scratch.dir().join(OWNER_AUDIENCE_FILE))
             .expect("metadata")
             .permissions()
@@ -645,7 +814,7 @@ mod tests {
         let scratch = Scratch::new();
         let kp = node_identity();
 
-        let first = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0)
+        let first = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
             .expect("adopt");
         // Raise a floor between adoptions (for a DIFFERENT member,
         // so the re-adopt cert stays valid).
@@ -657,7 +826,7 @@ mod tests {
         drop(first);
 
         // Renewal: same org, fresh cert.
-        let second = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 2), kp.entity_id(), 0)
+        let second = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 2), kp.entity_id(), 0, None)
             .expect("re-adopt");
         assert_eq!(
             second.audience.audience_handle, handle_before,
@@ -677,13 +846,14 @@ mod tests {
     fn adopt_refuses_second_owner() {
         let scratch = Scratch::new();
         let kp = node_identity();
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
 
         let other_org = OrgKeypair::from_bytes([0x99u8; 32]);
         let foreign_cert =
             OrgMembershipCert::try_issue(&other_org, kp.entity_id().clone(), 1, 3600)
                 .expect("issue");
-        let err = NodeAuthority::adopt(scratch.dir(), foreign_cert, kp.entity_id(), 0)
+        let err = NodeAuthority::adopt(scratch.dir(), foreign_cert, kp.entity_id(), 0, None)
             .expect_err("one node one owner");
         assert!(matches!(err, OrgAuthorityError::AlreadyOwned { .. }));
     }
@@ -695,8 +865,14 @@ mod tests {
         let stranger = EntityKeypair::from_bytes([0x55u8; 32]);
 
         // Cert names someone else.
-        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&stranger, 1), kp.entity_id(), 0)
-            .expect_err("wrong member");
+        let err = NodeAuthority::adopt(
+            scratch.dir(),
+            cert_for(&stranger, 1),
+            kp.entity_id(),
+            0,
+            None,
+        )
+        .expect_err("wrong member");
         assert!(matches!(err, OrgAuthorityError::CertNotForThisNode { .. }));
 
         // Expired cert.
@@ -712,8 +888,8 @@ mod tests {
             now - 1000,
             7,
         );
-        let err =
-            NodeAuthority::adopt(scratch.dir(), expired, kp.entity_id(), 0).expect_err("expired");
+        let err = NodeAuthority::adopt(scratch.dir(), expired, kp.entity_id(), 0, None)
+            .expect_err("expired");
         assert!(matches!(err, OrgAuthorityError::CertInvalid(_)));
 
         // Nothing was installed by the refused adoptions.
@@ -729,7 +905,8 @@ mod tests {
         let err = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect_err("missing");
         assert!(matches!(err, OrgAuthorityError::MissingFile { .. }));
 
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
 
         // Corrupt membership: open is loud, and so is re-adopt —
         // the one-owner check cannot be evaluated against garbage,
@@ -737,14 +914,15 @@ mod tests {
         std::fs::write(scratch.dir().join(OWNER_MEMBERSHIP_FILE), b"{ nope").expect("write");
         let err = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect_err("corrupt");
         assert!(matches!(err, OrgAuthorityError::CorruptFile { .. }));
-        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0)
+        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
             .expect_err("adopt over corrupt membership is loud");
         assert!(matches!(err, OrgAuthorityError::CorruptFile { .. }));
 
         // Remove the corrupt file (the explicit operator action),
         // re-adopt, then corrupt the audience key (truncated).
         std::fs::remove_file(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("remove");
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
         std::fs::write(scratch.dir().join(OWNER_AUDIENCE_FILE), [1u8; 10]).expect("write");
         let err = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect_err("corrupt key");
         assert!(matches!(err, OrgAuthorityError::CorruptFile { .. }));
@@ -759,7 +937,8 @@ mod tests {
         // Remove the bad audience file (fresh one regenerates on
         // adopt), then delete the revocation state: open is loud.
         std::fs::remove_file(scratch.dir().join(OWNER_AUDIENCE_FILE)).expect("remove");
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
         std::fs::remove_file(scratch.dir().join(REVOCATION_STATE_FILE)).expect("remove");
         let err = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect_err("no floors");
         assert!(matches!(err, OrgAuthorityError::Revocation(_)));
@@ -772,8 +951,9 @@ mod tests {
     fn open_refuses_floored_cert() {
         let scratch = Scratch::new();
         let kp = node_identity();
-        let authority = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0)
-            .expect("adopt");
+        let authority =
+            NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+                .expect("adopt");
 
         let mut floors = BTreeMap::new();
         floors.insert(kp.entity_id().clone(), 5u32);
@@ -791,7 +971,7 @@ mod tests {
         ));
 
         // Renewal at the floor restores startup.
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 5), kp.entity_id(), 0)
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 5), kp.entity_id(), 0, None)
             .expect("renew at floor");
         NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect("open after renewal");
     }
@@ -800,7 +980,8 @@ mod tests {
     fn membership_file_rejects_org_cert_mismatch() {
         let scratch = Scratch::new();
         let kp = node_identity();
-        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0).expect("adopt");
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
 
         // Hand-edit the file to claim a different owner_org while
         // keeping the original cert.
@@ -831,5 +1012,196 @@ mod tests {
         let debug = format!("{credential:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains(&hex::encode(credential.discovery_key())));
+    }
+
+    // ----------------- review-8 ceremony witnesses -----------------
+
+    fn floors_bundle(member: &EntityId, generation: u32) -> OrgRevocationBundle {
+        let mut floors = BTreeMap::new();
+        floors.insert(member.clone(), generation);
+        OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
+    }
+
+    /// Review-8 §7: a certificate the supplied bundle immediately
+    /// revokes must never adopt successfully — and a refused first
+    /// adoption leaves the directory untouched.
+    #[test]
+    fn adopt_with_floors_refuses_immediately_revoked_cert() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let bundle = floors_bundle(kp.entity_id(), 5);
+
+        let err = NodeAuthority::adopt(
+            scratch.dir(),
+            cert_for(&kp, 3),
+            kp.entity_id(),
+            0,
+            Some(&bundle),
+        )
+        .expect_err("generation 3 under candidate floor 5 must refuse");
+        assert!(matches!(
+            err,
+            OrgAuthorityError::CertBelowFloor {
+                generation: 3,
+                floor: 5
+            }
+        ));
+        // Nothing durable was created by the refused ceremony.
+        for name in NodeAuthority::file_names() {
+            assert!(
+                !scratch.dir().join(name).exists(),
+                "{name} must not exist after a refused adoption"
+            );
+        }
+
+        // A cert AT the candidate floor adopts, with the floors
+        // durably applied in the same ceremony.
+        let authority = NodeAuthority::adopt(
+            scratch.dir(),
+            cert_for(&kp, 5),
+            kp.entity_id(),
+            0,
+            Some(&bundle),
+        )
+        .expect("generation 5 at floor 5 adopts");
+        assert_eq!(
+            authority
+                .revocation
+                .floor_for(&org().org_id(), kp.entity_id()),
+            5
+        );
+        // And the persisted floors survive a fresh open.
+        let reopened = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect("open");
+        assert_eq!(
+            reopened
+                .revocation
+                .floor_for(&org().org_id(), kp.entity_id()),
+            5
+        );
+    }
+
+    /// Review-8 §6: signed receipt is not trust establishment — a
+    /// bundle signed by any org other than the candidate owner
+    /// refuses BEFORE durable state changes.
+    #[test]
+    fn adopt_refuses_foreign_floor_bundle() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let org_b = OrgKeypair::from_bytes([0x99u8; 32]);
+        let mut floors = BTreeMap::new();
+        floors.insert(kp.entity_id().clone(), 5u32);
+        let foreign = OrgRevocationBundle::try_issue(&org_b, &floors).expect("issue");
+
+        let err = NodeAuthority::adopt(
+            scratch.dir(),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            Some(&foreign),
+        )
+        .expect_err("B-signed bundle under A adoption must refuse");
+        assert!(matches!(err, OrgAuthorityError::ForeignFloorBundle { .. }));
+        // No file — in particular no B floor — was persisted.
+        for name in NodeAuthority::file_names() {
+            assert!(!scratch.dir().join(name).exists());
+        }
+    }
+
+    /// Review-8 §8: a same-org renewal against corrupt preserved
+    /// state refuses BEFORE membership publishes — the previous
+    /// membership bytes remain exactly as they were.
+    #[test]
+    fn renewal_against_corrupt_audience_leaves_membership_untouched() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let m1 = std::fs::read(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("read M1");
+
+        // Corrupt the preserved audience credential, then attempt a
+        // same-org renewal (a fresh generation-2 cert).
+        std::fs::write(scratch.dir().join(OWNER_AUDIENCE_FILE), [1u8; 10]).expect("corrupt");
+        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 2), kp.entity_id(), 0, None)
+            .expect_err("renewal over corrupt audience must refuse");
+        assert!(matches!(err, OrgAuthorityError::CorruptFile { .. }));
+
+        // Membership is byte-for-byte the pre-renewal M1.
+        let after = std::fs::read(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("read");
+        assert_eq!(after, m1, "failed renewal must not advertise M2");
+    }
+
+    /// Review-8 §10: a group/other-readable audience key refuses
+    /// startup AND re-adoption — creation-time 0600 is not trusted
+    /// to persist.
+    #[cfg(unix)]
+    #[test]
+    fn permissive_audience_key_refuses_open_and_readopt() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let key_path = scratch.dir().join(OWNER_AUDIENCE_FILE);
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        let err = NodeAuthority::open(scratch.dir(), kp.entity_id(), 0)
+            .expect_err("permissive key must refuse startup");
+        assert!(matches!(
+            err,
+            OrgAuthorityError::PermissiveAudienceFile { mode: 0o644, .. }
+        ));
+        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 2), kp.entity_id(), 0, None)
+            .expect_err("re-adopt must not silently preserve a permissive key");
+        assert!(matches!(
+            err,
+            OrgAuthorityError::PermissiveAudienceFile { .. }
+        ));
+
+        // Tightening the mode restores both paths.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+        NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect("open after tighten");
+    }
+
+    /// Review-8 §10: pre-created permissive temp files (the old
+    /// predictable names, or any `.tmp.` litter) cannot weaken the
+    /// final key's mode — the writer always creates a fresh 0600
+    /// inode.
+    #[cfg(unix)]
+    #[test]
+    fn pre_created_permissive_temps_cannot_weaken_the_final_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let kp = node_identity();
+
+        // Litter the directory with permissive would-be temps,
+        // including the previous implementation's predictable
+        // `with_extension`-shaped name.
+        let pid = std::process::id();
+        for name in [
+            format!("owner-audience.tmp.{pid}"),
+            format!("owner-audience.key.tmp.{pid}"),
+            format!("owner-audience.key.tmp.{pid}.0.00000000"),
+        ] {
+            let p = scratch.dir().join(name);
+            std::fs::write(&p, b"attacker").expect("pre-create");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+        }
+
+        NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let mode = std::fs::metadata(scratch.dir().join(OWNER_AUDIENCE_FILE))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "final audience key must be owner-only, got {mode:o}"
+        );
+        // And the ceremony's result actually loads.
+        NodeAuthority::open(scratch.dir(), kp.entity_id(), 0).expect("open");
     }
 }

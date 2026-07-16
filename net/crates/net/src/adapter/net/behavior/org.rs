@@ -59,7 +59,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
-use crate::adapter::net::identity::EntityId;
+use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
 /// Signature domain for [`OrgMembershipCert`]. Prefixed to the
 /// 92-byte canonical payload before signing so a certificate
@@ -283,6 +283,21 @@ pub enum OrgError {
     /// Validity window exceeds [`MAX_ORG_CERT_TTL_SECS`]. Raised at
     /// issue AND at verify — see the constant's docs.
     TtlTooLong,
+    /// `not_after <= not_before` — a zero or reversed validity
+    /// window is structurally invalid (review-8). A reversed
+    /// window is not merely unusable: with ordinary allowed clock
+    /// skew, `now >= not_before - skew` and `now < not_after +
+    /// skew` can BOTH hold for a short reversed window, admitting
+    /// a certificate that was never live. Rejected at verify
+    /// before any TTL or signature work.
+    InvalidValidityWindow,
+    /// The caller passed a clock-skew tolerance above
+    /// [`MAX_TOKEN_CLOCK_SKEW_SECS`] (the token-module ceiling).
+    /// Enforced inside [`OrgMembershipCert::is_valid_with_skew`]
+    /// rather than documented at the call sites — with saturating
+    /// window arithmetic, an unbounded skew admits any expired
+    /// certificate.
+    ClockSkewTooLarge,
     /// Certificate window has not opened yet (`now < not_before`,
     /// after skew).
     NotYetValid,
@@ -311,6 +326,13 @@ impl std::fmt::Display for OrgError {
                 f,
                 "certificate validity window exceeds MAX_ORG_CERT_TTL_SECS"
             ),
+            Self::InvalidValidityWindow => write!(
+                f,
+                "certificate validity window is zero or reversed (not_after <= not_before)"
+            ),
+            Self::ClockSkewTooLarge => {
+                write!(f, "clock-skew tolerance exceeds MAX_TOKEN_CLOCK_SKEW_SECS")
+            }
             Self::NotYetValid => write!(f, "certificate not yet valid"),
             Self::Expired => write!(f, "certificate expired"),
             Self::TooManyFloors => write!(
@@ -483,17 +505,23 @@ impl OrgMembershipCert {
 
     /// Verify the certificate's signature and structural validity.
     ///
-    /// Checks, in order: the validity-window length is within
-    /// [`MAX_ORG_CERT_TTL_SECS`] (enforced at verify as well as at
-    /// issue — see the constant), then `verify_strict` of the
-    /// domain-prefixed payload against `org_id`.
+    /// Checks, in order: the validity window is well-formed
+    /// (`not_after > not_before` — zero or reversed windows are
+    /// structurally invalid, [`OrgError::InvalidValidityWindow`]);
+    /// the window length is within [`MAX_ORG_CERT_TTL_SECS`]
+    /// (enforced at verify as well as at issue — see the
+    /// constant); then `verify_strict` of the domain-prefixed
+    /// payload against `org_id`.
     ///
     /// Does NOT check wall-clock bounds or revocation floors —
     /// those are contextual; use [`Self::is_valid_with_skew`] for
     /// the time window and the persisted revocation state for
     /// floors.
     pub fn verify(&self) -> Result<(), OrgError> {
-        if self.not_after.saturating_sub(self.not_before) > MAX_ORG_CERT_TTL_SECS {
+        if self.not_after <= self.not_before {
+            return Err(OrgError::InvalidValidityWindow);
+        }
+        if self.not_after - self.not_before > MAX_ORG_CERT_TTL_SECS {
             return Err(OrgError::TtlTooLong);
         }
         let sig = Signature::from_bytes(&self.signature);
@@ -505,11 +533,17 @@ impl OrgMembershipCert {
     /// `now >= not_before - skew` AND `now < not_after + skew`.
     ///
     /// Skew semantics are identical to the token module's
-    /// (`PermissionToken::is_valid_with_skew`); callers should
-    /// source the tolerance from the same operator setting they use
-    /// for tokens and respect `MAX_TOKEN_CLOCK_SKEW_SECS` as the
-    /// ceiling.
+    /// (`PermissionToken::is_valid_with_skew`), and the token
+    /// ceiling is ENFORCED here (review-8): a tolerance above
+    /// [`MAX_TOKEN_CLOCK_SKEW_SECS`] is rejected with
+    /// [`OrgError::ClockSkewTooLarge`] rather than trusted to a
+    /// documentation clause — saturating window arithmetic would
+    /// otherwise let an unbounded skew admit any expired
+    /// certificate.
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), OrgError> {
+        if skew_secs > MAX_TOKEN_CLOCK_SKEW_SECS {
+            return Err(OrgError::ClockSkewTooLarge);
+        }
         self.verify()?;
         self.check_time_bounds(skew_secs)
     }
@@ -1069,6 +1103,52 @@ mod tests {
         // expiry, matching the token module).
         let boundary = OrgMembershipCert::issue_at(&org(), member(), 0, now - 100, now, 1);
         assert_eq!(boundary.is_valid_with_skew(0), Err(OrgError::Expired));
+    }
+
+    #[test]
+    fn skew_ceiling_enforced_at_and_above_max() {
+        let now = current_timestamp();
+        // Expired 100 s ago: the full ceiling tolerance legally
+        // admits it (the documented skew semantics)...
+        let past = OrgMembershipCert::issue_at(&org(), member(), 0, now - 200, now - 100, 1);
+        past.is_valid_with_skew(MAX_TOKEN_CLOCK_SKEW_SECS)
+            .expect("skew of exactly MAX is legal");
+        // ...one past the ceiling is refused as caller misuse, not
+        // applied to the window.
+        assert_eq!(
+            past.is_valid_with_skew(MAX_TOKEN_CLOCK_SKEW_SECS + 1),
+            Err(OrgError::ClockSkewTooLarge)
+        );
+        assert_eq!(
+            past.is_valid_with_skew(u64::MAX),
+            Err(OrgError::ClockSkewTooLarge)
+        );
+        // Even a currently-valid cert refuses an over-ceiling
+        // tolerance — the ceiling gates the CALL, not the outcome.
+        assert_eq!(
+            valid_cert().is_valid_with_skew(MAX_TOKEN_CLOCK_SKEW_SECS + 1),
+            Err(OrgError::ClockSkewTooLarge)
+        );
+    }
+
+    #[test]
+    fn zero_and_reversed_windows_are_structurally_invalid() {
+        let now = current_timestamp();
+        // not_after == not_before → reject.
+        let zero = OrgMembershipCert::issue_at(&org(), member(), 0, now, now, 1);
+        assert_eq!(zero.verify(), Err(OrgError::InvalidValidityWindow));
+        // not_after < not_before → reject. The review-8 scenario: a
+        // short reversed window straddling `now` passes BOTH
+        // saturating time comparisons under ordinary legal skew, so
+        // structural verification must kill it first.
+        let reversed = OrgMembershipCert::issue_at(&org(), member(), 0, now + 100, now - 100, 1);
+        assert_eq!(reversed.verify(), Err(OrgError::InvalidValidityWindow));
+        assert_eq!(
+            reversed.is_valid_with_skew(120),
+            Err(OrgError::InvalidValidityWindow)
+        );
+        // A positive window proceeds to TTL/signature checks.
+        valid_cert().verify().expect("positive window verifies");
     }
 
     #[test]

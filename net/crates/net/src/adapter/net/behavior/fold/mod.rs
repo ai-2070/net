@@ -651,6 +651,21 @@ impl<K: FoldKind> Fold<K> {
         f(&state)
     }
 
+    /// Narrow in-place mutation escape hatch for RECEIVER-LOCAL
+    /// projection fields: `#[serde(skip)]` payload data that
+    /// participates in no secondary index, no wire form, and no
+    /// signing transcript (OA-1's floor-raise ownership retraction
+    /// clears `CapabilityMembership::owner` this way, review-8 §9).
+    ///
+    /// Deliberately `pub(crate)` and deliberately NOT a general
+    /// mutation surface — anything that affects indexed, signed, or
+    /// wire-visible payload state must go through [`Self::apply`]
+    /// so generation ordering and index maintenance hold.
+    pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut FoldState<K>) -> R) -> R {
+        let mut state = self.state.write();
+        f(&mut state)
+    }
+
     /// Install (or uninstall) the audit sink. Idempotent;
     /// re-installing replaces the prior sink. After
     /// `set_audit_sink(Some(...))`, every

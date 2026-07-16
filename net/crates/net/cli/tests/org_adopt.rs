@@ -207,6 +207,113 @@ fn issue_floors_and_adopt_applies_bundle() {
         .code(3);
 }
 
+/// Review-8 §7 real-CLI red, reproduced as a witness: a certificate
+/// the supplied floor bundle immediately revokes must never adopt —
+/// nonzero exit, nothing provisioned.
+#[test]
+fn adopt_refuses_cert_below_supplied_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let cert = issue_cert(dir.path(), &key, MEMBER_HEX, 3, "node.cert.json");
+
+    let floors = dir.path().join("floors.json");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-floors", "--org-key"])
+        .arg(&key)
+        .args(["--floor", &format!("{MEMBER_HEX}=5")])
+        .args(["--out"])
+        .arg(&floors)
+        .assert()
+        .code(0);
+
+    let authority = dir.path().join("authority");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["node", "adopt", "--cert"])
+        .arg(&cert)
+        .args(["--entity", MEMBER_HEX])
+        .args(["--authority-dir"])
+        .arg(&authority)
+        .args(["--floors"])
+        .arg(&floors)
+        .assert()
+        .code(3);
+    // Nothing was provisioned by the refused ceremony.
+    for file in [
+        "owner-membership.json",
+        "owner-audience.key",
+        "revocation-state.json",
+    ] {
+        assert!(
+            !authority.join(file).exists(),
+            "{file} must not exist after a refused adoption"
+        );
+    }
+}
+
+/// Review-8 §6: a bundle signed by a foreign org is refused before
+/// durable state changes — no foreign floors are ever persisted
+/// through the owner-adoption ceremony.
+#[test]
+fn adopt_refuses_foreign_floor_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_a = keygen(dir.path(), "org-a.toml");
+    let key_b = keygen(dir.path(), "org-b.toml");
+    let cert_a = issue_cert(dir.path(), &key_a, MEMBER_HEX, 0, "node.cert.json");
+
+    // B signs a perfectly valid bundle for the same member.
+    let floors_b = dir.path().join("floors-b.json");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-floors", "--org-key"])
+        .arg(&key_b)
+        .args(["--floor", &format!("{MEMBER_HEX}=5")])
+        .args(["--out"])
+        .arg(&floors_b)
+        .assert()
+        .code(0);
+
+    let authority = dir.path().join("authority");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["node", "adopt", "--cert"])
+        .arg(&cert_a)
+        .args(["--entity", MEMBER_HEX])
+        .args(["--authority-dir"])
+        .arg(&authority)
+        .args(["--floors"])
+        .arg(&floors_b)
+        .assert()
+        .code(3);
+    assert!(
+        !authority.join("revocation-state.json").exists(),
+        "no B floor may be persisted"
+    );
+}
+
+/// Review-8 §11: a skew above the token ceiling is rejected as
+/// invalid arguments (exit 2) before anything is written.
+#[test]
+fn adopt_rejects_over_ceiling_skew_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let cert = issue_cert(dir.path(), &key, MEMBER_HEX, 0, "node.cert.json");
+
+    let authority = dir.path().join("authority");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["node", "adopt", "--cert"])
+        .arg(&cert)
+        .args(["--entity", MEMBER_HEX])
+        .args(["--authority-dir"])
+        .arg(&authority)
+        .args(["--skew-secs", "301"])
+        .assert()
+        .code(2);
+    assert!(!authority.exists() || !authority.join("owner-membership.json").exists());
+}
+
 #[test]
 fn issue_cert_rejects_overlong_ttl_and_bad_member() {
     let dir = tempfile::tempdir().unwrap();

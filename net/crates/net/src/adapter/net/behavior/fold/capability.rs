@@ -126,12 +126,16 @@ pub struct CapabilityMembership {
     /// `metadata_equals` consult this map after `synthesize_capability_set`
     /// hydrates the synthesized set from the fold.
     pub metadata: BTreeMap<String, String>,
-    /// OA-1 ownership projection — the publisher's owner org,
-    /// populated ONLY from an announcement `owner_cert` that passed
-    /// ingest verification (signature, window, `member ==
-    /// entity_id` binding, revocation floors). `None` for unowned
-    /// publishers and for announcements whose cert failed
-    /// verification (the cert is dropped; the entry is kept).
+    /// OA-1 ownership projection — the publisher's verified owner,
+    /// populated ONLY when BOTH the enclosing announcement
+    /// signature AND the embedded `owner_cert` passed ingest
+    /// verification (announcement signature, cert signature,
+    /// window, `member == entity_id` binding, revocation floors).
+    /// `None` for unowned publishers, for unsigned announcements
+    /// (a valid replayed cert must not lend ownership to an
+    /// unauthenticated capability statement — review-8 §1), and
+    /// for announcements whose cert failed verification (the cert
+    /// is dropped; the entry is kept).
     ///
     /// Unlike `allowed_*` / tag-derived axes this is not
     /// self-declared — it is proven belonging. It is also NOT
@@ -141,13 +145,27 @@ pub struct CapabilityMembership {
     /// `#[serde(skip)]` is load-bearing twice over: (1) the fold
     /// payload rides `SUBPROTOCOL_FOLD` as positional postcard, so
     /// a serialized field would break every mixed-fleet fold frame
-    /// at upgrade time; (2) a wire-carried `owner_org` would be a
+    /// at upgrade time; (2) a wire-carried owner would be a
     /// SELF-DECLARED ownership claim — the projection must only
     /// ever be derived on the receiving node from a cert it
     /// verified itself, and fold state (including snapshots) is
     /// never admission evidence. Decode always yields `None`.
     #[serde(skip)]
-    pub owner_org: Option<super::super::org::OrgId>,
+    pub owner: Option<VerifiedOwner>,
+}
+
+/// An ingest-verified ownership projection: which org vouched for
+/// the publisher and at which certificate generation. The
+/// generation is retained so a rising revocation floor can retract
+/// exactly the projections that fell below it — no re-announcement
+/// required, no still-valid (higher-generation) projection
+/// over-cleared (review-8 §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedOwner {
+    /// The organization whose certificate verified at ingest.
+    pub org: super::super::org::OrgId,
+    /// The verified certificate's revocation generation.
+    pub generation: u32,
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -986,7 +1004,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
-                owner_org: None,
+                owner: None,
             },
         )
         .expect("sign succeeds")
@@ -1199,7 +1217,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
-            owner_org: None,
+            owner: None,
         };
         assert!(
             <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &base.clone()),
@@ -1288,7 +1306,7 @@ mod tests {
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
                     metadata: BTreeMap::new(),
-                    owner_org: None,
+                    owner: None,
                 },
             )
             .expect("sign succeeds")
@@ -1960,7 +1978,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
-                owner_org: None,
+                owner: None,
             },
         )
         .unwrap();

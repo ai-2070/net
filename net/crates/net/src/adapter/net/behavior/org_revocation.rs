@@ -42,12 +42,17 @@
 //! # Writer model
 //!
 //! The node owns its own maxima file; bundle files distributed by
-//! the operator are inputs, never this file. Reloads are serialized
-//! by an in-process lock. (`net node adopt` also touches the file,
-//! but adoption happens before the node runs.)
+//! the operator are inputs, never this file. Same-file writers —
+//! whether a second store instance, a concurrent `net node adopt`,
+//! or another process — are ENFORCED serial (review-8 §5): every
+//! reload holds an exclusive advisory lock on the stable `.lock`
+//! sidecar and rereads the persisted maxima under that lock before
+//! merging, so no writer's floors can be rolled out of the file by
+//! a staler writer's in-memory snapshot.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -143,6 +148,22 @@ impl OrgRevocationState {
         })
     }
 
+    /// Strict read of a persisted state file that may not exist
+    /// yet: `Ok(None)` when absent, loud typed errors on anything
+    /// unparseable. The adoption ceremony uses this to validate
+    /// candidate floors BEFORE creating any durable state
+    /// (review-8 §7/§8).
+    pub fn load_if_exists(path: &Path) -> Result<Option<Self>, OrgRevocationError> {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::from_file_bytes(&bytes, path).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(OrgRevocationError::Io {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
     /// Strict parse of the on-disk form. Unknown fields, an
     /// unsupported version, or duplicate `(org, member)` keys are
     /// all corruption — loud typed errors, never best-effort
@@ -222,12 +243,43 @@ pub enum OrgRevocationError {
         /// The version the file declares.
         found: u32,
     },
-    /// Filesystem failure while reading or durably writing.
+    /// Filesystem failure while reading or durably writing. When
+    /// raised from `apply_bundle` this is always PRE-rename: the
+    /// old file and old live view are both intact.
     Io {
         /// The path being read or written.
         path: String,
         /// The underlying I/O error.
         reason: String,
+    },
+    /// The rename LANDED but the parent-directory fsync failed —
+    /// the directory entry may or may not survive a crash, so disk
+    /// and memory can no longer be proven synchronized. The store
+    /// publishes the merged (never-weaker) live view, then poisons
+    /// itself: further applies are refused until restart
+    /// re-establishes ground truth from disk (review-8 §13).
+    DurabilityUncertain {
+        /// The state file's path.
+        path: String,
+        /// The underlying fsync error.
+        reason: String,
+    },
+    /// A previous apply ended post-rename durability-uncertain
+    /// (see [`Self::DurabilityUncertain`]); this store refuses
+    /// further reloads until the process restarts.
+    Poisoned {
+        /// The state file's path.
+        path: String,
+    },
+    /// A running node refused to swap its installed revocation
+    /// store for one whose live view is lower on some `(org,
+    /// member)` key — an installed floor never lowers (review-8
+    /// §4). Reload higher floors through
+    /// [`OrgRevocationStore::apply_bundle`] instead of replacing
+    /// the store.
+    NonMonotonicReplacement {
+        /// The candidate store's state-file path.
+        path: String,
     },
 }
 
@@ -251,11 +303,39 @@ impl std::fmt::Display for OrgRevocationError {
                  (this build supports {ORG_REVOCATION_STATE_VERSION})"
             ),
             Self::Io { path, reason } => write!(f, "revocation state I/O at {path}: {reason}"),
+            Self::DurabilityUncertain { path, reason } => write!(
+                f,
+                "revocation state at {path}: rename landed but the parent-directory \
+                 fsync failed ({reason}); disk and memory can no longer be proven \
+                 synchronized — store poisoned until restart"
+            ),
+            Self::Poisoned { path } => write!(
+                f,
+                "revocation store at {path} is poisoned after a durability-uncertain \
+                 write; restart the process to re-establish ground truth from disk"
+            ),
+            Self::NonMonotonicReplacement { path } => write!(
+                f,
+                "refusing to replace the installed revocation store with {path}: its \
+                 live view is lower on at least one (org, member) floor — an installed \
+                 floor never lowers; apply a bundle instead"
+            ),
         }
     }
 }
 
 impl std::error::Error for OrgRevocationError {}
+
+/// One floor raise observed by [`OrgRevocationStore::apply_bundle`]
+/// relative to the store's previously published live view —
+/// `(org, member, new_floor)`. Fed to the raise callback so a
+/// running node can retract stale ownership projections
+/// immediately (review-8 §9).
+pub type RaisedFloor = (OrgId, EntityId, u32);
+
+/// Callback invoked after a reload publishes floors higher than the
+/// previously enforced view.
+type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 
 /// The node-local persisted revocation maxima plus its published
 /// live view. See the module docs for the locked reload order and
@@ -265,22 +345,55 @@ impl std::error::Error for OrgRevocationError {}
 /// bundles get fed to [`Self::apply_bundle`] is the caller's trust
 /// decision — in OA-1 the adopt/startup wiring feeds only the
 /// node's owner-org bundle.
+///
+/// # Multi-writer safety (review-8 §5)
+///
+/// Same-file writers (a second store instance, a concurrent
+/// `net node adopt`) are serialized through an exclusive advisory
+/// lock on a stable `.lock` sidecar, and every reload REREADS the
+/// persisted maxima under that lock before merging — an instance's
+/// in-memory snapshot is never trusted as the merge base, so a
+/// stale writer cannot roll another writer's floors out of the
+/// file. Because every writer follows reread-merge-write, the disk
+/// state only ever grows, and republishing the reread state can
+/// never lower a live view.
 pub struct OrgRevocationStore {
     path: PathBuf,
-    /// Serializes merge→persist→publish sequences.
+    /// Serializes this instance's merge→persist→publish sequences
+    /// (the sidecar file lock serializes across instances).
     reload: Mutex<()>,
-    /// The published live view. Always equal to the last
-    /// successfully persisted state — never ahead of the disk.
+    /// The published live view. Never ahead of the durably
+    /// persisted state; possibly behind it between reloads when
+    /// another writer advanced the file.
     live: RwLock<Arc<OrgRevocationState>>,
+    /// Set when a write ended post-rename durability-uncertain
+    /// (parent-dir fsync failure). Further applies are refused
+    /// until restart (review-8 §13).
+    poisoned: AtomicBool,
+    /// Invoked (outside the file lock) with the floors a reload
+    /// raised relative to the previously published view. The
+    /// running node uses this to retract stale ownership
+    /// projections from the capability fold.
+    on_floors_raised: RwLock<Option<FloorsRaisedCallback>>,
 }
 
 impl OrgRevocationStore {
     /// Adopt-time entry point: load the existing file if present
     /// (re-adoption preserves maxima — monotonicity survives even
     /// an operator re-running adopt), otherwise durably create an
-    /// empty state file.
+    /// empty state file. Runs under the interprocess lock so two
+    /// concurrent adoptions cannot race the create.
     pub fn init(path: impl Into<PathBuf>) -> Result<Self, OrgRevocationError> {
         let path = path.into();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| OrgRevocationError::Io {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+            }
+        }
+        let _lock = lock_state_file(&path)?;
         let state = match std::fs::read(&path) {
             Ok(bytes) => OrgRevocationState::from_file_bytes(&bytes, &path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -299,6 +412,8 @@ impl OrgRevocationStore {
             path,
             reload: Mutex::new(()),
             live: RwLock::new(Arc::new(state)),
+            poisoned: AtomicBool::new(false),
+            on_floors_raised: RwLock::new(None),
         })
     }
 
@@ -330,6 +445,8 @@ impl OrgRevocationStore {
             path,
             reload: Mutex::new(()),
             live: RwLock::new(Arc::new(state)),
+            poisoned: AtomicBool::new(false),
+            on_floors_raised: RwLock::new(None),
         })
     }
 
@@ -348,17 +465,58 @@ impl OrgRevocationStore {
         self.snapshot().floor_for(org, member)
     }
 
-    /// Apply an operator bundle under the locked reload order.
+    /// `true` once a write ended post-rename durability-uncertain;
+    /// [`Self::apply_bundle`] refuses until restart.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Install the raise callback (review-8 §9). Invoked after a
+    /// reload publishes floors above the previously enforced view —
+    /// including floors learned from OTHER writers via the
+    /// under-lock reread, not only the supplied bundle's. The node
+    /// wiring uses this to retract stale ownership projections.
+    pub fn set_on_floors_raised(&self, callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static) {
+        *self.on_floors_raised.write() = Some(Arc::new(callback));
+    }
+
+    /// Apply an operator bundle under the locked reload order
+    /// (interprocess-safe, review-8 §5):
     ///
-    /// Returns the number of floors raised. `Ok(0)` means the
-    /// bundle was valid but every floor was at or below the
-    /// persisted maxima — nothing written, nothing republished
-    /// (a lower bundle never rolls back).
+    /// ```text
+    /// verify bundle signature
+    /// → acquire exclusive lock on the stable `.lock` sidecar
+    /// → REREAD the persisted maxima under the lock (load-bearing:
+    ///    an in-memory snapshot must never be the merge base)
+    /// → monotone merge
+    /// → atomically persist iff the disk state changed
+    /// → publish the merged live view
+    /// → release the lock, notify raise observers
+    /// ```
     ///
-    /// On ANY error the persisted last-good state and the live view
-    /// are both untouched.
-    pub fn apply_bundle(&self, bundle: &OrgRevocationBundle) -> Result<usize, OrgRevocationError> {
+    /// Returns the floors raised relative to this store's
+    /// PREVIOUSLY published view — the supplied bundle's raises
+    /// plus any floors another writer advanced on disk since the
+    /// last reload. `Ok(empty)` means nothing rose (a lower bundle
+    /// never rolls back).
+    ///
+    /// On pre-rename errors the persisted last-good state and the
+    /// live view are both untouched. A POST-rename parent-fsync
+    /// failure publishes the merged (never-weaker) view, poisons
+    /// the store, and returns
+    /// [`OrgRevocationError::DurabilityUncertain`]; further applies
+    /// are refused until restart.
+    pub fn apply_bundle(
+        &self,
+        bundle: &OrgRevocationBundle,
+    ) -> Result<Vec<RaisedFloor>, OrgRevocationError> {
         let _guard = self.reload.lock();
+
+        if self.is_poisoned() {
+            return Err(OrgRevocationError::Poisoned {
+                path: self.path.display().to_string(),
+            });
+        }
 
         // 1. Verify the incoming bundle's signature + canonical
         //    structure. A corrupt bundle keeps last-good, loudly.
@@ -371,23 +529,91 @@ impl OrgRevocationStore {
             return Err(err);
         }
 
-        // 2. Merge maxima with the PERSISTED state (the live view
-        //    mirrors it by construction — never ahead of disk).
-        let mut merged = (*self.snapshot()).clone();
-        let raised = merged.merge_bundle(bundle);
-        if raised == 0 {
-            return Ok(0);
+        // 2. Interprocess critical section: reread the PERSISTED
+        //    maxima under the lock. The reread is load-bearing —
+        //    merging from this instance's live snapshot would let a
+        //    stale writer overwrite floors another writer already
+        //    persisted.
+        let lock = lock_state_file(&self.path)?;
+        let disk_bytes = std::fs::read(&self.path).map_err(|e| OrgRevocationError::Io {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let disk = OrgRevocationState::from_file_bytes(&disk_bytes, &self.path)?;
+
+        // 3. Monotone merge against the reread disk state.
+        let mut merged = disk.clone();
+        let raised_on_disk = merged.merge_bundle(bundle);
+
+        // 4. Persist iff the disk state changed; the write must
+        //    complete before anything is published.
+        if raised_on_disk > 0 {
+            match write_atomic_phased(&self.path, &merged.to_file_bytes()?) {
+                Ok(()) => {}
+                Err(WritePhase::PreRename(reason)) => {
+                    // Old file (rename never happened) and old live
+                    // view both intact — a floor the disk could
+                    // forget is never enforced.
+                    drop(lock);
+                    return Err(OrgRevocationError::Io {
+                        path: self.path.display().to_string(),
+                        reason,
+                    });
+                }
+                Err(WritePhase::PostRename(reason)) => {
+                    // The rename LANDED; only the directory-entry
+                    // durability is uncertain. Publish the merged
+                    // (never-weaker) view so enforcement doesn't
+                    // regress below what the disk may now hold, then
+                    // poison: disk and memory can no longer be
+                    // proven synchronized until a restart rereads
+                    // ground truth.
+                    let raised = self.publish(merged);
+                    self.poisoned.store(true, Ordering::Release);
+                    drop(lock);
+                    let err = OrgRevocationError::DurabilityUncertain {
+                        path: self.path.display().to_string(),
+                        reason,
+                    };
+                    tracing::error!("{err}");
+                    self.notify_raised(&raised);
+                    return Err(err);
+                }
+            }
         }
 
-        // 3. Atomically persist the merged maxima. Failure here
-        //    leaves the old file (rename is atomic) and the old
-        //    live view — a floor the disk could forget is never
-        //    enforced.
-        write_atomic(&self.path, &merged.to_file_bytes()?)?;
-
-        // 4. ONLY THEN publish the new live view.
-        *self.live.write() = Arc::new(merged);
+        // 5. Publish the merged view (also syncs this instance up
+        //    to floors other writers advanced), release the lock,
+        //    then notify raise observers.
+        let raised = self.publish(merged);
+        drop(lock);
+        self.notify_raised(&raised);
         Ok(raised)
+    }
+
+    /// Swap the live view to `next`, returning every floor that
+    /// rose relative to the previously published view. `next` is
+    /// always a monotone superset under the locked reload order,
+    /// so no floor can lower here.
+    fn publish(&self, next: OrgRevocationState) -> Vec<RaisedFloor> {
+        let mut live = self.live.write();
+        let raised: Vec<RaisedFloor> = next
+            .iter()
+            .filter(|((org, member), floor)| **floor > live.floor_for(org, member))
+            .map(|((org, member), floor)| (*org, member.clone(), *floor))
+            .collect();
+        *live = Arc::new(next);
+        raised
+    }
+
+    fn notify_raised(&self, raised: &[RaisedFloor]) {
+        if raised.is_empty() {
+            return;
+        }
+        let callback = self.on_floors_raised.read().clone();
+        if let Some(callback) = callback {
+            callback(raised);
+        }
     }
 }
 
@@ -400,61 +626,171 @@ impl std::fmt::Debug for OrgRevocationStore {
     }
 }
 
-/// Durable atomic write: temp file (owner-only on Unix) → fsync
-/// temp → atomic rename → fsync parent directory. Unlike the sdk's
-/// `RevocationStore`, the parent-dir fsync is a hard requirement
-/// here (plan §1.5 locked order): if the directory entry isn't
-/// durable, the caller must not publish state the filesystem could
-/// forget.
-///
-/// `pub(crate)`: the org-authority scaffolding (`org_authority.rs`)
-/// writes its sibling config files with the same discipline.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrgRevocationError> {
+/// Which phase of the durable write failed. PRE-rename failures
+/// are recoverable (the target file was never touched; the temp is
+/// cleaned up). POST-rename failures mean the directory entry may
+/// already point at the new bytes while its durability is unproven
+/// — the caller must fail closed (review-8 §13).
+pub(crate) enum WritePhase {
+    /// The target file is untouched; nothing published.
+    PreRename(String),
+    /// The rename landed; only the parent-directory fsync failed.
+    PostRename(String),
+}
+
+/// Acquire the exclusive interprocess lock guarding `path` via its
+/// stable `.lock` sidecar (the state file itself is replaced by
+/// rename, so it cannot carry the lock). Blocking; released when
+/// the returned handle drops. std advisory file locking — same
+/// semantics as the sdk revocation store's fs2 sidecar.
+fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocationError> {
     let io = |e: std::io::Error| OrgRevocationError::Io {
         path: path.display().to_string(),
-        reason: e.to_string(),
+        reason: format!("state lock: {e}"),
     };
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(PathBuf::from(lock_path))
+        .map_err(io)?;
+    f.lock().map_err(io)?;
+    Ok(f)
+}
+
+/// Monotone counter qualifying temp names so two writers in one
+/// process (or a reused PID) can never collide on a temp inode.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, unpredictable same-directory temp path:
+/// `<file>.tmp.<pid>.<seq>.<rand8hex>`. Appended to the FULL file
+/// name (the previous `with_extension` form replaced `.json`,
+/// making the name predictable — review-8 §10: a pre-created
+/// permissive temp would survive `create(true).truncate(true)`
+/// with its original mode).
+fn fresh_temp_path(path: &Path) -> PathBuf {
+    let mut rand = [0u8; 4];
+    // Best-effort: pid + seq already guarantee uniqueness within
+    // and across live processes; the random suffix defeats
+    // prediction by an unprivileged pre-creator.
+    let _ = getrandom::fill(&mut rand);
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(
+        ".tmp.{}.{}.{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        hex::encode(rand)
+    ));
+    PathBuf::from(s)
+}
+
+/// Durable atomic write with phase-typed failures: fresh
+/// `create_new` temp (owner-only mode applied at creation — never
+/// a reused inode) → write → flush → fsync temp → atomic rename →
+/// fsync parent directory. The temp file is removed on every
+/// pre-rename failure. Unlike the sdk's `RevocationStore`, the
+/// parent-dir fsync is a hard requirement here (plan §1.5 locked
+/// order).
+pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), WritePhase> {
+    let pre = |e: std::io::Error| WritePhase::PreRename(e.to_string());
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(io)?;
+            std::fs::create_dir_all(parent).map_err(pre)?;
         }
     }
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        use std::io::Write;
+    // `create_new` + creation-time 0600: an attacker cannot
+    // pre-create the (unpredictable) name, and even a collision
+    // with a crash-left temp fails loudly instead of truncating a
+    // permissive inode. A handful of retries covers the
+    // astronomically unlikely name collision.
+    let mut tmp = fresh_temp_path(path);
+    let mut file = None;
+    for _ in 0..4 {
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp).map_err(io)?;
-        f.write_all(bytes).map_err(io)?;
-        f.flush().map_err(io)?;
-        f.sync_all().map_err(io)?;
+        match opts.open(&tmp) {
+            Ok(f) => {
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp = fresh_temp_path(path);
+            }
+            Err(e) => return Err(pre(e)),
+        }
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let Some(mut f) = file else {
+        return Err(WritePhase::PreRename(
+            "could not create a fresh temp file after 4 attempts".to_string(),
+        ));
+    };
+
+    // Any failure before the rename removes the temp so no stale
+    // inode accumulates for later reuse.
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        drop(f);
         let _ = std::fs::remove_file(&tmp);
-        io(e)
-    })?;
+        return Err(pre(e));
+    }
+    drop(f);
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(pre(e));
+    }
 
     // POSIX: rename() updates the directory entry in memory only; a
     // crash before the directory fsyncs can revert to the old file
     // (BUG #93 lineage, mirrors redex/disk.rs). Required, not
-    // best-effort — see the function docs.
+    // best-effort — and a failure HERE is post-rename: the caller
+    // must treat disk state as unproven (review-8 §13).
     #[cfg(unix)]
     {
         let dir = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
-        let dirf = std::fs::File::open(dir).map_err(io)?;
-        dirf.sync_all().map_err(io)?;
+        let dir_sync = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        if let Err(e) = dir_sync {
+            return Err(WritePhase::PostRename(e.to_string()));
+        }
     }
     Ok(())
+}
+
+/// Phase-flattened wrapper for callers whose files carry no
+/// published live view (the org-authority config writes): any
+/// failure — pre- or post-rename — is an error to surface.
+///
+/// `pub(crate)`: the org-authority scaffolding (`org_authority.rs`)
+/// writes its sibling config files with the same discipline.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrgRevocationError> {
+    write_atomic_phased(path, bytes).map_err(|phase| match phase {
+        WritePhase::PreRename(reason) => OrgRevocationError::Io {
+            path: path.display().to_string(),
+            reason,
+        },
+        WritePhase::PostRename(reason) => OrgRevocationError::DurabilityUncertain {
+            path: path.display().to_string(),
+            reason,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -528,7 +864,7 @@ mod tests {
         let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
 
         let raised = store.apply_bundle(&bundle_with_floor(5)).expect("apply");
-        assert_eq!(raised, 1);
+        assert_eq!(raised, vec![(org().org_id(), member(), 5)]);
         assert_eq!(store.floor_for(&org().org_id(), &member()), 5);
 
         // Persisted: a fresh open (simulated restart) sees floor 5.
@@ -563,7 +899,7 @@ mod tests {
         let raised = store
             .apply_bundle(&bundle_with_floor(3))
             .expect("valid lower bundle is not an error");
-        assert_eq!(raised, 0, "lower floor must not merge");
+        assert!(raised.is_empty(), "lower floor must not merge");
         assert_eq!(store.floor_for(&org().org_id(), &member()), 5);
         // No-op reload leaves the persisted file byte-identical.
         assert_eq!(std::fs::read(&path).expect("read state"), before);
@@ -694,7 +1030,126 @@ mod tests {
             .expect_err("rename onto non-empty dir must fail");
         assert!(matches!(err, OrgRevocationError::Io { .. }));
         // The live view still serves the last DURABLE floor — the
-        // undurable 9 is never enforced.
+        // undurable 9 is never enforced. Pre-rename failure does
+        // NOT poison: nothing on disk changed.
         assert_eq!(store.floor_for(&org().org_id(), &member()), 5);
+        assert!(!store.is_poisoned());
+
+        // No temp files left behind by the failed write.
+        let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)
+            .expect("read scratch")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stale temps: {leftovers:?}");
+    }
+
+    fn bundle_for(member: EntityId, generation: u32) -> OrgRevocationBundle {
+        let mut floors = BTreeMap::new();
+        floors.insert(member, generation);
+        OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
+    }
+
+    /// Review-8 §5 witness: two store instances on one file. B's
+    /// in-memory view is stale when it writes; the under-lock
+    /// REREAD must preserve A's floor — both maxima survive in the
+    /// persisted state and in B's republished live view.
+    #[test]
+    fn concurrent_store_instances_preserve_all_maxima() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let member_x = EntityId::from_bytes([0xAAu8; 32]);
+        let member_y = EntityId::from_bytes([0xBBu8; 32]);
+
+        let store_a = OrgRevocationStore::init(&path).expect("init A");
+        let store_b = OrgRevocationStore::open_existing(&path).expect("open B");
+
+        // A raises member_x to 5; B has not observed it.
+        store_a
+            .apply_bundle(&bundle_for(member_x.clone(), 5))
+            .expect("A applies x=5");
+        assert_eq!(store_b.floor_for(&org().org_id(), &member_x), 0);
+
+        // B (stale snapshot) raises member_y to 7. Without the
+        // reread this write would roll x=5 out of the file.
+        let raised = store_b
+            .apply_bundle(&bundle_for(member_y.clone(), 7))
+            .expect("B applies y=7");
+
+        // The persisted state carries BOTH maxima…
+        let reopened = OrgRevocationStore::open_existing(&path).expect("reopen");
+        assert_eq!(reopened.floor_for(&org().org_id(), &member_x), 5);
+        assert_eq!(reopened.floor_for(&org().org_id(), &member_y), 7);
+        // …and B's live view synced up to A's floor during the
+        // locked reload, reporting the cross-writer raise too.
+        assert_eq!(store_b.floor_for(&org().org_id(), &member_x), 5);
+        assert!(raised.contains(&(org().org_id(), member_x, 5)));
+        assert!(raised.contains(&(org().org_id(), member_y, 7)));
+    }
+
+    /// Review-8 §9 plumbing: the raise callback fires with exactly
+    /// the raised floors, and never for a no-op (lower) bundle.
+    #[test]
+    fn raise_callback_fires_only_on_raises() {
+        let scratch = Scratch::new();
+        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+
+        let seen: Arc<Mutex<Vec<RaisedFloor>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        store.set_on_floors_raised(move |raised| {
+            sink.lock().extend_from_slice(raised);
+        });
+
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        assert_eq!(*seen.lock(), vec![(org().org_id(), member(), 5)]);
+
+        seen.lock().clear();
+        store.apply_bundle(&bundle_with_floor(3)).expect("apply 3");
+        assert!(seen.lock().is_empty(), "lower bundle must not notify");
+    }
+
+    /// Review-8 §13 witness: a POST-rename parent-fsync failure
+    /// publishes the merged (never-weaker) view, poisons the store,
+    /// and refuses further applies until restart.
+    #[cfg(unix)]
+    #[test]
+    fn post_rename_fsync_failure_poisons_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path).expect("init");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+
+        // Write+execute but NO read on the parent: lookups, file
+        // reads, temp creation, and the rename all still work, but
+        // opening the directory for fsync needs read — the exact
+        // post-rename failure.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
+            .expect("chmod 0300");
+        let err = store
+            .apply_bundle(&bundle_with_floor(9))
+            .expect_err("dir fsync must fail");
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        assert!(
+            matches!(err, OrgRevocationError::DurabilityUncertain { .. }),
+            "got: {err}"
+        );
+
+        // Fail-closed in the never-weaker direction: the merged
+        // floor IS enforced (the rename landed; the disk may hold
+        // it), but the store refuses to pretend disk and memory
+        // are synchronized.
+        assert_eq!(store.floor_for(&org().org_id(), &member()), 9);
+        assert!(store.is_poisoned());
+        let err = store
+            .apply_bundle(&bundle_with_floor(11))
+            .expect_err("poisoned store refuses further applies");
+        assert!(matches!(err, OrgRevocationError::Poisoned { .. }));
+
+        // Restart re-establishes ground truth from disk.
+        let restarted = OrgRevocationStore::open_existing(&path).expect("restart");
+        assert!(!restarted.is_poisoned());
+        assert_eq!(restarted.floor_for(&org().org_id(), &member()), 9);
     }
 }

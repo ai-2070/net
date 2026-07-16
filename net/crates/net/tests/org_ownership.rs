@@ -111,7 +111,7 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
     let dir = scratch_dir("wire");
     let cert =
         OrgMembershipCert::try_issue(&org(), a.entity_id().clone(), 1, 3600).expect("issue cert");
-    let authority = NodeAuthority::adopt(&dir, cert, a.entity_id(), 0).expect("adopt");
+    let authority = NodeAuthority::adopt(&dir, cert, a.entity_id(), 0, None).expect("adopt");
 
     // Phase 1 — emission OFF (default): announce, verify B folds
     // the caps but projects NO ownership (pre-OA-1 byte shape).
@@ -132,10 +132,14 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
         "emission off ⇒ no ownership projected"
     );
 
-    // Phase 2 — emission ON (Migration step 3 switch): the next
-    // announcement carries the cert; B's real ingest verifies it
-    // and projects owner_org.
-    a.set_owner_cert_emission(Some(authority.config.owner_cert.clone()));
+    // Phase 2 — install the loaded authority as THE production
+    // authority object, then flip emission ON (Migration step 3
+    // switch; review-8 §3 — the installed authority is the only
+    // certificate source). The next announcement carries exactly
+    // the installed cert; B's real ingest verifies + projects.
+    a.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    a.set_owner_cert_emission(true).expect("enable emission");
     a.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
         .await
         .expect("announce with cert");
@@ -148,6 +152,252 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Review-8 §2/§3/§4 — production startup + scaffold-sourced emission.
+// ---------------------------------------------------------------------------
+
+/// Emission without an installed authority is a loud refusal — an
+/// unadopted node cannot claim ownership at runtime.
+#[tokio::test]
+async fn emission_requires_installed_authority() {
+    let node = build_node().await;
+    assert!(node.node_authority().is_none());
+    assert!(
+        node.set_owner_cert_emission(true).is_err(),
+        "unadopted node must not enable emission"
+    );
+    // Disabling is always fine (no-op).
+    node.set_owner_cert_emission(false).expect("disable is ok");
+}
+
+/// One node, one owner at runtime too: an A-owned node refuses a
+/// B-issued authority even when B's cert validly names this node.
+#[tokio::test]
+async fn install_refuses_foreign_authority() {
+    let node = build_node().await;
+    let dir_a = scratch_dir("install-a");
+    let dir_b = scratch_dir("install-b");
+
+    let cert_a =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue A");
+    let authority_a =
+        NodeAuthority::adopt(&dir_a, cert_a, node.entity_id(), 0, None).expect("adopt A");
+    node.install_node_authority(Arc::new(authority_a))
+        .expect("install A");
+
+    let org_b = OrgKeypair::from_bytes([0x99u8; 32]);
+    let cert_b =
+        OrgMembershipCert::try_issue(&org_b, node.entity_id().clone(), 1, 3600).expect("issue B");
+    let authority_b =
+        NodeAuthority::adopt(&dir_b, cert_b, node.entity_id(), 0, None).expect("adopt B");
+    assert!(
+        node.install_node_authority(Arc::new(authority_b)).is_err(),
+        "A-owned node must refuse B authority"
+    );
+    assert_eq!(
+        node.node_authority().expect("still owned").owner_org(),
+        org().org_id()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Review-8 §4: an installed revocation store never lowers — a
+/// stale independently opened store is refused; the same store is
+/// idempotent.
+#[tokio::test]
+async fn store_replacement_never_lowers_the_live_view() {
+    let node = build_node().await;
+    let publisher = EntityKeypair::generate();
+    let dir_hi = scratch_dir("store-hi");
+    let dir_lo = scratch_dir("store-lo");
+
+    let hi = Arc::new(OrgRevocationStore::init(dir_hi.join("revocation-state.json")).expect("hi"));
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(publisher.entity_id().clone(), 5u32);
+    hi.apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+        .expect("floor 5");
+    node.install_org_revocation_store(hi.clone())
+        .expect("install hi");
+    // Idempotent same-Arc re-install.
+    node.install_org_revocation_store(hi)
+        .expect("same store is idempotent");
+
+    let mut low_floors = std::collections::BTreeMap::new();
+    low_floors.insert(publisher.entity_id().clone(), 3u32);
+    let lo = Arc::new(OrgRevocationStore::init(dir_lo.join("revocation-state.json")).expect("lo"));
+    lo.apply_bundle(&OrgRevocationBundle::try_issue(&org(), &low_floors).expect("issue"))
+        .expect("floor 3");
+    assert!(
+        node.install_org_revocation_store(lo).is_err(),
+        "stale floor-3 store must not replace floor-5 store"
+    );
+    assert_eq!(
+        node.org_revocation_store()
+            .expect("still installed")
+            .floor_for(&org().org_id(), publisher.entity_id()),
+        5,
+        "live floor must remain 5"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_hi);
+    let _ = std::fs::remove_dir_all(&dir_lo);
+}
+
+/// Review-8 §9 end-to-end: raising a floor through the INSTALLED
+/// store retracts an existing ownership projection immediately —
+/// no re-announcement — while the capability entry stays present
+/// and `may_execute` is unchanged.
+#[tokio::test]
+async fn floor_raise_retracts_projection_without_reannouncement() {
+    let node = build_node().await;
+    let dir = scratch_dir("retract");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
+    node.install_node_authority(Arc::new(authority))
+        .expect("install");
+
+    // A publisher projects ownership from a generation-4 cert.
+    let publisher = EntityKeypair::generate();
+    let publisher_node_id = publisher.node_id();
+    let cert4 = OrgMembershipCert::try_issue(&org(), publisher.entity_id().clone(), 4, 3600)
+        .expect("issue");
+    let mut ann = CapabilityAnnouncement::new(
+        publisher_node_id,
+        publisher.entity_id().clone(),
+        100,
+        CapabilitySet::new().add_tag("nrpc:oa1-echo"),
+    )
+    .with_owner_cert(Some(cert4));
+    ann.sign(&publisher);
+    node.test_inject_capability_announcement(ann);
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        Some(org().org_id())
+    );
+
+    // Raise the floor to 5 through the installed store: the stale
+    // projection retracts with NO further announcement.
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(publisher.entity_id().clone(), 5u32);
+    let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
+    node.org_revocation_store()
+        .expect("installed")
+        .apply_bundle(&bundle)
+        .expect("apply floor 5");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        None,
+        "revoked membership must stop projecting immediately"
+    );
+    // Capability entry present, verdicts unchanged.
+    assert!(may_execute(
+        node.capability_fold(),
+        publisher_node_id,
+        "nrpc:oa1-echo",
+        0xDEAD
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review-8 §2 production-startup witnesses: the four configured
+/// cases through the real `MeshNode::new`.
+#[tokio::test]
+async fn production_startup_honors_configured_authority() {
+    // (a) No authority configured: legacy startup, no owner
+    // projection, no store.
+    let legacy = build_node().await;
+    assert!(legacy.node_authority().is_none());
+    assert!(legacy.org_revocation_store().is_none());
+
+    // (b) Configured and valid: startup succeeds, store installed,
+    // emission default OFF (self-announce projects no ownership).
+    let dir = scratch_dir("startup");
+    let keypair = EntityKeypair::from_bytes([0x77u8; 32]);
+    let cert =
+        OrgMembershipCert::try_issue(&org(), keypair.entity_id().clone(), 1, 3600).expect("issue");
+    NodeAuthority::adopt(&dir, cert, keypair.entity_id(), 0, None).expect("adopt");
+    let cfg = test_config().with_node_authority_dir(&dir);
+    let node = Arc::new(
+        MeshNode::new(keypair.clone(), cfg)
+            .await
+            .expect("adopted startup succeeds"),
+    );
+    assert_eq!(
+        node.node_authority()
+            .expect("authority installed")
+            .owner_org(),
+        org().org_id()
+    );
+    assert!(node.org_revocation_store().is_some());
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), node.node_id()),
+        None,
+        "emission defaults OFF"
+    );
+
+    // (c) Explicit emission flag: the self-index projects exactly
+    // the loaded certificate's org.
+    let node2 = Arc::new(
+        MeshNode::new(
+            keypair.clone(),
+            test_config()
+                .with_node_authority_dir(&dir)
+                .with_owner_cert_emission(true),
+        )
+        .await
+        .expect("emitting startup succeeds"),
+    );
+    node2
+        .announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+    assert_eq!(
+        owner_org_for(node2.capability_fold(), node2.node_id()),
+        Some(org().org_id()),
+        "explicit emission emits the loaded authority's cert"
+    );
+
+    // (d) Configured but missing/corrupt/floored: startup refuses.
+    let missing = scratch_dir("startup-missing");
+    assert!(
+        MeshNode::new(
+            keypair.clone(),
+            test_config().with_node_authority_dir(&missing)
+        )
+        .await
+        .is_err(),
+        "configured-but-missing authority must refuse startup"
+    );
+    std::fs::write(dir.join("owner-membership.json"), b"{ nope").expect("corrupt");
+    assert!(
+        MeshNode::new(keypair.clone(), test_config().with_node_authority_dir(&dir))
+            .await
+            .is_err(),
+        "corrupt authority must refuse startup"
+    );
+
+    // (e) Emission flag without a configured authority: refused.
+    assert!(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            test_config().with_owner_cert_emission(true)
+        )
+        .await
+        .is_err(),
+        "emit_owner_cert without node_authority_dir must refuse"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&missing);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +459,7 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     floors.insert(publisher.entity_id().clone(), 5u32);
     let bundle5 = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
     store.apply_bundle(&bundle5).expect("apply floor 5");
-    node.install_org_revocation_store(store);
+    node.install_org_revocation_store(store).expect("install");
 
     let inject = |generation: u32, version: u64| {
         let cert =
@@ -250,13 +500,14 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     let raised = restarted
         .apply_bundle(&bundle3)
         .expect("lower bundle is a no-op");
-    assert_eq!(raised, 0, "lower bundle must not merge");
+    assert!(raised.is_empty(), "lower bundle must not merge");
     assert_eq!(
         restarted.floor_for(&org().org_id(), publisher.entity_id()),
         5,
         "generation 5 remains authoritative across restart"
     );
-    node.install_org_revocation_store(restarted);
+    node.install_org_revocation_store(restarted)
+        .expect("install restarted");
     inject(4, 300);
     assert_eq!(
         owner_org_for(node.capability_fold(), publisher_node_id),

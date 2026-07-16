@@ -32,6 +32,11 @@ pub use net::adapter::net::behavior::org::{
     ORG_FLOORS_SIG_DOMAIN,
 };
 
+/// The clock-skew ceiling org certificate verification enforces
+/// (`OrgError::ClockSkewTooLarge` above it) — the token module's
+/// constant, re-exported beside the cert API it gates.
+pub use net::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+
 pub use net::adapter::net::behavior::org_authority::{
     authority_dir, NodeAuthority, NodeAuthorityConfig, OrgAuthorityError, OwnerAudienceCredential,
     NODE_AUTHORITY_CONFIG_VERSION, OWNER_AUDIENCE_FILE, OWNER_MEMBERSHIP_FILE,

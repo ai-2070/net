@@ -1615,6 +1615,28 @@ pub struct MeshNodeConfig {
     /// the 0x0C02 dispatch arm; default-rooted nodes keep the strict
     /// entity-root rule.
     pub sensing_owner_root: Option<sensing::AudienceScopeCommitment>,
+    /// OA-1 (review-8 §2): the authority directory holding this
+    /// node's adopted ownership files (`owner-membership.json`,
+    /// `owner-audience.key`, `revocation-state.json` — provisioned
+    /// by `net node adopt`).
+    ///
+    /// `None` (the default): legacy un-adopted startup — the node
+    /// runs with no owner projection and no floors, exactly as
+    /// pre-OA-1. `Some(dir)`: [`MeshNode::new`] opens and
+    /// self-verifies the authority BEFORE any networking starts
+    /// and installs it as the one production authority object;
+    /// missing, corrupt, or floored authority state REFUSES
+    /// construction — configured authority never silently degrades
+    /// to an un-adopted node.
+    pub node_authority_dir: Option<std::path::PathBuf>,
+    /// OA-1: attach the installed authority's owner certificate to
+    /// this node's own capability announcements from startup.
+    /// `false` (the default) keeps announcements byte-identical to
+    /// pre-OA-1; flipping it is the plan's explicit Migration
+    /// step 3 (`upgrade-all-then-emit`) and requires
+    /// [`Self::node_authority_dir`] — construction refuses the
+    /// flag without a configured authority.
+    pub emit_owner_cert: bool,
     /// SI-3: the §4.6 origin incarnation this node's sensing plane
     /// signs attestations under. The caller owns persistence:
     /// derive the value with [`sensing::next_incarnation`] over a
@@ -1780,6 +1802,8 @@ impl MeshNodeConfig {
             attestation_cadence_floor: sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR,
             continuity_factor: 3,
             sensing_owner_root: None,
+            node_authority_dir: None,
+            emit_owner_cert: false,
             sensing_incarnation: None,
             token_sweep_interval: Duration::from_secs(30),
             max_auth_failures_per_window: 16,
@@ -1962,6 +1986,23 @@ impl MeshNodeConfig {
     /// [`Self::sensing_owner_root`].
     pub fn with_sensing_owner_root(mut self, root: sensing::AudienceScopeCommitment) -> Self {
         self.sensing_owner_root = Some(root);
+        self
+    }
+
+    /// OA-1: configure the adopted authority directory — see
+    /// [`Self::node_authority_dir`]. Startup opens and
+    /// self-verifies it before networking; missing/corrupt/floored
+    /// state refuses construction.
+    pub fn with_node_authority_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.node_authority_dir = Some(dir.into());
+        self
+    }
+
+    /// OA-1: enable owner-cert emission from startup — see
+    /// [`Self::emit_owner_cert`] (Migration step 3; requires
+    /// [`Self::with_node_authority_dir`]).
+    pub fn with_owner_cert_emission(mut self, emit: bool) -> Self {
+        self.emit_owner_cert = emit;
         self
     }
 
@@ -4052,14 +4093,23 @@ pub struct MeshNode {
     /// [`Self::install_org_revocation_store`] by the
     /// authority-adoption wiring. `None` on un-adopted nodes.
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
-    /// OA-1: the owner membership certificate this node attaches
-    /// to its own capability announcements. `None` (the default)
-    /// keeps the announcement byte-identical to the pre-OA-1
-    /// shape; enabling emission is the plan's EXPLICIT migration
-    /// step 3 (`upgrade-all-then-emit` — a not-yet-upgraded
-    /// signed-mode peer drops announcements carrying a populated
-    /// cert). Set via [`Self::set_owner_cert_emission`].
-    owner_cert_emission: Arc<ArcSwapOption<super::behavior::org::OrgMembershipCert>>,
+    /// OA-1: the node's loaded, self-verified authority — the ONLY
+    /// source of the owner certificate this node may emit
+    /// (review-8 §3: no raw-certificate bypass) and the owner of
+    /// the installed revocation store. Installed via
+    /// [`Self::install_node_authority`] (or the
+    /// `node_authority_dir` config at construction); replacement by
+    /// a DIFFERENT owner org is refused — one node, one owner.
+    node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA-1: whether self-announcements attach the installed
+    /// authority's owner certificate. `false` (the default) keeps
+    /// the announcement byte-identical to the pre-OA-1 shape;
+    /// enabling is the plan's EXPLICIT migration step 3
+    /// (`upgrade-all-then-emit` — a not-yet-upgraded signed-mode
+    /// peer drops announcements carrying a populated cert) and
+    /// requires an installed authority
+    /// ([`Self::set_owner_cert_emission`]).
+    owner_cert_emission_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -4722,6 +4772,34 @@ impl MeshNode {
         config: MeshNodeConfig,
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
+
+        // OA-1 (review-8 §2): resolve the configured node authority
+        // BEFORE any networking starts. A configured-but-missing,
+        // corrupt, or floored authority REFUSES construction — it
+        // never silently degrades to an un-adopted node. The loaded
+        // value installs after the struct exists, below.
+        let node_authority = match &config.node_authority_dir {
+            Some(dir) => {
+                let authority = super::behavior::org_authority::NodeAuthority::open(
+                    dir,
+                    identity.entity_id(),
+                    0,
+                )
+                .map_err(|e| AdapterError::Fatal(format!("node authority startup refusal: {e}")))?;
+                Some(Arc::new(authority))
+            }
+            None => {
+                if config.emit_owner_cert {
+                    return Err(AdapterError::Fatal(
+                        "emit_owner_cert requires node_authority_dir: emission is \
+                         sourced only from an adopted authority"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
+        };
+
         let static_keypair = StaticKeypair::generate();
 
         let socket = NetSocket::with_config(config.bind_addr, config.socket_buffers)
@@ -5250,7 +5328,7 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
-        Ok(Self {
+        let node = Self {
             identity: Arc::new(identity),
             static_keypair,
             node_id,
@@ -5288,7 +5366,8 @@ impl MeshNode {
             cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             org_revocation: Arc::new(ArcSwapOption::empty()),
-            owner_cert_emission: Arc::new(ArcSwapOption::empty()),
+            node_authority: Arc::new(ArcSwapOption::empty()),
+            owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
@@ -5422,7 +5501,22 @@ impl MeshNode {
             started: AtomicBool::new(false),
             self_weak: Arc::new(std::sync::OnceLock::new()),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
-        })
+        };
+
+        // OA-1 (review-8 §2): install the authority loaded above as
+        // the one production authority object — revocation store
+        // (with the floor-raise retraction wiring) + retained owner
+        // certificate — and honor the explicit emission flag.
+        if let Some(authority) = node_authority {
+            node.install_node_authority(authority)
+                .map_err(|e| AdapterError::Fatal(format!("node authority install: {e}")))?;
+            if node.config.emit_owner_cert {
+                node.set_owner_cert_emission(true)
+                    .map_err(|e| AdapterError::Fatal(format!("owner-cert emission: {e}")))?;
+            }
+        }
+
+        Ok(node)
     }
 
     /// Get this node's ID.
@@ -6552,15 +6646,55 @@ impl MeshNode {
 
     /// OA-1: install the node's persisted org revocation store so
     /// announcement ingest floor-checks owner certificates.
-    /// Called by the authority-adoption wiring after the store's
-    /// loud `open_existing` succeeded at startup; installing is
-    /// idempotent (later stores replace earlier ones — the store
-    /// itself carries its own monotone live view).
+    /// MONOTONIC (review-8 §4): installing over nothing is
+    /// accepted, re-installing the same store is idempotent, and a
+    /// replacement whose live view is LOWER on any `(org, member)`
+    /// floor is refused — an installed floor never lowers. Every
+    /// accepted store is wired to retract stale fold ownership
+    /// projections when its floors rise (review-8 §9).
     pub fn install_org_revocation_store(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
-    ) {
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        if let Some(current) = self.org_revocation.load_full() {
+            if Arc::ptr_eq(&current, &store) {
+                return Ok(());
+            }
+            let current_view = current.snapshot();
+            let candidate_view = store.snapshot();
+            let dominates = current_view
+                .iter()
+                .all(|((org, member), floor)| candidate_view.floor_for(org, member) >= *floor);
+            if !dominates {
+                return Err(
+                    super::behavior::org_revocation::OrgRevocationError::NonMonotonicReplacement {
+                        path: store.path().display().to_string(),
+                    },
+                );
+            }
+        }
+        // Floor raises retract exactly the fold ownership
+        // projections that fell below the new floor — immediately,
+        // with no re-announcement; capability entries untouched
+        // (review-8 §9).
+        let fold = self.capability_fold.clone();
+        store.set_on_floors_raised(move |raised| {
+            for (org, member, floor) in raised {
+                let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
+                    &fold, *org, member, *floor,
+                );
+                if retracted > 0 {
+                    tracing::info!(
+                        org = %org,
+                        floor,
+                        retracted,
+                        "revocation floor rise retracted stale ownership projection(s)"
+                    );
+                }
+            }
+        });
         self.org_revocation.store(Some(store));
+        Ok(())
     }
 
     /// OA-1: the installed org revocation store, if any.
@@ -6570,9 +6704,57 @@ impl MeshNode {
         self.org_revocation.load_full()
     }
 
-    /// OA-1: enable (`Some`) or disable (`None`, the default)
-    /// attaching this node's owner membership certificate to its
-    /// own capability announcements.
+    /// OA-1 (review-8 §2/§3): install the node's loaded,
+    /// self-verified [`NodeAuthority`](super::behavior::org_authority::NodeAuthority)
+    /// as THE production authority object — the only certificate
+    /// source for emission and the owner of the installed
+    /// revocation store.
+    ///
+    /// Verifies the authority's certificate names THIS node's
+    /// entity; refuses replacement by a DIFFERENT owner org (one
+    /// node one owner — same-org renewal is accepted); installs
+    /// the authority's revocation store under the monotonic rules
+    /// of [`Self::install_org_revocation_store`]. Emission stays
+    /// wherever it was (off by default) — enabling is the
+    /// separate, explicit [`Self::set_owner_cert_emission`] step.
+    pub fn install_node_authority(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        if authority.config.owner_cert.member != *self.identity.entity_id() {
+            return Err(
+                super::behavior::org_authority::OrgAuthorityError::CertNotForThisNode {
+                    cert_member: authority.config.owner_cert.member.clone(),
+                    local_entity: self.identity.entity_id().clone(),
+                },
+            );
+        }
+        if let Some(existing) = self.node_authority.load_full() {
+            if existing.owner_org() != authority.owner_org() {
+                return Err(
+                    super::behavior::org_authority::OrgAuthorityError::AlreadyOwned {
+                        existing: existing.owner_org(),
+                        requested: authority.owner_org(),
+                    },
+                );
+            }
+        }
+        self.install_org_revocation_store(authority.revocation.clone())
+            .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
+        self.node_authority.store(Some(authority));
+        Ok(())
+    }
+
+    /// OA-1: the installed node authority, if any.
+    pub fn node_authority(&self) -> Option<Arc<super::behavior::org_authority::NodeAuthority>> {
+        self.node_authority.load_full()
+    }
+
+    /// OA-1: enable or disable attaching the INSTALLED authority's
+    /// owner certificate to this node's own capability
+    /// announcements. There is no way to emit any other
+    /// certificate (review-8 §3) — the local scaffold selects the
+    /// one authoritative owner.
     ///
     /// This is the plan's Migration **step 3** switch
     /// (`upgrade-all-then-emit`): with emission off the signed
@@ -6582,10 +6764,30 @@ impl MeshNode {
     /// field and drops this node's announcements (fail-closed).
     /// Enable only after every participant is upgraded.
     ///
+    /// Enabling on a node with no installed authority fails loudly.
     /// The next self-announcement (periodic or service-driven)
     /// carries the change; no immediate re-broadcast is forced.
-    pub fn set_owner_cert_emission(&self, cert: Option<super::behavior::org::OrgMembershipCert>) {
-        self.owner_cert_emission.store(cert.map(Arc::new));
+    pub fn set_owner_cert_emission(
+        &self,
+        enabled: bool,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        if enabled && self.node_authority.load().is_none() {
+            return Err(super::behavior::org_authority::OrgAuthorityError::NoAuthorityInstalled);
+        }
+        self.owner_cert_emission_enabled
+            .store(enabled, Ordering::Release);
+        Ok(())
+    }
+
+    /// The certificate self-announcements attach right now: the
+    /// installed authority's owner cert iff emission is enabled.
+    fn owner_cert_for_emission(&self) -> Option<super::behavior::org::OrgMembershipCert> {
+        if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.node_authority
+            .load_full()
+            .map(|authority| authority.config.owner_cert.clone())
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -15027,25 +15229,28 @@ impl MeshNode {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
         // OA-1: verify the announcement's owner cert (if any) at
-        // the ingest boundary — signature, window, member binding,
-        // and the node's persisted revocation floors. A bad cert is
-        // dropped here (the announcement is kept); ONLY a verified
-        // cert reaches the fold's `owner_org` projection. Runs
-        // after the forward block: the signed bytes (cert included)
+        // the ingest boundary — the OUTER announcement signature is
+        // an explicit precondition (`signature_verified` from step
+        // 5 above; a valid replayed cert must not lend ownership to
+        // an unsigned capability statement — review-8 §1), then the
+        // cert's signature, window, member binding, and the node's
+        // persisted revocation floors. A bad cert is dropped here
+        // (announcement handling unchanged); ONLY a fully verified
+        // cert reaches the fold's `owner` projection. Runs after
+        // the forward block: the signed bytes (cert included)
         // propagate verbatim and every receiver re-verifies.
-        let verified_owner_org = {
+        let verified_owner = {
             let store = ctx.org_revocation.load();
             let floors = store.as_ref().map(|s| s.snapshot());
             super::behavior::fold::capability_bridge::verify_announced_owner_cert(
                 &ann,
+                signature_verified,
                 floors.as_deref(),
                 0,
             )
         };
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
-            &ann,
-            verified_owner_org,
-        );
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = ctx.capability_fold.apply(fold_ann);
 
         // SI-6 review P1 (unified scheduler-input generation): fold
@@ -16972,27 +17177,29 @@ impl MeshNode {
             merged,
         )
         .with_ttl(300)
-        // OA-1: attach the owner cert iff emission is enabled
-        // (Migration step 3 switch; `None` keeps pre-OA-1 bytes).
-        .with_owner_cert(self.owner_cert_emission.load_full().map(|c| (*c).clone()));
+        // OA-1: attach the INSTALLED authority's owner cert iff
+        // emission is enabled (Migration step 3 switch; `None`
+        // keeps pre-OA-1 bytes; no other cert source exists).
+        .with_owner_cert(self.owner_cert_for_emission());
         ann.sign(&self.identity);
         // OA-1: self-index runs the same owner-cert verification as
         // inbound ingest — a node's own projection is held to the
         // identical proof standard (no cert on the announcement →
-        // no owner_org, exactly like a peer would see).
-        let verified_owner_org = {
+        // no owner projection, exactly like a peer would see). The
+        // outer signature was produced by `sign` on the line above,
+        // so the precondition holds by construction.
+        let verified_owner = {
             let store = self.org_revocation.load();
             let floors = store.as_ref().map(|s| s.snapshot());
             super::behavior::fold::capability_bridge::verify_announced_owner_cert(
                 &ann,
+                true,
                 floors.as_deref(),
                 0,
             )
         };
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
-            &ann,
-            verified_owner_org,
-        );
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = self.capability_fold.apply(fold_ann);
     }
 
@@ -17254,9 +17461,10 @@ impl MeshNode {
                 caps,
             )
             .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
-            // OA-1: attach the owner cert iff emission is enabled
-            // (Migration step 3 switch; `None` keeps pre-OA-1 bytes).
-            .with_owner_cert(self.owner_cert_emission.load_full().map(|c| (*c).clone()));
+            // OA-1: attach the INSTALLED authority's owner cert iff
+            // emission is enabled (Migration step 3 switch; `None`
+            // keeps pre-OA-1 bytes; no other cert source exists).
+            .with_owner_cert(self.owner_cert_for_emission());
             #[cfg(feature = "nat-traversal")]
             {
                 ann = ann.with_reflex_addr(reflex_snapshot);
@@ -17269,19 +17477,22 @@ impl MeshNode {
             // regardless of rate limit — the self-index reflects the
             // latest intended announcement. OA-1: same owner-cert
             // verification as inbound ingest (see
-            // `index_self_with_local_services`).
-            let verified_owner_org = {
+            // `index_self_with_local_services`); the outer-signature
+            // precondition is `sign` — an unsigned announcement
+            // projects no ownership even for ourselves.
+            let verified_owner = {
                 let store = self.org_revocation.load();
                 let floors = store.as_ref().map(|s| s.snapshot());
                 super::behavior::fold::capability_bridge::verify_announced_owner_cert(
                     &ann,
+                    sign,
                     floors.as_deref(),
                     0,
                 )
             };
             let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
                 &ann,
-                verified_owner_org,
+                verified_owner,
             );
             let _ = self.capability_fold.apply(fold_ann);
 
@@ -19297,22 +19508,23 @@ impl MeshNode {
         ann: super::behavior::capability::CapabilityAnnouncement,
     ) {
         // Mirrors the inbound dispatch path, including OA-1
-        // owner-cert verification against this node's installed
-        // revocation floors — so exit-gate fixtures exercise the
-        // real ingest semantics.
-        let verified_owner_org = {
+        // owner-cert verification — the outer-signature
+        // precondition is computed here exactly as dispatch's step
+        // 5 does — against this node's installed revocation floors,
+        // so exit-gate fixtures exercise the real ingest semantics.
+        let outer_signature_verified = ann.verify().is_ok();
+        let verified_owner = {
             let store = self.org_revocation.load();
             let floors = store.as_ref().map(|s| s.snapshot());
             super::behavior::fold::capability_bridge::verify_announced_owner_cert(
                 &ann,
+                outer_signature_verified,
                 floors.as_deref(),
                 0,
             )
         };
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
-            &ann,
-            verified_owner_org,
-        );
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = self.capability_fold.apply(fold_ann);
     }
 
@@ -22474,7 +22686,7 @@ mod fold_publisher_helpers_tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
-                owner_org: None,
+                owner: None,
             })
             .await;
         assert!(result.is_ok());
