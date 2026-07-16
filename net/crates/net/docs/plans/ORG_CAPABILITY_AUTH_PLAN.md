@@ -1,63 +1,45 @@
 # Organization Capability Auth Plan
 
-**Status:** Draft — not started.
-**Scope:** cryptographic organization membership for nodes, org-scoped
-capability announcements, and org-verified admission of incoming work.
-Three phases: (1) org identity + membership certs + org allow-list
-axis, (2) invocation delegation carried per-request and verified at
-the callee, (3) owner-scoped discovery over the sensing path.
-**Supersedes:** the deferred "v3" of `SCOPED_CAPABILITIES_PLAN.md`
-(§"Follow-ups") — "multiple organizations sharing one mesh under
-strict cross-tenant requirements" is now the requirement.
+**Version:** v0.4 — closes the three review-3 implementation
+contracts: dedicated floor replication + write-through lifecycle
+(§1.5), finite admission-proof validity + (caller, call_id) replay
+identity (§2.4/§2.6), two-epoch owner discovery + plaintext-interest
+boundary (§3.2/§3.5). Architecture, three-plane separation,
+scaffolded ownership, delegated admission model, and the visibility
+mode split are review-3 APPROVED and unchanged. All review-2 and
+review-3 sign-offs (see §Locked) are retained verbatim.
+**Status:** Draft, awaiting review-4 / implementation authorization.
+**Scope:** cryptographic organization ownership for nodes,
+capability-specific delegated admission of incoming work, and
+owner-scoped discovery.
+
+```
+Belonging:   org-signed membership          (Phase 1 — scaffolded,
+                                             authority-dark)
+Admission:   per-call delegated authority   (Phase 2 — load-bearing,
+                                             replay-guarded, unary)
+Visibility:  owner-scoped discovery         (Phase 3 — two honest
+                                             modes, epoch-keyed)
+```
+
+**The invariant sentence:** *Scaffolding establishes belonging.
+Delegation authorizes work. Discovery limits knowledge. Provider
+policy controls execution.* Membership is never invocation
+authority. Visibility is never admission. Admission is never
+confidentiality. Authentication is never replay prevention. A
+replay key never dies before the proof it guards (§2.6).
 
 ---
 
 ## Context
 
-Capability auth v0.4 (`CAPABILITY_AUTH_PLAN.md`, shipped) gates
-execution with three allow-list axes on `CapabilityAnnouncement`:
-`allowed_nodes`, `allowed_subnets`, `allowed_groups`. Membership on
-the subnet/group axes is **self-declared** via `subnet:<hex>` /
-`group:<hex>` tags on the caller's own announcement. That is safe
-only in the bearer-secret sense: a random `GroupId` is unguessable,
-so knowing the bytes IS membership.
-
-Bearer-secret membership has four structural limits an organization
-boundary cannot live with:
-
-1. **No verifiable belonging.** A receiver cannot prove "node N is a
-   member of org O" — it can only observe that N emitted the right
-   bytes. Anyone the secret leaks to is indistinguishable from a
-   member.
-2. **No per-member revocation.** Rotating the secret evicts everyone
-   at once and requires out-of-band redistribution to every member.
-3. **The secret rides every announcement.** Group tags are inside the
-   (signed, plaintext) `CapabilitySet`, so the credential is
-   broadcast to the entire mesh, hop-forwarded up to
-   `MAX_CAPABILITY_HOPS = 16`.
-4. **Membership conflates into invocation authority.** v0.4's gate
-   admits any caller matching any axis. There is no way to say "this
-   node belongs to the org but may not dispatch work."
-
-Separately, discovery is permissive-global: every announcement fans
-out to the whole mesh. `SCOPED_CAPABILITIES_PLAN.md` added query-time
-tag filtering but deliberately punted on real visibility control
-("doesn't prove anything, leaks everything it always leaked").
-
-The design target (per the visibility/admission review):
-
-```
-Visibility controls knowledge.  Admission controls authority.
-Provider policy controls execution.  Never substitute one for another.
-```
-
-For an internal organizational capability the default is:
-
-```
-visibility:  owner members only            (Phase 3)
-admission:   valid owner delegation        (Phase 2)
-belonging:   org-signed membership cert    (Phase 1)
-```
+Unchanged from v0.2/v0.3: v0.4-capability-auth's four structural
+limits for an org boundary, with "membership conflates into
+invocation authority" as the trap no phase may rebuild. No
+execute-gate change ships in Phase 1; authority arrives only as
+capability-specific, per-call, replay-guarded delegated admission
+in Phase 2; Phase 3 ends the discovery deferral with
+honestly-named visibility modes.
 
 ---
 
@@ -65,569 +47,600 @@ belonging:   org-signed membership cert    (Phase 1)
 
 ```
 ORG IDENTITY
-    OrgId = org's ed25519 public key (32 bytes, self-certifying —
-    same construction as EntityId). Org signing key lives offline
-    with the operator.
+    OrgId = org's ed25519 public key (32 B, self-certifying).
+    Root key offline.
 
-MEMBERSHIP (Phase 1)
-    OrgMembershipCert {
-        org_id:      OrgId        // 32 — issuer, also the verify key
-        member:      EntityId     // 32 — the node's entity key
-        not_before:  u64          //  8
-        not_after:   u64          //  8
-        generation:  u32          //  4 — reserved, see Locked #4
-        nonce:       u64          //  8
-        --- signed above (92 bytes) ---
-        signature:   [u8; 64]     // ed25519 by org_id
-    }                             // wire: 156 bytes
+OWNERSHIP (Phase 1) — one node, exactly one owner org
+    OrgMembershipCert { org_id, member, not_before, not_after,
+                        generation, nonce, --- signed ---, sig }
+    ~1-year TTL, silent renewal, 156 B wire.
+    VERIFY = verify_strict AND TOFU member binding AND window
+             AND generation >= durable_floor(org, member)
 
-    Nodes attach certs to their CapabilityAnnouncement. Receivers
-    verify at fold ingest:
-        sig valid under org_id
-        cert.member == announcement.entity_id   (TOFU-bound)
-        now ∈ [not_before − skew, not_after + skew]
-    Only verified OrgIds land in the fold's NodeId → member_orgs view.
+REVOCATION (Phase 1) — OrgAuthorityFloorStore (§1.5)
+    Dedicated durable authority store + explicit replication
+    protocol. Inner org signature is authority; carriers are
+    interchangeable; floors never expire; write-through durable
+    commit BEFORE admission visibility; monotone generation-primary
+    merge. NOT an ordinary fold.
+    Delegations: short expiry only; no floors in v1.
 
-SCOPED ANNOUNCEMENT (Phase 1)
-    allowed_orgs: Vec<OrgId> — fourth allow-list axis, union
-    semantics with the existing three.
+SCAFFOLDING (Phase 1)
+    NodeAuthorityConfig { owner_org, owner_cert, trusted_org_root,
+                          revocation_state }
+    Loud self-verification at startup (cert AND floor store health).
+    Fold projection owner_org: Option<OrgId> — discovery/indexing/
+    admission-input ONLY. may_execute untouched.
 
-EXECUTE check (Phase 1), caller C invokes tag T on announcer A:
-    1–6. unchanged from v0.4 (§Model of CAPABILITY_AUTH_PLAN.md)
-    6b.  if C's VERIFIED member_orgs ∩ A.allowed_orgs → allow
-    7.   else → deny
+ADMISSION (Phase 2) — capability-specific, per-call, replay-guarded,
+                       UNARY (v1)
+    Provider-local HashMap<CapabilityAuthorityId, CapabilityPolicy>.
+    AdmissionRequirement: PublicAuthenticated | OwnerDelegation(OrgId)
+        | OrgMembership(OrgId) | Extension{kind,body} (unknown DENIES)
+    Exactly one "net-org-admission" header:
+        AdmissionProof { membership_cert, delegation_chain,
+                         proof_expires_at, call_binding_sig }
+    proof_expires_at is FINITE always (deadline-less RPC included);
+    replay keys retain until proof_expires_at + skew — a key never
+    dies before its proof.
+    Replay identity is nRPC correlation identity: (caller, call_id).
 
-ADMISSION (Phase 2), independent of the above:
-    A's announcement may declare
-        admission: OwnerDelegation(org_id)
-    Caller must then carry, in the RPC request itself:
-        AdmissionProof {
-            membership_cert:   OrgMembershipCert,
-            delegation_chain:  Vec<OrgDelegation>,   // root issuer == org_id
-            call_binding_sig:  [u8; 64],             // replay binding
-        }
-    Callee verifies fresh, per call, before fold.apply. Membership
-    without delegation does NOT admit — a GPU worker can be a member
-    and still be denied dispatch authority.
-
-DISCOVERY VISIBILITY (Phase 3):
-    Owner-only capabilities stop riding the CAP-ANN flood (or ride
-    it summary-only). Private detail is delivered over the sensing
-    interest path after the consumer's DiscoveryAuthority
-    (membership cert + signed interest) validates.
-
-REVOCATION:
-    Membership: cert expiry. Issue short-lived certs (recommended
-    not_after − not_before ≤ 24h) and re-issue on the announcement
-    cadence. `generation` is on the wire from day one so a floor-
-    based scheme can ship later without a wire break (Locked #4).
-    Delegation: expiry + the same reserved generation field.
-    Announcement scope: unchanged — publish version+1 with new lists.
+VISIBILITY (Phase 3)
+    Public | PublicLocatorOwnerDetail(OrgId) | OwnerOnly(OrgId)
+    OwnerOnly: epoch-keyed locator ids + owner-domain registration;
+    two-key rotation overlap; the sensing amendment must settle the
+    plaintext-interest boundary before implementation (§3.5).
 ```
 
 ---
 
-## What ships — Phase 1: org identity, membership, org axis
+## What ships — Phase 1: scaffolded ownership, dark authority facts
 
-### 1.1 `OrgId` — `src/adapter/net/behavior/org.rs` (new)
+### 1.1–1.4 — as v0.3, unchanged
 
-32-byte ed25519 public key. `Debug + Display + Hash + Eq + Copy`,
-serde (hex when human-readable, raw bytes otherwise — mirror
-`EntityId`'s impls in `identity/entity.rs`), postcard round-trip,
-`from_bytes` / `as_bytes`, `verifying_key()`.
+`OrgId` (`behavior/org.rs`, derived non-ct PartialEq, documented
+contrast with bearer-secret ids); `OrgKeypair` / `OrgMembershipCert`
+(canonical layout, strict decode, verify_strict, ~1y recommended /
+2y max TTL, token-module skew); `NodeAuthorityConfig` scaffolding
+(`net node adopt`, loud startup self-verification, one owner org,
+runtime-attached cert); single `owner_cert: Option<...>`
+announcement field with `SignedPayloadCanonical` lockstep; fold
+`owner_org` projection from ingest-verified certs only;
+`may_execute` untouched (T5); no verification cache before its
+benchmark.
 
-**Deliberate difference from `GroupId`/`SubnetId`: derived
-`PartialEq`, NOT constant-time.** An `OrgId` is a public key —
-knowing it grants nothing — so the `subtle::ConstantTimeEq` treatment
-those bearer-secret types need does not apply. Document this in the
-module header so nobody "fixes" it into ct_eq or, worse, concludes
-GroupId's ct_eq is optional.
+Startup self-verification now explicitly includes floor-store
+health per §1.5: cert valid AND durable store open and consistent,
+or loud failure. CLI as v0.3 plus nothing — floor distribution is
+runtime, not operator ceremony.
 
-### 1.2 `OrgKeypair` + `OrgMembershipCert` — same module
+### 1.5 `OrgAuthorityFloorStore` — dedicated durable authority store
+(closes review-3 Blocker 1)
 
-`OrgKeypair` mirrors `EntityKeypair` (generate, from_bytes, sign).
-`OrgMembershipCert` mirrors `PermissionToken`'s canonical byte layout
-discipline (`identity/token.rs`): fixed-offset signed payload, strict
-length check on decode, `verify()` using `verify_strict` (see the
-malleability rationale on `EntityId::verify` — same caching-on-bytes
-concern applies here).
-
-Constraints, mirroring token constants:
-
-- `MAX_CERT_TTL_SECS` — reuse `MAX_TOKEN_TTL_SECS`' value; reject
-  longer at issue AND at verify.
-- Clock skew — reuse `MAX_TOKEN_CLOCK_SKEW_SECS` handling.
-- `MAX_ORG_CERTS_PER_ANNOUNCEMENT: usize = 8`. Certs are 156 bytes
-  each; 8 keeps the announcement well under the wire-size ceiling
-  that motivated `MAX_ALLOW_LIST_LEN = 64`. A node in more than 8
-  orgs is an operator smell, not a substrate requirement.
-
-### 1.3 Two fields on `CapabilityAnnouncement` — `behavior/capability.rs`
+The generic fold runtime assumes per-entry `expires_at`,
+outer-publisher entry ownership, failure eviction of a publisher's
+entries, outer-generation merge ordering, and no automatic
+rebroadcast of inbound deliveries. Every one of those conflicts
+with floor semantics. **Floors are therefore NOT a `FoldKind`** —
+no "non-default lifecycle" fiction, no `Duration::MAX` abuse of an
+expiry-structured sweeper. Dedicated component:
 
 ```rust
-/// Org membership certificates for THIS announcer. Verified at
-/// fold ingest; unverifiable certs are dropped (not the whole
-/// announcement). Capped at MAX_ORG_CERTS_PER_ANNOUNCEMENT.
-#[serde(default, skip_serializing_if = "Vec::is_empty")]
-pub org_certs: Vec<OrgMembershipCert>,
+// behavior/org_floor.rs (new)
+pub struct OrgAuthorityFloorStore {
+    /// Authoritative local maximum per key. Durable, write-through.
+    durable: PersistentMap<MembershipFloorKey, MembershipFloorValue>,
+    /// Mesh transport/projection surface (frames below).
+    replication: OrgFloorReplication,
+}
 
-/// Org allow-list — callers with a VERIFIED membership cert for
-/// any listed org may invoke. Empty = no org grant (the other
-/// axes still apply). Capped at MAX_ALLOW_LIST_LEN.
-#[serde(default, skip_serializing_if = "Vec::is_empty")]
-pub allowed_orgs: Vec<OrgId>,
+MembershipFloorKey   { org_id: OrgId, member: EntityId }
+MembershipFloorValue {
+    minimum_generation: u32,
+    issued_at:          u64,
+    org_signature:      Signature64,  // over ("net-org-floor-v1" ‖
+}                                     //  org_id ‖ member ‖ min_gen ‖
+                                      //  issued_at)
 ```
 
-**`SignedPayloadCanonical` moves in lockstep** — add the two
-`serialize_field` / `skip_field` pairs in declaration order, after
-`allowed_groups`. This is the #1 way to break rolling upgrades; the
-byte-identity test (§Tests, T1) pins it.
+**Authority + carriage.** The inner org signature is the sole
+authority; the outer transporting node is an interchangeable
+carrier. Any node may wrap and carry the byte-identical inner
+record under its own transport identity. Carrier disconnect,
+failure eviction, or carrier outer-generation NEVER affects stored
+floors (witnesses 8–9). Records failing inner-signature
+verification are dropped, never merged.
 
-Builder helpers: `with_org_cert(cert)`, `allow_org(org_id)` with cap
-enforcement at build time (mirror the existing allow-list builders).
+**Merge** (unchanged, restated): generation-primary monotone;
+`issued_at` breaks ties only; lower generation never replaces
+higher regardless of `issued_at`.
 
-### 1.4 Fold ingest verification — `behavior/fold/capability_bridge.rs`
+**Write-through lifecycle (locked; Q10 answered as mandatory):**
 
-Where announcements convert to fold entries, verify each cert per
-§Model. Verified OrgIds land on the fold payload
-(`behavior/fold/capability.rs`):
+```
+verify inner org signature
+→ compare against durable maximum
+→ write + fsync / atomic durable commit
+→ ONLY THEN update the live admission view
+→ notify / rebroadcast the exact inner record
+```
+
+Persistence failure: the new floor is NOT exposed from memory;
+protected admission is marked unhealthy and fails closed (deny)
+until durable state is trustworthy again. A node must never
+enforce a floor it could forget on crash (witnesses 10–11).
+Periodic checkpointing may optimize restart; it is never the
+durability boundary.
+
+**Retention: indefinite (locked).** No TTL, no age-based GC — the
+v0.3 "retention ≥ MAX_ORG_CERT_TTL past issued_at" rule is removed
+(unsafe without bounding future-dated `not_before`, and the table
+is tiny). Compaction retains exactly one maximum record per key,
+verbatim with signature, re-verifiable. Per-key removal arrives
+only with a future reviewed org/key-retirement mechanism.
+
+**Explicit replication protocol** (subprotocol ids allocated from
+the registry at implementation, alongside 0x0C00/0x0C02/0x0C03):
 
 ```rust
-/// Orgs this publisher has PROVEN membership in — populated only
-/// from certs that verified at ingest. Unlike allowed_groups /
-/// the caller's group tags, this is not self-declared.
-pub member_orgs: Vec<OrgId>,
-/// Mirror of the announcement's allowed_orgs axis.
-pub allowed_orgs: Vec<OrgId>,
+OrgFloorAnnounce    { record: OrgMembershipFloor }
+OrgFloorSyncRequest { }                         // v1: all maxima
+OrgFloorSyncPage    { records: Vec<OrgMembershipFloor>,
+                      cursor:  Option<...> }    // bounded pages
 ```
 
-Both fields also get `Vec::new()` at every existing payload
-construction site (~5 sites in `fold/capability.rs`, one in
-`mesh.rs:~22340`; grep `allowed_groups: Vec::new()` and mirror).
+Behavior: an ACCEPTED higher floor (post-durable-commit) is
+broadcast/rebroadcast as the exact inner record — inbound valid
+maxima are re-propagated beyond the receiving peer, because
+ordinary delivery does not do this automatically (witness 12). On
+peer session establishment/recovery: `OrgFloorSyncRequest` → bounded
+pages → verify + monotone-merge every record; converges across
+non-full-mesh topologies (witness 13). Periodic anti-entropy replays
+maxima (v1: full replay; compact summaries are a follow-up
+optimization — the table is tiny).
 
-**Verification cost + cache.** One ed25519 verify per cert per
-announcement, and announcements re-broadcast every ~TTL/2 with
-identical certs. Add a small verified-cert LRU keyed on the cert's
-signature bytes (sig uniquely commits to the payload under
-verify_strict): hit → skip the verify, but ALWAYS re-check the time
-window and the member == entity_id binding (those are contextual,
-not cacheable). Size ~1024 entries; follow the `OriginKeyedLru`
-pattern in `mesh_rpc.rs`.
+**Witnesses (T-floor, thirteen total):** 1–7 from v0.3 (restart;
+compaction; no later-lower rollback; reconnect sync; post-
+propagation rejection; pre-propagation acceptance proven;
+store-unavailable loud failure) plus review-3's:
+(8) carrier failure/disconnect does not remove a floor;
+(9) a carrier with a huge outer generation cannot block a higher
+inner floor arriving via another carrier;
+(10) an accepted floor is not visible to admission before durable
+commit; (11) persistence failure ⇒ protected admission unhealthy /
+fail-closed; (12) valid inbound floor re-propagates beyond the
+receiving peer; (13) join-time full sync converges on non-full-mesh
+topology.
 
-### 1.5 Execute gate — org axis — `fold/capability_bridge.rs`
-
-Extend `may_execute` (bridge line ~459), `may_execute_batch`,
-`may_execute_with_caller`, and `derive_caller_axes`:
-
-- Target side: accumulate `allowed_orgs` alongside the other three
-  lists; the "all axes empty → permissive" check at ~487 now spans
-  four axes.
-- Caller side: `derive_caller_axes` returns
-  `(caller_subnet, caller_groups, caller_member_orgs)` — the org set
-  read from the caller's fold entry's **`member_orgs`** (verified),
-  never from tags.
-- Admit on `caller_member_orgs ∩ allowed_orgs ≠ ∅`, short-circuit on
-  first match (Locked #2 of the v0.4 plan carries over).
-
-Both existing wire points come for free: caller-side pre-flight in
-`Mesh::call_service` and the callee-side defense-in-depth in
-`serve_rpc` (`mesh_rpc.rs` ~2156, ~2406) already call `may_execute`.
-No new plumbing in Phase 1.
-
-### 1.6 CLI — `net org` verbs
-
-- `net org keygen --out <path>` — generate an org keypair.
-- `net org issue-cert --org-key <path> --member <entity-hex>
-  --ttl-secs N --out <path>` — emit a cert (JSON bytes).
-- `net cap announce` grows `--org-cert <path>` (repeatable, ≤8) and
-  `--allow-org <hex64>` (repeatable, ≤64).
-
-One issue verb, no `revoke` verb — revocation is expiry + declining
-to re-issue, consistent with Locked #3 of the v0.4 plan.
+Delegation floors: still out of v1; `OrgDelegation.generation`
+reserved and unenforced (T7 pins).
 
 ---
 
-## What ships — Phase 2: invocation delegation (admission)
+## What ships — Phase 2: capability-specific delegated admission
 
-Membership proves belonging; it must not imply dispatch authority.
-Phase 2 adds the per-request proof.
+### 2.1–2.3 — as v0.3, unchanged
 
-### 2.1 `OrgDelegation` — `behavior/org.rs`
+`CapabilityAuthorityId` (32-byte blake3 derive_key, documented
+enumerable, never a secrecy mechanism); `OrgDelegation` (sibling
+type, actions vs `CapabilityScope::{Exact,Any}`, short-lived,
+TokenChain-semantics chain rules, membership floor checked via the
+proof's cert, delegation generation reserved-unenforced);
+provider-local per-capability `CapabilityPolicy` with bounded
+advertisement (dual count+byte limits, worst-case encoded fixture
+before constants freeze, `MAX_ADMISSION_EXTENSION_BODY_BYTES`
+independent cap, fail-closed `Extension`).
 
-Structurally `PermissionToken` with the channel axis swapped for a
-capability axis:
-
-```
-issuer:           32   // OrgId at the root; EntityId below it
-subject:          32   // EntityId being empowered
-scope:             4   // bits: INVOKE | DELEGATE (READ reserved)
-capability_hash:   8   // blake2s64("net-org-cap-v1", tag), or
-                       //   WILDCARD scope bit for all-capabilities
-generation:        4   // reserved (Locked #4)
-not_before:        8
-not_after:         8
-delegation_depth:  1
-nonce:             8
---- signed above ---
-signature:        64
-```
-
-Chain rules copied from `TokenChain`, not reinvented: root issuer
-must equal the required `OrgId`; each link's issuer == previous
-link's subject; scope monotonically narrows; validity windows
-intersect; depth ≤ `MAX_CHAIN_DEPTH`; parent must carry DELEGATE.
-The four-level "owner → org → team → service" shape the token module
-already documents is exactly the org shape.
-
-Decision point (see Open questions Q1): implement as a new type
-mirroring `PermissionToken`, or generalize `PermissionToken` with a
-scope-axis enum. Plan assumes the new type — the token's
-`ChannelHash` coupling and `TokenCache` slot semantics are
-channel-auth-specific, and a shared abstract type would force both
-subsystems through one wire format forever.
-
-### 2.2 `AdmissionRequirement` on the announcement
+### 2.4 `AdmissionProof` — finite validity, exactly one header
+(closes review-3 Blocker 2, part 1)
 
 ```rust
-#[derive(Serialize, Deserialize, ...)]
-pub enum AdmissionRequirement {
-    /// v0.4 behavior: allow-list axes + transport auth only.
-    PublicAuthenticated,
-    /// Caller must present a delegation chain rooted at this org.
-    OwnerDelegation(OrgId),
+AdmissionProof {
+    membership_cert:  OrgMembershipCert,
+    delegation_chain: Vec<OrgDelegation>,
+    /// FINITE, always. Bounds how long this signed invocation can
+    /// FIRST be admitted — independent of the RPC deadline, which
+    /// still bounds execution. Deadline-less RPC (deadline_ns == 0)
+    /// changes nothing here.
+    proof_expires_at: u64,
+    call_binding_sig: [u8; 64],
 }
-
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub admission: Option<AdmissionRequirement>,
 ```
 
-`None` ≡ `PublicAuthenticated` ≡ pre-Phase-2 bytes.
-`SignedPayloadCanonical` lockstep again. `ExplicitGrant` /
-`PolicyRef` variants from the review are future arms of this enum —
-the enum is `#[non_exhaustive]` from day one so adding them is not a
-break. Mirror the field onto the fold payload.
-
-### 2.3 `AdmissionProof` carried in RPC headers
-
-No nRPC wire break. The proof rides a well-known header on
-`RpcRequestPayload.headers`:
+Callee checks (in addition to v0.3's):
 
 ```
-name:  "net-org-admission"
-value: postcard(AdmissionProof {
-           membership_cert:  OrgMembershipCert,       // 156
-           delegation_chain: Vec<OrgDelegation>,       // ≤ depth×~170
-           call_binding_sig: [u8; 64],
-       })
+now <= proof_expires_at + skew
+proof_expires_at <= now + MAX_ADMISSION_PROOF_TTL
 ```
 
-Worst case (cert + 4-link chain + sig) ≈ 900 bytes — comfortably
-under `MAX_RPC_HEADER_VALUE_LEN = 4096`.
+`proof_expires_at` is bound into the call-binding transcript —
+domain bumps to `"net-org-call-v3"`:
 
-`call_binding_sig` is the caller entity's ed25519 signature over the
-domain-separated transcript
-`("net-org-call-v1", callee_node_id, service, deadline_ns,
-blake2s(body))`. This binds the proof to THIS call: a relay or a
-previously-authorized-now-revoked peer replaying a captured proof
-against a different call, callee, or deadline fails the binding.
-Deadline in the transcript bounds the replay window for a
-byte-identical re-send; idempotency is the application's concern as
-today.
+```
+blake3("net-org-call-v3" ‖ caller EntityId ‖ caller origin_hash
+       ‖ callee NodeId ‖ call_id
+       ‖ canonical RpcRequestPayload bytes, net-org-admission
+         header omitted
+       ‖ proof_expires_at
+       ‖ blake3(membership_cert) ‖ blake3(delegation_chain))
+```
 
-### 2.4 Callee-side admission gate — `mesh_rpc.rs`
+Header discipline unchanged: exactly one `net-org-admission`
+header or deny; static size asserts include the new field.
+Golden vectors regenerated for v3 transcripts.
 
-In `serve_rpc`'s intake, after the existing `may_execute` check and
-before `fold.apply`:
+### 2.5 Callee gate + plumbing — as v0.3
 
-1. Look up the target capability's `admission` from OUR OWN
-   announcement state (the provider enforces its own policy — never
-   the fold copy of someone else's).
-2. `PublicAuthenticated` / absent → done (v0.4 path).
-3. `OwnerDelegation(org)` → require the header; verify: membership
-   cert valid and `member == caller EntityId` (resolved via the
-   `peer_entity_ids` TOFU binding — Locked #1); chain roots at
-   `org`, leaf subject == caller EntityId, leaf scope ⊇ INVOKE,
-   `capability_hash` matches the invoked tag (or WILDCARD); windows
-   valid; `call_binding_sig` verifies against the caller EntityId
-   over this call's transcript.
-4. Any failure → `RpcStatus::AdmissionDenied` (0x0009, next free
-   after `CapabilityDenied = 0x0008`) + typed
-   `RpcError::AdmissionDenied { target, capability }`.
+Local policy resolution → per-requirement verification (incl.
+membership floor, proof expiry) → §2.6 → handler.
+`RpcStatus::AdmissionDenied` (0x0009) + typed error; caller
+`CallOptions.admission_proof` + proof-provider hook (the hook now
+also picks `proof_expires_at`; sane default = min(deadline,
+now + provider-advertised max) with `MAX_ADMISSION_PROOF_TTL`
+ceiling); pre-flight advisory only; old callees can't enforce.
 
-Caller-side: `CallOptions` grows `admission_proof: Option<...>` (or
-a mesh-level default provider closure so schedulers set it once).
-Caller pre-flight can fast-fail from the fold's `admission` copy but
-MUST NOT treat fold state as authoritative — the callee re-verifies
-regardless.
+**Streaming scope (locked, v1):** organizational admission covers
+UNARY requests / durable-job submission only. The call binding
+covers the initial `RpcRequestPayload`; it does not bind later
+`REQUEST_CHUNK` bodies, so no whole-work binding claim is made for
+streaming. Client-streaming and duplex calls under org admission
+are DEFERRED until chunks are hash-chained or independently
+caller-signed (future amendment). Phase-2 code rejects
+org-protected streaming calls with `AdmissionDenied` + a distinct
+reason rather than admitting them under a false binding claim
+(T18).
 
-Verification cost per call: 3 ed25519 verifies + chain walk. Cache
-(cert, chain) validation keyed on concatenated signature bytes, same
-LRU pattern as §1.4; `call_binding_sig` is verified every call, never
-cached.
+### 2.6 Admission replay guard — call-identity keyed, proof-lifetime
+retained (closes review-3 Blocker 2, part 2)
 
-### 2.5 CLI
+nRPC's completed-call replay cache never landed
+(`cortex/rpc.rs:108`); in-flight dedup alone is insufficient.
+Corrected guard:
 
-`net org delegate --key <issuer-key> --subject <entity-hex>
---capability <tag> [--delegatable] --ttl-secs N --out <path>` —
-works for both the root link (org key) and sub-links (entity key).
+```rust
+/// Key is nRPC correlation identity — NOT request content.
+AdmissionReplayKey   { caller: EntityId, call_id: u64 }
+AdmissionReplayValue { binding_digest: [u8; 32], expires_at: u64 }
+                     // expires_at = proof_expires_at + skew
+```
+
+Keying on `(caller, call_id, binding_digest)` (v0.3) was wrong: the
+same caller could reuse a call_id with a freshly signed different
+binding and mint a new map key. Under correlation-identity keying,
+ANY reuse of `(caller, call_id)` before expiry denies without a
+second handler invocation:
+
+```
+same binding_digest      → AdmissionDenied (replay)
+different binding_digest → AdmissionDenied (call-id collision)
+```
+
+Processing order unchanged and locked: verify proof + binding →
+ATOMIC insert-or-deny (single entry-op; occupied → deny) → handler.
+Retention: until `expires_at` — **an unexpired key is NEVER evicted,
+for capacity or any other reason** (v0.3's 60-second default window
+is removed; proof expiry is the retention clock, so the guard is
+exact for deadline-less RPC too).
+
+Capacity (Q9 answered): constants are not frozen now. Provider
+configuration with hard global ceilings:
+
+```rust
+AdmissionReplayConfig {
+    max_proof_ttl:          Duration,   // ceiling on accepted
+                                        // proof_expires_at horizon
+    max_entries_per_caller: usize,
+    max_entries_total:      usize,
+}
+```
+
+Sizing rule before freezing defaults:
+`required ≈ peak per-caller admitted RPS × max_proof_ttl × safety
+factor` (v0.3's 4096 × 60 s ≈ 68 calls/s/caller — fine for durable
+job dispatch, too low for inference RPC; measure, don't guess).
+Capacity exhaustion denies NEW protected calls and emits a metric;
+it never evicts unexpired entries. Providers trade `max_proof_ttl`
+against guard memory explicitly.
+
+Honest residual unchanged: the guard is volatile; cross-restart
+exactly-once is the application's idempotency key; call binding is
+never called replay prevention.
 
 ---
 
-## What ships — Phase 3: discovery visibility
+## What ships — Phase 3: owner-scoped discovery
 
-### 3.1 Publication split — `behavior/capability.rs`
+### 3.1 Visibility modes — as v0.3, review-3 APPROVED
+
+`Public` / `PublicLocatorOwnerDetail(OrgId)` (deterministic global
+locator, disclosure named honestly) / `OwnerOnly(OrgId)`. Locator
+trust binding locked (publisher/owner-cert/generation cross-checks;
+cross-org spoof witness T17). Org-scaffolded default
+`OwnerOnly(owner_org)`.
+
+### 3.2 Epoch-keyed owner discovery (closes review-3 Q8)
 
 ```rust
-pub enum DiscoveryVisibility {
-    Public,                 // default; today's behavior
-    OwnerOnly(OrgId),
-}
+OrgDiscoveryKey { epoch: u32, key: [u8; 32] }
 
-pub struct CapabilityPublication {
-    pub public_summary:  Option<CapabilitySet>,  // coarse, floodable
-    pub private_detail:  CapabilitySet,          // full manifest
-    pub visibility:      DiscoveryVisibility,
+OwnerCapabilityLocatorId =
+    blake3::keyed_hash(key[epoch], canonical capability identity)
+```
+
+The `epoch` is bound into: the keyed locator identity, the signed
+locator registration, the `DiscoveryAuthority` transcript (domain
+bumps to `"net-org-discovery-v2"`, epoch after org_id), provider
+verification, and the private locator-table key. Distributed via
+adopt-time config alongside membership; grants METADATA VISIBILITY
+ONLY.
+
+**Two-key rotation overlap (locked):** during rotation to epoch
+E+1, providers register locators under BOTH E and E+1; consumers
+may query both; new interests prefer E+1. Epoch E retires only
+after
+
+```
+max locator soft-state TTL
++ max live interest TTL
++ anti-entropy / registration propagation allowance
+```
+
+has elapsed since all intended members received E+1. A revoked
+member still fails membership/floor verification even while
+holding an old discovery key — the key is metadata visibility, not
+authority; where metadata confidentiality from a revoked member
+matters, revocation SHOULD trigger discovery-key rotation
+(operator guidance, stated in docs).
+
+### 3.3 Member-signed `DiscoveryAuthority` — as v0.3 + epoch
+
+Transcript: `("net-org-discovery-v2" ‖ org_id ‖ discovery_key_epoch
+‖ member EntityId ‖ consumer NodeId ‖ interest_digest ‖ audience
+scope ‖ expires_at ‖ nonce)`. Leader verifies (incl. floor),
+refuses registration otherwise; leader→provider leg forwards the
+complete authority; provider re-verifies independently; digest
+alone never authorizes.
+
+### 3.4 Capability-detail leg — wire enum + bounds
+
+As v0.3 with review-3's corrections: the descriptor is a real wire
+enum, not a conceptual union —
+
+```rust
+enum CapabilityDetailBody {
+    Inline(CapabilitySet),      // independent size bound:
+                                // MAX_INLINE_DETAIL_BYTES
+    Datafort(DatafortRef),
 }
 ```
 
-`Public` publishes exactly as today. `OwnerOnly`: only
-`public_summary` (possibly empty) enters the flooded CAP-ANN;
-`private_detail` never rides the gossip. Scaffolding default for
-org-provisioned nodes is `OwnerOnly(local_org)` + summary omitted —
-a capability must opt OUTWARD explicitly (owner-only → public),
-never the reverse.
+`CapabilityDetailResponse { provider, owner_org, capability_id,
+generation, request_nonce, descriptor_digest, body, signature }` —
+nonce + generation bound, digest over encoded body bytes,
+admission-gated retrieval, attestations stay compact (T16).
 
-### 3.2 Owner-validated detail delivery — over sensing
+### 3.5 Plaintext-interest boundary (sensing-amendment gate, locked)
 
-The sensing subsystem (`behavior/sensing/`) is already the
-interest-routed, signed-attestation path: authenticated downstream
-interests, provider-targeted routing, per-hop coalescing, signed
-attestations. Owner-scoped discovery is an interest-validation hook,
-not a new protocol:
+A keyed locator id is worthless if another field in the same
+protocol carries the plaintext capability identity, constraints,
+or selector/detail through a relay the threat model allows to
+inspect payloads. The sensing amendment MUST resolve the boundary
+by adopting exactly one of:
 
-- Interest frames (`sensing/frames.rs`) grow an optional
-  `DiscoveryAuthority { org_id, membership_cert }`; the cert's
-  `member` must match the interest's already-signed origin identity.
-- Provider-side intake (`SensingInterestFrame::validated_spec` /
-  `SensingLeader::register_from_frame`): interests targeting an
-  `OwnerOnly(org)` capability without a valid, unexpired cert for
-  `org` are refused at registration — no attestation row is ever
-  created for that consumer. A matching capability digest alone MUST
-  NOT authorize delivery.
-- Attestations for owner-only capabilities carry the private detail
-  only along rows that passed the check.
+1. **Prove the session boundary** — routed logical sessions already
+   provide end-to-end payload confidentiality across relays;
+   document and test that boundary, then plaintext interest fields
+   are relay-opaque by construction.
+2. **Keyed + encrypted frames** — owner-only registration and
+   interest frames use keyed capability ids AND encrypt sensitive
+   constraints/selectors to the provider / owner leader.
+3. **Trusted-path restriction** — `OwnerOnly` is supported only on
+   owner-member relay paths, stated as a deployment constraint.
 
-Wire caveat: `sensing/wire.rs` is frozen ("changing any wire-borne
-type from here on is a wire break"). The frame extension therefore
-follows sensing's own amendment process (the review-7
-`ProviderRegistration` precedent) — Phase 3 does not start until
-that's signed off. This is the main reason 3 is sequenced last.
-
-### 3.3 Explicitly deferred within Phase 3
-
-Routing scope ≠ confidentiality. If interest/attestation paths cross
-only org-member nodes, owner-scoped routing suffices for v1. If
-paths may cross foreign relays AND the metadata is sensitive, the
-payload needs a signed outer routing envelope with an encrypted
-capability payload readable only by authorized members. That is a
-follow-up plan (recipient key wrapping / org broadcast encryption),
-gated on an actual foreign-relay deployment. Until it ships, docs
-MUST NOT claim confidentiality for owner-only announcements — only
-reduced fanout.
+**This plan's recommended default is (2)**, with (1) acceptable
+instead if the confidentiality boundary is proven and pinned by
+tests, and (3) only as an explicitly documented interim. The
+amendment states its choice; Phase-3 implementation does not start
+before that. No configuration may claim OwnerOnly while any frame
+on an inspectable path carries the plaintext capability name
+(T15 extended: a relay-position observer of the full OwnerOnly
+interest/registration exchange cannot recover the capability
+identity under the chosen option).
 
 ---
 
 ## What this plan deliberately does NOT include
 
-- **No policy language / ACL engine.** Admission classes are generic
-  authority shapes; tool-specific rules (path scoping, rate limits,
-  contract/payment for commercial capabilities) stay provider-local,
-  as today.
-- **No org hierarchy beyond delegation chains.** Sub-orgs, cross-org
-  federation, org-to-org trust: out.
-- **No revocation gossip.** `generation` is reserved wire space
-  (Locked #4); the propagation mechanism for a floor bump is a
-  follow-up. v1 revocation is short expiry.
-- **No encrypted announcements** (§3.3).
-- **No Go / TS / Python parity in this plan.** Rust core first. The
-  Go side (`groups.go`, `capabilities.go`, golden vectors,
-  `header_parity_test.go`) gets a parity follow-up plan; the wire
-  formats here are frozen with cross-language golden vectors from
-  day one (T2) so parity is mechanical.
-- **No changes to channel-auth tokens.** `PermissionToken` is
-  untouched; `OrgDelegation` is a sibling, not a refactor (Q1).
+As v0.3 (no ACL engine; no multi-org ownership/hierarchy/
+federation; no enrollment protocol; no caches before measurement;
+no Go/TS/Python parity — golden vectors freeze the wire;
+channel-auth untouched; no delegation floors; no cross-restart
+exactly-once; no E2E-encrypted descriptors beyond §3.5's chosen
+option), plus newly explicit:
+
+- **No streaming/duplex org admission in v1** (§2.5) — deferred
+  until chunk hash-chaining or per-chunk signatures exist.
+- **No floor GC / org retirement** — per-key maxima are kept
+  indefinitely until a future reviewed retirement mechanism.
+- **No compact floor anti-entropy summaries in v1** — full replay
+  of a tiny table; summaries are an optimization follow-up.
 
 ---
 
 ## Risks
 
-1. **`SignedPayloadCanonical` drift.** Every field this plan adds to
-   `CapabilityAnnouncement` (Phases 1 and 2) must be mirrored there
-   in declaration order with identical skip predicates, or signature
-   verification breaks across a rolling upgrade. Mitigation: T1
-   byte-identity tests extended per field, plus a proptest that
-   round-trips random announcements through both serializers.
-2. **Old forwarders strip new fields.** A pre-upgrade forwarder
-   deserializes into the old struct (unknown fields dropped),
-   increments `hop_count`, re-serializes — downstream signature
-   verification of the org fields' announcement then fails and the
-   announcement is discarded. Same constraint v0.4 had. Mitigation:
-   receivers/forwarders upgrade BEFORE any node emits `org_certs` /
-   `allowed_orgs` / `admission` (§Migration). Failure mode is
-   fail-closed (announcement dropped), never fail-open.
-3. **Fold-ingest verify cost.** ed25519 verify per cert per
-   announcement re-broadcast, mesh-wide. Mitigation: §1.4 cache;
-   bench added to `benches/` alongside the existing capability
-   benches; cap of 8 certs bounds worst case.
-4. **Header-borne proof size.** Bounded by construction (≈900 B
-   worst case vs 4096 cap), but `MAX_CHAIN_DEPTH` and cert size are
-   now coupled to `MAX_RPC_HEADER_VALUE_LEN`. A static assert pins
-   the relationship.
-5. **Clock skew on short-lived certs.** Short TTLs + skewed clocks =
-   spurious denials. Reuse the token module's skew allowance and its
-   `TOKEN_CLOCK_SKEW_SECS_RECOMMENDED` guidance; conformance
-   scenario T5 covers the boundary.
-6. **Two gates, one outcome space.** Operators will see both
-   `CapabilityDenied` and `AdmissionDenied`. Distinct status codes +
-   distinct typed errors + a docs table (which gate, which evidence,
-   which fix) keep triage sane.
+1–3 as v0.3 (canonical-serializer drift; mixed-fleet emission
+fail-closed + upgrade-all-then-emit; old callees can't enforce).
+4. **Floor propagation lag** — unchanged, witnessed (T-floor 5/6).
+5. **Floor-store durability** — now governed by the write-through
+   contract; residual risk moves to `PersistentMap` implementation
+   quality (fsync discipline, atomic rename); witnesses 10–11 +
+   crash-injection in T-floor.
+6. **Replay-guard memory** — retention is proof-lifetime exact and
+   unexpired entries are never evicted, so memory is
+   `O(admitted RPS × max_proof_ttl)` per provider; bounded by
+   `AdmissionReplayConfig` ceilings with deny+metric on exhaustion;
+   providers tune TTL vs memory explicitly.
+7. **Root-key ceremony** — unchanged.
+8. **Announcement/proof size coupling** — unchanged (dual bounds +
+   measured fixture).
+9. **Discovery-key handling** — as v0.3 (blast radius: metadata
+   visibility only) plus epoch machinery: skewed epoch adoption
+   during rotation is absorbed by the two-key overlap window;
+   premature retirement of E is the failure mode — the retirement
+   inequality in §3.2 is enforced by operator tooling, not vibes.
+10. **Two denial surfaces** — unchanged; the replay and collision
+    and streaming-rejection reasons are distinct within
+    `AdmissionDenied` for triage.
 
 ---
 
 ## Phases
 
-### Phase 1 — org identity + membership + org axis
-`behavior/org.rs` (OrgId, OrgKeypair, OrgMembershipCert); two
-announcement fields + canonical serializer + builders; fold payload
-fields + ingest verification + cert cache; `may_execute` family org
-axis; CLI keygen/issue-cert/announce flags; tests T1–T6.
-Self-contained; ships alone. Exit: conformance green, byte-identity
-pinned, bench within budget.
+### Phase 1 — scaffolded ownership, dark authority facts
+As v0.3 with §1.5 replaced by the dedicated
+`OrgAuthorityFloorStore` + explicit replication protocol +
+write-through lifecycle + indefinite retention. Exit: T1–T6 +
+T-floor(1–13) green (incl. crash-injection on the durable commit
+path); bench recorded; adopt-path loud failure demonstrated.
 
-### Phase 2 — admission
-`OrgDelegation` + chain validation; `AdmissionRequirement` field;
-`AdmissionProof` header codec; callee gate in `serve_rpc` +
-`RpcStatus::AdmissionDenied`; `CallOptions` proof plumbing; CLI
-delegate verb; tests T7–T12. Depends on Phase 1 types only.
+### Phase 2 — capability-specific delegated admission (unary)
+As v0.3 plus: `proof_expires_at` (transcript v3), correlation-
+identity replay keying with proof-lifetime retention and
+never-evict-unexpired, `AdmissionReplayConfig` with measured
+defaults, streaming rejection with distinct reason. Organizational
+capability emission stays dark until Phase 2 is deployable
+fleet-wide.
 
-### Phase 3 — discovery visibility
-`CapabilityPublication` split + scaffolding defaults; sensing
-interest `DiscoveryAuthority` + provider-side refusal; tests
-T13–T15. Gated on sensing wire-amendment sign-off.
+### Phase 3 — owner-scoped discovery
+Sensing amendment FIRST — it must contain: the §3.5 plaintext-
+boundary choice with its witnesses, epoch-keyed locator identity +
+two-key rotation, `DiscoveryAuthority` v2 transcript, registration
+frames, `CapabilityDetailResponse` with `CapabilityDetailBody` and
+inline bound. Then implementation + T13–T18.
 
 ---
 
 ## Test plan
 
-- **T1 — signed byte identity.** Announcement with empty
-  `org_certs` / `allowed_orgs` / absent `admission` serializes
-  byte-identical to pre-plan form; derived-vs-canonical serializer
-  proptest.
-- **T2 — golden vectors.** Fixed-key cert, delegation, chain, and
-  AdmissionProof bytes checked into `tests/` (Go/TS parity anchors,
-  same pattern as `consent_golden_vectors_test.go`).
-- **T3 — cert verification matrix.** Valid; expired; not-yet-valid;
-  skew boundary; wrong member; forged sig; malleated sig (strict
-  verify); TTL over cap.
-- **T4 — fold ingest.** Bad certs dropped, good certs from the same
-  announcement retained; `member_orgs` populated only from verified;
-  cache hit still re-checks window + member binding.
-- **T5 — execute-gate conformance.** Extend
-  `tests/capability_auth_conformance.rs`: org-only allow-list admits
-  verified member / denies non-member / denies expired-cert member;
-  union with the three v0.4 axes; four-axes-empty stays permissive;
-  a caller SELF-DECLARING an org via tag (no cert) is denied.
-- **T6 — rolling upgrade.** Old-struct round-trip drops new fields →
-  forwarded announcement fails verification downstream (fail-closed
-  pinned); old reader accepts new announcement with fields defaulted.
-- **T7 — chain validation matrix.** Root mismatch; broken
-  issuer→subject linkage; scope widening; window non-intersection;
-  depth over cap; missing DELEGATE on parent; WILDCARD vs
-  capability_hash.
-- **T8 — admission e2e.** `OwnerDelegation` target: member WITHOUT
-  delegation denied (the load-bearing scenario); valid chain admits;
-  `PublicAuthenticated` ignores proofs.
-- **T9 — replay.** Captured proof re-sent against different callee /
-  service / deadline / body denied via call-binding transcript.
-- **T10 — revocation-by-expiry.** Chain valid at t0, expired at t1;
-  fold state still lists the caller — callee still denies (proves
-  admission ignores index staleness).
-- **T11 — proof size static assert** vs header cap.
-- **T12 — status mapping.** Wire `AdmissionDenied` → typed error,
-  both call paths (mirror the existing 0x0008 mapping test at
-  `mesh_rpc.rs:~3725`).
-- **T13 — visibility.** OwnerOnly detail never enters CAP-ANN bytes;
-  summary-only flood; scaffolding default is owner-only.
-- **T14 — sensing refusal.** Interest without/with-invalid authority
-  for an OwnerOnly capability refused at registration; no
-  attestation row created; valid cert admits.
-- **T15 — digest-alone insufficient.** Matching capability digest
-  without authority does not receive detail.
+T1–T5 as v0.3 (byte identity; golden vectors regenerated for
+`net-org-call-v3`, `net-org-discovery-v2`, floor frames, epoch-keyed
+locator ids, `CapabilityDetailBody`; cert matrix incl. floors; fold
+ingest; authority-dark pin).
+
+- **T6 — mixed-fleet** as v0.3 (old readers reject nonempty new
+  signed fields; fail-closed everywhere).
+- **T-floor — thirteen witnesses** (§1.5), including crash injection
+  between durable commit and admission-view update, carrier-failure
+  independence, outer-generation independence, re-propagation, and
+  non-full-mesh join sync.
+- **T7 — chain matrix** as v0.3 (reserved generation ignored,
+  pinned).
+- **T8 — admission e2e** as v0.3, plus: expired `proof_expires_at`
+  denied; `proof_expires_at` beyond `MAX_ADMISSION_PROOF_TTL`
+  denied.
+- **T9 — binding + replay** (review-3 matrix): transplant matrix as
+  v0.3 (now incl. mutated `proof_expires_at` → binding fails);
+  same caller + same call_id + identical binding → deny (replay);
+  same caller + same call_id + DIFFERENT valid binding → deny
+  (collision); different caller + same call_id → independent;
+  same caller + different call_id → independent; two identical
+  concurrent requests → exactly one handler invocation;
+  deadline-less request replayed after v0.3's-would-be-window but
+  before `proof_expires_at` → DENIED (the fixed defect, witnessed);
+  replay after `proof_expires_at + skew` → proof itself expired →
+  denied at verification, key may be gone, still no execution;
+  restart residual witnessed honestly.
+- **T10 — index-staleness** as v0.3.
+- **T11 — bounds** as v0.3, plus: unexpired replay entries survive
+  capacity pressure (new protected calls denied + metric instead);
+  proof-size asserts include `proof_expires_at`.
+- **T12 — status mapping** as v0.3; replay / collision / streaming
+  reasons distinguishable.
+- **T13 — publication modes** as v0.3; OwnerOnly floods nothing
+  capability-identifying in ANY epoch.
+- **T14 — signed-interest gate** as v0.3 + epoch binding: wrong-
+  epoch authority refused; both-epoch queries admitted during
+  overlap.
+- **T15 — dictionary/relay insufficiency** as v0.3, extended per
+  §3.5: relay-position observer of the complete OwnerOnly exchange
+  cannot recover capability identity under the amendment's chosen
+  option.
+- **T16 — detail-leg binding** as v0.3 + inline body over
+  `MAX_INLINE_DETAIL_BYTES` rejected.
+- **T17 — locator trust binding** as v0.3, per epoch.
+- **T18 — streaming rejection**: org-protected client-streaming /
+  duplex call → `AdmissionDenied` with the streaming reason; no
+  handler invocation; unary unaffected.
 
 ---
 
 ## Migration
 
-Rolling-upgrade ordering (Risk 2): ship the code mesh-wide with
-emission OFF, then enable cert issuance / org fields per fleet. Old
-nodes reading new announcements default the fields (harmless). New
-fields on paths through old forwarders fail closed. Phase 2's
-`admission` field follows the same ordering; callers must be able to
-attach proofs before any provider declares `OwnerDelegation`, so the
-enable order is: upgrade all → issue certs → callers gain proof
-plumbing → providers flip admission → (optionally) providers tighten
-`allowed_orgs`.
-
-No data migration: fold state is TTL-bound (~5 min) and rebuilds
-from announcements.
+As v0.3 (upgrade-all → provision → enable `owner_cert` emission →
+delegations + caller plumbing → flip provider policies per
+capability → Phase 3 last), with two additions: floor-store
+provisioning (durable path + health check) happens at adopt time in
+step 2, and `org_discovery_key` epoch-0 distribution rides the
+adopt-config update in step 6 before any capability flips to
+`OwnerOnly`. Epoch rotations thereafter follow §3.2's retirement
+inequality. No data migration; the floor store migrates as its own
+durable files.
 
 ---
 
 ## Locked design points
 
-1. **`OrgId` IS the org public key.** No registry, no separate id
-   space, no lookup. Verification needs zero infrastructure —
-   consistent with the substrate's EntityId construction and its
-   no-coordinator axiom.
-2. **`member_orgs` comes only from verified certs; org membership is
-   NEVER tag-derived.** The `org:` tag prefix is not introduced at
-   all, so there is no ambiguous half-verified path. Extends v0.4's
-   Locked #1 (identity from the wire binding; tags only for
-   bearer-style membership).
-3. **Membership ≠ admission.** The Phase 1 org axis is an allow-list
-   convenience with strictly better properties than groups
-   (verifiable, per-member revocable, no broadcast secret). Anything
-   labeled internal/sensitive declares `OwnerDelegation` and callers
-   carry per-request proofs verified fresh at the callee — index
-   state is never admission evidence (T10 pins this).
-4. **`generation` is reserved wire space in both credentials from
-   day one; enforcement ships later.** Adding the field after
-   golden vectors freeze would be a wire break; carrying 4 dead
-   bytes is not.
-5. **Admission proofs ride RPC headers, not a new envelope.** The
-   header surface exists, is size-capped, and old servers ignore
-   unknown headers — no nRPC wire change, graceful partial-upgrade
-   behavior.
-6. **Visibility never substitutes for admission, and vice versa**
-   (T8, T15 pin both directions). Owner-scoped routing is fanout
-   reduction, not confidentiality, until the encryption follow-up
-   ships — documentation must say so.
+1–3 as v0.3 (OrgId IS the key; singular scaffolded ownership;
+membership is never execution authority).
+4. **Revocation is the §1.5 dedicated durable authority store** —
+   not a FoldKind; inner-signature authority with interchangeable
+   carriers; write-through durable commit before admission
+   visibility; indefinite retention; explicit
+   announce/sync/anti-entropy protocol; loud unhealthy-store
+   fail-closed coupling. Delegations revoke by short expiry only.
+5–8 as v0.3 (capability-specific provider-local admission; 32-byte
+digest grant scopes, wildcard as scope variant; whole-initial-
+request call binding + exactly-one-header; honest wire evolution,
+fail-closed `Extension`).
+9. **Replay guard is exact for the proof lifetime**: finite
+   `proof_expires_at` on every proof (deadline-less RPC included),
+   bound into the v3 transcript; `(caller, call_id)` correlation-
+   identity keying; reuse denies as replay OR collision, never a
+   second invocation; unexpired keys are never evicted; capacity
+   exhaustion denies new calls; volatile by contract with the
+   idempotency-key guidance.
+10. **Visibility modes named by disclosure** as v0.3, now
+    epoch-keyed with a two-key rotation overlap and the retirement
+    inequality; discovery keys grant metadata visibility only.
+11. **Sensing carries proofs, not assumptions** — detail leg binds
+    nonce + generation with a real wire enum and inline bound; the
+    plaintext-interest boundary is settled by the amendment (§3.5
+    options, recommended default (2)) before any Phase-3 code.
+12. **No cache before its benchmark**; replay/floor sizing
+    constants freeze only after measurement.
+13. **Org admission is unary in v1.** Streaming admission waits for
+    chunk-level binding; org-protected streaming calls are rejected
+    with a distinct reason, never admitted under a partial binding
+    claim.
 
 ---
 
-## Open questions
+## Open questions (v0.4)
 
-- **Q1 — `OrgDelegation` as new type vs `PermissionToken`
-  generalization.** Plan assumes new sibling type (channel-auth
-  coupling stays untouched; independent wire evolution). Revisit
-  only if a third credential type appears.
-- **Q2 — should Phase 1's org axis also admit at `OwnerDelegation`
-  targets when the allow-list matches?** Plan says no (Locked #3):
-  when `admission` is declared, the allow-list axes still gate
-  discovery-time pre-flight but admission requires the proof.
-  Confirm during Phase 2 review.
-- **Q3 — cert distribution ergonomics.** Out-of-band file handoff is
-  fine for v1; an org-membership issuance flow over the mesh itself
-  (enrollment protocol) is a candidate follow-up.
-- **Q4 — recommended cert TTL default.** Plan says 24h with
-  re-issue automation guidance; tune after Phase 1 soak.
+- **Q11 — `PersistentMap` backing.** Reuse an existing durable
+  primitive in-repo (Mikoshi/datafort-adjacent) vs a minimal
+  fsync'd log+snapshot local store owned by `org_floor.rs`. The
+  contract (§1.5) is fixed either way; pick at Phase-1
+  implementation review with a crash-injection harness as the
+  acceptance bar.
+- **Q12 — floor sync paging bounds.** Page size / cursor shape for
+  `OrgFloorSyncPage` (table is tiny; propose 256 records/page,
+  postcard-bounded) — confirm against frame-size conventions at
+  implementation.
+- **Q13 — proof-provider default TTL.** Default `proof_expires_at`
+  horizon the caller hook picks when the app doesn't specify
+  (proposal: min(RPC deadline, 30 s), never exceeding the
+  provider-advertised max) — confirm against real dispatch
+  latencies during Phase-2 review.
