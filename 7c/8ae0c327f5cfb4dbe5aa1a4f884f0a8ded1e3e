@@ -1,0 +1,25 @@
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_12246663fabd10 491-497
+net/crates/net/benches/island_claim_fallback.rs
+  s_c28bdf38c0df3a::t_53cb5fde6b0d84 239
+  s_c28bdf38c0df3a::t_4c31de76a89d1a 72-74,395-398,408-411,434-442
+  s_c28bdf38c0df3a::t_7924069bd544db 391
+  s_c28bdf38c0df3a::t_c7cf4af7a62a6b 94-95
+  s_c28bdf38c0df3a::t_762afce341ab31 1-71,75-93,96-238,240-390,392-394,399-407,412-433,443-485
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7c8ae0c327f5cfb4dbe5aa1a4f884f0a8ded1e3e",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

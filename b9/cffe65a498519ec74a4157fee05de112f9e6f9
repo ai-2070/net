@@ -1,0 +1,27 @@
+net/crates/net/Cargo.toml
+  s_c28bdf38c0df3a::t_183559f32525fd 498-505
+net/crates/net/benches/island_claim_sensed.rs
+  s_c28bdf38c0df3a::t_8319fce56cd7c1 122
+  s_c28bdf38c0df3a::t_0273c680b49f15 66-68,285-289,353-354,432-436,462-465,481-483,501-503,527-534,541-543,565-569,572-573,593-596,620-623,647-656,666-667,697-700,741-742
+  s_c28bdf38c0df3a::t_c19ec039ecb663 260-263
+  s_c28bdf38c0df3a::t_962a31960b8fad 553
+  s_c28bdf38c0df3a::t_a7c03d5cbe2fc6 1-18,20-65,69-87,89-90,92-121,123-259,264-284,290-352,355-431,437-461,466-480,484-500,504-526,535-540,544-552,554-564,570-571,574-592,597-619,624-646,657-665,668-696,701-740,743-747
+  s_c28bdf38c0df3a::t_6c0fcbc21c291d 88,91
+  s_c28bdf38c0df3a::t_330be6d3ea1b03 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b9cffe65a498519ec74a4157fee05de112f9e6f9",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
