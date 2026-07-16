@@ -1,0 +1,21 @@
+net/crates/net/benches/island_claim_divergence.rs
+  s_c28bdf38c0df3a::t_e2ae48fc2071a4 250-255
+  s_c28bdf38c0df3a::t_1ec5cba3a8c165 908-914,917-920,922-923,926-932,937,939-948,950
+  s_c28bdf38c0df3a::t_1929c526fc0cfd 366-379
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "9a41847f38b86cbbd907e1336e058905a3de01ca",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
