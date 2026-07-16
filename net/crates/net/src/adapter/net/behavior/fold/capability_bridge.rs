@@ -28,6 +28,8 @@ use super::super::capability::{
     matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
     GpuVendor, ScopeFilter,
 };
+use super::super::org::OrgId;
+use super::super::org_revocation::OrgRevocationState;
 use super::capability::{
     resolve_candidate_keys, CapabilityFilter, CapabilityFold, CapabilityMembership, HardwareSummary,
 };
@@ -244,8 +246,93 @@ pub fn apply_legacy_announcement(
     fold: &Fold<CapabilityFold>,
     ann: CapabilityAnnouncement,
 ) -> Result<ApplyOutcome, FoldError> {
-    let fold_ann = translate_announcement(&ann);
+    // Mirror the production dispatch path's OA-1 ingest
+    // verification (no revocation floors in this fixture-shaped
+    // helper — floors are node state, and fixtures priming a bare
+    // fold have none).
+    let verified_owner_org = verify_announced_owner_cert(&ann, None, 0);
+    let fold_ann = translate_announcement(&ann, verified_owner_org);
     fold.apply(fold_ann)
+}
+
+/// OA-1 ingest verification for an announcement's `owner_cert` —
+/// the ONLY producer of a `Some` value for the fold's
+/// [`CapabilityMembership::owner_org`] projection.
+///
+/// Returns `Some(org_id)` iff ALL of:
+///
+/// 1. the announcement carries a cert,
+/// 2. the cert's `member` equals the announcement's `entity_id`
+///    (a cert vouches for exactly the announcing entity — a valid
+///    cert for someone else is not belonging),
+/// 3. the cert verifies structurally and cryptographically
+///    (`verify_strict` under `net-org-cert-v1`, TTL ceiling) and
+///    is inside its validity window with `skew_secs` tolerance,
+/// 4. the cert's `generation` is at or above the node's persisted
+///    revocation floor for `(org, member)` (`floors = None` means
+///    this node tracks no floors — every generation admissible,
+///    identical to an empty state).
+///
+/// On any failure the cert is dropped and the ANNOUNCEMENT is kept
+/// (OA-1 exit-gate contract: "ingest drops bad certs, not
+/// announcements") — the publisher stays discoverable, merely
+/// unowned.
+///
+/// Belonging only: the returned org id feeds discovery
+/// projections, never `may_execute`.
+pub fn verify_announced_owner_cert(
+    ann: &CapabilityAnnouncement,
+    floors: Option<&OrgRevocationState>,
+    skew_secs: u64,
+) -> Option<OrgId> {
+    let cert = ann.owner_cert.as_ref()?;
+    if cert.member != ann.entity_id {
+        tracing::debug!(
+            node_id = format!("{:#x}", ann.node_id),
+            org = %cert.org_id,
+            "dropping owner cert: member does not match announcing entity (announcement kept)"
+        );
+        return None;
+    }
+    if let Err(e) = cert.is_valid_with_skew(skew_secs) {
+        tracing::debug!(
+            node_id = format!("{:#x}", ann.node_id),
+            org = %cert.org_id,
+            error = %e,
+            "dropping unverifiable owner cert (announcement kept)"
+        );
+        return None;
+    }
+    if let Some(floors) = floors {
+        let floor = floors.floor_for(&cert.org_id, &cert.member);
+        if cert.generation < floor {
+            tracing::debug!(
+                node_id = format!("{:#x}", ann.node_id),
+                org = %cert.org_id,
+                generation = cert.generation,
+                floor,
+                "dropping owner cert below revocation floor (announcement kept)"
+            );
+            return None;
+        }
+    }
+    Some(cert.org_id)
+}
+
+/// The verified owner org projected for `node_id`, if any — walks
+/// the publisher's fold entries via the `by_node` reverse index and
+/// returns the first `Some` (mirrors [`reflex_addr_for`]'s
+/// one-publisher-one-value shape).
+pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<OrgId> {
+    fold.with_state(|state| {
+        let keys = state.by_node.get(&node_id)?;
+        keys.iter().find_map(|key| {
+            state
+                .entries
+                .get(key)
+                .and_then(|entry| entry.payload.owner_org)
+        })
+    })
 }
 
 /// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
@@ -672,8 +759,16 @@ fn may_execute_with_caller(
 /// Queries that don't constrain on class — which is every
 /// caller in this codebase per the prior survey — work
 /// transparently against this layout.
+///
+/// `verified_owner_org` is the OA-1 ownership projection and MUST
+/// come from [`verify_announced_owner_cert`] (or be `None`). The
+/// parameter is deliberately explicit rather than derived here:
+/// this function is pure and is also reached from paths that never
+/// verified anything (test injection, fixture priming), so the
+/// authority decision has to be visible at every call site.
 pub fn translate_announcement(
     ann: &CapabilityAnnouncement,
+    verified_owner_org: Option<OrgId>,
 ) -> SignedAnnouncement<CapabilityMembership> {
     let views = ann.capabilities.views();
     let hw_view = views.hardware();
@@ -735,6 +830,7 @@ pub fn translate_announcement(
             allowed_subnets: ann.allowed_subnets.clone(),
             allowed_groups: ann.allowed_groups.clone(),
             metadata: ann.capabilities.metadata.clone(),
+            owner_org: verified_owner_org,
         },
     )
 }
@@ -1014,6 +1110,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                owner_org: None,
             },
         )
         .expect("sign")
@@ -1126,6 +1223,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
+            owner_org: None,
         };
         assert!(membership_passes_post_filter(&pass, &legacy));
 
@@ -1168,6 +1266,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
+            owner_org: None,
         };
         assert!(membership_passes_post_filter(&ok, &legacy));
 
@@ -1542,7 +1641,7 @@ mod tests {
         );
         let ann = CapabilityAnnouncement::new(0xAA, EntityId::from_bytes([0u8; 32]), 7, caps);
 
-        let translated = translate_announcement(&ann);
+        let translated = translate_announcement(&ann, None);
         assert_eq!(translated.node_id, 0xAA);
         assert_eq!(translated.generation, 7);
         let hw = translated.payload.hardware.expect("hardware summary set");
@@ -1567,7 +1666,7 @@ mod tests {
             0,
             CapabilitySet::new(),
         );
-        let translated = translate_announcement(&ann);
+        let translated = translate_announcement(&ann, None);
         assert_eq!(translated.generation, 1);
     }
 
@@ -1666,6 +1765,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                owner_org: None,
             },
         )
         .expect("sign v2");
@@ -1806,6 +1906,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                owner_org: None,
             },
         )
         .expect("sign restricted");
@@ -1917,6 +2018,7 @@ mod tests {
                         allowed_subnets: subnets,
                         allowed_groups: groups,
                         metadata: std::collections::BTreeMap::new(),
+                        owner_org: None,
                     },
                 )
                 .expect("sign restricted")
@@ -1944,5 +2046,178 @@ mod tests {
             vec![true, true, false],
             "subnet-allowed admits, group-allowed admits, foreign subnet denies"
         );
+    }
+
+    // ------------- OA-1: owner-cert ingest verification -------------
+
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_revocation::OrgRevocationState;
+
+    fn org_root() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x42u8; 32])
+    }
+
+    fn signed_announcement_with_cert(
+        kp: &EntityKeypair,
+        node_id: NodeId,
+        cert: Option<OrgMembershipCert>,
+    ) -> CapabilityAnnouncement {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        let caps = CapabilitySet::new().add_tag("nrpc:echo".to_string());
+        let mut ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps)
+            .with_owner_cert(cert);
+        ann.sign(kp);
+        ann
+    }
+
+    /// A verified cert projects `owner_org` into the fold; the
+    /// entry itself is a normal, queryable membership.
+    #[test]
+    fn verified_owner_cert_projects_owner_org() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, 0xA1, Some(cert));
+
+        apply_legacy_announcement(&fold, ann).expect("apply");
+        assert_eq!(owner_org_for(&fold, 0xA1), Some(org_root().org_id()));
+    }
+
+    /// OA-1 exit-gate contract: ingest drops bad CERTS, not
+    /// announcements. Every failure mode leaves the publisher
+    /// discoverable with `owner_org = None`.
+    #[test]
+    fn bad_owner_cert_is_dropped_but_announcement_is_kept() {
+        use crate::adapter::net::identity::EntityId;
+        let kp = EntityKeypair::generate();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+
+        // (a) member mismatch — a valid cert vouching for someone else.
+        let stranger = EntityId::from_bytes([0x77u8; 32]);
+        let wrong_member =
+            OrgMembershipCert::try_issue(&org_root(), stranger, 1, 3600).expect("issue");
+        // (b) tampered signature.
+        let mut tampered =
+            OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+                .expect("issue");
+        tampered.signature[0] ^= 1;
+        // (c) expired window.
+        let expired = OrgMembershipCert::issue_at(
+            &org_root(),
+            kp.entity_id().clone(),
+            1,
+            now - 2000,
+            now - 1000,
+            7,
+        );
+
+        for (label, cert, node_id) in [
+            ("member mismatch", wrong_member, 0xB1),
+            ("tampered signature", tampered, 0xB2),
+            ("expired window", expired, 0xB3),
+        ] {
+            let fold = new_fold();
+            let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+            apply_legacy_announcement(&fold, ann).expect("apply");
+            // Announcement kept: the publisher is in the fold and
+            // queryable by tag.
+            let filter = LegacyFilter {
+                require_tags: vec!["nrpc:echo".into()],
+                ..LegacyFilter::default()
+            };
+            assert!(
+                find_nodes_matching(&fold, &filter).contains(&node_id),
+                "{label}: announcement must be kept"
+            );
+            // Cert dropped: no ownership projected.
+            assert_eq!(
+                owner_org_for(&fold, node_id),
+                None,
+                "{label}: cert must be dropped"
+            );
+        }
+    }
+
+    /// A cert below the node's persisted revocation floor is
+    /// dropped at ingest; at or above the floor it projects.
+    #[test]
+    fn floored_cert_is_dropped_at_ingest() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        let kp = EntityKeypair::generate();
+
+        let mut floors_map = std::collections::BTreeMap::new();
+        floors_map.insert(kp.entity_id().clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org_root(), &floors_map).expect("issue");
+        bundle.verify().expect("bundle verifies");
+        let mut floors = OrgRevocationState::empty();
+        floors.merge_bundle(&bundle);
+
+        let below = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let at = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 5, 3600)
+            .expect("issue");
+
+        let ann_below = signed_announcement_with_cert(&kp, 0xC1, Some(below));
+        let ann_at = signed_announcement_with_cert(&kp, 0xC2, Some(at));
+
+        assert_eq!(
+            verify_announced_owner_cert(&ann_below, Some(&floors), 0),
+            None,
+            "generation below floor must be dropped"
+        );
+        assert_eq!(
+            verify_announced_owner_cert(&ann_at, Some(&floors), 0),
+            Some(org_root().org_id()),
+            "generation at floor must project"
+        );
+        // No floors tracked (un-adopted node) ⇒ implicit floor 0.
+        assert_eq!(
+            verify_announced_owner_cert(&ann_below, None, 0),
+            Some(org_root().org_id()),
+            "no floor state ⇒ every generation admissible"
+        );
+    }
+
+    /// Authority-dark pin: `owner_org` never enters `may_execute`.
+    /// A cert-bearing permissive announcement admits everyone; a
+    /// restricted one denies the same caller — identical verdicts
+    /// to the cert-free announcements. (The full exit-gate pin runs
+    /// end-to-end in the integration suite.)
+    #[test]
+    fn owner_org_never_enters_may_execute() {
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCA11;
+        let cert = || {
+            OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+                .expect("issue")
+        };
+
+        // Permissive (no allow-lists): admitted with or without cert.
+        for with_cert in [false, true] {
+            let fold = new_fold();
+            let ann = signed_announcement_with_cert(&kp, 0xD1, with_cert.then(cert));
+            apply_legacy_announcement(&fold, ann).expect("apply");
+            assert!(
+                may_execute(&fold, 0xD1, "nrpc:echo", caller),
+                "permissive verdict must not depend on owner_org (with_cert={with_cert})"
+            );
+        }
+
+        // Restricted to a different node: denied with or without cert.
+        for with_cert in [false, true] {
+            let fold = new_fold();
+            let mut ann = signed_announcement_with_cert(&kp, 0xD2, with_cert.then(cert));
+            ann.allowed_nodes = vec![0xFFFF];
+            ann.sign(&kp);
+            apply_legacy_announcement(&fold, ann).expect("apply");
+            assert!(
+                !may_execute(&fold, 0xD2, "nrpc:echo", caller),
+                "restricted verdict must not depend on owner_org (with_cert={with_cert})"
+            );
+        }
     }
 }

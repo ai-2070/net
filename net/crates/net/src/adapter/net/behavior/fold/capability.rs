@@ -126,6 +126,28 @@ pub struct CapabilityMembership {
     /// `metadata_equals` consult this map after `synthesize_capability_set`
     /// hydrates the synthesized set from the fold.
     pub metadata: BTreeMap<String, String>,
+    /// OA-1 ownership projection — the publisher's owner org,
+    /// populated ONLY from an announcement `owner_cert` that passed
+    /// ingest verification (signature, window, `member ==
+    /// entity_id` binding, revocation floors). `None` for unowned
+    /// publishers and for announcements whose cert failed
+    /// verification (the cert is dropped; the entry is kept).
+    ///
+    /// Unlike `allowed_*` / tag-derived axes this is not
+    /// self-declared — it is proven belonging. It is also NOT
+    /// execution authority: `may_execute` never consults it
+    /// (`ORG_CAPABILITY_AUTH_PLAN.md`, authority-dark OA-1).
+    ///
+    /// `#[serde(skip)]` is load-bearing twice over: (1) the fold
+    /// payload rides `SUBPROTOCOL_FOLD` as positional postcard, so
+    /// a serialized field would break every mixed-fleet fold frame
+    /// at upgrade time; (2) a wire-carried `owner_org` would be a
+    /// SELF-DECLARED ownership claim — the projection must only
+    /// ever be derived on the receiving node from a cert it
+    /// verified itself, and fold state (including snapshots) is
+    /// never admission evidence. Decode always yields `None`.
+    #[serde(skip)]
+    pub owner_org: Option<super::super::org::OrgId>,
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -964,6 +986,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
+                owner_org: None,
             },
         )
         .expect("sign succeeds")
@@ -1176,6 +1199,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
+            owner_org: None,
         };
         assert!(
             <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &base.clone()),
@@ -1264,6 +1288,7 @@ mod tests {
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
                     metadata: BTreeMap::new(),
+                    owner_org: None,
                 },
             )
             .expect("sign succeeds")
@@ -1935,6 +1960,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
+                owner_org: None,
             },
         )
         .unwrap();

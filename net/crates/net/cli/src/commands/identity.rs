@@ -280,7 +280,7 @@ async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<()
 
 /// Parse an issuer entity-id: 64 hex chars (optional `0x`) → 32-byte
 /// [`EntityId`].
-fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
+pub(crate) fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
     let trimmed = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
@@ -301,11 +301,11 @@ fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
 // =========================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
-struct IdentityFile {
-    operator_id_hex: String,
-    seed_hex: String,
-    public_key_hex: String,
-    created_at: String,
+pub(crate) struct IdentityFile {
+    pub(crate) operator_id_hex: String,
+    pub(crate) seed_hex: String,
+    pub(crate) public_key_hex: String,
+    pub(crate) created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -338,7 +338,7 @@ struct RevokeOutput {
     store: String,
 }
 
-async fn read_identity_file(
+pub(crate) async fn read_identity_file(
     path: &Path,
     insecure_permissions: bool,
 ) -> Result<IdentityFile, CliError> {
@@ -367,7 +367,7 @@ async fn read_identity_file(
 /// concurrent reader at the default umask. On Windows the temp
 /// file is created with default ACLs — managed out-of-band per the
 /// module header — and `enforce_strict_permissions` is a no-op.
-async fn write_identity_atomically(
+pub(crate) async fn write_identity_atomically(
     tmp: &Path,
     final_path: &Path,
     bytes: &[u8],
@@ -412,7 +412,7 @@ async fn write_identity_atomically(
 }
 
 #[cfg(unix)]
-async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o600);
     tokio::fs::set_permissions(path, perms).await.map_err(|e| {
@@ -424,7 +424,7 @@ async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
+pub(crate) async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
     // No-op on Windows — file ACLs don't have a clean
     // 0o600 analog accessible from std::fs. Operators on
     // Windows are expected to manage NTFS ACLs out-of-band.
@@ -432,7 +432,7 @@ async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(unix)]
-async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
     let meta = tokio::fs::metadata(path).await.map_err(|e| {
         generic(format!(
@@ -455,7 +455,7 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
     // NTFS ACLs don't have a clean 0o600 analog reachable from
     // `std::fs`, so structurally the permission gate is a no-op
     // on Windows — but pre-fix that no-op was silent and every
@@ -487,7 +487,7 @@ fn default_identity_path(operator_id: u64) -> PathBuf {
     base.join(format!("operator-0x{operator_id:016x}.toml"))
 }
 
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     // The chrono crate isn't in the CLI's deps; format the
     // current SystemTime as ISO-8601 by hand. Format:
     // `YYYY-MM-DDTHH:MM:SSZ` (no sub-second precision).

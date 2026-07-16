@@ -14,7 +14,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 ///
 /// This is the canonical identity for a node in the mesh. All other
 /// identifiers (node_id, origin_hash) are derived from this.
-#[derive(Clone, PartialEq, Eq, Hash)]
+///
+/// `Ord` is the derived lexicographic byte order — it doubles as
+/// the canonical ordering wherever entities key sorted structures
+/// (org revocation floors, canonical wire encodings of member
+/// lists).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EntityId(pub [u8; 32]);
 
 impl EntityId {

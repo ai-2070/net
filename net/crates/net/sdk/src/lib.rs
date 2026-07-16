@@ -146,6 +146,12 @@ pub mod devices;
 // authority + device registry + revocation store into one coordinator.
 #[cfg(feature = "net")]
 pub mod operator;
+// Organization capability auth (OA-1, scaffolded ownership) — org root keys,
+// membership certificates, revocation-floor bundles, and the node authority
+// files `net node adopt` provisions. Re-exports of the core primitives; see
+// ORG_CAPABILITY_AUTH_PLAN.md.
+#[cfg(feature = "net")]
+pub mod org;
 // Live enrollment over the mesh (Hermes V2 Phase 1 Slice B2b) — `mesh.join` /
 // `mesh.serve_enrollment` via direct-addressed nRPC. Needs `cortex` for the
 // nRPC surface, so gated net+cortex (the `operator` facade above is

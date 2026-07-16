@@ -441,6 +441,14 @@ name = "sensing_signature"
 harness = false
 required-features = ["net"]
 
+# OA-1 §1.6 (ORG_CAPABILITY_AUTH_PLAN): uncached org cert / floors
+# verification cost at fold ingest — the number any future
+# verified-cert cache must justify itself against.
+[[bench]]
+name = "org_signature"
+harness = false
+required-features = ["net"]
+
 # CPB — capability propagation benchmark suite (custom main + hdrhistogram).
 # See docs/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md.
 [[bench]]

@@ -991,6 +991,13 @@ struct DispatchCtx {
     /// before user migration traffic lands, which is otherwise
     /// awkward because a started `Mesh` is shared by `Arc`.
     migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
+    /// OA-1: node-local persisted org revocation maxima, installed
+    /// by the authority-adoption wiring
+    /// ([`MeshNode::install_org_revocation_store`]). Absent on
+    /// un-adopted nodes — announcement owner certs then verify
+    /// against implicit floor 0. Same `ArcSwapOption` install
+    /// surface as `migration_handler`.
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
@@ -4039,6 +4046,20 @@ pub struct MeshNode {
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
     migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
+    /// OA-1: node-local persisted org revocation maxima. Shared
+    /// with [`DispatchCtx`] so announcement ingest floor-checks
+    /// owner certs; installed via
+    /// [`Self::install_org_revocation_store`] by the
+    /// authority-adoption wiring. `None` on un-adopted nodes.
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// OA-1: the owner membership certificate this node attaches
+    /// to its own capability announcements. `None` (the default)
+    /// keeps the announcement byte-identical to the pre-OA-1
+    /// shape; enabling emission is the plan's EXPLICIT migration
+    /// step 3 (`upgrade-all-then-emit` — a not-yet-upgraded
+    /// signed-mode peer drops announcements carrying a populated
+    /// cert). Set via [`Self::set_owner_cert_emission`].
+    owner_cert_emission: Arc<ArcSwapOption<super::behavior::org::OrgMembershipCert>>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -5266,6 +5287,8 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
+            org_revocation: Arc::new(ArcSwapOption::empty()),
+            owner_cert_emission: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
@@ -6525,6 +6548,44 @@ impl MeshNode {
     /// that's already been torn down.
     pub fn clear_migration_handler(&self) {
         self.migration_handler.store(None);
+    }
+
+    /// OA-1: install the node's persisted org revocation store so
+    /// announcement ingest floor-checks owner certificates.
+    /// Called by the authority-adoption wiring after the store's
+    /// loud `open_existing` succeeded at startup; installing is
+    /// idempotent (later stores replace earlier ones — the store
+    /// itself carries its own monotone live view).
+    pub fn install_org_revocation_store(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+    ) {
+        self.org_revocation.store(Some(store));
+    }
+
+    /// OA-1: the installed org revocation store, if any.
+    pub fn org_revocation_store(
+        &self,
+    ) -> Option<Arc<super::behavior::org_revocation::OrgRevocationStore>> {
+        self.org_revocation.load_full()
+    }
+
+    /// OA-1: enable (`Some`) or disable (`None`, the default)
+    /// attaching this node's owner membership certificate to its
+    /// own capability announcements.
+    ///
+    /// This is the plan's Migration **step 3** switch
+    /// (`upgrade-all-then-emit`): with emission off the signed
+    /// announcement bytes stay identical to pre-OA-1, so mixed
+    /// fleets interoperate; with emission on, a not-yet-upgraded
+    /// signed-mode peer fails signature verification on the new
+    /// field and drops this node's announcements (fail-closed).
+    /// Enable only after every participant is upgraded.
+    ///
+    /// The next self-announcement (periodic or service-driven)
+    /// carries the change; no immediate re-broadcast is forced.
+    pub fn set_owner_cert_emission(&self, cert: Option<super::behavior::org::OrgMembershipCert>) {
+        self.owner_cert_emission.store(cert.map(Arc::new));
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -7822,6 +7883,7 @@ impl MeshNode {
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
+            org_revocation: self.org_revocation.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
@@ -14964,7 +15026,26 @@ impl MeshNode {
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        // OA-1: verify the announcement's owner cert (if any) at
+        // the ingest boundary — signature, window, member binding,
+        // and the node's persisted revocation floors. A bad cert is
+        // dropped here (the announcement is kept); ONLY a verified
+        // cert reaches the fold's `owner_org` projection. Runs
+        // after the forward block: the signed bytes (cert included)
+        // propagate verbatim and every receiver re-verifies.
+        let verified_owner_org = {
+            let store = ctx.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
+            &ann,
+            verified_owner_org,
+        );
         let _ = ctx.capability_fold.apply(fold_ann);
 
         // SI-6 review P1 (unified scheduler-input generation): fold
@@ -16890,9 +16971,28 @@ impl MeshNode {
             version,
             merged,
         )
-        .with_ttl(300);
+        .with_ttl(300)
+        // OA-1: attach the owner cert iff emission is enabled
+        // (Migration step 3 switch; `None` keeps pre-OA-1 bytes).
+        .with_owner_cert(self.owner_cert_emission.load_full().map(|c| (*c).clone()));
         ann.sign(&self.identity);
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        // OA-1: self-index runs the same owner-cert verification as
+        // inbound ingest — a node's own projection is held to the
+        // identical proof standard (no cert on the announcement →
+        // no owner_org, exactly like a peer would see).
+        let verified_owner_org = {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
+            &ann,
+            verified_owner_org,
+        );
         let _ = self.capability_fold.apply(fold_ann);
     }
 
@@ -17153,7 +17253,10 @@ impl MeshNode {
                 version,
                 caps,
             )
-            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
+            // OA-1: attach the owner cert iff emission is enabled
+            // (Migration step 3 switch; `None` keeps pre-OA-1 bytes).
+            .with_owner_cert(self.owner_cert_emission.load_full().map(|c| (*c).clone()));
             #[cfg(feature = "nat-traversal")]
             {
                 ann = ann.with_reflex_addr(reflex_snapshot);
@@ -17164,8 +17267,22 @@ impl MeshNode {
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
-            // latest intended announcement.
-            let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+            // latest intended announcement. OA-1: same owner-cert
+            // verification as inbound ingest (see
+            // `index_self_with_local_services`).
+            let verified_owner_org = {
+                let store = self.org_revocation.load();
+                let floors = store.as_ref().map(|s| s.snapshot());
+                super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                    &ann,
+                    floors.as_deref(),
+                    0,
+                )
+            };
+            let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
+                &ann,
+                verified_owner_org,
+            );
             let _ = self.capability_fold.apply(fold_ann);
 
             // Publish as the latest local announcement so future
@@ -19179,7 +19296,23 @@ impl MeshNode {
         &self,
         ann: super::behavior::capability::CapabilityAnnouncement,
     ) {
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        // Mirrors the inbound dispatch path, including OA-1
+        // owner-cert verification against this node's installed
+        // revocation floors — so exit-gate fixtures exercise the
+        // real ingest semantics.
+        let verified_owner_org = {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
+            &ann,
+            verified_owner_org,
+        );
         let _ = self.capability_fold.apply(fold_ann);
     }
 
@@ -22341,6 +22474,7 @@ mod fold_publisher_helpers_tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                owner_org: None,
             })
             .await;
         assert!(result.is_ok());
@@ -25117,7 +25251,7 @@ mod stream_ack_batching_tests {
         // handler does before invalidating the cache).
         let caps = CapabilitySet::new().add_tag(ACK_RANGES_CAPABILITY_TAG.to_string());
         let ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps);
-        fold.apply(translate_announcement(&ann))
+        fold.apply(translate_announcement(&ann, None))
             .expect("fold apply");
 
         // Without invalidation the stale `false` still wins (the bug).

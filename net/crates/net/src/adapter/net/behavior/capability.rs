@@ -2127,6 +2127,27 @@ pub struct CapabilityAnnouncement {
     /// as `allowed_nodes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_groups: Vec<super::group::GroupId>,
+    /// OA-1 organization ownership — the announcer's
+    /// [`OrgMembershipCert`](super::org::OrgMembershipCert), issued
+    /// by its (single) owner org. Verified at fold ingest against
+    /// the certificate signature, time window, the
+    /// `member == entity_id` binding, and the persisted revocation
+    /// floors; an unverifiable cert is dropped (the announcement is
+    /// kept) and never reaches the fold's `owner_org` projection.
+    ///
+    /// Belonging only — this field NEVER participates in
+    /// `may_execute` or any execute-authorization axis (see
+    /// `ORG_CAPABILITY_AUTH_PLAN.md`, OA-1: authority-dark).
+    ///
+    /// **Wire compat.** Same treatment as `reflex_addr`: `None`
+    /// serializes to nothing, keeping the signed byte form
+    /// identical to pre-OA-1 announcements. A populated cert enters
+    /// the signed transcript, so a not-yet-upgraded signed-mode
+    /// peer fails verification and drops the announcement —
+    /// fail-closed by design; emission stays off until the fleet is
+    /// upgraded (plan §Migration step 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_cert: Option<super::org::OrgMembershipCert>,
 }
 
 /// Cap on any single allow-list axis on a
@@ -2155,12 +2176,12 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let a = self.0;
-        // Up to 11 fields can be emitted (signature and hop_count
+        // Up to 12 fields can be emitted (signature and hop_count
         // are ALWAYS omitted in the canonical view because we're
         // emulating `signature = None` and `hop_count = 0`). The
         // count is a hint; the JSON serializer ignores it and the
         // others tolerate over-counting plus `skip_field`.
-        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 11)?;
+        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 12)?;
         state.serialize_field("node_id", &a.node_id)?;
         state.serialize_field("entity_id", &a.entity_id)?;
         state.serialize_field("version", &a.version)?;
@@ -2190,6 +2211,11 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
             state.serialize_field("allowed_groups", &a.allowed_groups)?;
         } else {
             state.skip_field("allowed_groups")?;
+        }
+        if a.owner_cert.is_some() {
+            state.serialize_field("owner_cert", &a.owner_cert)?;
+        } else {
+            state.skip_field("owner_cert")?;
         }
         state.end()
     }
@@ -2290,12 +2316,22 @@ impl CapabilityAnnouncement {
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
+            owner_cert: None,
         }
     }
 
     /// Set TTL
     pub fn with_ttl(mut self, ttl_secs: u32) -> Self {
         self.ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Attach the announcer's org membership certificate (OA-1
+    /// scaffolded ownership). Included in the signed envelope: set
+    /// it before [`Self::sign`], and see the `owner_cert` field
+    /// docs for the mixed-fleet emission discipline.
+    pub fn with_owner_cert(mut self, cert: Option<super::org::OrgMembershipCert>) -> Self {
+        self.owner_cert = cert;
         self
     }
 
@@ -3377,6 +3413,11 @@ mod tests {
             "empty allowed_groups must be skipped on the wire; got: {}",
             s
         );
+        assert!(
+            !s.contains("owner_cert"),
+            "absent owner_cert must be skipped on the wire; got: {}",
+            s
+        );
     }
     /// Round-trip an announcement with each allow-list populated
     /// — the decoder must reconstruct the exact field values.
@@ -3430,6 +3471,10 @@ mod tests {
             !obj.contains_key("allowed_groups"),
             "pre-v0.4 wire shape must not carry allowed_groups when empty"
         );
+        assert!(
+            !obj.contains_key("owner_cert"),
+            "pre-OA-1 wire shape must not carry owner_cert when absent"
+        );
     }
     /// PERF_AUDIT §4.4 — the borrowed `SignedPayloadCanonical`
     /// wrapper MUST emit byte-identical JSON to the pre-fix
@@ -3482,6 +3527,19 @@ mod tests {
             "with allowed_nodes: signed_payload must equal cloned-canonical bytes"
         );
 
+        // With owner_cert set (OA-1) — the newest optional signed
+        // field, exercised in its EMITTED form.
+        let org = super::super::org::OrgKeypair::from_bytes([0x42; 32]);
+        let cert =
+            super::super::org::OrgMembershipCert::try_issue(&org, kp.entity_id().clone(), 1, 3600)
+                .expect("issue cert");
+        let with_cert = bare.clone().with_owner_cert(Some(cert.clone()));
+        assert_eq!(
+            with_cert.signed_payload(),
+            cloned_canonical(&with_cert),
+            "with owner_cert: signed_payload must equal cloned-canonical bytes"
+        );
+
         // With every optional field populated — including
         // non-empty allowed_subnets / allowed_groups so all three
         // allow-list `skip_serializing_if = "Vec::is_empty"` axes
@@ -3490,6 +3548,7 @@ mod tests {
         full.allowed_nodes = vec![0x1111, 0x2222];
         full.allowed_subnets = vec![super::super::subnet::SubnetId([0x11; 16])];
         full.allowed_groups = vec![super::super::group::GroupId([0x22; 32])];
+        full.owner_cert = Some(cert);
         // Pretend signature was already set + hop_count was bumped
         // (the canonical view must blank both before hashing).
         full.signature = Some(Signature64([0x42; 64]));
@@ -3499,6 +3558,72 @@ mod tests {
             cloned_canonical(&full),
             "with signature/hop_count set: canonical must blank them before serialize"
         );
+    }
+
+    /// OA-1 mixed-fleet pins for `owner_cert`:
+    ///
+    /// 1. A populated cert round-trips the wire and the signature
+    ///    verifies (upgraded ↔ upgraded).
+    /// 2. The cert sits INSIDE the signed envelope — injecting or
+    ///    stripping it after signing breaks verification. This is
+    ///    the fail-closed mechanism for a mixed fleet: an old
+    ///    reader (whose canonical payload cannot reproduce the
+    ///    field) fails `verify()` on a nonempty `owner_cert` and
+    ///    drops the announcement rather than silently accepting an
+    ///    ownership claim it cannot check.
+    /// 3. Pre-OA-1 bytes (no `owner_cert` key) decode to `None`
+    ///    via `#[serde(default)]` and keep verifying — old
+    ///    announcements remain valid on new readers.
+    #[test]
+    fn owner_cert_is_inside_the_signed_envelope() {
+        use super::super::super::identity::EntityKeypair;
+        let kp = EntityKeypair::generate();
+        let org = super::super::org::OrgKeypair::from_bytes([0x42; 32]);
+        let cert =
+            super::super::org::OrgMembershipCert::try_issue(&org, kp.entity_id().clone(), 1, 3600)
+                .expect("issue cert");
+
+        // 1. Round-trip + verify with the cert in place.
+        let mut ann =
+            CapabilityAnnouncement::new(7, kp.entity_id().clone(), 1, sample_capability_set())
+                .with_owner_cert(Some(cert.clone()));
+        ann.sign(&kp);
+        ann.verify().expect("signed-with-cert verifies");
+        let decoded = CapabilityAnnouncement::from_bytes(&ann.to_bytes()).expect("decode");
+        assert_eq!(decoded.owner_cert.as_ref(), Some(&cert));
+        decoded.verify().expect("decoded announcement verifies");
+
+        // 2a. Transplant: inject a cert into an announcement signed
+        // WITHOUT one → verification must fail.
+        let mut unsigned_cert = ann.clone();
+        unsigned_cert.owner_cert = None;
+        unsigned_cert.sign(&kp);
+        unsigned_cert
+            .verify()
+            .expect("cert-free announcement verifies");
+        let mut injected = unsigned_cert.clone();
+        injected.owner_cert = Some(cert.clone());
+        assert!(
+            injected.verify().is_err(),
+            "injecting owner_cert after signing must break the signature"
+        );
+
+        // 2b. Stripping the cert from a signed-with-cert
+        // announcement must equally fail.
+        let mut stripped = ann.clone();
+        stripped.owner_cert = None;
+        assert!(
+            stripped.verify().is_err(),
+            "stripping owner_cert after signing must break the signature"
+        );
+
+        // 3. Pre-OA-1 bytes decode with owner_cert = None and still
+        // verify (the canonical form without the field is
+        // unchanged).
+        let legacy_bytes = unsigned_cert.to_bytes();
+        let legacy = CapabilityAnnouncement::from_bytes(&legacy_bytes).expect("decode legacy");
+        assert!(legacy.owner_cert.is_none());
+        legacy.verify().expect("legacy shape still verifies");
     }
 
     /// A signed announcement carrying non-empty allow-lists

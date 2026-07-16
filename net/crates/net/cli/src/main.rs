@@ -133,6 +133,13 @@ enum Command {
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
+    /// Organization root authority authoring (keygen / issue-cert
+    /// / issue-floors) — OA-1.
+    #[command(subcommand)]
+    Org(commands::org::OrgCommand),
+    /// Node ownership provisioning (`adopt`) — OA-1.
+    #[command(subcommand)]
+    Node(commands::node::NodeCommand),
     /// Hierarchical subnet inspection (`show|ls|tree`).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
@@ -239,6 +246,8 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
+        Command::Org(cmd) => commands::org::run(cmd, output).await,
+        Command::Node(cmd) => commands::node::run(cmd, output).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
         Command::Channel(cmd) => commands::channel::run(cmd, output, config_path, profile).await,

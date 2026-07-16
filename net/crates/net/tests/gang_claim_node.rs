@@ -75,6 +75,7 @@ fn prime_capability(node: &MeshNode, kp: &EntityKeypair, node_id: u64, tags: Vec
         allowed_subnets: Vec::new(),
         allowed_groups: Vec::new(),
         metadata: BTreeMap::new(),
+        owner_org: None,
     };
     let ann = SignedAnnouncement::sign(
         kp,
