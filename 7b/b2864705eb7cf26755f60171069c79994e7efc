@@ -1,0 +1,32 @@
+net/crates/net/benches/island_claim_harness.rs
+  s_c28bdf38c0df3a::t_f964c04e8b08b1 351-436,440-446
+  s_c28bdf38c0df3a::t_1c1537e53a7cb3 14
+  s_c28bdf38c0df3a::t_19245ff43e5a70 34,46-48
+  s_c28bdf38c0df3a::t_263ef3946b6741 437-439
+  s_c28bdf38c0df3a::t_c508b765d5f328 298-299,301-306,310-311,315,322,325-350
+  s_c28bdf38c0df3a::t_3ab8a4012d2b43 49
+net/crates/net/benches/bench_island_claim/mod.rs
+  s_c28bdf38c0df3a::t_bb03c390228641 49
+  s_c28bdf38c0df3a::t_60d63683907f2c 505-510,516,520-521,523-527,531
+  s_c28bdf38c0df3a::t_85a2aae436ca04 419-432
+  s_c28bdf38c0df3a::t_b01455f916e626 522
+  s_c28bdf38c0df3a::t_4dc889b055ef0c 275-279,284,286-297,299,303-312,317
+  s_c28bdf38c0df3a::t_977b15ef3c9d96 313-316
+  s_c28bdf38c0df3a::t_f1affcfba03cbc 318-319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7bb2864705eb7cf26755f60171069c79994e7efc",
+  "prompts": {},
+  "sessions": {
+    "s_c28bdf38c0df3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79f843aa-d209-4e04-8b8b-1b11a0fb4d45",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
