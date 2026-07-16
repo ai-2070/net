@@ -50,7 +50,7 @@ const ITERS: u64 = 300;
 const WARMUP: u64 = 30;
 const ISLAND_BASE: u64 = 0x2C00_0000;
 const PREFLIGHT_ISLAND: u64 = 0x2C00_FFFF;
-/// Per-sample ceiling; a delivery timeout skips the sample (no print).
+/// Per-sample joint ceiling; a joint-sample timeout skips the sample (no print).
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(5);
 
 fn main() {
@@ -132,7 +132,7 @@ async fn measure_direct() {
 }
 
 /// One uncontended sample on a FRESH island. Returns the three endpoint
-/// durations from a common t0, or `None` on a delivery timeout (skipped,
+/// durations from a common t0, or `None` on a joint-sample timeout (skipped,
 /// not printed). Panics on any hard invariant violation (Lost, wrong
 /// publisher, count overshoot, holder mismatch) — those never print.
 async fn one_sample(

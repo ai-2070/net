@@ -481,6 +481,13 @@ name = "island_claim_boundaries"
 harness = false
 required-features = ["net"]
 
+# ICB-3 distributed simultaneous-claim divergence diagnostic (2/4/8/16
+# claimants; right-censored agreement reporting + required witnesses).
+[[bench]]
+name = "island_claim_divergence"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
