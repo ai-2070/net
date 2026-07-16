@@ -495,6 +495,14 @@ name = "island_claim_fallback"
 harness = false
 required-features = ["net"]
 
+# ICB-5 sensed selection / fallback (SINGLE CLAIMANT): 5a on-demand re-selection
+# + 5b reservation fallback over the real claim_island_sensed path; opposing
+# load/sensed seed.
+[[bench]]
+name = "island_claim_sensed"
+harness = false
+required-features = ["net", "redex"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
