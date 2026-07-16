@@ -247,11 +247,12 @@ async fn build_topology(n: usize) -> Option<Topology> {
 ///     OTHER claimant id;
 ///   - the observer: exactly N unique deliveries, publishers = all claimant ids.
 ///
-/// Counts are monotonic within a round (reset only at its start), so a snapshot
-/// count above target can only be a late unique tuple that landed after the
-/// count barrier returned at equality — a [`InvalidReason::CountOvershoot`]. A
-/// matching cardinality with the wrong sources is a
-/// [`InvalidReason::PublisherMismatch`].
+/// Counts are monotonic within a round (reset only at its start). In this
+/// CLOSED round a snapshot count cannot exceed its target — every producer
+/// emits exactly one unique tuple and duplicates dedupe — so the
+/// [`InvalidReason::CountOvershoot`] branch is a DEFENSIVE guard (unreachable
+/// under this topology), not a guard against an expected late tuple. A matching
+/// cardinality with the wrong sources is a [`InvalidReason::PublisherMismatch`].
 fn verify_delivery_endpoint(
     claimant_snapshots: &[DeliverySnapshot],
     observer_snapshot: &DeliverySnapshot,
@@ -362,12 +363,20 @@ async fn delivery_round_timed(
         });
     }
 
-    // Re-prove EXACT count AND EXACT publisher set together, atomically per
-    // counter (one lock per snapshot), immediately before the endpoint
-    // timestamp — via the SAME `verify_delivery_endpoint` the W13 witness
-    // pins. This also closes the interval between the count barrier returning
-    // at equality and this capture: a late unique (publisher, generation)
-    // tuple surfaces here as a CountOvershoot rather than slipping in unseen.
+    // Take a coherent (count, publishers) snapshot of each counter under ONE
+    // lock, then re-prove EXACT count AND EXACT publisher set via the SAME
+    // `verify_delivery_endpoint` the W13 witness pins.
+    //
+    // Why sequential per-counter snapshots suffice here (NOT a general
+    // multi-counter atomicity claim): this is a CLOSED round — exactly N
+    // claimants, each emitting exactly ONE reserve generation for this fresh
+    // island; the observer emits nothing; wire duplicates carry the same
+    // (publisher, island, generation) and dedupe. Once a counter's snapshot
+    // shows its exact expected publisher set, every producer has already
+    // contributed its sole unique tuple, so no later delivery can increment
+    // that counter (only duplicates remain). A globally frozen counter set
+    // would be needed only against adversarial / background writers — outside
+    // this closed benchmark topology.
     let claimant_snaps: Vec<DeliverySnapshot> = claimant_counters
         .iter()
         .map(|cc| cc.delivery_snapshot())
@@ -896,38 +905,49 @@ fn w13_wrong_publisher_same_cardinality() {
     );
 }
 
-/// W14 — mixed per-sample holder shapes are recorded AND formatted as a RANGE,
-/// so a lone extreme sample cannot masquerade as a singular value. Feeds mixed
-/// samples through the SAME `HolderShapeAggregate::record` + `format_line` the
-/// production measurement uses, so collapsing EITHER the recording or the
-/// formatter breaks this witness.
+/// W14 — pins EVERY production holder-shape aggregate field and the COMPLETE
+/// formatter output through the SAME `HolderShapeAggregate::record` +
+/// `format_line` the measurement uses. Samples vary the delivery, end-W, and
+/// cohort axes INDEPENDENTLY (and include exactly one uniform-shaped sample),
+/// so collapsing any single range (recording or formatting), the uniform
+/// numerator, or the sample denominator breaks this witness — not just the
+/// delivery+cohort axes.
 fn w14_mixed_shapes_not_collapsed() {
     let mut shape = HolderShapeAggregate::default();
-    shape.record(4, 3, 3, 2); // distinct@delivery = 3
-    shape.record(4, 1, 1, 4); // distinct@delivery = 1 (coincidental agreement)
-    shape.record(4, 2, 2, 3); // distinct@delivery = 2
+    shape.record(4, 3, 1, 2);
+    shape.record(4, 1, 4, 4);
+    shape.record(4, 2, 2, 3);
+    shape.record(4, 4, 3, 2); // exactly one uniform sample (distinct==N, cohort==2)
 
-    // Recording must retain BOTH extremes, never collapse to one value.
+    // Every production aggregate field — both endpoints of all three ranges,
+    // uniform incidence, and the sample denominator.
     assert_eq!(
         (shape.distinct_delivery_min, shape.distinct_delivery_max),
-        (1, 3),
-        "recorded distinct-holder range must expose both extremes"
+        (1, 4),
+        "distinct@delivery range must expose both extremes"
+    );
+    assert_eq!(
+        (shape.distinct_window_min, shape.distinct_window_max),
+        (1, 4),
+        "distinct@end-W range must expose both extremes"
     );
     assert_eq!(
         (shape.cohort_min, shape.cohort_max),
         (2, 4),
-        "recorded cohort range must expose both extremes"
+        "largest_cohort range must expose both extremes"
     );
-    // The SOLE holder-shape output line (same formatter production prints) must
-    // emit the full range — a collapsed min..min / max..max fails here.
-    let line = shape.format_line();
-    assert!(
-        line.contains("distinct@delivery[min=1 max=3]"),
-        "formatter must emit the full range, not a collapsed extremum: {line}"
+    assert_eq!(shape.uniform_shape, 1, "exactly one uniform-shaped sample");
+    assert_eq!(shape.samples, 4, "sample denominator");
+
+    // Pin the COMPLETE production formatter output by exact equality — every
+    // range, every label, the uniform incidence, the denominator, and the
+    // sole-holder-shape wiring.
+    assert_eq!(
+        shape.format_line(),
+        "holder_shape: distinct@delivery[min=1 max=4] distinct@end-W[min=1 max=4] largest_cohort[min=2 max=4] · uniform(distinct=N,cohort=2)=1/4",
+        "the complete holder-shape formatter output must match exactly"
     );
-    println!(
-        "  [PASS] W14 mixed holder shapes → recorded + formatted as a range, not a hidden extremum"
-    );
+    println!("  [PASS] W14 every holder-shape aggregate field + complete formatter output pinned");
 }
 
 /// W12 — a raw chain topology cannot enter the matrix: the sentinel delivery
