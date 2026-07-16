@@ -9,6 +9,19 @@
 //! Matrix: island population {10, 100, 1000} × units/island {1, 8, 72} ×
 //! capability shape {sparse, dense}.
 //!
+//! Scaling interpretation (architecture evidence — NOT an optimization task;
+//! ICB measures the current implementation): the coarse capability query is
+//! INDEXED. `CapabilityQuery::Composite` with one required tag reads the
+//! inverted `by_tag` bucket (`capability::composite_query`), so it
+//! materializes only the matched hosts — never a full capability-fold scan.
+//! The full-population scan is on the ISLAND fold: `IslandQuery::HostedByAny`
+//! iterates every island entry (`island.rs`). So matcher cost ≈ indexed
+//! capability-bucket materialization + a full island-topology scan +
+//! clone/numeric-filter/select over matching islands. Sparse-1000 is slower
+//! than dense-100 (both yield 100 candidate islands) because `HostedByAny`
+//! scans 1,000 topology entries vs 100 — NOT because the capability query
+//! scanned 1,000 hosts.
+//!
 //! Boundary discipline (Kyra ICB-1): **`min_units` is an ELIGIBILITY
 //! constraint; any later successful CLAIM reserves the whole island. The
 //! matcher reserves nothing.** Reported island populations are the three
@@ -313,8 +326,11 @@ fn print_row(report: &LatencyReport, islands: usize, units: u32, dense: bool, po
         if dense { "dense" } else { "sparse" }
     );
     println!(
-        "   island_pop={} · matched_hosts={} · candidate_islands(pre-numeric, bench-reconstructed)={} · eligible_pop={} · viable_returned={}",
-        pop.island_pop, pop.matched_hosts, pop.candidate_islands, pop.candidate_islands, pop.viable,
+        "   island_pop={} · matched_hosts={} · candidate_islands(pre-numeric, bench-reconstructed)={} · eligible_islands_after_numeric={} · viable_returned={}",
+        pop.island_pop, pop.matched_hosts, pop.candidate_islands, pop.viable, pop.viable,
+    );
+    println!(
+        "   (eligible_islands_after_numeric == viable_returned in ICB-1: selection applies no result cap; a pre-numeric candidate that fails min_units is NOT eligible)",
     );
     println!(
         "   min_units={MIN_UNITS} (ELIGIBILITY only — a later successful CLAIM reserves the whole island; the matcher reserves nothing) · selection=LeastLoaded",
