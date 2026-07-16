@@ -1,474 +1,626 @@
 # Organization Capability Auth Plan
 
-**Version:** v0.5 — closes review-4's floor-replication admission
-blocker (tracked-org authority boundary + authenticated owner-scoped
-synchronization, §1.5–§1.6), adopts the review-4 answers to Q11
-(dedicated WAL, §1.7), Q12 (bounded sync pages, §1.6), Q13 (explicit
-proof timestamp semantics, §2.4), and corrects the foreign-access
-wording throughout. All review-4 approved portions (see §Locked) are
-retained verbatim and are not reopened.
-**Status:** Awaiting review-5 — expected to be the implementation-
-authorization pass for Phases 1–2; Phase 3 remains correctly gated
-on the sensing amendment.
-**Scope:** cryptographic organization ownership for nodes,
-capability-specific delegated admission of incoming work, and
-owner-scoped discovery.
+**Version:** v1.3 — applies review-7: the legacy-gate integration
+correction for OA-2 (`may_execute` aggregates allow-lists
+TARGET-WIDE across all of a node's entries, so an empty allow-list
+on the protected service is not a dependable pass-through —
+protected services now use policy-directed gate selection with a
+narrow `has_local_capability` check, §2.4a), the stronger seam
+witness matrix (§OA-4), and three OA-3 carry-forwards: the zero
+grant_id is reserved (grant issuance/decode rejects it), envelope
+dedup identity includes `grant_id`, and secret-bearing runtime
+types are structurally non-serializable.
+**Status:** **OA-1 implementation AUTHORIZED (review-7); proceed
+with OA-1 only, then stop at its review gate.** OA-2 held on the
+§2.4a correction (now applied in this document, pending its staged
+review); OA-3/OA-4 held behind their staged reviews.
+
+**Scope — the compact core:**
 
 ```
-Belonging:   org-signed membership          (Phase 1 — scaffolded,
-                                             authority-dark)
-Admission:   per-call delegated authority   (Phase 2 — load-bearing,
-                                             replay-guarded, unary)
-Visibility:  owner-scoped discovery         (Phase 3 — two honest
-                                             modes, epoch-keyed)
+membership proves who you belong to
+dispatcher grant proves who you act for
+provider grant proves where you may look and what you may invoke
+scoped announcement privately carries the capability descriptor
+provider verifies the exact call
 ```
 
-**The invariant sentence:** *Scaffolding establishes belonging.
-Delegation authorizes work. Discovery limits knowledge. Provider
-policy controls execution.* Membership is never invocation
-authority. Visibility is never admission. Admission is never
-confidentiality. Authentication is never replay prevention. A
-replay key never dies before the proof it guards. **A signature
-proves what an organization said — never that this node has any
-reason to track that organization (§1.5).**
-
----
-
-## Context
-
-Unchanged from v0.2–v0.4. One addition from review-4: once floor
-replication became concrete, self-certifying `OrgId`s + permanent
-fsynced retention + unauthenticated all-maxima sync composed into
-an amplification and disclosure surface — any peer could mint
-unlimited valid (org, member) floors and force permanent durable
-state, rebroadcast, unbounded join sync, and cross-tenant
-disclosure of membership/revocation events. v0.5 adds the missing
-authority boundary: cryptographic validity admits nothing; local
-provisioning does.
+**Invariants (pinned):** membership is never invocation authority;
+decrypting an announcement is never invocation authority; the
+audience credential grants only knowledge; visibility is never
+admission; provider-local policy is final; authentication is never
+replay prevention; ownership is singular; **the OrgAdmission gate —
+not a legacy allow-list — supplies the authority for protected
+services (red-witnessed, §OA-4)**; revocation monotonicity survives
+restart.
 
 ---
 
 ## Model
 
 ```
-ORG IDENTITY / OWNERSHIP / SCAFFOLDING — as v0.4
-    OrgId = self-certifying ed25519 pubkey; one node, one owner org;
-    OrgMembershipCert (~1y, silent renewal, generation floor-checked);
-    NodeAuthorityConfig with loud startup self-verification;
-    fold projection owner_org: Option<OrgId> — never execution.
+IDENTITY
+    OrgId = ed25519 verifying key. Self-certifying; root offline;
+    issuance occasional, never per-call.
 
-REVOCATION (Phase 1) — OrgAuthorityFloorStore, TRACKED ORGS ONLY
-    tracked organizations (v1) = local node's owner_org only
-    ingest: tracked-check BEFORE durable allocation; unknown orgs
-    are never persisted, never rebroadcast, never synced, never
-    allocate per-org state.
-    sync: org-scoped, member-authenticated, policy-gated
-    (OwnerMembersOnly in v1), bounded pages.
-    storage: dedicated WAL + snapshot owned by org_floor.rs.
-    Write-through before admission visibility; indefinite retention;
-    carrier-independent inner authority — all as v0.4.
+AUTHORITY OBJECTS
 
-ADMISSION (Phase 2) — as v0.4, timestamps made explicit
-    AdmissionProof { membership_cert, delegation_chain,
-                     proof_expires_at_unix_ns, call_binding_sig }
-    (caller, call_id) replay identity; retention to proof expiry +
-    skew on a monotonic clock; unary only.
-    v1 OwnerDelegation semantics, stated plainly:
-        valid owner member + valid owner-rooted dispatcher
-        delegation → may request invocation.
-    Foreign access = FUTURE explicit grants; NOT implemented by v1
-    OwnerDelegation. membership_cert stays mandatory.
+1. OrgMembershipCert                 S ∈ A     (scaffolded; one
+     { org_id, member, not_before,             node one owner;
+       not_after, generation, nonce, sig }     ~1y silent renewal)
 
-VISIBILITY (Phase 3) — as v0.4
-    Public | PublicLocatorOwnerDetail | OwnerOnly; epoch-keyed with
-    two-key overlap; plaintext-interest boundary gated in the
-    sensing amendment.
+2. OrgDispatcherGrant                A → S     (fixed one-hop,
+     { org_id, dispatcher,                     org-root-signed,
+       capability_scope: Exact | Any,          days–weeks TTL)
+       not_before, not_after, nonce, sig }
+
+3. OrgCapabilityGrant                B → A
+     { grant_id: [u8;32],
+       issuer_org: B, grantee_org: A,
+       capability: CapabilityAuthorityId,
+       rights: GrantRights,                    // DISCOVER | INVOKE
+       target_scope: ExactNode(NodeId) | AnyNodeOwnedBy(OrgId),
+       discovery: Option<GrantedDiscoveryBinding>,
+       not_before, not_after, nonce, sig }
+
+   GrantedDiscoveryBinding {                   // in the SIGNED grant
+       audience_handle: [u8; 32],              // random, per grant
+       key_commitment:  [u8; 32],              // blake3 derive_key(
+   }                                           //  "net-org-audience-
+                                               //   commit-v1", key)
+
+   OrgAudienceSecret {                         // LOCAL FILE, out of
+       grant_id, audience_handle,              // band, never on the
+       discovery_key: [u8; 32],                // wire, never in a
+   }                                           // proof
+
+   STRUCTURAL RULE (v1):
+       rights ⊇ DISCOVER  ⇔  discovery == Some(..)
+       one DISCOVER grant ⇔ one unique handle ⇔ one unique key.
+       No audience reuse across grants.
+
+4. ScopedCapabilityAnnouncement      P ⇒ audience   (§OA-3)
+
+5. OrgCallProof                      S → P, one call
+     { caller_membership, dispatcher_grant,
+       capability_grant: Option<OrgCapabilityGrant>,
+       proof_expires_at_unix_ns, call_binding_sig }
+     Carries the SIGNED grant (with commitment) only — the raw
+     discovery key never rides a call (witnessed).
+
+CAPABILITY REGISTRATION (provider-local; the §2.4a seam)
+    RegisteredCapability { descriptor, visibility, admission }
+    Local registry/fold ALWAYS receives the capability;
+    EMISSION projects by visibility:
+        Public          → plaintext CAP-ANN
+        OwnerScoped     → plaintext scoped form, excluded from
+                          unscoped query projection (fanout
+                          control, not confidentiality)
+        GrantedAudience → encrypted ScopedCapabilityAnnouncement
+                          ONLY
+
+AUDIENCE SCOPES (fold partitioning; mutually invisible)
+    enum CapabilityAudienceScope {
+        Public,
+        Owner { org_id, audience_handle },
+        Grant { grant_id, audience_handle },
+    }
+
+ADMISSION (per registered service)
+    enum OrgAdmission { PublicAuthenticated, OwnerDelegated,
+                        CrossOrgGranted }
+
+REVOCATION (v1) — local, operator-distributed, RESTART-DURABLE
+    OrgRevocationBundle (signed floors) merged into a persisted
+    OrgRevocationState maxima file; atomically written BEFORE the
+    live view updates; a lower bundle never rolls back, including
+    across restart. Grants: expiry + non-renewal; provider-local
+    deny is immediate. Audience: per-grant rotation.
+
+AUDIT IDENTITY: actor S, acting for org A, under grant from
+provider org B, invoked capability C, on exact provider P — never
+"A invoked B."
 ```
 
 ---
 
-## What ships — Phase 1: scaffolded ownership, dark authority facts
+## OA-1 — scaffolded ownership (stop and review)
 
-### 1.1–1.4 — as v0.4, unchanged
+### 1.1–1.4 — as v1.1
 
-(`org.rs` types; cert discipline; `NodeAuthorityConfig` + adopt path
-with loud failure incl. floor-store health; single `owner_cert`
-announcement field with canonical lockstep; verified-only fold
-projection; `may_execute` untouched; no cache before benchmark.)
+`behavior/org.rs` types (`OrgId` with derived non-ct `PartialEq` —
+public value, documented contrast with bearer-secret ids;
+`OrgKeypair`; `OrgMembershipCert`; `OrgRevocationBundle`), canonical
+signed layouts, strict decode, `verify_strict`, domains
+(`net-org-cert-v1`, `net-org-floors-v1`), ~1y/2y TTLs, token-module
+skew. `NodeAuthorityConfig` at adopt; loud startup
+self-verification; one node one owner. Scaffolding installs the
+owner audience credential as its own versioned file (see file
+layout below). Announcement field
+`owner_cert: Option<OrgMembershipCert>` with
+`SignedPayloadCanonical` lockstep; fold projection
+`owner_org: Option<OrgId>` from ingest-verified certs only
+(this projection also implements `OwnerScoped` query filtering and
+the caller-side `AnyNodeOwnedBy` precheck). **`may_execute`
+untouched; no org execute axis; no `org:` tag.** Uncached
+verification + bench. CLI: `net org keygen`, `issue-cert`,
+`issue-floors`, `net node adopt`.
 
-### 1.5 Floor authority boundary — tracked organizations
-(closes review-4 critical)
+Config file layout (separately versioned; visibility key material
+is not membership and does not ride certificate-renewal
+semantics):
 
-The inner org signature proves authorship. It does not create a
-tracking relation. Durable floor state exists only for locally
-provisioned roots:
+```
+owner-membership.json      // NodeAuthorityConfig + owner_cert
+owner-audience.key         // owner audience handle + key
+revocation-state.json      // persisted floor maxima (§1.5)
+```
+
+### 1.5 Restart-persistent revocation maxima (review-6 §4)
+
+In-memory monotone merge is insufficient: if config management
+replaces the bundle with an OLDER valid signed bundle and the node
+restarts, there is no prior maximum to compare against. The minimum
+fix — NOT the deferred WAL/replication system — is one small atomic
+local file:
 
 ```rust
-pub struct TrackedOrgAuthority {
-    pub org_id:     OrgId,
-    pub floor_sync: FloorSyncPolicy,
-}
-
-pub enum FloorSyncPolicy {
-    /// v1 default and only shipped mode: floor pages are served
-    /// exclusively to verified current members of this same org.
-    OwnerMembersOnly,
-    /// Reserved for future foreign relying parties (providers that
-    /// accept a foreign org's grants pin that org explicitly).
-    ExplicitRelyingParties,
+OrgRevocationState {
+    floors: BTreeMap<(OrgId, EntityId), u32>,
 }
 ```
 
-**v1 rule:** `tracked organizations = { local owner_org }` —
-populated from `NodeAuthorityConfig` at adopt time. A future
-relying-party provider pins additional roots explicitly and
-locally. **Receiving a signed record from the network never creates
-the trust relation** (T-floor-18).
-
-Ingest pipeline (locked order):
+Reload path (locked order):
 
 ```
-decode bounded frame (size-checked before allocation)
-→ record.org_id locally tracked?  — NO → drop; bounded counter
-                                     metric only, no per-org state,
-                                     no high-cardinality label
-→ verify inner org signature
-→ monotone compare against durable maximum
-→ write-through durable commit (§1.7)
-→ live admission view update
-→ owner-scoped rebroadcast of the exact inner record
+verify incoming bundle signature
+→ merge maxima with PERSISTED state (monotone; lower never wins)
+→ atomically write merged maxima
+     (write temp → fsync temp → atomic rename → fsync parent dir)
+→ ONLY THEN publish the new live view
 ```
 
-Unknown organizations: not persisted, not rebroadcast, not included
-in anti-entropy, never allocate per-org state (T-floor-14). This
-removes all four review-4 amplification/disclosure vectors at the
-first pipeline step.
+Failure handling: corrupt incoming bundle → keep persisted
+last-good, log loudly (Q1-prior resolved). Corrupt persisted maxima
+file → LOUD startup failure — protected verification never starts
+against silently weaker floors.
 
-**Operator injection path:** the offline root signs a new floor;
-the operator injects it into ONE owner node via the CLI / local
-administrative path (`net org inject-floor --record <path>`, local
-transport only); that node durably commits and propagates it
-through the owner domain. Origination never requires the org root
-on the mesh.
+### 1.6 OA-1 exit gate
 
-### 1.6 Floor synchronization — org-scoped, member-authenticated
-(closes review-4 critical, part 2; answers Q12)
+As v1.1 (byte identity + canonical proptest; golden vectors;
+cert/floor matrix; ingest drops bad certs not announcements;
+authority-dark `may_execute` pin; adopt loud failure; mixed-fleet
+fail-closed pins) PLUS the restart witness, verbatim:
 
-The v0.4 unauthenticated `OrgFloorSyncRequest {}` is replaced:
+```
+load floor generation 5 → persist
+replace operator bundle with VALID generation 3
+restart
+→ generation 5 remains authoritative
+```
+
+and: corrupt persisted maxima → loud startup failure; reload of a
+corrupt bundle → last-good retained. Stop. Review.
+
+---
+
+## OA-2 — internal and cross-org admission (stop and review)
+
+### 2.1 `CapabilityAuthorityId` — as v1.1
+
+Deterministic 32-byte `blake3::derive_key("net-org-capability-v1",
+canonical identity)`; authorization scope only; never a locator or
+secret.
+
+### 2.2 Grants — commitments in, keys out (review-6 §1–2)
+
+`OrgDispatcherGrant` as v1.1. `OrgCapabilityGrant` per the model:
+the SIGNED grant carries `GrantedDiscoveryBinding { audience_handle,
+key_commitment }`; the raw key lives only in the local
+`OrgAudienceSecret` file, delivered out of band to B's publishing
+nodes and A's consuming nodes, validated against the commitment
+(`key_commitment == blake3 derive_key("net-org-audience-commit-v1",
+discovery_key)`). The key therefore never transits RPC headers,
+tracing/debug paths, denial logs, or provider surfaces
+(witnessed in OA-2's gate).
+
+Structural rule enforced at issue AND decode:
+`rights ⊇ DISCOVER ⇔ discovery.is_some()`. One DISCOVER grant, one
+unique handle, one unique key — `net org grant-capability
+--discover` always mints fresh audience material; there is NO
+`--audience <file>` reuse flag in v1 (the reuse failure modes:
+a shared key lets an INVOKE-only grantee decrypt, and an expired
+grant's holder retains a still-live shared key; both are structural
+non-events under per-grant audiences). Shared "disclosure groups"
+are a future explicit feature.
+
+Grant lifetimes days–weeks; renewal is grant revocation in v1;
+`AnyNodeOwnedBy(B)` reusable across discovered B-owned providers,
+call always names exact P.
+
+### 2.3 `OrgCallProof` + binding — as v1.1
+
+Exactly one `net-org-admission` header; postcard proof (grant now
+carries a 32-byte commitment instead of the key — size unchanged);
+static asserts vs 4096 B. Transcript `"net-org-call-v1"` binding
+acting org, caller + origin, provider org, exact callee, call_id,
+capability, whole canonical request minus the proof header, expiry
+(unit-explicit ns), and all credential digests. Wall-clock verify,
+monotonic retention.
+
+### 2.4 Provider-local admission — as v1.1
+
+Same 10-step verification order (local policy resolution →
+exactly-one-header → TOFU member binding → mode checks
+(`OwnerDelegated` rejects an unexpected capability grant as
+malformed; `CrossOrgGranted` requires issuer == my owner, grantee
+== caller's org, rights ⊇ INVOKE, capability match, target covers
+exact me) → dispatcher grant checks → floors/windows/freshness →
+binding → replay guard → provider-local policy LAST). Typed
+`AdmissionDenied` (0x0009) with distinguishable reasons. Fold
+state, decrypted announcements, and discovery responses are never
+admission evidence. Unary only; streaming rejected with a distinct
+reason.
+
+### 2.4a Registration/projection seam (review-6 §3)
+
+`may_execute` requires the provider's LOCAL fold to carry the
+service's capability tag, and today the local self-announcement
+feeds both the self-fold and the peer broadcast. Private services
+therefore need an explicit seam:
 
 ```rust
-OrgFloorSyncRequest {
-    org_id:           OrgId,
-    requester_cert:   OrgMembershipCert,
-    nonce:            u64,
-    expires_at:       u64,
-    member_signature: Signature64,
+RegisteredCapability {
+    descriptor: CapabilityDescriptor,
+    visibility: CapabilityVisibility,
+    admission:  OrgAdmission,
 }
-// transcript: "net-org-floor-sync-v1" ‖ org_id
-//   ‖ requester EntityId ‖ responding peer NodeId
-//   ‖ nonce ‖ expires_at
 ```
 
-Responder verifies, in order: `org_id` locally tracked;
-`requester_cert.org_id == org_id`; `requester_cert.member` == the
-authenticated session EntityId; the cert valid under the
-responder's CURRENT local floor; freshness (`expires_at`, nonce)
-and signature; the tracked org's `FloorSyncPolicy` admits the
-requester. v1 `OwnerMembersOnly`: only valid current members of
-that same organization receive pages — floor synchronization no
-longer discloses membership identities or revocation events to
-outsiders (T-floor-15/16/17).
+- The local registry/self-fold ALWAYS receives the capability
+  (with empty v0.4 allow-lists), so the exact service is locally
+  registered/capable.
+- **Gate selection is policy-directed (review-7).** The legacy
+  `may_execute` aggregates allow-lists TARGET-WIDE: it unions
+  `allowed_nodes/subnets/groups` from EVERY capability entry the
+  target carries, so an unrelated restricted capability (e.g. an
+  admin service with a tight `allowed_nodes`) on the same provider
+  would block a protected service's callers before `OrgAdmission`
+  ever ran. Therefore the callee resolves the registered
+  `OrgAdmission` FIRST and only then picks the gate:
 
-Page shape (Q12 — 256/page was impossible: ~140 B/record × 256 ≈
-35,840 B against the 8,192 B packet ceiling):
+  ```rust
+  match registered.admission {
+      OrgAdmission::PublicAuthenticated => {
+          // Preserve existing v0.4 behavior exactly.
+          require(may_execute(fold, self_id, tag, caller));
+      }
+      OrgAdmission::OwnerDelegated | OrgAdmission::CrossOrgGranted => {
+          // Exact service must be locally registered/capable, but
+          // the unrelated v0.4 allow-list union is NOT authority.
+          require(has_local_capability(fold, self_id, tag));
+          verify_org_admission(...)?;
+      }
+  }
+
+  /// Narrow helper in capability_bridge: does this target carry
+  /// this exact tag? Evaluates NO legacy allow-lists.
+  pub fn has_local_capability(fold, target, capability_tag) -> bool;
+  ```
+
+  `may_execute` itself stays byte-for-byte untouched for existing
+  public/v0.4 services; protected services simply never route
+  authority through it. **`OrgAdmission` is the load-bearing
+  authority** (red-witnessed without depending on the legacy gate
+  returning any particular value).
+- Emission projects by visibility: `Public` → plaintext CAP-ANN;
+  `OwnerScoped` → plaintext scoped form excluded from unscoped
+  query projection; `GrantedAudience` → encrypted envelope only.
+  A `GrantedAudience` descriptor never appears in plaintext
+  broadcast bytes (witnessed).
+
+**Migration implication, explicit:** an OLD provider with a
+permissive local entry would serve any authenticated caller.
+Therefore per protected service the order is: upgrade provider
+code → enable org admission at registration → only then
+emit/enable the protected service. Step 5 of §Migration enforces
+this.
+
+### 2.5 Replay guard — as v1.1
+
+`(caller, call_id)` → `{binding_digest, expires_at}`; atomic
+insert-or-deny before handler; replay vs collision reasons;
+retention to proof expiry on a monotonic clock; unexpired keys
+never evicted; `AdmissionReplayConfig` ceilings, deny+metric on
+exhaustion, constants frozen after measurement; volatile guard,
+cross-restart idempotency is the application's.
+
+### 2.6 OA-2 exit gate
+
+As v1.1 (golden vectors — grants now with commitments; grant
+matrices incl. the structural DISCOVER⇔binding rule at issue and
+decode; binding transplant matrix; replay witnesses; header
+discipline; streaming rejection; reason mapping) PLUS:
+
+```
+call proof / header bytes contain no discovery_key   → witnessed
+  (byte-scan of the encoded header against the known key, plus a
+   type-level assertion that OrgAudienceSecret is not a member of
+   any wire object)
+key_commitment mismatch with installed secret        → credential
+                                                        rejected
+                                                        locally
+```
+
+Stop. Review.
+
+---
+
+## OA-3 — grant-scoped private discovery (stop and review)
+
+### 3.1 `ScopedCapabilityAnnouncement` — as v1.1, per-grant audiences
+
+Envelope as v1.1 (provider, owner_org, owner_cert,
+audience_handle, grant_id, generation, expires_at, 24-byte nonce,
+bounded ciphertext, outer signature by P under
+`"net-org-scoped-ann-v1"`). AEAD XChaCha20-Poly1305 under the
+per-grant `discovery_key`; associated data = `(provider ‖
+owner_org ‖ audience_handle ‖ grant_id ‖ generation ‖ expires_at)`.
+For the owner audience (below), `grant_id` is the fixed
+all-zero sentinel — committed in the golden vectors — so owner and
+granted envelopes can never be confused under one AD.
+**Consequently `[0u8; 32]` is a RESERVED grant id:** ordinary
+`OrgCapabilityGrant` issuance AND decode reject it (pinned in the
+grant matrix).
+
+Size bounds (review-6 Q1 — dual, no silent trimming):
 
 ```rust
-/// Provisional; frozen only after a worst-case encoded fixture.
-/// 32 × ~140 B ≈ 4,480 B before framing — fits with headroom.
-pub const MAX_FLOOR_SYNC_RECORDS_PER_PAGE: usize = 32;
-pub const MAX_FLOOR_SYNC_PAGE_BYTES: usize =
-    MAX_PACKET_SIZE - frame_overhead - transport_headroom;
-
-OrgFloorSyncPage {
-    records: Vec<OrgMembershipFloor>,   // both bounds enforced at
-                                        // decoder BEFORE allocation
-                                        // and at builder
-    /// Last key of this page under lexicographic
-    /// (org_id, member) ordering; None on the final page.
-    cursor: Option<MembershipFloorKey>,
-    /// Final-page marker + snapshot digest/version so one sync run
-    /// can prove completeness; records added mid-paging also arrive
-    /// via live announce / periodic anti-entropy (state is
-    /// monotone, so overlap is harmless).
-    complete: Option<FloorSnapshotDigest>,
-}
+MAX_SCOPED_ANN_CIPHERTEXT_BYTES: usize;   // plaintext-side cap
+MAX_SCOPED_ANN_ENCODED_BYTES:    usize =  // whole-envelope cap
+    8192 − transport/event framing − outer fields − signature
+         − AEAD tag − safety headroom;
+// builder AND decoder enforce both; oversized descriptors return
+ScopedAnnouncementError::DescriptorTooLarge { encoded, maximum }
+// — never trimmed: trimming changes capability semantics.
 ```
 
-### 1.7 Storage — dedicated WAL + snapshot owned by `org_floor.rs`
-(Q11 answered)
+### 3.2 Propagation — as v1.1
 
-Not Mikoshi/datafort machinery — authority state is tiny and
-specialized; the guarantees are clearer in a dedicated store.
+Own broadcast id from the subprotocol registry; CAP-ANN hop-cap +
+dedup discipline, dedup key `(provider, grant_id, audience_handle,
+generation)` — the wire identity carries the actual audience scope
+even though handles are unique by rule, so a handle collision
+(accidental or malicious) cannot let one envelope suppress another
+before ingest validation; v1 floods opaque envelopes (observers learn
+existence, provider, owner, random handle, size — nothing
+matchable); selective forwarding by handle is a later fanout
+optimization.
 
-Commit path: `append canonical signed record → fsync log → update
-in-memory maximum`. Compaction: `write canonical maxima to temp
-snapshot → fsync snapshot → atomic rename → fsync parent directory
-→ rotate/truncate log`.
+### 3.3 Audience authority — owner vs granted (review-6 §2 fix)
 
-Recovery rules (locked): incomplete tail record → truncate safely;
-invalid checksum/signature in the committed region → LOUD
-corruption failure — never silently skip and continue with weaker
-floors; single-writer lock enforced; snapshot and log carry format
-version + domain; recovery replay passes through the same monotone
-merge; untrusted frame sizes checked before allocation. Acceptance
-bar: the crash-injection harness (commit-path and compaction-path
-fault points).
-
-All v0.4 floor semantics stand: write-through before admission
-visibility; unhealthy-store fail-closed; indefinite retention;
-carrier-independent inner authority; thirteen witnesses — now
-nineteen (§Tests).
-
----
-
-## What ships — Phase 2: capability-specific delegated admission
-
-### 2.1–2.3 — as v0.4, unchanged
-
-(`CapabilityAuthorityId`; `OrgDelegation` sibling type with
-reserved-unenforced generation; provider-local per-capability
-`CapabilityPolicy` with dual bounds, measured fixture, fail-closed
-`Extension`.)
-
-### 2.4 `AdmissionProof` — explicit timestamp semantics (Q13)
-
-Field renamed for unit-explicitness in a signed transcript:
+The v1.1 "internal capabilities use the owner audience" claim
+contradicted the grant-dependent ingest path (no grant, no
+grant_id, nothing for step 2 to verify). Explicit split:
 
 ```rust
-AdmissionProof {
-    membership_cert:           OrgMembershipCert,
-    delegation_chain:          Vec<OrgDelegation>,
-    /// Unix NANOSECONDS (matches nRPC's deadline_ns convention).
-    proof_expires_at_unix_ns:  u64,
-    call_binding_sig:          [u8; 64],
+enum AudienceAuthority {
+    Owner   { owner_org: OrgId, audience_handle: [u8; 32],
+              discovery_key: [u8; 32] },          // scaffolded
+    Granted { grant: OrgCapabilityGrant,          // signed authz
+              secret: OrgAudienceSecret },        // local material
+}
+
+enum CapabilityAudienceScope {                    // fold partition
+    Public,
+    Owner { org_id: OrgId,     audience_handle: [u8; 32] },
+    Grant { grant_id: [u8;32], audience_handle: [u8; 32] },
 }
 ```
 
-Caller-side selection rule (the proof-provider hook's default):
+**Owner ingest** (internal private capabilities): local node's
+owner == envelope `owner_org`; local owner audience handle
+matches; owner key decrypts (AD with the zero grant_id sentinel);
+provider's `owner_cert` proves P ∈ same org (incl. floors);
+generation/expiry valid → fold entry under
+`Owner { org_id, handle }`. The owner audience credential grants
+ONLY knowledge — internal invocation still requires
+`OwnerDelegated`.
 
-```
-if rpc.deadline_ns == 0:
-    proof_expires_at_unix_ns = now + default_proof_ttl   // 30 s
-                                                         // provisional
-else:
-    proof_expires_at_unix_ns = min(rpc.deadline_ns,
-                                   now + default_proof_ttl)
-// and, where practical:
-proof_expires_at_unix_ns <= effective chain not_after
-// (a proof should not claim admission life beyond its own
-//  delegation's validity)
-```
+**Granted ingest** (cross-org): handle matches an installed
+grant+secret pair; `key_commitment` matches the secret; B signed
+the grant; grant names A (local owner); grant ⊇ DISCOVER; S's own
+membership currently valid; P's outer signature; P's `owner_cert`
+proves P ∈ grant.issuer_org; generation/expiry → fold entry under
+`Grant { grant_id, handle }`.
 
-30 s stays provisional until Phase-2 latency/RPS measurement. The
-provider-advertised maximum is caller guidance only; the callee's
-local `AdmissionReplayConfig` remains authoritative. Callee checks
-and the `"net-org-call-v3"` transcript binding are as v0.4 (the
-transcript field is the renamed ns value; golden vectors name the
-unit).
+Both scopes are mutually invisible and invisible to unscoped
+queries. Query surface: `find_capabilities_for_grant(grant_id,
+predicate)` and `find_owner_private_capabilities(predicate)`.
 
-**Clock discipline (locked):** expiry is VERIFIED against
-wall-clock protocol time (with skew allowance); replay-map
-retention is then derived onto a monotonic local `Instant`, so a
-local wall-clock rollback cannot evict a key prematurely.
+### 3.4 Rotation — as v1.1, plus owner-audience procedure (Q4)
 
-### 2.5–2.6 — as v0.4, unchanged
+Granted: per-grant expiry → new grant mints fresh handle+key; a
+former grantee keeps cached knowledge (stated) but cannot decrypt
+new envelopes, invoke after expiry, or bypass admission. Owner:
+config-management rotation of `owner-audience.key` — install new
+credential → providers briefly dual-publish old+new envelopes →
+consumers accept both → retire old after announcement TTL. An
+operational tooling concern, not a mesh key-epoch protocol.
 
-(Callee gate order; unary-only scope with distinct streaming
-rejection; `(caller, call_id)` replay identity with
-replay/collision denial; never-evict-unexpired; capacity
-deny+metric; volatile-guard residual with idempotency guidance.)
+### 3.5 OA-3 exit gate
 
-### 2.7 Scope statement — foreign access (wording corrected)
-
-v1 `OwnerDelegation` semantics, stated plainly:
-
-```
-valid owner member
-+ valid owner-rooted dispatcher delegation
-→ may request invocation
-```
-
-Every `AdmissionProof` carries a mandatory owner membership
-certificate; a foreign actor without owner membership cannot use
-v1 `OwnerDelegation`. That is intended for this plan's
-internal-organization objective. Everywhere earlier revisions said
-"foreign access = grants," read:
-
-```
-foreign access = FUTURE explicit grants;
-not implemented by v1 OwnerDelegation
-```
-
-When foreign invocation ships, it is a separate policy/proof arm
-(under the reserved `Extension` discriminant or a new reviewed
-variant) in which delegation authenticates the foreign subject
-WITHOUT issuing it a false ownership membership certificate.
-`membership_cert` is not made optional globally; the internal
-default is not weakened.
+As v1.1 (golden vectors incl. the zero-sentinel owner AD;
+AD-transplant matrix; generation/expiry/dedup; scoped-fold
+isolation — Owner↔Grant↔Public all mutually invisible;
+owner-audience internal case) PLUS: dual size bounds enforced at
+builder and decoder with the typed error; INVOKE-only grant holds
+no audience material by construction (structural rule) and cannot
+ingest; expired-grant holder cannot decrypt a NEW audience's
+envelopes (per-grant key independence witnessed). Stop. Review.
 
 ---
 
-## What ships — Phase 3: owner-scoped discovery
+## OA-4 — end-to-end witnesses (then STOP)
 
-As v0.4 in full (three visibility modes; epoch-keyed locators with
-two-key overlap and the retirement inequality; locator trust
-binding; `DiscoveryAuthority` v2 with epoch; `CapabilityDetailBody`
-wire enum with inline bound; plaintext-interest boundary settled by
-the sensing amendment — recommended option (2), option (1) iff
-proven, option (3) as documented interim). Review-4 approved the
-architecture; implementation remains gated on that amendment. One
-alignment: the amendment's owner-scoped registration/serving paths
-adopt the same tracked-org principle — a leader/provider serves
-owner-domain state only for orgs it is provisioned to serve, never
-because a frame named one.
+Nodes: dispatcher **S** ∈ A; providers **P₁** ∈ A, **P₂** ∈ B;
+unrelated **X**; org **C** as wrong-grantee foil.
 
----
+**Internal (P₁, `OwnerDelegated`)** — as v1.1: valid dispatcher
+grant accepted; membership-only denied; copied proof denied; wrong
+target/capability/body/expiry/replay denied; floored-after-reload
+denied; public capabilities unchanged; `may_execute` pinned
+unchanged. Plus the restart witness chain from OA-1 run end-to-end
+(floor 5 → old bundle 3 → restart → S with generation 4 cert still
+denied).
 
-## What this plan deliberately does NOT include
+**Cross-org invocation (P₂, `CrossOrgGranted`)** — as v1.1: the
+full accept + eleven-denial matrix; `AnyNodeOwnedBy(B)` reuse
+accepted against a second B-owned node, denied against a non-B
+node; four-party audit attribution asserted.
 
-As v0.4 (no ACL engine; no multi-org ownership; no enrollment
-protocol; no caches before measurement; no parity in this plan; no
-delegation floors; no cross-restart exactly-once; no streaming org
-admission; no floor GC/org retirement; no compact anti-entropy
-summaries), plus newly explicit:
+**Private discovery (`GrantedAudience` on P₂)** — as v1.1
+(Kyra's matrix verbatim: absent from global CAP-ANN; no grant ⇒ no
+enumeration; DISCOVER-only resolves but cannot invoke; INVOKE-only
+cannot ingest; DISCOVER|INVOKE resolves and calls exact P₂; copied
+grant by C, wrong dispatcher, wrong provider owner, wrong
+handle/capability, stale registration, decrypt-without-invoke all
+denied/ignored; provider policy final) plus observer-recovers-
+nothing, AD-transplant, and post-rotation decryption failure.
 
-- **No foreign-org invocation in v1** (§2.7) — future explicit
-  grant arm, separately reviewed.
-- **No network auto-enrollment of tracked orgs** — tracking is
-  local provisioning, only (§1.5); `ExplicitRelyingParties` is
-  reserved shape, not shipped behavior.
+**Seam red witnesses (review-7 matrix — robust to target-wide
+allow-list aggregation):**
 
----
+```
+P registers protected capability C:
+    OrgAdmission::CrossOrgGranted, empty legacy allow-lists
+P also registers unrelated capability D:
+    legacy allow-list EXCLUDES caller S
 
-## Risks
+may_execute(P, C, S) may be false (target-wide aggregation pulls
+    in D's restrictions) — witnessed, not assumed either way
+has_local_capability(P, C) is true
+valid org proof for C → ACCEPTED through the OrgAdmission path
+    (D's restrictions cannot block C)
+invalid org proof for C → denied
+missing local C tag + otherwise-valid proof → denied as
+    unregistered
+public capability D → still governed by unchanged may_execute
+    behavior
 
-1–3 as v0.4. 4. floor propagation lag — unchanged, witnessed.
-5. **Floor-store durability** — now concretely the §1.7 WAL
-   contract; crash-injection harness is the acceptance bar.
-6. **Replay-guard memory** — unchanged (proof-lifetime exact,
-   ceilings, deny+metric).
-7. root-key ceremony — unchanged (inject-floor is carrier-side
-   only; the root never automates).
-8. size coupling — unchanged, now also covering floor sync pages
-   (dual bounds + fixture).
-9. discovery-key/epoch handling — unchanged.
-10. denial-surface triage — unchanged.
-11. **Tracked-set misconfiguration** — new: a relying party that
-    forgets to pin a foreign root simply ignores its floors
-    (fail-closed toward not-tracking); the dangerous direction —
-    auto-enrollment — is structurally absent (T-floor-18). Unknown-
-    floor counter metrics are bounded and unlabeled by org to keep
-    the metrics plane from becoming the amplification surface
-    (T-floor-19).
+private service C absent from plaintext broadcast bytes
 
----
+RED: disable verify_org_admission in the protected-service branch
+    (test rig only)
+→ unauthorized C invocation SUCCEEDS
+    — proving OrgAdmission is load-bearing, independent of any
+      legacy-gate verdict
+```
 
-## Phases
-
-### Phase 1 — scaffolded ownership, dark authority facts
-As v0.4 plus: tracked-org ingest boundary, authenticated org-scoped
-sync with bounded pages, `inject-floor` local admin path, dedicated
-WAL/snapshot store per §1.7. Exit: T1–T6 + T-floor(1–19) green
-incl. crash injection; bench recorded; adopt-path loud failure
-demonstrated.
-
-### Phase 2 — capability-specific delegated admission (unary)
-As v0.4 plus: unit-explicit proof timestamp + selection rule,
-monotonic retention clocks, foreign-access scope statement.
-Emission stays dark until deployable fleet-wide.
-
-### Phase 3 — owner-scoped discovery
-Unchanged from v0.4; gated on the sensing amendment (which now also
-carries the tracked-org alignment note).
-
----
-
-## Test plan
-
-T1–T5, T7–T18 as v0.4 (with golden vectors naming
-`proof_expires_at_unix_ns` and covering floor-sync
-request/page/digest forms; T8/T9 use the renamed field; T-floor
-1–13 unchanged). T6 as v0.4. New floor witnesses (review-4,
-verbatim):
-
-- **T-floor-14** — a peer mints many self-signed unknown
-  organizations and floods valid-signature floors → no durable
-  rows, no rebroadcast, store size unchanged.
-- **T-floor-15** — unauthenticated / foreign sync request → no
-  floor pages returned.
-- **T-floor-16** — valid owner-member sync request → bounded pages
-  returned (count AND byte limits enforced at decoder before
-  allocation; fixture-verified worst case).
-- **T-floor-17** — requester whose membership is below the current
-  floor → sync refused.
-- **T-floor-18** — a trusted root must be locally provisioned;
-  receiving its signed floor cannot auto-enroll it (record from an
-  untracked-but-later-pinned org is only accepted after local
-  pinning, via re-announce/sync — never retroactively from cache).
-- **T-floor-19** — no unknown-org identifier becomes a persistent
-  or high-cardinality metrics label; the unknown-floor counter is
-  bounded.
-
-Plus, from §2.4's clock discipline: a wall-clock rollback on the
-callee does not evict unexpired replay keys (added to T9).
+Then STOP. No further org work without a named consumer or
+measured failure.
 
 ---
 
 ## Migration
 
-As v0.4, with tracked-set provisioning folded into step 2 (adopt
-writes `TrackedOrgAuthority { owner_org, OwnerMembersOnly }`
-alongside `NodeAuthorityConfig`) and floor-store WAL paths
-provisioned/health-checked at the same step. No other changes.
+1. Upgrade every participant; emission of all new signed
+   fields/objects OFF (old readers reject nonempty new signed
+   announcement fields; old forwarders strip-then-break; all
+   fail-closed; upgrade-all-then-emit mandatory).
+2. Provision ownership (`net node adopt`): membership, owner
+   audience credential, and the persisted revocation-state file —
+   three separately versioned files.
+3. Enable `owner_cert` emission fleet-wide.
+4. Issue dispatcher grants; wire caller proof plumbing; distribute
+   `OrgAudienceSecret` files out of band alongside their grants.
+5. **Per protected service:** upgrade provider code → register with
+   `OrgAdmission` enabled → only then emit/enable the service
+   (an old provider's permissive local entry would otherwise serve
+   any authenticated caller — the §2.4a implication).
+6. Flip private capabilities to `GrantedAudience` (plaintext
+   CAP-ANN presence stops at the same moment — OA-4 absence
+   witness); rotate owner audience via config management as needed.
+
+No data migration; fold state rebuilds; bundles, audience
+credentials, and revocation maxima are plain local files.
+
+---
+
+## Deliberately NOT in v1
+
+As v1.1 (floor replication/WAL/sync/anti-entropy → deferred plan;
+live private sensing → deferred plan; resolver nodes and
+request/response discovery objects; deterministic locators;
+org-wide discovery keys; key epochs; delegation chains;
+`OrgMembership` invocation mode; advertised policy vectors;
+extension bodies; foreign co-ownership REJECTED; streaming
+admission; caches before benchmarks; language parity; any change
+to `PermissionToken` or `may_execute`; selective forwarding by
+handle) plus, newly explicit:
+
+- **No audience sharing across grants** — disclosure groups are a
+  future explicit feature with their own review; v1 is structurally
+  one-secret-per-DISCOVER-grant.
+- **No raw key material in any wire object** — enforced
+  structurally (review-7): `OrgAudienceSecret` and
+  `AudienceAuthority::Owner` do NOT derive `Serialize` /
+  `Deserialize` / any postcard wire trait; config-file encoding,
+  where needed, is a separate explicit codec; wire objects carry
+  only `GrantedDiscoveryBinding` and its commitment. The type-level
+  witness covers both granted and owner secret types.
 
 ---
 
 ## Locked design points
 
-1–3 as v0.4 (OrgId IS the key; singular scaffolded ownership;
-membership never enters `may_execute`).
-4. Revocation floor store as v0.4 (dedicated, write-through,
-   indefinite, carrier-independent) **plus the authority boundary:
-   floors are ingested, stored, served, and rebroadcast only for
-   locally provisioned tracked orgs; network receipt never enrolls;
-   sync is org-scoped and member-authenticated under
-   `OwnerMembersOnly` in v1; storage is the §1.7 dedicated
-   WAL+snapshot with loud-corruption recovery.**
-5–8 as v0.4.
-9. Replay guard as v0.4, **plus explicit clock discipline:
-   wall-clock verification, monotonic retention.** Proof expiry is
-   unit-explicit (`_unix_ns`) inside the signed transcript, with
-   the deadline-less selection rule and chain-window cap stated.
-10–13 as v0.4 (visibility modes; sensing proofs + amendment gate;
-    no cache/constants before measurement; unary-only admission).
-14. **Foreign access is future explicit grants** — v1
-    `OwnerDelegation` is owner-member + owner-rooted delegation by
-    construction; no global optional `membership_cert`; the
-    internal default is never weakened to accommodate a feature
-    that isn't shipping.
+1. `OrgId` IS the org key; no registry.
+2. Ownership singular + scaffolded; loud failure; cross-org access
+   is a B→A grant, never co-membership.
+3. Membership never enters `may_execute`; decryption never
+   authorizes; fold state is never admission evidence; **the
+   OrgAdmission gate is load-bearing and the legacy permissive
+   self-entry is only a pass-through seam — red-witnessed.**
+4. Grants are fixed one-hop, org-root-signed; DISCOVER and INVOKE
+   independent; `rights ⊇ DISCOVER ⇔ discovery binding present`;
+   one DISCOVER grant = one audience secret; the signed grant
+   carries a key COMMITMENT and the raw key never rides the wire;
+   grant renewal is grant revocation in v1.
+5. Membership revocation is the local monotone bundle whose merged
+   maxima are atomically persisted BEFORE the live view updates —
+   "lower bundle never rolls back" holds across restart; corrupt
+   incoming bundle → last-good; corrupt persisted maxima → loud
+   startup failure.
+6. Admission per-service, provider-local, bound at registration,
+   always last; three modes only.
+7. Call binding as specified; exactly one admission header or
+   deny.
+8. Replay identity (caller, call_id); unexpired keys never evict;
+   volatile by contract.
+9. Unary only; streaming rejected distinctly.
+10. Private discovery is a visibility mode of the one announcement
+    substrate; audience authority is explicitly Owner or Granted
+    with mutually invisible fold scopes; owner-audience envelopes
+    use the zero grant_id sentinel in AD; per-grant audiences make
+    rotation surgical; `OwnerScoped` plaintext is labeled fanout
+    control, not confidentiality.
+11. Audit identity is the full four-party attribution.
+12. Wire evolution honest; unit-explicit timestamps; dual size
+    bounds with typed errors, never silent trimming; constants
+    freeze only after measurement.
 
 ---
 
-## Open questions (v0.5)
+## Open questions
 
-- **Q14 — `FloorSnapshotDigest` shape.** Digest over the sorted
-  canonical maxima + store format version (proposal:
-  blake3-of-concatenated-records + u32 version); confirm at
-  Phase-1 implementation review alongside the paging fixture.
-- **Q15 — unknown-floor counter surfacing.** Single bounded counter
-  vs a small fixed histogram (by frame size class) for the dropped
-  unknown-org floors — observability wants some signal for abuse
-  detection without per-org labels; pick at Phase-1 review.
-
-Everything else previously open is answered: Q11 (§1.7 WAL),
-Q12 (§1.6 bounds), Q13 (§2.4 rule + units).
+- **Q1 — encoded-bounds fixture.** Concrete values for the two
+  scoped-envelope bounds from a worst-case encoded fixture
+  (realistic `CapabilitySet` fragment + envelope overhead) at OA-3
+  review.
+- **Q2 — `OrgAudienceSecret` at-rest protection.** Plain file
+  0600 under the config dir (matching existing key-material
+  handling in the repo) vs OS keychain integration — follow
+  whatever `EntityKeypair` storage does today; confirm at OA-2
+  review.
+- **Q3 — `default_proof_ttl`.** 30 s provisional; freeze after
+  OA-2 measurement; callee `AdmissionReplayConfig` authoritative.
