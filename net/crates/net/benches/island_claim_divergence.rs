@@ -40,9 +40,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bench_island_claim::*;
-use net::adapter::net::behavior::fold::{Fold, ReservationFold};
+use net::adapter::net::behavior::fold::{Fold, FoldChannelRouter, ReservationFold};
 use net::adapter::net::behavior::gang::ClaimOutcome;
-use net::adapter::net::MeshNode;
+use net::adapter::net::{EntityKeypair, MeshNode};
 
 /// Claimant fleet sizes (N). The full mesh has N+1 nodes (+ observer).
 const CLAIMANT_SIZES: &[usize] = &[2, 4, 8, 16];
@@ -71,8 +71,10 @@ fn main() {
         println!("-- witnesses --");
         w8_opposite_arrival_opposite_holder();
         w9_persistent_disagreement_is_censored();
-        w10_censored_never_enters_latency();
+        w10_censored_agreement_adds_no_duration();
         w11_coincidental_agreement_is_incidence();
+        w13_wrong_publisher_same_cardinality();
+        w14_mixed_shapes_not_collapsed();
         w2_delivery_and_divergence().await; // covers W1..4, W6, W7
         w5_missing_delivery_invalidates().await;
         w12_raw_chain_cannot_enter_matrix().await;
@@ -124,13 +126,39 @@ fn holder_stats(claimant_holders: &[Option<u64>], obs: Option<u64>) -> (usize, u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Classification {
     /// All nodes already agree at the complete-delivery barrier (may be
-    /// coincidental arrival-order agreement — NOT a consensus protocol).
+    /// coincidental arrival-order agreement — agreement INCIDENCE, NOT a
+    /// consensus protocol).
     AgreedAtBarrier,
-    /// Views genuinely changed and became identical during W.
-    AgreedDuringWindow,
+    /// Views genuinely changed and became identical during W, at the carried
+    /// time-to-agreement (a completed agreement duration).
+    AgreedDuringWindow(Duration),
     /// Disagreement persisted to the end of W: split-view duration >= W.
-    /// Right-censored — never a completed latency.
+    /// Right-censored — carries NO agreement duration.
     Censored,
+}
+
+/// Why a sample never became a valid divergence observation. Distinct from
+/// right-censored disagreement (which IS a valid observation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidReason {
+    /// A counter never reached its exact target (a dropped foreign claim).
+    DeliveryTimeout,
+    /// A counter exceeded its exact target.
+    CountOvershoot,
+    /// A local claim returned `Lost` instead of the expected optimistic `Won`.
+    ClaimNotWon,
+    /// Exact cardinality reached but with an unexpected publisher set.
+    PublisherMismatch,
+}
+
+/// Record a completed agreement duration ONLY: `AgreedDuringWindow(d)`
+/// contributes one time-to-agreement sample; `AgreedAtBarrier` (incidence,
+/// t≈0) and `Censored` (>= W lower bound) contribute nothing to the
+/// agreement-latency histogram.
+fn record_agreement(agg: &mut LatencyReport, class: Classification) {
+    if let Classification::AgreedDuringWindow(d) = class {
+        agg.record(d.as_nanos() as u64);
+    }
 }
 
 // ============================================================================
@@ -211,9 +239,10 @@ async fn build_topology(n: usize) -> Option<Topology> {
 
 /// One synchronized concurrent-claim round on `island`: every claimant claims
 /// together from a common t0, then we await the complete verified-delivery
-/// barrier (each claimant exactly N-1, observer exactly N) and enforce the
-/// exact publisher sets. Returns the two mechanism timings, or `None` if a
-/// delivery was missing / overshot / a claim did not Win (invalid sample).
+/// endpoint — each claimant reaches EXACTLY N-1 and the observer EXACTLY N AND
+/// each proves the exact expected publisher set, all before capturing
+/// `complete_delivery_dt`. Returns the two mechanism timings (all-APIs-returned,
+/// complete-delivery) or a typed [`InvalidReason`].
 async fn delivery_round_timed(
     observer: &Arc<MeshNode>,
     claimants: &[Arc<MeshNode>],
@@ -221,7 +250,7 @@ async fn delivery_round_timed(
     claimant_counters: &[Arc<CountingRouter>],
     claimant_ids: &[u64],
     island: u64,
-) -> Option<(Duration, Duration)> {
+) -> Result<(Duration, Duration), InvalidReason> {
     let n = claimants.len();
     // Reset counters + confirm the island free everywhere (outside timing).
     observer_counter.reset(island);
@@ -277,22 +306,19 @@ async fn delivery_round_timed(
     for h in dwaits {
         all_delivered &= h.await.expect("delivery wait task");
     }
-    let complete_delivery_dt = t0.elapsed();
-
-    // Join claims: every local claim must optimistically Win.
-    let mut all_apis_dt = Duration::ZERO;
-    let mut all_won = true;
-    for h in claim_handles {
-        let (out, dt) = h.await.expect("claim task");
-        all_won &= matches!(out, ClaimOutcome::Won);
-        all_apis_dt = all_apis_dt.max(dt);
+    if !all_delivered {
+        // Distinguish a dropped foreign claim (short) from an overshoot (long).
+        let overshoot =
+            observer_counter.count() > n || claimant_counters.iter().any(|cc| cc.count() > n - 1);
+        return Err(if overshoot {
+            InvalidReason::CountOvershoot
+        } else {
+            InvalidReason::DeliveryTimeout
+        });
     }
 
-    if !all_delivered || !all_won {
-        return None; // invalid — missing delivery / overshoot / not Won
-    }
-
-    // Exact expected publisher sets (fail-loud).
+    // Exact expected publisher sets — proven BEFORE the endpoint timestamp
+    // (cardinality alone does not complete the combined delivery endpoint).
     for (i, cc) in claimant_counters.iter().enumerate() {
         let expected: HashSet<u64> = claimant_ids
             .iter()
@@ -300,20 +326,32 @@ async fn delivery_round_timed(
             .filter(|(j, _)| *j != i)
             .map(|(_, id)| *id)
             .collect();
-        assert_eq!(
-            cc.seen_publishers(),
-            expected,
-            "claimant {i} must observe EXACTLY the other claimants"
-        );
+        if cc.seen_publishers() != expected {
+            return Err(InvalidReason::PublisherMismatch);
+        }
     }
     let all_ids: HashSet<u64> = claimant_ids.iter().copied().collect();
-    assert_eq!(
-        observer_counter.seen_publishers(),
-        all_ids,
-        "observer must observe EXACTLY all claimants"
-    );
+    if observer_counter.seen_publishers() != all_ids {
+        return Err(InvalidReason::PublisherMismatch);
+    }
+    // Endpoint 2 (complete verified delivery): exact count AND exact publisher
+    // sets both proven — capture only now.
+    let complete_delivery_dt = t0.elapsed();
 
-    Some((all_apis_dt, complete_delivery_dt))
+    // Endpoint 1 (all claim APIs returned) + Won validity. Claims returned
+    // before delivery could complete, so joining them is instant.
+    let mut all_apis_dt = Duration::ZERO;
+    let mut all_won = true;
+    for h in claim_handles {
+        let (out, dt) = h.await.expect("claim task");
+        all_won &= matches!(out, ClaimOutcome::Won);
+        all_apis_dt = all_apis_dt.max(dt);
+    }
+    if !all_won {
+        return Err(InvalidReason::ClaimNotWon);
+    }
+
+    Ok((all_apis_dt, complete_delivery_dt))
 }
 
 /// Preflight variant — a delivery round that just returns success/failure.
@@ -334,26 +372,46 @@ async fn delivery_round(
         island,
     )
     .await
-    .is_some()
+    .is_ok()
 }
 
 // ============================================================================
 // Measurement — one topology row (S samples on fresh islands).
 // ============================================================================
 
+/// Minimum agreement-duration samples before percentiles are credible.
+const AGREEMENT_MIN_SAMPLES: u64 = 30;
+
 #[derive(Default)]
 struct Agg {
-    samples: usize,
-    invalid: usize,
+    samples: usize, // valid divergence observations
+    invalid_delivery_timeout: usize,
+    invalid_overshoot: usize,
+    invalid_not_won: usize,
+    invalid_publisher: usize,
     agreed_barrier: usize,
     agreed_window: usize,
     censored: usize,
     claimant_agree: usize,
     observer_agree: usize,
     all_node_agree: usize,
-    max_distinct_delivery: usize,
-    max_distinct_window: usize,
-    min_largest_cohort: usize,
+    // Holder-shape ranges (min/max) — never a single hidden extremum.
+    distinct_delivery_min: usize,
+    distinct_delivery_max: usize,
+    distinct_window_min: usize,
+    distinct_window_max: usize,
+    cohort_min: usize,
+    cohort_max: usize,
+    uniform_shape: usize, // samples with distinct == N && largest_cohort == 2
+}
+
+impl Agg {
+    fn invalid(&self) -> usize {
+        self.invalid_delivery_timeout
+            + self.invalid_overshoot
+            + self.invalid_not_won
+            + self.invalid_publisher
+    }
 }
 
 async fn measure_topology(n: usize) {
@@ -366,14 +424,18 @@ async fn measure_topology(n: usize) {
 
     let mut all_apis = LatencyReport::new();
     let mut complete_delivery = LatencyReport::new();
+    // Completed time-to-agreement (only AgreedDuringWindow contributes).
+    let mut agreement_dur = LatencyReport::new();
     let mut agg = Agg {
-        min_largest_cohort: usize::MAX,
+        distinct_delivery_min: usize::MAX,
+        distinct_window_min: usize::MAX,
+        cohort_min: usize::MAX,
         ..Default::default()
     };
 
     for s in 0..SAMPLES {
         let island = ISLAND_BASE + s;
-        let timings = delivery_round_timed(
+        let outcome = delivery_round_timed(
             &topo.observer,
             &topo.claimants,
             &topo.observer_counter,
@@ -382,12 +444,21 @@ async fn measure_topology(n: usize) {
             island,
         )
         .await;
-        let Some((apis_dt, deliver_dt)) = timings else {
-            agg.invalid += 1;
-            continue;
+        let (apis_dt, deliver_dt) = match outcome {
+            Ok(v) => v,
+            Err(reason) => {
+                match reason {
+                    InvalidReason::DeliveryTimeout => agg.invalid_delivery_timeout += 1,
+                    InvalidReason::CountOvershoot => agg.invalid_overshoot += 1,
+                    InvalidReason::ClaimNotWon => agg.invalid_not_won += 1,
+                    InvalidReason::PublisherMismatch => agg.invalid_publisher += 1,
+                }
+                continue;
+            }
         };
 
-        // Mechanism boundaries (LatencyReport) — every delivered sample.
+        // Mechanism boundaries (LatencyReport) — every VALID sample, including
+        // ones later right-censored (delivery completed regardless of holders).
         if s >= WARMUP {
             all_apis.record(apis_dt.as_nanos() as u64);
             complete_delivery.record(deliver_dt.as_nanos() as u64);
@@ -405,6 +476,8 @@ async fn measure_topology(n: usize) {
         // Observe the window W for agreement (there is no convergence
         // mechanism, so this is expected to remain divergent).
         let classification = classify_window(&topo, island, &initial, obs_initial).await;
+        // Only a completed during-W agreement contributes a duration sample.
+        record_agreement(&mut agreement_dur, classification);
 
         let final_c: Vec<Option<u64>> = topo
             .claimants
@@ -414,26 +487,29 @@ async fn measure_topology(n: usize) {
         let obs_final = holder_of(topo.observer.reservation_fold(), island);
         let (distinct1, _) = holder_stats(&final_c, obs_final);
 
-        // Aggregate the architecture outcomes (DivergenceReport).
+        // Aggregate the architecture outcomes — RANGES, never a hidden extremum.
         agg.samples += 1;
-        agg.max_distinct_delivery = agg.max_distinct_delivery.max(distinct0);
-        agg.max_distinct_window = agg.max_distinct_window.max(distinct1);
-        agg.min_largest_cohort = agg.min_largest_cohort.min(cohort0);
-        let claimant_common = common_holder(&initial, initial.first().copied().flatten());
-        if claimant_common.is_some() {
+        agg.distinct_delivery_min = agg.distinct_delivery_min.min(distinct0);
+        agg.distinct_delivery_max = agg.distinct_delivery_max.max(distinct0);
+        agg.distinct_window_min = agg.distinct_window_min.min(distinct1);
+        agg.distinct_window_max = agg.distinct_window_max.max(distinct1);
+        agg.cohort_min = agg.cohort_min.min(cohort0);
+        agg.cohort_max = agg.cohort_max.max(cohort0);
+        if distinct0 == n && cohort0 == 2 {
+            agg.uniform_shape += 1;
+        }
+        if common_holder(&initial, initial.first().copied().flatten()).is_some() {
             agg.claimant_agree += 1;
         }
-        if let Some(h) = common_holder(&initial, obs_initial) {
+        if common_holder(&initial, obs_initial).is_some() {
             agg.all_node_agree += 1;
-            let _ = h;
         }
-        // Observer agrees with the claimant-majority holder.
         if observer_agrees_with_majority(&initial, obs_initial) {
             agg.observer_agree += 1;
         }
         match classification {
             Classification::AgreedAtBarrier => agg.agreed_barrier += 1,
-            Classification::AgreedDuringWindow => agg.agreed_window += 1,
+            Classification::AgreedDuringWindow(_) => agg.agreed_window += 1,
             Classification::Censored => agg.censored += 1,
         }
     }
@@ -446,21 +522,19 @@ async fn measure_topology(n: usize) {
         "ICB-3 N={n} · complete verified-delivery barrier (mechanism)"
     ));
 
-    // Architecture outcomes (incidence + censoring; no latency percentiles).
+    // Architecture outcomes (incidence + ranges; no latency percentiles).
     let denom = agg.samples.max(1) as f64;
+    let invalid = agg.invalid();
+    let zero_if_unset = |v: usize| if v == usize::MAX { 0 } else { v };
     let report = DivergenceReport {
         label: format!("N={n} claimants (+1 observer)"),
         claimants: n,
         logical_sessions: logical_sessions(n + 1),
         observation_window: WINDOW,
         optimistic_local_won: n, // per sample — N/N
-        distinct_holders_at_delivery: agg.max_distinct_delivery,
-        distinct_holders_at_window_end: agg.max_distinct_window,
-        largest_agreement_cohort: if agg.min_largest_cohort == usize::MAX {
-            0
-        } else {
-            agg.min_largest_cohort
-        },
+        distinct_holders_at_delivery: agg.distinct_delivery_max,
+        distinct_holders_at_window_end: agg.distinct_window_max,
+        largest_agreement_cohort: agg.cohort_max,
         claimant_self_belief: n,     // each claimant holds itself locally
         foreign_rejected: n * n - 1, // (N-1) per claimant + (N-1) at observer
         claimant_holder_agreement: agg.claimant_agree as f64 / denom,
@@ -468,20 +542,49 @@ async fn measure_topology(n: usize) {
         all_node_agreement: agg.all_node_agree as f64 / denom,
         samples_agreed: agg.agreed_barrier + agg.agreed_window,
         samples_right_censored: agg.censored,
-        timeouts: agg.invalid,
+        invalid_samples: invalid,
     };
     report.print();
+    // Holder-shape RANGES + uniform-shape incidence — proves the every-sample
+    // claim (a lone extreme sample cannot masquerade as the singular value).
     println!(
-        "   agreed@barrier={} agreed@window={} right_censored={} (fraction={:.2}) invalid={} · optimistic_local_won={}/{} per sample · complete_deliveries={}·(N-1)+1·N",
+        "   holder_shape: distinct@delivery[min={} max={}] distinct@end-W[min={} max={}] largest_cohort[min={} max={}] · uniform(distinct=N,cohort=2)={}/{}",
+        zero_if_unset(agg.distinct_delivery_min),
+        agg.distinct_delivery_max,
+        zero_if_unset(agg.distinct_window_min),
+        agg.distinct_window_max,
+        zero_if_unset(agg.cohort_min),
+        agg.cohort_max,
+        agg.uniform_shape,
+        agg.samples,
+    );
+    // Invalid-sample reason breakdown (NOT timeouts; disagreement is NEVER invalid).
+    println!(
+        "   invalid_samples={invalid}: delivery_timeout={} overshoot={} claim_not_won={} publisher_mismatch={} · (persistent disagreement is right-censored, never invalid)",
+        agg.invalid_delivery_timeout,
+        agg.invalid_overshoot,
+        agg.invalid_not_won,
+        agg.invalid_publisher,
+    );
+    // Agreement incidence + completed time-to-agreement (percentiles only if credible).
+    print!(
+        "   agreed@barrier={} agreed@window={} right_censored={} (censored_fraction={:.2}) · optimistic_local_won={n}/{n} per sample · time_to_agreement(during-W): samples={}",
         agg.agreed_barrier,
         agg.agreed_window,
         agg.censored,
         agg.censored as f64 / denom,
-        agg.invalid,
-        n,
-        n,
-        n,
+        agreement_dur.samples(),
     );
+    if agreement_dur.samples() >= AGREEMENT_MIN_SAMPLES {
+        println!(
+            " p50={:.2}us p95={:.2}us p99={:.2}us",
+            agreement_dur.quantile_us(0.50),
+            agreement_dur.quantile_us(0.95),
+            agreement_dur.quantile_us(0.99),
+        );
+    } else {
+        println!(" (percentiles suppressed below {AGREEMENT_MIN_SAMPLES})");
+    }
     println!();
 }
 
@@ -507,7 +610,7 @@ async fn classify_window(
             .collect();
         let obs_cur = holder_of(topo.observer.reservation_fold(), island);
         if common_holder(&cur, obs_cur).is_some() {
-            return Classification::AgreedDuringWindow;
+            return Classification::AgreedDuringWindow(start.elapsed());
         }
         tokio::time::sleep(WINDOW_POLL).await;
     }
@@ -564,17 +667,36 @@ fn w9_persistent_disagreement_is_censored() {
     println!("  [PASS] W9 persistent disagreement → Censored (>= W), not a timeout/latency");
 }
 
-/// W10 — a right-censored sample never enters a latency histogram: the
-/// mechanism `LatencyReport`s only ever record the two mechanism durations,
-/// and `Classification::Censored` carries no duration to record.
-fn w10_censored_never_enters_latency() {
-    // Structural: Censored is a unit variant with no Duration payload, so it
-    // cannot be fed to LatencyReport::record. A fresh LatencyReport stays empty
-    // when a sample is censored.
-    let report = LatencyReport::new();
-    assert_eq!(report.samples(), 0);
-    assert!(matches!(Classification::Censored, Classification::Censored));
-    println!("  [PASS] W10 right-censored samples carry no latency (never enter a histogram)");
+/// W10 — a CENSORED AGREEMENT duration never enters the agreement-latency
+/// histogram, while the completed API and delivery MECHANISM boundaries remain
+/// independently reportable. Passing one completed agreement and one censored
+/// result through the actual `record_agreement` aggregator yields exactly one
+/// agreement-duration sample.
+fn w10_censored_agreement_adds_no_duration() {
+    let mut agreement = LatencyReport::new();
+    record_agreement(
+        &mut agreement,
+        Classification::AgreedDuringWindow(Duration::from_millis(3)),
+    );
+    record_agreement(&mut agreement, Classification::Censored);
+    record_agreement(&mut agreement, Classification::AgreedAtBarrier);
+    assert_eq!(
+        agreement.samples(),
+        1,
+        "only a completed during-W agreement contributes an agreement-duration sample"
+    );
+    // The completed mechanism boundaries are a SEPARATE report — a censored
+    // sample still records its all-APIs / complete-delivery durations there.
+    let mut mechanism = LatencyReport::new();
+    mechanism.record(42);
+    assert_eq!(
+        mechanism.samples(),
+        1,
+        "completed mechanisms remain reportable"
+    );
+    println!(
+        "  [PASS] W10 censored agreement adds no agreement-duration sample; mechanisms stay reportable"
+    );
 }
 
 /// W11 — a coincidentally-common holder is `AgreedAtBarrier` (agreement
@@ -641,12 +763,48 @@ async fn w5_missing_delivery_invalidates() {
     let counters = vec![cc0, cc1];
     let ids = vec![c0.node_id(), c1.node_id()];
     let island = 0x3C05u64;
-    let timings = delivery_round_timed(&observer, &claimants, &oc, &counters, &ids, island).await;
+    let outcome = delivery_round_timed(&observer, &claimants, &oc, &counters, &ids, island).await;
     assert!(
-        timings.is_none(),
-        "a missing foreign delivery must INVALIDATE the sample, not censor it"
+        matches!(outcome, Err(InvalidReason::DeliveryTimeout)),
+        "a missing foreign delivery must INVALIDATE the sample (DeliveryTimeout), never censor it (got {outcome:?})"
     );
-    println!("  [PASS] W5 missing delivery invalidates the sample (not censored)");
+    println!("  [PASS] W5 missing delivery → invalid (DeliveryTimeout), never censored");
+}
+
+/// W13 — same cardinality with a WRONG publisher cannot complete the combined
+/// delivery endpoint: cardinality alone does not prove the expected sources.
+fn w13_wrong_publisher_same_cardinality() {
+    let island = 0x3C0Du64;
+    let (cr, _fold) = unit_router(island);
+    let unexpected = EntityKeypair::generate();
+    let _ = cr.try_route(
+        unexpected.entity_id(),
+        &reserve_bytes(&unexpected, island, 1),
+    );
+    assert_eq!(cr.count(), 1, "cardinality target reached");
+    // The delivery endpoint proves an EXPECTED publisher set; a wrong publisher
+    // at the same cardinality fails that proof (-> InvalidReason::PublisherMismatch).
+    let expected: HashSet<u64> = HashSet::from([0xDEAD_BEEFu64]);
+    assert_ne!(
+        cr.seen_publishers(),
+        expected,
+        "same cardinality but the wrong publisher set — endpoint must not complete"
+    );
+    println!("  [PASS] W13 same cardinality + wrong publisher cannot complete delivery");
+}
+
+/// W14 — mixed holder shapes are reported as a RANGE, so a lone extreme sample
+/// cannot masquerade as the singular value.
+fn w14_mixed_shapes_not_collapsed() {
+    let per_sample_distinct = [3usize, 1, 2];
+    let min = *per_sample_distinct.iter().min().unwrap();
+    let max = *per_sample_distinct.iter().max().unwrap();
+    assert_eq!((min, max), (1, 3), "range must expose both extremes");
+    assert_ne!(
+        min, max,
+        "a mixed-shape aggregate must NOT collapse into one misleading value"
+    );
+    println!("  [PASS] W14 mixed holder shapes → min/max range, not a hidden singular extremum");
 }
 
 /// W12 — a raw chain topology cannot enter the matrix: the sentinel delivery

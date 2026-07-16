@@ -646,7 +646,10 @@ pub struct DivergenceReport {
     pub all_node_agreement: f64,
     pub samples_agreed: usize,
     pub samples_right_censored: usize,
-    pub timeouts: usize,
+    /// Samples that never became a valid divergence observation (missing
+    /// delivery / count overshoot / claim-not-Won / publisher mismatch).
+    /// NOT timeouts, and NEVER right-censored disagreement.
+    pub invalid_samples: usize,
 }
 
 impl DivergenceReport {
@@ -668,8 +671,8 @@ impl DivergenceReport {
             self.claimant_holder_agreement, self.observer_holder_agreement, self.all_node_agreement,
         );
         println!(
-            "   samples_agreed={} samples_right_censored={} timeouts={}",
-            self.samples_agreed, self.samples_right_censored, self.timeouts,
+            "   samples_agreed={} samples_right_censored={} invalid_samples={}",
+            self.samples_agreed, self.samples_right_censored, self.invalid_samples,
         );
     }
 }
