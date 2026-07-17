@@ -6741,8 +6741,8 @@ impl MeshNode {
     }
 
     /// Deterministic-witness seam: run a store installation that
-    /// invokes `pause` while the CURRENT store's publish guard is
-    /// held, after the dominance comparison and before the swap.
+    /// invokes `pause` while the publish pin is held, after the
+    /// dominance comparison and before the swap.
     /// Exposed as `pub` (not `pub(crate)`) only so the
     /// `tests/org_ownership.rs` race witnesses can reach it from a
     /// separate crate; not for production use.
@@ -6761,18 +6761,20 @@ impl MeshNode {
     /// one-owner comparison and this store install under ONE lock
     /// acquisition so no other install can interleave.
     ///
-    /// `candidate_guard_held` is `true` when the caller already
-    /// holds the CANDIDATE store's publish guard
-    /// (`install_node_authority` pins it across verification):
-    /// when candidate and current share one core (same backing
-    /// path), re-acquiring the same non-reentrant guard here would
-    /// deadlock, and the caller's guard already pins both views.
+    /// `pin_held` is `true` when the caller already holds the
+    /// publish pin over BOTH the current and candidate cores
+    /// (`install_node_authority` pins them across its
+    /// verification): re-acquiring the same non-reentrant reload
+    /// guard here would deadlock, and the caller's pin already
+    /// froze both live views.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
-        candidate_guard_held: bool,
+        pin_held: bool,
         pause_before_swap: Option<&(dyn Fn() + Sync)>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        // Fast poison reject (rechecked UNDER the pin below — a
+        // candidate can be poisoned between here and the swap).
         if store.is_poisoned() {
             return Err(
                 super::behavior::org_revocation::OrgRevocationError::Poisoned {
@@ -6787,27 +6789,40 @@ impl MeshNode {
             }
         }
 
-        // Pin the CURRENT store's publish transaction across the
-        // dominance comparison AND the swap (review-9 addendum):
-        // without this, the installed store can rise between
-        // `snapshot()` and the ArcSwap below, and the node would
-        // replace an already-enforced floor 10 with a candidate
-        // validated against floor 5. Same-core candidates share
-        // the current store's live view (dominance holds
-        // structurally), so the single shared guard — possibly
-        // already held by the caller — suffices. No callback runs
-        // under this guard: raises notify outside the reload lock.
-        let _current_guard = match &current {
-            Some(cur) if cur.shares_core_with(&store) => {
-                if candidate_guard_held {
-                    None
-                } else {
-                    Some(store.publish_guard())
-                }
+        // Pin BOTH the current AND candidate publish transactions
+        // across the poison recheck, the dominance comparison, and
+        // the swap (review-11 P1). Pinning only the current store
+        // (review-10) left the candidate free to publish a stronger
+        // then durability-uncertain view and poison itself between
+        // the poison check and the swap; pinning both freezes the
+        // candidate too. [`publish_guard_pair`] locks distinct
+        // cores in canonical normalized-path order, so two nodes
+        // swapping the opposite pair cannot deadlock ABBA. No
+        // callback runs under this guard (raises notify outside the
+        // reload lock), so holding it cannot deadlock notification.
+        let _pin = if pin_held {
+            None
+        } else {
+            match &current {
+                Some(cur) => Some(super::behavior::org_revocation::publish_guard_pair(
+                    cur, &store,
+                )),
+                None => Some(store.publish_guard()),
             }
-            Some(cur) => Some(cur.publish_guard()),
-            None => None,
         };
+
+        // Recheck candidate poison UNDER the pin (review-11 P1):
+        // with the candidate's reload frozen, no apply_bundle can be
+        // mid-rename on it, so this reflects a stable state that
+        // cannot change before the swap — a candidate that became
+        // durability-uncertain after the fast check is refused here.
+        if store.is_poisoned() {
+            return Err(
+                super::behavior::org_revocation::OrgRevocationError::Poisoned {
+                    path: store.path().display().to_string(),
+                },
+            );
+        }
 
         if let Some(cur) = &current {
             let current_view = cur.snapshot();
@@ -6879,7 +6894,7 @@ impl MeshNode {
             *subscription = Some((store.clone(), token));
         }
         self.org_revocation.store(Some(store.clone()));
-        drop(_current_guard);
+        drop(_pin);
 
         // Emission inputs changed with the installed store.
         self.org_authority_epoch.fetch_add(1, Ordering::AcqRel);
@@ -6965,19 +6980,30 @@ impl MeshNode {
         // ArcSwap fields).
         let _install = self.org_install.lock();
 
-        // Review-9 addendum: pin the CANDIDATE store's publish
-        // transaction across verification AND publication. Without
-        // it, a concurrent apply can raise this node's own floor
-        // between `self_verify` and the stores below, and the
-        // installation would return `Ok` with an authority that no
-        // longer satisfies its "currently self-verified" contract.
-        // Under the guard, a racing raise publishes strictly AFTER
-        // the authority — at which point it is an ordinary
-        // post-install raise: the (already-subscribed) callback
-        // retracts, and emission goes dark. No callback runs under
-        // this guard.
+        // Review-9 addendum + review-11 P1: pin BOTH the candidate
+        // AND the currently-installed store across verification AND
+        // publication. Without the candidate pin, a concurrent apply
+        // can raise this node's own floor between `self_verify` and
+        // the store install, and the installation would return `Ok`
+        // with an authority that no longer satisfies its "currently
+        // self-verified" contract. Without the current pin, the
+        // downstream store install could not safely compare against
+        // a frozen current view. [`publish_guard_pair`] locks the
+        // two distinct cores in canonical normalized-path order, so
+        // two nodes installing the opposite pair cannot deadlock
+        // ABBA (review-11 P1); same-core dedups to one lock. Under
+        // the pin a racing raise publishes strictly AFTER the
+        // authority — an ordinary post-install raise the
+        // already-subscribed callback retracts, darkening emission.
+        // No callback runs under this pin.
         let candidate_store = authority.revocation.clone();
-        let _candidate_guard = candidate_store.publish_guard();
+        let current_store = self.org_revocation.load_full();
+        let _pin = match &current_store {
+            Some(cur) if !Arc::ptr_eq(cur, &candidate_store) => Some(
+                super::behavior::org_revocation::publish_guard_pair(cur, &candidate_store),
+            ),
+            _ => Some(candidate_store.publish_guard()),
+        };
 
         // Review-9: the authority object is RE-VERIFIED here in
         // full, not trusted as a proof token — `NodeAuthority` is
@@ -7005,6 +7031,7 @@ impl MeshNode {
                 );
             }
         }
+        // The pin is already held over both cores → `pin_held = true`.
         self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
         self.node_authority.store(Some(authority));

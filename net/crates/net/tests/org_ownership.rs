@@ -1432,3 +1432,174 @@ async fn one_store_installed_into_two_nodes_notifies_both() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Review-11 P1 — publication serialization vs openers, and canonical
+// dual-core locking (no ABBA under opposite cross-core swaps).
+// ---------------------------------------------------------------------------
+
+/// Review-11 P1: a store replacement holds the publish pin across
+/// its dominance comparison AND swap, so a same-path opener cannot
+/// publish (its `open_existing` blocks on the pinned core) inside
+/// that interval — the exact review-10 red where an opener lifted
+/// the active floor 10→5 mid-swap. Blocking is strictly stronger
+/// than "can't lower": the opener cannot publish anything at all
+/// while pinned.
+#[tokio::test]
+async fn opener_cannot_publish_during_store_replacement() {
+    let node = build_node().await;
+    let dir_a = scratch_dir("r11-openrepl-a");
+    let dir_b = scratch_dir("r11-openrepl-b");
+    let a_path = dir_a.join("revocation-state.json");
+
+    let a = Arc::new(OrgRevocationStore::init(&a_path).expect("init A"));
+    node.install_org_revocation_store(a.clone())
+        .expect("install A");
+    // Candidate B (different core, empty → dominates empty A).
+    let b =
+        Arc::new(OrgRevocationStore::init(dir_b.join("revocation-state.json")).expect("init B"));
+
+    let opener_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ob = opener_blocked.clone();
+    let a_path_for_opener = a_path.clone();
+    let n = node.clone();
+    let install = tokio::task::spawn_blocking(move || {
+        n.install_org_revocation_store_paused_for_test(b, &move || {
+            // Pin held over A (current) + B (candidate). An opener of
+            // A's path must NOT complete while the pin is held.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let ap = a_path_for_opener.clone();
+            std::thread::spawn(move || {
+                let s = OrgRevocationStore::open_existing(&ap).expect("open A");
+                let _ = done_tx.send(());
+                // Keep the handle alive briefly so its core join
+                // actually publishes before the thread exits.
+                std::thread::sleep(Duration::from_millis(50));
+                drop(s);
+            });
+            let blocked = done_rx.recv_timeout(Duration::from_millis(400)).is_err();
+            ob.store(blocked, std::sync::atomic::Ordering::Release);
+        })
+    });
+    install
+        .await
+        .expect("join install")
+        .expect("replacement ok");
+    assert!(
+        opener_blocked.load(std::sync::atomic::Ordering::Acquire),
+        "a same-path opener published inside the replacement's pinned interval"
+    );
+    // The node ended up on B (the intended candidate).
+    assert!(node
+        .org_revocation_store()
+        .expect("installed")
+        .shares_core_with(&b_marker(&dir_b)));
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Helper: reopen B's path to compare cores (the installed store is
+/// B iff it shares B's core).
+fn b_marker(dir_b: &PathBuf) -> OrgRevocationStore {
+    OrgRevocationStore::open_existing(dir_b.join("revocation-state.json")).expect("reopen B")
+}
+
+/// Review-11 P1: authority installation pins BOTH the candidate and
+/// the current store across self-verification and publication, so a
+/// same-path opener cannot publish inside that interval either.
+#[tokio::test]
+async fn opener_cannot_publish_during_authority_installation() {
+    let node = build_node().await;
+    let dir_a = scratch_dir("r11-openauth-a");
+    let dir_b = scratch_dir("r11-openauth-b");
+
+    // Install an initial authority (store A).
+    let cert_a =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue A");
+    let auth_a =
+        Arc::new(NodeAuthority::adopt(&dir_a, cert_a, node.entity_id(), 0, None).expect("adopt A"));
+    node.install_node_authority(auth_a).expect("install A");
+    let a_path = dir_a.join("revocation-state.json");
+
+    // Candidate authority B (same owner org → same-org renewal).
+    let cert_b =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 2, 3600).expect("issue B");
+    let auth_b =
+        Arc::new(NodeAuthority::adopt(&dir_b, cert_b, node.entity_id(), 0, None).expect("adopt B"));
+
+    let opener_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ob = opener_blocked.clone();
+    let n = node.clone();
+    let install = tokio::task::spawn_blocking(move || {
+        n.install_node_authority_paused_for_test(auth_b, &move || {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let ap = a_path.clone();
+            std::thread::spawn(move || {
+                let s = OrgRevocationStore::open_existing(&ap).expect("open A");
+                let _ = done_tx.send(());
+                std::thread::sleep(Duration::from_millis(50));
+                drop(s);
+            });
+            let blocked = done_rx.recv_timeout(Duration::from_millis(400)).is_err();
+            ob.store(blocked, std::sync::atomic::Ordering::Release);
+        })
+    });
+    install.await.expect("join").expect("authority install ok");
+    assert!(
+        opener_blocked.load(std::sync::atomic::Ordering::Acquire),
+        "a same-path opener published inside the authority install's pinned interval"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Review-11 P1 (canonical dual-core locking): two nodes performing
+/// the OPPOSITE cross-core store swap concurrently must both
+/// terminate — `publish_guard_pair` locks distinct cores in
+/// canonical normalized-path order, so no ABBA cycle forms even
+/// though each node's `org_install` mutex is node-local.
+#[tokio::test]
+async fn two_nodes_opposite_store_swaps_do_not_deadlock() {
+    let n1 = build_node().await;
+    let n2 = build_node().await;
+    let dir_a = scratch_dir("r11-abba-a");
+    let dir_b = scratch_dir("r11-abba-b");
+
+    // Empty stores dominate each other, so both swaps are legal.
+    let a = Arc::new(OrgRevocationStore::init(dir_a.join("revocation-state.json")).expect("A"));
+    let b = Arc::new(OrgRevocationStore::init(dir_b.join("revocation-state.json")).expect("B"));
+    n1.install_org_revocation_store(a.clone())
+        .expect("n1 installs A");
+    n2.install_org_revocation_store(b.clone())
+        .expect("n2 installs B");
+
+    // n1: A → B, n2: B → A, concurrently. Loop a few rounds to make
+    // the interleaving likely to hit any ordering bug.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        for _ in 0..50 {
+            let (n1c, n2c) = (n1.clone(), n2.clone());
+            let (bc, ac) = (b.clone(), a.clone());
+            let t1 = tokio::task::spawn_blocking(move || n1c.install_org_revocation_store(bc));
+            let t2 = tokio::task::spawn_blocking(move || n2c.install_org_revocation_store(ac));
+            let _ = t1.await.expect("t1");
+            let _ = t2.await.expect("t2");
+            // Swap back so the next round repeats the opposite pair.
+            let (n1c, n2c) = (n1.clone(), n2.clone());
+            let (ac, bc) = (a.clone(), b.clone());
+            let t1 = tokio::task::spawn_blocking(move || n1c.install_org_revocation_store(ac));
+            let t2 = tokio::task::spawn_blocking(move || n2c.install_org_revocation_store(bc));
+            let _ = t1.await.expect("t1b");
+            let _ = t2.await.expect("t2b");
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "opposite cross-core swaps deadlocked (canonical ordering failed)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
