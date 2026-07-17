@@ -1,334 +1,412 @@
-# OA2-E Live Integration — Design (PROPOSAL, not yet authorized)
+# OA2-E Live Integration — Design v2 (PROPOSAL, not authorized)
 
-**Status:** DESIGN ONLY. No code, no behavior change. This document
-specifies the bounded OA2-E integration commit that turns the parked
-OA-2 groundwork into running provider-side authorization.
+**Status:** DESIGN ONLY. No code, no behavior change. Revised per the
+OA2-E design verdict (CHANGES REQUESTED) + independent-review
+addendum.
 
-**It MUST NOT be implemented until BOTH gates pass:**
+**MUST NOT be implemented until ALL gates pass:**
 
-1. OA-1 review-11 independently signed off, AND
-2. the OA2-A–E-partial primitives audited (§2.4 ordering, binding,
-   replay, attribution) as unwired.
+1. OA-1 review-11 independently signed off;
+2. OA2-A–E-partial primitives audited as unwired;
+3. this revised design accepted;
+4. the OA2-E0 nRPC substrate prerequisites landed and reviewed.
 
-This is the step Kyra flagged as crossing the security boundary:
-"preparing the authority engine" → "turning it into authority." The
-purpose of writing it now is only to have a reviewable, ready-to-run
-plan so the eventual commit is small and mechanical.
+## The core problem (why this is not one mechanical commit)
 
----
+The current nRPC dispatch does **not** have one atomic, collision-safe,
+end-to-end-authenticated mapping from `caller + service + policy →
+handler`. OA-2 admission must **make that mapping load-bearing**, not
+assume it exists. Every correction below is an instance of that:
 
-## 0. What already exists (parked, unwired)
+- two mutable truths (channel→handler, name→policy) can disagree;
+- a wire `u16` bucket fans frames to every dispatcher in it;
+- control frames (CANCEL/CHUNK/GRANT) carry no service identity;
+- `from_node` is the AEAD last-hop peer, not the end-to-end caller;
+- installed authority at registration ≠ usable authority at call time;
+- a floor can rise between proof verification and dispatch.
 
-| Symbol | Module | Role |
+Admission is only sound once that one seam is singular and fail-closed.
+
+## Revised sequence (supersedes "one commit")
+
+| Slice | Content | Enables OA-2? |
 |---|---|---|
-| `OrgCapabilityGrant`, `OrgDispatcherGrant`, `CapabilityAuthorityId`, `GrantRights`, `GrantTargetScope`, `OrgAudienceSecret` | `behavior/org_grant.rs` | grant family (§2.1–2.2) |
-| `OrgCallProof`, `CallBinding`, `ORG_ADMISSION_HEADER`, `MAX_ORG_CALL_PROOF_BYTES` | `behavior/org_call.rs` | per-call proof + binding (§2.3) |
-| `AdmissionReplayGuard`, `ReplayOutcome`, `AdmissionReplayConfig` | `behavior/org_admission_replay.rs` | replay guard (§2.5) |
-| `OrgAdmission`, `AdmissionContext`, `AdmissionDenied`, `Admitted`, `verify_org_admission` | `behavior/org_admission.rs` | ordered decision (§2.4) |
-| `has_local_capability` | `behavior/fold/capability_bridge.rs` | tag-presence, no allow-lists (§2.4a) |
+| **OA2-E0** | nRPC substrate: non-destructive registration + generation tokens, channel/service equality, registration-bound call state, caller-identity model. Reviewable WITHOUT enabling admission. | no |
+| **OA2-E1** | Unary provider admission: captured immutable policy, live self-verify, stable authority stamp + replay ordering, single clock sample, per-caller replay, policy + attribution wiring. | yes (provider side) |
+| **OA2-E2** | Caller + wire: proof-intent builder in `call()`, `RpcStatus 0x0009`, coarse external reasons + detailed audit, mixed-version fleet gate. | yes (caller side) |
+| **OA-3** | Visibility: `OwnerScoped` / `GrantedAudience`, encrypted `ScopedCapabilityAnnouncement`, audience-partitioned discovery, baseline sanitization. | discovery |
 
-None of these has a caller outside its own module + tests today. The
-integration commit is what adds the first real callers.
-
----
-
-## 1. Scope of the OA2-E commit
-
-**In (one bounded commit):**
-
-- `RegisteredCapability { descriptor, visibility, admission }` and the
-  per-service registration surface.
-- Policy-directed gate selection in the callee-side RPC intake.
-- `AdmissionContext` assembly from the verified inbound call.
-- `request_digest` canonicalization (proof header removed).
-- `RpcStatus::AdmissionDenied = 0x0009` + reason surfacing.
-- One per-node `AdmissionReplayGuard` + eviction.
-- Emission-by-visibility split (plaintext `Public` / `OwnerScoped`
-  fanout-controlled; `GrantedAudience` withheld from plaintext).
-- End-to-end serve_rpc dispatch witnesses (admit + each deny class).
-
-**Out (deferred):**
-
-- The encrypted `ScopedCapabilityAnnouncement` envelope + private
-  discovery propagation — that is OA-3. OA2-E's emission split only
-  needs to (a) carry `visibility` on the registration and (b) keep a
-  `GrantedAudience` descriptor OUT of plaintext broadcast bytes. The
-  encrypted form is an OA-3 concern.
-- CLI/SDK grant-minting and the §2.6 wire gate — that is OA2-F, which
-  layers on top of this commit.
-
-**Untouchable (invariants this commit must preserve):**
-
-- `may_execute` stays **byte-for-byte identical** (verified 2,586
-  bytes at review-11). Public services route through it unchanged.
-- The review-11 `StoreCore` / `PublishGuard` / send-seqlock surfaces
-  are not modified — admission only READS `org_revocation` snapshots
-  and the installed `NodeAuthority`.
-- Fold state, decrypted announcements, and discovery responses are
-  never admission evidence (Locked #3).
+Visibility is **removed from the admission commit** (verdict §11): E1
+registration LOUDLY REJECTS non-`Public` visibility until OA-3, so the
+authority commit does not also span the announcement state machine.
 
 ---
 
-## 2. The registration model (§2.4a)
+## OA2-E0 — nRPC substrate prerequisites (OA-2-neutral)
+
+These are correctness repairs to the dispatch primitive. They enable
+nothing on their own and are reviewable independently.
+
+### E0.1 Non-destructive registration (addendum §1)
+
+`register_rpc_inbound` today does
+`Some(std::mem::replace(existing_disp, dispatcher))` — the replacement
+has ALREADY happened by the time the caller reads `Some` as
+`AlreadyServing`, so a duplicate `serve_rpc` silently breaks the old
+registration and installs a dispatcher with no live bridge consumer.
+
+Repair:
+
+- vacant-only insertion; an existing canonical channel returns
+  "occupied" WITHOUT mutating;
+- each registration carries a `registration_id` (monotonic generation)
+  + a token;
+- teardown is conditional: a `ServeHandle` removes ONLY its own
+  `registration_id` (a stale handle cannot evict a newer registration);
+- registration failure rolls back leaving no dispatcher, tag, or
+  policy.
+
+Useful nRPC hardening independent of OA-2; **prerequisite** because OA-2
+policy cannot be layered on a destructive primitive.
+
+### E0.2 Channel/service equality + registration-bound call state (verdict §3, addendum §2)
+
+The wire carries a `u16` channel bucket; a collision fans a frame into
+every canonical dispatcher in that bucket. Initial REQUEST frames
+carry `payload.service`; **CANCEL / REQUEST_CHUNK / STREAM_GRANT do
+not**.
+
+- Every REQUEST dispatch requires `payload.service == captured
+  registration.service`; a non-matching dispatcher **silently
+  discards** (never emits a competing response).
+- Active call state is keyed by `(authenticated caller, call_id,
+  registration_id)` — a control frame may reach a fold only when its
+  authenticated origin + call identity + registration match. Two
+  colliding services sharing a caller/call_id cannot cross-mutate.
+- Protected calls SHOULD use a collision-free exact channel identity;
+  at minimum, control-frame handling is registration-bound.
+
+### E0.3 Caller-identity model — DECISION: direct-session-only in v1 (verdict §4, addendum caller-binding)
+
+The live code defines `from_node` = AEAD-authenticated **last-hop
+session peer**; `origin_hash` = routing metadata, **not** an
+authenticated identity. For a relayed RPC, `from_node` is the RELAY,
+not the caller. Relay identity and caller identity must not collapse.
+
+**Chosen cut for v1 (smaller, fail-closed):** org-protected RPC is
+**direct-session-only**.
+
+```text
+let caller = peer_entity_id(inbound.from_node)
+    .ok_or(CallerIdentityUnavailable)?;
+require(meta.origin_hash == caller.origin_hash());   // bound, not trusted alone
+// A relayed protected request (from_node != proof subject's session)
+// is LOUDLY DENIED — never inferred through a relay.
+```
+
+Rationale: end-to-end authenticated caller identity (carry an
+authenticated origin entity independent of the relay, keep
+`transport_relay: NodeId` separate for attribution) is strictly more
+surface. Direct-only is the minimal sound seam; the end-to-end path is
+a later E2+ evolution, not a v1 requirement. Registration of a
+protected service records that protected calls require a direct
+authenticated session to the proof subject.
+
+Witnesses: direct-session admit; relayed protected request denied
+(`CallerIdentityUnavailable` / relay-mismatch); forged `origin_hash`
+vs authenticated session entity denied.
+
+### E0.4 One clock sample (addendum §3)
+
+Capture `wall_now` and `monotonic_now` ONCE per admission. All
+certificate/grant/proof freshness uses `wall_now`; the replay deadline
+is derived from the SAME `wall_now` relative to `monotonic_now`. A
+wall-clock jump between a freshness check and replay-retention
+derivation must not immediately expire a just-fresh proof. Deterministic
+clock-step witness required.
+
+---
+
+## OA2-E1 — unary provider admission
+
+### E1.1 Registration owns the policy (verdict §1, §2, §7, §12)
+
+Replace `LocalServiceRegistry`'s name-only set with a
+generation-owned registration whose policy is **captured by the
+handler bridge**, so there is ONE truth, not a name→policy side map:
 
 ```rust
-// behavior/org_admission.rs (or a new behavior/org_registration.rs)
-pub enum CapabilityVisibility { Public, OwnerScoped, GrantedAudience }
+type OrgProviderPolicy = Arc<dyn Fn(&OrgCallProof) -> bool + Send + Sync>;
 
-pub struct RegisteredCapability {
-    pub descriptor: CapabilityDescriptor, // existing service descriptor
-    pub visibility: CapabilityVisibility, // emission projection
-    pub admission:  OrgAdmission,         // the gate to run (already exists)
+struct RegisteredRpcService {
+    registration_id: u64,           // generation (E0.1)
+    service:  Arc<str>,
+    visibility: CapabilityVisibility, // E1: MUST be Public (else refuse)
+    admission:  OrgAdmission,
+    provider_policy: OrgProviderPolicy,
 }
 ```
 
-- The LOCAL registry / self-fold ALWAYS receives the capability (with
-  empty v0.4 allow-lists), so the exact service is locally
-  registered/capable — `has_local_capability(self)` is true for it.
-- Registration of an `OwnerDelegated` / `CrossOrgGranted` service
-  REQUIRES an installed `NodeAuthority` (the provider must have a
-  proven owner org to admit against). Registering org-protected
-  without an authority is a loud refusal at registration time — never
-  a silent fail-open.
+- Legacy `serve_rpc` constructs `Public + PublicAuthenticated` with a
+  trivial `|_| true` policy — so **every live handler has a policy**.
+- Protected registration constructs an immutable
+  `Arc<RegisteredRpcService>`; the dedicated bridge captures that EXACT
+  `Arc`. No per-request name→policy lookup; **no unknown-policy
+  fallback** (a live handler with no policy = inconsistent state =
+  LOUD DENY, never `may_execute` fallback — verdict §2).
+- The cold registration is ONE serialized transaction (a cold-path
+  mutex, not lock-free cross-map coordination): validate → capture
+  immutable policy with the handler → establish exact local capability
+  → install dispatcher → (only later) schedule announcement.
+- No hot `Public→Protected` switch in v1 — require teardown/re-register
+  or restart, with the old bridge DRAINED before the protected mode is
+  claimed active (verdict §12).
+- Protected registration REQUIRES an installed authority AND
+  `visibility == Public` (OA-3 defers the rest); either failing is a
+  loud refusal that rolls back cleanly.
 
-Where it plugs in: the existing per-node service registry
-(`rpc_local_services`, the `nrpc:<service>` set on `MeshNode`) gains a
-parallel `DashMap<service_name, RegisteredCapability>`. Public
-services default to `RegisteredCapability { …, Public,
-PublicAuthenticated }`, so pre-OA-2 registrations are unchanged.
+### E1.2 The gate (verdict §2, §3; the load-bearing seam)
 
----
-
-## 3. The callee-side gate (the load-bearing change)
-
-**Location:** the server-fold inbound RPC path, BEFORE the user
-handler is spawned — the same point that today produces
-`RpcStatus::CapabilityDenied` (0x0008). Concretely, the dispatch that
-builds an `RpcContext` (`cortex/rpc.rs`; `RpcContext.caller_origin` is
-the AEAD-verified peer origin_hash, `.call_id`, `.payload`).
-
-**Gate selection (policy-directed, review-7 correction §2.4a):**
+At the REQUEST dispatch, on the captured `Arc<RegisteredRpcService>`:
 
 ```text
-resolve RegisteredCapability for payload.service   (unknown → today's path)
-match registered.admission {
-    PublicAuthenticated =>
-        // EXACTLY today's behavior — may_execute unchanged.
-        require( may_execute(fold, self_id, tag, caller_node) )
+require(payload.service == reg.service)          // E0.2 — authority not payload-selected
+tag = nrpc_tag_for(reg.service)                  // from the CAPTURED registration
+cap = CapabilityAuthorityId::for_tag(tag)
 
-    OwnerDelegated | CrossOrgGranted => {
-        // The legacy allow-list UNION is NOT authority here.
-        require( has_local_capability(fold, self_id, tag) )   // exact service registered
-        let admitted = verify_org_admission(&ctx, headers, &replay, now, policy)?;
-        // admitted carries the four-party attribution for audit.
-    }
+match reg.admission {
+  PublicAuthenticated =>
+      require( may_execute(fold, self_id, tag, caller_node) )   // UNCHANGED
+  OwnerDelegated | CrossOrgGranted => {
+      require( has_local_capability(fold, self_id, tag) )       // no allow-list union
+      let admitted = admit_protected(reg, cap, caller, ctx)?;   // E1.3–E1.5
+  }
 }
 ```
 
-`may_execute` is consulted **only** on the `PublicAuthenticated` arm.
-Protected services never route authority through it — the OA-2 gate is
-load-bearing, red-witnessed without depending on the legacy gate's
-return value (Locked #3).
+`may_execute` is consulted ONLY on the public arm and stays byte-for-
+byte identical. The capability id derives from the CAPTURED
+registration, never from attacker-selected `payload.service`.
 
-**`AdmissionContext` assembly** (all provider-side facts):
+### E1.3 Live provider self-verification (verdict §5)
 
-| field | source |
-|---|---|
-| `mode` | `registered.admission` |
-| `authenticated_caller` | `caller_origin` → `EntityId` via the TOFU `peer_entity_ids` binding (NOT self-claimable) |
-| `provider` | `self.identity.entity_id()` |
-| `provider_owner_org` | installed `NodeAuthority.owner_org()` (loud deny if none) |
-| `invoked_capability` | `CapabilityAuthorityId::for_tag(nrpc_tag_for(service))` |
-| `call_id` | `ctx.call_id` |
-| `request_digest` | canonical request, admission header removed (§4) |
-| `is_unary` | `false` for streaming REQUEST kinds → `StreamingUnsupported` |
-| `floors` | `org_revocation` snapshot (installed store) |
-| `skew_secs` | `NodeAuthority.config.verification_skew_secs` |
-
-**Header extraction:** collect every `payload.headers` value whose
-name == `ORG_ADMISSION_HEADER`; pass the slice to
-`verify_org_admission`, which enforces exactly-one.
-
-**Deny mapping:** `AdmissionDenied` → `RpcStatus::AdmissionDenied`
-(0x0009). The reason rides a response header (e.g.
-`net-org-admission-reason: <variant>`) for audit — distinguishable
-`Replay` vs `CallIdCollision` vs `BindingInvalid`, etc. The body stays
-a short diagnostic. No reason leaks credential material.
-
----
-
-## 4. `request_digest` canonicalization
-
-The binding covers "the whole canonical request minus the proof
-header" (§2.3). The caller and the provider must compute an IDENTICAL
-digest.
-
-Proposed canonical form (deterministic, both sides):
+Registration-time authority ≠ usable authority at call time. For every
+protected admission, as a call-time prerequisite:
 
 ```text
-digest = blake3(
-    service_len ‖ service
-  ‖ deadline_ns
-  ‖ flags
-  ‖ sorted(headers WITHOUT net-org-admission)  // (name,value) length-prefixed, byte-sorted
-  ‖ body_len ‖ body
-)
+authority = installed NodeAuthority        else ProviderAuthorityUnavailable
+store     = installed OrgRevocationStore    else ProviderAuthorityUnavailable
+require( !store.is_poisoned() )
+authority.config.self_verify(provider_entity, store.snapshot())  // expiry + floor + binding
 ```
 
-- The `net-org-admission` header is excluded (it carries the proof,
-  which is being signed).
-- Headers are byte-sorted so header ordering is not load-bearing (the
-  transport may reorder). Documented as the canonical rule; the caller
-  helper and the provider gate share ONE implementation.
-- Everything else (`service`, `deadline_ns`, `flags`, `body`) is bound
-  — a relay cannot re-point the proof at a different body/deadline.
+Any failure → `ProviderAuthorityUnavailable`; the handler stays dark.
+An expired/revoked/poisoned node cannot keep admitting as org B.
 
-Caller side (OA2-F/SDK): a helper that builds the proof header
-computes this digest over the request it is about to send, minus the
-header it is about to add.
+### E1.4 Stable security view + replay ordering (verdict §6, addendum §3)
 
----
-
-## 5. Replay guard lifecycle
-
-- One `AdmissionReplayGuard` per `MeshNode` (a new field), created with
-  `AdmissionReplayConfig::default()`.
-- `verify_org_admission` calls `.admit(caller, call_id, binding_digest,
-  expires_at, now)` as its step 10 — atomic insert-or-deny BEFORE the
-  handler runs.
-- Eviction: a low-frequency sweep (piggyback an existing timer, or a
-  dedicated interval) calls `evict_expired(Instant::now())`. Lazy
-  reclamation at capacity is already built in.
-- Volatile by contract; cross-restart idempotency is the application's
-  (Locked #8).
-
----
-
-## 6. Emission by visibility (the projection half of §2.4a)
-
-The announce path (`announce_from_baseline` / `index_self_with_local
-_services`) branches by each registered capability's visibility:
-
-- `Public` → plaintext `nrpc:<service>` tag as today.
-- `OwnerScoped` → plaintext scoped form, EXCLUDED from unscoped query
-  projection (labeled fanout control, not confidentiality — Locked
-  #10). Realized as a reserved scoped tag the unscoped discovery query
-  filters out.
-- `GrantedAudience` → **withheld from plaintext broadcast bytes
-  entirely** in OA2-E. The encrypted `ScopedCapabilityAnnouncement`
-  envelope that actually delivers it is OA-3; OA2-E's obligation is
-  only the negative one: a `GrantedAudience` descriptor NEVER appears
-  in plaintext broadcast bytes (witnessed by a byte-scan).
-
-This interacts with the review-11 send path only as an input to what
-`caps` the announcement carries — it does NOT touch the
-`SendStamp`/seqlock or the owner-cert emission machinery.
-
----
-
-## 7. Migration ordering (§Migration step 5)
-
-An OLD provider with a permissive local entry serves any authenticated
-caller. Therefore, PER protected service, the operator order is fixed:
+Reading one floor snapshot is insufficient — a floor can rise between
+verification and dispatch. Give admission a linearization point using a
+stamp analogous to (but distinct from) the OA-1 send seqlock:
 
 ```text
-upgrade provider code
-  → register the service with OwnerDelegated / CrossOrgGranted admission
-    → only THEN emit / enable the protected service
+AdmissionStamp { authority_ptr, store_ptr, store_generation, poisoned }
 ```
 
-Enabling a protected service before its admission is registered would
-be a fail-open window; registration refuses org-protected modes
-without an installed authority, and the emit step is gated on
-registration.
+Order INSIDE `verify_org_admission` (a narrow §9.5 hook between call
+binding and replay insertion):
+
+```text
+1..9   existing verification (against the captured snapshot + wall_now)
+9.5    provider security view still current?
+         recompute AdmissionStamp; if != captured OR poisoned:
+             retry from a fresh view, or deny AuthorityChanged
+10     replay insert (atomic)          — AFTER 9.5, so a stale attempt
+                                          never consumes (caller,call_id)
+11     provider policy (captured Arc)  — runs LAST
+```
+
+A floor raise AFTER 9.5 is ordered after this admission; a raise BEFORE
+it forces retry/deny. The stability check precedes replay insertion so
+a stale attempt cannot burn a `(caller, call_id)` slot. Deterministic
+witness: pause after binding verification, raise caller/provider floor
+(and separately: replace authority, poison store), resume → no replay
+record under the stale view, handler never runs.
+
+### E1.5 Replay fairness (verdict §10)
+
+`AdmissionReplayConfig` gains `max_entries_per_caller` beside the
+global `max_entries`. At per-caller capacity, deny ONLY that caller;
+the global ceiling stays fail-closed. This matters because policy runs
+AFTER replay insertion, so even policy-vetoed valid proofs consume a
+slot — a single credentialed caller must not be able to starve every
+other org. No dedicated eviction task (lazy reclamation in `admit`
+suffices; add one only if measured).
+
+### E1.6 Policy + attribution wiring (verdict §7)
+
+- The captured `provider_policy` runs as step 11 — real destination,
+  not `|_| true`.
+- `RpcContext` gains `org_admission: Option<Admitted>`. Protected calls
+  place the four-party `Admitted` there; the raw `net-org-admission`
+  header is STRIPPED from the headers handed to application code (the
+  app receives verified attribution, never raw credential material).
+  Public calls receive `None` and keep existing header behavior.
+
+### E1.7 Canonical request digest via the existing codec (verdict §8)
+
+No second hand-written concatenation codec. One shared helper:
+
+```text
+digest(req) =
+  clone request view
+  → remove EVERY exact net-org-admission header
+  → byte-sort remaining (name,value) pairs
+  → encode with RpcRequestPayload's existing canonical wire encoder
+  → blake3::derive_key("net-org-rpc-request-v1", encoded_bytes)
+```
+
+This binds payload version, service, deadline, flags, header
+count/lengths, duplicate-header multiplicity, and body length+bytes
+automatically. The SAME function is used by the E1 wire witnesses and
+the OA2-E2 caller helper — divergence would fail every legitimate call
+closed (safe, caught by the admit witness).
+
+### E1.8 Unary-only boundary (verdict §9)
+
+- Existing server-streaming / client-streaming / duplex serving APIs
+  remain explicitly `PublicAuthenticated`; no protected policy can be
+  installed through a streaming/duplex registration path.
+- Protected registration is accepted ONLY by the unary registered API.
+- Any streaming flag on a protected unary REQUEST → `StreamingUnsupported`.
+- CANCEL for an admitted unary call reaches the fold only when its
+  authenticated origin + call identity + registration match (E0.2).
 
 ---
 
-## 8. Wire / status additions
+## OA2-E2 — caller + wire surfacing
 
-- `RpcStatus::AdmissionDenied = 0x0009` (next after `CapabilityDenied
-  = 0x0008`), plus `to_wire` / `from_wire` arms and the reserved-range
-  round-trip test.
-- No change to `RpcRequestPayload` layout — the proof rides an
-  existing header; the response reason rides an existing header.
-- Static size assertion: the encoded proof header ≤
-  `MAX_RPC_HEADER_VALUE_LEN` (4096) — already pinned at 1024 in
-  `org_call.rs`.
+### E2.1 Proof-intent builder inside `call()` (addendum §4)
 
----
+`CallOptions.request_headers` is supplied BEFORE `call()` mints the
+final `call_id`, yet the proof binds `call_id`, final deadline, final
+flags, generated headers, and body — so an ordinary caller cannot
+prebuild the admission header. E2 adds a minimal proof-intent seam:
+`call()` mints the `call_id`, finalizes the request, computes the
+shared digest (E1.7), signs the proof, and appends the
+`net-org-admission` header. This is NOT the full grant-management CLI
+(OA2-F) — it is the minimum caller seam to exercise the protocol
+honestly. Until it lands, E1 tests are explicitly low-level
+injected-frame witnesses and the feature is unreleasable.
 
-## 9. Witnesses the OA2-E commit must add (the dispatch proof)
+### E2.2 Status + reasons (verdict §8 mapping)
 
-Integration tests against real `MeshNode` RPC, mirroring the OA-1
-`org_ownership.rs` style:
+- `RpcStatus::AdmissionDenied = 0x0009` (+ `to_wire`/`from_wire` +
+  reserved-range round-trip).
+- COARSE, stable external reason on the wire (a small enum: e.g.
+  `denied` / `not-supported` / `unavailable`) — the DETAILED
+  `AdmissionDenied` variant stays provider-side audit only, so denial
+  reasons don't become an oracle and don't leak credential state.
+- Retry/breaker/binding behavior specified for callers.
 
-1. **Admit end-to-end** — B-owned provider registers a
-   `CrossOrgGranted` service; an A-caller with membership + dispatcher
-   + B→A INVOKE grant calls it; the handler runs; response OK; the
-   audit attribution is the four-party identity.
-2. **Owner-delegated admit** — same-org caller, no capability grant,
-   admitted.
-3. **Each deny class reaches the wire as 0x0009** with the right
-   reason header: missing/duplicate header, malformed proof,
-   member-binding mismatch, foreign issuer, target-not-covered,
-   insufficient rights, revoked membership (floor), transplanted
-   binding (wrong call_id/body), replay, call-id collision, expired
-   proof, provider-policy veto.
-4. **Streaming rejected** — an org-protected streaming REQUEST →
-   `AdmissionDenied` / `StreamingUnsupported`, never admitted under a
-   binding covering only the initial payload.
-5. **Public unchanged** — a `PublicAuthenticated` service admits/denies
-   EXACTLY as before (may_execute), with and without an installed
-   authority present.
-6. **Load-bearing gate (red witness)** — a protected service on a node
-   whose OTHER capability carries a restrictive allow-list is admitted
-   for a legitimate org caller (proving the legacy union is not
-   consulted), and denied for a caller with a bad proof even though
-   `may_execute`'s union would have said something else.
-7. **Emission** — a `GrantedAudience` descriptor is byte-absent from
-   plaintext broadcast; a `Public` one is present.
-8. **Authority-dark preserved** — a node with NO org-protected
-   registrations behaves identically to pre-OA-2 (may_execute only).
+### E2.3 Mixed-version fleet gate (addendum §5)
+
+"New caller sends a proof to an old provider" is NOT an upgrade
+mechanism — the old provider ignores the header and applies legacy
+`may_execute` (permissive). Before a service is advertised as
+protected: all serving replicas upgraded → old public advertisements
+withdrawn/expired → every replica registered protected → only THEN
+enable discovery/traffic. A mixed-version witness must prove the
+OLD-PROVIDER case, not only that old clients decode 0x0009.
 
 ---
 
-## 10. Risk register / boundary checks for the eventual commit
+## OA-3 — visibility (out of the admission commit)
 
-- **may_execute byte-identity** — re-verify the function bytes are
-  unchanged after the commit (the review-7/Locked #3 invariant).
-- **No fail-open** — an org-protected service with no installed
-  authority, a missing proof, or ANY verification failure DENIES;
-  there is no path where an unverified call reaches the handler.
-- **Replay before handler** — the atomic insert-or-deny must precede
-  handler dispatch; a handler must never run twice for one
-  `(caller, call_id)`.
-- **Digest agreement** — the caller-side and provider-side
-  `request_digest` share one implementation; a divergence would fail
-  every legitimate call closed (safe, but must be caught by test 1).
-- **Skew/floor sourcing** — floors from the INSTALLED store snapshot
-  (not a detached handle), skew from the persisted authority config —
-  reuse the review-11-correct accessors.
-- **Bounded** — one commit; touches the registry, the callee gate, the
-  status enum, the announce visibility branch, and tests. It does NOT
-  touch `may_execute`, the `StoreCore`/seqlock surfaces, or OA-3
-  envelope machinery.
+`OwnerScoped` semantics, `GrantedAudience` encryption, audience-
+partitioned discovery, baseline sanitization, and the full send-path
+leak matrix (immediate / explicit-baseline / change-driven / keepalive
+/ rate-limited flush / late-join push / unregister / restart). E1
+registration rejects non-`Public` visibility until this lands.
+`OwnerScoped` wording corrected: a reserved plaintext scoped tag
+excluded from generic lookup is **query-projection control**, not
+fanout control, unless recipients and forwarded propagation are
+actually restricted.
 
 ---
 
-## 11. Execution checklist (run only when authorized)
+## Witness matrix (E0–E2)
+
+Substrate (E0): 1 non-destructive duplicate registration returns
+occupied without mutating; 2 stale handle cannot evict a newer
+registration; 3 failed/duplicate registration leaves no tag/policy;
+4 channel A + payload B service-confusion → deny, neither handler runs
+(both directions); 5 colliding-bucket control frame bound to
+`(caller, call_id, registration_id)`; 6 direct-session caller binding;
+7 relayed protected request denied; 8 forged `origin_hash` vs session
+entity denied; 9 clock-step: freshness+retention from one sample.
+
+Admission (E1): 10 cross-org admit end-to-end with four-party
+attribution; 11 owner-delegated admit; 12 each deny class → 0x0009 with
+coarse reason (missing/dup header, malformed, member-binding, foreign
+issuer, target-not-covered, insufficient rights, revoked floor,
+transplanted binding, replay, call-id collision, expired, policy veto);
+13 missing registration policy NEVER falls back — loud deny;
+14 provider owner cert expires after registration → `ProviderAuthority
+Unavailable`; 15 provider floor rises after registration → deny;
+16 floor raise DURING verification (paused) → no replay record, handler
+never runs; 17 authority replaced mid-admission → retry/deny; 18 active
+store poisoned mid-admission → deny; 19 provider-policy result reaches
+the live gate; 20 `Admitted` reaches the handler AND the raw proof
+header does not; 21 one caller cannot consume another caller's replay
+allocation; 22 protected streaming/client-streaming/duplex cannot
+bypass; 23 concurrent duplicate proof invokes the inner handler EXACTLY
+once; 24 Public unchanged (with and without an installed authority);
+25 authority-dark node (no protected registrations) == pre-OA-2.
+
+Caller/wire (E2): 26 `call()` builds a valid proof end-to-end;
+27 mixed-version: NEW caller → OLD provider does not become protected
+(old provider applies legacy gate); 28 coarse external reason is not a
+credential oracle.
+
+---
+
+## Boundary / risk register
+
+- `may_execute` byte-for-byte identical (re-verify after E1).
+- **No fail-open path**: no unknown-policy fallback; org-protected
+  without authority / with a bad or missing proof / with an unhealthy
+  authority all DENY; a handler never runs for an unverified call.
+- **One seam**: `caller + service + policy → handler` is atomic,
+  collision-safe (E0.1/E0.2), and end-to-end-authenticated (E0.3).
+- **Replay before handler; stability before replay** (E1.4) — a
+  handler never runs twice for one `(caller, call_id)`, and a stale
+  view never consumes a slot.
+- **One clock sample** drives freshness + retention (E0.4).
+- Digest via the existing RPC codec, shared caller/provider (E1.7).
+- Admission reads review-11-correct accessors (installed store
+  snapshot, persisted skew); it does not touch the `StoreCore` /
+  `PublishGuard` / send-seqlock surfaces or `may_execute`.
+- Visibility deferred to OA-3; E1 registration rejects non-`Public`.
+
+---
+
+## Execution checklist (run only when authorized)
 
 - [ ] Gate 1: OA-1 review-11 signed off.
-- [ ] Gate 2: OA2-A–E-partial audited as unwired.
-- [ ] `RegisteredCapability` + registry surface + org-protected-needs-
-      authority refusal.
-- [ ] `request_digest` canonical helper (shared caller/provider).
-- [ ] `RpcStatus::AdmissionDenied = 0x0009` + round-trip.
-- [ ] Per-node `AdmissionReplayGuard` + eviction.
-- [ ] Callee gate: policy-directed selection; `AdmissionContext`
-      assembly; deny→status/reason mapping.
-- [ ] Emission-by-visibility branch (+ `GrantedAudience` byte-absence).
-- [ ] Witnesses §9.1–§9.8.
+- [ ] Gate 2: OA2-A–E-partial primitives audited.
+- [ ] Gate 3: this revised design accepted.
+- [ ] OA2-E0 landed + reviewed (non-destructive registration,
+      channel/service equality, registration-bound call state,
+      caller-identity model, single clock sample).
+- [ ] OA2-E1: registration-owned policy; live self-verify; admission
+      stamp + §9.5 ordering; per-caller replay; policy + `Admitted`
+      wiring + header strip; shared canonical digest; unary boundary;
+      witnesses 10–25.
+- [ ] OA2-E2: proof-intent builder; `RpcStatus 0x0009` + coarse
+      reasons; mixed-version fleet gate; witnesses 26–28.
 - [ ] Gates: `may_execute` byte-identity, fmt, both clippy, full lib +
-      org_ownership + CLI + a new org_admission_wire integration file.
-- [ ] Then OA2-F (CLI/SDK + §2.6 gate).
+      org_ownership + CLI + new org_admission_wire integration file.
+- [ ] OA-3 (separate): visibility state machine.
+- [ ] OA2-F: CLI/SDK grant management + §2.6 gate.
 ```
