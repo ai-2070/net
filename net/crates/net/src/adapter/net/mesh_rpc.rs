@@ -2674,6 +2674,16 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
+        // OA2-E0 (Kyra E0 review): publish the token-owned service
+        // registration AND refresh the self-index BEFORE the bridge is
+        // exposed, so no inbound event can be processed before the
+        // local registration/discovery state exists (the unary and
+        // response-streaming paths already do this). The dispatcher
+        // above only buffers into the mpsc; the bridge that drains it
+        // is spawned LAST.
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
+        self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
@@ -2697,8 +2707,6 @@ impl MeshNode {
                 }
             }
         });
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
         Ok(ServeHandle {
             channel_hash,
             registration_id,
@@ -2934,6 +2942,12 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
+        // OA2-E0 (Kyra E0 review): publish + self-index BEFORE the
+        // bridge is exposed (see serve_rpc_client_stream). The
+        // dispatcher only buffers; the bridge drains it LAST.
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
+        self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
@@ -2957,8 +2971,6 @@ impl MeshNode {
                 }
             }
         });
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
         Ok(ServeHandle {
             channel_hash,
             registration_id,
