@@ -727,6 +727,15 @@ impl OrgRevocationStore {
         }
     }
 
+    /// Number of raise subscribers currently registered on the
+    /// shared core (test/metric surface). Used by the review-11 P2
+    /// leak witness to prove a dropped node unsubscribed its
+    /// callback.
+    #[doc(hidden)]
+    pub fn subscriber_count(&self) -> usize {
+        self.core.subscribers.read().len()
+    }
+
     /// Register `callback` as ONE subscriber in the core's raise
     /// registry and return its removable token (review-9 addendum:
     /// subscription is a registry, not a single replaceable slot —

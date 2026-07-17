@@ -1722,3 +1722,51 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Review-11 P2 — subscription lifecycle (no core/callback leak on node drop).
+// ---------------------------------------------------------------------------
+
+/// Review-11 P2: dropping a node unsubscribes its raise callback
+/// from the installed store's shared core. Without the RAII
+/// unsubscription the core retains a callback capturing the node's
+/// org_revocation slot (core → callback → slot → store → core), a
+/// cycle that outlives the node and leaks the core plus its stale
+/// fold. Here the test keeps the store handle alive but drops the
+/// node, and the core's subscriber count returns to zero.
+#[tokio::test]
+async fn dropping_a_node_unsubscribes_its_raise_callback() {
+    let dir = scratch_dir("r11-leak");
+    let store =
+        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    assert_eq!(store.subscriber_count(), 0);
+
+    let node = build_node().await;
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    assert_eq!(
+        store.subscriber_count(),
+        1,
+        "installation registers exactly one node subscriber"
+    );
+
+    // Drop the node (the test holds the only strong Arc, and an
+    // unstarted node has no background task pinning it). Its Drop
+    // must remove the callback from the shared core.
+    drop(node);
+    assert_eq!(
+        store.subscriber_count(),
+        0,
+        "a dropped node must unsubscribe — else the core/callback leaks"
+    );
+
+    // The store still works after the node is gone (a raise simply
+    // notifies nobody now).
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(EntityKeypair::generate().entity_id().clone(), 5u32);
+    store
+        .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+        .expect("raise after node drop");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

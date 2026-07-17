@@ -22352,6 +22352,19 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+        // Review-11 P2: unsubscribe this node's raise callback from
+        // its installed store. Without this, the callback the
+        // shared `StoreCore` retains captures the node's
+        // `org_revocation` slot (an `ArcSwapOption` holding the
+        // installed store, which holds the core), forming a
+        // core → callback → slot → store → core cycle that outlives
+        // the node — the core, its old callback, and the stale fold
+        // it captures never drop. Removing the callback breaks the
+        // cycle so the core is released once the last store handle
+        // drops.
+        if let Some((store, token)) = self.org_raise_subscription.lock().take() {
+            store.unsubscribe_floors_raised(token);
+        }
     }
 }
 
