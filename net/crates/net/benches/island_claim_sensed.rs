@@ -35,11 +35,17 @@
 //!     ICB-4: rejected-apply delta EXACTLY ONE, direct observer visibility.
 //!
 //! Absence of sensed evidence never becomes negative evidence: an UNSENSED host
-//! (no readiness branch) is retained in `match_islands_sensed` (W6); a NotReady
-//! host is pruned from THIS match only and never suspends the capability entry
-//! (W5, §4.9). Honesty (carried from ICB-4): a losing reserve still gossips, so
-//! O also observes the pre-held island held by A — orthogonal to the fallback
-//! outcome.
+//! (no readiness branch) is retained in `match_islands_sensed` (W6 — this
+//! benchmark proves the UNSENSED case only; `potential`/Unknown retention is a
+//! production unit concern, not re-claimed here); a NotReady host is pruned from
+//! THIS match only and never suspends the capability entry, proven both
+//! behaviorally (plain match) and structurally (byte-identical capability entry)
+//! (W5, §4.9).
+//!
+//! The pre-held first island is PRE-CONVERGED at BOTH A and O, so A's losing
+//! reserve of it is rejected at O (O already knows H) — the known-state first
+//! island stays `H` at both nodes and only ISLAND_R moves under the fallback.
+//! Every fallback sample asserts the full shape at both nodes.
 //!
 //! Results are localhost MECHANISM/orientation evidence: no arbitration,
 //! tie-break, quorum, or fencing is added to make anything pass; ICB-3's
@@ -93,6 +99,10 @@ const LOAD_R: f32 = 0.1;
 /// evidence retention witness (W6). Fictional host id.
 const HOST_X: u64 = 0x5C00_0C01;
 const ISLAND_X: u64 = 0x5C00_00C1;
+/// Explicit long fixture TTL so the fold sweeper never removes a seeded
+/// capability / island entry mid-run (the fixture is seeded once for the whole
+/// bench — a loaded run must not lose islands halfway through).
+const FIXTURE_TTL_SECS: u32 = 3_600;
 
 /// Interest cadence (mirrors the SI-6 bridge witness).
 const TTL: Duration = Duration::from_millis(1500);
@@ -118,8 +128,9 @@ fn main() {
         w1_opposing_order(&fix, &budget);
         w2_selected_receives_first_claim(&fix, &budget).await;
         w6_absence_of_evidence_retained(&fix, &budget);
-        // From here A's island is pre-held by H (the reservation-fallback state).
-        apply_reserve(fix.a.reservation_fold(), &fix.h, ISLAND_A, 1);
+        // From here ISLAND_A is the pre-CONVERGED known-state first island
+        // (held by H at BOTH A and O), so the fallback moves only ISLAND_R.
+        preconverge_first_island(&fix).await;
         w4_sensed_reservation_fallback(&fix, &budget).await;
         w3_w5_reselection_and_no_suspension(&fix, &budget).await;
 
@@ -204,6 +215,15 @@ fn criteria() -> MatchCriteria {
     }
 }
 
+/// Explicit long-TTL fixture envelope (nothing expires mid-run).
+fn fixture_meta() -> EnvelopeMeta {
+    EnvelopeMeta {
+        announced_at: 0,
+        ttl_secs: Some(FIXTURE_TTL_SECS),
+        flags: 0,
+    }
+}
+
 /// Gang capability membership for `host_id` on `node`'s fold.
 fn seed_gang_capability(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u64) {
     let membership = CapabilityMembership {
@@ -225,7 +245,7 @@ fn seed_gang_capability(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u
         GANG_CLASS,
         host_id,
         1,
-        EnvelopeMeta::default(),
+        fixture_meta(),
         membership,
     )
     .expect("sign gang cap");
@@ -248,7 +268,7 @@ fn seed_island(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u64, islan
         0,
         host_id,
         1,
-        EnvelopeMeta::default(),
+        fixture_meta(),
         record,
     )
     .expect("sign island");
@@ -413,6 +433,50 @@ async fn await_selected(fix: &Fixture, budget: &ConsumerLatencyBudget, expected:
     );
 }
 
+/// The gang capability membership `host_id` publishes in `node`'s fold.
+fn gang_membership(node: &Arc<MeshNode>, host_id: u64) -> CapabilityMembership {
+    node.capability_fold()
+        .query(CapabilityQuery::InClass(GANG_CLASS))
+        .into_iter()
+        .find(|((_, id), _)| *id == host_id)
+        .map(|(_, m)| m)
+        .unwrap_or_else(|| panic!("no gang membership for {host_id:#x}"))
+}
+
+/// Pre-CONVERGE the known-state first island: apply H's exact reservation of
+/// ISLAND_A to BOTH the claimant A and the observer O, and await exact `H` at
+/// each. Because O now knows H holds ISLAND_A, A's LOSING reserve of it
+/// (broadcast even when Rejected locally) is rejected at O too — so the first
+/// island stays `H` at both nodes and only ISLAND_R moves under the fallback.
+async fn preconverge_first_island(fix: &Fixture) {
+    let h_id = fix.h.node_id();
+    apply_reserve(fix.a.reservation_fold(), &fix.h, ISLAND_A, 1);
+    apply_reserve(fix.o.reservation_fold(), &fix.h, ISLAND_A, 1);
+    assert!(
+        wait_until(RESET_TIMEOUT, || {
+            holder_of(fix.a.reservation_fold(), ISLAND_A) == Some(h_id)
+                && holder_of(fix.o.reservation_fold(), ISLAND_A) == Some(h_id)
+        })
+        .await,
+        "ISLAND_A must be pre-converged to H at BOTH A and O"
+    );
+}
+
+/// Assert the pre-converged first island is `H` at BOTH A and O.
+fn assert_first_island_is_h(fix: &Fixture) {
+    let h_id = fix.h.node_id();
+    assert_eq!(
+        holder_of(fix.a.reservation_fold(), ISLAND_A),
+        Some(h_id),
+        "A must see ISLAND_A held by H"
+    );
+    assert_eq!(
+        holder_of(fix.o.reservation_fold(), ISLAND_A),
+        Some(h_id),
+        "O must see ISLAND_A held by H (A's losing reserve is rejected at O)"
+    );
+}
+
 // ============================================================================
 // Witnesses.
 // ============================================================================
@@ -504,10 +568,10 @@ fn w6_absence_of_evidence_retained(fix: &Fixture, budget: &ConsumerLatencyBudget
 }
 
 /// W4 — RESERVATION FALLBACK through the sensed path (ICB-5b core): A stays
-/// sensed-selected and first, but ISLAND_A is pre-held by H →
-/// `claim_island_sensed` reserves ISLAND_A (Rejected), walks to R's island, and
-/// commits ISLAND_R. Rejected-apply delta EXACTLY ONE; ISLAND_A stays held by
-/// H. Assumes ISLAND_A already pre-held. Releases ISLAND_R at the end.
+/// sensed-selected and first, but ISLAND_A is the pre-CONVERGED known state
+/// (`H` at BOTH A and O) → `claim_island_sensed` reserves ISLAND_A (Rejected),
+/// walks to R's island, and commits ISLAND_R. Rejected-apply delta EXACTLY ONE;
+/// the full known-state shape holds at both nodes (ISLAND_A=H, ISLAND_R=A).
 async fn w4_sensed_reservation_fallback(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     assert_eq!(
         fix.a
@@ -516,13 +580,23 @@ async fn w4_sensed_reservation_fallback(fix: &Fixture, budget: &ConsumerLatencyB
         Some(fix.a_id),
         "A must still be the selected provider"
     );
+    assert_first_island_is_h(fix); // known state at A AND O before the claim
+    let mut o_rx = fix.o.reservation_fold().subscribe_changes();
+    let deadline = far_deadline(); // outside the observed endpoint
     let before = fix.a.reservation_fold().stats().applies_rejected;
     let claimed = fix
         .a
-        .claim_island_sensed(&criteria(), &fix.spec, budget, None, far_deadline())
+        .claim_island_sensed(&criteria(), &fix.spec, budget, None, deadline)
         .await
         .expect("claim")
         .expect("the fallback island is claimable");
+    // Observe R's island at O BEFORE reading stats.
+    tokio::time::timeout(
+        REMOTE_DEADLINE,
+        await_reservation_holder(&mut o_rx, fix.o.reservation_fold(), ISLAND_R, fix.a_id),
+    )
+    .await
+    .expect("O observes ISLAND_R held by A");
     let delta = fix.a.reservation_fold().stats().applies_rejected - before;
     assert_eq!(
         claimed, ISLAND_R,
@@ -532,14 +606,21 @@ async fn w4_sensed_reservation_fallback(fix: &Fixture, budget: &ConsumerLatencyB
         delta, 1,
         "exactly one rejected apply (the attempt on held A)"
     );
+    // Full known-state shape at BOTH nodes: ISLAND_A=H, ISLAND_R=A.
+    assert_first_island_is_h(fix);
     assert_eq!(
-        holder_of(fix.a.reservation_fold(), ISLAND_A),
-        Some(fix.h.node_id()),
-        "ISLAND_A remains held by H"
+        held_islands(&fix.a, fix.a_id),
+        vec![ISLAND_R],
+        "A holds only R's island"
+    );
+    assert_eq!(
+        holder_of(fix.o.reservation_fold(), ISLAND_R),
+        Some(fix.a_id),
+        "O sees ISLAND_R held by A"
     );
     release_and_await_free(&fix.a, &[&fix.o], ISLAND_R, RESET_TIMEOUT).await;
     println!(
-        "  [PASS] W4 sensed fallback: A selected, ISLAND_A held → walk to R (rejected-delta=1)"
+        "  [PASS] W4 sensed fallback: ISLAND_A=H at A&O → walk to R (rejected-delta=1; R=A at A&O)"
     );
 }
 
@@ -550,6 +631,22 @@ async fn w4_sensed_reservation_fallback(fix: &Fixture, budget: &ConsumerLatencyB
 /// suspends the capability entry). The re-selected claim wins R's island with
 /// NO rejection. Restores A Ready.
 async fn w3_w5_reselection_and_no_suspension(fix: &Fixture, budget: &ConsumerLatencyBudget) {
+    // Capture the exact gang capability entries BEFORE the transition (both are
+    // Idle) — the §4.9 non-suspension claim is about the capability ENTRY, not
+    // just matcher survival.
+    let a_mem_before = gang_membership(&fix.a, fix.a_id);
+    let r_mem_before = gang_membership(&fix.a, fix.r_id);
+    assert_eq!(
+        a_mem_before.state,
+        NodeState::Idle,
+        "A gang entry Idle before"
+    );
+    assert_eq!(
+        r_mem_before.state,
+        NodeState::Idle,
+        "R gang entry Idle before"
+    );
+
     fix.a_ready.store(false, Ordering::Relaxed);
     fix.a.notify_sensing_state_changed(&fix.cap);
     assert!(
@@ -574,11 +671,23 @@ async fn w3_w5_reselection_and_no_suspension(fix: &Fixture, budget: &ConsumerLat
         vec![ISLAND_R],
         "a NotReady host is pruned from THIS match"
     );
-    // §4.9: no suspension — the PLAIN match still offers both hosts' islands.
+    // §4.9 no suspension — BEHAVIORAL: the PLAIN match still offers both islands.
     assert_eq!(
         fix.a.match_islands(&criteria()),
         vec![ISLAND_R, ISLAND_A],
         "NotReady for one interest must NOT suspend the capability entry"
+    );
+    // §4.9 no suspension — STRUCTURAL: the capability ENTRIES are byte-identical
+    // across the readiness transition (still Idle; nothing mutated or suspended).
+    assert_eq!(
+        gang_membership(&fix.a, fix.a_id),
+        a_mem_before,
+        "A's gang capability entry must be byte-identical across the NotReady flip"
+    );
+    assert_eq!(
+        gang_membership(&fix.a, fix.r_id),
+        r_mem_before,
+        "R's gang capability entry must be byte-identical across the NotReady flip"
     );
 
     let before = fix.a.reservation_fold().stats().applies_rejected;
@@ -607,33 +716,65 @@ async fn w3_w5_reselection_and_no_suspension(fix: &Fixture, budget: &ConsumerLat
 // Measurement.
 // ============================================================================
 
+/// The one-line fixture/group descriptor shared by every measurement row.
+fn print_fixture_metadata() {
+    println!(
+        "   fixture: island_pop=2 eligible_islands=2 units/island={ISLAND_UNITS} claimants=1 providers=2(A,R) logical_sessions=1(A↔R) observer_sessions=1(A↔O) topology=direct-mesh relays=0 routed=no policy=LeastLoaded mode=sensed reservation_deadline=far-future(precomputed; no takeover — ICB-6) workers={WORKER_THREADS}"
+    );
+}
+
+/// The iterations/warmups line — states plainly that p99 is orientation only.
+fn print_group_note(iterations: u64, warmups: u64) {
+    println!(
+        "   iterations={iterations} warmups_discarded={warmups} measured={} · p99 is orientation only, NOT a baseline/threshold (baselines are ICB-7)",
+        iterations - warmups
+    );
+}
+
 /// ICB-5b — reservation fallback through the sensed path. A stays selected;
-/// ISLAND_A pre-held; each sample walks to R's island. Two boundaries from one
-/// claim start: fallback API return and direct observer visibility.
+/// ISLAND_A is the pre-CONVERGED known state (H at A AND O); each sample walks
+/// to R's island. Two boundaries from one claim start: fallback API return and
+/// direct observer visibility (observed BEFORE any stats read).
 async fn measure_5b(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     await_selected(fix, budget, fix.a_id).await; // A selected, first in sensed order
+    let crit = criteria();
+    // Population stability before the timed group (long fixture TTL — nothing
+    // expired) + pre-converged first island at both nodes.
+    assert_eq!(
+        fix.a.match_islands(&crit),
+        vec![ISLAND_R, ISLAND_A],
+        "island population must be intact before the 5b group"
+    );
+    assert_first_island_is_h(fix);
+    let deadline = far_deadline(); // fixture/policy setup — outside timing
     let mut api = LatencyReport::new();
     let mut remote = LatencyReport::new();
-    let crit = criteria();
 
     for s in 0..SAMPLES {
+        // Known-state precondition at BOTH nodes.
+        assert_first_island_is_h(fix);
         assert_eq!(
-            holder_of(fix.a.reservation_fold(), ISLAND_A),
-            Some(fix.h.node_id())
+            holder_of(fix.a.reservation_fold(), ISLAND_R),
+            None,
+            "A: ISLAND_R free before claim"
         );
-        assert_eq!(holder_of(fix.a.reservation_fold(), ISLAND_R), None);
+        assert_eq!(
+            holder_of(fix.o.reservation_fold(), ISLAND_R),
+            None,
+            "O: ISLAND_R free before claim"
+        );
         let mut o_rx = fix.o.reservation_fold().subscribe_changes();
         let before = fix.a.reservation_fold().stats().applies_rejected;
 
         let t0 = Instant::now();
         let claimed = fix
             .a
-            .claim_island_sensed(&crit, &fix.spec, budget, None, far_deadline())
+            .claim_island_sensed(&crit, &fix.spec, budget, None, deadline)
             .await
             .expect("claim")
             .expect("fallback island");
         let api_dt = t0.elapsed();
-        let delta = fix.a.reservation_fold().stats().applies_rejected - before;
+        // Observe R's island at O — the endpoint — BEFORE any stats read.
         tokio::time::timeout(
             REMOTE_DEADLINE,
             await_reservation_holder(&mut o_rx, fix.o.reservation_fold(), ISLAND_R, fix.a_id),
@@ -641,9 +782,12 @@ async fn measure_5b(fix: &Fixture, budget: &ConsumerLatencyBudget) {
         .await
         .expect("O observes ISLAND_R held by A");
         let remote_dt = t0.elapsed();
+        let delta = fix.a.reservation_fold().stats().applies_rejected - before;
 
         assert_eq!(claimed, ISLAND_R, "fallback claims R's island");
         assert_eq!(delta, 1, "exactly one rejected apply per fallback");
+        // Full known-state shape at BOTH nodes: ISLAND_A=H, ISLAND_R=A.
+        assert_first_island_is_h(fix);
         assert_eq!(
             held_islands(&fix.a, fix.a_id),
             vec![ISLAND_R],
@@ -652,7 +796,12 @@ async fn measure_5b(fix: &Fixture, budget: &ConsumerLatencyBudget) {
         assert_eq!(
             held_islands(&fix.a, fix.h.node_id()),
             vec![ISLAND_A],
-            "H still holds A's island"
+            "H holds only ISLAND_A at A"
+        );
+        assert_eq!(
+            holder_of(fix.o.reservation_fold(), ISLAND_R),
+            Some(fix.a_id),
+            "O sees ISLAND_R held by A"
         );
 
         if s >= WARMUP {
@@ -666,28 +815,44 @@ async fn measure_5b(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     remote
         .print_row("ICB-5b · direct remote visibility (O reads R's island held by A) · mechanism");
     println!(
-        "   label=\"sensed reservation fallback, single claimant\" · selected_provider=A · first_island=A(held-by-H) · final_island=R · rejected_delta=1/sample · claimant=1 (no coordinator; distributed-race framing DISCLAIMED)"
+        "   label=\"sensed reservation fallback, single claimant\" · selected_provider=A · first_island=ISLAND_A(pre-converged H at A&O) · final_island=R · rejected_delta=1/sample · distributed-race framing DISCLAIMED"
     );
+    print_fixture_metadata();
+    print_group_note(SAMPLES, WARMUP);
     println!();
 }
 
 /// ICB-5a — sensed re-selection. With A flipped NotReady, R is the selected
 /// provider; each on-demand claim wins R's island directly (no rejection). The
 /// re-selection (A→R) is the changed SELECTION, not a reservation conflict.
+/// Restores A Ready AND awaits settlement before returning (so the overhead
+/// group that follows measures the steady sensed state, not a transition).
 async fn measure_5a(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     fix.a_ready.store(false, Ordering::Relaxed);
     fix.a.notify_sensing_state_changed(&fix.cap);
     await_selected(fix, budget, fix.r_id).await;
-
-    let mut claim = LatencyReport::new();
     let crit = criteria();
+    // Precondition: sensed match is R only (A pruned); plain still offers both.
+    assert_eq!(
+        fix.a.match_islands_sensed(&crit, &fix.spec, budget, None),
+        vec![ISLAND_R],
+        "5a precondition: sensed match is R only"
+    );
+    assert_eq!(
+        fix.a.match_islands(&crit),
+        vec![ISLAND_R, ISLAND_A],
+        "5a precondition: plain match still offers both"
+    );
+    let deadline = far_deadline();
+    let mut claim = LatencyReport::new();
+
     for s in 0..SAMPLES {
         assert_eq!(holder_of(fix.a.reservation_fold(), ISLAND_R), None);
         let before = fix.a.reservation_fold().stats().applies_rejected;
         let t0 = Instant::now();
         let claimed = fix
             .a
-            .claim_island_sensed(&crit, &fix.spec, budget, None, far_deadline())
+            .claim_island_sensed(&crit, &fix.spec, budget, None, deadline)
             .await
             .expect("claim")
             .expect("re-selected island");
@@ -701,26 +866,50 @@ async fn measure_5a(fix: &Fixture, budget: &ConsumerLatencyBudget) {
         if s >= WARMUP {
             claim.record(dt.as_nanos() as u64);
         }
-        release_and_await_free(&fix.a, &[], ISLAND_R, RESET_TIMEOUT).await;
+        // Reset — await exact Free at BOTH the claimant and the observer.
+        release_and_await_free(&fix.a, &[&fix.o], ISLAND_R, RESET_TIMEOUT).await;
     }
 
-    // Restore A Ready for the overhead section.
+    // Restore A Ready and SETTLE (fail-loud) before returning.
     fix.a_ready.store(true, Ordering::Relaxed);
     fix.a.notify_sensing_state_changed(&fix.cap);
-    // (settle handled by await_selected inside measure_projection_overhead)
+    await_selected(fix, budget, fix.a_id).await;
 
     claim.print_row("ICB-5a · re-selected-provider claim (sensed, on-demand) · mechanism");
     println!(
         "   label=\"sensed re-selection, single claimant\" · selection_change=A→R (overlay: A NotReady) · claimed=R · rejected_delta=0/sample (no spurious rejection) · on-demand (bench-invoked after the overlay change)"
     );
+    print_fixture_metadata();
+    print_group_note(SAMPLES, WARMUP);
     println!();
 }
 
 /// Sensed-projection overhead: the cost the sensed join ADDS over the plain
-/// matcher (read-only; no claim). Reported as two mechanism rows, not a
+/// matcher (read-only; no claim). Precondition is pinned once BEFORE timing
+/// (measure_5a settled A back to selected) so the loop measures the STEADY
+/// sensed state, never a NotReady/transition mixture. Two mechanism rows, not a
 /// threshold. Does NOT restate capability-propagation latency (CPB owns it).
 fn measure_projection_overhead(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     let crit = criteria();
+    // Steady-state precondition (settled by measure_5a).
+    assert_eq!(
+        fix.a
+            .sensed_candidates(&fix.spec, budget, None)
+            .selected_provider(),
+        Some(fix.a_id),
+        "overhead precondition: A selected"
+    );
+    assert_eq!(
+        fix.a.match_islands(&crit),
+        vec![ISLAND_R, ISLAND_A],
+        "overhead precondition: plain order == [R, A]"
+    );
+    assert_eq!(
+        fix.a.match_islands_sensed(&crit, &fix.spec, budget, None),
+        vec![ISLAND_A, ISLAND_R],
+        "overhead precondition: sensed order == [A, R]"
+    );
+
     let mut plain = LatencyReport::new();
     let mut sensed = LatencyReport::new();
     for i in 0..500u64 {
@@ -741,7 +930,9 @@ fn measure_projection_overhead(fix: &Fixture, budget: &ConsumerLatencyBudget) {
     sensed
         .print_row("ICB-5 · match_islands_sensed (sensed join = plain + Projection 6) · mechanism");
     println!(
-        "   sensed-projection overhead = sensed − plain (the readiness join + re-rank cost) · workers={WORKER_THREADS}"
+        "   sensed-projection overhead = sensed − plain (the readiness join + re-rank cost) · precondition: selected=A, plain=[R,A], sensed=[A,R]"
     );
+    print_fixture_metadata();
+    print_group_note(500, 50);
     println!();
 }
