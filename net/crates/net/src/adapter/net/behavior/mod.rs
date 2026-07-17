@@ -48,7 +48,10 @@ pub mod meshos;
 // it needs both gates.
 pub mod metadata;
 pub mod org;
+pub mod org_admission_replay;
 pub mod org_authority;
+pub mod org_call;
+pub mod org_grant;
 pub mod org_revocation;
 pub mod placement;
 pub mod placement_registry;

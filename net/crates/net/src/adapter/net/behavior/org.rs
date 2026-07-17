@@ -250,8 +250,11 @@ impl OrgKeypair {
         self.signing_key.as_bytes()
     }
 
-    /// Sign a message with the org root key.
-    fn sign(&self, message: &[u8]) -> Signature {
+    /// Sign a message with the org root key. `pub(crate)`: the
+    /// OA-2 grant family (`org_grant.rs`) signs through the same
+    /// root; the public issuing surfaces remain the typed
+    /// `try_issue` paths, never raw signing.
+    pub(crate) fn sign(&self, message: &[u8]) -> Signature {
         self.signing_key.sign(message)
     }
 }
@@ -313,6 +316,27 @@ pub enum OrgError {
     /// non-canonical bundle is rejected before its signature is
     /// even examined.
     NonCanonicalFloors,
+    /// A capability grant carries the all-zero `grant_id` (OA-2).
+    /// Zero is RESERVED — it is the owner-audience envelope
+    /// sentinel in OA-3's associated data — so issuance and decode
+    /// both reject it (plan v1.3 carry-forward).
+    ReservedGrantId,
+    /// A capability grant violates the structural rule
+    /// `rights ⊇ DISCOVER ⇔ discovery binding present` (OA-2
+    /// §2.2): DISCOVER without a binding grants a right with no
+    /// audience, a binding without DISCOVER smuggles audience
+    /// material into a grant that confers no discovery. Enforced
+    /// at issue AND decode.
+    DiscoveryBindingMismatch,
+    /// A grant's rights bitset carries bits this build does not
+    /// know (OA-2). Unknown rights could widen authority under an
+    /// old verifier — wire evolution is honest, so they refuse
+    /// loudly instead of being masked off.
+    UnknownRights,
+    /// A grant's rights bitset is empty (OA-2). A credential that
+    /// permits nothing is structurally meaningless — minting or
+    /// accepting it can only hide a caller bug.
+    EmptyRights,
 }
 
 impl std::fmt::Display for OrgError {
@@ -342,6 +366,15 @@ impl std::fmt::Display for OrgError {
             Self::NonCanonicalFloors => {
                 write!(f, "revocation bundle floors are not in canonical order")
             }
+            Self::ReservedGrantId => {
+                write!(f, "grant_id zero is reserved (owner-audience sentinel)")
+            }
+            Self::DiscoveryBindingMismatch => write!(
+                f,
+                "grant violates rights ⊇ DISCOVER ⇔ discovery binding present"
+            ),
+            Self::UnknownRights => write!(f, "grant rights carry unknown bits"),
+            Self::EmptyRights => write!(f, "grant rights are empty"),
         }
     }
 }
@@ -905,7 +938,9 @@ fn hex_short(bytes: &[u8]) -> String {
 
 /// Unix seconds. Matches the token module's private helper —
 /// pre-epoch clocks collapse to 0 rather than panicking.
-fn current_timestamp() -> u64 {
+/// Unix seconds now. `pub(crate)`: the OA-2 grant family
+/// (`org_grant.rs`) shares the org module's clock discipline.
+pub(crate) fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
