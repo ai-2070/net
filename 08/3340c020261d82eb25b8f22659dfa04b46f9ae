@@ -1,0 +1,56 @@
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_9298fd786cc20e::t_95a718db44d087 54-56
+  s_9298fd786cc20e::t_938cc0570329c0 71
+net/crates/net/tests/integration_nrpc_loopback.rs
+  s_9298fd786cc20e::t_a760f670958bc9 53,55-60
+net/crates/net/tests/integration_nrpc_cross_lang.rs
+  s_9298fd786cc20e::t_4998deaeee5bcc 115,117-120
+net/crates/net/tests/nrpc_route_discriminator.rs
+  s_9298fd786cc20e::t_10bb4289e45d6a 123-125
+  s_9298fd786cc20e::t_938cc0570329c0 26-27,183-187,200-204,207-210,224-225,248-255
+  s_9298fd786cc20e::t_02b91c312aec00 1-25,28-122,126-182,188-199,205-206,211-223,226-247,256-275
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_9298fd786cc20e::t_4998deaeee5bcc 183,185-188
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_f27164b7dbb503 995,997
+  s_9298fd786cc20e::t_8555c93a73a49b 3088,3539
+  s_9298fd786cc20e::t_8a0cfa0e8f198c 1653-1654,1656
+  s_9298fd786cc20e::t_b9fb8387e3af35 38
+  s_9298fd786cc20e::t_dab587b86cd738 47
+  s_9298fd786cc20e::t_54732ae12ac95d 1776-1781
+  s_9298fd786cc20e::t_938cc0570329c0 3086,3537
+  s_9298fd786cc20e::t_c9e94489bf034b 1248,1250
+  s_9298fd786cc20e::t_6bdba69fd005e1 568,570
+  s_9298fd786cc20e::t_3914baee31653c 694,696
+  s_9298fd786cc20e::t_9b148f917804af 1815-1820
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_9298fd786cc20e::t_6b4d12477e9789 136-158
+  s_9298fd786cc20e::t_0ff1082b897586 3042,3471,3960,4046
+  s_9298fd786cc20e::t_001ce393ace28c 2535,3977,4066
+  s_9298fd786cc20e::t_e02b4cc84df119 4664-4667,4677-4679,5196-5199,5442-5445,5571-5574,5668-5671,5791-5794,5839-5842,5903-5906,6268-6271,6317-6320
+  s_9298fd786cc20e::t_33891a7a68b61f 103-135,159-164,167-187
+  s_9298fd786cc20e::t_28a96a8452958a 165-166
+  s_9298fd786cc20e::t_75605ef2f0eb3d 1001-1002,1008
+  s_9298fd786cc20e::t_443ddb1f6e4456 4619
+  s_9298fd786cc20e::t_938cc0570329c0 1602-1626,2242-2272,2781-2799,3175-3201
+  s_9298fd786cc20e::t_b928654d2d1a89 4632
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_da5ecad6684587 10778-10789,10793-10799,10803-10812,10823-10854
+  s_9298fd786cc20e::t_938cc0570329c0 10790-10792
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "083340c020261d82eb25b8f22659dfa04b46f9ae",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
