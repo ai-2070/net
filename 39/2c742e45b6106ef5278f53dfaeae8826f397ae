@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  s_9298fd786cc20e::t_48c191ed76527e 604,649
+  s_9298fd786cc20e::t_6af3bff017968e 154-159
+  s_9298fd786cc20e::t_b0ecc0b9744995 653-660,671-678,937-938,956-957,963,980-981
+  s_9298fd786cc20e::t_82934d89204afa 942-955,958-962,964-979,982-984
+  s_9298fd786cc20e::t_fae9ced0e1feb6 397-409
+  s_9298fd786cc20e::t_4f8489aabf8737 237-251,260
+net/crates/net/src/adapter/net/org_admission_gate.rs
+  s_9298fd786cc20e::t_48c94c22fab1b9 191-224
+  s_9298fd786cc20e::t_042c946176ea3f 71-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "392c742e45b6106ef5278f53dfaeae8826f397ae",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
