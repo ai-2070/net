@@ -8,11 +8,20 @@
 //! (`EventMeta ‖ RpcRouteV1 ‖ payload`), published through the real
 //! network path, must reach only the dispatcher named by its route:
 //!
-//! - REQUEST / CANCEL / CHUNK / GRANT each single-select (2/3/4);
-//! - a route absent from the bucket drops (6);
-//! - a malformed/short discriminator drops (7);
-//! - the collision test IS the red-witness (9): under the removed
+//! - the initial REQUEST single-selects (dedicated test);
+//! - ALL SIX non-REQUEST nRPC dispatches — RESPONSE, CANCEL,
+//!   DEADLINE_EXCEEDED, STREAM_GRANT, REQUEST_CHUNK, REQUEST_GRANT —
+//!   likewise single-select, so every one of the seven classified
+//!   nRPC frame types is exercised;
+//! - a route absent from the bucket drops;
+//! - a malformed/short discriminator drops;
+//! - the collision test IS the red-witness: under the removed
 //!   fan-out both dispatchers would fire; here exactly one does.
+//!
+//! The complementary legacy path — a RAW (non-nRPC) event that has
+//! no `RpcRouteV1` and therefore intentionally fans out to every
+//! bucket-registered dispatcher — is pinned by
+//! `nrpc_inbound_dispatcher::raw_non_rpc_event_fans_out_to_every_bucket_dispatcher`.
 
 #![cfg(all(feature = "net", feature = "cortex"))]
 
@@ -24,7 +33,8 @@ use bytes::Bytes;
 use net::adapter::net::channel::wire_channel_hash;
 use net::adapter::net::cortex::{
     encode_rpc_route, EventMeta, RpcInboundDispatcher, RpcInboundEvent, DISPATCH_RPC_CANCEL,
-    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE,
+    DISPATCH_RPC_DEADLINE_EXCEEDED, DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK,
+    DISPATCH_RPC_REQUEST_GRANT, DISPATCH_RPC_RESPONSE, DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE,
     RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::{
@@ -211,15 +221,22 @@ async fn request_route_selects_exactly_one_colliding_dispatcher() {
     );
 }
 
-/// Witnesses 3/4: control frames (CANCEL, CHUNK, STREAM_GRANT)
-/// likewise mutate ONLY the dispatcher named by the canonical
-/// route — a colliding sibling never sees them.
+/// Every non-REQUEST nRPC dispatch — RESPONSE, CANCEL,
+/// DEADLINE_EXCEEDED, STREAM_GRANT, REQUEST_CHUNK, REQUEST_GRANT —
+/// likewise reaches ONLY the dispatcher named by the canonical
+/// route; a colliding sibling never sees it. Together with the
+/// dedicated REQUEST witness this exercises all SEVEN dispatch types
+/// that `is_rpc_dispatch_frame` classifies (route-selected, never
+/// fanned out).
 #[tokio::test]
 async fn control_frames_route_to_exactly_one_dispatcher() {
     for dispatch in [
+        DISPATCH_RPC_RESPONSE,
         DISPATCH_RPC_CANCEL,
-        DISPATCH_RPC_REQUEST_CHUNK,
+        DISPATCH_RPC_DEADLINE_EXCEEDED,
         DISPATCH_RPC_STREAM_GRANT,
+        DISPATCH_RPC_REQUEST_CHUNK,
+        DISPATCH_RPC_REQUEST_GRANT,
     ] {
         let c = Collision::new().await;
         c.deliver(rpc_frame(dispatch, c.ch1.hash(), &[0u8; 4]))

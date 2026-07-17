@@ -344,16 +344,24 @@ async fn registered_dispatcher_receives_published_events() {
     assert_eq!(events[0].payload.as_ref(), b"hello-rpc");
 }
 
-/// Wire-bucket collision: two canonical `ChannelHash` values share a
-/// wire `u16` bucket. When a packet arrives stamped with that wire
-/// hash, every dispatcher registered in the bucket must be invoked
-/// and each must receive its own canonical hash on the
-/// `RpcInboundEvent` — that's how dispatchers self-disambiguate.
+/// Legacy fan-out for RAW (non-nRPC) events under a wire-bucket
+/// collision. Two canonical `ChannelHash` values share a wire `u16`
+/// bucket. The published event here is a bare `b"collide"` payload —
+/// NOT an `EventMeta ‖ RpcRouteV1 ‖ …` nRPC frame — so mesh ingress
+/// classifies it as non-RPC and delivers it to EVERY dispatcher
+/// registered in the bucket, each tagged with its own canonical hash
+/// so a receiver can self-disambiguate.
 ///
-/// Pins the Many-entry branch of the inbound dispatch fast path,
-/// which lifts the common single-entry case out of the heap.
+/// This is deliberately the OPPOSITE of the nRPC route single-select
+/// (OA2-E0.2). It is NOT a contradiction: the route discriminator
+/// applies only to the seven `is_rpc_dispatch_frame` types
+/// (`nrpc_route_discriminator`); other users of the shared
+/// dispatcher map — e.g. the sensing intake — still ride the legacy
+/// fan-out that this test pins. It also exercises the Many-entry
+/// branch of the inbound dispatch fast path, which lifts the common
+/// single-entry case out of the heap.
 #[tokio::test]
-async fn wire_bucket_collision_fans_out_to_every_registered_canonical() {
+async fn raw_non_rpc_event_fans_out_to_every_bucket_dispatcher() {
     use net::adapter::net::channel::wire_channel_hash;
 
     // Find two valid channel names that share a wire `u16` bucket.
