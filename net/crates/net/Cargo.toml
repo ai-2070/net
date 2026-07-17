@@ -461,6 +461,56 @@ name = "capability_burst"
 harness = false
 required-features = ["net", "tool"]
 
+# ICB-0 harness self-test (island/gang claim benchmark). Not a measurement
+# bench — asserts the counting-router / delivery / exact-read witnesses.
+[[bench]]
+name = "island_claim_harness"
+harness = false
+required-features = ["net"]
+
+# ICB-1 ordinary matcher scaling: match_islands over a static fixture.
+[[bench]]
+name = "island_claim_match"
+harness = false
+required-features = ["net"]
+
+# ICB-2 single-claimant claim boundaries: local commit / API return /
+# remote visibility, from one common start (+ required witnesses).
+[[bench]]
+name = "island_claim_boundaries"
+harness = false
+required-features = ["net"]
+
+# ICB-3 distributed simultaneous-claim divergence diagnostic (2/4/8/16
+# claimants; right-censored agreement reporting + required witnesses).
+[[bench]]
+name = "island_claim_divergence"
+harness = false
+required-features = ["net"]
+
+# ICB-4 known-state fallback (SINGLE CLAIMANT): claim loop walks past one
+# pre-converged held island to the next free one; nine per-sample assertions.
+[[bench]]
+name = "island_claim_fallback"
+harness = false
+required-features = ["net"]
+
+# ICB-5 sensed selection / fallback (SINGLE CLAIMANT): 5a on-demand re-selection
+# + 5b reservation fallback over the real claim_island_sensed path; opposing
+# load/sensed seed.
+[[bench]]
+name = "island_claim_sensed"
+harness = false
+required-features = ["net", "redex"]
+
+# ICB-6 deadline-enabled takeover + runtime-entry expiry: two separately-labeled
+# recovery groups (foreign takeover CAS after a lapsed deadline; short-TTL entry
+# sweep) + the M5 short-TTL diagnostic.
+[[bench]]
+name = "island_claim_recovery"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
