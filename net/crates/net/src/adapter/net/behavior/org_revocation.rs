@@ -450,6 +450,18 @@ fn core_registry() -> &'static Mutex<std::collections::HashMap<PathBuf, std::syn
 /// create a fresh core seeded with that state. The caller MUST
 /// hold the interprocess state lock, which is what makes the
 /// reread current.
+///
+/// The republish through an EXISTING core takes that core's
+/// `reload` lock (review-11 P1): every `StoreCore::publish` — not
+/// only `apply_bundle`'s — must hold `reload`, or a replacement
+/// holding [`PublishGuard`] could be racing an opener that
+/// publishes a stronger floor between the guard's dominance
+/// comparison and its swap. The canonical order is interprocess
+/// file lock (already held by the caller) OUTER, `reload` INNER;
+/// [`OrgRevocationStore::apply_bundle`] obeys the same order, and
+/// a replacement holds only `reload` (never the file lock), so no
+/// cycle exists. The registry lock is released before `reload` is
+/// acquired so no `registry → reload` nesting can form.
 fn join_or_create_core(
     path: &Path,
     disk: OrgRevocationState,
@@ -457,9 +469,16 @@ fn join_or_create_core(
     let mut cores = core_registry().lock();
     cores.retain(|_, weak| weak.strong_count() > 0);
     if let Some(core) = cores.get(path).and_then(std::sync::Weak::upgrade) {
-        let raised = core.publish(disk);
+        drop(cores);
+        let raised = {
+            let _reload = core.reload.lock();
+            core.publish(disk)
+        };
         return (core, raised);
     }
+    // Fresh core: nobody else can observe it until we insert, so
+    // its first publish races nothing. Hold the registry lock
+    // across the check-and-insert so two openers cannot both create.
     let core = Arc::new(StoreCore {
         path: path.to_path_buf(),
         reload: Mutex::new(()),
@@ -472,17 +491,52 @@ fn join_or_create_core(
     (core, Vec::new())
 }
 
-/// Exclusive guard over a store's publish transaction. While held,
-/// no reload can publish a new live view through the store's core
-/// — from ANY same-path handle. The node holds this across its
-/// replacement dominance comparison and swap, and across authority
-/// verification and publication (review-9 addendum), so the
-/// installed floor view cannot rise between a check and the
-/// publication that depends on it. Callbacks are never invoked
-/// under this guard (raises notify outside the reload lock), so
-/// holding it cannot deadlock against notification work.
+/// Exclusive guard over one or two stores' publish transactions.
+/// While held, no reload can publish a new live view through the
+/// guarded core(s) — from ANY same-path handle, including an
+/// opener joining the core (review-11 P1). The node holds this
+/// across its replacement dominance comparison and swap, and
+/// across authority verification and publication, so the installed
+/// floor view cannot rise between a check and the publication that
+/// depends on it.
+///
+/// When two DISTINCT cores must be pinned (a cross-core store
+/// replacement or authority install — the topology review-10
+/// supports), [`publish_guard_pair`] acquires their `reload` locks
+/// in a canonical order (normalized path order) so two nodes
+/// performing opposite swaps cannot deadlock ABBA (review-11 P1).
+/// Callbacks are never invoked under this guard (raises notify
+/// outside the reload lock), so holding it cannot deadlock against
+/// notification work.
 pub(crate) struct PublishGuard<'a> {
-    _guard: parking_lot::MutexGuard<'a, ()>,
+    _guards: Vec<parking_lot::MutexGuard<'a, ()>>,
+}
+
+/// Pin BOTH stores' publish transactions in a canonical, ABBA-free
+/// order (review-11 P1). Same-core stores dedup to a single lock
+/// (parking_lot mutexes are not reentrant, so locking one core
+/// twice would self-deadlock). Distinct cores lock in normalized
+/// path order, so every caller that pins the same two cores — from
+/// any node — acquires them in the same sequence.
+pub(crate) fn publish_guard_pair<'a>(
+    a: &'a OrgRevocationStore,
+    b: &'a OrgRevocationStore,
+) -> PublishGuard<'a> {
+    if Arc::ptr_eq(&a.core, &b.core) {
+        return PublishGuard {
+            _guards: vec![a.core.reload.lock()],
+        };
+    }
+    let (first, second) = if a.core.path <= b.core.path {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let g1 = first.core.reload.lock();
+    let g2 = second.core.reload.lock();
+    PublishGuard {
+        _guards: vec![g1, g2],
+    }
 }
 
 /// The node-local persisted revocation maxima plus its published
@@ -669,7 +723,7 @@ impl OrgRevocationStore {
     /// handle. See [`PublishGuard`].
     pub(crate) fn publish_guard(&self) -> PublishGuard<'_> {
         PublishGuard {
-            _guard: self.core.reload.lock(),
+            _guards: vec![self.core.reload.lock()],
         }
     }
 
@@ -755,19 +809,28 @@ impl OrgRevocationStore {
             DurabilityUncertain(Vec<RaisedFloor>, String),
         }
 
-        let outcome = {
-            let _guard = self.core.reload.lock();
+        // 1. Verify the incoming bundle's signature + canonical
+        //    structure BEFORE taking any lock — a corrupt bundle
+        //    keeps last-good, loudly, and touches nothing.
+        if let Err(e) = bundle.verify() {
+            let err = OrgRevocationError::InvalidBundle(e);
+            tracing::error!(
+                org = %bundle.org_id,
+                "rejecting revocation bundle, keeping last-good persisted floors: {err}"
+            );
+            return Err(err);
+        }
 
-            // 1. Verify the incoming bundle's signature + canonical
-            //    structure. A corrupt bundle keeps last-good, loudly.
-            if let Err(e) = bundle.verify() {
-                let err = OrgRevocationError::InvalidBundle(e);
-                tracing::error!(
-                    org = %bundle.org_id,
-                    "rejecting revocation bundle, keeping last-good persisted floors: {err}"
-                );
-                return Err(err);
-            }
+        let outcome = {
+            // Canonical lock order (review-11 P1): interprocess file
+            // lock OUTER, core `reload` INNER — the SAME order every
+            // opener (`join_or_create_core`) uses. Publishing under
+            // `reload` is what makes [`PublishGuard`] a real barrier:
+            // no publish can land between a replacement's dominance
+            // comparison and its swap. A replacement holds only
+            // `reload` (never the file lock), so no lock cycle forms.
+            let lock = lock_state_file(path)?;
+            let _guard = self.core.reload.lock();
 
             // 2. Interprocess critical section. A poisoned path
             //    must first prove its directory entry durable; the
@@ -775,7 +838,6 @@ impl OrgRevocationStore {
             //    truth through the shared core BEFORE the poison
             //    bit clears (review-9 addendum: recovery reloads
             //    live views, it never merely fsyncs).
-            let lock = lock_state_file(path)?;
             let was_poisoned = is_path_poisoned(path);
             if was_poisoned {
                 prove_entry_durable(path)?;
@@ -901,14 +963,31 @@ fn is_path_poisoned(key: &Path) -> bool {
 }
 
 /// Normalize a backing pathname ONCE at store construction
-/// (review-9 addendum): absolute canonical parent joined with the
-/// final component — resolved to its on-disk case when the file
-/// exists — with NO verbatim fallback. Aliases of one file (bare
-/// vs `./`, relative vs absolute, `..` hops, symlinked parents,
-/// case aliases on case-insensitive filesystems) must land on ONE
-/// core and ONE poison entry, or one backing file gets independent
-/// security views. A path that cannot be normalized, or whose
-/// final component is a symlink, is refused outright.
+/// (review-9 addendum): the CANONICAL parent joined with the
+/// literal final component, with NO verbatim fallback. Aliases of
+/// one file (bare vs `./`, relative vs absolute, `..` hops,
+/// symlinked parents) land on ONE core and ONE poison entry, so a
+/// single backing file never gets independent security views. A
+/// path with no final component, or whose parent cannot resolve,
+/// is refused.
+///
+/// The final component is validated for symlink/non-regular
+/// ATOMICALLY (review-11 P2): the previous form did
+/// `symlink_metadata` then `canonicalize` as two syscalls, and the
+/// final component could be swapped to a symlink in between —
+/// `canonicalize` would then follow it and key the store to the
+/// link's target, which the later no-follow opens could not detect.
+/// A no-follow open of the joined path IS the check: it refuses a
+/// symlink (`ELOOP`) or non-regular final in one syscall, or
+/// reports the file simply does not exist yet (a fresh `init`).
+///
+/// The parent is canonicalized (resolving parent symlinks and
+/// case), so parent-side aliases still collapse; the FINAL
+/// component is taken literally rather than canonicalized. In
+/// practice the final component is a fixed constant
+/// (`revocation-state.json`, `owner-audience.key`), so
+/// final-component case aliasing on case-insensitive filesystems
+/// is not a real call shape — trading it away removes the TOCTOU.
 pub(crate) fn normalize_backing_path(path: &Path) -> Result<PathBuf, OrgRevocationError> {
     let io = |reason: String| OrgRevocationError::Io {
         path: path.display().to_string(),
@@ -925,21 +1004,16 @@ pub(crate) fn normalize_backing_path(path: &Path) -> Result<PathBuf, OrgRevocati
         .canonicalize()
         .map_err(|e| io(format!("cannot canonicalize parent directory: {e}")))?;
     let joined = canon_parent.join(file_name);
-    match std::fs::symlink_metadata(&joined) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(io(
-            "refusing symlink: authority files must be regular files".to_string(),
-        )),
-        // Existing non-symlink: the full canonicalize resolves the
-        // final component to its ON-DISK case, so case aliases on
-        // case-insensitive filesystems share one key.
-        Ok(_) => joined
-            .canonicalize()
-            .map_err(|e| io(format!("cannot canonicalize backing path: {e}"))),
-        // Not there yet (a fresh `init` creates it under exactly
-        // this name) — the canonical-parent join IS the normal
-        // form.
+    // Atomic final-component validation: the no-follow open refuses
+    // a symlink/FIFO/non-regular final in one syscall (no
+    // stat→canonicalize gap). NotFound is fine — a fresh store
+    // creates the file under exactly this name.
+    match open_regular_nofollow(&joined) {
+        Ok(_) => Ok(joined),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(joined),
-        Err(e) => Err(io(e.to_string())),
+        Err(e) => Err(io(format!(
+            "refusing non-regular backing path (symlink/FIFO/other): {e}"
+        ))),
     }
 }
 
@@ -1616,6 +1690,64 @@ mod tests {
         );
     }
 
+    /// Review-11 P1: an opener publishing through an EXISTING core
+    /// obeys the same `PublishGuard` a replacement holds. While the
+    /// guard is held, a same-path opener cannot publish its
+    /// (stronger) floor — it blocks until the guard drops, so a
+    /// replacement's dominance comparison and swap see a frozen
+    /// live view. This is the store-level root of the review-10 red
+    /// (opener published floor 10 inside a held guard).
+    #[test]
+    fn opener_cannot_publish_through_a_held_publish_guard() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        // store_a creates and keeps the core alive at floor 0.
+        let store_a = OrgRevocationStore::init(&path).expect("init");
+
+        // A stronger state is already durable on disk (an operator
+        // bundle another writer persisted); an opener would read and
+        // publish floor 10 through the shared core.
+        let norm = normalize_backing_path(&path).expect("normalize");
+        let mut stronger = OrgRevocationState::empty();
+        stronger.merge_bundle(&bundle_with_floor(10));
+        {
+            let _lk = lock_state_file(&norm).expect("lock");
+            write_atomic(&norm, &stronger.to_file_bytes().expect("bytes")).expect("write");
+        }
+
+        // Hold the publish guard (what a replacement holds across
+        // dominance→swap).
+        let guard = store_a.publish_guard();
+
+        let opener_path = path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let s = OrgRevocationStore::open_existing(&opener_path).expect("open");
+            done_tx.send(()).expect("done");
+            s
+        });
+        // The opener must NOT publish while the guard is held: the
+        // shared live view stays at floor 0.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "opener published inside a held PublishGuard"
+        );
+        assert_eq!(
+            store_a.floor_for(&org().org_id(), &member()),
+            0,
+            "the guarded live view must not move under an opener"
+        );
+
+        // Releasing the guard lets the opener publish; the shared
+        // view then advances to 10.
+        drop(guard);
+        let opened = opener.join().expect("join");
+        assert_eq!(opened.floor_for(&org().org_id(), &member()), 10);
+        assert_eq!(store_a.floor_for(&org().org_id(), &member()), 10);
+    }
+
     /// Review-9 addendum: the raise-observer registry supports
     /// multiple subscribers — registering a second observer never
     /// steals the first one's notifications, same-path handles'
@@ -1715,29 +1847,35 @@ mod tests {
         );
     }
 
-    /// Review-9 addendum: case aliases on case-insensitive
-    /// filesystems (default macOS) land on one core. Skips itself
-    /// on case-sensitive filesystems, where different case IS a
-    /// different file.
+    /// Review-11 P2: the final component is validated ATOMICALLY
+    /// (no-follow open), so a symlink final is refused in one
+    /// syscall — no `symlink_metadata`→`canonicalize` TOCTOU. The
+    /// parent is still canonicalized, so parent-side aliasing
+    /// collapses; final-component case aliasing is deliberately NOT
+    /// folded (the filename is a fixed constant in every real call
+    /// site — trading it away removes the race).
+    #[cfg(unix)]
     #[test]
-    fn case_aliased_paths_share_one_core_on_case_insensitive_filesystems() {
+    fn final_component_symlink_is_refused_atomically() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store_a = OrgRevocationStore::init(&path).expect("init");
+        OrgRevocationStore::init(&path).expect("init");
+        drop(OrgRevocationStore::open_existing(&path).expect("regular final opens"));
 
-        let upper = scratch.0.join("REVOCATION-STATE.JSON");
-        if std::fs::metadata(&upper).is_err() {
-            // Case-sensitive filesystem: the alias doesn't resolve;
-            // nothing to witness here.
-            return;
-        }
-        let store_b = OrgRevocationStore::open_existing(&upper).expect("open case alias");
+        // Swap the final component for a symlink to a real file: the
+        // no-follow validation refuses it — canonicalize never gets
+        // the chance to follow it and re-key the store.
+        let real = scratch.0.join("real-state.json");
+        std::fs::rename(&path, &real).expect("move real");
+        std::os::unix::fs::symlink(&real, &path).expect("plant final symlink");
         assert!(
-            store_a.shares_core_with(&store_b),
-            "case alias must join the same core"
+            normalize_backing_path(&path).is_err(),
+            "a symlink final component must refuse atomically"
         );
-        store_a.apply_bundle(&bundle_with_floor(5)).expect("apply");
-        assert_eq!(store_b.floor_for(&org().org_id(), &member()), 5);
+        assert!(
+            OrgRevocationStore::open_existing(&path).is_err(),
+            "open must refuse a symlink final"
+        );
     }
 
     /// Review-9: lock inodes are held to the full regular-file
