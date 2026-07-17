@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use super::behavior::org::OrgId;
 use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
+use super::behavior::org_authority::NodeAuthority;
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
-use super::behavior::org_revocation::OrgRevocationState;
+use super::behavior::org_revocation::{OrgRevocationState, OrgRevocationStore};
 use super::cortex::{RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
 use super::mesh::MeshNode;
@@ -164,6 +165,16 @@ pub struct ProviderFacts {
     /// gate re-checks this against [`capture_admission_stamp`] after
     /// verification and before the replay insert.
     pub stamp: AdmissionStamp,
+    /// The installed authority Arc, PINNED for the admission's
+    /// lifetime (Kyra E1 audit — ABA). `stamp.authority_ptr` is a raw
+    /// address; without retaining the Arc, a replace/drop/realloc
+    /// cycle could reuse that address for a DIFFERENT authority and
+    /// make the §9.5 pointer comparison false-match "unchanged".
+    /// Holding the Arc keeps the address occupied until the stability
+    /// check completes.
+    _authority: Arc<NodeAuthority>,
+    /// The installed store Arc, pinned for the same ABA reason.
+    _store: Arc<OrgRevocationStore>,
 }
 
 /// Live provider self-verification (E1.3, verdict §5). For every
@@ -213,11 +224,16 @@ pub fn verify_provider_authority(mesh: &MeshNode) -> Result<ProviderFacts, Admis
         // point is caught by the §9.5 recheck via the live stamp.
         poisoned: false,
     };
+    let provider_owner_org = authority.owner_org();
     Ok(ProviderFacts {
         provider,
-        provider_owner_org: authority.owner_org(),
+        provider_owner_org,
         floors,
         stamp,
+        // Pin the exact Arcs the stamp fingerprints, so their
+        // addresses cannot be reused under a §9.5 recheck (ABA).
+        _authority: authority,
+        _store: store,
     })
 }
 

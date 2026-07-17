@@ -93,6 +93,46 @@ async fn verify_provider_authority_returns_facts_for_a_healthy_provider() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// KC4 (ABA) — ProviderFacts RETAINS the authority and store Arcs
+/// for the admission's lifetime, so `stamp.authority_ptr` /
+/// `store_ptr` cannot be reused by a different object under a §9.5
+/// recheck. Holding `facts` therefore raises the installed Arcs'
+/// strong counts; dropping it lowers them again.
+#[tokio::test]
+async fn provider_facts_pins_the_authority_and_store_arcs() {
+    let node = build_node().await;
+    let dir = adopt_and_install(&node, "aba-pin").await;
+
+    let authority = node.node_authority().expect("authority");
+    let store = node.org_revocation_store().expect("store");
+    let auth_before = Arc::strong_count(&authority);
+    let store_before = Arc::strong_count(&store);
+
+    let facts = verify_provider_authority(&node).expect("healthy");
+    assert!(
+        Arc::strong_count(&authority) > auth_before,
+        "facts must pin the authority Arc",
+    );
+    assert!(
+        Arc::strong_count(&store) > store_before,
+        "facts must pin the store Arc",
+    );
+
+    drop(facts);
+    assert_eq!(
+        Arc::strong_count(&authority),
+        auth_before,
+        "pin released on drop"
+    );
+    assert_eq!(
+        Arc::strong_count(&store),
+        store_before,
+        "pin released on drop"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Witness 25 seed — an authority-dark node (never adopted) cannot
 /// admit a protected call: no authority installed → the provider
 /// self-verify is `ProviderAuthorityUnavailable`, and its stamp is
