@@ -157,8 +157,12 @@ pub enum AdmissionDenied {
     /// The same `(caller, call_id)` reused with a different binding
     /// — a correlation-id collision.
     CallIdCollision,
-    /// The replay guard is at capacity — denied fail-closed.
+    /// The GLOBAL replay guard is at capacity — denied fail-closed.
     ReplayCapacity,
+    /// THIS caller has filled its per-caller replay allocation
+    /// (E1.5) — denied fail-closed, but only for this caller; other
+    /// callers are unaffected.
+    PerCallerReplayCapacity,
     /// The provider-local policy (application veto, run LAST)
     /// rejected the call.
     ProviderPolicyRejected,
@@ -387,6 +391,9 @@ pub fn verify_org_admission(
         ReplayOutcome::Replay => return Err(AdmissionDenied::Replay),
         ReplayOutcome::CallIdCollision => return Err(AdmissionDenied::CallIdCollision),
         ReplayOutcome::CapacityExhausted => return Err(AdmissionDenied::ReplayCapacity),
+        ReplayOutcome::PerCallerCapacityExhausted => {
+            return Err(AdmissionDenied::PerCallerReplayCapacity)
+        }
     }
 
     // 11. Provider-local policy LAST (Locked #6): the application

@@ -52,21 +52,36 @@ use crate::adapter::net::identity::EntityId;
 /// `call_id`s. Flagged for OA-2 measurement before freeze.
 pub const DEFAULT_MAX_REPLAY_ENTRIES: usize = 65_536;
 
-/// Replay-guard ceilings. One field today; a struct so the OA-2
-/// review can add per-caller sub-ceilings without a signature
-/// break.
+/// Provisional per-caller ceiling (E1.5, verdict §10). Policy runs
+/// AFTER replay insertion, so even a policy-vetoed VALID proof
+/// consumes a slot; without a per-caller sub-ceiling a single
+/// credentialed caller could fill the whole global map and starve
+/// every other org fail-closed. Sized to admit a healthy concurrent
+/// burst from one caller while leaving ample global headroom for
+/// everyone else (16× fits under the global default). Flagged for
+/// OA-2 measurement before freeze.
+pub const DEFAULT_MAX_REPLAY_ENTRIES_PER_CALLER: usize = 4_096;
+
+/// Replay-guard ceilings — a global map cap plus a per-caller
+/// sub-ceiling (E1.5) so one caller cannot consume another's
+/// allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionReplayConfig {
     /// Maximum simultaneously-retained `(caller, call_id)`
-    /// entries. At capacity, a novel admission denies rather than
-    /// evicting an unexpired guard.
+    /// entries across ALL callers. At capacity, a novel admission
+    /// denies rather than evicting an unexpired guard.
     pub max_entries: usize,
+    /// Maximum simultaneously-retained entries for ONE caller.
+    /// Checked before the global cap, so a flooding caller hits its
+    /// own ceiling first and never denies other callers.
+    pub max_entries_per_caller: usize,
 }
 
 impl Default for AdmissionReplayConfig {
     fn default() -> Self {
         Self {
             max_entries: DEFAULT_MAX_REPLAY_ENTRIES,
+            max_entries_per_caller: DEFAULT_MAX_REPLAY_ENTRIES_PER_CALLER,
         }
     }
 }
@@ -86,10 +101,15 @@ pub enum ReplayOutcome {
     /// digest — a correlation-id collision (caller bug or a
     /// forged reuse of an id).
     CallIdCollision,
-    /// The guard is full of still-live entries; admitting would
-    /// require evicting an unexpired guard, so this call is denied
-    /// fail-closed.
+    /// The GLOBAL guard is full of still-live entries; admitting
+    /// would require evicting an unexpired guard, so this call is
+    /// denied fail-closed.
     CapacityExhausted,
+    /// THIS caller already holds the maximum simultaneously-retained
+    /// entries (E1.5). Denies only this caller — every other
+    /// caller's allocation is untouched, so one flooding org cannot
+    /// starve the rest.
+    PerCallerCapacityExhausted,
 }
 
 struct ReplayEntry {
@@ -98,22 +118,66 @@ struct ReplayEntry {
     expires_at: Instant,
 }
 
+/// The mutex-guarded state. Nested `caller → (call_id → entry)` so
+/// the per-caller ceiling and per-caller reclamation touch ONLY one
+/// caller's entries (E1.5); `total` mirrors the summed inner lengths
+/// so the global cap is a field read, not an O(callers) sum.
+#[derive(Default)]
+struct ReplayState {
+    by_caller: HashMap<EntityId, HashMap<u64, ReplayEntry>>,
+    total: usize,
+}
+
+impl ReplayState {
+    /// Drop `caller`'s expired entries (and the caller bucket if it
+    /// empties). Returns nothing; keeps `total` in step.
+    fn reclaim_caller(&mut self, caller: &EntityId, now: Instant) {
+        if let Some(inner) = self.by_caller.get_mut(caller) {
+            let before = inner.len();
+            inner.retain(|_, e| e.expires_at > now);
+            self.total -= before - inner.len();
+            if inner.is_empty() {
+                self.by_caller.remove(caller);
+            }
+        }
+    }
+
+    /// Drop every expired entry across all callers. Returns the
+    /// number reclaimed.
+    fn reclaim_all(&mut self, now: Instant) -> usize {
+        let mut removed = 0usize;
+        self.by_caller.retain(|_, inner| {
+            let before = inner.len();
+            inner.retain(|_, e| e.expires_at > now);
+            removed += before - inner.len();
+            !inner.is_empty()
+        });
+        self.total -= removed;
+        removed
+    }
+}
+
 /// The volatile admission replay guard. One per provider node.
 pub struct AdmissionReplayGuard {
-    entries: Mutex<HashMap<(EntityId, u64), ReplayEntry>>,
+    entries: Mutex<ReplayState>,
     config: AdmissionReplayConfig,
-    /// Count of admissions denied for capacity — a metric surface
-    /// (§2.5: "deny + metric on exhaustion").
+    /// Count of admissions denied for GLOBAL capacity — a metric
+    /// surface (§2.5: "deny + metric on exhaustion").
     capacity_denials: AtomicU64,
+    /// Count of admissions denied for PER-CALLER capacity (E1.5) —
+    /// a separate metric so operators can tell a fleet-wide flood
+    /// from a single abusive caller.
+    per_caller_denials: AtomicU64,
 }
 
 impl AdmissionReplayGuard {
     /// A guard with the given ceilings.
     pub fn new(config: AdmissionReplayConfig) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(ReplayState::default()),
             config,
             capacity_denials: AtomicU64::new(0),
+            per_caller_denials: AtomicU64::new(0),
         }
     }
 
@@ -139,49 +203,67 @@ impl AdmissionReplayGuard {
         expires_at: Instant,
         now: Instant,
     ) -> ReplayOutcome {
-        let key = (caller.clone(), call_id);
-        let mut entries = self.entries.lock();
+        let mut st = self.entries.lock();
 
-        // An existing entry for this key: replay vs collision,
-        // UNLESS it has expired (then it is reusable — the window
-        // closed, so this is a legitimate new call reusing the id).
-        if let Some(existing) = entries.get(&key) {
-            if existing.expires_at > now {
-                return if existing.binding_digest == binding_digest {
-                    ReplayOutcome::Replay
-                } else {
-                    ReplayOutcome::CallIdCollision
-                };
+        // An existing entry for this exact `(caller, call_id)`:
+        // replay vs collision, UNLESS it has expired (then it is
+        // reusable — the window closed, so this is a legitimate new
+        // call reusing the id). Handled under one `get_mut` so the
+        // expired overwrite touches neither `total` nor the
+        // per-caller count (the key stays occupied).
+        if let Some(inner) = st.by_caller.get_mut(caller) {
+            if let Some(existing) = inner.get(&call_id) {
+                if existing.expires_at > now {
+                    return if existing.binding_digest == binding_digest {
+                        ReplayOutcome::Replay
+                    } else {
+                        ReplayOutcome::CallIdCollision
+                    };
+                }
+                inner.insert(
+                    call_id,
+                    ReplayEntry {
+                        binding_digest,
+                        expires_at,
+                    },
+                );
+                return ReplayOutcome::Admitted;
             }
-            // Expired: overwrite it below as a fresh admission.
-            entries.insert(
-                key,
-                ReplayEntry {
-                    binding_digest,
-                    expires_at,
-                },
-            );
-            return ReplayOutcome::Admitted;
         }
 
-        // New key. If at capacity, reclaim only EXPIRED slots; if
-        // none are reclaimable, deny fail-closed rather than evict
-        // a live guard.
-        if entries.len() >= self.config.max_entries {
-            entries.retain(|_, e| e.expires_at > now);
-            if entries.len() >= self.config.max_entries {
+        // New key for this caller. Per-caller ceiling FIRST (E1.5) so
+        // a flooding caller hits its own limit before it can pressure
+        // the global cap. At capacity, reclaim only THIS caller's
+        // expired slots; if still full, deny only this caller.
+        let caller_live = st.by_caller.get(caller).map_or(0, HashMap::len);
+        if caller_live >= self.config.max_entries_per_caller {
+            st.reclaim_caller(caller, now);
+            let caller_live = st.by_caller.get(caller).map_or(0, HashMap::len);
+            if caller_live >= self.config.max_entries_per_caller {
+                self.per_caller_denials.fetch_add(1, Ordering::Relaxed);
+                return ReplayOutcome::PerCallerCapacityExhausted;
+            }
+        }
+
+        // Global ceiling. Reclaim EXPIRED slots fleet-wide; if none
+        // are reclaimable, deny fail-closed rather than evict a live
+        // guard.
+        if st.total >= self.config.max_entries {
+            st.reclaim_all(now);
+            if st.total >= self.config.max_entries {
                 self.capacity_denials.fetch_add(1, Ordering::Relaxed);
                 return ReplayOutcome::CapacityExhausted;
             }
         }
 
-        entries.insert(
-            key,
+        st.by_caller.entry(caller.clone()).or_default().insert(
+            call_id,
             ReplayEntry {
                 binding_digest,
                 expires_at,
             },
         );
+        st.total += 1;
         ReplayOutcome::Admitted
     }
 
@@ -190,25 +272,39 @@ impl AdmissionReplayGuard {
     /// capacity — but a periodic sweep keeps steady-state memory
     /// low. Returns how many entries were reclaimed.
     pub fn evict_expired(&self, now: Instant) -> usize {
-        let mut entries = self.entries.lock();
-        let before = entries.len();
-        entries.retain(|_, e| e.expires_at > now);
-        before - entries.len()
+        self.entries.lock().reclaim_all(now)
     }
 
-    /// Current tracked-entry count (test/metric surface).
+    /// Current tracked-entry count across all callers (test/metric
+    /// surface).
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.lock().total
     }
 
     /// `true` iff no entries are tracked.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.entries.lock().total == 0
     }
 
-    /// Total admissions denied for capacity since construction.
+    /// Number of entries currently tracked for one caller
+    /// (test/metric surface).
+    pub fn caller_len(&self, caller: &EntityId) -> usize {
+        self.entries
+            .lock()
+            .by_caller
+            .get(caller)
+            .map_or(0, HashMap::len)
+    }
+
+    /// Total admissions denied for GLOBAL capacity since construction.
     pub fn capacity_denials(&self) -> u64 {
         self.capacity_denials.load(Ordering::Relaxed)
+    }
+
+    /// Total admissions denied for PER-CALLER capacity (E1.5) since
+    /// construction.
+    pub fn per_caller_denials(&self) -> u64 {
+        self.per_caller_denials.load(Ordering::Relaxed)
     }
 }
 
@@ -217,7 +313,12 @@ impl std::fmt::Debug for AdmissionReplayGuard {
         f.debug_struct("AdmissionReplayGuard")
             .field("entries", &self.len())
             .field("max_entries", &self.config.max_entries)
+            .field(
+                "max_entries_per_caller",
+                &self.config.max_entries_per_caller,
+            )
             .field("capacity_denials", &self.capacity_denials())
+            .field("per_caller_denials", &self.per_caller_denials())
             .finish()
     }
 }
@@ -318,7 +419,10 @@ mod tests {
 
     #[test]
     fn capacity_denies_without_evicting_a_live_guard() {
-        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig { max_entries: 2 });
+        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
+            max_entries: 2,
+            max_entries_per_caller: 1024,
+        });
         let now = Instant::now();
         let expires = now + Duration::from_secs(30);
 
@@ -347,7 +451,10 @@ mod tests {
 
     #[test]
     fn capacity_reclaims_expired_slots_before_denying() {
-        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig { max_entries: 2 });
+        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
+            max_entries: 2,
+            max_entries_per_caller: 1024,
+        });
         let t0 = Instant::now();
         let short = t0 + Duration::from_secs(10);
         let long = t0 + Duration::from_secs(60);
@@ -433,5 +540,84 @@ mod tests {
         }
         assert_eq!(admitted.load(Ordering::Relaxed), 1, "exactly one admit");
         assert_eq!(replayed.load(Ordering::Relaxed), 15, "the rest replay");
+    }
+
+    /// E1.5 witness 21 — one caller cannot consume another's replay
+    /// allocation. Caller(1) fills its per-caller ceiling; a further
+    /// NOVEL call from caller(1) is denied `PerCallerCapacityExhausted`,
+    /// yet caller(2) admits freely and the GLOBAL capacity denial
+    /// metric never ticks.
+    #[test]
+    fn per_caller_ceiling_isolates_a_flooding_caller() {
+        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
+            max_entries: 1_000,
+            max_entries_per_caller: 3,
+        });
+        let now = Instant::now();
+        let expires = now + Duration::from_secs(30);
+
+        // caller(1) fills its per-caller allocation with 3 novel calls.
+        for call_id in 0..3u64 {
+            assert_eq!(
+                guard.admit(&caller(1), call_id, [call_id as u8; 32], expires, now),
+                ReplayOutcome::Admitted
+            );
+        }
+        assert_eq!(guard.caller_len(&caller(1)), 3);
+
+        // The 4th novel call from caller(1) is denied — only caller(1).
+        assert_eq!(
+            guard.admit(&caller(1), 99, [9u8; 32], expires, now),
+            ReplayOutcome::PerCallerCapacityExhausted
+        );
+        assert_eq!(guard.per_caller_denials(), 1);
+        assert_eq!(guard.capacity_denials(), 0, "global cap never fired");
+
+        // caller(2) is entirely unaffected — its allocation is its own.
+        for call_id in 0..3u64 {
+            assert_eq!(
+                guard.admit(&caller(2), call_id, [call_id as u8; 32], expires, now),
+                ReplayOutcome::Admitted
+            );
+        }
+        assert_eq!(guard.caller_len(&caller(2)), 3);
+        // A still-live replay from caller(1) is unchanged behavior.
+        assert_eq!(
+            guard.admit(&caller(1), 0, [0u8; 32], expires, now),
+            ReplayOutcome::Replay
+        );
+    }
+
+    /// The per-caller ceiling reclaims that caller's EXPIRED slots
+    /// before denying, so a caller whose earlier calls have aged out
+    /// can keep making new ones without ever touching other callers.
+    #[test]
+    fn per_caller_ceiling_reclaims_expired_before_denying() {
+        let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
+            max_entries: 1_000,
+            max_entries_per_caller: 2,
+        });
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(10);
+
+        guard.admit(&caller(1), 1, [1u8; 32], short, t0);
+        guard.admit(&caller(1), 2, [2u8; 32], short, t0);
+        assert_eq!(guard.caller_len(&caller(1)), 2);
+
+        // After caller(1)'s window closes, a novel call at the
+        // per-caller cap reclaims the expired slots instead of denying.
+        let later = t0 + Duration::from_secs(11);
+        assert_eq!(
+            guard.admit(
+                &caller(1),
+                3,
+                [3u8; 32],
+                later + Duration::from_secs(30),
+                later
+            ),
+            ReplayOutcome::Admitted
+        );
+        assert_eq!(guard.per_caller_denials(), 0);
+        assert_eq!(guard.caller_len(&caller(1)), 1, "expired slots reclaimed");
     }
 }
