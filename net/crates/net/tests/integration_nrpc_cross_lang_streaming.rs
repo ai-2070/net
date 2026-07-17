@@ -56,13 +56,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    classify_streaming_chunk, encode_request_grant, EventMeta, RequestStream,
+    classify_streaming_chunk, encode_request_grant, encode_rpc_route, EventMeta, RequestStream,
     RpcAsyncResponseEmitter, RpcClientFold, RpcClientPending, RpcClientStreamingHandler,
     RpcDuplexFold, RpcDuplexHandler, RpcHandlerError, RpcRequestChunkPayload, RpcRequestPayload,
     RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
     RpcStreamingRequestFold, StreamingChunkKind, DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK,
     DISPATCH_RPC_RESPONSE, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
-    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
+    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -180,12 +180,12 @@ impl RpcDuplexHandler for DuplexEchoHandler {
 // =====================================================================
 
 fn make_event(meta: EventMeta, payload_tail: &[u8]) -> RedexEvent {
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 8 + payload_tail.len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + payload_tail.len());
     buf.extend_from_slice(&meta.to_bytes());
     // OA2-E0.2: RpcRouteV1 canonical discriminator placeholder — this
     // harness feeds the folds directly (no mesh ingress select), and
     // the folds skip these 8 bytes to reach the payload.
-    buf.extend_from_slice(&0u64.to_le_bytes());
+    encode_rpc_route(&mut buf, 0);
     buf.extend_from_slice(payload_tail);
     RedexEvent {
         entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),

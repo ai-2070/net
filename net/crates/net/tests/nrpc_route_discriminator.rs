@@ -23,8 +23,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use net::adapter::net::channel::wire_channel_hash;
 use net::adapter::net::cortex::{
-    EventMeta, RpcInboundDispatcher, RpcInboundEvent, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE,
+    encode_rpc_route, EventMeta, RpcInboundDispatcher, RpcInboundEvent, DISPATCH_RPC_CANCEL,
+    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE,
+    RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::{
     ChannelName, ChannelPublisher, EntityKeypair, MeshNode, MeshNodeConfig, PublishConfig,
@@ -102,9 +103,9 @@ fn colliding_channel_names() -> (ChannelName, ChannelName) {
 /// tail`, matching what a real sender emits.
 fn rpc_frame(dispatch: u8, route: u64, tail: &[u8]) -> Bytes {
     let meta = EventMeta::new(dispatch, 0, 0xC0FFEE, 1, 0);
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 8 + tail.len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + tail.len());
     buf.extend_from_slice(&meta.to_bytes());
-    buf.extend_from_slice(&route.to_le_bytes());
+    encode_rpc_route(&mut buf, route);
     buf.extend_from_slice(tail);
     Bytes::from(buf)
 }

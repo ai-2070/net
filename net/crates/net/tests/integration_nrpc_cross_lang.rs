@@ -31,9 +31,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use net::adapter::net::cortex::{
-    EventMeta, RpcClientFold, RpcClientPending, RpcContext, RpcHandler, RpcHandlerError,
-    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcStatus,
-    DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
+    encode_rpc_route, EventMeta, RpcClientFold, RpcClientPending, RpcContext, RpcHandler,
+    RpcHandlerError, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold,
+    RpcStatus, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE, RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -112,12 +112,12 @@ impl RpcHandler for EchoSumHandler {
 // =====================================================================
 
 fn make_event(meta: EventMeta, payload_tail: &[u8]) -> RedexEvent {
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 8 + payload_tail.len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + payload_tail.len());
     buf.extend_from_slice(&meta.to_bytes());
     // OA2-E0.2: RpcRouteV1 canonical discriminator placeholder — this
     // harness feeds the folds directly (no mesh ingress select), and
     // the folds skip these 8 bytes to reach the payload.
-    buf.extend_from_slice(&0u64.to_le_bytes());
+    encode_rpc_route(&mut buf, 0);
     buf.extend_from_slice(payload_tail);
     RedexEvent {
         entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),

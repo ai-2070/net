@@ -4661,10 +4661,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -4676,7 +4676,7 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, caller_origin, call_id, 0);
         let mut buf = meta.to_bytes().to_vec();
         // OA2-E0.2: RpcRouteV1 route placeholder (folds skip it).
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        encode_rpc_route(&mut buf, 0);
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
             payload: bytes::Bytes::from(buf),
@@ -5193,10 +5193,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 7, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0x00); // svc_len = 0 → empty service → Truncated
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5439,10 +5439,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5568,10 +5568,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 11, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0xFF);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5665,10 +5665,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_request_grant(call_id, credits));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5788,10 +5788,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5836,10 +5836,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_request_grant(0xBEEF, 5));
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5900,10 +5900,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_stream_grant(n));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6265,10 +6265,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0x00);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6314,10 +6314,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
-        // OA2-E0.2: RpcRouteV1 route placeholder — these test
-        // frames feed the folds directly (no ingress select), and
-        // the folds skip these 8 bytes to reach the payload.
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
