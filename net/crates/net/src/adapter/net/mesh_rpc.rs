@@ -35,16 +35,17 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
-    build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant, EventMeta,
-    RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler,
-    RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher,
-    RpcInboundEvent, RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload,
-    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus,
-    RpcStreamingHandler, RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL,
-    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT,
-    DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
-    FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
-    HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_ROUTE_V1_SIZE,
+    build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant,
+    peek_request_service, EventMeta, RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold,
+    RpcClientStreamingHandler, RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler,
+    RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent, RpcRequestChunkPayload,
+    RpcRequestGrantEmitter, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload,
+    RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, RpcStreamingRequestFold,
+    StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
+    DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT, DISPATCH_RPC_STREAM_GRANT,
+    EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_PROPAGATE_TRACE,
+    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL,
+    HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_ROUTE_V1_SIZE,
 };
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
@@ -370,6 +371,47 @@ impl Drop for ServeHandle {
         self.mesh
             .unregister_rpc_inbound(self.channel_hash, self.registration_id);
         self.mesh.rpc_local_services_arc().remove(&self.service);
+    }
+}
+
+/// OA2-E0.2 P0 — cross-service confused-deputy guard for the serve
+/// bridges.
+///
+/// The route discriminator (E0.2) already selected THIS service's
+/// dispatcher by canonical channel hash. But the initial REQUEST
+/// payload carries its own self-declared `service` field, and the
+/// server folds route to their handler without re-checking it. A
+/// frame physically delivered to `admin.requests` whose payload
+/// names `echo` would otherwise run the admin handler under an
+/// `echo` request — a cross-service confused deputy.
+///
+/// Returns `true` when `frame` is an initial `DISPATCH_RPC_REQUEST`
+/// whose payload names a service OTHER than `expected` and must be
+/// dropped BEFORE the capability gate or any fold/handler state.
+/// Returns `false` for:
+///   * control frames (CANCEL / CHUNK / GRANT) — they carry no
+///     service and inherit the route-selected active call;
+///   * a REQUEST whose payload names exactly `expected`;
+///   * a REQUEST whose service field is unreadable — the fold's own
+///     full decode then rejects it (`UnknownVersion`), so no handler
+///     runs and the caller still gets a diagnostic (rather than a
+///     silent drop here that mimics a timeout);
+///   * a frame too short to even carry the `EventMeta` — the fold
+///     drops those too.
+fn is_cross_service_request(frame: &[u8], expected: &str) -> bool {
+    let Some(meta) = (if frame.len() >= EVENT_META_SIZE {
+        EventMeta::from_bytes(&frame[..EVENT_META_SIZE])
+    } else {
+        None
+    }) else {
+        return false;
+    };
+    if meta.dispatch != DISPATCH_RPC_REQUEST {
+        return false;
+    }
+    match peek_request_service(frame) {
+        Some(svc) => svc != expected,
+        None => false,
     }
 }
 
@@ -2164,6 +2206,16 @@ impl MeshNode {
                 if inbound.from_node != 0 {
                     origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
+                // OA2-E0.2 P0: captured-service equality. An initial
+                // REQUEST routed to THIS dispatcher whose payload
+                // names a different service is a cross-service
+                // confused deputy — drop it before the capability
+                // gate or any fold/handler state. Control frames
+                // inherit the route-selected active call and are not
+                // re-checked (see `is_cross_service_request`).
+                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
+                    continue;
+                }
                 // Defense-in-depth check. Skip only when the wire
                 // session resolved no NodeId (`from_node == 0` is
                 // the loopback / test sentinel per
@@ -2420,6 +2472,12 @@ impl MeshNode {
                 if inbound.from_node != 0 {
                     origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
+                // OA2-E0.2 P0: captured-service equality — see the
+                // unary bridge. A cross-service initial REQUEST is
+                // dropped before the capability gate or fold state.
+                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
+                    continue;
+                }
                 // Callee-side capability-auth gate — the streaming
                 // mirror of the unary bridge's defense-in-depth
                 // check (the caller-side gate inside
@@ -2607,10 +2665,18 @@ impl MeshNode {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
+        let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
                     origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
+                }
+                // OA2-E0.2 P0: captured-service equality — a
+                // cross-service initial REQUEST is dropped before any
+                // fold state. Control frames inherit the
+                // route-selected active call (see the unary bridge).
+                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
+                    continue;
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
@@ -2858,10 +2924,18 @@ impl MeshNode {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
+        let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
                     origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
+                }
+                // OA2-E0.2 P0: captured-service equality — a
+                // cross-service initial REQUEST is dropped before any
+                // fold state. Control frames inherit the
+                // route-selected active call (see the unary bridge).
+                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
+                    continue;
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);

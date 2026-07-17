@@ -185,6 +185,43 @@ pub fn is_rpc_dispatch_frame(event_type: u8) -> bool {
     )
 }
 
+/// Peek the self-declared `service` field of an initial-REQUEST
+/// frame (`EventMeta ‖ RpcRouteV1 ‖ RpcRequestPayload`) WITHOUT a
+/// full payload decode (OA2-E0.2 P0).
+///
+/// The route discriminator (E0.2) already selected a dispatcher by
+/// *canonical channel hash*, but `RpcRequestPayload` also carries
+/// its OWN `service` string — the first body field (`u8` length ‖
+/// bytes, see [`RpcRequestPayload::encode_into`]). The serve bridge
+/// uses this to enforce `payload.service == captured_service` before
+/// the capability gate or any fold state, so a frame routed to
+/// `admin.requests` whose payload names `echo` never reaches the
+/// admin handler.
+///
+/// Returns `None` when the service field is unreadable — frame too
+/// short (missing the route or the length byte), an empty or
+/// over-cap length, or non-UTF-8 bytes. Those exactly mirror the
+/// `Err` arms of [`RpcRequestPayload::decode`], so an unreadable
+/// service falls through to the fold's full decode, which rejects it
+/// (`UnknownVersion`) — no handler runs either way. A `Some(svc)`
+/// return borrows the service bytes straight out of `frame`.
+///
+/// Only meaningful for `DISPATCH_RPC_REQUEST` frames; control frames
+/// (CANCEL / CHUNK / GRANT) carry no service and inherit the
+/// route-selected active call, so callers gate on the dispatch type
+/// before calling this.
+#[inline]
+pub fn peek_request_service(frame: &[u8]) -> Option<&str> {
+    let body = frame.get(RPC_FRAME_BODY_OFFSET..)?;
+    let (&svc_len, rest) = body.split_first()?;
+    let svc_len = svc_len as usize;
+    if svc_len == 0 || svc_len > MAX_RPC_SERVICE_NAME_LEN {
+        return None;
+    }
+    let svc = rest.get(..svc_len)?;
+    std::str::from_utf8(svc).ok()
+}
+
 // ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
@@ -4100,6 +4137,70 @@ mod tests {
 
     fn header(name: &str, value: &[u8]) -> RpcHeader {
         (name.to_string(), value.to_vec())
+    }
+
+    // --------------------------------------------------------------------
+    // OA2-E0.2 P0 — `peek_request_service` boundary contract.
+    // --------------------------------------------------------------------
+
+    /// Build a REQUEST frame `EventMeta ‖ RpcRouteV1(0) ‖
+    /// RpcRequestPayload{service, ..}` for the peek unit tests.
+    fn request_frame_for_peek(service: &str) -> Vec<u8> {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0);
+        let req = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"body"),
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        req.encode_into(&mut buf);
+        buf
+    }
+
+    /// The peek reads back exactly the `service` the full encoder
+    /// wrote — the invariant the serve-bridge equality check relies
+    /// on (peek and full decode agree on the service).
+    #[test]
+    fn peek_request_service_matches_full_decode() {
+        for name in ["admin", "echo.v1", "x"] {
+            let frame = request_frame_for_peek(name);
+            assert_eq!(peek_request_service(&frame), Some(name));
+            // And it agrees with the authoritative decoder.
+            let decoded =
+                RpcRequestPayload::decode(Bytes::from(frame[RPC_FRAME_BODY_OFFSET..].to_vec()))
+                    .expect("decode");
+            assert_eq!(decoded.service, name);
+        }
+    }
+
+    /// Unreadable service fields return `None`, mirroring the `Err`
+    /// arms of `RpcRequestPayload::decode` — the bridge then lets the
+    /// fold's full decode reject the frame (`UnknownVersion`) rather
+    /// than silently dropping it.
+    #[test]
+    fn peek_request_service_none_on_malformed() {
+        // Frame with no room for the route/body at all.
+        let short = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0).to_bytes();
+        assert_eq!(peek_request_service(&short), None);
+
+        // Route present but zero-length service (decode rejects empty).
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        buf.push(0u8); // svc_len = 0
+        assert_eq!(peek_request_service(&buf), None);
+
+        // Length byte claims more bytes than remain.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        buf.push(5u8); // svc_len = 5 but no bytes follow
+        assert_eq!(peek_request_service(&buf), None);
     }
 
     // --------------------------------------------------------------------
