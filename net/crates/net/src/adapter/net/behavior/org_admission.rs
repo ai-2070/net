@@ -151,6 +151,14 @@ pub enum AdmissionDenied {
     /// caller over THIS exact call (call_id, callee, capability,
     /// provider org, request digest, credential digests).
     BindingInvalid,
+    /// The provider cannot admit an org-protected call right now: no
+    /// node authority / revocation store is installed, the store is
+    /// poisoned, or the provider's own owner certificate fails its
+    /// call-time self-verification (expired, or its generation fell
+    /// below a floor). Registration-time authority is NOT usable
+    /// authority — an expired/revoked/unhealthy provider stays dark
+    /// (E1.3, verdict §5).
+    ProviderAuthorityUnavailable,
     /// The provider's security view changed BETWEEN verification and
     /// the replay insert (E1.4 §9.5) — a revocation floor rose, the
     /// installed authority was replaced, or the active store was

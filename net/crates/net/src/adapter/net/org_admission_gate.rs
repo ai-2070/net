@@ -12,8 +12,15 @@
 //! every legitimate call CLOSED — safe, and caught by the admit
 //! witness.
 
-use super::behavior::org_call::ORG_ADMISSION_HEADER;
+use std::sync::Arc;
+
+use super::behavior::org::OrgId;
+use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
+use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+use super::behavior::org_revocation::{OrgRevocationState, OrgRevocationStore};
 use super::cortex::{RpcHeader, RpcRequestPayload};
+use super::identity::EntityId;
+use super::mesh::MeshNode;
 
 /// blake3 `derive_key` context for the canonical org-RPC request
 /// digest (E1.7). Distinct, versioned domain string so a future wire
@@ -104,6 +111,173 @@ impl AdmissionStamp {
     /// live. Any change, or a now-poisoned store, is a stale view.
     pub fn is_current(&self, current: &AdmissionStamp) -> bool {
         self == current && !current.poisoned
+    }
+}
+
+/// Recompute the provider's admission stamp against LIVE state
+/// (E1.4 §9.5). A single read of each field — used only to detect
+/// CHANGE relative to a previously-captured stamp, so it does not
+/// need the consistent floors/generation pairing that
+/// [`verify_provider_authority`] performs. `0` pointers mean the
+/// authority / store is no longer installed.
+pub fn capture_admission_stamp(mesh: &MeshNode) -> AdmissionStamp {
+    let authority = mesh.node_authority();
+    let store = mesh.org_revocation_store();
+    let authority_ptr = authority
+        .as_ref()
+        .map_or(0, |a| Arc::as_ptr(a) as *const () as usize);
+    let (store_ptr, store_generation, poisoned) = store.as_ref().map_or((0, 0, false), |s| {
+        (
+            Arc::as_ptr(s) as *const () as usize,
+            s.publish_generation(),
+            s.is_poisoned(),
+        )
+    });
+    AdmissionStamp {
+        authority_ptr,
+        store_ptr,
+        store_generation,
+        poisoned,
+    }
+}
+
+/// Read a floor snapshot together with the exact publish generation
+/// it corresponds to (E1.3/E1.4). `StoreCore::publish` swaps the live
+/// view and bumps the generation under one write lock, so a seqlock
+/// double-read of the generation around the snapshot yields a
+/// CONSISTENT pair: if the generation is unchanged across the
+/// snapshot, the snapshot is exactly that generation. This matters
+/// because the §9.5 recheck compares the captured generation to the
+/// live one — a snapshot tagged with a NEWER generation than it
+/// actually reflects could let a stale (permissive) floor view pass
+/// the recheck. Floor publishes are disk-backed and rare, so this
+/// converges in one iteration in practice.
+fn capture_consistent_floors(store: &OrgRevocationStore) -> (Arc<OrgRevocationState>, u64) {
+    loop {
+        let g1 = store.publish_generation();
+        let floors = store.snapshot();
+        let g2 = store.publish_generation();
+        if g1 == g2 {
+            return (floors, g1);
+        }
+    }
+}
+
+/// The provider's own facts for one admission, captured at CALL time
+/// (E1.3). Registration-time authority is not usable authority: a
+/// provider whose owner cert has since expired, whose store is
+/// poisoned, or whose authority was uninstalled cannot admit.
+pub struct ProviderFacts {
+    /// This provider's entity (P).
+    pub provider: EntityId,
+    /// This provider's PROVEN owner org (B) — from the installed
+    /// authority scaffold, never fold state.
+    pub provider_owner_org: OrgId,
+    /// The floor snapshot the admission is verified against, paired
+    /// with the generation recorded in `stamp`.
+    pub floors: Arc<OrgRevocationState>,
+    /// The security-view fingerprint (§9.5) matching `floors`. The
+    /// gate re-checks this against [`capture_admission_stamp`] after
+    /// verification and before the replay insert.
+    pub stamp: AdmissionStamp,
+}
+
+/// Live provider self-verification (E1.3, verdict §5). For every
+/// protected admission, as a call-time prerequisite:
+///
+/// - a node authority AND a revocation store must be installed;
+/// - the store must not be poisoned;
+/// - the authority's owner cert must pass `self_verify` against the
+///   CURRENT floor snapshot (binds this node, temporally valid, its
+///   generation at/above the floor).
+///
+/// Any failure is [`AdmissionDenied::ProviderAuthorityUnavailable`]
+/// and the handler stays dark. On success returns the four provider
+/// facts the admission engine needs plus the security stamp matching
+/// the captured floors.
+pub fn verify_provider_authority(mesh: &MeshNode) -> Result<ProviderFacts, AdmissionDenied> {
+    let authority = mesh
+        .node_authority()
+        .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
+    let store = mesh
+        .org_revocation_store()
+        .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
+    if store.is_poisoned() {
+        return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+    }
+    let (floors, store_generation) = capture_consistent_floors(&store);
+    let provider = mesh.entity_id().clone();
+    // Live self-verify: an expired / below-floor / foreign-bound
+    // owner cert fails here even though it verified at registration.
+    authority
+        .config
+        .self_verify(&provider, &floors)
+        .map_err(|_| AdmissionDenied::ProviderAuthorityUnavailable)?;
+    // A poison could have raced in after the check above; deny rather
+    // than admit against a durability-uncertain store.
+    if store.is_poisoned() {
+        return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+    }
+    let stamp = AdmissionStamp {
+        authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store) as *const () as usize,
+        store_generation,
+        // Verified non-poisoned above; a poison arriving after this
+        // point is caught by the §9.5 recheck via the live stamp.
+        poisoned: false,
+    };
+    Ok(ProviderFacts {
+        provider,
+        provider_owner_org: authority.owner_org(),
+        floors,
+        stamp,
+    })
+}
+
+/// The visibility of a registered capability (E1.1). E1 protected
+/// registration accepts ONLY [`Self::Public`]; `OwnerScoped` /
+/// `GrantedAudience` are deferred to OA-3, where the announcement
+/// state machine lands, and a protected registration that requested
+/// them is loudly refused until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityVisibility {
+    /// Announced in the clear, discoverable by anyone (v0.4 default).
+    Public,
+}
+
+/// The provider-local application veto (E1.1/E1.6, verdict §7). Runs
+/// LAST in the admission order, seeing only the VERIFIED proof, and
+/// returns `true` to admit. Legacy public services carry a trivial
+/// `|_| true`; a protected registration supplies a real one.
+pub type OrgProviderPolicy = Arc<dyn Fn(&OrgCallProof) -> bool + Send + Sync>;
+
+/// The immutable registration record captured by a serve bridge
+/// (E1.1, verdict §1/§2/§7/§12). ONE truth per registration — the
+/// policy is captured WITH the handler, not looked up in a separate
+/// name→policy map, so there is never an unknown-policy fallback.
+#[derive(Clone)]
+pub struct RegisteredRpcService {
+    /// The generation token (E0.1) this registration owns.
+    pub registration_id: u64,
+    /// The service name this registration serves.
+    pub service: Arc<str>,
+    /// Announcement visibility — MUST be `Public` in E1.
+    pub visibility: CapabilityVisibility,
+    /// The admission mode bound at registration.
+    pub admission: OrgAdmission,
+    /// The application veto (step 11). `|_| true` for public.
+    pub provider_policy: OrgProviderPolicy,
+}
+
+impl std::fmt::Debug for RegisteredRpcService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredRpcService")
+            .field("registration_id", &self.registration_id)
+            .field("service", &self.service)
+            .field("visibility", &self.visibility)
+            .field("admission", &self.admission)
+            .field("provider_policy", &"<fn>")
+            .finish()
     }
 }
 
