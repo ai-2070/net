@@ -1,22 +1,29 @@
 # OA2-E Live Integration — Design v2 (PROPOSAL, not authorized)
 
 **Status:** DESIGN ONLY. No code, no behavior change. Revised per the
-OA2-E design verdict (CHANGES REQUESTED) + independent-review
-addendum.
+OA2-E design verdict (CHANGES REQUESTED) + independent-review addendum,
+then v3 per the v2 acceptance corrections.
 
-**MUST NOT be implemented until ALL gates pass:**
+**Authorization is SPLIT — E0 is OA-2-neutral, so it does not inherit
+the OA-1 gate:**
 
-1. OA-1 review-11 independently signed off;
-2. OA2-A–E-partial primitives audited as unwired;
-3. this revised design accepted;
-4. the OA2-E0 nRPC substrate prerequisites landed and reviewed.
+- **OA2-E0** (nRPC substrate hardening) — authorized once this revised
+  design is accepted, ONE amendment resolved (the E0.2 control-frame
+  discriminator, §E0.2). It may proceed INDEPENDENTLY: it enables no
+  organization authority and therefore does not wait on OA-1.
+- **OA2-E1 / OA2-E2** (provider admission + caller/wire) — HOLD until
+  ALL of: (1) OA-1 review-11 independently signed off; (2) OA2-A–E-
+  partial primitives audited as unwired; (3) OA2-E0 landed and
+  reviewed.
 
 ## The core problem (why this is not one mechanical commit)
 
 The current nRPC dispatch does **not** have one atomic, collision-safe,
-end-to-end-authenticated mapping from `caller + service + policy →
-handler`. OA-2 admission must **make that mapping load-bearing**, not
-assume it exists. Every correction below is an instance of that:
+**authenticated** mapping from `caller + service + policy → handler`
+(v1 authenticates the caller at the DIRECT session — end-to-end
+identity through a relay is explicitly deferred, §E0.3). OA-2 admission
+must **make that mapping load-bearing**, not assume it exists. Every
+correction below is an instance of that:
 
 - two mutable truths (channel→handler, name→policy) can disagree;
 - a wire `u16` bucket fans frames to every dispatcher in it;
@@ -69,7 +76,7 @@ Repair:
 Useful nRPC hardening independent of OA-2; **prerequisite** because OA-2
 policy cannot be layered on a destructive primitive.
 
-### E0.2 Channel/service equality + registration-bound call state (verdict §3, addendum §2)
+### E0.2 Channel/service equality + a wire discriminator on control frames (verdict §3, addendum §2)
 
 The wire carries a `u16` channel bucket; a collision fans a frame into
 every canonical dispatcher in that bucket. Initial REQUEST frames
@@ -78,13 +85,37 @@ not**.
 
 - Every REQUEST dispatch requires `payload.service == captured
   registration.service`; a non-matching dispatcher **silently
-  discards** (never emits a competing response).
-- Active call state is keyed by `(authenticated caller, call_id,
-  registration_id)` — a control frame may reach a fold only when its
-  authenticated origin + call identity + registration match. Two
-  colliding services sharing a caller/call_id cannot cross-mutate.
-- Protected calls SHOULD use a collision-free exact channel identity;
-  at minimum, control-frame handling is registration-bound.
+  discards** (never emits a competing response). This closes INITIAL
+  request service-confusion.
+
+Local state keyed by `(authenticated caller, call_id, registration_id)`
+does NOT by itself close colliding-bucket CONTROL frames: a CANCEL
+carries no `registration_id`, so when fanned into two dispatchers each
+supplies its OWN captured `registration_id` and both can match if the
+caller reused the `call_id`. The discriminator MUST live on the WIRE.
+
+**Requirement (MUST — the one open E0 decision):** every control frame
+(CANCEL / REQUEST_CHUNK / STREAM_GRANT) MUST carry an unambiguous
+discriminator selecting exactly one dispatcher. One of:
+
+- **(A, recommended)** the exact canonical channel identity — the
+  `u32` canonical `ChannelHash` the dispatcher is already keyed on
+  within the bucket — added to every control frame, so it routes to
+  exactly one dispatcher deterministically (a natural extension of the
+  existing "canonical hash is what each dispatcher is keyed on"
+  bucket-collision handling); or
+- **(B)** a collision-free per-call token minted by the initial
+  REQUEST and echoed by CANCEL / CHUNK / GRANT, matched against the
+  registration-bound active-call state.
+
+**The exact wire shape is selected at E0 review.** Recommendation: (A)
+— it reuses the canonical-hash dispatch keying already present and
+needs no per-call token distribution to the caller. Either way, a
+control frame reaches a fold ONLY when its authenticated origin + call
+identity + on-wire discriminator resolve to exactly one registration;
+two colliding services sharing a caller/call_id can never cross-mutate.
+Protected calls, being unary, still see CANCEL — this requirement is
+what makes CANCEL registration-exact.
 
 ### E0.3 Caller-identity model — DECISION: direct-session-only in v1 (verdict §4, addendum caller-binding)
 
@@ -116,14 +147,17 @@ Witnesses: direct-session admit; relayed protected request denied
 (`CallerIdentityUnavailable` / relay-mismatch); forged `origin_hash`
 vs authenticated session entity denied.
 
-### E0.4 One clock sample (addendum §3)
+### E0.4 One clock sample — helper here, RULE applies in E1 (addendum §3)
 
-Capture `wall_now` and `monotonic_now` ONCE per admission. All
+Conceptually this belongs to E1 admission; the reusable helper
+(a `struct` capturing `wall_now` + `monotonic_now` together) is
+harmless groundwork to land in E0. The RULE is enforced in E1.4/E1.5:
+capture `wall_now` and `monotonic_now` ONCE per admission; all
 certificate/grant/proof freshness uses `wall_now`; the replay deadline
-is derived from the SAME `wall_now` relative to `monotonic_now`. A
+is derived from the SAME `wall_now` relative to `monotonic_now`, so a
 wall-clock jump between a freshness check and replay-retention
-derivation must not immediately expire a just-fresh proof. Deterministic
-clock-step witness required.
+derivation cannot immediately expire a just-fresh proof. Deterministic
+clock-step witness lands with E1.
 
 ---
 
@@ -347,10 +381,13 @@ registration; 3 failed/duplicate registration leaves no tag/policy;
 entity denied; 9 clock-step: freshness+retention from one sample.
 
 Admission (E1): 10 cross-org admit end-to-end with four-party
-attribution; 11 owner-delegated admit; 12 each deny class → 0x0009 with
-coarse reason (missing/dup header, malformed, member-binding, foreign
-issuer, target-not-covered, insufficient rights, revoked floor,
-transplanted binding, replay, call-id collision, expired, policy veto);
+attribution; 11 owner-delegated admit; 12 deny classes → 0x0009 with
+coarse reason — a REPRESENTATIVE matrix (missing/dup header, malformed,
+member-binding, foreign issuer, target-not-covered, insufficient
+rights, revoked floor, transplanted binding, replay, call-id collision,
+expired, policy veto) PLUS an exhaustive enum-driven test asserting
+EVERY `AdmissionDenied` variant maps to `0x0009` with a defined coarse
+reason (so a newly added variant cannot silently escape the mapping);
 13 missing registration policy NEVER falls back — loud deny;
 14 provider owner cert expires after registration → `ProviderAuthority
 Unavailable`; 15 provider floor rises after registration → deny;
@@ -378,7 +415,8 @@ credential oracle.
   without authority / with a bad or missing proof / with an unhealthy
   authority all DENY; a handler never runs for an unverified call.
 - **One seam**: `caller + service + policy → handler` is atomic,
-  collision-safe (E0.1/E0.2), and end-to-end-authenticated (E0.3).
+  collision-safe (E0.1/E0.2), and direct-session-authenticated in v1
+  (E0.3; relayed end-to-end identity is explicitly deferred).
 - **Replay before handler; stability before replay** (E1.4) — a
   handler never runs twice for one `(caller, call_id)`, and a stale
   view never consumes a slot.
@@ -391,22 +429,45 @@ credential oracle.
 
 ---
 
-## Execution checklist (run only when authorized)
+## Execution checklist
+
+**OA2-E0 gate (independent — OA-2-neutral):**
+
+- [ ] This revised design accepted.
+- [ ] The E0.2 control-frame discriminator wire shape chosen (A canonical
+      channel identity / B per-call token) at E0 review.
+- [ ] → E0 AUTHORIZED to proceed (does not wait on OA-1).
+
+**OA2-E0 work (nRPC hardening, enables no org authority):**
+
+- [ ] Non-destructive vacant-only registration + generation tokens +
+      conditional teardown (E0.1).
+- [ ] Channel/service equality on REQUEST + the chosen control-frame
+      discriminator + registration-bound call state (E0.2).
+- [ ] Direct-session caller-identity binding; relayed protected denied
+      (E0.3).
+- [ ] Single wall+monotonic clock-sample helper (E0.4).
+- [ ] Witnesses 1–9; gates (fmt, both clippy, full suites).
+
+**OA2-E1 / E2 gate (behind the org-authority gates):**
 
 - [ ] Gate 1: OA-1 review-11 signed off.
 - [ ] Gate 2: OA2-A–E-partial primitives audited.
-- [ ] Gate 3: this revised design accepted.
-- [ ] OA2-E0 landed + reviewed (non-destructive registration,
-      channel/service equality, registration-bound call state,
-      caller-identity model, single clock sample).
+- [ ] Gate 3: OA2-E0 landed and reviewed.
+
+**OA2-E1 / E2 work (authorized only after the gate above):**
+
 - [ ] OA2-E1: registration-owned policy; live self-verify; admission
       stamp + §9.5 ordering; per-caller replay; policy + `Admitted`
       wiring + header strip; shared canonical digest; unary boundary;
-      witnesses 10–25.
+      witnesses 10–25 (incl. the exhaustive enum→0x0009 test).
 - [ ] OA2-E2: proof-intent builder; `RpcStatus 0x0009` + coarse
       reasons; mixed-version fleet gate; witnesses 26–28.
 - [ ] Gates: `may_execute` byte-identity, fmt, both clippy, full lib +
       org_ownership + CLI + new org_admission_wire integration file.
+
+**Later:**
+
 - [ ] OA-3 (separate): visibility state machine.
 - [ ] OA2-F: CLI/SDK grant management + §2.6 gate.
 ```
