@@ -1521,7 +1521,10 @@ mod tests {
             // decodes into a value whose signature no longer verifies
             // — never a value that passes verification.
             if let Ok(tampered) = OrgCapabilityGrant::from_bytes(&bytes) {
-                assert!(tampered.verify().is_err(), "tamper at {offset} must not verify");
+                assert!(
+                    tampered.verify().is_err(),
+                    "tamper at {offset} must not verify"
+                );
             }
         }
 
