@@ -46,6 +46,8 @@ pub mod meshos;
 // import each other (integration-plan Locked Decision 5); every
 // cross-layer projection lives here. Spans both feature surfaces, so
 // it needs both gates.
+pub mod admission_clock;
+pub mod caller_identity;
 pub mod metadata;
 pub mod org;
 pub mod org_admission;
