@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::behavior::org::OrgId;
 use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
-use super::behavior::org_revocation::{OrgRevocationState, OrgRevocationStore};
+use super::behavior::org_revocation::OrgRevocationState;
 use super::cortex::{RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
 use super::mesh::MeshNode;
@@ -129,7 +129,12 @@ pub fn capture_admission_stamp(mesh: &MeshNode) -> AdmissionStamp {
     let (store_ptr, store_generation, poisoned) = store.as_ref().map_or((0, 0, false), |s| {
         (
             Arc::as_ptr(s) as *const () as usize,
-            s.publish_generation(),
+            // Publication-barriered (Kyra E1 review): a bare
+            // `publish_generation()` could read an old generation
+            // while a floor publish holds `live.write()` mid-swap, so
+            // a stale stamp would compare "unchanged". The barriered
+            // read serializes against the swap.
+            s.barriered_generation(),
             s.is_poisoned(),
         )
     });
@@ -138,28 +143,6 @@ pub fn capture_admission_stamp(mesh: &MeshNode) -> AdmissionStamp {
         store_ptr,
         store_generation,
         poisoned,
-    }
-}
-
-/// Read a floor snapshot together with the exact publish generation
-/// it corresponds to (E1.3/E1.4). `StoreCore::publish` swaps the live
-/// view and bumps the generation under one write lock, so a seqlock
-/// double-read of the generation around the snapshot yields a
-/// CONSISTENT pair: if the generation is unchanged across the
-/// snapshot, the snapshot is exactly that generation. This matters
-/// because the §9.5 recheck compares the captured generation to the
-/// live one — a snapshot tagged with a NEWER generation than it
-/// actually reflects could let a stale (permissive) floor view pass
-/// the recheck. Floor publishes are disk-backed and rare, so this
-/// converges in one iteration in practice.
-fn capture_consistent_floors(store: &OrgRevocationStore) -> (Arc<OrgRevocationState>, u64) {
-    loop {
-        let g1 = store.publish_generation();
-        let floors = store.snapshot();
-        let g2 = store.publish_generation();
-        if g1 == g2 {
-            return (floors, g1);
-        }
     }
 }
 
@@ -205,7 +188,10 @@ pub fn verify_provider_authority(mesh: &MeshNode) -> Result<ProviderFacts, Admis
     if store.is_poisoned() {
         return Err(AdmissionDenied::ProviderAuthorityUnavailable);
     }
-    let (floors, store_generation) = capture_consistent_floors(&store);
+    // Publication-barriered floors + generation (Kyra E1 review): both
+    // read under one `live.read()`, so the pair is consistent and the
+    // generation cannot lag an in-progress floor swap.
+    let (floors, store_generation) = store.snapshot_with_generation();
     let provider = mesh.entity_id().clone();
     // Live self-verify: an expired / below-floor / foreign-bound
     // owner cert fails here even though it verified at registration.

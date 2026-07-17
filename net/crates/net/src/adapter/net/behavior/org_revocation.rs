@@ -386,6 +386,23 @@ struct StoreCore {
     subscribers: RwLock<Vec<(u64, FloorsRaisedCallback)>>,
     /// Token source for [`Self::subscribers`].
     next_subscriber: AtomicU64,
+    /// Test-only pause fired ONCE, from inside [`Self::publish`],
+    /// AFTER the live-view swap and BEFORE the generation bump, while
+    /// `live.write()` is still held. Lets a witness deterministically
+    /// occupy the exact "new view installed, old generation still
+    /// present" window the barriered readers must not observe.
+    #[cfg(test)]
+    publish_pause: parking_lot::Mutex<Option<PublishPauseHook>>,
+}
+
+/// The one-shot hook a test installs to pause [`StoreCore::publish`]
+/// between the view swap and the generation bump.
+#[cfg(test)]
+struct PublishPauseHook {
+    /// Signalled once the view is swapped and the pause begins.
+    swapped: std::sync::mpsc::Sender<()>,
+    /// Blocks the publisher until the test releases it.
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl StoreCore {
@@ -408,8 +425,24 @@ impl StoreCore {
             .map(|((org, member), floor)| (*org, member.clone(), *floor))
             .collect();
         *live = Arc::new(next);
+        // Test-only: occupy the "new view installed, old generation
+        // still present" window while `live` (the write guard) is
+        // held, so a witness can prove the barriered readers never
+        // observe it. No-op in production (field absent).
+        #[cfg(test)]
+        self.run_publish_pause_hook();
         self.generation.fetch_add(1, Ordering::Release);
         raised
+    }
+
+    /// Fire the one-shot publish pause hook if a test installed one.
+    /// Runs while the caller holds `live.write()`.
+    #[cfg(test)]
+    fn run_publish_pause_hook(&self) {
+        if let Some(hook) = self.publish_pause.lock().take() {
+            let _ = hook.swapped.send(());
+            let _ = hook.resume.recv();
+        }
     }
 
     /// Notify every subscriber of `raised`. Callers invoke this
@@ -486,6 +519,8 @@ fn join_or_create_core(
         generation: AtomicU64::new(0),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
+        #[cfg(test)]
+        publish_pause: parking_lot::Mutex::new(None),
     });
     cores.insert(path.to_path_buf(), Arc::downgrade(&core));
     (core, Vec::new())
@@ -713,8 +748,60 @@ impl OrgRevocationStore {
     /// The core's publish generation — bumped once per published
     /// live view. Lets callers order publications relative to
     /// their own critical sections.
+    ///
+    /// A BARE atomic load: it does NOT cross the live-view lock, so a
+    /// publication in progress (view already swapped under
+    /// `live.write()`, generation not yet bumped) is observed as the
+    /// OLD generation. Admission stamping must use
+    /// [`Self::barriered_generation`] / [`Self::snapshot_with_generation`]
+    /// instead — see their docs (OA2-E1 Kyra review).
     pub fn publish_generation(&self) -> u64 {
         self.core.generation.load(Ordering::Acquire)
+    }
+
+    /// The publish generation read UNDER a `live.read()` barrier
+    /// (OA2-E1 Kyra review). [`StoreCore::publish`] swaps the live
+    /// view and bumps the generation while holding `live.write()`, so
+    /// acquiring a read guard first guarantees no publication is
+    /// mid-flight: the returned generation always matches the
+    /// currently-visible view. Unlike [`Self::publish_generation`],
+    /// this can never return an old generation while a raised floor is
+    /// already installed — the interleaving that would let a stale
+    /// admission stamp compare "unchanged" and admit against a floor
+    /// that has actually risen.
+    pub fn barriered_generation(&self) -> u64 {
+        let _live = self.core.live.read();
+        self.core.generation.load(Ordering::Acquire)
+    }
+
+    /// A floor snapshot together with the exact generation it
+    /// reflects, both read under ONE `live.read()` guard (OA2-E1
+    /// Kyra review). Publication-barriered like
+    /// [`Self::barriered_generation`], so the `(snapshot, generation)`
+    /// pair is always consistent — no seqlock retry needed.
+    pub fn snapshot_with_generation(&self) -> (Arc<OrgRevocationState>, u64) {
+        let live = self.core.live.read();
+        let generation = self.core.generation.load(Ordering::Acquire);
+        (live.clone(), generation)
+    }
+
+    /// Test-only: arm the one-shot publish pause. The NEXT
+    /// [`StoreCore::publish`] (e.g. via [`Self::apply_bundle`]) will,
+    /// after swapping the live view and while still holding
+    /// `live.write()`, signal the returned receiver and then block
+    /// until the returned sender is used. Lets a witness sit in the
+    /// "new view, old generation" window.
+    #[cfg(test)]
+    fn arm_publish_pause_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *self.core.publish_pause.lock() = Some(PublishPauseHook {
+            swapped: swapped_tx,
+            resume: resume_rx,
+        });
+        (swapped_rx, resume_tx)
     }
 
     /// Pin this store's publish transaction (review-9 addendum):
@@ -2075,5 +2162,74 @@ mod tests {
             store.apply_bundle(&bundle_with_floor(9)).is_err(),
             "symlinked lock sidecar must refuse a reload"
         );
+    }
+
+    /// OA2-E1 (Kyra review) — the publication barrier. A barriered
+    /// generation read issued while a floor publish is paused between
+    /// the live-view swap and the generation bump must NOT observe the
+    /// stale (pre-bump) generation the bare `publish_generation()`
+    /// still returns; it blocks on `live.read()` and, once released,
+    /// returns the NEW generation. Deterministic: the publisher is
+    /// pinned in the exact "new view installed, old generation
+    /// present" window by the one-shot pause hook.
+    #[test]
+    fn barriered_generation_never_observes_an_in_progress_publish() {
+        use std::sync::mpsc;
+
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let g0 = store.barriered_generation();
+
+        // Arm the one-shot pause, then raise a floor on another thread:
+        // it swaps the live view and blocks BEFORE bumping the
+        // generation, holding `live.write()` throughout.
+        let (swapped_rx, resume_tx) = store.arm_publish_pause_for_test();
+        let publisher = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.apply_bundle(&bundle_with_floor(9)).expect("apply");
+            })
+        };
+        swapped_rx.recv().expect("publisher reached the pause");
+
+        // Window open: new view installed, generation NOT yet bumped,
+        // write lock held. A BARE read sees the stale generation — the
+        // hazard the barrier closes.
+        assert_eq!(
+            store.publish_generation(),
+            g0,
+            "bare read observes the pre-bump generation while the new floor is already swapped in",
+        );
+
+        // A BARRIERED read issued now must block on `live.read()` — no
+        // result until the publisher releases the write lock.
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let g = store.barriered_generation();
+                let _ = reader_tx.send(g);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            reader_rx.try_recv().is_err(),
+            "barriered read must block while the publish holds live.write() mid-swap",
+        );
+
+        // Release: the publisher bumps the generation and drops the
+        // write lock; the barriered reader unblocks.
+        resume_tx.send(()).expect("resume");
+        publisher.join().expect("publisher join");
+        reader.join().expect("reader join");
+
+        let observed = reader_rx.recv().expect("barriered read result");
+        assert_eq!(
+            observed,
+            g0 + 1,
+            "the barriered read returned the NEW generation, never the stale one",
+        );
+        assert_eq!(store.barriered_generation(), g0 + 1);
+        assert!(store.floor_for(&org().org_id(), &member()) >= 9);
     }
 }
