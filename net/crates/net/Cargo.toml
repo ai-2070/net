@@ -503,6 +503,14 @@ name = "island_claim_sensed"
 harness = false
 required-features = ["net", "redex"]
 
+# ICB-6 deadline-enabled takeover + runtime-entry expiry: two separately-labeled
+# recovery groups (foreign takeover CAS after a lapsed deadline; short-TTL entry
+# sweep) + the M5 short-TTL diagnostic.
+[[bench]]
+name = "island_claim_recovery"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
