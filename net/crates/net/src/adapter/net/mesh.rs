@@ -2567,6 +2567,31 @@ struct AnnounceGate {
     deferral_generation: u64,
 }
 
+/// The cached local capability announcement plus the org
+/// authority/floor EPOCH it was built under (review-9 addendum).
+/// Send paths that reuse the cached object — the immediate
+/// broadcast, the trailing-edge flush, the session-open push —
+/// compare the stamp against the current epoch before serializing:
+/// a mismatch means emission's inputs changed since the build (a
+/// floor raise, an authority change, the emission switch), and the
+/// embedded owner certificate must be re-validated — peers cannot
+/// know this node's local floor state, so a self-floored
+/// certificate must never keep riding the wire.
+struct PublishedAnnouncement {
+    /// `org_authority_epoch` at build time.
+    epoch: u64,
+    /// The signed announcement as built.
+    ann: Arc<CapabilityAnnouncement>,
+}
+
+/// The node's slot in the installed revocation store's
+/// raise-subscriber registry — the store it subscribed on plus the
+/// removable token (review-9 addendum).
+type OrgRaiseSubscription = Option<(
+    Arc<super::behavior::org_revocation::OrgRevocationStore>,
+    u64,
+)>;
+
 /// Signal-carrying wrapper around the `nrpc:` local-service set
 /// (RT-2). `serve_rpc` inserts and `ServeHandle::drop` removes
 /// through the shared `Arc`, so the local-caps change signal has to
@@ -4117,6 +4142,23 @@ pub struct MeshNode {
     /// requires an installed authority
     /// ([`Self::set_owner_cert_emission`]).
     owner_cert_emission_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Review-9 addendum: the node's slot in the INSTALLED store's
+    /// raise-subscriber registry — `(store, token)`. Replacement
+    /// unsubscribes the outgoing store's token, so a detached
+    /// store neither keeps nor steals this node's notifications,
+    /// and installing one store `Arc` into several nodes leaves
+    /// every node subscribed (the registry replaced the old
+    /// single-slot callback).
+    org_raise_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
+    /// Review-9 addendum: the authority/floor EPOCH. Bumped
+    /// whenever the inputs to owner-cert emission change — an
+    /// installed-store floor raise, a store or authority
+    /// (re)installation, the emission switch. The cached local
+    /// announcement carries the epoch it was built under; every
+    /// send path that reuses the cache re-validates on mismatch
+    /// and rebuilds WITHOUT the certificate when it no longer
+    /// stands ([`Self::announcement_bytes_for_send`]).
+    org_authority_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -4496,11 +4538,16 @@ pub struct MeshNode {
     /// [`sensing::ProviderObservationKey`], packing, down-sampling,
     /// hop rule) subsumes the `latest` half.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
-    /// Most recent `CapabilityAnnouncement` this node published.
-    /// Pushed to new peers right after `accept` / `connect`
-    /// completes, so late joiners pick up our caps without waiting
-    /// for a re-announce. `None` until the first `announce_*` call.
-    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
+    /// Most recent `CapabilityAnnouncement` this node published,
+    /// stamped with the org authority/floor epoch it was built
+    /// under (review-9 addendum). Pushed to new peers right after
+    /// `accept` / `connect` completes, so late joiners pick up our
+    /// caps without waiting for a re-announce; every reusing send
+    /// path serializes it through
+    /// [`MeshNode::announcement_bytes_for_send`], which
+    /// re-validates the embedded owner certificate on an epoch
+    /// mismatch. `None` until the first `announce_*` call.
+    local_announcement: Arc<ArcSwapOption<PublishedAnnouncement>>,
     /// User-supplied capability baseline — the pre-augmentation set
     /// the most recent `announce_capabilities` call published. The
     /// `announce_chain` / `announce_chain_range` / `withdraw_chain`
@@ -5379,6 +5426,8 @@ impl MeshNode {
             node_authority: Arc::new(ArcSwapOption::empty()),
             org_install: Arc::new(parking_lot::Mutex::new(())),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
+            org_authority_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
@@ -6662,13 +6711,23 @@ impl MeshNode {
     /// - installs are SERIALIZED (two concurrent dominance checks
     ///   cannot both validate against the same older view and
     ///   publish in reverse order);
+    /// - the CURRENT store's publish transaction is pinned across
+    ///   the dominance comparison and the swap (review-9
+    ///   addendum): an in-flight raise on the installed store
+    ///   either publishes first — the comparison sees it and
+    ///   refuses a lower candidate — or is forced to publish after
+    ///   the swap, where it is unambiguously a raise through a
+    ///   detached store whose subscription has been removed;
     /// - installing over nothing is accepted, re-installing the
     ///   same store is idempotent, a replacement whose live view is
     ///   LOWER on any `(org, member)` floor is refused, and a
     ///   durability-poisoned candidate is refused (uncertainty is
     ///   never laundered through replacement);
-    /// - the raise callback is INERT once its store is detached —
-    ///   a replaced store can no longer mutate this node's fold;
+    /// - the node subscribes to the candidate through the store's
+    ///   subscriber REGISTRY and unsubscribes from the outgoing
+    ///   store — a detached store neither keeps nor steals this
+    ///   node's notifications, and one store installed into
+    ///   several nodes notifies all of them (review-9 addendum);
     /// - the candidate's floors are RECONCILED against existing
     ///   fold projections before returning, so a pre-raised store
     ///   retracts stale ownership immediately (no floor-change
@@ -6678,16 +6737,41 @@ impl MeshNode {
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        self.install_org_revocation_store_locked(store)
+        self.install_org_revocation_store_locked(store, false, None)
+    }
+
+    /// Deterministic-witness seam: run a store installation that
+    /// invokes `pause` while the CURRENT store's publish guard is
+    /// held, after the dominance comparison and before the swap.
+    /// Exposed as `pub` (not `pub(crate)`) only so the
+    /// `tests/org_ownership.rs` race witnesses can reach it from a
+    /// separate crate; not for production use.
+    #[doc(hidden)]
+    pub fn install_org_revocation_store_paused_for_test(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        let _install = self.org_install.lock();
+        self.install_org_revocation_store_locked(store, false, Some(pause))
     }
 
     /// Body of [`Self::install_org_revocation_store`], called with
     /// the install lock HELD — `install_node_authority` runs its
     /// one-owner comparison and this store install under ONE lock
     /// acquisition so no other install can interleave.
+    ///
+    /// `candidate_guard_held` is `true` when the caller already
+    /// holds the CANDIDATE store's publish guard
+    /// (`install_node_authority` pins it across verification):
+    /// when candidate and current share one core (same backing
+    /// path), re-acquiring the same non-reentrant guard here would
+    /// deadlock, and the caller's guard already pins both views.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+        candidate_guard_held: bool,
+        pause_before_swap: Option<&(dyn Fn() + Sync)>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         if store.is_poisoned() {
             return Err(
@@ -6696,11 +6780,37 @@ impl MeshNode {
                 },
             );
         }
-        if let Some(current) = self.org_revocation.load_full() {
-            if Arc::ptr_eq(&current, &store) {
+        let current = self.org_revocation.load_full();
+        if let Some(cur) = &current {
+            if Arc::ptr_eq(cur, &store) {
                 return Ok(());
             }
-            let current_view = current.snapshot();
+        }
+
+        // Pin the CURRENT store's publish transaction across the
+        // dominance comparison AND the swap (review-9 addendum):
+        // without this, the installed store can rise between
+        // `snapshot()` and the ArcSwap below, and the node would
+        // replace an already-enforced floor 10 with a candidate
+        // validated against floor 5. Same-core candidates share
+        // the current store's live view (dominance holds
+        // structurally), so the single shared guard — possibly
+        // already held by the caller — suffices. No callback runs
+        // under this guard: raises notify outside the reload lock.
+        let _current_guard = match &current {
+            Some(cur) if cur.shares_core_with(&store) => {
+                if candidate_guard_held {
+                    None
+                } else {
+                    Some(store.publish_guard())
+                }
+            }
+            Some(cur) => Some(cur.publish_guard()),
+            None => None,
+        };
+
+        if let Some(cur) = &current {
+            let current_view = cur.snapshot();
             let candidate_view = store.snapshot();
             let dominates = current_view
                 .iter()
@@ -6713,6 +6823,9 @@ impl MeshNode {
                 );
             }
         }
+        if let Some(pause) = pause_before_swap {
+            pause();
+        }
 
         // Floor raises retract exactly the fold ownership
         // projections that fell below the new floor — immediately,
@@ -6720,11 +6833,15 @@ impl MeshNode {
         // (review-8 §9). The callback first checks that ITS store
         // is still the installed one (review-9): a detached store's
         // late raises must not mutate a node it no longer speaks
-        // for.
+        // for. Registered through the subscriber REGISTRY (review-9
+        // addendum) so other observers — another node holding this
+        // same store `Arc`, a same-path sibling handle — keep
+        // their own registrations.
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
+        let epoch = self.org_authority_epoch.clone();
         let me = Arc::downgrade(&store);
-        store.set_on_floors_raised(move |raised| {
+        let token = store.subscribe_floors_raised(move |raised| {
             let installed = slot.load_full();
             let still_installed = match (&installed, me.upgrade()) {
                 (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
@@ -6733,6 +6850,10 @@ impl MeshNode {
             if !still_installed {
                 return;
             }
+            // The enforced floor view changed: any cached
+            // owner-bearing announcement must re-validate before
+            // its next send (review-9 addendum).
+            epoch.fetch_add(1, Ordering::AcqRel);
             for (org, member, floor) in raised {
                 let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
                     &fold, *org, member, *floor,
@@ -6747,12 +6868,29 @@ impl MeshNode {
                 }
             }
         });
+        // Swap the node's observer slot: drop the token held on the
+        // outgoing store so a detached store neither keeps nor
+        // steals this node's notifications (review-9 addendum).
+        {
+            let mut subscription = self.org_raise_subscription.lock();
+            if let Some((old_store, old_token)) = subscription.take() {
+                old_store.unsubscribe_floors_raised(old_token);
+            }
+            *subscription = Some((store.clone(), token));
+        }
         self.org_revocation.store(Some(store.clone()));
+        drop(_current_guard);
+
+        // Emission inputs changed with the installed store.
+        self.org_authority_epoch.fetch_add(1, Ordering::AcqRel);
 
         // Reconcile the candidate's floors against projections that
         // already exist in the fold: a store installed AFTER its
         // floors rose produces no callback, so the install itself
-        // performs the retraction sweep (review-9).
+        // performs the retraction sweep (review-9). The snapshot is
+        // taken after the swap, so a raise landing in the gap is
+        // covered either by its (now active) subscription or by
+        // this sweep.
         let snapshot = store.snapshot();
         for ((org, member), floor) in snapshot.iter() {
             let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
@@ -6797,6 +6935,50 @@ impl MeshNode {
         &self,
         authority: Arc<super::behavior::org_authority::NodeAuthority>,
     ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        self.install_node_authority_inner(authority, None)
+    }
+
+    /// Deterministic-witness seam: run an authority installation
+    /// that invokes `pause` while the CANDIDATE store's publish
+    /// guard is held, right after the self-verification. Exposed as
+    /// `pub` (not `pub(crate)`) only so the `tests/org_ownership.rs`
+    /// race witnesses can reach it from a separate crate; not for
+    /// production use.
+    #[doc(hidden)]
+    pub fn install_node_authority_paused_for_test(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        self.install_node_authority_inner(authority, Some(pause))
+    }
+
+    fn install_node_authority_inner(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+        pause_after_verify: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        // Serialize the one-owner comparison, the store install,
+        // and the authority publication under ONE lock acquisition
+        // (review-9: two concurrent installs must not both observe
+        // "no authority" and race different owners through separate
+        // ArcSwap fields).
+        let _install = self.org_install.lock();
+
+        // Review-9 addendum: pin the CANDIDATE store's publish
+        // transaction across verification AND publication. Without
+        // it, a concurrent apply can raise this node's own floor
+        // between `self_verify` and the stores below, and the
+        // installation would return `Ok` with an authority that no
+        // longer satisfies its "currently self-verified" contract.
+        // Under the guard, a racing raise publishes strictly AFTER
+        // the authority — at which point it is an ordinary
+        // post-install raise: the (already-subscribed) callback
+        // retracts, and emission goes dark. No callback runs under
+        // this guard.
+        let candidate_store = authority.revocation.clone();
+        let _candidate_guard = candidate_store.publish_guard();
+
         // Review-9: the authority object is RE-VERIFIED here in
         // full, not trusted as a proof token — `NodeAuthority` is
         // not immutable (its store can rise after adopt returned,
@@ -6804,17 +6986,15 @@ impl MeshNode {
         // must be re-established at the installation boundary:
         // structural binding to THIS node, wall-clock validity
         // under the persisted ceremony skew, and the certificate's
-        // standing against the authority's CURRENT floor snapshot.
+        // standing against the authority's floor snapshot — pinned
+        // by the guard above until publication.
         authority
             .config
-            .self_verify(self.identity.entity_id(), &authority.revocation.snapshot())?;
+            .self_verify(self.identity.entity_id(), &candidate_store.snapshot())?;
+        if let Some(pause) = pause_after_verify {
+            pause();
+        }
 
-        // Serialize the one-owner comparison, the store install,
-        // and the authority publication under ONE lock acquisition
-        // (review-9: two concurrent installs must not both observe
-        // "no authority" and race different owners through separate
-        // ArcSwap fields).
-        let _install = self.org_install.lock();
         if let Some(existing) = self.node_authority.load_full() {
             if existing.owner_org() != authority.owner_org() {
                 return Err(
@@ -6825,9 +7005,12 @@ impl MeshNode {
                 );
             }
         }
-        self.install_org_revocation_store_locked(authority.revocation.clone())
+        self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
         self.node_authority.store(Some(authority));
+        // Emission inputs changed with the installed authority.
+        self.org_authority_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 
@@ -6862,6 +7045,10 @@ impl MeshNode {
         }
         self.owner_cert_emission_enabled
             .store(enabled, Ordering::Release);
+        // Emission inputs changed: a cached owner-bearing
+        // announcement must re-validate before its next send
+        // (review-9 addendum).
+        self.org_authority_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -6900,6 +7087,122 @@ impl MeshNode {
             }
         }
         Some(cert.clone())
+    }
+
+    /// Serialize the cached local announcement for a reusing send
+    /// path — the immediate broadcast, the trailing-edge flush,
+    /// the session-open push (review-9 addendum). If the cached
+    /// stamp matches the current authority/floor epoch, the cached
+    /// bytes are what this node's current state would emit. On a
+    /// mismatch the embedded owner certificate is re-validated
+    /// and, when it no longer stands, the announcement is rebuilt
+    /// WITHOUT it — re-signed, version-bumped so it supersedes the
+    /// certified form at peers that already hold it — and
+    /// atomically republished. Returns `None` when nothing has
+    /// been announced yet.
+    fn announcement_bytes_for_send(&self) -> Option<Vec<u8>> {
+        let cached = self.local_announcement.load_full()?;
+        if cached.epoch
+            == self
+                .org_authority_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Some(cached.ann.to_bytes());
+        }
+        self.revalidate_cached_announcement()
+    }
+
+    /// Deterministic-witness seam for the send-time serialization
+    /// boundary every reusing path shares. Exposed as `pub` (not
+    /// `pub(crate)`) only so `tests/org_ownership.rs` can decode
+    /// what a send path would put on the wire; not for production
+    /// use.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_for_test(&self) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send()
+    }
+
+    /// Slow path of [`Self::announcement_bytes_for_send`]: under
+    /// `announce_mu` (every `local_announcement` store runs under
+    /// it), re-derive what emission would attach NOW and reconcile
+    /// the cache. Unchanged certificate → restamp the epoch;
+    /// changed certificate (a self-floor rose, the authority
+    /// changed, emission toggled) → rebuild, refresh the
+    /// timestamp, bump the version, re-sign, republish, and hold
+    /// the self-projection to the same standard as the wire.
+    fn revalidate_cached_announcement(&self) -> Option<Vec<u8>> {
+        let _announce_guard = self.announce_mu.lock();
+        let cached = self.local_announcement.load_full()?;
+        // Epoch FIRST, certificate second: a raise landing between
+        // the two reads leaves a stale stamp (safe — the next send
+        // re-validates), never a fresh stamp over a stale cert.
+        let epoch = self
+            .org_authority_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cert = self.owner_cert_for_emission();
+        if cert == cached.ann.owner_cert {
+            let restamped = Arc::new(PublishedAnnouncement {
+                epoch,
+                ann: cached.ann.clone(),
+            });
+            self.local_announcement.store(Some(restamped.clone()));
+            return Some(restamped.ann.to_bytes());
+        }
+
+        let mut ann = (*cached.ann).clone();
+        ann.owner_cert = cert;
+        // A fresh version + timestamp: the replacement must
+        // supersede the certified form at peers that already
+        // received it, and must not ship a stale freshness claim.
+        ann.version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        ann.timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let signed = cached.ann.signature.is_some();
+        if signed {
+            ann.sign(&self.identity);
+        }
+
+        // Self-index the rebuilt announcement exactly like the
+        // announce path does — the node's own projection is held
+        // to the identical proof standard as the wire form.
+        let verified_owner = {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                signed,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
+        let _ = self.capability_fold.apply(fold_ann);
+        if let Some(owner) = &verified_owner {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &self.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
+
+        let published = Arc::new(PublishedAnnouncement {
+            epoch,
+            ann: Arc::new(ann),
+        });
+        self.local_announcement.store(Some(published.clone()));
+        tracing::info!(
+            version = published.ann.version,
+            has_cert = published.ann.owner_cert.is_some(),
+            "cached announcement re-validated: owner certificate no longer \
+             matches emission state; republished"
+        );
+        Some(published.ann.to_bytes())
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -16503,7 +16806,7 @@ impl MeshNode {
                     .local_announcement
                     .load()
                     .as_deref()
-                    .map(|ann| ann.capabilities.clone())
+                    .map(|published| published.ann.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
                 // Build the publish chain. Prefer an explicitly-held
@@ -17399,8 +17702,9 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
-        // `Some(bytes)` to broadcast after releasing the lock; `None`
-        // when the announce was rate-limit-deferred or coalesced.
+        // `Some(())` = broadcast after releasing the lock (bytes are
+        // serialized at send time through the epoch-checked path);
+        // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
             let _announce_guard = self.announce_mu.lock();
             // Set a new baseline or re-read the current one — both
@@ -17594,6 +17898,15 @@ impl MeshNode {
             // state.
             self.proximity_graph.set_local_capabilities(caps.clone());
 
+            // Capture the authority/floor epoch BEFORE deriving the
+            // owner cert (review-9 addendum): if a raise lands
+            // between the two reads, the cached stamp is OLDER than
+            // the live epoch and the next send re-validates — the
+            // unsafe direction (fresh stamp over a stale cert) is
+            // structurally impossible.
+            let org_epoch = self
+                .org_authority_epoch
+                .load(std::sync::atomic::Ordering::Acquire);
             let mut ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
@@ -17651,8 +17964,14 @@ impl MeshNode {
             // Publish as the latest local announcement so future
             // session-opens push this version to new peers. Also always
             // runs so late joiners get the latest caps even when we've
-            // rate-limited away the broadcast.
-            self.local_announcement.store(Some(Arc::new(ann.clone())));
+            // rate-limited away the broadcast. Stamped with the epoch
+            // captured BEFORE the owner cert was derived (review-9
+            // addendum).
+            self.local_announcement
+                .store(Some(Arc::new(PublishedAnnouncement {
+                    epoch: org_epoch,
+                    ann: Arc::new(ann.clone()),
+                })));
 
             // Origin-side rate limit: within-window calls update the
             // self-index + `local_announcement` and coalesce into one
@@ -17710,14 +18029,21 @@ impl MeshNode {
                 self.spawn_deferred_announce(delay, generation);
                 None
             } else {
-                Some(ann.to_bytes())
+                Some(())
             }
         };
         // `announce_mu` is released here — the peer broadcast is
         // network I/O and must never hold the announce lock.
 
-        // Fan out to currently-connected peers.
-        let Some(bytes) = to_broadcast else {
+        // Fan out to currently-connected peers. The bytes are
+        // serialized AT SEND TIME through the epoch-checked path
+        // (review-9 addendum): a self-floor raised between the
+        // build above and this send must not ship the certified
+        // form.
+        if to_broadcast.is_none() {
+            return Ok(());
+        }
+        let Some(bytes) = self.announcement_bytes_for_send() else {
             return Ok(());
         };
         self.broadcast_announcement_bytes(&bytes).await;
@@ -17795,11 +18121,14 @@ impl MeshNode {
             gate.last_broadcast_at = Some(std::time::Instant::now());
         }
         // `local_announcement` is stored before the gate on every
-        // announce path, so a scheduled flush always finds it.
-        let Some(ann) = self.local_announcement.load_full() else {
+        // announce path, so a scheduled flush always finds it. The
+        // bytes are serialized through the epoch-checked path
+        // (review-9 addendum): a self-floor raised during the
+        // deferral window must not ship the certified form.
+        let Some(bytes) = self.announcement_bytes_for_send() else {
             return;
         };
-        self.broadcast_announcement_bytes(&ann.to_bytes()).await;
+        self.broadcast_announcement_bytes(&bytes).await;
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
@@ -19732,10 +20061,13 @@ impl MeshNode {
     /// late joiners don't have to wait for a re-announce. No-op
     /// when we haven't yet announced anything.
     async fn push_local_announcement(&self, peer_addr: SocketAddr) {
-        let Some(ann) = self.local_announcement.load_full() else {
+        // Serialized through the epoch-checked path (review-9
+        // addendum): a late joiner must receive what this node's
+        // CURRENT state would emit, never a cached certificate a
+        // floor raise has since invalidated.
+        let Some(bytes) = self.announcement_bytes_for_send() else {
             return;
         };
-        let bytes = ann.to_bytes();
         if let Err(e) = self
             .send_subprotocol(peer_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
             .await
@@ -21356,7 +21688,7 @@ impl MeshNode {
         let Some(observed) = self.reflex_addr() else {
             return false;
         };
-        if published.reflex_addr == Some(observed) {
+        if published.ann.reflex_addr == Some(observed) {
             return false;
         }
         self.reclassify_nat().await;
@@ -21414,7 +21746,9 @@ impl MeshNode {
     /// return torn pairs under concurrent mutation.
     #[doc(hidden)]
     pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
-        self.local_announcement.load_full()
+        self.local_announcement
+            .load_full()
+            .map(|published| published.ann.clone())
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking

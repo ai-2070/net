@@ -513,6 +513,21 @@ impl NodeAuthority {
     /// bundle has been durably applied, a LATER failure does not
     /// roll it back (revocation is monotone; that is fail-closed).
     ///
+    /// # Interrupted-ceremony recovery (review-9 addendum)
+    ///
+    /// A failure AFTER durable changes begin (store created,
+    /// audience written) but BEFORE the membership publication
+    /// leaves a PARTIAL scaffold: revocation state and/or audience
+    /// key exist, membership does not. That scaffold is fail-closed
+    /// — [`Self::open`] (and therefore production startup) refuses
+    /// a directory without a membership file, so no ownership is
+    /// ever emitted from it — and RESUMABLE: re-running `adopt`
+    /// preserves the audience credential and every persisted floor
+    /// maximum and completes the ceremony. The contract is
+    /// deliberately NOT "all three files or none": rolling back
+    /// monotone floor state to recover atomicity would be the
+    /// weaker failure mode.
+    ///
     /// - `owner-membership.json` — refuses a DIFFERENT org's cert
     ///   while an owner is installed; same-org renewal overwrites.
     /// - `owner-audience.key` — generated fresh on first adopt,
@@ -761,28 +776,22 @@ fn parse_membership(bytes: &[u8], path: &Path) -> Result<NodeAuthorityConfig, Or
     Ok(config)
 }
 
-/// Acquire the ceremony lock for `dir`
-/// (`<dir>/authority.lock`, no-follow): exactly one adoption at a
-/// time per authority directory, held from the ownership decision
-/// through the final reopen (review-9). Blocking; released when
-/// the handle drops.
+/// Acquire the ceremony lock for `dir` (`<dir>/authority.lock`):
+/// exactly one adoption at a time per authority directory, held
+/// from the ownership decision through the final reopen (review-9).
+/// Blocking; released when the handle drops. The lock inode is
+/// held to the full regular-file policy via
+/// [`org_revocation::open_lock_file`](super::org_revocation) —
+/// no-follow, non-blocking open, and a type check on the opened
+/// descriptor, so a planted symlink or FIFO is refused rather than
+/// followed or parked on (review-9).
 fn lock_ceremony(dir: &Path) -> Result<std::fs::File, OrgAuthorityError> {
     let lock_path = dir.join("authority.lock");
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: lock_path.display().to_string(),
         reason: format!("ceremony lock: {e}"),
     };
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-        opts.mode(0o600);
-    }
-    let f = opts.open(&lock_path).map_err(io)?;
-    f.lock().map_err(io)?;
-    Ok(f)
+    super::org_revocation::open_lock_file(&lock_path).map_err(io)
 }
 
 /// Open, mode-check, and read the audience key through ONE
@@ -940,6 +949,80 @@ mod tests {
             opened.audience.discovery_key(),
             authority.audience.discovery_key()
         );
+    }
+
+    /// Review-9: the ceremony lock inode is held to the full
+    /// regular-file policy — a planted FIFO refuses the ceremony
+    /// (and cannot park the open waiting for a reader) instead of
+    /// carrying the lock.
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_ceremony_lock_is_refused() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let status = std::process::Command::new("mkfifo")
+            .arg(scratch.dir().join("authority.lock"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("FIFO ceremony lock must refuse");
+        assert!(matches!(err, OrgAuthorityError::Io { .. }), "got: {err}");
+        assert!(
+            !scratch.dir().join(OWNER_MEMBERSHIP_FILE).exists(),
+            "refused ceremony must not publish membership"
+        );
+    }
+
+    /// Review-9 addendum: an adoption interrupted AFTER durable
+    /// state exists (floors, audience) but BEFORE the membership
+    /// publication leaves a fail-closed, RESUMABLE scaffold —
+    /// startup refuses it, a re-run completes it, and the durable
+    /// state (floor maxima, audience credential) survives.
+    #[test]
+    fn interrupted_adoption_is_fail_closed_and_resumable() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+
+        // Manufacture the partial scaffold deterministically: a
+        // completed ceremony minus its membership publication — the
+        // exact on-disk shape a crash (or a refused final
+        // verification, cf. the racing-floor witness) leaves
+        // behind.
+        let first = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let mut floors = BTreeMap::new();
+        floors.insert(EntityId::from_bytes([9u8; 32]), 7u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
+        first.revocation.apply_bundle(&bundle).expect("apply");
+        let handle_before = first.audience.audience_handle;
+        drop(first);
+        std::fs::remove_file(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("interrupt");
+
+        // Fail-closed: no membership → startup refuses → no
+        // ownership is ever emitted from the partial scaffold.
+        let err = NodeAuthority::open(scratch.dir(), kp.entity_id())
+            .expect_err("partial scaffold must refuse startup");
+        assert!(
+            matches!(err, OrgAuthorityError::MissingFile { .. }),
+            "got: {err}"
+        );
+
+        // Resumable: a re-run completes the ceremony, preserving
+        // the audience credential and every persisted floor.
+        let resumed =
+            NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 2), kp.entity_id(), 0, None)
+                .expect("re-run completes the ceremony");
+        assert_eq!(resumed.audience.audience_handle, handle_before);
+        assert_eq!(
+            resumed
+                .revocation
+                .floor_for(&org().org_id(), &EntityId::from_bytes([9u8; 32])),
+            7,
+            "monotone floor state survives the interruption"
+        );
+        NodeAuthority::open(scratch.dir(), kp.entity_id()).expect("startup succeeds after resume");
     }
 
     #[cfg(unix)]

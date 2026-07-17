@@ -49,6 +49,20 @@
 //! sidecar and rereads the persisted maxima under that lock before
 //! merging, so no writer's floors can be rolled out of the file by
 //! a staler writer's in-memory snapshot.
+//!
+//! # One path, one security view
+//!
+//! Within a process, every [`OrgRevocationStore`] handle backed by
+//! the same NORMALIZED pathname shares one [`StoreCore`] (review-9
+//! addendum): one live floor view, one reload/publish transaction
+//! lock, one publish generation, and one subscriber registry. A
+//! same-path sibling therefore observes a raise the instant it is
+//! published — one backing file is never modeled as several
+//! independent security views glued to a shared poison boolean.
+//! Opens ALWAYS serialize behind the interprocess state lock (no
+//! pre-lock poison fast path), and durability recovery rereads and
+//! republishes the persisted state through the shared core BEFORE
+//! the path-wide poison bit clears.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -256,8 +270,11 @@ pub enum OrgRevocationError {
     /// the directory entry may or may not survive a crash, so disk
     /// and memory can no longer be proven synchronized. The store
     /// publishes the merged (never-weaker) live view, then poisons
-    /// itself: further applies are refused until restart
-    /// re-establishes ground truth from disk (review-8 §13).
+    /// the BACKING PATH: same-path operations are refused until
+    /// recovery — a locked reread republished through the shared
+    /// core plus a SUCCESSFUL parent-directory fsync —
+    /// re-establishes ground truth (review-8 §13, review-9). A
+    /// restart is one route to that recovery, not the contract.
     DurabilityUncertain {
         /// The state file's path.
         path: String,
@@ -265,8 +282,10 @@ pub enum OrgRevocationError {
         reason: String,
     },
     /// A previous apply ended post-rename durability-uncertain
-    /// (see [`Self::DurabilityUncertain`]); this store refuses
-    /// further reloads until the process restarts.
+    /// (see [`Self::DurabilityUncertain`]) and recovery has not yet
+    /// succeeded; same-path reloads and opens are refused until a
+    /// locked reread plus a successful parent-directory fsync
+    /// clears the uncertainty.
     Poisoned {
         /// The state file's path.
         path: String,
@@ -307,12 +326,15 @@ impl std::fmt::Display for OrgRevocationError {
                 f,
                 "revocation state at {path}: rename landed but the parent-directory \
                  fsync failed ({reason}); disk and memory can no longer be proven \
-                 synchronized — store poisoned until restart"
+                 synchronized — path poisoned until a locked reread and a successful \
+                 parent-directory fsync recover it"
             ),
             Self::Poisoned { path } => write!(
                 f,
-                "revocation store at {path} is poisoned after a durability-uncertain \
-                 write; restart the process to re-establish ground truth from disk"
+                "revocation store path {path} is poisoned after a durability-uncertain \
+                 write; recovery requires a locked reread republished through the \
+                 shared store plus a successful parent-directory fsync (restarting the \
+                 process is one route, not the requirement)"
             ),
             Self::NonMonotonicReplacement { path } => write!(
                 f,
@@ -337,6 +359,132 @@ pub type RaisedFloor = (OrgId, EntityId, u32);
 /// previously enforced view.
 type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 
+/// The process-wide state shared by every [`OrgRevocationStore`]
+/// handle backed by one normalized path (review-9 addendum): ONE
+/// live view, ONE reload/publish transaction lock, ONE publish
+/// generation, ONE subscriber registry. Handles are cheap facades;
+/// the core is the security object.
+struct StoreCore {
+    /// The NORMALIZED backing path — also the key in the core and
+    /// poison registries.
+    path: PathBuf,
+    /// Serializes merge→persist→publish transactions in-process
+    /// (the sidecar file lock serializes across processes). Also
+    /// exposed to the node as [`PublishGuard`] so store
+    /// replacement and authority installation can pin the live
+    /// view across their check-then-swap sections.
+    reload: Mutex<()>,
+    /// The one published live view every same-path handle shares.
+    /// Never ahead of the durably persisted state.
+    live: RwLock<Arc<OrgRevocationState>>,
+    /// Bumped on every publish; lets callers order publications.
+    generation: AtomicU64,
+    /// Raise subscribers, each with a removable token. A REGISTRY,
+    /// not a single slot (review-9 addendum): registering a second
+    /// observer must never silently steal the first one's
+    /// notifications.
+    subscribers: RwLock<Vec<(u64, FloorsRaisedCallback)>>,
+    /// Token source for [`Self::subscribers`].
+    next_subscriber: AtomicU64,
+}
+
+impl StoreCore {
+    /// Swap the live view to `next`, returning every floor that
+    /// rose relative to the previously published view. `next` is
+    /// always a monotone superset under the locked reload order;
+    /// the per-key max with the outgoing view makes "an installed
+    /// floor never lowers" structural rather than assumed.
+    fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
+        let mut live = self.live.write();
+        for ((org, member), floor) in live.iter() {
+            let entry = next.floors.entry((*org, member.clone())).or_insert(0);
+            if *floor > *entry {
+                *entry = *floor;
+            }
+        }
+        let raised: Vec<RaisedFloor> = next
+            .iter()
+            .filter(|((org, member), floor)| **floor > live.floor_for(org, member))
+            .map(|((org, member), floor)| (*org, member.clone(), *floor))
+            .collect();
+        *live = Arc::new(next);
+        self.generation.fetch_add(1, Ordering::Release);
+        raised
+    }
+
+    /// Notify every subscriber of `raised`. Callers invoke this
+    /// OUTSIDE both the file lock and the reload lock — re-entrant
+    /// callbacks must not deadlock (review-9).
+    fn notify(&self, raised: &[RaisedFloor]) {
+        if raised.is_empty() {
+            return;
+        }
+        let subscribers: Vec<FloorsRaisedCallback> = self
+            .subscribers
+            .read()
+            .iter()
+            .map(|(_, callback)| callback.clone())
+            .collect();
+        for callback in subscribers {
+            callback(raised);
+        }
+    }
+}
+
+/// Process-wide core registry, keyed by the normalized backing
+/// path. `Weak` so a path whose handles all dropped releases its
+/// core; the POISON registry is separate precisely because poison
+/// must outlive every handle.
+static CORES: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StoreCore>>>,
+> = std::sync::OnceLock::new();
+
+fn core_registry() -> &'static Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StoreCore>>>
+{
+    CORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Join the existing core for `path`, republishing the state just
+/// reread from disk through it (a same-path sibling's live view
+/// advances BEFORE any poison clears — review-9 addendum), or
+/// create a fresh core seeded with that state. The caller MUST
+/// hold the interprocess state lock, which is what makes the
+/// reread current.
+fn join_or_create_core(
+    path: &Path,
+    disk: OrgRevocationState,
+) -> (Arc<StoreCore>, Vec<RaisedFloor>) {
+    let mut cores = core_registry().lock();
+    cores.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(core) = cores.get(path).and_then(std::sync::Weak::upgrade) {
+        let raised = core.publish(disk);
+        return (core, raised);
+    }
+    let core = Arc::new(StoreCore {
+        path: path.to_path_buf(),
+        reload: Mutex::new(()),
+        live: RwLock::new(Arc::new(disk)),
+        generation: AtomicU64::new(0),
+        subscribers: RwLock::new(Vec::new()),
+        next_subscriber: AtomicU64::new(0),
+    });
+    cores.insert(path.to_path_buf(), Arc::downgrade(&core));
+    (core, Vec::new())
+}
+
+/// Exclusive guard over a store's publish transaction. While held,
+/// no reload can publish a new live view through the store's core
+/// — from ANY same-path handle. The node holds this across its
+/// replacement dominance comparison and swap, and across authority
+/// verification and publication (review-9 addendum), so the
+/// installed floor view cannot rise between a check and the
+/// publication that depends on it. Callbacks are never invoked
+/// under this guard (raises notify outside the reload lock), so
+/// holding it cannot deadlock against notification work.
+pub(crate) struct PublishGuard<'a> {
+    _guard: parking_lot::MutexGuard<'a, ()>,
+}
+
 /// The node-local persisted revocation maxima plus its published
 /// live view. See the module docs for the locked reload order and
 /// failure semantics.
@@ -357,25 +505,18 @@ type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 /// file. Because every writer follows reread-merge-write, the disk
 /// state only ever grows, and republishing the reread state can
 /// never lower a live view.
+///
+/// Within one process, same-path handles additionally share one
+/// [`StoreCore`] — one live view, one publish transaction, one
+/// subscriber registry (review-9 addendum). See the module docs.
 pub struct OrgRevocationStore {
-    path: PathBuf,
-    /// Registry key for the PATH-WIDE durability-uncertainty bit
-    /// (review-9): poison is shared by every store instance backed
-    /// by the same canonical pathname, not held per object.
-    poison_key: PathBuf,
-    /// Serializes this instance's merge→persist→publish sequences
-    /// (the sidecar file lock serializes across instances).
-    reload: Mutex<()>,
-    /// The published live view. Never ahead of the durably
-    /// persisted state; possibly behind it between reloads when
-    /// another writer advanced the file.
-    live: RwLock<Arc<OrgRevocationState>>,
-    /// Invoked (outside BOTH the file lock and the reload lock —
-    /// re-entrant callbacks must not deadlock, review-9) with the
-    /// floors a reload raised relative to the previously published
-    /// view. The running node uses this to retract stale ownership
-    /// projections from the capability fold.
-    on_floors_raised: RwLock<Option<FloorsRaisedCallback>>,
+    /// The shared per-path core.
+    core: Arc<StoreCore>,
+    /// This handle's own slot in the core's subscriber registry —
+    /// the one [`Self::set_on_floors_raised`] replaces. Other
+    /// handles' and [`Self::subscribe_floors_raised`] registrations
+    /// are untouched by it.
+    own_subscription: Mutex<Option<u64>>,
 }
 
 impl OrgRevocationStore {
@@ -394,9 +535,12 @@ impl OrgRevocationStore {
                 })?;
             }
         }
-        let _lock = lock_state_file(&path)?;
-        let poison_key = poison_key_for(&path);
-        recover_poison_if_needed_locked(&path, &poison_key)?;
+        let path = normalize_backing_path(&path)?;
+        let lock = lock_state_file(&path)?;
+        let was_poisoned = is_path_poisoned(&path);
+        if was_poisoned {
+            prove_entry_durable(&path)?;
+        }
         let state = match read_regular_nofollow(&path) {
             Ok(bytes) => OrgRevocationState::from_file_bytes(&bytes, &path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -411,31 +555,40 @@ impl OrgRevocationStore {
                 })
             }
         };
-        Ok(Self {
-            path,
-            poison_key,
-            reload: Mutex::new(()),
-            live: RwLock::new(Arc::new(state)),
-            on_floors_raised: RwLock::new(None),
-        })
+        let (core, raised) = join_or_create_core(&path, state);
+        if was_poisoned {
+            clear_poison(&path);
+        }
+        drop(lock);
+        let store = Self {
+            core,
+            own_subscription: Mutex::new(None),
+        };
+        store.core.notify(&raised);
+        Ok(store)
     }
 
     /// Startup entry point: the file MUST exist and parse. Missing
     /// or corrupt → loud typed error; protected verification never
     /// starts against silently weaker floors.
     ///
-    /// If the backing path is durability-poisoned (review-9), the
-    /// open performs explicit recovery under the interprocess lock
-    /// — a reread plus a SUCCESSFUL parent-directory fsync — before
-    /// treating the current pathname as authoritative; recovery
-    /// failure refuses the open. A fresh instance therefore never
-    /// launders path-wide uncertainty.
+    /// The open ALWAYS serializes behind the interprocess state
+    /// lock — there is no pre-lock poison fast path (review-9
+    /// addendum): a writer holding the lock may be mid-rename, so
+    /// an opener must wait and read the FINAL state, and a poison
+    /// bit registered while it waited must gate it. If the path is
+    /// durability-poisoned, the open performs explicit recovery
+    /// under that lock — a successful parent-directory fsync plus
+    /// the reread republished through the shared per-path core
+    /// (every live sibling advances) — BEFORE the poison clears;
+    /// recovery failure refuses the open. A fresh instance
+    /// therefore never launders path-wide uncertainty.
     pub fn open_existing(path: impl Into<PathBuf>) -> Result<Self, OrgRevocationError> {
-        let path = path.into();
-        let poison_key = poison_key_for(&path);
-        if poison_registry().lock().contains(&poison_key) {
-            let _lock = lock_state_file(&path)?;
-            recover_poison_if_needed_locked(&path, &poison_key)?;
+        let path = normalize_backing_path(&path.into())?;
+        let lock = lock_state_file(&path)?;
+        let was_poisoned = is_path_poisoned(&path);
+        if was_poisoned {
+            prove_entry_durable(&path)?;
         }
         let bytes = match read_regular_nofollow(&path) {
             Ok(bytes) => bytes,
@@ -456,23 +609,27 @@ impl OrgRevocationStore {
         let state = OrgRevocationState::from_file_bytes(&bytes, &path).inspect_err(|err| {
             tracing::error!("{err}");
         })?;
-        Ok(Self {
-            path,
-            poison_key,
-            reload: Mutex::new(()),
-            live: RwLock::new(Arc::new(state)),
-            on_floors_raised: RwLock::new(None),
-        })
+        let (core, raised) = join_or_create_core(&path, state);
+        if was_poisoned {
+            clear_poison(&path);
+        }
+        drop(lock);
+        let store = Self {
+            core,
+            own_subscription: Mutex::new(None),
+        };
+        store.core.notify(&raised);
+        Ok(store)
     }
 
-    /// The backing file path.
+    /// The backing file path (normalized at construction).
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.core.path
     }
 
     /// Snapshot of the published live view.
     pub fn snapshot(&self) -> Arc<OrgRevocationState> {
-        self.live.read().clone()
+        self.core.live.read().clone()
     }
 
     /// Live floor for `(org, member)`.
@@ -482,22 +639,76 @@ impl OrgRevocationStore {
 
     /// `true` while this store's BACKING PATH is
     /// durability-uncertain (review-9: the poison bit is shared by
-    /// every instance on the same canonical pathname, not held per
-    /// object). Cleared only by explicit recovery — a locked
-    /// reread plus a successful parent-directory fsync — performed
-    /// by [`Self::open_existing`], [`Self::init`], or the next
+    /// every instance on the same normalized pathname, not held
+    /// per object). Cleared only by explicit recovery — a locked
+    /// reread republished through the shared core plus a
+    /// successful parent-directory fsync — performed by
+    /// [`Self::open_existing`], [`Self::init`], or the next
     /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
-        poison_registry().lock().contains(&self.poison_key)
+        is_path_poisoned(&self.core.path)
     }
 
-    /// Install the raise callback (review-8 §9). Invoked after a
-    /// reload publishes floors above the previously enforced view —
-    /// including floors learned from OTHER writers via the
-    /// under-lock reread, not only the supplied bundle's. The node
-    /// wiring uses this to retract stale ownership projections.
+    /// `true` iff `other` is backed by the same normalized path —
+    /// i.e. shares this store's core (live view, publish lock,
+    /// subscribers).
+    pub fn shares_core_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// The core's publish generation — bumped once per published
+    /// live view. Lets callers order publications relative to
+    /// their own critical sections.
+    pub fn publish_generation(&self) -> u64 {
+        self.core.generation.load(Ordering::Acquire)
+    }
+
+    /// Pin this store's publish transaction (review-9 addendum):
+    /// while the returned guard lives, no reload can publish a new
+    /// live view through this store's core, from any same-path
+    /// handle. See [`PublishGuard`].
+    pub(crate) fn publish_guard(&self) -> PublishGuard<'_> {
+        PublishGuard {
+            _guard: self.core.reload.lock(),
+        }
+    }
+
+    /// Register `callback` as ONE subscriber in the core's raise
+    /// registry and return its removable token (review-9 addendum:
+    /// subscription is a registry, not a single replaceable slot —
+    /// a second observer must never silently steal the first one's
+    /// notifications). Subscribers fire after a reload publishes
+    /// floors above the previously enforced view — including
+    /// floors learned from OTHER writers via the under-lock
+    /// reread, and raises published by same-path sibling handles.
+    pub fn subscribe_floors_raised(
+        &self,
+        callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static,
+    ) -> u64 {
+        let token = self.core.next_subscriber.fetch_add(1, Ordering::Relaxed);
+        self.core
+            .subscribers
+            .write()
+            .push((token, Arc::new(callback)));
+        token
+    }
+
+    /// Remove the subscriber registered under `token`. Unknown
+    /// tokens are a no-op.
+    pub fn unsubscribe_floors_raised(&self, token: u64) {
+        self.core.subscribers.write().retain(|(t, _)| *t != token);
+    }
+
+    /// Install THIS HANDLE's raise callback (review-8 §9),
+    /// replacing only the callback this same handle previously set
+    /// through this method — never another handle's or an explicit
+    /// [`Self::subscribe_floors_raised`] registration.
     pub fn set_on_floors_raised(&self, callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static) {
-        *self.on_floors_raised.write() = Some(Arc::new(callback));
+        let mut own = self.own_subscription.lock();
+        if let Some(token) = own.take() {
+            self.unsubscribe_floors_raised(token);
+        }
+        *own = Some(self.subscribe_floors_raised(callback));
     }
 
     /// Apply an operator bundle under the locked reload order
@@ -522,26 +733,30 @@ impl OrgRevocationStore {
     ///
     /// On pre-rename errors the persisted last-good state and the
     /// live view are both untouched. A POST-rename parent-fsync
-    /// failure publishes the merged (never-weaker) view, poisons
-    /// the store, and returns
-    /// [`OrgRevocationError::DurabilityUncertain`]; further applies
-    /// are refused until restart.
+    /// failure publishes the merged (never-weaker) view through
+    /// the shared core (every same-path sibling advances with it),
+    /// poisons the PATH, and returns
+    /// [`OrgRevocationError::DurabilityUncertain`]; further
+    /// same-path applies are refused until recovery — a locked
+    /// reread republished through the core plus a successful
+    /// parent-directory fsync — clears the uncertainty.
     pub fn apply_bundle(
         &self,
         bundle: &OrgRevocationBundle,
     ) -> Result<Vec<RaisedFloor>, OrgRevocationError> {
+        let path = &self.core.path;
+
         // The locked phase returns its outcome so raise observers
-        // run AFTER both the file lock and this instance's reload
-        // guard have dropped — a callback that re-enters
-        // `apply_bundle` on the same store must not deadlock
-        // (review-9).
+        // run AFTER both the file lock and the core's reload guard
+        // have dropped — a callback that re-enters `apply_bundle`
+        // on the same store must not deadlock (review-9).
         enum LockedOutcome {
             Applied(Vec<RaisedFloor>),
             DurabilityUncertain(Vec<RaisedFloor>, String),
         }
 
         let outcome = {
-            let _guard = self.reload.lock();
+            let _guard = self.core.reload.lock();
 
             // 1. Verify the incoming bundle's signature + canonical
             //    structure. A corrupt bundle keeps last-good, loudly.
@@ -554,24 +769,27 @@ impl OrgRevocationStore {
                 return Err(err);
             }
 
-            // 2. Interprocess critical section. If the backing path
-            //    is durability-poisoned, attempt explicit recovery
-            //    (parent-dir fsync under the lock) — no same-path
-            //    apply may silently succeed while uncertainty
-            //    remains, whichever instance carries it (review-9).
-            let lock = lock_state_file(&self.path)?;
-            recover_poison_if_needed_locked(&self.path, &self.poison_key)?;
+            // 2. Interprocess critical section. A poisoned path
+            //    must first prove its directory entry durable; the
+            //    reread + publish below then republish the ground
+            //    truth through the shared core BEFORE the poison
+            //    bit clears (review-9 addendum: recovery reloads
+            //    live views, it never merely fsyncs).
+            let lock = lock_state_file(path)?;
+            let was_poisoned = is_path_poisoned(path);
+            if was_poisoned {
+                prove_entry_durable(path)?;
+            }
 
             // 3. REREAD the persisted maxima under the lock — the
             //    reread is load-bearing: merging from this
             //    instance's live snapshot would let a stale writer
             //    overwrite floors another writer already persisted.
-            let disk_bytes =
-                read_regular_nofollow(&self.path).map_err(|e| OrgRevocationError::Io {
-                    path: self.path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
-            let disk = OrgRevocationState::from_file_bytes(&disk_bytes, &self.path)?;
+            let disk_bytes = read_regular_nofollow(path).map_err(|e| OrgRevocationError::Io {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            let disk = OrgRevocationState::from_file_bytes(&disk_bytes, path)?;
 
             // 4. Monotone merge against the reread disk state.
             let mut merged = disk.clone();
@@ -581,7 +799,7 @@ impl OrgRevocationStore {
             //    complete before anything is published.
             let mut durability_uncertain: Option<String> = None;
             if raised_on_disk > 0 {
-                match write_atomic_phased(&self.path, &merged.to_file_bytes()?) {
+                match write_atomic_phased(path, &merged.to_file_bytes()?) {
                     Ok(()) => {}
                     Err(WritePhase::PreRename(reason)) => {
                         // Old file (rename never happened) and old
@@ -589,7 +807,7 @@ impl OrgRevocationStore {
                         // could forget is never enforced.
                         drop(lock);
                         return Err(OrgRevocationError::Io {
-                            path: self.path.display().to_string(),
+                            path: path.display().to_string(),
                             reason,
                         });
                     }
@@ -602,16 +820,21 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        poison_registry().lock().insert(self.poison_key.clone());
+                        poison_registry().lock().insert(path.clone());
                         durability_uncertain = Some(reason);
                     }
                 }
             }
 
-            // 6. Publish the merged view (also syncs this instance
-            //    up to floors other writers advanced) and release
-            //    the lock; notification happens outside.
-            let raised = self.publish(merged);
+            // 6. Publish the merged view through the SHARED core —
+            //    every same-path handle's view advances the instant
+            //    this lands (review-9 addendum) — then clear any
+            //    recovered poison and release the lock;
+            //    notification happens outside.
+            let raised = self.core.publish(merged);
+            if was_poisoned && durability_uncertain.is_none() {
+                clear_poison(path);
+            }
             drop(lock);
             match durability_uncertain {
                 None => LockedOutcome::Applied(raised),
@@ -621,43 +844,18 @@ impl OrgRevocationStore {
 
         match outcome {
             LockedOutcome::Applied(raised) => {
-                self.notify_raised(&raised);
+                self.core.notify(&raised);
                 Ok(raised)
             }
             LockedOutcome::DurabilityUncertain(raised, reason) => {
                 let err = OrgRevocationError::DurabilityUncertain {
-                    path: self.path.display().to_string(),
+                    path: path.display().to_string(),
                     reason,
                 };
                 tracing::error!("{err}");
-                self.notify_raised(&raised);
+                self.core.notify(&raised);
                 Err(err)
             }
-        }
-    }
-
-    /// Swap the live view to `next`, returning every floor that
-    /// rose relative to the previously published view. `next` is
-    /// always a monotone superset under the locked reload order,
-    /// so no floor can lower here.
-    fn publish(&self, next: OrgRevocationState) -> Vec<RaisedFloor> {
-        let mut live = self.live.write();
-        let raised: Vec<RaisedFloor> = next
-            .iter()
-            .filter(|((org, member), floor)| **floor > live.floor_for(org, member))
-            .map(|((org, member), floor)| (*org, member.clone(), *floor))
-            .collect();
-        *live = Arc::new(next);
-        raised
-    }
-
-    fn notify_raised(&self, raised: &[RaisedFloor]) {
-        if raised.is_empty() {
-            return;
-        }
-        let callback = self.on_floors_raised.read().clone();
-        if let Some(callback) = callback {
-            callback(raised);
         }
     }
 }
@@ -665,7 +863,7 @@ impl OrgRevocationStore {
 impl std::fmt::Debug for OrgRevocationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OrgRevocationStore")
-            .field("path", &self.path)
+            .field("path", &self.core.path)
             .field("floors", &self.snapshot().len())
             .finish()
     }
@@ -684,12 +882,13 @@ pub(crate) enum WritePhase {
 }
 
 /// Process-wide durability-uncertainty registry, keyed by the
-/// CANONICAL backing path (review-9): the filesystem's uncertainty
+/// NORMALIZED backing path (review-9): the filesystem's uncertainty
 /// after a landed-rename/failed-dir-fsync belongs to the directory
 /// entry, not to one `OrgRevocationStore` instance. Every store
 /// opened on the same pathname shares the poison bit; recovery
-/// (a locked reread plus a SUCCESSFUL parent-directory fsync)
-/// clears it.
+/// (a locked reread republished through the shared core plus a
+/// SUCCESSFUL parent-directory fsync) clears it. Separate from the
+/// core registry because poison must outlive every handle.
 static PATH_POISON: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::OnceLock::new();
 
@@ -697,17 +896,85 @@ fn poison_registry() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     PATH_POISON.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// The registry key for `path`: canonicalized parent (stable — the
-/// file itself is replaced by rename) joined with the file name;
-/// falls back to the path verbatim when the parent cannot resolve.
-fn poison_key_for(path: &Path) -> PathBuf {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
+fn is_path_poisoned(key: &Path) -> bool {
+    poison_registry().lock().contains(key)
+}
+
+/// Normalize a backing pathname ONCE at store construction
+/// (review-9 addendum): absolute canonical parent joined with the
+/// final component — resolved to its on-disk case when the file
+/// exists — with NO verbatim fallback. Aliases of one file (bare
+/// vs `./`, relative vs absolute, `..` hops, symlinked parents,
+/// case aliases on case-insensitive filesystems) must land on ONE
+/// core and ONE poison entry, or one backing file gets independent
+/// security views. A path that cannot be normalized, or whose
+/// final component is a symlink, is refused outright.
+pub(crate) fn normalize_backing_path(path: &Path) -> Result<PathBuf, OrgRevocationError> {
+    let io = |reason: String| OrgRevocationError::Io {
+        path: path.display().to_string(),
+        reason,
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(io("backing path has no final component".to_string()));
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|e| io(format!("cannot canonicalize parent directory: {e}")))?;
+    let joined = canon_parent.join(file_name);
+    match std::fs::symlink_metadata(&joined) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io(
+            "refusing symlink: authority files must be regular files".to_string(),
+        )),
+        // Existing non-symlink: the full canonicalize resolves the
+        // final component to its ON-DISK case, so case aliases on
+        // case-insensitive filesystems share one key.
+        Ok(_) => joined
             .canonicalize()
-            .map(|p| p.join(name))
-            .unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
+            .map_err(|e| io(format!("cannot canonicalize backing path: {e}"))),
+        // Not there yet (a fresh `init` creates it under exactly
+        // this name) — the canonical-parent join IS the normal
+        // form.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(joined),
+        Err(e) => Err(io(e.to_string())),
     }
+}
+
+/// First half of durability recovery, called with the interprocess
+/// lock HELD: prove the directory entry durable with a
+/// parent-directory fsync. Failure refuses with
+/// [`OrgRevocationError::Poisoned`] — no same-path operation may
+/// proceed while uncertainty remains. On success the caller MUST
+/// reread the state file and republish it through the shared core
+/// (so every live sibling advances to ground truth) BEFORE calling
+/// [`clear_poison`] — recovery reloads live views; it never merely
+/// fsyncs (review-9 addendum).
+fn prove_entry_durable(path: &Path) -> Result<(), OrgRevocationError> {
+    fsync_parent_dir(path).map_err(|e| {
+        tracing::error!(
+            path = %path.display(),
+            error = %e,
+            "revocation-state durability recovery failed; path remains poisoned"
+        );
+        OrgRevocationError::Poisoned {
+            path: path.display().to_string(),
+        }
+    })
+}
+
+/// Second half of durability recovery: clear the path-wide bit
+/// after the entry was proven durable AND the reread state was
+/// republished through the shared core.
+fn clear_poison(path: &Path) {
+    poison_registry().lock().remove(path);
+    tracing::warn!(
+        path = %path.display(),
+        "revocation-state durability uncertainty recovered \
+         (locked reread republished; parent directory fsynced)"
+    );
 }
 
 /// Open `path` as a REGULAR file without following symlinks
@@ -772,9 +1039,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
 /// stable `.lock` sidecar (the state file itself is replaced by
 /// rename, so it cannot carry the lock). Blocking; released when
 /// the returned handle drops. std advisory file locking — same
-/// semantics as the sdk revocation store's fs2 sidecar. The sidecar
-/// is opened no-follow so a planted symlink cannot redirect the
-/// lock inode (review-9).
+/// semantics as the sdk revocation store's fs2 sidecar.
 ///
 /// `pub(crate)`: the adoption ceremony's final phase holds this
 /// lock across its floor re-verification and membership write.
@@ -785,52 +1050,54 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocatio
     };
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
+    open_lock_file(&PathBuf::from(lock_path)).map_err(io)
+}
+
+/// Open-and-lock a lock inode (`.lock` sidecar, ceremony lock)
+/// under the full regular-file policy (review-9): no-follow (a
+/// planted symlink cannot redirect the lock inode), `O_NONBLOCK`
+/// (a planted FIFO fails or returns instead of blocking the open
+/// forever), and a type check on the OPENED descriptor — advisory
+/// locking a non-regular inode is not a lock on anything this
+/// module owns. `O_NONBLOCK` is inert for regular files and does
+/// not affect the (deliberately blocking) advisory lock call.
+///
+/// `pub(crate)`: the adoption ceremony lock
+/// (`org_authority::lock_ceremony`) applies the same policy.
+pub(crate) fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         opts.mode(0o600);
     }
-    let f = opts.open(PathBuf::from(lock_path)).map_err(io)?;
-    f.lock().map_err(io)?;
+    #[cfg(not(unix))]
+    {
+        // Non-Unix has no O_NOFOLLOW: same symlink precheck as
+        // `open_regular_nofollow` (plus the opened-handle type
+        // check below).
+        if let Ok(meta) = std::fs::symlink_metadata(lock_path) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing symlink: lock files must be regular files",
+                ));
+            }
+        }
+    }
+    let f = opts.open(lock_path)?;
+    // Type check on the opened descriptor — immune to a swap
+    // between check and use.
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing non-regular file: lock files must be regular files",
+        ));
+    }
+    f.lock()?;
     Ok(f)
-}
-
-/// Explicit durability recovery, called with the interprocess lock
-/// HELD (review-9): if `poison_key` is registered, prove the
-/// directory entry durable with a parent-directory fsync; success
-/// clears the path-wide poison, failure refuses with
-/// [`OrgRevocationError::Poisoned`]. No same-path operation may
-/// silently succeed while uncertainty remains.
-fn recover_poison_if_needed_locked(
-    path: &Path,
-    poison_key: &Path,
-) -> Result<(), OrgRevocationError> {
-    if !poison_registry().lock().contains(poison_key) {
-        return Ok(());
-    }
-    match fsync_parent_dir(path) {
-        Ok(()) => {
-            poison_registry().lock().remove(poison_key);
-            tracing::warn!(
-                path = %path.display(),
-                "revocation-state durability uncertainty recovered (parent directory fsynced)"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!(
-                path = %path.display(),
-                error = %e,
-                "revocation-state durability recovery failed; path remains poisoned"
-            );
-            Err(OrgRevocationError::Poisoned {
-                path: path.display().to_string(),
-            })
-        }
-    }
 }
 
 /// fsync the parent directory of `path` (Unix; no-op elsewhere,
@@ -948,11 +1215,16 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
     drop(f);
 
     // Atomic replacement. On Unix, rename(2) atomically replaces
-    // an existing destination. On Windows, Rust's std::fs::rename
-    // is implemented with MoveFileExW + MOVEFILE_REPLACE_EXISTING,
-    // which also replaces an existing destination — no separate
-    // ReplaceFileW path is required (std library guarantee since
-    // Rust 1.0; see std::fs::rename platform-specific behavior).
+    // an existing destination. On Windows, std::fs::rename is
+    // DOCUMENTED to replace an existing destination file (see the
+    // std platform-specific behavior notes), so no separate
+    // ReplaceFileW path is required for replacement semantics.
+    // Crash DURABILITY is a distinct boundary: the parent-dir
+    // fsync below is Unix-only, so on non-Unix platforms the
+    // durability of the new directory entry is whatever the
+    // platform's rename primitive provides — this module's
+    // fail-closed poison machinery therefore only arms on Unix,
+    // where the fsync can actually be attempted and fail.
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(pre(e));
@@ -1245,12 +1517,14 @@ mod tests {
         OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
     }
 
-    /// Review-8 §5 witness: two store instances on one file. B's
-    /// in-memory view is stale when it writes; the under-lock
-    /// REREAD must preserve A's floor — both maxima survive in the
-    /// persisted state and in B's republished live view.
+    /// Review-8 §5 + review-9 addendum witness: two store handles
+    /// on one file share ONE core — a sibling observes a raise the
+    /// instant it publishes (never a stale independent view) — and
+    /// the under-lock REREAD keeps every maximum in the persisted
+    /// file (the reread still guards CROSS-PROCESS writers, which
+    /// cannot share a core).
     #[test]
-    fn concurrent_store_instances_preserve_all_maxima() {
+    fn same_path_handles_share_one_live_view_and_preserve_all_maxima() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
         let member_x = EntityId::from_bytes([0xAAu8; 32]);
@@ -1258,28 +1532,233 @@ mod tests {
 
         let store_a = OrgRevocationStore::init(&path).expect("init A");
         let store_b = OrgRevocationStore::open_existing(&path).expect("open B");
+        assert!(
+            store_a.shares_core_with(&store_b),
+            "same normalized path must join one core"
+        );
 
-        // A raises member_x to 5; B has not observed it.
+        // A raises member_x to 5; B's view advances IMMEDIATELY —
+        // one backing file is never two security views (review-9
+        // addendum).
         store_a
             .apply_bundle(&bundle_for(member_x.clone(), 5))
             .expect("A applies x=5");
-        assert_eq!(store_b.floor_for(&org().org_id(), &member_x), 0);
+        assert_eq!(store_b.floor_for(&org().org_id(), &member_x), 5);
 
-        // B (stale snapshot) raises member_y to 7. Without the
-        // reread this write would roll x=5 out of the file.
+        // B raises member_y to 7; the shared view means only y
+        // newly rises, and the persisted file carries BOTH maxima.
         let raised = store_b
             .apply_bundle(&bundle_for(member_y.clone(), 7))
             .expect("B applies y=7");
+        assert_eq!(raised, vec![(org().org_id(), member_y.clone(), 7)]);
 
-        // The persisted state carries BOTH maxima…
         let reopened = OrgRevocationStore::open_existing(&path).expect("reopen");
         assert_eq!(reopened.floor_for(&org().org_id(), &member_x), 5);
         assert_eq!(reopened.floor_for(&org().org_id(), &member_y), 7);
-        // …and B's live view synced up to A's floor during the
-        // locked reload, reporting the cross-writer raise too.
-        assert_eq!(store_b.floor_for(&org().org_id(), &member_x), 5);
-        assert!(raised.contains(&(org().org_id(), member_x, 5)));
-        assert!(raised.contains(&(org().org_id(), member_y, 7)));
+        assert!(reopened.shares_core_with(&store_a));
+    }
+
+    /// Review-9 addendum: `open_existing` has NO pre-lock poison
+    /// fast path — an opener serializes behind the state lock, and
+    /// a poison bit registered while it waited gates it. Recovery
+    /// rereads the FINAL persisted state and returns it, never a
+    /// stale pre-write view.
+    #[test]
+    fn fresh_open_serializes_behind_the_state_lock_and_recovers_poison() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        drop(OrgRevocationStore::init(&path).expect("init"));
+        let norm = normalize_backing_path(&path).expect("normalize");
+
+        // Writer holds the interprocess lock…
+        let lock = lock_state_file(&norm).expect("lock");
+
+        let opener_path = path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            started_tx.send(()).expect("send started");
+            let result = OrgRevocationStore::open_existing(&opener_path);
+            done_tx.send(()).expect("send done");
+            result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener started");
+        // …so the opener must NOT complete while the lock is held.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "open_existing must serialize behind the state lock"
+        );
+
+        // Still under the lock: the writer lands a stronger state
+        // and (simulating a failed post-rename parent fsync)
+        // registers the path-wide poison.
+        let mut stronger = OrgRevocationState::empty();
+        stronger.merge_bundle(&bundle_with_floor(9));
+        write_atomic(&norm, &stronger.to_file_bytes().expect("bytes")).expect("write");
+        poison_registry().lock().insert(norm.clone());
+
+        // Lock releases → the opener proceeds: it must observe the
+        // poison, recover (reread + successful parent fsync), and
+        // return the FINAL floor — never the pre-write view.
+        drop(lock);
+        let opened = opener
+            .join()
+            .expect("join opener")
+            .expect("open recovers and succeeds");
+        assert_eq!(opened.floor_for(&org().org_id(), &member()), 9);
+        assert!(
+            !opened.is_poisoned(),
+            "successful recovery clears the path-wide bit"
+        );
+    }
+
+    /// Review-9 addendum: the raise-observer registry supports
+    /// multiple subscribers — registering a second observer never
+    /// steals the first one's notifications, same-path handles'
+    /// callbacks all fire, and a token unsubscribes only its own
+    /// registration.
+    #[test]
+    fn multiple_subscribers_on_one_path_all_observe_raises() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store_a = OrgRevocationStore::init(&path).expect("init A");
+        let store_b = OrgRevocationStore::open_existing(&path).expect("open B");
+
+        let seen_a: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_b: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_tok: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen_a.clone();
+        store_a.set_on_floors_raised(move |raised| {
+            sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
+        });
+        let sink = seen_b.clone();
+        store_b.set_on_floors_raised(move |raised| {
+            sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
+        });
+        let sink = seen_tok.clone();
+        let token = store_a.subscribe_floors_raised(move |raised| {
+            sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
+        });
+
+        // One raise through A notifies EVERY registration —
+        // including B's, which observes the raise through the
+        // shared core (previously the review-9 addendum red: only
+        // the final `set_on_floors_raised` caller was notified).
+        store_a
+            .apply_bundle(&bundle_with_floor(5))
+            .expect("apply 5");
+        assert_eq!(*seen_a.lock(), vec![5]);
+        assert_eq!(*seen_b.lock(), vec![5]);
+        assert_eq!(*seen_tok.lock(), vec![5]);
+
+        // Unsubscribing the token removes ONLY that registration.
+        store_a.unsubscribe_floors_raised(token);
+        store_b
+            .apply_bundle(&bundle_with_floor(7))
+            .expect("apply 7");
+        assert_eq!(*seen_a.lock(), vec![5, 7]);
+        assert_eq!(*seen_b.lock(), vec![5, 7]);
+        assert_eq!(*seen_tok.lock(), vec![5], "unsubscribed token is silent");
+    }
+
+    /// Review-9 addendum: aliased pathnames — `..` hops, `./`
+    /// prefixes, symlinked parents — normalize onto ONE core and
+    /// ONE poison key; no verbatim fallback survives.
+    #[test]
+    fn aliased_paths_share_one_core() {
+        let scratch = Scratch::new();
+        let sub = scratch.0.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir sub");
+        let direct = sub.join("revocation-state.json");
+        let dotted = scratch.0.join("sub/../sub/revocation-state.json");
+
+        let store_a = OrgRevocationStore::init(&direct).expect("init direct");
+        let store_b = OrgRevocationStore::open_existing(&dotted).expect("open dotted alias");
+        assert!(
+            store_a.shares_core_with(&store_b),
+            "`..` alias joins the core"
+        );
+        store_a.apply_bundle(&bundle_with_floor(5)).expect("apply");
+        assert_eq!(store_b.floor_for(&org().org_id(), &member()), 5);
+
+        #[cfg(unix)]
+        {
+            let link = scratch.0.join("linked-sub");
+            std::os::unix::fs::symlink(&sub, &link).expect("symlink dir");
+            let via_link = OrgRevocationStore::open_existing(link.join("revocation-state.json"))
+                .expect("open through symlinked parent");
+            assert!(
+                store_a.shares_core_with(&via_link),
+                "symlinked-parent alias joins the core"
+            );
+        }
+
+        // Normalization invariants: bare and `./`-prefixed names
+        // resolve absolute (no verbatim fallback)…
+        let bare = normalize_backing_path(Path::new("bare-floors.json")).expect("bare");
+        let dot = normalize_backing_path(Path::new("./bare-floors.json")).expect("dot");
+        assert!(bare.is_absolute());
+        assert_eq!(bare, dot);
+        // …and a path that cannot normalize is refused, never keyed
+        // verbatim.
+        assert!(
+            normalize_backing_path(&scratch.0.join("no-such-dir/state.json")).is_err(),
+            "unresolvable parent must refuse"
+        );
+        assert!(
+            normalize_backing_path(Path::new("..")).is_err(),
+            "no final component must refuse"
+        );
+    }
+
+    /// Review-9 addendum: case aliases on case-insensitive
+    /// filesystems (default macOS) land on one core. Skips itself
+    /// on case-sensitive filesystems, where different case IS a
+    /// different file.
+    #[test]
+    fn case_aliased_paths_share_one_core_on_case_insensitive_filesystems() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store_a = OrgRevocationStore::init(&path).expect("init");
+
+        let upper = scratch.0.join("REVOCATION-STATE.JSON");
+        if std::fs::metadata(&upper).is_err() {
+            // Case-sensitive filesystem: the alias doesn't resolve;
+            // nothing to witness here.
+            return;
+        }
+        let store_b = OrgRevocationStore::open_existing(&upper).expect("open case alias");
+        assert!(
+            store_a.shares_core_with(&store_b),
+            "case alias must join the same core"
+        );
+        store_a.apply_bundle(&bundle_with_floor(5)).expect("apply");
+        assert_eq!(store_b.floor_for(&org().org_id(), &member()), 5);
+    }
+
+    /// Review-9: lock inodes are held to the full regular-file
+    /// policy — a planted FIFO is refused (and, thanks to
+    /// `O_NONBLOCK`, cannot park the open forever waiting for a
+    /// reader), it does not carry the lock.
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_lock_sidecar_is_refused() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let err = OrgRevocationStore::init(&path).expect_err("FIFO lock must refuse");
+        assert!(matches!(err, OrgRevocationError::Io { .. }), "got: {err}");
     }
 
     /// Review-8 §9 plumbing: the raise callback fires with exactly
@@ -1429,7 +1908,11 @@ mod tests {
         OrgRevocationStore::open_existing(&path).expect("regular file opens");
 
         // Symlinked LOCK sidecar: locking refuses rather than
-        // following the link to a foreign inode.
+        // following the link to a foreign inode — at open time
+        // (every open serializes behind the lock, review-9
+        // addendum) and on a reload through a previously-opened
+        // handle alike.
+        let store = OrgRevocationStore::open_existing(&path).expect("open before planting");
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
@@ -1437,10 +1920,13 @@ mod tests {
         let foreign = scratch.0.join("foreign.lock");
         std::fs::write(&foreign, b"").expect("foreign lock");
         std::os::unix::fs::symlink(&foreign, &lock_path).expect("plant lock symlink");
-        let store = OrgRevocationStore::open_existing(&path).expect("open");
+        assert!(
+            OrgRevocationStore::open_existing(&path).is_err(),
+            "symlinked lock sidecar must refuse the open"
+        );
         assert!(
             store.apply_bundle(&bundle_with_floor(9)).is_err(),
-            "symlinked lock sidecar must refuse"
+            "symlinked lock sidecar must refuse a reload"
         );
     }
 }
