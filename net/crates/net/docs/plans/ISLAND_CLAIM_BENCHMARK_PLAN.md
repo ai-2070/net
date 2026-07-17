@@ -1,12 +1,15 @@
 # Island / Gang Claim Benchmark Plan (ICB) — v0.3
 
-**Status:** v0.3 DRAFT — folds Kyra's 2026-07-15 20:05 v0.2 verdict (one blocker + bounded
-corrections). v0.2 was "architecturally honest"; the only substantive error was treating known-state
-fallback as a concurrent multi-scheduler allocation. Still pre-implementation, no code. Review
-disposition (v0.2): D1–D6 **APPROVED** (D6 with an exactness note); ICB-1/2/6 **APPROVED**; ICB-3
-**APPROVED WITH CENSORING FIX**; ICB-4 **BLOCKED AS WRITTEN** → fixed to single-claimant; ICB-5
-**APPROVED WITH BOUNDARY SPLIT**; ICB-7 **APPROVED WITH DOC FIXES**. After v0.3 the plan is
-approvable for implementation.
+**Status:** v0.3 **IMPLEMENTED** (as-built in §7). The plan was signed off and built: ICB-0…6 landed
+on branch `gang-scheduler-benchmarks`; **ICB-0…5 signed off by Kyra, ICB-6 delivered (awaiting
+sign-off)**. The ICB-7 analytical close-out (reference-machine baseline table, data-derived
+regression thresholds for completed boundaries, and the architecture-disposition prose) is the only
+remaining work — see §7.6. v0.3 folded Kyra's 2026-07-15 20:05 v0.2 verdict (one blocker + bounded
+corrections); v0.2 was "architecturally honest", the only substantive error being treating known-state
+fallback as a concurrent multi-scheduler allocation. Review disposition (v0.2): D1–D6 **APPROVED**
+(D6 with an exactness note); ICB-1/2/6 **APPROVED**; ICB-3 **APPROVED WITH CENSORING FIX**; ICB-4
+**BLOCKED AS WRITTEN** → fixed to single-claimant; ICB-5 **APPROVED WITH BOUNDARY SPLIT**; ICB-7
+**APPROVED WITH DOC FIXES**.
 **Sequencing (unchanged, Kyra):** complete P5 and the payment-storage disposition **before** starting
 ICB code. Disposition-only; commits no code.
 **Provenance:** Kyra's 2026-07-15 recommendation + two review rounds. Sibling to
@@ -133,6 +136,10 @@ benches/island_claim_contention.rs   ICB-2/3/4    required-features ["net"]
 benches/island_claim_sensed.rs       ICB-5        required-features ["net", "redex"]
 benches/island_claim_recovery.rs     ICB-6        required-features ["net"]
 ```
+**As-built deviation:** ICB-2/3/4 shipped as **three separate targets** —
+`island_claim_boundaries.rs` / `island_claim_divergence.rs` / `island_claim_fallback.rs` — rather
+than one `island_claim_contention.rs` (each phase reviewed and landed independently); ICB-0's harness
+is `bench_island_claim/mod.rs` plus the `island_claim_harness.rs` self-test. Full target list in §7.1.
 
 **D2 — Reserved-only divergence diagnostic (items 1, 2, B1). APPROVED.** ICB stays entirely on the
 `Reserved` path. Cross-node merge is arrival-order-dependent → no convergence to time; ICB-3 measures
@@ -342,8 +349,92 @@ Does not duplicate: `benches/placement.rs` (scorer), CPB-2 (one island reacting 
 
 ## 7. As-built (ICB-7) — files, baselines, thresholds, CI, architecture disposition
 
-*Reserved. Filled at the ICB-7 close-out with the reference-machine baseline table, data-derived
-regression thresholds for **completed** boundaries only, the CI note, the six-equivalences-as-built
-confirmation, and — iff ICB-3 confirms divergence — the architecture disposition (candidate authority
-models, none chosen). ICB-3 is recorded as hard semantic evidence, not a performance SLO. Empty until
-the suite is built and measured.*
+**Suite status.** ICB-0…6 implemented and landed on branch `gang-scheduler-benchmarks`. ICB-0…5
+signed off by Kyra; ICB-6 delivered (awaiting sign-off). Each phase followed the same discipline:
+disposition-first (verify API facts against real code before writing), one commit per phase +
+closure, every load-bearing rule red-verified (break the rule → the witness/assertion fails with
+exit 101 → restore), benches dev-only/observation-only with **no production or arbitration change**.
+The §7.6 analytical close-out (reference-machine baselines, derived thresholds, architecture
+disposition, cross-links) is the only remaining work.
+
+### 7.1 Delivered files + commits
+
+| Phase | Target (`benches/…`) | Feat. | Measures | Landed (first → closures) |
+|---|---|---|---|---|
+| ICB-0 | `bench_island_claim/mod.rs` (harness) + `island_claim_harness.rs` (self-test) | `net` | full-mesh builders, exact-holder awaits, delivery preflight, counting router, fail-loud reset | `9dec8b5a8` → `7bb286470` |
+| ICB-1 | `island_claim_match.rs` | `net` | `match_islands` scaling (10/100/1000 × 1/8/72 × sparse/dense); matched-hosts → candidate → viable | `d29e07af9` → `ef2c63063` |
+| ICB-2 | `island_claim_boundaries.rs` | `net` | single claim → local commit / API return / remote visibility, from one t0 | `033189249` → `99baabbb3` |
+| ICB-3 | `island_claim_divergence.rs` | `net` | distributed simultaneous-claim divergence (N=2/4/8/16), right-censored | `251060090` → `3d55d15c8` → `2660a1c82` → `9a41847f3` |
+| ICB-4 | `island_claim_fallback.rs` | `net` | single-claimant known-state fallback (reject-walk past held A → free B) | `7c8ae0c32` |
+| ICB-5 | `island_claim_sensed.rs` | `net,redex` | sensed re-selection (5a) + sensed reservation fallback (5b) over `claim_island_sensed` | `b9cffe65a` → `c4f1f2ea7` |
+| ICB-6 | `island_claim_recovery.rs` | `net` | deadline-enabled takeover + runtime-entry expiry (M5 short-TTL diagnostic) | `507561853` |
+
+All are `harness = false` Cargo `[[bench]]` targets with the stated `required-features` (ICB-0…4/6 =
+`net`; ICB-5 = `net, redex`). Plan history: v0.2 `7c9818efe`, v0.3 `76fcba5a0`.
+
+### 7.2 The load-bearing finding — CONFIRMED (ICB-3, E2)
+
+`ReservationFold::merge` is arrival-order-dependent across publishers. Empirically: N distinct-node
+claimants racing one fresh island **all** optimistically Win; every foreign claim is verified-delivered
+(the counting router proves exactly **N−1** unique deliveries per claimant / **N** at the observer,
+with the exact expected publisher sets); yet the nodes retain **different** holders — **100%
+right-censored, distinct holders = N, largest cohort = 2, uniform shape**, across N = 2/4/8/16, with
+common agreement absent through the observation window W. Invalid samples are typed `ClaimNotWon` (a
+claimant received a peer's reservation for the fresh island before its own local apply → its CAS
+lost), **never** mislabeled as disagreement or a timeout. Kyra reproduced this independently.
+
+> **Complete verified delivery of every competing reservation does not create common allocation
+> authority.** The distributed `Reserved` fold is an availability-oriented *announcement* mechanism,
+> not a common allocation authority. This is architecture evidence, recorded as **hard semantic
+> reporting — never a performance SLO**; no latency threshold is derived over the split view.
+
+### 7.3 Localhost orientation numbers — NOT baselines or thresholds
+
+Representative p50s from mixed localhost runs, **orientation only** (C11/M6): they are noisy, machine-
+and load-dependent, and are **not** the ICB-7 reference-machine baselines. Baselines/thresholds come
+only from a quiet host (§7.6). Full distributions live in each bench's own output.
+
+| Phase · boundary | Orientation p50 (localhost) |
+|---|---|
+| ICB-3 · holder divergence | 100% right-censored; distinct = N; largest cohort = 2 (**semantic — no latency**) |
+| ICB-4 · fallback API return / remote visibility | ~44 µs / ~147 µs (rejected-apply delta = 1) |
+| ICB-5b · sensed fallback API / remote visibility | ~56 µs / ~172 µs (rejected-apply delta = 1) |
+| ICB-5a · sensed re-selection claim | ~28 µs (rejected-apply delta = 0) |
+| ICB-5 · plain vs sensed match (projection overhead) | ~0.6 µs vs ~1.3 µs |
+| ICB-6 g1 · takeover CAS / remote visibility | ~215 µs / ~491 µs (deadline wait = policy, separate) |
+| ICB-6 g2 · entry expiry (local & remote, independent) | ~1499 ms ≈ 1 s TTL + ~0.5 s sweep (**no p99**) |
+
+ICB-1 (matcher scaling) and ICB-2 (three boundaries) distributions are in their bench output; matcher
+cost ≈ indexed capability-bucket materialization + a full island-topology `HostedByAny` scan.
+
+### 7.4 Compile / CI gate (D5)
+
+Per target: `cargo clippy --bench <target> --features <net|redex> -- -D warnings -A
+clippy::unwrap_used -A clippy::expect_used` (the panic allowances CI uses for bench/test targets),
+plus `cargo fmt --all -- --check` and `git diff --check`. All seven targets pass. The harness uses
+`parking_lot::Mutex` (std `Mutex::lock` is a `disallowed_method`). No new CI step (the broad Clippy
+job covers `[[bench]]` targets); ICB-5 additionally needs `--features redex`.
+
+### 7.5 Six equivalences — as-built confirmation
+
+E1 (`reserve_island` awaits fan-out ≠ local commit ≠ remote visibility) — ICB-2 measured three
+distinct numbers from one t0. E2 (delivery ≠ convergence) — **the finding**, ICB-3. E3 (direct-peer
+broadcast ≠ mesh gossip) — ICB-0 preflight refuses a routed chain; distributed matrix is 2/4/8/16.
+E4 (min-unit eligibility ≠ whole-island reservation) — ICB-1 wording + the matcher reserving nothing.
+E5 (input candidate population ≠ viable output) — ICB-1 three-column reconstruction. E6 (deadline
+takeover ≠ automatic reclaim ≠ runtime-TTL sweep) — ICB-6's two separately-labeled groups + W2
+(lapsed deadline is not auto-reclaim; entry survives it) vs W3 (entry TTL sweep).
+
+### 7.6 Remaining ICB-7 close-out (still to do)
+
+1. **Reference-machine baseline table** (quiet host) for the **completed** boundaries only: matcher
+   latency; local exact-holder visibility; API return; direct remote visibility; known-state fallback;
+   sensed fallback / re-selection; takeover CAS; runtime-expiry observation when statistically valid.
+2. **Data-derived regression thresholds** for those completed boundaries. **No** threshold that
+   normalizes the ICB-3 split view; **no** threshold derived from censored divergence samples.
+3. **Architecture disposition** (divergence confirmed): enumerate candidate authority models —
+   single scheduler authority · host-authoritative claim RPC · deterministic convergent reservation
+   merge · defer distributed `Reserved` authority to the on-wire `Active`/quorum path — **without
+   choosing or implementing one** (the benchmark phase must not).
+4. **Cross-links / docs:** update `docs/SENSING.md` and `MESH_SCHEDULER_GANG_CLAIM_PLAN.md`;
+   performance documentation. **Not** personal memory (M6).
