@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_9d09deb95b4997 22355-22367
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_753cac15298abb 730-738
+net/crates/net/tests/org_ownership.rs
+  s_9298fd786cc20e::t_35b265cd779c7d 1725-1772
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "db5f0fa848e19e4a6d8ddb51219fd9f9d0321f8f",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
