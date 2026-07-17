@@ -1517,12 +1517,11 @@ mod tests {
         for offset in [0usize, 33, 65, 97, 134, 167, 199, 231, 239, 247] {
             let mut bytes = grant.to_bytes();
             bytes[offset] ^= 1;
-            match OrgCapabilityGrant::from_bytes(&bytes) {
-                Ok(tampered) => assert!(
-                    tampered.verify().is_err(),
-                    "tamper at {offset} must not verify"
-                ),
-                Err(_) => {} // strict decode already refused
+            // A tampered byte either fails strict decode outright, or
+            // decodes into a value whose signature no longer verifies
+            // — never a value that passes verification.
+            if let Ok(tampered) = OrgCapabilityGrant::from_bytes(&bytes) {
+                assert!(tampered.verify().is_err(), "tamper at {offset} must not verify");
             }
         }
 

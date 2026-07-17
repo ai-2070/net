@@ -1501,7 +1501,7 @@ async fn opener_cannot_publish_during_store_replacement() {
 
 /// Helper: reopen B's path to compare cores (the installed store is
 /// B iff it shares B's core).
-fn b_marker(dir_b: &PathBuf) -> OrgRevocationStore {
+fn b_marker(dir_b: &std::path::Path) -> OrgRevocationStore {
     OrgRevocationStore::open_existing(dir_b.join("revocation-state.json")).expect("reopen B")
 }
 
