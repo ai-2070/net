@@ -160,12 +160,39 @@ pub struct CapabilityMembership {
 /// exactly the projections that fell below it — no re-announcement
 /// required, no still-valid (higher-generation) projection
 /// over-cleared (review-8 §9).
+///
+/// Construction is `pub(crate)` and the fields are private
+/// (review-9): the verification bridge
+/// (`capability_bridge::verify_announced_owner_cert`) is the only
+/// legitimate producer, so a caller outside this crate cannot
+/// synthesize an unverified "verified" projection and feed it
+/// through `translate_announcement`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedOwner {
     /// The organization whose certificate verified at ingest.
-    pub org: super::super::org::OrgId,
+    org: super::super::org::OrgId,
     /// The verified certificate's revocation generation.
-    pub generation: u32,
+    generation: u32,
+}
+
+impl VerifiedOwner {
+    /// In-crate constructor — the verification bridge is the only
+    /// legitimate producer; everything else consumes.
+    pub(crate) fn new(org: super::super::org::OrgId, generation: u32) -> Self {
+        Self { org, generation }
+    }
+
+    /// The vouching organization.
+    #[inline]
+    pub fn org(&self) -> super::super::org::OrgId {
+        self.org
+    }
+
+    /// The verified certificate's revocation generation.
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// Query shapes the [`CapabilityFold`] answers.

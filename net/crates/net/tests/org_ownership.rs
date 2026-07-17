@@ -247,6 +247,247 @@ async fn store_replacement_never_lowers_the_live_view() {
     let _ = std::fs::remove_dir_all(&dir_lo);
 }
 
+/// Review-9 red 1: installing a store whose floors ALREADY rose
+/// must reconcile existing projections — no floor-change event
+/// fires after installation, so the install itself performs the
+/// retraction sweep, and the fold change generation advances.
+#[tokio::test]
+async fn installing_pre_raised_store_reconciles_existing_projections() {
+    let node = build_node().await;
+    let dir = scratch_dir("pre-raised");
+
+    // With NO store installed, a generation-4 projection lands.
+    let publisher = EntityKeypair::generate();
+    let publisher_node_id = publisher.node_id();
+    let cert4 = OrgMembershipCert::try_issue(&org(), publisher.entity_id().clone(), 4, 3600)
+        .expect("issue");
+    let mut ann = CapabilityAnnouncement::new(
+        publisher_node_id,
+        publisher.entity_id().clone(),
+        100,
+        CapabilitySet::new().add_tag("nrpc:oa1-echo"),
+    )
+    .with_owner_cert(Some(cert4));
+    ann.sign(&publisher);
+    node.test_inject_capability_announcement(ann);
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        Some(org().org_id())
+    );
+
+    // An independent store already carries floor 5.
+    let store =
+        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(publisher.entity_id().clone(), 5u32);
+    store
+        .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+        .expect("floor 5");
+
+    // Installing it retracts the stale projection immediately and
+    // signals fold subscribers.
+    let generation_before = node.capability_fold().change_generation();
+    node.install_org_revocation_store(store).expect("install");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        None,
+        "pre-raised install must reconcile existing projections"
+    );
+    assert!(
+        node.capability_fold().change_generation() > generation_before,
+        "reconciliation must advance the fold change generation"
+    );
+    // Capability entry remains.
+    assert!(may_execute(
+        node.capability_fold(),
+        publisher_node_id,
+        "nrpc:oa1-echo",
+        0xDEAD
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review-9 red 2: a DETACHED (replaced) store's late raises must
+/// not mutate the node — its callback is inert once it is no
+/// longer the installed store.
+#[tokio::test]
+async fn detached_store_cannot_mutate_the_node() {
+    let node = build_node().await;
+    let dir_old = scratch_dir("detached-old");
+    let dir_new = scratch_dir("detached-new");
+
+    let old =
+        Arc::new(OrgRevocationStore::init(dir_old.join("revocation-state.json")).expect("old"));
+    node.install_org_revocation_store(old.clone())
+        .expect("install old");
+    // Replace with an (empty, trivially dominating) current store.
+    let current =
+        Arc::new(OrgRevocationStore::init(dir_new.join("revocation-state.json")).expect("new"));
+    node.install_org_revocation_store(current.clone())
+        .expect("replace with current");
+
+    // A projection lands under the CURRENT store's floors.
+    let publisher = EntityKeypair::generate();
+    let publisher_node_id = publisher.node_id();
+    let cert4 = OrgMembershipCert::try_issue(&org(), publisher.entity_id().clone(), 4, 3600)
+        .expect("issue");
+    let mut ann = CapabilityAnnouncement::new(
+        publisher_node_id,
+        publisher.entity_id().clone(),
+        100,
+        CapabilitySet::new().add_tag("nrpc:oa1-echo"),
+    )
+    .with_owner_cert(Some(cert4));
+    ann.sign(&publisher);
+    node.test_inject_capability_announcement(ann);
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        Some(org().org_id())
+    );
+
+    // Raising floors through the DETACHED store must not touch the
+    // node's fold…
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(publisher.entity_id().clone(), 5u32);
+    let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
+    old.apply_bundle(&bundle)
+        .expect("raise through detached store");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        Some(org().org_id()),
+        "a detached store must be inert"
+    );
+
+    // …while the same raise through the INSTALLED store retracts.
+    current
+        .apply_bundle(&bundle)
+        .expect("raise through installed store");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), publisher_node_id),
+        None,
+        "the installed store retracts"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_old);
+    let _ = std::fs::remove_dir_all(&dir_new);
+}
+
+/// Review-9: concurrent dominating replacements are serialized —
+/// the final installed floor never regresses (7 wins whether it
+/// installs first, refusing 6, or second, dominating 6).
+#[tokio::test]
+async fn concurrent_replacements_never_lower_the_installed_floor() {
+    let node = build_node().await;
+    let publisher = EntityKeypair::generate();
+    let dir6 = scratch_dir("repl-6");
+    let dir7 = scratch_dir("repl-7");
+
+    let make_store = |dir: &PathBuf, floor: u32| {
+        let store =
+            Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(publisher.entity_id().clone(), floor);
+        store
+            .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+            .expect("raise");
+        store
+    };
+    let store6 = make_store(&dir6, 6);
+    let store7 = make_store(&dir7, 7);
+
+    let n6 = node.clone();
+    let n7 = node.clone();
+    let t6 = tokio::task::spawn_blocking(move || n6.install_org_revocation_store(store6));
+    let t7 = tokio::task::spawn_blocking(move || n7.install_org_revocation_store(store7));
+    let r6 = t6.await.expect("t6");
+    let r7 = t7.await.expect("t7");
+
+    assert!(r7.is_ok(), "the floor-7 store always ends up installable");
+    // Whether 6 installed first (then 7 replaced it) or was refused
+    // after 7, the final floor is 7.
+    let final_floor = node
+        .org_revocation_store()
+        .expect("installed")
+        .floor_for(&org().org_id(), publisher.entity_id());
+    assert_eq!(
+        final_floor, 7,
+        "final installed floor never drops (r6: {r6:?})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir6);
+    let _ = std::fs::remove_dir_all(&dir7);
+}
+
+/// Review-9: `install_node_authority` re-verifies the authority
+/// object in full — an authority whose OWN floor rose above its
+/// certificate after adoption is refused, and enabled emission
+/// goes dark rather than advertising a revoked certificate.
+#[tokio::test]
+async fn floored_authority_fails_installation_and_emission_goes_dark() {
+    let node = build_node().await;
+    let dir = scratch_dir("floored-auth");
+
+    let cert1 =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, cert1, node.entity_id(), 0, None).expect("adopt"));
+
+    // Raise the authority's OWN member floor to 2 after adoption.
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(node.entity_id().clone(), 2u32);
+    let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
+    authority
+        .revocation
+        .apply_bundle(&bundle)
+        .expect("raise to 2");
+
+    // The reviewer red: installation previously succeeded.
+    let err = node
+        .install_node_authority(authority.clone())
+        .expect_err("floored authority must fail installation");
+    assert!(format!("{err}").contains("floor"), "got: {err}");
+
+    // Emission liveness: install a VALID authority, enable
+    // emission, then raise the node's own floor — the next
+    // announcement goes dark instead of advertising the revoked
+    // cert.
+    let dir2 = scratch_dir("floored-auth-2");
+    let cert1 =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority2 =
+        Arc::new(NodeAuthority::adopt(&dir2, cert1, node.entity_id(), 0, None).expect("adopt 2"));
+    node.install_node_authority(authority2).expect("install");
+    node.set_owner_cert_emission(true).expect("enable");
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), node.node_id()),
+        Some(org().org_id()),
+        "emission live while the cert stands"
+    );
+
+    node.org_revocation_store()
+        .expect("installed")
+        .apply_bundle(&bundle)
+        .expect("raise own floor");
+    // The raise itself retracted the self-projection…
+    assert_eq!(owner_org_for(node.capability_fold(), node.node_id()), None);
+    // …and the next announcement carries no cert (emission dark).
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce dark");
+    assert_eq!(
+        owner_org_for(node.capability_fold(), node.node_id()),
+        None,
+        "a self-floored node must stop emitting ownership"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
 /// Review-8 §9 end-to-end: raising a floor through the INSTALLED
 /// store retracts an existing ownership projection immediately —
 /// no re-announcement — while the capability entry stays present
@@ -301,6 +542,51 @@ async fn floor_raise_retracts_projection_without_reannouncement() {
         "nrpc:oa1-echo",
         0xDEAD
     ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review-9 real-path witness: a certificate acceptable ONLY under
+/// the ceremony's skew adopts AND starts — the accepted tolerance
+/// is persisted in the membership config, so `MeshNode::new`
+/// verifies with exactly what `net node adopt` accepted (no
+/// zero-skew startup surprise).
+#[tokio::test]
+async fn ceremony_skew_carries_into_production_startup() {
+    let dir = scratch_dir("skew-startup");
+    let keypair = EntityKeypair::from_bytes([0x66u8; 32]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    // Validly signed, expired 30 s ago: acceptable only with
+    // skew ≥ 30.
+    let expired = {
+        // issue_at is crate-internal; build the same shape through
+        // the public issue path is impossible for a past window, so
+        // sign a short-lived cert and wait it out — 2 s TTL keeps
+        // the test fast while exercising the real expiry.
+        let cert = OrgMembershipCert::try_issue(&org(), keypair.entity_id().clone(), 1, 2)
+            .expect("issue short-lived");
+        let _ = now;
+        cert
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Zero-skew ceremony refuses the expired cert…
+    assert!(
+        NodeAuthority::adopt(&dir, expired.clone(), keypair.entity_id(), 0, None).is_err(),
+        "expired cert must refuse a strict ceremony"
+    );
+    // …a 120 s tolerance accepts it, persisting the tolerance.
+    NodeAuthority::adopt(&dir, expired, keypair.entity_id(), 120, None)
+        .expect("skewed ceremony accepts");
+
+    // Production startup succeeds with the SAME persisted skew.
+    let node = MeshNode::new(keypair.clone(), test_config().with_node_authority_dir(&dir))
+        .await
+        .expect("startup verifies under the persisted ceremony skew");
+    assert!(node.node_authority().is_some());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

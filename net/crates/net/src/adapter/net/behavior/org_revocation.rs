@@ -52,7 +52,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -154,7 +154,7 @@ impl OrgRevocationState {
     /// candidate floors BEFORE creating any durable state
     /// (review-8 §7/§8).
     pub fn load_if_exists(path: &Path) -> Result<Option<Self>, OrgRevocationError> {
-        match std::fs::read(path) {
+        match read_regular_nofollow(path) {
             Ok(bytes) => Self::from_file_bytes(&bytes, path).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(OrgRevocationError::Io {
@@ -359,6 +359,10 @@ type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 /// never lower a live view.
 pub struct OrgRevocationStore {
     path: PathBuf,
+    /// Registry key for the PATH-WIDE durability-uncertainty bit
+    /// (review-9): poison is shared by every store instance backed
+    /// by the same canonical pathname, not held per object.
+    poison_key: PathBuf,
     /// Serializes this instance's merge→persist→publish sequences
     /// (the sidecar file lock serializes across instances).
     reload: Mutex<()>,
@@ -366,13 +370,10 @@ pub struct OrgRevocationStore {
     /// persisted state; possibly behind it between reloads when
     /// another writer advanced the file.
     live: RwLock<Arc<OrgRevocationState>>,
-    /// Set when a write ended post-rename durability-uncertain
-    /// (parent-dir fsync failure). Further applies are refused
-    /// until restart (review-8 §13).
-    poisoned: AtomicBool,
-    /// Invoked (outside the file lock) with the floors a reload
-    /// raised relative to the previously published view. The
-    /// running node uses this to retract stale ownership
+    /// Invoked (outside BOTH the file lock and the reload lock —
+    /// re-entrant callbacks must not deadlock, review-9) with the
+    /// floors a reload raised relative to the previously published
+    /// view. The running node uses this to retract stale ownership
     /// projections from the capability fold.
     on_floors_raised: RwLock<Option<FloorsRaisedCallback>>,
 }
@@ -394,7 +395,9 @@ impl OrgRevocationStore {
             }
         }
         let _lock = lock_state_file(&path)?;
-        let state = match std::fs::read(&path) {
+        let poison_key = poison_key_for(&path);
+        recover_poison_if_needed_locked(&path, &poison_key)?;
+        let state = match read_regular_nofollow(&path) {
             Ok(bytes) => OrgRevocationState::from_file_bytes(&bytes, &path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let state = OrgRevocationState::empty();
@@ -410,9 +413,9 @@ impl OrgRevocationStore {
         };
         Ok(Self {
             path,
+            poison_key,
             reload: Mutex::new(()),
             live: RwLock::new(Arc::new(state)),
-            poisoned: AtomicBool::new(false),
             on_floors_raised: RwLock::new(None),
         })
     }
@@ -420,9 +423,21 @@ impl OrgRevocationStore {
     /// Startup entry point: the file MUST exist and parse. Missing
     /// or corrupt → loud typed error; protected verification never
     /// starts against silently weaker floors.
+    ///
+    /// If the backing path is durability-poisoned (review-9), the
+    /// open performs explicit recovery under the interprocess lock
+    /// — a reread plus a SUCCESSFUL parent-directory fsync — before
+    /// treating the current pathname as authoritative; recovery
+    /// failure refuses the open. A fresh instance therefore never
+    /// launders path-wide uncertainty.
     pub fn open_existing(path: impl Into<PathBuf>) -> Result<Self, OrgRevocationError> {
         let path = path.into();
-        let bytes = match std::fs::read(&path) {
+        let poison_key = poison_key_for(&path);
+        if poison_registry().lock().contains(&poison_key) {
+            let _lock = lock_state_file(&path)?;
+            recover_poison_if_needed_locked(&path, &poison_key)?;
+        }
+        let bytes = match read_regular_nofollow(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let err = OrgRevocationError::MissingState {
@@ -443,9 +458,9 @@ impl OrgRevocationStore {
         })?;
         Ok(Self {
             path,
+            poison_key,
             reload: Mutex::new(()),
             live: RwLock::new(Arc::new(state)),
-            poisoned: AtomicBool::new(false),
             on_floors_raised: RwLock::new(None),
         })
     }
@@ -465,10 +480,15 @@ impl OrgRevocationStore {
         self.snapshot().floor_for(org, member)
     }
 
-    /// `true` once a write ended post-rename durability-uncertain;
-    /// [`Self::apply_bundle`] refuses until restart.
+    /// `true` while this store's BACKING PATH is
+    /// durability-uncertain (review-9: the poison bit is shared by
+    /// every instance on the same canonical pathname, not held per
+    /// object). Cleared only by explicit recovery — a locked
+    /// reread plus a successful parent-directory fsync — performed
+    /// by [`Self::open_existing`], [`Self::init`], or the next
+    /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
+        poison_registry().lock().contains(&self.poison_key)
     }
 
     /// Install the raise callback (review-8 §9). Invoked after a
@@ -510,85 +530,110 @@ impl OrgRevocationStore {
         &self,
         bundle: &OrgRevocationBundle,
     ) -> Result<Vec<RaisedFloor>, OrgRevocationError> {
-        let _guard = self.reload.lock();
-
-        if self.is_poisoned() {
-            return Err(OrgRevocationError::Poisoned {
-                path: self.path.display().to_string(),
-            });
+        // The locked phase returns its outcome so raise observers
+        // run AFTER both the file lock and this instance's reload
+        // guard have dropped — a callback that re-enters
+        // `apply_bundle` on the same store must not deadlock
+        // (review-9).
+        enum LockedOutcome {
+            Applied(Vec<RaisedFloor>),
+            DurabilityUncertain(Vec<RaisedFloor>, String),
         }
 
-        // 1. Verify the incoming bundle's signature + canonical
-        //    structure. A corrupt bundle keeps last-good, loudly.
-        if let Err(e) = bundle.verify() {
-            let err = OrgRevocationError::InvalidBundle(e);
-            tracing::error!(
-                org = %bundle.org_id,
-                "rejecting revocation bundle, keeping last-good persisted floors: {err}"
-            );
-            return Err(err);
-        }
+        let outcome = {
+            let _guard = self.reload.lock();
 
-        // 2. Interprocess critical section: reread the PERSISTED
-        //    maxima under the lock. The reread is load-bearing —
-        //    merging from this instance's live snapshot would let a
-        //    stale writer overwrite floors another writer already
-        //    persisted.
-        let lock = lock_state_file(&self.path)?;
-        let disk_bytes = std::fs::read(&self.path).map_err(|e| OrgRevocationError::Io {
-            path: self.path.display().to_string(),
-            reason: e.to_string(),
-        })?;
-        let disk = OrgRevocationState::from_file_bytes(&disk_bytes, &self.path)?;
+            // 1. Verify the incoming bundle's signature + canonical
+            //    structure. A corrupt bundle keeps last-good, loudly.
+            if let Err(e) = bundle.verify() {
+                let err = OrgRevocationError::InvalidBundle(e);
+                tracing::error!(
+                    org = %bundle.org_id,
+                    "rejecting revocation bundle, keeping last-good persisted floors: {err}"
+                );
+                return Err(err);
+            }
 
-        // 3. Monotone merge against the reread disk state.
-        let mut merged = disk.clone();
-        let raised_on_disk = merged.merge_bundle(bundle);
+            // 2. Interprocess critical section. If the backing path
+            //    is durability-poisoned, attempt explicit recovery
+            //    (parent-dir fsync under the lock) — no same-path
+            //    apply may silently succeed while uncertainty
+            //    remains, whichever instance carries it (review-9).
+            let lock = lock_state_file(&self.path)?;
+            recover_poison_if_needed_locked(&self.path, &self.poison_key)?;
 
-        // 4. Persist iff the disk state changed; the write must
-        //    complete before anything is published.
-        if raised_on_disk > 0 {
-            match write_atomic_phased(&self.path, &merged.to_file_bytes()?) {
-                Ok(()) => {}
-                Err(WritePhase::PreRename(reason)) => {
-                    // Old file (rename never happened) and old live
-                    // view both intact — a floor the disk could
-                    // forget is never enforced.
-                    drop(lock);
-                    return Err(OrgRevocationError::Io {
-                        path: self.path.display().to_string(),
-                        reason,
-                    });
-                }
-                Err(WritePhase::PostRename(reason)) => {
-                    // The rename LANDED; only the directory-entry
-                    // durability is uncertain. Publish the merged
-                    // (never-weaker) view so enforcement doesn't
-                    // regress below what the disk may now hold, then
-                    // poison: disk and memory can no longer be
-                    // proven synchronized until a restart rereads
-                    // ground truth.
-                    let raised = self.publish(merged);
-                    self.poisoned.store(true, Ordering::Release);
-                    drop(lock);
-                    let err = OrgRevocationError::DurabilityUncertain {
-                        path: self.path.display().to_string(),
-                        reason,
-                    };
-                    tracing::error!("{err}");
-                    self.notify_raised(&raised);
-                    return Err(err);
+            // 3. REREAD the persisted maxima under the lock — the
+            //    reread is load-bearing: merging from this
+            //    instance's live snapshot would let a stale writer
+            //    overwrite floors another writer already persisted.
+            let disk_bytes =
+                read_regular_nofollow(&self.path).map_err(|e| OrgRevocationError::Io {
+                    path: self.path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+            let disk = OrgRevocationState::from_file_bytes(&disk_bytes, &self.path)?;
+
+            // 4. Monotone merge against the reread disk state.
+            let mut merged = disk.clone();
+            let raised_on_disk = merged.merge_bundle(bundle);
+
+            // 5. Persist iff the disk state changed; the write must
+            //    complete before anything is published.
+            let mut durability_uncertain: Option<String> = None;
+            if raised_on_disk > 0 {
+                match write_atomic_phased(&self.path, &merged.to_file_bytes()?) {
+                    Ok(()) => {}
+                    Err(WritePhase::PreRename(reason)) => {
+                        // Old file (rename never happened) and old
+                        // live view both intact — a floor the disk
+                        // could forget is never enforced.
+                        drop(lock);
+                        return Err(OrgRevocationError::Io {
+                            path: self.path.display().to_string(),
+                            reason,
+                        });
+                    }
+                    Err(WritePhase::PostRename(reason)) => {
+                        // The rename LANDED; only the directory-entry
+                        // durability is uncertain. Still publish the
+                        // merged (never-weaker) view below so
+                        // enforcement doesn't regress under what the
+                        // disk may now hold, but poison the PATH: no
+                        // instance may pretend disk and memory are
+                        // synchronized until recovery proves the
+                        // entry durable.
+                        poison_registry().lock().insert(self.poison_key.clone());
+                        durability_uncertain = Some(reason);
+                    }
                 }
             }
-        }
 
-        // 5. Publish the merged view (also syncs this instance up
-        //    to floors other writers advanced), release the lock,
-        //    then notify raise observers.
-        let raised = self.publish(merged);
-        drop(lock);
-        self.notify_raised(&raised);
-        Ok(raised)
+            // 6. Publish the merged view (also syncs this instance
+            //    up to floors other writers advanced) and release
+            //    the lock; notification happens outside.
+            let raised = self.publish(merged);
+            drop(lock);
+            match durability_uncertain {
+                None => LockedOutcome::Applied(raised),
+                Some(reason) => LockedOutcome::DurabilityUncertain(raised, reason),
+            }
+        };
+
+        match outcome {
+            LockedOutcome::Applied(raised) => {
+                self.notify_raised(&raised);
+                Ok(raised)
+            }
+            LockedOutcome::DurabilityUncertain(raised, reason) => {
+                let err = OrgRevocationError::DurabilityUncertain {
+                    path: self.path.display().to_string(),
+                    reason,
+                };
+                tracing::error!("{err}");
+                self.notify_raised(&raised);
+                Err(err)
+            }
+        }
     }
 
     /// Swap the live view to `next`, returning every floor that
@@ -638,26 +683,174 @@ pub(crate) enum WritePhase {
     PostRename(String),
 }
 
+/// Process-wide durability-uncertainty registry, keyed by the
+/// CANONICAL backing path (review-9): the filesystem's uncertainty
+/// after a landed-rename/failed-dir-fsync belongs to the directory
+/// entry, not to one `OrgRevocationStore` instance. Every store
+/// opened on the same pathname shares the poison bit; recovery
+/// (a locked reread plus a SUCCESSFUL parent-directory fsync)
+/// clears it.
+static PATH_POISON: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn poison_registry() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    PATH_POISON.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The registry key for `path`: canonicalized parent (stable — the
+/// file itself is replaced by rename) joined with the file name;
+/// falls back to the path verbatim when the parent cannot resolve.
+fn poison_key_for(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
+            .canonicalize()
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Open `path` as a REGULAR file without following symlinks
+/// (review-9): authority/state data and the stable lock inode must
+/// never be attacker-steerable through a planted link, and the
+/// permission/type checks must run on the OPENED handle so there is
+/// no check-to-use window.
+///
+/// Unix uses `O_NOFOLLOW` (a symlink final component fails to
+/// open); other platforms fall back to a `symlink_metadata`
+/// pre-check plus a handle-metadata type check.
+pub(crate) fn open_regular_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink: authority files must be regular files",
+            ));
+        }
+    }
+    let file = opts.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink: authority files must be regular files",
+            );
+        }
+        e
+    })?;
+    // Type check on the opened descriptor — immune to a swap
+    // between check and use.
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing non-regular file: authority files must be regular files",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read a whole regular file through a no-follow handle.
+pub(crate) fn read_regular_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = open_regular_nofollow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Acquire the exclusive interprocess lock guarding `path` via its
 /// stable `.lock` sidecar (the state file itself is replaced by
 /// rename, so it cannot carry the lock). Blocking; released when
 /// the returned handle drops. std advisory file locking — same
-/// semantics as the sdk revocation store's fs2 sidecar.
-fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocationError> {
+/// semantics as the sdk revocation store's fs2 sidecar. The sidecar
+/// is opened no-follow so a planted symlink cannot redirect the
+/// lock inode (review-9).
+///
+/// `pub(crate)`: the adoption ceremony's final phase holds this
+/// lock across its floor re-verification and membership write.
+pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocationError> {
     let io = |e: std::io::Error| OrgRevocationError::Io {
         path: path.display().to_string(),
         reason: format!("state lock: {e}"),
     };
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(PathBuf::from(lock_path))
-        .map_err(io)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    let f = opts.open(PathBuf::from(lock_path)).map_err(io)?;
     f.lock().map_err(io)?;
     Ok(f)
+}
+
+/// Explicit durability recovery, called with the interprocess lock
+/// HELD (review-9): if `poison_key` is registered, prove the
+/// directory entry durable with a parent-directory fsync; success
+/// clears the path-wide poison, failure refuses with
+/// [`OrgRevocationError::Poisoned`]. No same-path operation may
+/// silently succeed while uncertainty remains.
+fn recover_poison_if_needed_locked(
+    path: &Path,
+    poison_key: &Path,
+) -> Result<(), OrgRevocationError> {
+    if !poison_registry().lock().contains(poison_key) {
+        return Ok(());
+    }
+    match fsync_parent_dir(path) {
+        Ok(()) => {
+            poison_registry().lock().remove(poison_key);
+            tracing::warn!(
+                path = %path.display(),
+                "revocation-state durability uncertainty recovered (parent directory fsynced)"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "revocation-state durability recovery failed; path remains poisoned"
+            );
+            Err(OrgRevocationError::Poisoned {
+                path: path.display().to_string(),
+            })
+        }
+    }
+}
+
+/// fsync the parent directory of `path` (Unix; no-op elsewhere,
+/// where the rename primitive carries the metadata guarantee).
+/// Split out so the durability-recovery path (review-9) can prove
+/// the directory entry durable without rewriting the file.
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Monotone counter qualifying temp names so two writers in one
@@ -665,17 +858,21 @@ fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocationError> {
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A fresh, unpredictable same-directory temp path:
-/// `<file>.tmp.<pid>.<seq>.<rand8hex>`. Appended to the FULL file
+/// `<file>.tmp.<pid>.<seq>.<rand16hex>`. Appended to the FULL file
 /// name (the previous `with_extension` form replaced `.json`,
 /// making the name predictable — review-8 §10: a pre-created
 /// permissive temp would survive `create(true).truncate(true)`
 /// with its original mode).
-fn fresh_temp_path(path: &Path) -> PathBuf {
-    let mut rand = [0u8; 4];
-    // Best-effort: pid + seq already guarantee uniqueness within
-    // and across live processes; the random suffix defeats
-    // prediction by an unprivileged pre-creator.
-    let _ = getrandom::fill(&mut rand);
+///
+/// Entropy failure is an ERROR, not a silent all-zero suffix
+/// (review-9): pid + a process-local sequence do not survive PID
+/// reuse, so the random suffix is load-bearing for the
+/// unpredictability claim. `create_new` keeps even that failure
+/// mode fail-loud, but we don't rely on it.
+fn fresh_temp_path(path: &Path) -> Result<PathBuf, WritePhase> {
+    let mut rand = [0u8; 8];
+    getrandom::fill(&mut rand)
+        .map_err(|e| WritePhase::PreRename(format!("temp-name entropy unavailable: {e:?}")))?;
     let mut s = path.as_os_str().to_os_string();
     s.push(format!(
         ".tmp.{}.{}.{}",
@@ -683,7 +880,7 @@ fn fresh_temp_path(path: &Path) -> PathBuf {
         TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
         hex::encode(rand)
     ));
-    PathBuf::from(s)
+    Ok(PathBuf::from(s))
 }
 
 /// Durable atomic write with phase-typed failures: fresh
@@ -707,7 +904,7 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
     // with a crash-left temp fails loudly instead of truncating a
     // permissive inode. A handful of retries covers the
     // astronomically unlikely name collision.
-    let mut tmp = fresh_temp_path(path);
+    let mut tmp = fresh_temp_path(path)?;
     let mut file = None;
     for _ in 0..4 {
         let mut opts = std::fs::OpenOptions::new();
@@ -723,7 +920,7 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                tmp = fresh_temp_path(path);
+                tmp = fresh_temp_path(path)?;
             }
             Err(e) => return Err(pre(e)),
         }
@@ -750,6 +947,12 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
     }
     drop(f);
 
+    // Atomic replacement. On Unix, rename(2) atomically replaces
+    // an existing destination. On Windows, Rust's std::fs::rename
+    // is implemented with MoveFileExW + MOVEFILE_REPLACE_EXISTING,
+    // which also replaces an existing destination — no separate
+    // ReplaceFileW path is required (std library guarantee since
+    // Rust 1.0; see std::fs::rename platform-specific behavior).
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(pre(e));
@@ -760,16 +963,8 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
     // (BUG #93 lineage, mirrors redex/disk.rs). Required, not
     // best-effort — and a failure HERE is post-rename: the caller
     // must treat disk state as unproven (review-8 §13).
-    #[cfg(unix)]
-    {
-        let dir = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let dir_sync = std::fs::File::open(dir).and_then(|d| d.sync_all());
-        if let Err(e) = dir_sync {
-            return Err(WritePhase::PostRename(e.to_string()));
-        }
+    if let Err(e) = fsync_parent_dir(path) {
+        return Err(WritePhase::PostRename(e.to_string()));
     }
     Ok(())
 }
@@ -1108,16 +1303,21 @@ mod tests {
         assert!(seen.lock().is_empty(), "lower bundle must not notify");
     }
 
-    /// Review-8 §13 witness: a POST-rename parent-fsync failure
-    /// publishes the merged (never-weaker) view, poisons the store,
-    /// and refuses further applies until restart.
+    /// Review-8 §13 + review-9 witness: a POST-rename parent-fsync
+    /// failure publishes the merged (never-weaker) view and poisons
+    /// the BACKING PATH — every same-path instance refuses until an
+    /// explicit recovery (locked reread + successful parent-dir
+    /// fsync) proves the directory entry durable.
     #[cfg(unix)]
     #[test]
-    fn post_rename_fsync_failure_poisons_the_store() {
+    fn post_rename_fsync_failure_poisons_the_path_until_recovery() {
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         let path = scratch.state_path();
         let store = OrgRevocationStore::init(&path).expect("init");
+        // A second instance on the SAME path, opened before the
+        // failure — path-wide poison must gate it too (review-9).
+        let sibling = OrgRevocationStore::open_existing(&path).expect("sibling");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
 
         // Write+execute but NO read on the parent: lookups, file
@@ -1129,8 +1329,6 @@ mod tests {
         let err = store
             .apply_bundle(&bundle_with_floor(9))
             .expect_err("dir fsync must fail");
-        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod back");
         assert!(
             matches!(err, OrgRevocationError::DurabilityUncertain { .. }),
             "got: {err}"
@@ -1138,18 +1336,111 @@ mod tests {
 
         // Fail-closed in the never-weaker direction: the merged
         // floor IS enforced (the rename landed; the disk may hold
-        // it), but the store refuses to pretend disk and memory
-        // are synchronized.
+        // it), but no same-path instance may pretend disk and
+        // memory are synchronized while recovery is impossible.
         assert_eq!(store.floor_for(&org().org_id(), &member()), 9);
         assert!(store.is_poisoned());
+        assert!(
+            sibling.is_poisoned(),
+            "poison is path-wide, not per instance"
+        );
         let err = store
             .apply_bundle(&bundle_with_floor(11))
-            .expect_err("poisoned store refuses further applies");
+            .expect_err("originating store refuses while recovery fails");
         assert!(matches!(err, OrgRevocationError::Poisoned { .. }));
+        // The SIBLING's no-op-shaped lower apply must equally refuse
+        // — this is the review-9 red (it previously returned Ok).
+        let err = sibling
+            .apply_bundle(&bundle_with_floor(3))
+            .expect_err("sibling refuses while the path is uncertain");
+        assert!(matches!(err, OrgRevocationError::Poisoned { .. }));
+        // A NEWLY OPENED instance cannot launder the uncertainty
+        // either: its open attempts recovery, which still fails.
+        assert!(
+            OrgRevocationStore::open_existing(&path).is_err(),
+            "fresh open must not bypass path poison while recovery fails"
+        );
 
-        // Restart re-establishes ground truth from disk.
-        let restarted = OrgRevocationStore::open_existing(&path).expect("restart");
-        assert!(!restarted.is_poisoned());
-        assert_eq!(restarted.floor_for(&org().org_id(), &member()), 9);
+        // Once the environment is repaired, the next operation
+        // performs explicit recovery (locked reread + successful
+        // parent fsync) and clears the uncertainty.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        let raised = sibling
+            .apply_bundle(&bundle_with_floor(11))
+            .expect("recovered apply succeeds");
+        assert!(raised.contains(&(org().org_id(), member(), 11)));
+        assert!(!store.is_poisoned(), "recovery clears the path-wide bit");
+        let reopened = OrgRevocationStore::open_existing(&path).expect("reopen");
+        assert_eq!(reopened.floor_for(&org().org_id(), &member()), 11);
+    }
+
+    /// Review-9: raise callbacks run OUTSIDE both the file lock and
+    /// the instance reload guard — a callback that synchronously
+    /// re-enters `apply_bundle` on the same store must not
+    /// deadlock.
+    #[test]
+    fn reentrant_callback_does_not_deadlock() {
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+
+        let reentered = Arc::new(Mutex::new(false));
+        let store_for_callback = Arc::downgrade(&store);
+        let flag = reentered.clone();
+        store.set_on_floors_raised(move |raised| {
+            // Re-enter once, from the first raise only.
+            if raised.iter().any(|(_, _, floor)| *floor == 5) {
+                if let Some(store) = store_for_callback.upgrade() {
+                    store
+                        .apply_bundle(&bundle_with_floor(7))
+                        .expect("re-entrant apply must not deadlock");
+                    *flag.lock() = true;
+                }
+            }
+        });
+
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        assert!(*reentered.lock(), "callback re-entered apply_bundle");
+        assert_eq!(store.floor_for(&org().org_id(), &member()), 7);
+    }
+
+    /// Review-9 filesystem policy: state files and the lock sidecar
+    /// are opened no-follow — a planted symlink is refused, not
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_and_lock_files_are_refused() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path).expect("init");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        drop(store);
+
+        // Symlinked STATE file: reads refuse.
+        let real = scratch.0.join("elsewhere.json");
+        std::fs::rename(&path, &real).expect("move state");
+        std::os::unix::fs::symlink(&real, &path).expect("plant symlink");
+        assert!(
+            OrgRevocationStore::open_existing(&path).is_err(),
+            "symlinked state file must refuse"
+        );
+        std::fs::remove_file(&path).expect("remove link");
+        std::fs::rename(&real, &path).expect("restore state");
+        OrgRevocationStore::open_existing(&path).expect("regular file opens");
+
+        // Symlinked LOCK sidecar: locking refuses rather than
+        // following the link to a foreign inode.
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let _ = std::fs::remove_file(&lock_path);
+        let foreign = scratch.0.join("foreign.lock");
+        std::fs::write(&foreign, b"").expect("foreign lock");
+        std::os::unix::fs::symlink(&foreign, &lock_path).expect("plant lock symlink");
+        let store = OrgRevocationStore::open_existing(&path).expect("open");
+        assert!(
+            store.apply_bundle(&bundle_with_floor(9)).is_err(),
+            "symlinked lock sidecar must refuse"
+        );
     }
 }

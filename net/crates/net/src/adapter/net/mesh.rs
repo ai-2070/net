@@ -4101,6 +4101,13 @@ pub struct MeshNode {
     /// `node_authority_dir` config at construction); replacement by
     /// a DIFFERENT owner org is refused — one node, one owner.
     node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// Review-9: serializes authority/store installation. The
+    /// check-then-store sequences (dominance validation, one-owner
+    /// comparison, callback wiring, reconciliation) must be one
+    /// coherent lifecycle operation — two concurrent installs must
+    /// not both validate against the same older view and publish
+    /// in reverse order.
+    org_install: Arc<parking_lot::Mutex<()>>,
     /// OA-1: whether self-announcements attach the installed
     /// authority's owner certificate. `false` (the default) keeps
     /// the announcement byte-identical to the pre-OA-1 shape;
@@ -4778,14 +4785,17 @@ impl MeshNode {
         // corrupt, or floored authority REFUSES construction — it
         // never silently degrades to an un-adopted node. The loaded
         // value installs after the struct exists, below.
+        // Verification uses the skew the adoption ceremony
+        // PERSISTED into the membership config (review-9): what
+        // `net node adopt` accepted is exactly what startup
+        // accepts.
         let node_authority = match &config.node_authority_dir {
             Some(dir) => {
-                let authority = super::behavior::org_authority::NodeAuthority::open(
-                    dir,
-                    identity.entity_id(),
-                    0,
-                )
-                .map_err(|e| AdapterError::Fatal(format!("node authority startup refusal: {e}")))?;
+                let authority =
+                    super::behavior::org_authority::NodeAuthority::open(dir, identity.entity_id())
+                        .map_err(|e| {
+                            AdapterError::Fatal(format!("node authority startup refusal: {e}"))
+                        })?;
                 Some(Arc::new(authority))
             }
             None => {
@@ -5367,6 +5377,7 @@ impl MeshNode {
             migration_handler: Arc::new(ArcSwapOption::empty()),
             org_revocation: Arc::new(ArcSwapOption::empty()),
             node_authority: Arc::new(ArcSwapOption::empty()),
+            org_install: Arc::new(parking_lot::Mutex::new(())),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_handshakes,
             pending_direct_initiators,
@@ -6646,16 +6657,45 @@ impl MeshNode {
 
     /// OA-1: install the node's persisted org revocation store so
     /// announcement ingest floor-checks owner certificates.
-    /// MONOTONIC (review-8 §4): installing over nothing is
-    /// accepted, re-installing the same store is idempotent, and a
-    /// replacement whose live view is LOWER on any `(org, member)`
-    /// floor is refused — an installed floor never lowers. Every
-    /// accepted store is wired to retract stale fold ownership
-    /// projections when its floors rise (review-8 §9).
+    /// MONOTONIC (review-8 §4) and lifecycle-coherent (review-9):
+    ///
+    /// - installs are SERIALIZED (two concurrent dominance checks
+    ///   cannot both validate against the same older view and
+    ///   publish in reverse order);
+    /// - installing over nothing is accepted, re-installing the
+    ///   same store is idempotent, a replacement whose live view is
+    ///   LOWER on any `(org, member)` floor is refused, and a
+    ///   durability-poisoned candidate is refused (uncertainty is
+    ///   never laundered through replacement);
+    /// - the raise callback is INERT once its store is detached —
+    ///   a replaced store can no longer mutate this node's fold;
+    /// - the candidate's floors are RECONCILED against existing
+    ///   fold projections before returning, so a pre-raised store
+    ///   retracts stale ownership immediately (no floor-change
+    ///   event is needed after installation).
     pub fn install_org_revocation_store(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        let _install = self.org_install.lock();
+        self.install_org_revocation_store_locked(store)
+    }
+
+    /// Body of [`Self::install_org_revocation_store`], called with
+    /// the install lock HELD — `install_node_authority` runs its
+    /// one-owner comparison and this store install under ONE lock
+    /// acquisition so no other install can interleave.
+    fn install_org_revocation_store_locked(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        if store.is_poisoned() {
+            return Err(
+                super::behavior::org_revocation::OrgRevocationError::Poisoned {
+                    path: store.path().display().to_string(),
+                },
+            );
+        }
         if let Some(current) = self.org_revocation.load_full() {
             if Arc::ptr_eq(&current, &store) {
                 return Ok(());
@@ -6673,12 +6713,26 @@ impl MeshNode {
                 );
             }
         }
+
         // Floor raises retract exactly the fold ownership
         // projections that fell below the new floor — immediately,
         // with no re-announcement; capability entries untouched
-        // (review-8 §9).
+        // (review-8 §9). The callback first checks that ITS store
+        // is still the installed one (review-9): a detached store's
+        // late raises must not mutate a node it no longer speaks
+        // for.
         let fold = self.capability_fold.clone();
+        let slot = self.org_revocation.clone();
+        let me = Arc::downgrade(&store);
         store.set_on_floors_raised(move |raised| {
+            let installed = slot.load_full();
+            let still_installed = match (&installed, me.upgrade()) {
+                (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
+                _ => false,
+            };
+            if !still_installed {
+                return;
+            }
             for (org, member, floor) in raised {
                 let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
                     &fold, *org, member, *floor,
@@ -6693,7 +6747,29 @@ impl MeshNode {
                 }
             }
         });
-        self.org_revocation.store(Some(store));
+        self.org_revocation.store(Some(store.clone()));
+
+        // Reconcile the candidate's floors against projections that
+        // already exist in the fold: a store installed AFTER its
+        // floors rose produces no callback, so the install itself
+        // performs the retraction sweep (review-9).
+        let snapshot = store.snapshot();
+        for ((org, member), floor) in snapshot.iter() {
+            let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
+                &self.capability_fold,
+                *org,
+                member,
+                *floor,
+            );
+            if retracted > 0 {
+                tracing::info!(
+                    org = %org,
+                    floor,
+                    retracted,
+                    "store installation reconciled stale ownership projection(s)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -6721,14 +6797,24 @@ impl MeshNode {
         &self,
         authority: Arc<super::behavior::org_authority::NodeAuthority>,
     ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
-        if authority.config.owner_cert.member != *self.identity.entity_id() {
-            return Err(
-                super::behavior::org_authority::OrgAuthorityError::CertNotForThisNode {
-                    cert_member: authority.config.owner_cert.member.clone(),
-                    local_entity: self.identity.entity_id().clone(),
-                },
-            );
-        }
+        // Review-9: the authority object is RE-VERIFIED here in
+        // full, not trusted as a proof token — `NodeAuthority` is
+        // not immutable (its store can rise after adopt returned,
+        // its config fields are public), so "loaded, self-verified"
+        // must be re-established at the installation boundary:
+        // structural binding to THIS node, wall-clock validity
+        // under the persisted ceremony skew, and the certificate's
+        // standing against the authority's CURRENT floor snapshot.
+        authority
+            .config
+            .self_verify(self.identity.entity_id(), &authority.revocation.snapshot())?;
+
+        // Serialize the one-owner comparison, the store install,
+        // and the authority publication under ONE lock acquisition
+        // (review-9: two concurrent installs must not both observe
+        // "no authority" and race different owners through separate
+        // ArcSwap fields).
+        let _install = self.org_install.lock();
         if let Some(existing) = self.node_authority.load_full() {
             if existing.owner_org() != authority.owner_org() {
                 return Err(
@@ -6739,7 +6825,7 @@ impl MeshNode {
                 );
             }
         }
-        self.install_org_revocation_store(authority.revocation.clone())
+        self.install_org_revocation_store_locked(authority.revocation.clone())
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
         self.node_authority.store(Some(authority));
         Ok(())
@@ -6785,9 +6871,35 @@ impl MeshNode {
         if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
             return None;
         }
-        self.node_authority
-            .load_full()
-            .map(|authority| authority.config.owner_cert.clone())
+        let authority = self.node_authority.load_full()?;
+        let cert = &authority.config.owner_cert;
+        // Review-9: emission must not keep advertising a
+        // certificate that is no longer valid against the ACTIVE
+        // authority state — an expired window or a floor raised
+        // above the cert's own generation (self-revocation) goes
+        // loudly dark instead of continuing to claim belonging.
+        if let Err(e) = cert.is_valid_with_skew(authority.config.verification_skew_secs) {
+            tracing::warn!(
+                org = %cert.org_id,
+                error = %e,
+                "owner-cert emission dark: installed certificate is no longer valid"
+            );
+            return None;
+        }
+        if let Some(store) = self.org_revocation.load_full() {
+            let floor = store.floor_for(&cert.org_id, &cert.member);
+            if cert.generation < floor {
+                tracing::warn!(
+                    org = %cert.org_id,
+                    generation = cert.generation,
+                    floor,
+                    "owner-cert emission dark: revocation floor rose above this node's \
+                     own certificate — renew via `net node adopt`"
+                );
+                return None;
+            }
+        }
+        Some(cert.clone())
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -15252,6 +15364,21 @@ impl MeshNode {
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = ctx.capability_fold.apply(fold_ann);
+        // Review-9: post-apply floor recheck — a raise that landed
+        // between the verification above and this apply would have
+        // finished its retraction callback before the projection
+        // existed; reread the CURRENT floors and retract if the
+        // just-applied projection is already below them.
+        if let Some(owner) = &verified_owner {
+            let store = ctx.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &ctx.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
 
         // SI-6 review P1 (unified scheduler-input generation): fold
         // membership is a scheduler-relevant plane — a changed
@@ -17201,6 +17328,19 @@ impl MeshNode {
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = self.capability_fold.apply(fold_ann);
+        // Review-9: post-apply floor recheck (see the dispatch
+        // path) — self-index is held to the identical ordering
+        // guarantees.
+        if let Some(owner) = &verified_owner {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &self.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
     }
 
     /// Announce this node's capabilities to every directly-connected
@@ -17495,6 +17635,18 @@ impl MeshNode {
                 verified_owner,
             );
             let _ = self.capability_fold.apply(fold_ann);
+            // Review-9: post-apply floor recheck (see the dispatch
+            // path).
+            if let Some(owner) = &verified_owner {
+                let store = self.org_revocation.load();
+                let floors = store.as_ref().map(|s| s.snapshot());
+                super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                    &self.capability_fold,
+                    floors.as_deref(),
+                    &ann.entity_id,
+                    owner,
+                );
+            }
 
             // Publish as the latest local announcement so future
             // session-opens push this version to new peers. Also always
@@ -19526,6 +19678,18 @@ impl MeshNode {
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = self.capability_fold.apply(fold_ann);
+        // Review-9: post-apply floor recheck (see the dispatch
+        // path) — fixtures exercise the same ordering guarantees.
+        if let Some(owner) = &verified_owner {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &self.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
     }
 
     /// Test-only helper — does the fold know about an entry

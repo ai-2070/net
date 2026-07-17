@@ -291,7 +291,14 @@ pub fn apply_legacy_announcement(
 ///
 /// Belonging only: the returned projection feeds discovery, never
 /// `may_execute`.
-pub fn verify_announced_owner_cert(
+///
+/// `pub(crate)` (review-9): `outer_signature_verified` is a
+/// caller-asserted fact, so only the in-crate dispatch/self-index
+/// paths — which computed it from a real signature check — may
+/// call this. Combined with [`VerifiedOwner`]'s private
+/// construction, verified ingest is structurally the only
+/// ownership producer.
+pub(crate) fn verify_announced_owner_cert(
     ann: &CapabilityAnnouncement,
     outer_signature_verified: bool,
     floors: Option<&OrgRevocationState>,
@@ -337,10 +344,41 @@ pub fn verify_announced_owner_cert(
             return None;
         }
     }
-    Some(VerifiedOwner {
-        org: cert.org_id,
-        generation: cert.generation,
-    })
+    Some(VerifiedOwner::new(cert.org_id, cert.generation))
+}
+
+/// Post-apply floor recheck (review-9): a floor can rise BETWEEN
+/// owner-cert verification and the fold apply — the raise callback
+/// completes while the projection is not yet in the fold, the
+/// delayed apply then installs it, and no future callback fires.
+/// Every production apply that installed a `Some(VerifiedOwner)`
+/// therefore rereads the CURRENT floors afterwards and retracts if
+/// the just-applied projection is already below them. Combined
+/// with the raise callback, every ordering retracts:
+///
+/// ```text
+/// raise after apply:                the callback retracts
+/// raise before the delayed apply:   this recheck retracts
+/// raise between apply and recheck:  callback or recheck retracts
+/// ```
+///
+/// The generation comparison stays exact — a newer projection is
+/// never over-cleared. Returns how many entries were retracted.
+pub(crate) fn recheck_projected_owner_floor(
+    fold: &Fold<CapabilityFold>,
+    floors: Option<&OrgRevocationState>,
+    member: &crate::adapter::net::identity::EntityId,
+    owner: &VerifiedOwner,
+) -> usize {
+    let Some(floors) = floors else {
+        return 0;
+    };
+    let floor = floors.floor_for(&owner.org(), member);
+    if owner.generation() < floor {
+        retract_floored_ownership(fold, owner.org(), member, floor)
+    } else {
+        0
+    }
 }
 
 /// The verified owner org projected for `node_id`, if any — walks
@@ -354,7 +392,7 @@ pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<Org
             state
                 .entries
                 .get(key)
-                .and_then(|entry| entry.payload.owner.map(|owner| owner.org))
+                .and_then(|entry| entry.payload.owner.map(|owner| owner.org()))
         })
     })
 }
@@ -371,6 +409,11 @@ pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<Org
 /// The publisher's fold identity is derived from the member key
 /// (`member.node_id()`) — the same entity→node binding announcement
 /// ingest verified. Returns how many entries were retracted.
+///
+/// A retraction changes query-visible state (`owner_org_for`), so
+/// it bumps the fold change generation exactly like an `apply`
+/// (review-9): watch-based consumers and generation-keyed caches
+/// observe it.
 pub fn retract_floored_ownership(
     fold: &Fold<CapabilityFold>,
     org: OrgId,
@@ -378,7 +421,7 @@ pub fn retract_floored_ownership(
     floor: u32,
 ) -> usize {
     let node_id = member.node_id();
-    fold.with_state_mut(|state| {
+    let retracted = fold.with_state_mut(|state| {
         let Some(keys) = state.by_node.get(&node_id) else {
             return 0;
         };
@@ -387,7 +430,7 @@ pub fn retract_floored_ownership(
         for key in keys {
             if let Some(entry) = state.entries.get_mut(&key) {
                 if let Some(owner) = entry.payload.owner {
-                    if owner.org == org && owner.generation < floor {
+                    if owner.org() == org && owner.generation() < floor {
                         entry.payload.owner = None;
                         retracted += 1;
                     }
@@ -395,7 +438,11 @@ pub fn retract_floored_ownership(
             }
         }
         retracted
-    })
+    });
+    if retracted > 0 {
+        fold.notify_projection_changed();
+    }
+    retracted
 }
 
 /// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
@@ -2234,19 +2281,13 @@ mod tests {
         );
         assert_eq!(
             verify_announced_owner_cert(&ann_at, true, Some(&floors), 0),
-            Some(VerifiedOwner {
-                org: org_root().org_id(),
-                generation: 5
-            }),
+            Some(VerifiedOwner::new(org_root().org_id(), 5)),
             "generation at floor must project"
         );
         // No floors tracked (un-adopted node) ⇒ implicit floor 0.
         assert_eq!(
             verify_announced_owner_cert(&ann_below, true, None, 0),
-            Some(VerifiedOwner {
-                org: org_root().org_id(),
-                generation: 4
-            }),
+            Some(VerifiedOwner::new(org_root().org_id(), 4)),
             "no floor state ⇒ every generation admissible"
         );
     }
@@ -2297,6 +2338,91 @@ mod tests {
             None,
             "signature-invalid announcement must not project ownership"
         );
+    }
+
+    /// Review-9 race witness, deterministic: a floor rises AFTER
+    /// owner-cert verification but BEFORE the fold apply — the
+    /// raise's retraction callback completes against a fold that
+    /// does not yet hold the projection, the delayed apply then
+    /// installs it, and no future callback fires. The production
+    /// post-apply recheck must retract it.
+    #[test]
+    fn delayed_apply_after_floor_raise_still_retracts() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+
+        // 1. Ingest verifies the cert at floor 0 (no floors yet).
+        let owner = verify_announced_owner_cert(&ann, true, None, 0).expect("verifies at floor 0");
+
+        // 2. THE RACE: the floor rises to 5 and its retraction
+        //    callback completes — against a fold that does not yet
+        //    hold the projection (a no-op).
+        let mut floors = OrgRevocationState::empty();
+        let mut floors_map = std::collections::BTreeMap::new();
+        floors_map.insert(kp.entity_id().clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org_root(), &floors_map).expect("issue");
+        bundle.verify().expect("bundle verifies");
+        floors.merge_bundle(&bundle);
+        let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
+        assert_eq!(
+            retracted, 0,
+            "callback fires before the apply — nothing to retract"
+        );
+
+        // 3. The DELAYED apply installs the stale projection…
+        let fold_ann = translate_announcement(&ann, Some(owner));
+        fold.apply(fold_ann).expect("apply");
+        assert_eq!(
+            owner_org_for(&fold, node_id),
+            Some(org_root().org_id()),
+            "without the recheck the revoked projection would persist — the review-9 red"
+        );
+
+        // 4. …and the production post-apply recheck retracts it.
+        let retracted = recheck_projected_owner_floor(&fold, Some(&floors), kp.entity_id(), &owner);
+        assert_eq!(retracted, 1);
+        assert_eq!(
+            owner_org_for(&fold, node_id),
+            None,
+            "final owner must be None"
+        );
+        // Capability entry remains; verdicts untouched.
+        assert!(may_execute(&fold, node_id, "nrpc:echo", 0xCA11));
+    }
+
+    /// Review-9: retraction changes query-visible state, so it
+    /// advances the fold change generation exactly like an apply;
+    /// a no-op retraction does not.
+    #[test]
+    fn retraction_advances_the_fold_change_generation() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+        apply_legacy_announcement(&fold, ann).expect("apply");
+        assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
+
+        let before = fold.change_generation();
+        let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
+        assert_eq!(retracted, 1);
+        assert!(
+            fold.change_generation() > before,
+            "retraction must signal fold subscribers"
+        );
+
+        // A retraction that clears nothing leaves the generation
+        // untouched (no spurious wakeups).
+        let before = fold.change_generation();
+        let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
+        assert_eq!(retracted, 0);
+        assert_eq!(fold.change_generation(), before);
     }
 
     /// Review-8 §9 witness: a rising floor retracts a stale

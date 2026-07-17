@@ -666,6 +666,16 @@ impl<K: FoldKind> Fold<K> {
         f(&mut state)
     }
 
+    /// Bump the change generation for a projection mutation made
+    /// through [`Self::with_state_mut`] (review-9): retracting an
+    /// ownership projection changes query-visible state
+    /// (`owner_org_for` results), so watch-based consumers and
+    /// generation-keyed caches must observe it exactly like an
+    /// `apply`.
+    pub(crate) fn notify_projection_changed(&self) {
+        self.signal_changed();
+    }
+
     /// Install (or uninstall) the audit sink. Idempotent;
     /// re-installing replaces the prior sink. After
     /// `set_audit_sink(Some(...))`, every
