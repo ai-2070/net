@@ -721,6 +721,45 @@ pub fn may_execute(
     })
 }
 
+/// OA-2 §2.4a: does `target_node` carry `capability_tag` in the
+/// fold, evaluating NO legacy allow-lists?
+///
+/// The narrow companion to [`may_execute`] for the
+/// organization-admission seam. `may_execute` unions
+/// `allowed_nodes` / `allowed_subnets` / `allowed_groups`
+/// TARGET-WIDE across EVERY capability entry the target carries, so
+/// an unrelated restricted capability (e.g. an admin service with a
+/// tight `allowed_nodes`) on the same provider would gate a
+/// protected service's callers before `OrgAdmission` ever ran. A
+/// service whose admission is `OwnerDelegated` / `CrossOrgGranted`
+/// therefore resolves its registered admission FIRST and uses THIS
+/// check — "is the exact service locally registered and capable?"
+/// — as its only fold precondition, then runs the OA-2 admission
+/// engine
+/// ([`verify_org_admission`](crate::adapter::net::behavior::org_admission::verify_org_admission))
+/// as the load-bearing authority.
+///
+/// Reads ONLY tag presence — it evaluates no allow-lists and
+/// confers no authority on its own, so `may_execute` stays
+/// byte-for-byte unchanged for existing public / v0.4 services.
+pub fn has_local_capability(
+    fold: &Fold<CapabilityFold>,
+    target_node: NodeId,
+    capability_tag: &str,
+) -> bool {
+    fold.with_state(|state| {
+        let Some(keys) = state.by_node.get(&target_node) else {
+            return false;
+        };
+        keys.iter().any(|k| {
+            state
+                .entries
+                .get(k)
+                .is_some_and(|entry| entry.payload.tags.iter().any(|t| t == capability_tag))
+        })
+    })
+}
+
 /// Batched `may_execute` for the caller-side `candidates.retain(...)`
 /// path: takes ONE fold read lock for the whole batch and derives
 /// the caller's subnet + group membership ONCE outside the per-
@@ -2050,6 +2089,61 @@ mod tests {
             "permissive admits, restricted admits caller via node axis, \
              no-tag denies, unknown denies"
         );
+    }
+
+    /// OA-2 §2.4a: `has_local_capability` reports tag presence
+    /// only, evaluating NO allow-lists — the red-witnessed point
+    /// that the OA-2 admission engine, not the legacy gate, is the
+    /// authority for protected services. A restricted target that
+    /// `may_execute` would DENY for an unrelated caller still
+    /// `has_local_capability` == true.
+    #[test]
+    fn has_local_capability_ignores_allow_lists() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let restricted: NodeId = 0xBB;
+        let no_tag: NodeId = 0xCC;
+        let outsider: NodeId = 0xDD;
+
+        // A target carrying the tag but restricted to a specific
+        // (different) node — may_execute denies the outsider.
+        let restricted_ann = SignedAnnouncement::sign(
+            &kp,
+            super::super::capability::CapabilityFold::KIND_ID,
+            0x100,
+            restricted,
+            1,
+            EnvelopeMeta::default(),
+            CapabilityMembership {
+                class_hash: 0x100,
+                tags: vec!["nrpc:echo".into()],
+                hardware: None,
+                state: NodeState::Idle,
+                region: None,
+                price_quote: None,
+                reflex_addr: None,
+                allowed_nodes: vec![0x1234], // NOT the outsider
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+                owner: None,
+            },
+        )
+        .expect("sign restricted");
+        fold.apply(restricted_ann).expect("apply restricted");
+        fold.apply(sign_member(&kp, no_tag, 0x100, vec!["gpu"], None))
+            .expect("apply no-tag");
+
+        // may_execute DENIES the outsider (allow-list miss)…
+        assert!(!may_execute(&fold, restricted, "nrpc:echo", outsider));
+        // …but has_local_capability sees the tag regardless of the
+        // allow-list — the exact service IS locally registered.
+        assert!(has_local_capability(&fold, restricted, "nrpc:echo"));
+
+        // Absent tag / unknown node / wrong tag are all false.
+        assert!(!has_local_capability(&fold, no_tag, "nrpc:echo"));
+        assert!(!has_local_capability(&fold, restricted, "nrpc:other"));
+        assert!(!has_local_capability(&fold, 0xDEAD, "nrpc:echo"));
     }
 
     /// PERF_AUDIT §4.2 — empty `targets` slice short-circuits
