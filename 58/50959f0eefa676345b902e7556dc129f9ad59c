@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_f1a7c2a81047ba 812-823,825-832
+  s_9298fd786cc20e::t_7658657e82d434 473-476
+  s_9298fd786cc20e::t_1e4c1d7c440cbe 1850-1857,1859,1862-1870,1872-1877
+  s_9298fd786cc20e::t_64817c7f67b4df 966-990,1007-1012,1014-1016
+  s_9298fd786cc20e::t_53df2534c3b462 453-464,472,479-481,494-510,512-539
+  s_9298fd786cc20e::t_13649b263f7b6a 726
+  s_9298fd786cc20e::t_3c39ac6deff0dd 1693-1750
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5850959f0eefa676345b902e7556dc129f9ad59c",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
