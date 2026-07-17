@@ -574,18 +574,26 @@ impl OrgMembershipCert {
     /// otherwise let an unbounded skew admit any expired
     /// certificate.
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), OrgError> {
+        self.is_valid_at_with_skew(current_timestamp(), skew_secs)
+    }
+
+    /// Explicit-time variant (Kyra E1 audit): validate against a
+    /// caller-supplied `now_secs` (unix seconds) instead of re-reading
+    /// the wall clock, so one admission decision uses a SINGLE clock
+    /// sample for every credential/proof freshness check.
+    pub fn is_valid_at_with_skew(&self, now_secs: u64, skew_secs: u64) -> Result<(), OrgError> {
         if skew_secs > MAX_TOKEN_CLOCK_SKEW_SECS {
             return Err(OrgError::ClockSkewTooLarge);
         }
         self.verify()?;
-        self.check_time_bounds(skew_secs)
+        self.check_time_bounds_at(now_secs, skew_secs)
     }
 
-    /// Wall-clock window check with skew, without signature
-    /// verification — same split as the token module: signatures
-    /// are immutable, expiry must be re-evaluated per use.
-    fn check_time_bounds(&self, skew_secs: u64) -> Result<(), OrgError> {
-        let now = current_timestamp();
+    /// Wall-clock window check at an explicit `now` (unix seconds),
+    /// without signature verification — same split as the token
+    /// module: signatures are immutable, expiry must be re-evaluated
+    /// per use.
+    fn check_time_bounds_at(&self, now: u64, skew_secs: u64) -> Result<(), OrgError> {
         // `saturating_sub` pins the lower comparison at 0 when
         // `not_before < skew`; `saturating_add` keeps a saturated
         // `not_after` forever-valid instead of wrapping.

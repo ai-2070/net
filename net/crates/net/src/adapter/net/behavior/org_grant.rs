@@ -576,11 +576,18 @@ impl OrgDispatcherGrant {
     /// Signature + wall-clock validity with `skew_secs` tolerance
     /// on both bounds (ceiling-enforced, same as the cert).
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), OrgError> {
+        self.is_valid_at_with_skew(current_timestamp(), skew_secs)
+    }
+
+    /// Explicit-time variant (Kyra E1 audit): validate against a
+    /// caller-supplied `now_secs` instead of re-reading the wall
+    /// clock, so one admission uses a single clock sample.
+    pub fn is_valid_at_with_skew(&self, now_secs: u64, skew_secs: u64) -> Result<(), OrgError> {
         if skew_secs > MAX_TOKEN_CLOCK_SKEW_SECS {
             return Err(OrgError::ClockSkewTooLarge);
         }
         self.verify()?;
-        check_time_bounds(self.not_before, self.not_after, skew_secs)
+        check_time_bounds_at(self.not_before, self.not_after, now_secs, skew_secs)
     }
 
     /// Does this grant's scope cover `capability`?
@@ -916,11 +923,18 @@ impl OrgCapabilityGrant {
     /// Signature + wall-clock validity with `skew_secs` tolerance
     /// on both bounds (ceiling-enforced).
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), OrgError> {
+        self.is_valid_at_with_skew(current_timestamp(), skew_secs)
+    }
+
+    /// Explicit-time variant (Kyra E1 audit): validate against a
+    /// caller-supplied `now_secs` instead of re-reading the wall
+    /// clock, so one admission uses a single clock sample.
+    pub fn is_valid_at_with_skew(&self, now_secs: u64, skew_secs: u64) -> Result<(), OrgError> {
         if skew_secs > MAX_TOKEN_CLOCK_SKEW_SECS {
             return Err(OrgError::ClockSkewTooLarge);
         }
         self.verify()?;
-        check_time_bounds(self.not_before, self.not_after, skew_secs)
+        check_time_bounds_at(self.not_before, self.not_after, now_secs, skew_secs)
     }
 
     /// `rights ⊇ INVOKE`.
@@ -1108,8 +1122,18 @@ fn fresh_nonce(context: &str) -> u64 {
 /// Wall-clock window check with skew — identical semantics to
 /// `OrgMembershipCert::check_time_bounds` (saturating on both
 /// bounds; inclusive-expiry convention).
-fn check_time_bounds(not_before: u64, not_after: u64, skew_secs: u64) -> Result<(), OrgError> {
-    let now = current_timestamp();
+/// Window check at a caller-supplied `now` (unix seconds), so one
+/// admission uses a single clock sample for every grant (Kyra E1
+/// audit). The wall-clock convenience wrapper is
+/// [`OrgDispatcherGrant::is_valid_with_skew`] /
+/// [`OrgCapabilityGrant::is_valid_with_skew`], which pass
+/// `current_timestamp()`.
+fn check_time_bounds_at(
+    not_before: u64,
+    not_after: u64,
+    now: u64,
+    skew_secs: u64,
+) -> Result<(), OrgError> {
     if now < not_before.saturating_sub(skew_secs) {
         return Err(OrgError::NotYetValid);
     }

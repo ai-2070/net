@@ -286,10 +286,17 @@ impl OrgCallProof {
     /// be admitted too far out is refused as a standing
     /// credential. Skew ceiling enforced.
     pub fn check_expiry(&self, skew_secs: u64) -> Result<(), OrgError> {
+        self.check_expiry_at(current_timestamp().saturating_mul(1_000_000_000), skew_secs)
+    }
+
+    /// Explicit-time variant (Kyra E1 audit): check expiry + the TTL
+    /// ceiling against a caller-supplied `now_ns` (unix nanoseconds)
+    /// instead of re-reading the wall clock, so one admission uses a
+    /// single clock sample.
+    pub fn check_expiry_at(&self, now_ns: u64, skew_secs: u64) -> Result<(), OrgError> {
         if skew_secs > MAX_TOKEN_CLOCK_SKEW_SECS {
             return Err(OrgError::ClockSkewTooLarge);
         }
-        let now_ns = current_timestamp().saturating_mul(1_000_000_000);
         let skew_ns = skew_secs.saturating_mul(1_000_000_000);
         if now_ns >= self.proof_expires_at_unix_ns.saturating_add(skew_ns) {
             return Err(OrgError::Expired);

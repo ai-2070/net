@@ -53,8 +53,7 @@
 //! and maps [`AdmissionDenied`] to `RpcStatus::AdmissionDenied`
 //! (0x0009).
 
-use std::time::Instant;
-
+use super::admission_clock::ClockSample;
 use super::org::OrgId;
 use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome};
 use super::org_call::{OrgCallProof, MAX_ORG_CALL_PROOF_BYTES};
@@ -242,7 +241,12 @@ pub struct AdmissionContext<'a> {
 /// `admission_headers` is every value carried under
 /// [`ORG_ADMISSION_HEADER`](super::org_call::ORG_ADMISSION_HEADER)
 /// (exactly one is required). `replay` is the provider's replay
-/// guard; `now` its monotonic clock.
+/// guard. `clock` is ONE paired wall+monotonic sample for the whole
+/// admission (Kyra E1 audit): every credential/proof freshness check
+/// reads `clock.wall_ns` and the replay retention derives from the
+/// SAME sample's monotonic instant, so no `current_timestamp()` is
+/// read inside a single admission and a wall-clock jump cannot make
+/// checks disagree.
 ///
 /// `stability_recheck` is the §9.5 linearization hook (E1.4): it runs
 /// AFTER all credential/binding verification but BEFORE the replay
@@ -264,7 +268,7 @@ pub fn verify_org_admission(
     ctx: &AdmissionContext,
     admission_headers: &[&[u8]],
     replay: &AdmissionReplayGuard,
-    now: Instant,
+    clock: ClockSample,
     stability_recheck: impl FnOnce() -> bool,
     provider_policy: impl FnOnce(&OrgCallProof) -> bool,
 ) -> Result<Admitted, AdmissionDenied> {
@@ -363,10 +367,15 @@ pub fn verify_org_admission(
 
     // 8. Credentials: signatures + windows + floors + freshness.
     //    Membership first (belonging), then revocation floor, then
-    //    the grants, then proof expiry.
+    //    the grants, then proof expiry. EVERY wall-clock check reads
+    //    the ONE captured `clock` sample (E1.4/E0.4, Kyra E1 audit) —
+    //    never a freshly-sampled `current_timestamp()` — so a
+    //    wall-clock jump mid-admission cannot make one check disagree
+    //    with another or with the replay retention below.
+    let now_secs = clock.wall_ns / 1_000_000_000;
     proof
         .caller_membership
-        .is_valid_with_skew(ctx.skew_secs)
+        .is_valid_at_with_skew(now_secs, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::MembershipInvalid)?;
     let floor = ctx
         .floors
@@ -376,15 +385,15 @@ pub fn verify_org_admission(
     }
     proof
         .dispatcher_grant
-        .is_valid_with_skew(ctx.skew_secs)
+        .is_valid_at_with_skew(now_secs, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::DispatcherGrantInvalid)?;
     if let Some(grant) = &proof.capability_grant {
         grant
-            .is_valid_with_skew(ctx.skew_secs)
+            .is_valid_at_with_skew(now_secs, ctx.skew_secs)
             .map_err(|_| AdmissionDenied::CapabilityGrantInvalid)?;
     }
     proof
-        .check_expiry(ctx.skew_secs)
+        .check_expiry_at(clock.wall_ns, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::ProofExpired)?;
 
     // 9. Call binding: the caller ENTITY signed THIS exact call.
@@ -418,14 +427,24 @@ pub fn verify_org_admission(
     // 10. Replay guard: atomic insert-or-deny BEFORE the handler.
     //     Keyed on (caller, call_id); the binding signature
     //     distinguishes replay from call-id collision.
+    //
+    //     Retention derives from the SAME `clock` sample (Kyra E1
+    //     audit): the wall deadline is the proof's expiry PLUS the
+    //     accepted skew (a proof admitted within skew is still live,
+    //     so it must be retained that far), translated onto the
+    //     sample's monotonic instant. Using `clock.monotonic` as
+    //     `now` keeps insertion and expiry on one monotonic timeline —
+    //     a wall-clock jump cannot evict a just-admitted proof.
     let binding_digest: [u8; 32] = blake3::hash(&proof.call_binding_sig).into();
-    let expires_at = replay_deadline(now, proof.proof_expires_at_unix_ns, ctx.skew_secs);
+    let skew_ns = ctx.skew_secs.saturating_mul(1_000_000_000);
+    let retain_until_wall_ns = proof.proof_expires_at_unix_ns.saturating_add(skew_ns);
+    let expires_at = clock.monotonic_deadline_for(retain_until_wall_ns);
     match replay.admit(
         ctx.authenticated_caller,
         ctx.call_id,
         binding_digest,
         expires_at,
-        now,
+        clock.monotonic,
     ) {
         ReplayOutcome::Admitted => {}
         ReplayOutcome::Replay => return Err(AdmissionDenied::Replay),
@@ -452,19 +471,6 @@ pub fn verify_org_admission(
     })
 }
 
-/// The replay-guard deadline for a proof: the proof's wall-clock
-/// expiry (plus skew) translated onto the monotonic clock. A proof
-/// already past expiry (which step 8 would have rejected) yields
-/// `now`, so it is never retained beyond its own life.
-fn replay_deadline(now: Instant, proof_expires_at_unix_ns: u64, skew_secs: u64) -> Instant {
-    let now_ns = super::org::current_timestamp().saturating_mul(1_000_000_000);
-    let skew_ns = skew_secs.saturating_mul(1_000_000_000);
-    let remaining_ns = proof_expires_at_unix_ns
-        .saturating_add(skew_ns)
-        .saturating_sub(now_ns);
-    now + std::time::Duration::from_nanos(remaining_ns)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +480,7 @@ mod tests {
     };
     use crate::adapter::net::identity::EntityKeypair;
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     fn org_b() -> OrgKeypair {
         // Provider's owner org.
@@ -609,7 +616,14 @@ mod tests {
         replay: &AdmissionReplayGuard,
     ) -> Result<Admitted, AdmissionDenied> {
         let bytes = proof.encode().expect("encode");
-        verify_org_admission(ctx, &[&bytes], replay, Instant::now(), || true, |_| true)
+        verify_org_admission(
+            ctx,
+            &[&bytes],
+            replay,
+            ClockSample::now(),
+            || true,
+            |_| true,
+        )
     }
 
     #[test]
@@ -654,7 +668,7 @@ mod tests {
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         assert_eq!(
-            verify_org_admission(&ctx, &[], &replay, Instant::now(), || true, |_| true),
+            verify_org_admission(&ctx, &[], &replay, ClockSample::now(), || true, |_| true),
             Err(AdmissionDenied::MissingHeader)
         );
         assert_eq!(
@@ -662,7 +676,7 @@ mod tests {
                 &ctx,
                 &[&bytes, &bytes],
                 &replay,
-                Instant::now(),
+                ClockSample::now(),
                 || true,
                 |_| true
             ),
@@ -680,7 +694,7 @@ mod tests {
                 &ctx,
                 &[b"garbage"],
                 &replay,
-                Instant::now(),
+                ClockSample::now(),
                 || true,
                 |_| true
             ),
@@ -942,9 +956,74 @@ mod tests {
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         // Everything verifies, but the application vetoes.
-        let out =
-            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || true, |_| false);
+        let out = verify_org_admission(
+            &ctx,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || true,
+            |_| false,
+        );
         assert_eq!(out, Err(AdmissionDenied::ProviderPolicyRejected));
+    }
+
+    /// KC2 (Kyra E1 audit) — the whole admission derives from ONE
+    /// `ClockSample`: proof freshness reads the sample's `wall_ns`
+    /// (never a fresh `current_timestamp()`), and the replay retention
+    /// derives from the SAME sample's monotonic instant.
+    #[test]
+    fn admission_uses_one_clock_sample_for_freshness_and_retention() {
+        let floors = empty_floors();
+        let ctx = cross_org_ctx(&floors);
+        let proof = cross_org_proof();
+        let bytes = proof.encode().expect("encode");
+        let expiry_ns = proof.proof_expires_at_unix_ns;
+        // A fixed monotonic base for the retention timeline. (The
+        // certs were issued against the REAL clock and stay valid at
+        // every `wall_ns` used below — only the proof's own freshness
+        // moves with the sample.)
+        let base = ClockSample::now().monotonic;
+
+        // Freshness reads the SAMPLE's wall: a sample whose wall is
+        // PAST the proof expiry denies ProofExpired even though the
+        // real wall clock is well before it (no internal clock read).
+        let stale_guard = AdmissionReplayGuard::with_defaults();
+        let stale = ClockSample {
+            wall_ns: expiry_ns + 1_000_000_000,
+            monotonic: base,
+        };
+        assert_eq!(
+            verify_org_admission(&ctx, &[&bytes], &stale_guard, stale, || true, |_| true),
+            Err(AdmissionDenied::ProofExpired),
+        );
+        assert_eq!(stale_guard.len(), 0, "an expired proof consumes no slot");
+
+        // A sample 10 s before expiry admits; retention = the sample's
+        // monotonic + 10 s (skew 0).
+        let replay = AdmissionReplayGuard::with_defaults();
+        let fresh = ClockSample {
+            wall_ns: expiry_ns - 10_000_000_000,
+            monotonic: base,
+        };
+        assert!(verify_org_admission(&ctx, &[&bytes], &replay, fresh, || true, |_| true).is_ok());
+
+        // Same proof, monotonic still INSIDE retention → Replay.
+        let inside = ClockSample {
+            wall_ns: expiry_ns - 10_000_000_000,
+            monotonic: base + Duration::from_secs(5),
+        };
+        assert_eq!(
+            verify_org_admission(&ctx, &[&bytes], &replay, inside, || true, |_| true),
+            Err(AdmissionDenied::Replay),
+        );
+
+        // Monotonic PAST retention (on the sample's timeline) → the
+        // slot reopened, so the same still-fresh proof admits again.
+        let past = ClockSample {
+            wall_ns: expiry_ns - 10_000_000_000,
+            monotonic: base + Duration::from_secs(11),
+        };
+        assert!(verify_org_admission(&ctx, &[&bytes], &replay, past, || true, |_| true).is_ok());
     }
 
     /// E1.4 §9.5 — a security-view change detected AFTER binding
@@ -961,14 +1040,27 @@ mod tests {
         let bytes = cross_org_proof().encode().expect("encode");
 
         // The view changed mid-admission → recheck returns false.
-        let out =
-            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || false, |_| true);
+        let out = verify_org_admission(
+            &ctx,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || false,
+            |_| true,
+        );
         assert_eq!(out, Err(AdmissionDenied::AuthorityChanged));
         assert_eq!(replay.len(), 0, "the stale attempt consumed no replay slot");
 
         // A retry from a now-stable view admits the SAME call — proof
         // the earlier denial didn't burn the correlation id.
-        let out = verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || true, |_| true);
+        let out = verify_org_admission(
+            &ctx,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || true,
+            |_| true,
+        );
         assert!(out.is_ok(), "retry under a stable view admits");
         assert_eq!(replay.len(), 1);
     }
@@ -985,8 +1077,14 @@ mod tests {
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         // Even with an unstable view, the streaming rejection wins.
-        let out =
-            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || false, |_| true);
+        let out = verify_org_admission(
+            &ctx,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || false,
+            |_| true,
+        );
         assert_eq!(out, Err(AdmissionDenied::StreamingUnsupported));
     }
 
