@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/org.rs
+  s_9298fd786cc20e::t_b15eb1d9e1e78e 577-584,589,592-596
+net/crates/net/src/adapter/net/behavior/org_call.rs
+  s_9298fd786cc20e::t_a1039b79a29ed6 289
+  s_9298fd786cc20e::t_78da488464d741 290-296
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  s_9298fd786cc20e::t_82be399bbd5f35 271
+  s_9298fd786cc20e::t_824f219817d981 970-1028
+  s_9298fd786cc20e::t_43aef856a54831 483
+  s_9298fd786cc20e::t_ade8c412daa2ff 671,679,697
+  s_9298fd786cc20e::t_ff5b5d0f676113 56
+  s_9298fd786cc20e::t_cfe586dac1b45b 430-437,439-441,447
+  s_9298fd786cc20e::t_ab11c52dc93528 244-249
+  s_9298fd786cc20e::t_a1039b79a29ed6 619-626,959-966,1043-1050,1056-1063,1080-1087
+  s_9298fd786cc20e::t_2ac4fb15846611 370-375,378,388,392,396
+net/crates/net/src/adapter/net/behavior/org_grant.rs
+  s_9298fd786cc20e::t_48dbf24edbc5b4 1131-1136
+  s_9298fd786cc20e::t_1fbebe662b2f68 1125-1130
+  s_9298fd786cc20e::t_546ff171920afd 579-585,590,926-932,937
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "04d24f6543d0bb7c62cdd8cc2e4125d24dda9b23",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
