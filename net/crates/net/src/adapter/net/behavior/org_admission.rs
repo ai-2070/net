@@ -151,6 +151,12 @@ pub enum AdmissionDenied {
     /// caller over THIS exact call (call_id, callee, capability,
     /// provider org, request digest, credential digests).
     BindingInvalid,
+    /// The provider's security view changed BETWEEN verification and
+    /// the replay insert (E1.4 §9.5) — a revocation floor rose, the
+    /// installed authority was replaced, or the active store was
+    /// poisoned mid-admission. The stale decision is denied WITHOUT
+    /// consuming a replay slot; the gate may retry from a fresh view.
+    AuthorityChanged,
     /// The same `(caller, call_id)` proof was already admitted —
     /// a replay.
     Replay,
@@ -228,9 +234,21 @@ pub struct AdmissionContext<'a> {
 /// `admission_headers` is every value carried under
 /// [`ORG_ADMISSION_HEADER`](super::org_call::ORG_ADMISSION_HEADER)
 /// (exactly one is required). `replay` is the provider's replay
-/// guard; `now` its monotonic clock. `provider_policy` is the
-/// application veto, run LAST — it sees the verified proof and
-/// returns `true` to admit.
+/// guard; `now` its monotonic clock.
+///
+/// `stability_recheck` is the §9.5 linearization hook (E1.4): it runs
+/// AFTER all credential/binding verification but BEFORE the replay
+/// insert, and returns `true` iff the provider's security view (the
+/// floor snapshot + installed authority + store health captured by
+/// the gate before verification) is STILL current. A `false` return
+/// — a floor raised, the authority was swapped, or the store was
+/// poisoned mid-admission — denies [`AdmissionDenied::AuthorityChanged`]
+/// WITHOUT consuming a `(caller, call_id)` replay slot, so a stale
+/// decision can neither run the handler nor burn the correlation id;
+/// the gate is free to retry from a fresh view.
+///
+/// `provider_policy` is the application veto, run LAST — it sees the
+/// verified proof and returns `true` to admit.
 ///
 /// Returns the four-party [`Admitted`] attribution on success, or a
 /// distinguishable [`AdmissionDenied`] reason.
@@ -239,6 +257,7 @@ pub fn verify_org_admission(
     admission_headers: &[&[u8]],
     replay: &AdmissionReplayGuard,
     now: Instant,
+    stability_recheck: impl FnOnce() -> bool,
     provider_policy: impl FnOnce(&OrgCallProof) -> bool,
 ) -> Result<Admitted, AdmissionDenied> {
     // 1. Only org-protected modes reach the engine.
@@ -374,6 +393,19 @@ pub fn verify_org_admission(
     binding
         .verify(&proof.call_binding_sig)
         .map_err(|_| AdmissionDenied::BindingInvalid)?;
+
+    // 9.5. Stability linearization (E1.4, verdict §6). Steps 1–9
+    //      verified the proof against a floor snapshot + authority
+    //      captured by the gate BEFORE this call. A floor raise, an
+    //      authority swap, or a store poison DURING verification
+    //      would make that view stale. Recheck it HERE — before the
+    //      replay insert — so a stale decision neither runs the
+    //      handler nor consumes the `(caller, call_id)` slot. On a
+    //      changed view the gate retries from a fresh snapshot; a
+    //      persistent change denies `AuthorityChanged`.
+    if !stability_recheck() {
+        return Err(AdmissionDenied::AuthorityChanged);
+    }
 
     // 10. Replay guard: atomic insert-or-deny BEFORE the handler.
     //     Keyed on (caller, call_id); the binding signature
@@ -569,7 +601,7 @@ mod tests {
         replay: &AdmissionReplayGuard,
     ) -> Result<Admitted, AdmissionDenied> {
         let bytes = proof.encode().expect("encode");
-        verify_org_admission(ctx, &[&bytes], replay, Instant::now(), |_| true)
+        verify_org_admission(ctx, &[&bytes], replay, Instant::now(), || true, |_| true)
     }
 
     #[test]
@@ -614,11 +646,18 @@ mod tests {
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         assert_eq!(
-            verify_org_admission(&ctx, &[], &replay, Instant::now(), |_| true),
+            verify_org_admission(&ctx, &[], &replay, Instant::now(), || true, |_| true),
             Err(AdmissionDenied::MissingHeader)
         );
         assert_eq!(
-            verify_org_admission(&ctx, &[&bytes, &bytes], &replay, Instant::now(), |_| true),
+            verify_org_admission(
+                &ctx,
+                &[&bytes, &bytes],
+                &replay,
+                Instant::now(),
+                || true,
+                |_| true
+            ),
             Err(AdmissionDenied::MultipleHeaders)
         );
     }
@@ -629,7 +668,14 @@ mod tests {
         let ctx = cross_org_ctx(&floors);
         let replay = AdmissionReplayGuard::with_defaults();
         assert_eq!(
-            verify_org_admission(&ctx, &[b"garbage"], &replay, Instant::now(), |_| true),
+            verify_org_admission(
+                &ctx,
+                &[b"garbage"],
+                &replay,
+                Instant::now(),
+                || true,
+                |_| true
+            ),
             Err(AdmissionDenied::MalformedProof)
         );
 
@@ -888,8 +934,52 @@ mod tests {
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         // Everything verifies, but the application vetoes.
-        let out = verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), |_| false);
+        let out =
+            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || true, |_| false);
         assert_eq!(out, Err(AdmissionDenied::ProviderPolicyRejected));
+    }
+
+    /// E1.4 §9.5 — a security-view change detected AFTER binding
+    /// verification but BEFORE the replay insert denies
+    /// `AuthorityChanged` and, crucially, leaves NO replay record:
+    /// the stale attempt neither runs the handler nor burns the
+    /// `(caller, call_id)` slot, so a legitimate retry from a fresh
+    /// view can still admit.
+    #[test]
+    fn stability_recheck_denies_without_consuming_a_replay_slot() {
+        let floors = empty_floors();
+        let ctx = cross_org_ctx(&floors);
+        let replay = AdmissionReplayGuard::with_defaults();
+        let bytes = cross_org_proof().encode().expect("encode");
+
+        // The view changed mid-admission → recheck returns false.
+        let out =
+            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || false, |_| true);
+        assert_eq!(out, Err(AdmissionDenied::AuthorityChanged));
+        assert_eq!(replay.len(), 0, "the stale attempt consumed no replay slot");
+
+        // A retry from a now-stable view admits the SAME call — proof
+        // the earlier denial didn't burn the correlation id.
+        let out = verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || true, |_| true);
+        assert!(out.is_ok(), "retry under a stable view admits");
+        assert_eq!(replay.len(), 1);
+    }
+
+    /// The recheck runs LATE — a proof that fails an EARLIER check
+    /// (here: streaming) is rejected on its own merits and never
+    /// reaches the §9.5 hook (so `AuthorityChanged` cannot mask a
+    /// more specific denial).
+    #[test]
+    fn stability_recheck_runs_after_credential_checks() {
+        let floors = empty_floors();
+        let mut ctx = cross_org_ctx(&floors);
+        ctx.is_unary = false;
+        let replay = AdmissionReplayGuard::with_defaults();
+        let bytes = cross_org_proof().encode().expect("encode");
+        // Even with an unstable view, the streaming rejection wins.
+        let out =
+            verify_org_admission(&ctx, &[&bytes], &replay, Instant::now(), || false, |_| true);
+        assert_eq!(out, Err(AdmissionDenied::StreamingUnsupported));
     }
 
     #[test]

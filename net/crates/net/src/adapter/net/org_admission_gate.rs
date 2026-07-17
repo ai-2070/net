@@ -68,6 +68,45 @@ pub fn org_request_digest(req: &RpcRequestPayload) -> [u8; 32] {
     blake3::derive_key(ORG_RPC_REQUEST_DIGEST_CONTEXT, &encoded)
 }
 
+/// A cheap fingerprint of the provider's admission-relevant security
+/// view (E1.4 §9.5): which node authority + revocation store are
+/// installed, the store's floor-publish generation, and whether the
+/// store is poisoned right now.
+///
+/// The gate captures one stamp BEFORE running
+/// [`verify_org_admission`](super::behavior::org_admission::verify_org_admission)
+/// and recomputes it inside the engine's §9.5 hook. A mismatch — a
+/// floor raised (generation bumped), the authority was swapped
+/// (`authority_ptr` changed), or the store was poisoned — means the
+/// floor snapshot the proof was verified against is no longer live,
+/// so the stale decision is denied `AuthorityChanged` BEFORE it can
+/// consume a replay slot or run the handler. The comparison is
+/// distinct from the OA-1 send seqlock (which stamps the announce
+/// path) though structurally analogous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionStamp {
+    /// `Arc::as_ptr` of the installed `NodeAuthority` (0 = none).
+    pub authority_ptr: usize,
+    /// `Arc::as_ptr` of the installed `OrgRevocationStore` (0 = none).
+    pub store_ptr: usize,
+    /// The store's floor-publish generation — bumps on every floor
+    /// publish (under the reload lock), so a floor raise changes the
+    /// stamp even when the same store `Arc` stays installed.
+    pub store_generation: u64,
+    /// Whether the active store is poisoned as of this capture.
+    pub poisoned: bool,
+}
+
+impl AdmissionStamp {
+    /// `true` iff `self` (captured before verification) still equals
+    /// `current` (recomputed at §9.5) AND the store is not poisoned —
+    /// i.e. the security view the proof was verified against is still
+    /// live. Any change, or a now-poisoned store, is a stale view.
+    pub fn is_current(&self, current: &AdmissionStamp) -> bool {
+        self == current && !current.poisoned
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +186,40 @@ mod tests {
         let mut fl = req(vec![], b"body");
         fl.flags = 1;
         assert_ne!(base_d, org_request_digest(&fl));
+    }
+
+    /// The admission stamp is "current" only against an identical,
+    /// non-poisoned stamp — any field change, or a poisoned store,
+    /// reads as a stale view (E1.4 §9.5).
+    #[test]
+    fn admission_stamp_currency() {
+        let base = AdmissionStamp {
+            authority_ptr: 0x1000,
+            store_ptr: 0x2000,
+            store_generation: 7,
+            poisoned: false,
+        };
+        assert!(base.is_current(&base), "identical, unpoisoned → current");
+
+        // Floor rose (generation bumped) → stale.
+        let mut gen_bumped = base;
+        gen_bumped.store_generation = 8;
+        assert!(!base.is_current(&gen_bumped));
+
+        // Authority swapped → stale.
+        let mut swapped = base;
+        swapped.authority_ptr = 0x9999;
+        assert!(!base.is_current(&swapped));
+
+        // Store replaced → stale.
+        let mut store_swapped = base;
+        store_swapped.store_ptr = 0x9999;
+        assert!(!base.is_current(&store_swapped));
+
+        // Same identity but now poisoned → stale.
+        let mut poisoned = base;
+        poisoned.poisoned = true;
+        assert!(!base.is_current(&poisoned));
     }
 
     /// Golden: the digest is a stable, versioned value — pinned so a
