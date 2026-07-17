@@ -738,6 +738,18 @@ impl OrgRevocationStore {
         is_path_poisoned(&self.core.path)
     }
 
+    /// Test-only: mark this store's backing path poisoned so
+    /// [`Self::is_poisoned`] returns true, without forcing a real
+    /// fsync failure. Lets a witness exercise the
+    /// durability-uncertain admission-denial branch. `#[doc(hidden)]`
+    /// (matching the review-9/11 `*_for_test` seams) so integration
+    /// tests in a separate crate can reach it; never used in
+    /// production paths.
+    #[doc(hidden)]
+    pub fn mark_poisoned_for_test(&self) {
+        poison_registry().lock().insert(self.core.path.clone());
+    }
+
     /// `true` iff `other` is backed by the same normalized path —
     /// i.e. shares this store's core (live view, publish lock,
     /// subscribers).

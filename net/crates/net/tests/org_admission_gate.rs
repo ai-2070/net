@@ -176,6 +176,86 @@ async fn stamp_reflects_authority_installation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// KC10 negative — a provider whose OWN owner cert has fallen BELOW a
+/// revocation floor on its installed store can no longer admit: the
+/// call-time self-verify fails → ProviderAuthorityUnavailable, even
+/// though the authority verified at installation.
+#[tokio::test]
+async fn provider_below_its_own_floor_cannot_admit() {
+    let node = build_node().await;
+    let dir = adopt_and_install(&node, "below-floor").await;
+    // Healthy first.
+    assert!(verify_provider_authority(&node).is_ok());
+
+    // Raise the floor for THIS node's membership (cert generation 1)
+    // to 5 via a real bundle apply on the installed store.
+    let store = node.org_revocation_store().expect("store");
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(node.entity_id().clone(), 5u32);
+    store
+        .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+        .expect("apply floor");
+
+    assert_eq!(
+        verify_provider_authority(&node).map(|_| ()),
+        Err(AdmissionDenied::ProviderAuthorityUnavailable),
+        "a below-floor owner cert cannot admit",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// KC10 negative — an EXPIRED provider owner cert cannot admit. The
+/// cert is valid at adopt/install and expires shortly after; the
+/// call-time self-verify then rejects it.
+#[tokio::test]
+async fn provider_with_expired_cert_cannot_admit() {
+    let node = build_node().await;
+    let dir = scratch_dir("expired");
+    // Valid for 2 seconds, zero skew. (A 1s window is too tight
+    // against the second-granularity clock — a boundary crossing
+    // during adopt could expire it before the first assertion.)
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 2).expect("issue cert");
+    let authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
+    node.install_node_authority(Arc::new(authority))
+        .expect("install");
+    // Valid immediately after install.
+    assert!(verify_provider_authority(&node).is_ok());
+
+    // Let the window close (> 2s so the second-granularity not_after
+    // is definitely reached).
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    assert_eq!(
+        verify_provider_authority(&node).map(|_| ()),
+        Err(AdmissionDenied::ProviderAuthorityUnavailable),
+        "an expired owner cert cannot admit",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// KC10 negative — a POISONED installed store cannot admit: the
+/// durability-uncertain branch denies before any self-verify.
+#[tokio::test]
+async fn provider_with_poisoned_store_cannot_admit() {
+    let node = build_node().await;
+    let dir = adopt_and_install(&node, "poisoned").await;
+    assert!(verify_provider_authority(&node).is_ok());
+
+    node.org_revocation_store()
+        .expect("store")
+        .mark_poisoned_for_test();
+
+    assert_eq!(
+        verify_provider_authority(&node).map(|_| ()),
+        Err(AdmissionDenied::ProviderAuthorityUnavailable),
+        "a poisoned store cannot admit",
+    );
+    // The live stamp also reflects the poison.
+    assert!(capture_admission_stamp(&node).poisoned);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A floor raised through the installed store bumps the store
 /// generation, so a stamp captured before the raise is no longer
 /// current — the exact signal the §9.5 recheck uses to catch a
