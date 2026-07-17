@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_9298fd786cc20e::t_7fea31ecd246b7 57-58
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_9298fd786cc20e::t_9d9cf1e23bd632 188-224
+  s_9298fd786cc20e::t_07ce5f9e094608 4142-4205
+net/crates/net/tests/nrpc_service_equality.rs
+  s_9298fd786cc20e::t_f7c293b5e82773 1-272
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_208b30b1421c1f 377-415
+  s_9298fd786cc20e::t_7fea31ecd246b7 38-48
+  s_9298fd786cc20e::t_62ab1d1f6c8939 2668,2674-2679
+  s_9298fd786cc20e::t_f01f00510f7c5d 2927,2933-2938
+  s_9298fd786cc20e::t_3de405c1c1c8d8 2209-2218
+  s_9298fd786cc20e::t_80025a6b77c696 2475-2480,2680,2939
+  s_9298fd786cc20e::t_f1711cc6642245 416-417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a57f06f84fc59830e01450ea4b36f0d950d445b2",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
