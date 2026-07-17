@@ -1603,3 +1603,122 @@ async fn two_nodes_opposite_store_swaps_do_not_deadlock() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+// ---------------------------------------------------------------------------
+// Review-11 P1 — stable send snapshot (seqlock over the SendStamp).
+// ---------------------------------------------------------------------------
+
+/// Review-11 P1: a floor that becomes live DURING the send
+/// validation window — after the cached bytes are serialized but
+/// before they are emitted — must not ship the certified form. The
+/// SendStamp's store publish generation moved (bumped inside
+/// StoreCore::publish, before any callback), so the stability
+/// recheck fails and the seqlock retries, converging to cert-free
+/// bytes. This closes the publish-before-notify gap the epoch
+/// counter left open.
+#[tokio::test]
+async fn concurrent_floor_publish_during_send_retries_to_cert_free() {
+    let node = build_node().await;
+    let dir = scratch_dir("r11-seqlock");
+
+    let cert1 =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, cert1, node.entity_id(), 0, None).expect("adopt"));
+    node.install_node_authority(authority).expect("install");
+    node.set_owner_cert_emission(true).expect("enable");
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+
+    // The probe fires inside the stability window (after the
+    // certified bytes are serialized, before they are emitted) and
+    // — exactly once — raises this node's own floor above the
+    // cert's generation. The seqlock must detect the publish and
+    // retry, so the returned bytes carry NO certificate.
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let node_for_probe = node.clone();
+    let f = fired.clone();
+    let probe = move || {
+        if f.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return; // one-shot: let the retry converge
+        }
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(node_for_probe.entity_id().clone(), 2u32);
+        node_for_probe
+            .org_revocation_store()
+            .expect("installed")
+            .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
+            .expect("raise own floor");
+    };
+    let bytes = node
+        .announcement_bytes_for_send_probed_for_test(&probe)
+        .expect("send bytes");
+    assert!(
+        fired.load(std::sync::atomic::Ordering::Acquire),
+        "probe must have fired inside the stability window"
+    );
+    let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+    assert!(
+        sent.owner_cert.is_none(),
+        "a floor published during the send window must not ship the certified form"
+    );
+    assert!(
+        sent.verify().is_ok(),
+        "the rebuilt announcement is re-signed"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review-11 P1: certificate wall-clock expiry is honored on every
+/// reuse boundary even with NO authority/store/emission event —
+/// expiry bumps no generation, so the epoch mechanism (review-10)
+/// would keep taking the fast path. The seqlock re-derives the
+/// desired cert every send (which checks temporal validity), so an
+/// announcement cached while its short-lived cert was valid ships
+/// cert-free, re-signed, and version-bumped once the window closes.
+#[tokio::test]
+async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() {
+    let node = build_node().await;
+    let dir = scratch_dir("r11-expiry");
+
+    // A 1-second membership cert, adopted with zero skew.
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 1).expect("issue 1s");
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt"));
+    node.install_node_authority(authority).expect("install");
+    node.set_owner_cert_emission(true).expect("enable");
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+
+    // While valid: the cached bytes carry the certificate.
+    let certified = CapabilityAnnouncement::from_bytes(
+        &node.announcement_bytes_for_send_for_test().expect("cached"),
+    )
+    .expect("decode");
+    assert!(certified.owner_cert.is_some());
+    assert!(certified.verify().is_ok());
+
+    // Wait past the validity window with NO further authority
+    // event (no floor raise, no reinstall, no emission toggle).
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let bytes = node
+        .announcement_bytes_for_send_for_test()
+        .expect("post-expiry bytes");
+    let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+    assert!(
+        sent.owner_cert.is_none(),
+        "an expired certificate must not keep riding the wire"
+    );
+    assert!(sent.verify().is_ok(), "the cert-free rebuild is re-signed");
+    assert!(
+        sent.version > certified.version,
+        "the cert-free replacement supersedes the certified form"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

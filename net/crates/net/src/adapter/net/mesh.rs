@@ -2567,21 +2567,36 @@ struct AnnounceGate {
     deferral_generation: u64,
 }
 
-/// The cached local capability announcement plus the org
-/// authority/floor EPOCH it was built under (review-9 addendum).
-/// Send paths that reuse the cached object — the immediate
-/// broadcast, the trailing-edge flush, the session-open push —
-/// compare the stamp against the current epoch before serializing:
-/// a mismatch means emission's inputs changed since the build (a
-/// floor raise, an authority change, the emission switch), and the
-/// embedded owner certificate must be re-validated — peers cannot
-/// know this node's local floor state, so a self-floored
-/// certificate must never keep riding the wire.
-struct PublishedAnnouncement {
-    /// `org_authority_epoch` at build time.
-    epoch: u64,
-    /// The signed announcement as built.
-    ann: Arc<CapabilityAnnouncement>,
+/// A stable snapshot of the AUTHORITATIVE inputs to owner-cert
+/// emission (review-11 P1). Captured directly from live state —
+/// the installed store's identity and publish generation, the
+/// installed authority's identity, and the emission-switch
+/// generation — rather than from a lazily-bumped epoch counter, so
+/// it changes the instant any of those change, not when a
+/// subscriber callback later runs.
+///
+/// The send path uses it as a seqlock: capture stamp → derive the
+/// current certificate + serialize → capture stamp again → emit
+/// only if the stamp held still, else retry. A floor becoming live
+/// bumps the store's publish generation INSIDE `StoreCore::publish`
+/// (under the reload lock), before any notification, so this stamp
+/// closes the publish-before-notify gap the epoch counter left
+/// open. Certificate wall-clock expiry is handled separately (the
+/// send path re-derives the desired cert every time, which checks
+/// temporal validity), since expiry changes no generation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SendStamp {
+    /// `Arc::as_ptr` of the installed revocation store (0 = none).
+    store_ptr: usize,
+    /// The installed store's publish generation (bumped on every
+    /// floor publish, under the reload lock).
+    store_generation: u64,
+    /// `Arc::as_ptr` of the installed node authority (0 = none).
+    authority_ptr: usize,
+    /// Bumped by [`MeshNode::set_owner_cert_emission`] — a toggle
+    /// on the SAME authority/store changes no pointer or
+    /// generation, so it needs its own counter.
+    emission_generation: u64,
 }
 
 /// The node's slot in the installed revocation store's
@@ -4150,15 +4165,15 @@ pub struct MeshNode {
     /// every node subscribed (the registry replaced the old
     /// single-slot callback).
     org_raise_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
-    /// Review-9 addendum: the authority/floor EPOCH. Bumped
-    /// whenever the inputs to owner-cert emission change — an
-    /// installed-store floor raise, a store or authority
-    /// (re)installation, the emission switch. The cached local
-    /// announcement carries the epoch it was built under; every
-    /// send path that reuses the cache re-validates on mismatch
-    /// and rebuilds WITHOUT the certificate when it no longer
-    /// stands ([`Self::announcement_bytes_for_send`]).
-    org_authority_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Review-11 P1: bumped ONLY by
+    /// [`Self::set_owner_cert_emission`]. Store/authority
+    /// (re)installations and floor raises are captured DIRECTLY by
+    /// the [`SendStamp`] (store/authority pointers + the store's
+    /// publish generation), so only the emission toggle — which
+    /// changes neither a pointer nor a generation — needs its own
+    /// counter. The send-path seqlock reads it through
+    /// [`Self::security_stamp`].
+    emission_generation: Arc<std::sync::atomic::AtomicU64>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -4547,7 +4562,7 @@ pub struct MeshNode {
     /// [`MeshNode::announcement_bytes_for_send`], which
     /// re-validates the embedded owner certificate on an epoch
     /// mismatch. `None` until the first `announce_*` call.
-    local_announcement: Arc<ArcSwapOption<PublishedAnnouncement>>,
+    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
     /// User-supplied capability baseline — the pre-augmentation set
     /// the most recent `announce_capabilities` call published. The
     /// `announce_chain` / `announce_chain_range` / `withdraw_chain`
@@ -5427,7 +5442,7 @@ impl MeshNode {
             org_install: Arc::new(parking_lot::Mutex::new(())),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
-            org_authority_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
@@ -6854,7 +6869,6 @@ impl MeshNode {
         // their own registrations.
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
-        let epoch = self.org_authority_epoch.clone();
         let me = Arc::downgrade(&store);
         let token = store.subscribe_floors_raised(move |raised| {
             let installed = slot.load_full();
@@ -6865,10 +6879,12 @@ impl MeshNode {
             if !still_installed {
                 return;
             }
-            // The enforced floor view changed: any cached
-            // owner-bearing announcement must re-validate before
-            // its next send (review-9 addendum).
-            epoch.fetch_add(1, Ordering::AcqRel);
+            // The enforced floor view already changed before this
+            // callback runs — the store's publish generation bumped
+            // inside `StoreCore::publish`, so the send-path
+            // [`SendStamp`] observes it directly (review-11 P1); no
+            // epoch bump is needed here. This callback only retracts
+            // stale fold projections.
             for (org, member, floor) in raised {
                 let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
                     &fold, *org, member, *floor,
@@ -6896,8 +6912,9 @@ impl MeshNode {
         self.org_revocation.store(Some(store.clone()));
         drop(_pin);
 
-        // Emission inputs changed with the installed store.
-        self.org_authority_epoch.fetch_add(1, Ordering::AcqRel);
+        // No epoch bump: the installed store's IDENTITY changed, and
+        // the send-path [`SendStamp`] captures store identity
+        // directly (review-11 P1).
 
         // Reconcile the candidate's floors against projections that
         // already exist in the fold: a store installed AFTER its
@@ -7035,9 +7052,9 @@ impl MeshNode {
         self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
         self.node_authority.store(Some(authority));
-        // Emission inputs changed with the installed authority.
-        self.org_authority_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // No epoch bump: the installed authority's IDENTITY changed,
+        // captured directly by the send-path [`SendStamp`]
+        // (review-11 P1).
         Ok(())
     }
 
@@ -7072,10 +7089,12 @@ impl MeshNode {
         }
         self.owner_cert_emission_enabled
             .store(enabled, Ordering::Release);
-        // Emission inputs changed: a cached owner-bearing
-        // announcement must re-validate before its next send
-        // (review-9 addendum).
-        self.org_authority_epoch.fetch_add(1, Ordering::AcqRel);
+        // The emission toggle changes neither a store/authority
+        // pointer nor a publish generation, so it is the one input
+        // the send-path [`SendStamp`] cannot observe indirectly —
+        // bump its dedicated counter so a cached announcement
+        // re-validates before its next send (review-11 P1).
+        self.emission_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -7116,27 +7135,91 @@ impl MeshNode {
         Some(cert.clone())
     }
 
+    /// Capture the current [`SendStamp`] — the authoritative inputs
+    /// to owner-cert emission, read directly from live state
+    /// (review-11 P1). Two reads with an equal stamp bracket an
+    /// interval in which no store/authority (re)installation, no
+    /// floor publish, and no emission toggle occurred.
+    fn security_stamp(&self) -> SendStamp {
+        let store = self.org_revocation.load_full();
+        let authority = self.node_authority.load_full();
+        SendStamp {
+            store_ptr: store
+                .as_ref()
+                .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
+            store_generation: store.as_ref().map_or(0, |s| s.publish_generation()),
+            authority_ptr: authority
+                .as_ref()
+                .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
+            emission_generation: self
+                .emission_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
     /// Serialize the cached local announcement for a reusing send
     /// path — the immediate broadcast, the trailing-edge flush,
-    /// the session-open push (review-9 addendum). If the cached
-    /// stamp matches the current authority/floor epoch, the cached
-    /// bytes are what this node's current state would emit. On a
-    /// mismatch the embedded owner certificate is re-validated
-    /// and, when it no longer stands, the announcement is rebuilt
-    /// WITHOUT it — re-signed, version-bumped so it supersedes the
-    /// certified form at peers that already hold it — and
-    /// atomically republished. Returns `None` when nothing has
-    /// been announced yet.
+    /// the session-open push (review-9 addendum). Runs as a SEQLOCK
+    /// over the [`SendStamp`] (review-11 P1): capture the stamp,
+    /// derive the certificate emission would attach NOW (which
+    /// re-checks wall-clock validity + floor + emission), serialize,
+    /// and emit the bytes ONLY if the stamp still holds — otherwise
+    /// the enforced state moved during the read and we retry. A
+    /// cached certificate that no longer matches the derived one
+    /// (self-floor rose, authority swapped, emission toggled, OR
+    /// the certificate simply expired by wall clock) triggers a
+    /// rebuild WITHOUT it — re-signed, version-bumped so it
+    /// supersedes the certified form at peers that already hold it.
+    /// Returns `None` when nothing has been announced yet, or (only
+    /// under pathological continuous churn) when the seqlock cannot
+    /// converge — skipping one send is fail-safe (never a stale
+    /// cert).
     fn announcement_bytes_for_send(&self) -> Option<Vec<u8>> {
-        let cached = self.local_announcement.load_full()?;
-        if cached.epoch
-            == self
-                .org_authority_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Some(cached.ann.to_bytes());
+        self.announcement_bytes_for_send_probed(None)
+    }
+
+    /// Seqlock body of [`Self::announcement_bytes_for_send`].
+    /// `probe`, when set, runs AFTER the first stamp + serialize and
+    /// BEFORE the stability recheck — the exact window a concurrent
+    /// floor publish / store swap / authority swap would land in.
+    /// A test injects a state change there to prove the recheck
+    /// catches it and the stale bytes are discarded rather than
+    /// emitted. The closure fires every iteration; a one-shot test
+    /// closure makes the loop converge.
+    fn announcement_bytes_for_send_probed(&self, probe: Option<&dyn Fn()>) -> Option<Vec<u8>> {
+        for _ in 0..16 {
+            let cached = self.local_announcement.load_full()?;
+            let stamp = self.security_stamp();
+            // Derive what emission would attach right now. This
+            // re-checks temporal validity every send, so a cert
+            // that expired by wall clock (which bumps no
+            // generation) is caught here even with a stable stamp
+            // (review-11 P1 — certificate expiry honored on every
+            // reuse boundary).
+            let desired = self.owner_cert_for_emission();
+            if desired == cached.owner_cert {
+                let bytes = cached.to_bytes();
+                if let Some(probe) = probe {
+                    probe();
+                }
+                // Emit only if nothing moved during the derive +
+                // serialize — else the enforced view changed and a
+                // retry re-derives against the new state.
+                if self.security_stamp() == stamp {
+                    return Some(bytes);
+                }
+                continue;
+            }
+            // The cached cert is stale: rebuild cert-adjusted and
+            // republish, then loop to serialize the rebuilt form
+            // under a fresh stability check.
+            self.rebuild_cached_announcement(desired);
         }
-        self.revalidate_cached_announcement()
+        tracing::warn!(
+            "announcement send skipped: emission state churned past the seqlock \
+             retry budget; the next send will reconcile"
+        );
+        None
     }
 
     /// Deterministic-witness seam for the send-time serialization
@@ -7149,44 +7232,44 @@ impl MeshNode {
         self.announcement_bytes_for_send()
     }
 
-    /// Slow path of [`Self::announcement_bytes_for_send`]: under
-    /// `announce_mu` (every `local_announcement` store runs under
-    /// it), re-derive what emission would attach NOW and reconcile
-    /// the cache. Unchanged certificate → restamp the epoch;
-    /// changed certificate (a self-floor rose, the authority
-    /// changed, emission toggled) → rebuild, refresh the
-    /// timestamp, bump the version, re-sign, republish, and hold
-    /// the self-projection to the same standard as the wire.
-    fn revalidate_cached_announcement(&self) -> Option<Vec<u8>> {
-        let _announce_guard = self.announce_mu.lock();
-        let cached = self.local_announcement.load_full()?;
-        // Epoch FIRST, certificate second: a raise landing between
-        // the two reads leaves a stale stamp (safe — the next send
-        // re-validates), never a fresh stamp over a stale cert.
-        let epoch = self
-            .org_authority_epoch
-            .load(std::sync::atomic::Ordering::Acquire);
-        let cert = self.owner_cert_for_emission();
-        if cert == cached.ann.owner_cert {
-            let restamped = Arc::new(PublishedAnnouncement {
-                epoch,
-                ann: cached.ann.clone(),
-            });
-            self.local_announcement.store(Some(restamped.clone()));
-            return Some(restamped.ann.to_bytes());
-        }
+    /// Deterministic-witness seam: run the send seqlock with a probe
+    /// fired inside the stability window (see
+    /// [`Self::announcement_bytes_for_send_probed`]). Test-only.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_probed_for_test(
+        &self,
+        probe: &(dyn Fn() + Sync),
+    ) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send_probed(Some(probe))
+    }
 
-        let mut ann = (*cached.ann).clone();
-        ann.owner_cert = cert;
-        // A fresh version + timestamp: the replacement must
-        // supersede the certified form at peers that already
-        // received it, and must not ship a stale freshness claim.
+    /// Rebuild the cached announcement so its owner certificate
+    /// matches `desired` (the current emission output), under
+    /// `announce_mu` (every `local_announcement` store runs under
+    /// it). Refreshes the timestamp, bumps the version so the
+    /// replacement supersedes the certified form at peers that
+    /// already received it, re-signs, and self-indexes to the same
+    /// proof standard as the wire. A concurrent writer that already
+    /// reconciled the cache to `desired` makes this a no-op.
+    fn rebuild_cached_announcement(
+        &self,
+        desired: Option<super::behavior::org::OrgMembershipCert>,
+    ) {
+        let _announce_guard = self.announce_mu.lock();
+        let Some(cached) = self.local_announcement.load_full() else {
+            return;
+        };
+        if cached.owner_cert == desired {
+            return; // already reconciled by another send
+        }
+        let mut ann = (*cached).clone();
+        ann.owner_cert = desired;
         ann.version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
         ann.timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let signed = cached.ann.signature.is_some();
+        let signed = cached.signature.is_some();
         if signed {
             ann.sign(&self.identity);
         }
@@ -7218,18 +7301,15 @@ impl MeshNode {
             );
         }
 
-        let published = Arc::new(PublishedAnnouncement {
-            epoch,
-            ann: Arc::new(ann),
-        });
-        self.local_announcement.store(Some(published.clone()));
+        let has_cert = ann.owner_cert.is_some();
+        let version = ann.version;
+        self.local_announcement.store(Some(Arc::new(ann)));
         tracing::info!(
-            version = published.ann.version,
-            has_cert = published.ann.owner_cert.is_some(),
+            version,
+            has_cert,
             "cached announcement re-validated: owner certificate no longer \
              matches emission state; republished"
         );
-        Some(published.ann.to_bytes())
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -16833,7 +16913,7 @@ impl MeshNode {
                     .local_announcement
                     .load()
                     .as_deref()
-                    .map(|published| published.ann.capabilities.clone())
+                    .map(|ann| ann.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
                 // Build the publish chain. Prefer an explicitly-held
@@ -17925,15 +18005,6 @@ impl MeshNode {
             // state.
             self.proximity_graph.set_local_capabilities(caps.clone());
 
-            // Capture the authority/floor epoch BEFORE deriving the
-            // owner cert (review-9 addendum): if a raise lands
-            // between the two reads, the cached stamp is OLDER than
-            // the live epoch and the next send re-validates — the
-            // unsafe direction (fresh stamp over a stale cert) is
-            // structurally impossible.
-            let org_epoch = self
-                .org_authority_epoch
-                .load(std::sync::atomic::Ordering::Acquire);
             let mut ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
@@ -17991,14 +18062,11 @@ impl MeshNode {
             // Publish as the latest local announcement so future
             // session-opens push this version to new peers. Also always
             // runs so late joiners get the latest caps even when we've
-            // rate-limited away the broadcast. Stamped with the epoch
-            // captured BEFORE the owner cert was derived (review-9
-            // addendum).
-            self.local_announcement
-                .store(Some(Arc::new(PublishedAnnouncement {
-                    epoch: org_epoch,
-                    ann: Arc::new(ann.clone()),
-                })));
+            // rate-limited away the broadcast. The send path
+            // re-validates the owner cert against live state via the
+            // [`SendStamp`] seqlock, so no build-time stamp is stored
+            // (review-11 P1).
+            self.local_announcement.store(Some(Arc::new(ann.clone())));
 
             // Origin-side rate limit: within-window calls update the
             // self-index + `local_announcement` and coalesce into one
@@ -21715,7 +21783,7 @@ impl MeshNode {
         let Some(observed) = self.reflex_addr() else {
             return false;
         };
-        if published.ann.reflex_addr == Some(observed) {
+        if published.reflex_addr == Some(observed) {
             return false;
         }
         self.reclassify_nat().await;
@@ -21773,9 +21841,7 @@ impl MeshNode {
     /// return torn pairs under concurrent mutation.
     #[doc(hidden)]
     pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
-        self.local_announcement
-            .load_full()
-            .map(|published| published.ann.clone())
+        self.local_announcement.load_full()
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking
