@@ -8,7 +8,10 @@
 //! the shard queue.
 //!
 //! The test exercises:
-//! - register / unregister return the prior dispatcher correctly
+//! - VACANT-ONLY register (OA2-E0.1): success returns a fresh
+//!   registration id; a duplicate returns `None` WITHOUT disturbing
+//!   the incumbent; conditional teardown by id (a stale id is a
+//!   no-op and cannot evict a newer registration)
 //! - registered dispatchers receive events; nothing lands in the
 //!   shard queue for the registered channel_hash
 //! - unregistered channels still flow through the shard queue
@@ -80,34 +83,126 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool 
     cond()
 }
 
-/// Plain register/unregister behavior on a single node — no
-/// network needed. Pin the slot semantics: register on an empty
-/// slot returns None, register on an occupied slot returns the
-/// prior dispatcher, unregister returns the registered one.
+/// OA2-E0.1 vacant-only slot semantics (no network): register on an
+/// empty slot returns a fresh id; register on an OCCUPIED slot
+/// returns `None` WITHOUT replacing the incumbent; unregister
+/// removes only when the id matches; a stale id cannot evict.
 #[tokio::test]
 async fn register_and_unregister_round_trip() {
     let node = build_node().await;
     let dispatcher_a: RpcInboundDispatcher = Arc::new(|_| {});
     let dispatcher_b: RpcInboundDispatcher = Arc::new(|_| {});
 
-    // Empty slot.
-    assert!(node
+    // Empty slot → success with a fresh id.
+    let id_a = node
         .register_rpc_inbound(0xABCD, dispatcher_a.clone())
+        .expect("empty slot registers");
+
+    // Occupied slot → None (occupied), incumbent A untouched.
+    assert!(
+        node.register_rpc_inbound(0xABCD, dispatcher_b.clone())
+            .is_none(),
+        "re-register on an occupied slot must refuse without mutating",
+    );
+    assert!(node.rpc_inbound_dispatcher_registered(0xABCD));
+
+    // A stale/foreign id cannot evict the live registration.
+    assert!(
+        node.unregister_rpc_inbound(0xABCD, id_a.wrapping_add(999))
+            .is_none(),
+        "unregister with a non-matching id must be a no-op",
+    );
+    assert!(node.rpc_inbound_dispatcher_registered(0xABCD));
+
+    // The owning id removes it; the slot is then empty.
+    assert!(node.unregister_rpc_inbound(0xABCD, id_a).is_some());
+    assert!(!node.rpc_inbound_dispatcher_registered(0xABCD));
+
+    // A fresh registration on the now-empty slot gets a DISTINCT id
+    // (ids are monotonic, never reused).
+    let id_b = node
+        .register_rpc_inbound(0xABCD, dispatcher_b)
+        .expect("empty slot registers again");
+    assert_ne!(id_a, id_b, "registration ids are monotonic, never reused");
+    assert!(node.unregister_rpc_inbound(0xABCD, id_b).is_some());
+}
+
+/// OA2-E0.1 core witness: a duplicate registration does NOT replace
+/// the live dispatcher — the incumbent keeps receiving events, and
+/// the rejected dispatcher never does. (Pre-E0.1 the destructive
+/// `mem::replace` installed the new dispatcher and silently orphaned
+/// it, breaking the service.)
+#[tokio::test]
+async fn duplicate_registration_does_not_replace_the_live_dispatcher() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_pair(&a, &b).await;
+
+    let channel = ChannelName::new("test/rpc/nodup").unwrap();
+    let channel_hash = channel.hash();
+    b.subscribe_channel(a.node_id(), channel.clone())
+        .await
+        .expect("subscribe");
+
+    let incumbent: Arc<Mutex<Vec<RpcInboundEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let rejected: Arc<Mutex<Vec<RpcInboundEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let inc = incumbent.clone();
+    let rej = rejected.clone();
+    let disp_incumbent: RpcInboundDispatcher = Arc::new(move |ev| inc.lock().push(ev));
+    let disp_rejected: RpcInboundDispatcher = Arc::new(move |ev| rej.lock().push(ev));
+
+    assert!(b
+        .register_rpc_inbound(channel_hash, disp_incumbent)
+        .is_some());
+    // Duplicate registration is refused; the rejected dispatcher is
+    // never installed.
+    assert!(b
+        .register_rpc_inbound(channel_hash, disp_rejected)
         .is_none());
-    // Occupied slot — register returns the prior.
-    let prior = node.register_rpc_inbound(0xABCD, dispatcher_b.clone());
+
+    let publisher = ChannelPublisher::new(channel.clone(), PublishConfig::default());
+    a.publish(&publisher, Bytes::from_static(b"payload"))
+        .await
+        .expect("publish");
+
     assert!(
-        prior.is_some(),
-        "re-register on occupied slot must return the prior dispatcher",
+        wait_until(|| !incumbent.lock().is_empty(), Duration::from_secs(2)).await,
+        "the incumbent dispatcher must keep receiving events",
     );
-    // Unregister returns the currently-registered (B).
-    let removed = node.unregister_rpc_inbound(0xABCD);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(incumbent.lock().len(), 1);
     assert!(
-        removed.is_some(),
-        "unregister of registered slot must return Some"
+        rejected.lock().is_empty(),
+        "the refused dispatcher must never receive events",
     );
-    // After unregister, slot is empty again.
-    assert!(node.unregister_rpc_inbound(0xABCD).is_none());
+}
+
+/// OA2-E0.1: a stale handle cannot evict a NEWER registration for
+/// the same canonical channel. Register (id1) → unregister (id1) →
+/// register again (id2); the stale id1 unregister is now a no-op and
+/// the id2 registration survives.
+#[tokio::test]
+async fn stale_id_cannot_evict_a_newer_registration() {
+    let node = build_node().await;
+    let disp1: RpcInboundDispatcher = Arc::new(|_| {});
+    let disp2: RpcInboundDispatcher = Arc::new(|_| {});
+
+    let id1 = node.register_rpc_inbound(0x7777, disp1).expect("reg1");
+    assert!(node.unregister_rpc_inbound(0x7777, id1).is_some());
+    let id2 = node.register_rpc_inbound(0x7777, disp2).expect("reg2");
+    assert_ne!(id1, id2);
+
+    // The stale id1 teardown (e.g. a dropped ServeHandle from the
+    // first registration) must NOT remove the id2 registration.
+    assert!(
+        node.unregister_rpc_inbound(0x7777, id1).is_none(),
+        "a stale registration id must not evict the newer registration",
+    );
+    assert!(
+        node.rpc_inbound_dispatcher_registered(0x7777),
+        "the newer registration must survive a stale teardown",
+    );
+    assert!(node.unregister_rpc_inbound(0x7777, id2).is_some());
 }
 
 /// Two canonical `ChannelHash` values that share the same wire `u16`
@@ -126,18 +221,18 @@ async fn unregister_preserves_sibling_in_same_wire_bucket() {
     let disp_a: RpcInboundDispatcher = Arc::new(|_| {});
     let disp_b: RpcInboundDispatcher = Arc::new(|_| {});
 
-    assert!(node
+    let id_a = node
         .register_rpc_inbound(canonical_a, disp_a.clone())
-        .is_none());
-    assert!(node
+        .expect("register A");
+    let id_b = node
         .register_rpc_inbound(canonical_b, disp_b.clone())
-        .is_none());
+        .expect("register B");
 
     assert!(node.rpc_inbound_dispatcher_registered(canonical_a));
     assert!(node.rpc_inbound_dispatcher_registered(canonical_b));
 
     // Unregister A — B must survive, despite sharing the wire bucket.
-    assert!(node.unregister_rpc_inbound(canonical_a).is_some());
+    assert!(node.unregister_rpc_inbound(canonical_a, id_a).is_some());
     assert!(!node.rpc_inbound_dispatcher_registered(canonical_a));
     assert!(
         node.rpc_inbound_dispatcher_registered(canonical_b),
@@ -145,7 +240,7 @@ async fn unregister_preserves_sibling_in_same_wire_bucket() {
     );
 
     // B is still removable through the canonical-keyed path.
-    assert!(node.unregister_rpc_inbound(canonical_b).is_some());
+    assert!(node.unregister_rpc_inbound(canonical_b, id_b).is_some());
     assert!(!node.rpc_inbound_dispatcher_registered(canonical_b));
 }
 
@@ -166,9 +261,8 @@ async fn unregister_race_does_not_drop_concurrent_sibling_registration() {
 
     // Pin B for the duration of the test.
     let disp_b: RpcInboundDispatcher = Arc::new(|_| {});
-    assert!(node
-        .register_rpc_inbound(canonical_b, disp_b.clone())
-        .is_none());
+    node.register_rpc_inbound(canonical_b, disp_b.clone())
+        .expect("register B");
 
     let iters = 2_000u32;
     let churn = {
@@ -176,8 +270,11 @@ async fn unregister_race_does_not_drop_concurrent_sibling_registration() {
         tokio::task::spawn_blocking(move || {
             let disp_a: RpcInboundDispatcher = Arc::new(|_| {});
             for _ in 0..iters {
-                node.register_rpc_inbound(canonical_a, disp_a.clone());
-                node.unregister_rpc_inbound(canonical_a);
+                // Vacant-only: only this thread touches canonical_a,
+                // so each register succeeds; tear it down by its id.
+                if let Some(id) = node.register_rpc_inbound(canonical_a, disp_a.clone()) {
+                    node.unregister_rpc_inbound(canonical_a, id);
+                }
             }
         })
     };
@@ -228,7 +325,7 @@ async fn registered_dispatcher_receives_published_events() {
     let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
         captured_for_dispatcher.lock().push(ev);
     });
-    assert!(b.register_rpc_inbound(channel_hash, dispatcher).is_none());
+    assert!(b.register_rpc_inbound(channel_hash, dispatcher).is_some());
 
     // A publishes an event on the channel.
     let publisher = ChannelPublisher::new(channel.clone(), PublishConfig::default());
@@ -298,8 +395,8 @@ async fn wire_bucket_collision_fans_out_to_every_registered_canonical() {
     let cap2 = captured2.clone();
     let disp1: RpcInboundDispatcher = Arc::new(move |ev| cap1.lock().push(ev));
     let disp2: RpcInboundDispatcher = Arc::new(move |ev| cap2.lock().push(ev));
-    assert!(b.register_rpc_inbound(ch1.hash(), disp1).is_none());
-    assert!(b.register_rpc_inbound(ch2.hash(), disp2).is_none());
+    assert!(b.register_rpc_inbound(ch1.hash(), disp1).is_some());
+    assert!(b.register_rpc_inbound(ch2.hash(), disp2).is_some());
 
     // A publishes once on ch1.
     let publisher = ChannelPublisher::new(ch1.clone(), PublishConfig::default());
@@ -349,7 +446,9 @@ async fn unregister_restores_shard_inbound_path() {
     let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
         captured_for_dispatcher.lock().push(ev);
     });
-    b.register_rpc_inbound(channel_hash, dispatcher);
+    let reg_id = b
+        .register_rpc_inbound(channel_hash, dispatcher)
+        .expect("register dispatcher");
 
     let publisher = ChannelPublisher::new(channel.clone(), PublishConfig::default());
     a.publish(&publisher, Bytes::from_static(b"first"))
@@ -363,7 +462,7 @@ async fn unregister_restores_shard_inbound_path() {
     // Now unregister; subsequent publishes should NOT increment
     // the captured count (they go to the shard inbound queue
     // instead, which this test doesn't drain).
-    b.unregister_rpc_inbound(channel_hash);
+    b.unregister_rpc_inbound(channel_hash, reg_id);
     a.publish(&publisher, Bytes::from_static(b"second"))
         .await
         .expect("publish 2");

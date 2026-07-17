@@ -945,6 +945,20 @@ impl RetainedChain {
 ///
 /// `Clone`: every field is an `Arc` handle or a small config copy,
 /// so a clone is ~a round of refcount bumps. The SI-6.1 trailing-
+/// The per-`u16`-wire-bucket list of registered nRPC inbound
+/// dispatchers: `(canonical ChannelHash, registration_id,
+/// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
+/// Shared by `DispatchCtx` (read on the hot path) and `MeshNode`
+/// (registration).
+type RpcInboundDispatcherMap = DashMap<
+    u16,
+    Vec<(
+        ChannelHash,
+        u64,
+        crate::adapter::net::cortex::RpcInboundDispatcher,
+    )>,
+>;
+
 /// edge reconciliation task captures a clone — a boundary sleeper
 /// outlives the dispatch call that scheduled it, so it cannot
 /// borrow.
@@ -973,15 +987,10 @@ struct DispatchCtx {
     // the canonical `u32` hash is what each dispatcher is keyed on.
     // The `Vec` cost is paid only once per wire-bucket hit, and at
     // typical sizing there is exactly one entry per bucket.
-    rpc_inbound_dispatchers: Arc<
-        DashMap<
-            u16,
-            Vec<(
-                ChannelHash,
-                crate::adapter::net::cortex::RpcInboundDispatcher,
-            )>,
-        >,
-    >,
+    // OA2-E0.1: entries carry a monotonic registration id — a stale
+    // `ServeHandle` teardown removes ONLY its own id, so it cannot
+    // evict a newer registration for the same canonical channel.
+    rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -4012,15 +4021,15 @@ pub struct MeshNode {
     // the canonical `u32` hash is what each dispatcher is keyed on.
     // The `Vec` cost is paid only once per wire-bucket hit, and at
     // typical sizing there is exactly one entry per bucket.
-    rpc_inbound_dispatchers: Arc<
-        DashMap<
-            u16,
-            Vec<(
-                ChannelHash,
-                crate::adapter::net::cortex::RpcInboundDispatcher,
-            )>,
-        >,
-    >,
+    // OA2-E0.1: entries carry a monotonic registration id (see the
+    // `DispatchCtx` field for the teardown rationale).
+    rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// OA2-E0.1: monotonic source of registration ids for
+    /// [`Self::register_rpc_inbound`]. Bumped once per successful
+    /// (vacant-only) registration so each carries a unique id that
+    /// [`Self::unregister_rpc_inbound`] matches on.
+    #[cfg(feature = "cortex")]
+    rpc_registration_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Pending oneshots for in-flight `Mesh::call` invocations.
     /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
     /// arriving on reply channels complete the right call's
@@ -5413,6 +5422,8 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
+            rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             #[cfg(feature = "cortex")]
@@ -10700,11 +10711,15 @@ impl MeshNode {
                     drop(entry);
                     return;
                 }
+                // OA2-E0.1: the middle field is the registration id;
+                // the dispatch hot path does not need it (E0.2 will
+                // thread the canonical hash + id for the control-frame
+                // discriminator), so drop it from the snapshot here.
                 [only] => {
-                    let (c, d) = only.clone();
+                    let (c, _id, d) = only.clone();
                     Snapshot::Single(c, d)
                 }
-                many => Snapshot::Many(many.to_vec()),
+                many => Snapshot::Many(many.iter().map(|(c, _id, d)| (*c, d.clone())).collect()),
             };
             drop(entry);
             let origin_hash = parsed.header.origin_hash;
@@ -12153,11 +12168,22 @@ impl MeshNode {
     /// `Mesh::call` to receive RPC events without polling the
     /// shard queue.
     ///
-    /// Returns the previous dispatcher (if any) so callers can
-    /// detect a slot collision (typically a programming error —
-    /// two `serve_rpc` registrations for the same service on the
-    /// same node, or a hash collision between two different
-    /// channel names; the latter is bounded at ~1/65536 per pair).
+    /// **VACANT-ONLY (OA2-E0.1).** If a dispatcher is already
+    /// registered for this canonical hash, the incumbent is LEFT
+    /// UNTOUCHED and this returns `None` (occupied). It never
+    /// destroys a live registration. On success it returns
+    /// `Some(registration_id)` — a unique monotonic id the caller
+    /// stores and passes back to [`Self::unregister_rpc_inbound`],
+    /// so a stale teardown cannot evict a newer registration.
+    ///
+    /// Pre-E0.1 this method DESTRUCTIVELY replaced the incumbent and
+    /// returned it, but every caller only ever wanted "fail if
+    /// occupied": `serve_rpc` reported `AlreadyServing` AFTER the
+    /// replace had already installed a dispatcher whose bridge was
+    /// never spawned (silently killing the service), and the
+    /// caller-side reply path immediately restored the prior
+    /// dispatcher. Vacant-only serves both correctly and removes the
+    /// restore dance.
     ///
     /// **Hot-path cost.** One DashMap get per inbound packet.
     /// Absent registrations skip the conditional entirely.
@@ -12166,39 +12192,50 @@ impl MeshNode {
         &self,
         channel_hash: ChannelHash,
         dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
-    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+    ) -> Option<u64> {
         // The dispatcher map is indexed by the wire `u16` hash for
         // O(1) lookup on the inbound packet path; each bucket holds
-        // a list of `(canonical ChannelHash, dispatcher)` entries so
-        // wire-bucket collisions between independently-registered
-        // canonical channels don't share a dispatcher slot. Replace
-        // any existing entry for the same canonical hash; otherwise
-        // append.
+        // a list of `(canonical ChannelHash, registration_id,
+        // dispatcher)` entries so wire-bucket collisions between
+        // independently-registered canonical channels don't share a
+        // dispatcher slot. Vacant-only: if the canonical hash is
+        // already present, refuse WITHOUT mutating.
         let wire = channel_hash as u16;
         let mut entry = self.rpc_inbound_dispatchers.entry(wire).or_default();
-        for (existing_canonical, existing_disp) in entry.iter_mut() {
-            if *existing_canonical == channel_hash {
-                return Some(std::mem::replace(existing_disp, dispatcher));
-            }
+        if entry
+            .iter()
+            .any(|(existing, _, _)| *existing == channel_hash)
+        {
+            return None;
         }
-        entry.push((channel_hash, dispatcher));
-        None
+        let registration_id = self
+            .rpc_registration_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        entry.push((channel_hash, registration_id, dispatcher));
+        Some(registration_id)
     }
 
-    /// Remove the registered dispatcher for `channel_hash`. Returns
-    /// the prior dispatcher if one was registered. After removal,
-    /// inbound events for `channel_hash` resume landing in the
-    /// per-shard inbound queue.
+    /// Remove the dispatcher registered for `channel_hash` UNDER
+    /// `registration_id` (OA2-E0.1). Returns the removed dispatcher
+    /// iff both the canonical hash AND the id match — a stale
+    /// `ServeHandle` whose registration was already replaced by a
+    /// newer one is a NO-OP (it cannot evict the newer
+    /// registration). After removal, inbound events for
+    /// `channel_hash` resume landing in the per-shard inbound queue.
     #[cfg(feature = "cortex")]
     pub fn unregister_rpc_inbound(
         &self,
         channel_hash: ChannelHash,
+        registration_id: u64,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
         let wire = channel_hash as u16;
         let removed = {
             let mut entry = self.rpc_inbound_dispatchers.get_mut(&wire)?;
-            let pos = entry.iter().position(|(c, _)| *c == channel_hash)?;
-            let (_, removed) = entry.remove(pos);
+            let pos = entry
+                .iter()
+                .position(|(c, id, _)| *c == channel_hash && *id == registration_id)?;
+            let (_, _, removed) = entry.remove(pos);
             removed
         };
         // Release the wire-bucket slot only if it's *still* empty when
@@ -12224,7 +12261,7 @@ impl MeshNode {
     pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: ChannelHash) -> bool {
         self.rpc_inbound_dispatchers
             .get(&(channel_hash as u16))
-            .map(|entry| entry.iter().any(|(c, _)| *c == channel_hash))
+            .map(|entry| entry.iter().any(|(c, _, _)| *c == channel_hash))
             .unwrap_or(false)
     }
 

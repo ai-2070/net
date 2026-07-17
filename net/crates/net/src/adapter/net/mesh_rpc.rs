@@ -334,6 +334,12 @@ pub enum CodecDirection {
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
     channel_hash: ChannelHash,
+    /// OA2-E0.1: the registration id this handle owns. Drop passes
+    /// it to `unregister_rpc_inbound`, which removes the dispatcher
+    /// ONLY if the id still matches — so a stale handle whose
+    /// registration was already torn down and replaced cannot evict
+    /// the newer registration.
+    registration_id: u64,
     /// Service name to remove from `rpc_local_services` on Drop.
     service: String,
     /// The bridge task. Held only so callers can introspect /
@@ -361,7 +367,8 @@ impl Drop for ServeHandle {
         // events naturally and exits when its `rx.recv()` yields
         // `None` (which happens as soon as the dispatcher closure
         // — the sole `tx` owner — is dropped above).
-        self.mesh.unregister_rpc_inbound(self.channel_hash);
+        self.mesh
+            .unregister_rpc_inbound(self.channel_hash, self.registration_id);
         self.mesh.rpc_local_services_arc().remove(&self.service);
     }
 }
@@ -2105,15 +2112,17 @@ impl MeshNode {
         // `announce_capabilities` that pre-dated this service's
         // registration). See `docs/misc/CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
         // H1 + H2.
+        //
+        // OA2-E0.1: register FIRST (vacant-only). A duplicate
+        // `serve_rpc` now fails WITHOUT touching the incumbent and
+        // WITHOUT leaving a service tag behind. The tag + self-index
+        // still land before the bridge task below runs the gate, so
+        // the H1/H2 visibility guarantee holds.
+        let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
+            return Err(ServeError::AlreadyServing(service.to_string()));
+        };
         self.rpc_local_services_arc().insert(service.to_string());
         self.index_self_with_local_services();
-
-        if self
-            .register_rpc_inbound(channel_hash, dispatcher)
-            .is_some()
-        {
-            return Err(ServeError::AlreadyServing(service.to_string()));
-        }
 
         // Spawn the bridge task. It reads inbound events, runs
         // the v0.4 capability-auth callee-side gate (defense in
@@ -2256,6 +2265,7 @@ impl MeshNode {
 
         Ok(ServeHandle {
             channel_hash,
+            registration_id,
             service: service.to_string(),
             _bridge: bridge,
             _response_drain: Some(response_drain),
@@ -2374,14 +2384,15 @@ impl MeshNode {
         // just-registered service (see the unary `serve_rpc`
         // comment + `CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
         // H1 / H2).
+        //
+        // OA2-E0.1: register FIRST (vacant-only); a duplicate leaves
+        // no service tag behind. The tag still lands before the
+        // bridge task runs the gate.
+        let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
+            return Err(ServeError::AlreadyServing(service.to_string()));
+        };
         self.rpc_local_services_arc().insert(service.to_string());
         self.index_self_with_local_services();
-        if self
-            .register_rpc_inbound(channel_hash, dispatcher)
-            .is_some()
-        {
-            return Err(ServeError::AlreadyServing(service.to_string()));
-        }
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let mesh_for_bridge = Arc::clone(self);
         let service_for_bridge = service.to_string();
@@ -2455,6 +2466,7 @@ impl MeshNode {
         });
         Ok(ServeHandle {
             channel_hash,
+            registration_id,
             service: service.to_string(),
             _bridge: bridge,
             // Streaming/duplex variants still spawn per emit (§8a covers the
@@ -2572,12 +2584,11 @@ impl MeshNode {
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
-        if self
-            .register_rpc_inbound(channel_hash, dispatcher)
-            .is_some()
-        {
+        // OA2-E0.1: vacant-only register; a duplicate fails without
+        // disturbing the incumbent registration.
+        let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
-        }
+        };
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
@@ -2596,6 +2607,7 @@ impl MeshNode {
         self.rpc_local_services_arc().insert(service.to_string());
         Ok(ServeHandle {
             channel_hash,
+            registration_id,
             service: service.to_string(),
             _bridge: bridge,
             // Streaming/duplex variants still spawn per emit (§8a covers the
@@ -2823,12 +2835,11 @@ impl MeshNode {
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
-        if self
-            .register_rpc_inbound(channel_hash, dispatcher)
-            .is_some()
-        {
+        // OA2-E0.1: vacant-only register; a duplicate fails without
+        // disturbing the incumbent registration.
+        let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
-        }
+        };
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
@@ -2847,6 +2858,7 @@ impl MeshNode {
         self.rpc_local_services_arc().insert(service.to_string());
         Ok(ServeHandle {
             channel_hash,
+            registration_id,
             service: service.to_string(),
             _bridge: bridge,
             // Streaming/duplex variants still spawn per emit (§8a covers the
@@ -3834,18 +3846,16 @@ impl MeshNode {
             let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
                 fold.lock().apply_inbound(&ev);
             });
-            // Race-safe: a concurrent caller might have just
-            // registered between our check and our insert. In that
-            // case `register_rpc_inbound` returns the prior
-            // dispatcher; our new fresh fold is dropped here, and
-            // the prior dispatcher (which routes to the same
-            // shared `pending`) keeps doing the job. No collision
-            // — both folds are functionally equivalent.
-            if let Some(prev) = self.register_rpc_inbound(reply_hash, dispatcher) {
-                // Roll back: keep the prior dispatcher (it's
-                // already wired to the same shared pending map).
-                let _ = self.register_rpc_inbound(reply_hash, prev);
-            }
+            // Race-safe via VACANT-ONLY registration (OA2-E0.1): a
+            // concurrent caller might have registered between our
+            // `registered` check and here. If so, `register_rpc_inbound`
+            // returns `None` (occupied) and leaves the incumbent
+            // dispatcher UNTOUCHED — our fresh fold is simply dropped.
+            // The incumbent routes to the same shared `pending` map, so
+            // reuse is correct; no restore dance is needed. We don't
+            // retain the returned id — the reply dispatcher is a
+            // long-lived caller-side registration with no ServeHandle.
+            let _ = self.register_rpc_inbound(reply_hash, dispatcher);
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
