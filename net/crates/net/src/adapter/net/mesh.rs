@@ -2622,9 +2622,20 @@ type OrgRaiseSubscription = Option<(
 /// live inside the collection — a call-site bump could be forgotten
 /// by the next registration path (same reasoning as
 /// `Fold::signal_changed` and `ToolMetadataRegistry`).
+///
+/// OA2-E0.2 P1: the tag is GENERATION-OWNED — each entry stores the
+/// owning registration's id (the same monotonic token the dispatcher
+/// slot carries). A stale `ServeHandle` whose registration was
+/// already torn down and replaced holds the OLD id, so its Drop
+/// (`remove_if`) cannot evict the REPLACEMENT's tag by name. Without
+/// this, an old handle preempted between dispatcher-unregister and
+/// tag-removal could delete a live replacement's service projection
+/// — the dispatcher stays registered but discovery/announcements
+/// lose the service.
 #[cfg(feature = "cortex")]
 pub(super) struct LocalServiceRegistry {
-    set: dashmap::DashSet<String>,
+    /// `service name → owning registration id`.
+    map: dashmap::DashMap<String, u64>,
     change_signal: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
@@ -2632,40 +2643,137 @@ pub(super) struct LocalServiceRegistry {
 impl LocalServiceRegistry {
     fn new(change_signal: Arc<tokio::sync::watch::Sender<u64>>) -> Self {
         Self {
-            set: dashmap::DashSet::new(),
+            map: dashmap::DashMap::new(),
             change_signal,
         }
     }
 
-    /// Insert a service name. Bumps the local-caps generation only
-    /// when the name is new — an idempotent re-serve is not a
+    /// Install `service` owned by `registration_id`. Upserts: a
+    /// replacement (new id for the same name, after the incumbent's
+    /// dispatcher slot was freed) installs its own token over any
+    /// lingering stale entry. Bumps the local-caps generation only
+    /// when the NAME is newly present — the announced capability set
+    /// is keyed by name, so re-tokening an existing name is not a
     /// capability change and must not wake the announcer.
-    pub(super) fn insert(&self, service: String) -> bool {
-        let inserted = self.set.insert(service);
-        if inserted {
+    pub(super) fn insert(&self, service: String, registration_id: u64) -> bool {
+        let newly_present = self.map.insert(service, registration_id).is_none();
+        if newly_present {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
-        inserted
+        newly_present
     }
 
-    /// Remove a service name. Bumps only when it was present.
-    pub(super) fn remove(&self, service: &str) -> Option<String> {
-        let removed = self.set.remove(service);
-        if removed.is_some() {
+    /// Remove `service` ONLY when the stored registration id matches
+    /// `registration_id`. A stale handle carrying a superseded id is
+    /// a no-op — the replacement's tag survives. Bumps only when a
+    /// removal actually happened.
+    pub(super) fn remove_if(&self, service: &str, registration_id: u64) -> bool {
+        let removed = self
+            .map
+            .remove_if(service, |_, &id| id == registration_id)
+            .is_some();
+        if removed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
         removed
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.map.is_empty()
     }
 
     /// Cloned name list for the announce-path tag merge. Announces
     /// are rare relative to lookups; the allocation keeps the
-    /// DashSet's guard types out of the public surface.
+    /// DashMap's guard types out of the public surface.
     pub(super) fn snapshot(&self) -> Vec<String> {
-        self.set.iter().map(|s| s.clone()).collect()
+        self.map.iter().map(|e| e.key().clone()).collect()
+    }
+}
+
+#[cfg(all(test, feature = "cortex"))]
+mod local_service_registry_tests {
+    use super::LocalServiceRegistry;
+    use std::sync::Arc;
+
+    fn registry() -> (LocalServiceRegistry, tokio::sync::watch::Receiver<u64>) {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        (LocalServiceRegistry::new(Arc::new(tx)), rx)
+    }
+
+    /// OA2-E0.2 P1 — the barrier witness for old-handle retirement
+    /// versus a replacement registration.
+    ///
+    /// Deterministic replay of the exact interleaving Kyra flagged
+    /// (no threads, program order IS the barrier):
+    ///   1. old handle installs the tag under id 1;
+    ///   2. old handle's dispatcher is torn down and the slot freed
+    ///      — a REPLACEMENT `serve_rpc` re-registers it and upserts
+    ///      the tag under id 2 (the old handle is preempted BEFORE
+    ///      its tag-removal);
+    ///   3. the old handle resumes and retires by its OWN (stale)
+    ///      id 1.
+    ///
+    /// The replacement's tag MUST survive step 3, because retirement
+    /// is token-owned. A name-only removal (the pre-fix behavior)
+    /// would clobber it here.
+    #[test]
+    fn stale_handle_retirement_cannot_evict_a_replacement_tag() {
+        let (reg, _rx) = registry();
+
+        // (1) incumbent registration installs its tag.
+        assert!(reg.insert("svc".to_string(), 1), "first insert is new");
+        assert_eq!(reg.snapshot(), vec!["svc".to_string()]);
+
+        // (2) replacement upserts under a new id while the incumbent
+        //     handle is mid-drop. Same NAME, so no capability change
+        //     — `insert` reports "not newly present".
+        assert!(
+            !reg.insert("svc".to_string(), 2),
+            "re-tokening an existing name is not a new capability",
+        );
+
+        // (3) the stale incumbent handle retires by its OWN id.
+        assert!(
+            !reg.remove_if("svc", 1),
+            "a stale-id retirement must be a no-op",
+        );
+        assert_eq!(
+            reg.snapshot(),
+            vec!["svc".to_string()],
+            "the replacement's live tag must survive the stale retirement",
+        );
+        assert!(!reg.is_empty());
+
+        // The replacement's OWN handle later retires correctly.
+        assert!(reg.remove_if("svc", 2), "matching-id retirement removes");
+        assert!(
+            reg.is_empty(),
+            "registry drains once the live owner retires"
+        );
+    }
+
+    /// The change signal fires exactly on capability-set transitions
+    /// (name appears / name disappears), not on same-name re-tokening
+    /// — so a replacement doesn't spuriously wake the announcer and a
+    /// stale no-op retirement stays silent.
+    #[test]
+    fn change_signal_tracks_name_presence_not_token_churn() {
+        let (reg, rx) = registry();
+        let gen = |rx: &tokio::sync::watch::Receiver<u64>| *rx.borrow();
+
+        let g0 = gen(&rx);
+        assert!(reg.insert("svc".to_string(), 1));
+        assert_ne!(gen(&rx), g0, "new name bumps");
+
+        let g1 = gen(&rx);
+        assert!(!reg.insert("svc".to_string(), 2));
+        assert_eq!(gen(&rx), g1, "re-token of same name is silent");
+
+        assert!(!reg.remove_if("svc", 1));
+        assert_eq!(gen(&rx), g1, "stale no-op retirement is silent");
+
+        assert!(reg.remove_if("svc", 2));
+        assert_ne!(gen(&rx), g1, "name leaving the set bumps");
     }
 }
 

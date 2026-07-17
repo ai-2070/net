@@ -370,7 +370,15 @@ impl Drop for ServeHandle {
         // — the sole `tx` owner — is dropped above).
         self.mesh
             .unregister_rpc_inbound(self.channel_hash, self.registration_id);
-        self.mesh.rpc_local_services_arc().remove(&self.service);
+        // OA2-E0.2 P1: token-owned retirement. Remove the service tag
+        // ONLY if it still belongs to THIS registration. A handle
+        // preempted between the dispatcher-unregister above and here,
+        // while a replacement `serve_rpc` re-registered the freed slot
+        // and reinstalled the tag under a new id, must NOT evict the
+        // replacement's live tag by name.
+        self.mesh
+            .rpc_local_services_arc()
+            .remove_if(&self.service, self.registration_id);
     }
 }
 
@@ -2180,7 +2188,8 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
-        self.rpc_local_services_arc().insert(service.to_string());
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
         self.index_self_with_local_services();
 
         // Spawn the bridge task. It reads inbound events, runs
@@ -2460,7 +2469,8 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
-        self.rpc_local_services_arc().insert(service.to_string());
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let mesh_for_bridge = Arc::clone(self);
@@ -2687,7 +2697,8 @@ impl MeshNode {
                 }
             }
         });
-        self.rpc_local_services_arc().insert(service.to_string());
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
         Ok(ServeHandle {
             channel_hash,
             registration_id,
@@ -2946,7 +2957,8 @@ impl MeshNode {
                 }
             }
         });
-        self.rpc_local_services_arc().insert(service.to_string());
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id);
         Ok(ServeHandle {
             channel_hash,
             registration_id,
