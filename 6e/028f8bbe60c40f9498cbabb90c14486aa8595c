@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_9298fd786cc20e::t_4b5863518a6a66 2094-2148
+  s_9298fd786cc20e::t_33d08e5d98877f 724-762
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6e028f8bbe60c40f9498cbabb90c14486aa8595c",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
