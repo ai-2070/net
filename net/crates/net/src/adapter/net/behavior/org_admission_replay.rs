@@ -86,6 +86,51 @@ impl Default for AdmissionReplayConfig {
     }
 }
 
+impl AdmissionReplayConfig {
+    /// Enforce the ceiling invariant (Kyra E1 audit): both bounds are
+    /// positive AND the per-caller ceiling is STRICTLY below the
+    /// global one. A `max_entries_per_caller >= max_entries` would let
+    /// a single caller fill the entire global guard and starve every
+    /// other org — the exact starvation the per-caller ceiling exists
+    /// to prevent. Validated loudly at construction rather than
+    /// silently clamped.
+    pub fn validate(&self) -> Result<(), ReplayConfigError> {
+        if self.max_entries == 0 {
+            return Err(ReplayConfigError::ZeroGlobalCeiling);
+        }
+        if self.max_entries_per_caller == 0 {
+            return Err(ReplayConfigError::ZeroPerCallerCeiling);
+        }
+        if self.max_entries_per_caller >= self.max_entries {
+            return Err(ReplayConfigError::PerCallerNotBelowGlobal {
+                per_caller: self.max_entries_per_caller,
+                global: self.max_entries,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// An invalid [`AdmissionReplayConfig`] (Kyra E1 audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayConfigError {
+    /// `max_entries == 0` — the global guard could never admit.
+    #[error("replay max_entries must be > 0")]
+    ZeroGlobalCeiling,
+    /// `max_entries_per_caller == 0` — no caller could ever admit.
+    #[error("replay max_entries_per_caller must be > 0")]
+    ZeroPerCallerCeiling,
+    /// `max_entries_per_caller >= max_entries` — one caller could
+    /// consume the entire global guard.
+    #[error("replay max_entries_per_caller ({per_caller}) must be < max_entries ({global})")]
+    PerCallerNotBelowGlobal {
+        /// The configured per-caller ceiling.
+        per_caller: usize,
+        /// The configured global ceiling.
+        global: usize,
+    },
+}
+
 /// The outcome of an admission check. Only [`Self::Admitted`] lets
 /// the handler run; the §2.4 engine maps the others to typed
 /// `AdmissionDenied` reasons.
@@ -171,8 +216,15 @@ pub struct AdmissionReplayGuard {
 }
 
 impl AdmissionReplayGuard {
-    /// A guard with the given ceilings.
-    pub fn new(config: AdmissionReplayConfig) -> Self {
+    /// A guard with the given ceilings, VALIDATED (Kyra E1 audit) —
+    /// see [`AdmissionReplayConfig::validate`]. Prefer this over
+    /// [`Self::new`] on any config not known-good at compile time.
+    pub fn try_new(config: AdmissionReplayConfig) -> Result<Self, ReplayConfigError> {
+        config.validate()?;
+        Ok(Self::from_validated(config))
+    }
+
+    fn from_validated(config: AdmissionReplayConfig) -> Self {
         Self {
             entries: Mutex::new(ReplayState::default()),
             config,
@@ -181,9 +233,19 @@ impl AdmissionReplayGuard {
         }
     }
 
-    /// A guard with the default ceilings.
+    /// A guard with the given ceilings. Panics on an invalid config
+    /// (loud, not silently clamped) — use [`Self::try_new`] when the
+    /// config comes from untrusted/dynamic input.
+    pub fn new(config: AdmissionReplayConfig) -> Self {
+        match Self::try_new(config) {
+            Ok(guard) => guard,
+            Err(e) => panic!("invalid AdmissionReplayConfig: {e}"),
+        }
+    }
+
+    /// A guard with the default ceilings (always valid).
     pub fn with_defaults() -> Self {
-        Self::new(AdmissionReplayConfig::default())
+        Self::from_validated(AdmissionReplayConfig::default())
     }
 
     /// Atomic insert-or-deny (the last step of §2.4). `now` is the
@@ -421,7 +483,7 @@ mod tests {
     fn capacity_denies_without_evicting_a_live_guard() {
         let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
             max_entries: 2,
-            max_entries_per_caller: 1024,
+            max_entries_per_caller: 1,
         });
         let now = Instant::now();
         let expires = now + Duration::from_secs(30);
@@ -453,7 +515,7 @@ mod tests {
     fn capacity_reclaims_expired_slots_before_denying() {
         let guard = AdmissionReplayGuard::new(AdmissionReplayConfig {
             max_entries: 2,
-            max_entries_per_caller: 1024,
+            max_entries_per_caller: 1,
         });
         let t0 = Instant::now();
         let short = t0 + Duration::from_secs(10);
@@ -619,5 +681,82 @@ mod tests {
         );
         assert_eq!(guard.per_caller_denials(), 0);
         assert_eq!(guard.caller_len(&caller(1)), 1, "expired slots reclaimed");
+    }
+
+    /// KC8 — config validation boundaries (Kyra E1 audit). The
+    /// invariant is `0 < max_entries_per_caller < max_entries`, loud
+    /// via `try_new`, so no config can let one caller consume the
+    /// whole global guard.
+    #[test]
+    fn replay_config_validation_boundaries() {
+        // Valid: strictly below.
+        assert!(AdmissionReplayConfig {
+            max_entries: 10,
+            max_entries_per_caller: 9,
+        }
+        .validate()
+        .is_ok());
+        assert!(AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+            max_entries: 10,
+            max_entries_per_caller: 9,
+        })
+        .is_ok());
+        // Defaults are valid.
+        assert!(AdmissionReplayConfig::default().validate().is_ok());
+
+        // per_caller == max_entries → rejected.
+        assert_eq!(
+            AdmissionReplayConfig {
+                max_entries: 8,
+                max_entries_per_caller: 8,
+            }
+            .validate(),
+            Err(ReplayConfigError::PerCallerNotBelowGlobal {
+                per_caller: 8,
+                global: 8,
+            }),
+        );
+        // per_caller > max_entries → rejected.
+        assert!(matches!(
+            AdmissionReplayConfig {
+                max_entries: 8,
+                max_entries_per_caller: 9,
+            }
+            .validate(),
+            Err(ReplayConfigError::PerCallerNotBelowGlobal { .. }),
+        ));
+        // Zero ceilings → rejected.
+        assert_eq!(
+            AdmissionReplayConfig {
+                max_entries: 0,
+                max_entries_per_caller: 0,
+            }
+            .validate(),
+            Err(ReplayConfigError::ZeroGlobalCeiling),
+        );
+        assert_eq!(
+            AdmissionReplayConfig {
+                max_entries: 4,
+                max_entries_per_caller: 0,
+            }
+            .validate(),
+            Err(ReplayConfigError::ZeroPerCallerCeiling),
+        );
+        // try_new surfaces the error rather than clamping.
+        assert!(AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+            max_entries: 8,
+            max_entries_per_caller: 8,
+        })
+        .is_err());
+    }
+
+    /// The loud `new` panics on an invalid config (never clamps).
+    #[test]
+    #[should_panic(expected = "invalid AdmissionReplayConfig")]
+    fn replay_new_panics_on_invalid_config() {
+        let _ = AdmissionReplayGuard::new(AdmissionReplayConfig {
+            max_entries: 4,
+            max_entries_per_caller: 4,
+        });
     }
 }
