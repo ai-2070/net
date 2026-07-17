@@ -10775,9 +10775,41 @@ impl MeshNode {
                 );
                 return;
             };
+            // OA2-E0.2: classify a frame as an nRPC dispatch frame
+            // (carries the RpcRouteV1 canonical discriminator) vs a
+            // non-RPC dispatcher registration (e.g. the sensing
+            // intake). `Some(route)` = nRPC frame with a readable
+            // discriminator → route to EXACTLY ONE matching canonical
+            // dispatcher. `None` and a non-RPC dispatch type → legacy
+            // fan-out. `None` for an nRPC dispatch type (malformed /
+            // truncated route) → drop.
+            let classify = |frame: &Bytes| -> (bool, Option<ChannelHash>) {
+                let is_rpc = frame
+                    .get(..crate::adapter::net::cortex::EVENT_META_SIZE)
+                    .and_then(crate::adapter::net::cortex::EventMeta::from_bytes)
+                    .is_some_and(|m| {
+                        crate::adapter::net::cortex::is_rpc_dispatch_frame(m.dispatch)
+                    });
+                let route = if is_rpc {
+                    crate::adapter::net::cortex::decode_rpc_route(frame)
+                } else {
+                    None
+                };
+                (is_rpc, route)
+            };
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
+                        let (is_rpc, route) = classify(&event_data);
+                        // An nRPC frame is delivered ONLY if its route
+                        // matches this dispatcher's canonical — a
+                        // bucket-colliding frame for a different
+                        // canonical (or a malformed route) is dropped,
+                        // never misdelivered. Non-RPC frames deliver
+                        // (legacy behavior for the sole registration).
+                        if is_rpc && route != Some(canonical) {
+                            continue;
+                        }
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
                             channel_hash: canonical,
                             origin_hash,
@@ -10788,13 +10820,38 @@ impl MeshNode {
                 }
                 Snapshot::Many(pairs) => {
                     for event_data in events.into_iter() {
-                        for (canonical, disp) in &pairs {
-                            disp(crate::adapter::net::cortex::RpcInboundEvent {
-                                channel_hash: *canonical,
-                                origin_hash,
-                                from_node,
-                                payload: event_data.clone(),
-                            });
+                        let (is_rpc, route) = classify(&event_data);
+                        if is_rpc {
+                            // nRPC frame: select EXACTLY ONE canonical
+                            // dispatcher by the wire discriminator.
+                            // Absent / malformed / (impossibly) >1
+                            // match → drop, with no competing response
+                            // from a colliding sibling.
+                            let Some(route) = route else {
+                                continue;
+                            };
+                            let mut matching = pairs.iter().filter(|(c, _)| *c == route);
+                            if let (Some((canonical, disp)), None) =
+                                (matching.next(), matching.next())
+                            {
+                                disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    channel_hash: *canonical,
+                                    origin_hash,
+                                    from_node,
+                                    payload: event_data,
+                                });
+                            }
+                        } else {
+                            // Non-RPC dispatcher registrations keep
+                            // the legacy fan-out to every candidate.
+                            for (canonical, disp) in &pairs {
+                                disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    channel_hash: *canonical,
+                                    origin_hash,
+                                    from_node,
+                                    payload: event_data.clone(),
+                                });
+                            }
                         }
                     }
                 }

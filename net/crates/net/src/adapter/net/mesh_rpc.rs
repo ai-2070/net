@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::cortex::{
-    build_trace_headers, encode_request_grant, encode_stream_grant, EventMeta,
+    build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant, EventMeta,
     RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler,
     RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher,
     RpcInboundEvent, RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload,
@@ -44,7 +44,7 @@ use super::cortex::{
     DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT,
     DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
     FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
-    HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAM_WINDOW_INITIAL,
+    HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_ROUTE_V1_SIZE,
 };
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
@@ -565,8 +565,9 @@ fn spawn_grant_publish(
 ) {
     tokio::spawn(async move {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, self_origin, call_id, 0);
-        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, request_channel_hash);
         buf.extend_from_slice(&encode_stream_grant(amount));
         let payload = Bytes::from(buf);
         let _ = mesh
@@ -690,8 +691,9 @@ async fn publish_request_chunk(
     chunk: &RpcRequestChunkPayload,
 ) -> Result<(), RpcError> {
     let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, self_origin, chunk.call_id, 0);
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + chunk.encoded_len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + chunk.encoded_len());
     buf.extend_from_slice(&meta.to_bytes());
+    encode_rpc_route(&mut buf, request_channel_hash);
     chunk.encode_into(&mut buf);
     let payload = Bytes::from(buf);
     mesh.publish_to_peer(
@@ -990,8 +992,9 @@ impl ClientStreamCallRaw {
 
     async fn publish_initial_request(&self, req: &RpcRequestPayload) -> Result<(), RpcError> {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self.self_origin, self.call_id, 0);
-        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, self.request_channel_hash);
         req.encode_into(&mut buf);
         let payload = Bytes::from(buf);
         // PERF_AUDIT §3.10 — use the cached hash + stream_id from
@@ -1242,8 +1245,9 @@ impl DuplexSink {
             self.inner.call_id,
             0,
         );
-        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, self.inner.request_channel_hash);
         req.encode_into(&mut buf);
         let payload = Bytes::from(buf);
         // PERF_AUDIT §3.10 — cached hash + stream_id from the
@@ -1646,8 +1650,10 @@ fn build_request_grant_emitter(
                     }
                 };
                 let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, server_origin, call_id, 0);
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+                let reply_channel_hash = reply_channel.hash();
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + 12);
                 buf.extend_from_slice(&meta.to_bytes());
+                encode_rpc_route(&mut buf, reply_channel_hash);
                 buf.extend_from_slice(&encode_request_grant(call_id, credits));
                 let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
                 if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
@@ -1767,6 +1773,12 @@ async fn publish_response_to_caller(
     reply_stream_id: u64,
     payload: Bytes,
 ) -> Result<(), AdapterError> {
+    // OA2-E0.2: every server→caller frame (RESPONSE / DEADLINE /
+    // REQUEST_GRANT / STREAM_GRANT built for the reply channel)
+    // funnels through here, so insert the RpcRouteV1 discriminator —
+    // the reply channel's canonical hash — once, centrally. The
+    // caller's mesh ingress selects exactly this dispatcher.
+    let payload = super::cortex::insert_rpc_route(payload, reply_channel_hash);
     let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
     if let Some(target_node_id) = resolved {
         return mesh
@@ -1800,7 +1812,12 @@ fn spawn_cancel_publish(
         let request_channel_id = ChannelId::new(request_channel);
         let request_channel_hash = request_channel_id.hash();
         let stream_id = MeshNode::publish_stream_id(&request_channel_id);
-        let payload = Bytes::from(meta.to_bytes().to_vec());
+        // OA2-E0.2: CANCEL is meta-only (no frame payload) — the
+        // RpcRouteV1 discriminator still rides so ingress selects the
+        // exact request dispatcher, never a bucket-colliding sibling.
+        let mut buf = meta.to_bytes().to_vec();
+        encode_rpc_route(&mut buf, request_channel_hash);
+        let payload = Bytes::from(buf);
         let _ = mesh
             .publish_to_peer(
                 target,
@@ -3066,8 +3083,9 @@ impl MeshNode {
             body: payload.clone(),
         };
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
-        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, route.request_channel_hash);
         req.encode_into(&mut buf);
 
         let payload_bytes = Bytes::from(buf);
@@ -3516,8 +3534,9 @@ impl MeshNode {
             body: payload.clone(),
         };
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
-        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, route.request_channel_hash);
         req.encode_into(&mut buf);
 
         // Send the REQUEST directly to `target_node_id` via

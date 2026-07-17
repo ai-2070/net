@@ -101,6 +101,91 @@ pub const DISPATCH_RPC_REQUEST_CHUNK: u8 = 0x15;
 pub const DISPATCH_RPC_REQUEST_GRANT: u8 = 0x16;
 
 // ============================================================================
+// OA2-E0.2 — RpcRouteV1 frame discriminator.
+//
+// Every nRPC frame is laid out `EventMeta ‖ RpcRouteV1 ‖ payload`,
+// where RpcRouteV1 is the CANONICAL u64 ChannelHash of the physical
+// channel the frame rides (caller → provider: `<service>.requests`;
+// provider → caller: the reply channel). The wire packet header
+// carries only a `u16` bucket, which can collide; this discriminator
+// lets mesh ingress select EXACTLY ONE registered canonical
+// dispatcher instead of fanning the frame to every candidate and
+// asking each fold to self-filter (the removed ambiguity).
+//
+// This is a coordinated nRPC frame-version change — every nRPC
+// sender writes it and mesh ingress requires it for RPC event types.
+// ============================================================================
+
+/// Size of the [`RpcRouteV1`](encode_rpc_route) discriminator: one
+/// canonical u64 `ChannelHash`.
+pub const RPC_ROUTE_V1_SIZE: usize = 8;
+
+/// Byte offset of the frame-specific payload inside an nRPC frame:
+/// past the `EventMeta` prefix AND the RpcRouteV1 discriminator.
+pub const RPC_FRAME_BODY_OFFSET: usize = EVENT_META_SIZE + RPC_ROUTE_V1_SIZE;
+
+/// Append the RpcRouteV1 discriminator (`canonical` channel hash)
+/// to a frame buffer that already holds the `EventMeta` prefix
+/// (OA2-E0.2). Every nRPC frame builder calls this immediately
+/// after `meta.to_bytes()`.
+#[inline]
+pub fn encode_rpc_route(buf: &mut Vec<u8>, canonical: crate::adapter::net::channel::ChannelHash) {
+    buf.extend_from_slice(&canonical.to_le_bytes());
+}
+
+/// Insert the RpcRouteV1 discriminator into an already-assembled
+/// `EventMeta ‖ payload` frame, producing `EventMeta ‖ route ‖
+/// payload` (OA2-E0.2). Used at the centralized response publish
+/// choke point (`publish_response_to_caller`), where the frame is
+/// built before the reply-channel hash is threaded in — one small
+/// copy per response frame. Direct request-direction builders use
+/// [`encode_rpc_route`] inline instead (no copy). Frames shorter
+/// than `EVENT_META_SIZE` are returned unchanged (never a real
+/// nRPC frame).
+pub fn insert_rpc_route(
+    frame: bytes::Bytes,
+    canonical: crate::adapter::net::channel::ChannelHash,
+) -> bytes::Bytes {
+    if frame.len() < EVENT_META_SIZE {
+        return frame;
+    }
+    let mut out = Vec::with_capacity(frame.len() + RPC_ROUTE_V1_SIZE);
+    out.extend_from_slice(&frame[..EVENT_META_SIZE]);
+    out.extend_from_slice(&canonical.to_le_bytes());
+    out.extend_from_slice(&frame[EVENT_META_SIZE..]);
+    bytes::Bytes::from(out)
+}
+
+/// Read the RpcRouteV1 discriminator from a full nRPC frame
+/// (`EventMeta ‖ route ‖ payload`). `None` if the frame is too
+/// short to carry it — a malformed/legacy frame that ingress drops.
+#[inline]
+pub fn decode_rpc_route(frame: &[u8]) -> Option<crate::adapter::net::channel::ChannelHash> {
+    let bytes = frame.get(EVENT_META_SIZE..EVENT_META_SIZE + RPC_ROUTE_V1_SIZE)?;
+    let arr: [u8; RPC_ROUTE_V1_SIZE] = bytes.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
+/// `true` iff `event_type` is an nRPC dispatch frame that carries
+/// the RpcRouteV1 discriminator (OA2-E0.2). Mesh ingress uses this
+/// to apply route-based single-select to RPC frames while leaving
+/// non-RPC dispatcher registrations (e.g. the sensing intake) on
+/// the legacy fan-out path.
+#[inline]
+pub fn is_rpc_dispatch_frame(event_type: u8) -> bool {
+    matches!(
+        event_type,
+        DISPATCH_RPC_REQUEST
+            | DISPATCH_RPC_RESPONSE
+            | DISPATCH_RPC_CANCEL
+            | DISPATCH_RPC_DEADLINE_EXCEEDED
+            | DISPATCH_RPC_STREAM_GRANT
+            | DISPATCH_RPC_REQUEST_CHUNK
+            | DISPATCH_RPC_REQUEST_GRANT
+    )
+}
+
+// ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
 
@@ -913,13 +998,14 @@ fn decode_headers(
 /// Exposed so callers can budget the total event size at the bus
 /// layer without doing the encode first.
 pub fn request_wire_size(payload: &RpcRequestPayload) -> usize {
-    EVENT_META_SIZE + payload.encoded_len()
+    // OA2-E0.2: EventMeta + RpcRouteV1 discriminator + payload.
+    RPC_FRAME_BODY_OFFSET + payload.encoded_len()
 }
 
 /// Same for `RpcResponsePayload` after the `EventMeta` prefix in a
 /// `DISPATCH_RPC_RESPONSE` event.
 pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
-    EVENT_META_SIZE + payload.encoded_len()
+    RPC_FRAME_BODY_OFFSET + payload.encoded_len()
 }
 
 // ============================================================================
@@ -1513,30 +1599,31 @@ impl RedexFold<()> for RpcServerFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Malformed request payload. Surface as
-                        // `UnknownVersion` to the caller — they sent
-                        // bytes we couldn't parse, which usually
-                        // means a wire-format mismatch (the most
-                        // common cause). Log so operators can
-                        // diagnose.
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc server fold: malformed request payload",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                };
+                let payload =
+                    match RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // Malformed request payload. Surface as
+                            // `UnknownVersion` to the caller — they sent
+                            // bytes we couldn't parse, which usually
+                            // means a wire-format mismatch (the most
+                            // common cause). Log so operators can
+                            // diagnose.
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc server fold: malformed request payload",
+                            );
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                            return Ok(());
+                        }
+                    };
                 // Fast deadline-already-passed short-circuit.
                 // Server-side `Timeout` without invoking the
                 // handler. Includes a clock-skew tolerance window
@@ -2152,36 +2239,37 @@ impl RedexFold<()> for RpcServerStreamingFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc streaming server fold: malformed request payload",
-                        );
-                        // Surface as a terminal error chunk. Spawn
-                        // because the apply method is sync and the
-                        // emit is async; this is a one-shot publish
-                        // so ordering doesn't matter here.
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![(
-                                HEADER_NRPC_STREAMING.to_string(),
-                                HEADER_NRPC_STREAMING_END.to_vec(),
-                            )],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        let emit = self.emit.clone();
-                        let caller_origin = meta.origin_hash;
-                        let call_id = meta.seq_or_ts;
-                        tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
-                        });
-                        return Ok(());
-                    }
-                };
+                let payload =
+                    match RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc streaming server fold: malformed request payload",
+                            );
+                            // Surface as a terminal error chunk. Spawn
+                            // because the apply method is sync and the
+                            // emit is async; this is a one-shot publish
+                            // so ordering doesn't matter here.
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![(
+                                    HEADER_NRPC_STREAMING.to_string(),
+                                    HEADER_NRPC_STREAMING_END.to_vec(),
+                                )],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            let emit = self.emit.clone();
+                            let caller_origin = meta.origin_hash;
+                            let call_id = meta.seq_or_ts;
+                            tokio::spawn(async move {
+                                emit(caller_origin, call_id, resp).await;
+                            });
+                            return Ok(());
+                        }
+                    };
                 // Refuse a duplicate REQUEST with the same
                 // `(origin_hash, call_id)`. Without this, a retry
                 // that arrives while the first attempt's pump is
@@ -2444,7 +2532,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // the caller is racing a terminal vs. sending a
                 // grant for a non-flow-controlled stream, and
                 // both are harmless to ignore.
-                let amount = match decode_stream_grant(&ev.payload[EVENT_META_SIZE..]) {
+                let amount = match decode_stream_grant(&ev.payload[RPC_FRAME_BODY_OFFSET..]) {
                     Some(n) => n,
                     None => {
                         tracing::debug!(
@@ -2690,24 +2778,25 @@ impl RedexFold<()> for RpcStreamingRequestFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc client-streaming server fold: malformed request payload",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                };
+                let payload =
+                    match RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc client-streaming server fold: malformed request payload",
+                            );
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                            return Ok(());
+                        }
+                    };
                 // A REQUEST without the client-streaming flag on
                 // this fold is a caller bug — the service was
                 // registered as client-streaming. Refuse cleanly.
@@ -2950,7 +3039,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    ev.payload.slice(EVENT_META_SIZE..),
+                    ev.payload.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
                     "client-streaming",
@@ -3083,32 +3172,33 @@ impl RedexFold<()> for RpcDuplexFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc duplex server fold: malformed request payload",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![(
-                                HEADER_NRPC_STREAMING.to_string(),
-                                HEADER_NRPC_STREAMING_END.to_vec(),
-                            )],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        let emit = self.emit.clone();
-                        let caller_origin = meta.origin_hash;
-                        let call_id = meta.seq_or_ts;
-                        tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
-                        });
-                        return Ok(());
-                    }
-                };
+                let payload =
+                    match RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc duplex server fold: malformed request payload",
+                            );
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![(
+                                    HEADER_NRPC_STREAMING.to_string(),
+                                    HEADER_NRPC_STREAMING_END.to_vec(),
+                                )],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            let emit = self.emit.clone();
+                            let caller_origin = meta.origin_hash;
+                            let call_id = meta.seq_or_ts;
+                            tokio::spawn(async move {
+                                emit(caller_origin, call_id, resp).await;
+                            });
+                            return Ok(());
+                        }
+                    };
                 // Caller-bug guard: a duplex REQUEST must set
                 // BOTH the client-streaming flag (we'll receive
                 // request chunks) AND the streaming-response flag
@@ -3378,7 +3468,7 @@ impl RedexFold<()> for RpcDuplexFold {
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    ev.payload.slice(EVENT_META_SIZE..),
+                    ev.payload.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
                     "duplex",
@@ -3867,7 +3957,7 @@ impl RpcClientFold {
         };
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
                     Err(e) => {
                         tracing::warn!(
@@ -3884,7 +3974,7 @@ impl RpcClientFold {
                 // matching pending entry's grant mpsc; non-client-
                 // streaming entries silently ignore (see
                 // RpcClientPending::deliver_grant docs).
-                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                match decode_request_grant(&ev.payload[RPC_FRAME_BODY_OFFSET..]) {
                     Some(grant) => {
                         // The payload's `call_id` MUST agree with
                         // the EventMeta's `seq_or_ts`: producer
@@ -3953,7 +4043,7 @@ impl RedexFold<()> for RpcClientFold {
         // peer routing.
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
                     Err(e) => {
                         // Malformed RESPONSE on the reply channel.
@@ -3973,7 +4063,7 @@ impl RedexFold<()> for RpcClientFold {
                 }
             }
             DISPATCH_RPC_REQUEST_GRANT => {
-                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                match decode_request_grant(&ev.payload[RPC_FRAME_BODY_OFFSET..]) {
                     Some(grant) => {
                         // See `apply_inbound` REQUEST_GRANT arm for
                         // the meta/payload call_id invariant.
@@ -4526,7 +4616,7 @@ mod tests {
         let size = p.encode().len();
         // 1 (svc len) + 1 (svc bytes) + 8 (deadline) + 2 (flags) + 1 (headers count) + 4 (body len) = 17
         assert_eq!(size, 17, "minimum request encodes in 17 bytes");
-        assert_eq!(request_wire_size(&p), EVENT_META_SIZE + 17);
+        assert_eq!(request_wire_size(&p), RPC_FRAME_BODY_OFFSET + 17);
     }
 
     #[test]
@@ -4539,7 +4629,7 @@ mod tests {
         let size = p.encode().len();
         // 2 (status) + 1 (headers count) + 4 (body len) = 7
         assert_eq!(size, 7, "minimum response encodes in 7 bytes");
-        assert_eq!(response_wire_size(&p), EVENT_META_SIZE + 7);
+        assert_eq!(response_wire_size(&p), RPC_FRAME_BODY_OFFSET + 7);
     }
 
     // ====================================================================
@@ -4571,6 +4661,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -4580,7 +4674,9 @@ mod tests {
 
     fn rpc_cancel_event(caller_origin: u64, call_id: u64) -> RedexEvent {
         let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, caller_origin, call_id, 0);
-        let buf = meta.to_bytes().to_vec();
+        let mut buf = meta.to_bytes().to_vec();
+        // OA2-E0.2: RpcRouteV1 route placeholder (folds skip it).
+        buf.extend_from_slice(&0u64.to_le_bytes());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
             payload: bytes::Bytes::from(buf),
@@ -5097,6 +5193,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 7, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.push(0x00); // svc_len = 0 → empty service → Truncated
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5339,6 +5439,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5464,6 +5568,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 11, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.push(0xFF);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5557,6 +5665,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&encode_request_grant(call_id, credits));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5676,6 +5788,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5720,6 +5836,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&encode_request_grant(0xBEEF, 5));
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5780,6 +5900,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&encode_stream_grant(n));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6141,6 +6265,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.push(0x00);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6186,6 +6314,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test
+        // frames feed the folds directly (no ingress select), and
+        // the folds skip these 8 bytes to reach the payload.
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),

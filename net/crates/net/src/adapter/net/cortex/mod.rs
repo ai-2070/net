@@ -51,8 +51,9 @@ pub use meta::{
     FLAG_CAUSAL, FLAG_CONTINUITY_PROOF,
 };
 pub use rpc::{
-    build_trace_headers, classify_streaming_chunk, decode_request_grant, decode_stream_grant,
-    encode_request_grant, encode_stream_grant, extract_trace_context, parse_request_window_initial,
+    build_trace_headers, classify_streaming_chunk, decode_request_grant, decode_rpc_route,
+    decode_stream_grant, encode_request_grant, encode_rpc_route, encode_stream_grant,
+    extract_trace_context, insert_rpc_route, is_rpc_dispatch_frame, parse_request_window_initial,
     parse_stream_window_initial, request_wire_size, response_wire_size, RequestStream,
     RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientPending,
     RpcClientStreamingHandler, RpcCodecError, RpcContext, RpcDuplexFold, RpcDuplexHandler,
@@ -67,7 +68,7 @@ pub use rpc::{
     FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAMING,
     HEADER_NRPC_STREAMING_CONTINUE, HEADER_NRPC_STREAMING_END, HEADER_NRPC_STREAM_WINDOW_INITIAL,
     MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN,
-    MAX_RPC_SERVICE_NAME_LEN,
+    MAX_RPC_SERVICE_NAME_LEN, RPC_FRAME_BODY_OFFSET, RPC_ROUTE_V1_SIZE,
 };
 #[cfg(feature = "cortex")]
 pub use rpc_observer::{
