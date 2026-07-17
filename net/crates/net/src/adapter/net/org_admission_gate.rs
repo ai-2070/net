@@ -258,18 +258,94 @@ pub type OrgProviderPolicy = Arc<dyn Fn(&OrgCallProof) -> bool + Send + Sync>;
 /// (E1.1, verdict §1/§2/§7/§12). ONE truth per registration — the
 /// policy is captured WITH the handler, not looked up in a separate
 /// name→policy map, so there is never an unknown-policy fallback.
+///
+/// Fields are PRIVATE (Kyra E1 audit): a registration is built only
+/// through the validated [`Self::public`] / [`Self::protected`]
+/// constructors, which structurally enforce the legal shapes, and is
+/// read-only thereafter through the accessors.
 #[derive(Clone)]
 pub struct RegisteredRpcService {
+    registration_id: u64,
+    service: Arc<str>,
+    visibility: CapabilityVisibility,
+    admission: OrgAdmission,
+    provider_policy: OrgProviderPolicy,
+}
+
+/// An invalid [`RegisteredRpcService`] construction (Kyra E1 audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RegisteredServiceError {
+    /// [`RegisteredRpcService::protected`] was given
+    /// [`OrgAdmission::PublicAuthenticated`] — a protected service
+    /// must carry an org-protected admission mode.
+    #[error(
+        "protected registration requires an org-protected admission mode, not PublicAuthenticated"
+    )]
+    PublicAdmissionNotProtected,
+}
+
+impl RegisteredRpcService {
+    /// A legacy PUBLIC registration: `Public` visibility,
+    /// [`OrgAdmission::PublicAuthenticated`], and a trivial allow-all
+    /// policy — so every live public handler still carries a policy
+    /// (never an unknown-policy fallback).
+    pub fn public(registration_id: u64, service: Arc<str>) -> Self {
+        Self {
+            registration_id,
+            service,
+            visibility: CapabilityVisibility::Public,
+            admission: OrgAdmission::PublicAuthenticated,
+            provider_policy: Arc::new(|_| true),
+        }
+    }
+
+    /// A PROTECTED registration: `Public` visibility (E1 — OA-3 adds
+    /// the rest), an org-protected `admission` mode, and an EXPLICIT
+    /// `provider_policy`. Rejects [`OrgAdmission::PublicAuthenticated`]
+    /// structurally — a protected service cannot be built with the
+    /// public mode.
+    pub fn protected(
+        registration_id: u64,
+        service: Arc<str>,
+        admission: OrgAdmission,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<Self, RegisteredServiceError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(RegisteredServiceError::PublicAdmissionNotProtected);
+        }
+        Ok(Self {
+            registration_id,
+            service,
+            visibility: CapabilityVisibility::Public,
+            admission,
+            provider_policy,
+        })
+    }
+
     /// The generation token (E0.1) this registration owns.
-    pub registration_id: u64,
+    pub fn registration_id(&self) -> u64 {
+        self.registration_id
+    }
+
     /// The service name this registration serves.
-    pub service: Arc<str>,
-    /// Announcement visibility — MUST be `Public` in E1.
-    pub visibility: CapabilityVisibility,
+    pub fn service(&self) -> &Arc<str> {
+        &self.service
+    }
+
+    /// The announcement visibility (always `Public` in E1).
+    pub fn visibility(&self) -> CapabilityVisibility {
+        self.visibility
+    }
+
     /// The admission mode bound at registration.
-    pub admission: OrgAdmission,
+    pub fn admission(&self) -> OrgAdmission {
+        self.admission
+    }
+
     /// The application veto (step 11). `|_| true` for public.
-    pub provider_policy: OrgProviderPolicy,
+    pub fn provider_policy(&self) -> &OrgProviderPolicy {
+        &self.provider_policy
+    }
 }
 
 impl std::fmt::Debug for RegisteredRpcService {
@@ -381,6 +457,40 @@ mod tests {
         let mut fl = req(vec![], b"body");
         fl.flags = 1;
         assert_ne!(base_d, org_request_digest(&fl));
+    }
+
+    /// KC9 — RegisteredRpcService is built only through the validated
+    /// constructors, which structurally enforce the legal shapes.
+    #[test]
+    fn registered_service_constructors_enforce_shape() {
+        let svc: Arc<str> = Arc::from("oa2-echo");
+
+        // public(): Public + PublicAuthenticated + a (non-null) policy.
+        let pubreg = RegisteredRpcService::public(7, svc.clone());
+        assert_eq!(pubreg.registration_id(), 7);
+        assert_eq!(&**pubreg.service(), "oa2-echo");
+        assert_eq!(pubreg.visibility(), CapabilityVisibility::Public);
+        assert_eq!(pubreg.admission(), OrgAdmission::PublicAuthenticated);
+
+        // protected() accepts the org-protected modes...
+        for mode in [OrgAdmission::OwnerDelegated, OrgAdmission::CrossOrgGranted] {
+            let reg = RegisteredRpcService::protected(9, svc.clone(), mode, Arc::new(|_| true))
+                .expect("protected mode accepted");
+            assert_eq!(reg.admission(), mode);
+            assert_eq!(reg.visibility(), CapabilityVisibility::Public);
+        }
+
+        // ...and REFUSES PublicAuthenticated as a protected mode.
+        assert_eq!(
+            RegisteredRpcService::protected(
+                9,
+                svc.clone(),
+                OrgAdmission::PublicAuthenticated,
+                Arc::new(|_| true),
+            )
+            .err(),
+            Some(RegisteredServiceError::PublicAdmissionNotProtected),
+        );
     }
 
     /// The admission stamp is "current" only against an identical,
