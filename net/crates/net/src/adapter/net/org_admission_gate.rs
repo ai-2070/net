@@ -34,33 +34,34 @@ pub const ORG_RPC_REQUEST_DIGEST_CONTEXT: &str = "net-org-rpc-request-v1";
 /// 1. drop EVERY exact `net-org-admission` header (the proof itself
 ///    rides one of these; a request must not bind the proof carrying
 ///    it, and a provider strips them all before hashing);
-/// 2. byte-sort the remaining `(name, value)` pairs, so header ORDER
-///    never changes the digest while header COUNT / multiplicity /
-///    lengths still do;
+/// 2. PRESERVE the relative order of every remaining header;
 /// 3. re-encode with [`RpcRequestPayload`]'s existing canonical wire
 ///    encoder — this binds service, deadline, flags, every remaining
-///    header, and the body length + bytes automatically;
+///    header (in order, with multiplicity), and the body length +
+///    bytes automatically;
 /// 4. `blake3::derive_key(ORG_RPC_REQUEST_DIGEST_CONTEXT, encoded)`.
+///
+/// Header ORDER is bound, NOT canonicalized away (Kyra E1 audit): the
+/// application receives the original ordered `Vec<RpcHeader>` and
+/// existing parsers are order-sensitive (trace extraction is
+/// last-duplicate-wins; stream-window parsing is first-duplicate-wins),
+/// so the proof must bind the exact sequence the handler interprets.
+/// Sorting here would let `[("x","allow"),("x","deny")]` and its
+/// reverse sign the same digest while delivering different meaning.
 ///
 /// Both the provider (verifying `ctx.request_digest`) and the caller
 /// (E2, minting the proof) call THIS function over the SAME finalized
 /// request, so a mismatch is impossible for a well-formed call and a
-/// tampered body/header set fails the binding.
+/// tampered body/header set/order fails the binding.
 pub fn org_request_digest(req: &RpcRequestPayload) -> [u8; 32] {
-    let mut headers: Vec<RpcHeader> = req
+    // Strip the admission headers ONLY; the relative order of every
+    // other header is preserved exactly as the application will see it.
+    let headers: Vec<RpcHeader> = req
         .headers
         .iter()
         .filter(|(name, _)| name != ORG_ADMISSION_HEADER)
         .cloned()
         .collect();
-    // Byte-sort by name then value. Duplicate headers are preserved
-    // (multiplicity is bound); only their order is canonicalized.
-    headers.sort_by(|(a_name, a_val), (b_name, b_val)| {
-        a_name
-            .as_bytes()
-            .cmp(b_name.as_bytes())
-            .then_with(|| a_val.cmp(b_val))
-    });
 
     let canonical = RpcRequestPayload {
         service: req.service.clone(),
@@ -286,32 +287,50 @@ mod tests {
         (name.to_string(), value.to_vec())
     }
 
-    /// Header ORDER does not change the digest (canonical byte-sort).
+    /// Header ORDER is BOUND (Kyra E1 audit): two requests with the
+    /// same duplicate header in opposite orders — which order-sensitive
+    /// parsers interpret differently — must sign DIFFERENT digests.
     #[test]
-    fn digest_is_header_order_independent() {
-        let a = req(vec![h("b", b"2"), h("a", b"1"), h("c", b"3")], b"body");
-        let b = req(vec![h("a", b"1"), h("b", b"2"), h("c", b"3")], b"body");
-        assert_eq!(org_request_digest(&a), org_request_digest(&b));
+    fn digest_binds_header_order() {
+        let allow_then_deny = req(vec![h("x", b"allow"), h("x", b"deny")], b"body");
+        let deny_then_allow = req(vec![h("x", b"deny"), h("x", b"allow")], b"body");
+        assert_ne!(
+            org_request_digest(&allow_then_deny),
+            org_request_digest(&deny_then_allow),
+            "reversed duplicate headers must not collide",
+        );
+        // A plain reordering of distinct headers also changes it.
+        let abc = req(vec![h("a", b"1"), h("b", b"2"), h("c", b"3")], b"body");
+        let bac = req(vec![h("b", b"2"), h("a", b"1"), h("c", b"3")], b"body");
+        assert_ne!(org_request_digest(&abc), org_request_digest(&bac));
     }
 
     /// The admission header is stripped before hashing — so the proof
     /// (which rides that header) never binds itself, and adding /
-    /// removing it leaves the digest unchanged.
+    /// removing it leaves the digest unchanged WHILE the relative
+    /// order of the surrounding headers is preserved.
     #[test]
-    fn digest_ignores_admission_header() {
-        let bare = req(vec![h("x", b"1")], b"body");
+    fn digest_ignores_admission_header_and_preserves_surrounding_order() {
+        let bare = req(vec![h("x", b"1"), h("y", b"2")], b"body");
+        // Proof header interleaved between x and y: stripping it must
+        // leave x-before-y intact, matching `bare`.
         let with_proof = req(
-            vec![h("x", b"1"), h(ORG_ADMISSION_HEADER, b"opaque-proof-bytes")],
+            vec![
+                h("x", b"1"),
+                h(ORG_ADMISSION_HEADER, b"opaque-proof-bytes"),
+                h("y", b"2"),
+            ],
             b"body",
         );
         assert_eq!(org_request_digest(&bare), org_request_digest(&with_proof));
 
-        // Even MULTIPLE admission headers are all stripped.
+        // Even MULTIPLE admission headers are all stripped, order kept.
         let with_two = req(
             vec![
                 h(ORG_ADMISSION_HEADER, b"p1"),
                 h("x", b"1"),
                 h(ORG_ADMISSION_HEADER, b"p2"),
+                h("y", b"2"),
             ],
             b"body",
         );
@@ -382,25 +401,46 @@ mod tests {
         assert!(!base.is_current(&poisoned));
     }
 
-    /// Golden: the digest is a stable, versioned value — pinned so a
-    /// cross-language caller (or the E2 Rust caller) can reproduce it
-    /// byte-for-byte. A change here is a wire break and must bump the
-    /// derive-key context.
+    /// A fixed fixture, with a multi-header + duplicate-header layout,
+    /// hashing to a specific service/deadline/flags/body.
+    fn golden_fixture() -> RpcRequestPayload {
+        RpcRequestPayload {
+            service: "oa2-echo".to_string(),
+            deadline_ns: 1_700_000_000_000_000_000,
+            flags: 0,
+            headers: vec![
+                h("content-type", b"application/json"),
+                h("x-idempotency", b"k1"),
+                // duplicate header, order-significant
+                h("x-tag", b"a"),
+                h("x-tag", b"b"),
+                // admission headers must be stripped, not hashed
+                h(ORG_ADMISSION_HEADER, b"opaque"),
+            ],
+            body: bytes::Bytes::from_static(b"hello"),
+        }
+    }
+
+    /// Golden: a LITERAL, hard-coded 32-byte digest (Kyra E1 audit) —
+    /// pinned so a cross-language caller (or the E2 Rust caller) must
+    /// reproduce it byte-for-byte over the wire. It is NOT recomputed
+    /// with this same implementation, so it actually catches an
+    /// encoding / context / ordering drift. A change here is a wire
+    /// break and must bump `ORG_RPC_REQUEST_DIGEST_CONTEXT`.
     #[test]
-    fn digest_golden_is_stable() {
-        let r = req(vec![h("content-type", b"application/json")], b"hello");
-        let got = org_request_digest(&r);
-        // Regenerate deterministically from the canonical encoding so
-        // the golden documents the exact bytes hashed.
-        let mut canonical = r.clone();
-        canonical.headers.retain(|(n, _)| n != ORG_ADMISSION_HEADER);
-        let mut encoded = Vec::new();
-        canonical.encode_into(&mut encoded);
-        assert_eq!(
-            got,
-            blake3::derive_key(ORG_RPC_REQUEST_DIGEST_CONTEXT, &encoded)
-        );
-        // And it is not the all-zero / trivial value.
+    fn digest_golden_is_literal_and_stable() {
+        const GOLDEN: [u8; 32] = [
+            0xce, 0x89, 0x3f, 0xa7, 0x73, 0x10, 0x92, 0x8e, 0x5b, 0xa7, 0x5d, 0x2b, 0xe3, 0x3a,
+            0x66, 0xb1, 0x8c, 0x0e, 0xae, 0x77, 0x90, 0xe1, 0xaa, 0xdf, 0x52, 0x26, 0xc7, 0x62,
+            0xac, 0x6f, 0x70, 0xbb,
+        ];
+        let got = org_request_digest(&golden_fixture());
+        assert_eq!(got, GOLDEN, "wire digest drifted: {got:02x?}");
         assert_ne!(got, [0u8; 32]);
+        // Reversing the duplicate x-tag headers changes the digest —
+        // the golden binds their order.
+        let mut reversed = golden_fixture();
+        reversed.headers.swap(2, 3);
+        assert_ne!(org_request_digest(&reversed), GOLDEN);
     }
 }
