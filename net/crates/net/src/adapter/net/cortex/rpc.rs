@@ -2106,7 +2106,13 @@ pub struct RpcStreamingContext {
 /// initial window).
 ///
 /// Bidi streaming plan (Phase B).
-pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u32) + Send + Sync + 'static>;
+/// Arguments: `(from_node, caller_origin, call_id, credits)`. R3-1 —
+/// the AEAD-authenticated `from_node` is carried so an upload grant is
+/// session-scoped: coalesced and published per `(from_node, origin,
+/// call_id)`, and (for a trusted direct route) delivered ONLY to the
+/// session that issued the call, never roster-fanned to a same-origin
+/// sibling whose request semaphore it would otherwise wrongly refill.
+pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u64, u32) + Send + Sync + 'static>;
 
 /// Server-side stream of inbound request chunk bodies for one
 /// client-streaming (or duplex) call. Yields one `Bytes` per
@@ -2137,6 +2143,9 @@ pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u32) + Send + Sync + 'sta
 pub struct RequestStream {
     inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     grant_emitter: Option<RpcRequestGrantEmitter>,
+    /// AEAD-authenticated session that issued this call (R3-1) — the
+    /// grant identity, so a grant refills only THIS call's semaphore.
+    from_node: u64,
     caller_origin: u64,
     call_id: u64,
 }
@@ -2145,16 +2154,19 @@ impl RequestStream {
     /// Visible to the fold (and only the fold) for constructing
     /// a stream tied to a specific receiver + caller. The
     /// `grant_emitter` is `None` when the caller didn't opt into
-    /// flow control; `Some(...)` when they did.
+    /// flow control; `Some(...)` when they did. `from_node` is the
+    /// authenticated session the fold bound the call to (R3-1).
     pub(crate) fn new(
         inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
         grant_emitter: Option<RpcRequestGrantEmitter>,
+        from_node: u64,
         caller_origin: u64,
         call_id: u64,
     ) -> Self {
         Self {
             inner,
             grant_emitter,
+            from_node,
             caller_origin,
             call_id,
         }
@@ -2175,7 +2187,7 @@ impl futures::Stream for RequestStream {
                 // fire-and-forget; missed grants are recovered
                 // by subsequent pulls.
                 if let Some(emit) = self.grant_emitter.as_ref() {
-                    emit(self.caller_origin, self.call_id, 1);
+                    emit(self.from_node, self.caller_origin, self.call_id, 1);
                 }
                 std::task::Poll::Ready(Some(bytes))
             }
@@ -3084,8 +3096,13 @@ impl RpcStreamingRequestFold {
                 } else {
                     None
                 };
-                let request_stream =
-                    RequestStream::new(rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+                let request_stream = RequestStream::new(
+                    rx,
+                    grant_emitter,
+                    from_node,
+                    meta.origin_hash,
+                    meta.seq_or_ts,
+                );
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
                     extract_trace_context(&payload.headers)
                 } else {
@@ -3500,8 +3517,13 @@ impl RpcDuplexFold {
                 } else {
                     None
                 };
-                let request_stream =
-                    RequestStream::new(req_rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+                let request_stream = RequestStream::new(
+                    req_rx,
+                    grant_emitter,
+                    from_node,
+                    meta.origin_hash,
+                    meta.seq_or_ts,
+                );
 
                 // Build the per-call response-side mpsc (existing
                 // server-streaming-response pattern). The handler
@@ -4684,6 +4706,68 @@ mod tests {
             }
             other => panic!("expected TooLarge {{ field=headers }}, got {other:?}"),
         }
+    }
+
+    /// R3-1: a `RequestStream` auto-grant carries the call's
+    /// AEAD-authenticated `from_node`, so the upload grant is
+    /// session-scoped — the fold binds each call to its own session, and
+    /// two calls sharing one entity/origin + caller-chosen call_id
+    /// produce grants with DISTINCT identities that cannot collapse and
+    /// refill each other's request semaphore.
+    ///
+    /// Red-witness: the pre-R3-1 emit dropped `from_node` (fired
+    /// `(origin, call_id, 1)`), so both sessions' grants collapsed to the
+    /// same `(origin, call_id)` — reproduced here by hardcoding
+    /// `from_node = 0` in the emit, which makes the two captured grants
+    /// identical and fails the distinctness assertion.
+    #[tokio::test]
+    async fn request_stream_auto_grant_carries_the_authenticated_from_node() {
+        use futures::StreamExt;
+
+        const ORIGIN: u64 = 0xBEEF;
+        const CALL: u64 = 7;
+        const NODE_A: u64 = 0xAAAA;
+        const NODE_B: u64 = 0xBBBB;
+
+        // A capturing grant emitter (production `RpcRequestGrantEmitter`
+        // signature) records every `(from_node, origin, call_id, credits)`.
+        type Grants = Arc<Mutex<Vec<(u64, u64, u64, u32)>>>;
+        let captured: Grants = Arc::new(Mutex::new(Vec::new()));
+        let mk_emitter = |sink: Grants| -> RpcRequestGrantEmitter {
+            Arc::new(move |from_node, origin, call_id, credits| {
+                sink.lock().push((from_node, origin, call_id, credits));
+            })
+        };
+
+        // Drive one poll of a RequestStream bound to `node`, over the same
+        // ORIGIN + CALL, and return the grant it fired.
+        async fn one_grant(node: u64, emit: RpcRequestGrantEmitter) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+            tx.send(Bytes::from_static(b"chunk"))
+                .await
+                .expect("queue chunk");
+            drop(tx);
+            let mut stream = RequestStream::new(rx, Some(emit), node, ORIGIN, CALL);
+            assert_eq!(
+                stream.next().await.as_deref(),
+                Some(&b"chunk"[..]),
+                "the stream must yield the queued chunk",
+            );
+        }
+
+        one_grant(NODE_A, mk_emitter(captured.clone())).await;
+        one_grant(NODE_B, mk_emitter(captured.clone())).await;
+
+        let grants = captured.lock().clone();
+        assert_eq!(
+            grants,
+            vec![(NODE_A, ORIGIN, CALL, 1), (NODE_B, ORIGIN, CALL, 1)],
+            "each poll fires ONE grant carrying that call's from_node",
+        );
+        assert_ne!(
+            grants[0], grants[1],
+            "two sessions over the same origin+call_id must produce DISTINCT grant identities",
+        );
     }
 
     /// 5/5 — RequestGrant round-trip + truncation rejection. The

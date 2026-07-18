@@ -1905,28 +1905,54 @@ fn add_request_grant_credits(sem: &tokio::sync::Semaphore, credits: u32) {
 /// returned emitter (mpsc sender count > 0). When the fold and all
 /// in-flight handlers release the emitter, `rx.recv` returns `None`
 /// and the drainer exits naturally.
+/// R3-1 routing policy for an upload REQUEST_GRANT. A grant is a
+/// server→caller frame on the caller's reply channel, so it funnels
+/// through the SAME session-scoped router as responses:
+///
+/// - a trusted direct route (`from_node != 0`) is `DirectOnly` to the
+///   authenticated session — the grant is DROPPED, never roster-fanned to
+///   a same-origin sibling, if that session vanished (the server fold
+///   binds continuation frames to the original session anyway, so a
+///   sibling's request semaphore must never be refilled by it);
+/// - a call with no trusted direct route (`from_node == 0`: loopback /
+///   relayed public) keeps the roster path so relayed public behavior is
+///   preserved.
+fn request_grant_route(from_node: u64) -> (Option<u64>, ResponseRouteFallback) {
+    if from_node != 0 {
+        (Some(from_node), ResponseRouteFallback::DirectOnly)
+    } else {
+        (None, ResponseRouteFallback::RosterOnStaleDirect)
+    }
+}
+
 fn build_request_grant_emitter(
     mesh: Arc<MeshNode>,
     service: String,
     server_origin: u64,
     diag_tag: &'static str,
 ) -> RpcRequestGrantEmitter {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u64, u32)>();
     tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
-            let mut summed: std::collections::HashMap<(u64, u64), u32> =
+            // R3-1: coalesce by the FULL session-scoped call identity
+            // `(from_node, caller_origin, call_id)`, never `(origin,
+            // call_id)` alone — two authenticated sessions that share one
+            // entity/origin and picked the same caller-chosen call_id no
+            // longer collapse into one grant that would refill the wrong
+            // call's upload semaphore.
+            let mut summed: std::collections::HashMap<(u64, u64, u64), u32> =
                 std::collections::HashMap::new();
-            let (caller, call_id, credits) = first;
-            summed.insert((caller, call_id), credits);
+            let (from_node, caller, call_id, credits) = first;
+            summed.insert((from_node, caller, call_id), credits);
             // Coalesce anything immediately queued behind the first
             // wake. Bounded by what the substrate has produced so
             // far; doesn't add latency since `try_recv` returns
             // immediately when the queue is empty.
-            while let Ok((caller, call_id, credits)) = rx.try_recv() {
-                let entry = summed.entry((caller, call_id)).or_insert(0);
+            while let Ok((from_node, caller, call_id, credits)) = rx.try_recv() {
+                let entry = summed.entry((from_node, caller, call_id)).or_insert(0);
                 *entry = entry.saturating_add(credits);
             }
-            for ((caller, call_id), credits) in summed {
+            for ((from_node, caller, call_id), credits) in summed {
                 let reply_channel_name = format!("{service}.replies.{caller:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
                     Ok(c) => c,
@@ -1939,14 +1965,29 @@ fn build_request_grant_emitter(
                         continue;
                     }
                 };
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, server_origin, call_id, 0);
-                let reply_channel_hash = reply_channel.hash();
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + 12);
+                // `meta ‖ grant`; `publish_response_to_caller` inserts the
+                // RpcRouteV1 discriminator centrally (matches the response
+                // path), so no manual `encode_rpc_route` here.
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
                 buf.extend_from_slice(&meta.to_bytes());
-                encode_rpc_route(&mut buf, reply_channel_hash);
                 buf.extend_from_slice(&encode_request_grant(call_id, credits));
-                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                let (target_hint, fallback) = request_grant_route(from_node);
+                if let Err(e) = publish_response_to_caller(
+                    &mesh,
+                    caller,
+                    target_hint,
+                    &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
+                    Bytes::from(buf),
+                    fallback,
+                )
+                .await
+                {
                     tracing::warn!(
                         error = %e,
                         caller_origin = format!("{:#x}", caller),
@@ -1957,11 +1998,11 @@ fn build_request_grant_emitter(
             }
         }
     });
-    Arc::new(move |caller_origin, call_id, credits| {
+    Arc::new(move |from_node, caller_origin, call_id, credits| {
         // Send failure means the drainer has exited (all sender
         // clones dropped, then we somehow cloned a stale one).
         // Treat as a no-op — the call is tearing down anyway.
-        let _ = tx.send((caller_origin, call_id, credits));
+        let _ = tx.send((from_node, caller_origin, call_id, credits));
     })
 }
 
@@ -5010,6 +5051,33 @@ mod roster_fallback_tests {
     use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    /// R3-1: the upload-grant routing policy. A trusted authenticated
+    /// session (`from_node != 0`) gets a `DirectOnly` grant aimed at its
+    /// OWN node — so a grant can never roster-fan to a same-origin sibling
+    /// and refill the wrong call's request semaphore. The loopback /
+    /// relayed-public sentinel (`from_node == 0`, no trusted direct route)
+    /// keeps the roster path. Composes with
+    /// [`direct_only_frame_drops_while_normal_response_rosters_when_peer_gone`],
+    /// which proves `DirectOnly` delivers ONLY to the target and drops
+    /// otherwise — together: a grant reaches only its initiating session.
+    ///
+    /// Red-witness: reverting the grant drainer to an unconditional roster
+    /// `mesh.publish` (pre-R3-1) makes this return the roster policy for a
+    /// real session.
+    #[test]
+    fn request_grant_route_is_direct_only_for_authenticated_sessions() {
+        assert_eq!(
+            request_grant_route(0xABCD),
+            (Some(0xABCD), ResponseRouteFallback::DirectOnly),
+            "a real authenticated session must get a DirectOnly grant to its own node",
+        );
+        assert_eq!(
+            request_grant_route(0),
+            (None, ResponseRouteFallback::RosterOnStaleDirect),
+            "the loopback/relayed sentinel keeps the roster path",
+        );
+    }
 
     async fn build_server() -> Arc<MeshNode> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
