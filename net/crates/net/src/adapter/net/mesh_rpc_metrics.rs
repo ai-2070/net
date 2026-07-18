@@ -124,6 +124,12 @@ pub struct ServiceMetricsAtomic {
     /// fold rather than admitted and then silently starved of grants. A
     /// nonzero value means a relayed flow-controlled caller was refused.
     pub relayed_flow_controlled_rejected_total: AtomicU64,
+    /// Inbound frames dropped at the shared bridge preflight because the
+    /// packet (transport) origin did not equal the payload (EventMeta) origin
+    /// — a direct peer stamping a forged payload origin (Kyra Gate-3). Dropped
+    /// BEFORE capability admission, response-cache mutation, or fold execution,
+    /// so the fold never runs under an origin the packet did not authenticate.
+    pub packet_origin_mismatch_dropped_total: AtomicU64,
 }
 
 impl ServiceMetricsAtomic {
@@ -148,6 +154,7 @@ impl ServiceMetricsAtomic {
             streaming_chunks_dropped_total: AtomicU64::new(0),
             capability_denied_total: AtomicU64::new(0),
             relayed_flow_controlled_rejected_total: AtomicU64::new(0),
+            packet_origin_mismatch_dropped_total: AtomicU64::new(0),
         }
     }
 
@@ -348,6 +355,9 @@ impl RpcMetricsRegistry {
                 relayed_flow_controlled_rejected_total: m
                     .relayed_flow_controlled_rejected_total
                     .load(Ordering::Relaxed),
+                packet_origin_mismatch_dropped_total: m
+                    .packet_origin_mismatch_dropped_total
+                    .load(Ordering::Relaxed),
             });
         }
         services.sort_by(|a, b| a.service.cmp(&b.service));
@@ -449,6 +459,10 @@ pub struct ServiceMetrics {
     /// caller was dropped before the fold — relayed flow-controlled nRPC is
     /// unsupported until end-to-end recipient correlation exists.
     pub relayed_flow_controlled_rejected_total: u64,
+    /// Inbound frames dropped at the shared bridge preflight because the
+    /// packet origin != the payload (EventMeta) origin (a forged payload
+    /// origin). Dropped before capability admission, cache mutation, or fold.
+    pub packet_origin_mismatch_dropped_total: u64,
 }
 
 impl RpcMetricsSnapshot {
@@ -687,6 +701,21 @@ impl RpcMetricsSnapshot {
                 "nrpc_relayed_flow_controlled_rejected_total{{service=\"{}\"}} {}",
                 escape_label(&s.service),
                 s.relayed_flow_controlled_rejected_total
+            );
+        }
+
+        // packet_origin_mismatch_dropped_total — frames dropped at preflight
+        // because the packet origin != the payload (EventMeta) origin.
+        out.push_str(
+            "# HELP nrpc_packet_origin_mismatch_dropped_total Inbound frames dropped at the bridge preflight because the packet (transport) origin did not equal the payload (EventMeta) origin.\n",
+        );
+        out.push_str("# TYPE nrpc_packet_origin_mismatch_dropped_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_packet_origin_mismatch_dropped_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.packet_origin_mismatch_dropped_total
             );
         }
 

@@ -34,20 +34,20 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, PublishConfig};
-use super::cortex::{
+use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome, ServiceMetricsAtomic};
+use crate::adapter::net::cortex::{
     build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant,
-    peek_request_service, EventMeta, RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold,
-    RpcClientStreamingHandler, RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler,
-    RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent, RpcRequestChunkPayload,
-    RpcRequestGrantEmitter, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload,
-    RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler, RpcStreamingRequestFold,
-    StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
+    parse_request_window_initial, peek_request_service, EventMeta, RpcAsyncResponseEmitter,
+    RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler, RpcContext, RpcDuplexFold,
+    RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent,
+    RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload, RpcResponseEmitter,
+    RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler,
+    RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
     DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT, DISPATCH_RPC_STREAM_GRANT,
     EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_PROPAGATE_TRACE,
     FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL,
-    HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_ROUTE_V1_SIZE,
+    HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_FRAME_BODY_OFFSET, RPC_ROUTE_V1_SIZE,
 };
-use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome, ServiceMetricsAtomic};
 use crate::error::AdapterError;
 
 use super::mesh::{MeshNode, PeerPublishOutcome};
@@ -556,8 +556,8 @@ fn classify_request_grant_route(
 fn streaming_response_is_terminal(resp: &RpcResponsePayload) -> bool {
     resp.status != RpcStatus::Ok
         || resp.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case(super::cortex::HEADER_NRPC_STREAMING)
-                && value.as_slice() == super::cortex::HEADER_NRPC_STREAMING_END
+            name.eq_ignore_ascii_case(crate::adapter::net::cortex::HEADER_NRPC_STREAMING)
+                && value.as_slice() == crate::adapter::net::cortex::HEADER_NRPC_STREAMING_END
         })
 }
 
@@ -606,6 +606,7 @@ fn bridge_preflight(
     inbound: &RpcInboundEvent,
     expected_service: &str,
     tag: &str,
+    metrics: &ServiceMetricsAtomic,
 ) -> BridgePreflight {
     if is_cross_service_request(&inbound.payload, expected_service) {
         return BridgePreflight::Drop;
@@ -618,6 +619,33 @@ fn bridge_preflight(
         return BridgePreflight::Drop;
     };
     let from_node = inbound.from_node;
+    // Gate-3: bind the packet (transport) origin to the payload (EventMeta)
+    // origin. The response-route cache keys on the packet origin
+    // (`inbound.origin_hash`), while every fold keys calls, continuations, and
+    // grant emitters on the payload origin (`meta.origin_hash`). A direct peer
+    // that stamps a DIFFERENT payload origin than its authenticated packet
+    // origin would pass the packet-origin trust check yet run the fold under a
+    // forged origin (and split response routing between the two keys). Drop
+    // such a frame BEFORE capability admission, cache mutation, or fold
+    // execution. Loopback (`from_node == 0`) is exempt — its test/local
+    // metadata need not mirror production wire traffic.
+    if from_node != 0 && inbound.origin_hash != meta.origin_hash {
+        metrics
+            .packet_origin_mismatch_dropped_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            service = expected_service,
+            tag = tag,
+            from_node = format!("{from_node:#x}"),
+            packet_origin = format!("{:#x}", inbound.origin_hash),
+            payload_origin = format!("{:#x}", meta.origin_hash),
+            call_id = meta.seq_or_ts,
+            "nrpc: dropping frame whose packet origin != payload (EventMeta) origin \
+             before admission — a direct peer must not run the fold under a forged \
+             payload origin",
+        );
+        return BridgePreflight::Drop;
+    }
     if from_node != 0
         && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
             mesh.capability_fold(),
@@ -655,7 +683,7 @@ async fn emit_capability_denial(
     call_id: u64,
     from_node: u64,
 ) {
-    let resp = super::cortex::RpcResponsePayload {
+    let resp = crate::adapter::net::cortex::RpcResponsePayload {
         status: RpcStatus::CapabilityDenied,
         headers: vec![],
         body: Bytes::from(format!(
@@ -663,7 +691,7 @@ async fn emit_capability_denial(
         )),
     };
     let meta = EventMeta::new(
-        super::cortex::DISPATCH_RPC_RESPONSE,
+        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
         0,
         mesh.identity_origin_hash(),
         call_id,
@@ -744,6 +772,23 @@ fn reject_relayed_flow_controlled_request(
     // Classify (and reject) only the initial REQUEST; CHUNK / CANCEL / GRANT
     // control frames inherit the call the REQUEST already admitted-or-dropped.
     if meta.dispatch != DISPATCH_RPC_REQUEST {
+        return false;
+    }
+    // Reject ONLY a REQUEST that actually enables upload flow control: without
+    // a valid request-window header the fold creates no grant emitter (the
+    // unbounded-upload fast path), so a relayed/unpinned caller needs no secure
+    // grant and is admitted. Decode with the canonical decoder and use the SAME
+    // predicate the fold uses (`parse_request_window_initial`) — no second
+    // parser, identical "malformed header == absent" semantics. A too-short or
+    // undecodable frame is left to the fold, which rejects it.
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET {
+        return false;
+    }
+    let flow_controlled = matches!(
+        RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..)),
+        Ok(request) if parse_request_window_initial(&request.headers).is_some()
+    );
+    if !flow_controlled {
         return false;
     }
     let authenticated_peer_origin = mesh
@@ -1841,7 +1886,7 @@ impl futures::Stream for DuplexCallRaw {
 /// `completed = true` so Drop becomes a no-op (the server already
 /// finished and removed its in-flight entry).
 struct UnaryCallGuard {
-    pending: Arc<super::cortex::RpcClientPending>,
+    pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
@@ -2274,7 +2319,7 @@ async fn publish_response_to_caller(
     // funnels through here, so insert the RpcRouteV1 discriminator —
     // the reply channel's canonical hash — once, centrally. The
     // caller's mesh ingress selects exactly this dispatcher.
-    let payload = super::cortex::insert_rpc_route(payload, reply_channel_hash);
+    let payload = crate::adapter::net::cortex::insert_rpc_route(payload, reply_channel_hash);
     // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
     // AEAD-authenticated session peer): it must never resolve a
     // destination through the origin reverse-index, which could point at
@@ -2607,7 +2652,7 @@ impl MeshNode {
             // payload) synchronously — pure CPU, no await — then hand it to
             // the drainer.
             let meta = EventMeta::new(
-                super::cortex::DISPATCH_RPC_RESPONSE,
+                crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
                 0,
                 server_origin,
                 call_id,
@@ -2709,6 +2754,7 @@ impl MeshNode {
                     &inbound,
                     &service_for_bridge,
                     &tag,
+                    &metrics_for_bridge,
                 ) {
                     BridgePreflight::Proceed => {}
                     BridgePreflight::Drop => continue,
@@ -2806,7 +2852,7 @@ impl MeshNode {
     }
 
     /// Streaming variant of [`Self::serve_rpc`]. The handler
-    /// receives an [`RpcResponseSink`](super::cortex::RpcResponseSink)
+    /// receives an [`RpcResponseSink`](crate::adapter::net::cortex::RpcResponseSink)
     /// it writes chunks to via `sink.send(body)`; returning
     /// `Ok(())` closes the stream cleanly, `Err(_)` closes with
     /// an error frame.
@@ -2859,7 +2905,7 @@ impl MeshNode {
                         }
                     };
                     let meta = EventMeta::new(
-                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
                         0,
                         server_origin,
                         call_id,
@@ -2945,6 +2991,7 @@ impl MeshNode {
                     &inbound,
                     &service_for_bridge,
                     &tag,
+                    &metrics_for_bridge,
                 ) {
                     BridgePreflight::Proceed => {}
                     BridgePreflight::Drop => continue,
@@ -3042,7 +3089,7 @@ impl MeshNode {
                         }
                     };
                     let meta = EventMeta::new(
-                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
                         0,
                         server_origin,
                         call_id,
@@ -3138,6 +3185,7 @@ impl MeshNode {
                     &inbound,
                     &service_for_bridge,
                     &tag,
+                    &metrics_for_bridge,
                 ) {
                     BridgePreflight::Proceed => {
                         // Gate-3: a relayed/untrusted caller cannot be issued
@@ -3365,7 +3413,7 @@ impl MeshNode {
                         }
                     };
                     let meta = EventMeta::new(
-                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
                         0,
                         server_origin,
                         call_id,
@@ -3450,6 +3498,7 @@ impl MeshNode {
                     &inbound,
                     &service_for_bridge,
                     &tag,
+                    &metrics_for_bridge,
                 ) {
                     BridgePreflight::Proceed => {
                         // Gate-3: a relayed/untrusted caller cannot be issued
@@ -4636,7 +4685,7 @@ const CALL_ID_ENTROPY_POOL_BYTES: usize = 64 * 8;
 // ============================================================================
 
 impl MeshNode {
-    fn rpc_client_pending(&self) -> Arc<super::cortex::RpcClientPending> {
+    fn rpc_client_pending(&self) -> Arc<crate::adapter::net::cortex::RpcClientPending> {
         self.rpc_client_pending_arc()
     }
     fn identity_origin_hash(&self) -> u64 {
@@ -5278,45 +5327,85 @@ mod roster_fallback_tests {
         );
     }
 
-    /// Gate-3 (production seam): the flow-controlled serve bridges reject a
-    /// relayed/untrusted upload REQUEST BEFORE the fold via
-    /// [`reject_relayed_flow_controlled_request`]. A caller whose pinned
-    /// last-hop origin does NOT match its claimed origin (a relayed frame) is
-    /// dropped and metered; a directly-authenticated caller and the loopback
-    /// sentinel are admitted; only the initial REQUEST is classified, so
-    /// metering stays per-call. The bridge does `if reject(..) { continue }`,
-    /// so a `true` here means the fold / handler / grant emitter never run and
-    /// nothing is published — no roster reflection through the claimed origin.
+    /// Build a canonical REQUEST frame (`EventMeta ‖ RpcRouteV1 ‖
+    /// RpcRequestPayload`) with a chosen payload (EventMeta) origin, call_id,
+    /// dispatch, flags, and optional upload-window header — the exact shape a
+    /// serve fold decodes at `RPC_FRAME_BODY_OFFSET`.
+    fn rpc_request_frame(
+        payload_origin: u64,
+        call_id: u64,
+        dispatch: u8,
+        service: &str,
+        flags: u16,
+        window: Option<&[u8]>,
+    ) -> Bytes {
+        let headers = match window {
+            Some(w) => vec![(HEADER_NRPC_REQUEST_WINDOW_INITIAL.to_string(), w.to_vec())],
+            None => vec![],
+        };
+        let payload = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags,
+            headers,
+            body: Bytes::new(),
+        };
+        let mut buf = EventMeta::new(dispatch, 0, payload_origin, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut buf, 0);
+        buf.extend_from_slice(&payload.encode());
+        Bytes::from(buf)
+    }
+
+    /// Gate-3: [`reject_relayed_flow_controlled_request`] rejects a REQUEST
+    /// ONLY when it is both relayed/untrusted (pinned last-hop origin != the
+    /// claimed origin) AND actually flow-controlled (a valid upload-window
+    /// header). Without a valid window the upload is the unbounded fast path
+    /// with no grant emitter, so even a relayed caller is admitted; a direct
+    /// or loopback caller is always admitted; only the initial REQUEST is
+    /// classified. Uses the SAME decoder + `parse_request_window_initial`
+    /// predicate as the fold (no divergent parser).
     ///
-    /// Red-witness: classifying from `from_node != 0` (dropping the pinned-
-    /// origin equality) admits the relayed caller — the first assert fails and
-    /// the counter never moves.
+    /// Red-witness: rejecting every initial REQUEST (ignoring the window
+    /// header) fails the "relayed + absent/malformed window → admitted" cases;
+    /// classifying from `from_node != 0` fails the relayed case.
     #[tokio::test]
-    async fn reject_relayed_flow_controlled_request_drops_only_relayed_callers() {
+    async fn reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads() {
         use std::sync::atomic::Ordering;
         let server = build_server().await;
         let metrics = server.rpc_metrics_arc().for_service("svc.upload");
         const DIRECT_NODE: u64 = 0x51;
         const RELAY_NODE: u64 = 0x52;
 
-        // Pin two authenticated peers with known, distinct origins.
         let direct_entity = EntityKeypair::generate().entity_id().clone();
         let relay_entity = EntityKeypair::generate().entity_id().clone();
         let direct_origin = direct_entity.origin_hash();
         let relay_origin = relay_entity.origin_hash();
         server.test_pin_peer_entity(DIRECT_NODE, direct_entity);
         server.test_pin_peer_entity(RELAY_NODE, relay_entity);
+        let victim_origin = relay_origin ^ 0xFFFF_FFFF; // guaranteed distinct
 
         let chan = ChannelId::new(ChannelName::new("svc.upload.requests").unwrap()).hash();
-        let frame =
-            |from_node: u64, claimed_origin: u64, call_id: u64, dispatch: u8| RpcInboundEvent {
+        let frame = |from_node: u64,
+                     claimed_origin: u64,
+                     call_id: u64,
+                     dispatch: u8,
+                     window: Option<&[u8]>| {
+            RpcInboundEvent {
                 channel_hash: chan,
                 origin_hash: claimed_origin,
                 from_node,
-                payload: Bytes::copy_from_slice(
-                    &EventMeta::new(dispatch, 0, claimed_origin, call_id, 0).to_bytes(),
+                payload: rpc_request_frame(
+                    claimed_origin,
+                    call_id,
+                    dispatch,
+                    "svc.upload",
+                    FLAG_RPC_CLIENT_STREAMING_REQUEST,
+                    window,
                 ),
-            };
+            }
+        };
         let reject = |ev: &RpcInboundEvent| {
             reject_relayed_flow_controlled_request(
                 &server,
@@ -5326,57 +5415,354 @@ mod roster_fallback_tests {
                 "nrpc:svc.upload",
             )
         };
-
-        // Direct: pinned origin == claimed origin → admitted (not rejected).
-        assert!(
-            !reject(&frame(DIRECT_NODE, direct_origin, 1, DISPATCH_RPC_REQUEST)),
-            "a directly authenticated caller must be admitted",
-        );
-        // Loopback sentinel (from_node == 0) → admitted.
-        assert!(
-            !reject(&frame(0, 0xDEAD_BEEF, 2, DISPATCH_RPC_REQUEST)),
-            "the loopback/test sentinel must be admitted",
-        );
-        assert_eq!(
+        let rejected = || {
             metrics
                 .relayed_flow_controlled_rejected_total
-                .load(Ordering::Relaxed),
-            0,
-            "admitted callers must not bump the rejection counter",
-        );
+                .load(Ordering::Relaxed)
+        };
 
-        // Relayed: pinned last-hop origin != claimed caller origin → rejected.
-        let victim_origin = relay_origin ^ 0xFFFF_FFFF; // guaranteed distinct
+        // Relayed + VALID upload-window header → rejected (metric +1).
         assert!(
-            reject(&frame(RELAY_NODE, victim_origin, 3, DISPATCH_RPC_REQUEST)),
-            "a relayed caller (pinned origin != claimed origin) must be rejected before the fold",
+            reject(&frame(
+                RELAY_NODE,
+                victim_origin,
+                1,
+                DISPATCH_RPC_REQUEST,
+                Some(b"32")
+            )),
+            "a relayed flow-controlled caller must be rejected before the fold",
         );
         assert_eq!(
-            metrics
-                .relayed_flow_controlled_rejected_total
-                .load(Ordering::Relaxed),
+            rejected(),
             1,
-            "the relayed rejection bumps the dedicated counter exactly once",
+            "the relayed flow-controlled REQUEST metered once"
         );
 
-        // A CHUNK from the same relayed session is left to the fold (which
-        // ignores frames for a call it never admitted), so metering stays
-        // per-call, not per-frame.
+        // Relayed + ABSENT window → admitted (unbounded upload, no grant path).
+        assert!(
+            !reject(&frame(
+                RELAY_NODE,
+                victim_origin,
+                2,
+                DISPATCH_RPC_REQUEST,
+                None
+            )),
+            "a relayed caller without a window header is unbounded-upload and admitted",
+        );
+        // Relayed + MALFORMED window → admitted (fold treats it as absent).
         assert!(
             !reject(&frame(
                 RELAY_NODE,
                 victim_origin,
                 3,
-                DISPATCH_RPC_REQUEST_CHUNK
+                DISPATCH_RPC_REQUEST,
+                Some(b"not-a-number")
+            )),
+            "a malformed window header parses as absent, matching the fold",
+        );
+        // Direct + valid window → admitted (pinned origin == claimed).
+        assert!(
+            !reject(&frame(
+                DIRECT_NODE,
+                direct_origin,
+                4,
+                DISPATCH_RPC_REQUEST,
+                Some(b"32")
+            )),
+            "a directly authenticated flow-controlled caller is admitted",
+        );
+        // Loopback + valid window → admitted.
+        assert!(
+            !reject(&frame(0, 0xDEAD_BEEF, 5, DISPATCH_RPC_REQUEST, Some(b"32"))),
+            "the loopback sentinel is admitted",
+        );
+        // A CHUNK from the relayed session (even with a window) → not classified.
+        assert!(
+            !reject(&frame(
+                RELAY_NODE,
+                victim_origin,
+                1,
+                DISPATCH_RPC_REQUEST_CHUNK,
+                Some(b"32")
             )),
             "only the initial REQUEST is classified; control frames pass through",
+        );
+
+        assert_eq!(
+            rejected(),
+            1,
+            "only the one relayed flow-controlled REQUEST was metered"
+        );
+    }
+
+    /// A client-streaming handler that records each invocation.
+    struct RanClientStream(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::adapter::net::cortex::RpcClientStreamingHandler for RanClientStream {
+        async fn call(
+            &self,
+            _ctx: crate::adapter::net::cortex::RpcStreamingContext,
+            mut requests: crate::adapter::net::cortex::RequestStream,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            use futures::StreamExt;
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            while requests.next().await.is_some() {}
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::new(),
+            })
+        }
+    }
+
+    /// A duplex handler that records each invocation.
+    struct RanDuplex(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::adapter::net::cortex::RpcDuplexHandler for RanDuplex {
+        async fn call(
+            &self,
+            _ctx: crate::adapter::net::cortex::RpcStreamingContext,
+            mut requests: crate::adapter::net::cortex::RequestStream,
+            _responses: crate::adapter::net::cortex::RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            use futures::StreamExt;
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            while requests.next().await.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// Poll `get` until it reaches at least `want`, bounded (~2s).
+    async fn wait_until_at_least(get: impl Fn() -> u64, want: u64) -> bool {
+        for _ in 0..200 {
+            if get() >= want {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        get() >= want
+    }
+
+    /// Gate-3 end-to-end (client-streaming): drive the REAL registered
+    /// `serve_rpc_client_stream` bridge with crafted `RpcInboundEvent`s and
+    /// assert it rejects BEFORE the fold. A packet/payload origin mismatch and
+    /// a relayed flow-controlled REQUEST are dropped (metered; the handler
+    /// never runs); a relayed REQUEST without a window header and a directly-
+    /// authenticated flow-controlled REQUEST are admitted (the handler runs).
+    /// Proves the bridge actually runs the checks BEFORE `apply_inbound` — a
+    /// pure helper test could not (it would stay green if a bridge moved the
+    /// rejection after the fold or stopped calling it).
+    #[tokio::test]
+    async fn client_stream_bridge_rejects_before_fold_end_to_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = build_server().await;
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_client_stream("cs", std::sync::Arc::new(RanClientStream(ran.clone())))
+            .expect("serve client-stream");
+        let channel_hash = serve.channel_hash;
+        let metrics = server.rpc_metrics_arc().for_service("cs");
+
+        const DIRECT_NODE: u64 = 0x61;
+        const RELAY_NODE: u64 = 0x62;
+        let direct_entity = EntityKeypair::generate().entity_id().clone();
+        let relay_entity = EntityKeypair::generate().entity_id().clone();
+        let direct_origin = direct_entity.origin_hash();
+        let relay_origin = relay_entity.origin_hash();
+        server.test_pin_peer_entity(DIRECT_NODE, direct_entity);
+        server.test_pin_peer_entity(RELAY_NODE, relay_entity);
+        let victim = relay_origin ^ 0xFFFF_FFFF;
+
+        let event = |from_node: u64,
+                     packet_origin: u64,
+                     payload_origin: u64,
+                     call_id: u64,
+                     window: Option<&[u8]>| {
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: packet_origin,
+                from_node,
+                payload: rpc_request_frame(
+                    payload_origin,
+                    call_id,
+                    DISPATCH_RPC_REQUEST,
+                    "cs",
+                    FLAG_RPC_CLIENT_STREAMING_REQUEST,
+                    window,
+                ),
+            }
+        };
+
+        // 1. Packet origin != payload origin (direct node) → dropped before fold.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(DIRECT_NODE, direct_origin, victim, 1, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(
+                || metrics
+                    .packet_origin_mismatch_dropped_total
+                    .load(Ordering::Relaxed),
+                1
+            )
+            .await,
+            "an origin-mismatch frame is dropped and metered",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the handler must not run for an origin-mismatch frame",
+        );
+
+        // 2. Relayed (packet == payload == victim; pinned relay origin != victim),
+        //    flow-controlled → rejected before fold.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(RELAY_NODE, victim, victim, 2, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(
+                || metrics
+                    .relayed_flow_controlled_rejected_total
+                    .load(Ordering::Relaxed),
+                1
+            )
+            .await,
+            "a relayed flow-controlled frame is rejected and metered",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the handler must not run for a relayed flow-controlled frame",
+        );
+
+        // 3. Relayed but NO window header → admitted (unbounded upload); handler runs.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(RELAY_NODE, victim, victim, 3, None)
+        ));
+        assert!(
+            wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 1).await,
+            "a relayed non-flow-controlled REQUEST is admitted and the handler runs",
+        );
+
+        // 4. Direct, flow-controlled → admitted; handler runs (2 total).
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(DIRECT_NODE, direct_origin, direct_origin, 4, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 2).await,
+            "a direct flow-controlled REQUEST is admitted and the handler runs",
+        );
+
+        assert_eq!(
+            metrics
+                .packet_origin_mismatch_dropped_total
+                .load(Ordering::Relaxed),
+            1,
         );
         assert_eq!(
             metrics
                 .relayed_flow_controlled_rejected_total
                 .load(Ordering::Relaxed),
             1,
-            "a relayed control frame must not re-meter",
+        );
+    }
+
+    /// Gate-3 end-to-end (duplex): the duplex bridge likewise rejects a
+    /// packet/payload origin mismatch and a relayed flow-controlled REQUEST
+    /// BEFORE the fold, and admits a directly-authenticated flow-controlled
+    /// REQUEST.
+    #[tokio::test]
+    async fn duplex_bridge_rejects_before_fold_end_to_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = build_server().await;
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_duplex("dx", std::sync::Arc::new(RanDuplex(ran.clone())))
+            .expect("serve duplex");
+        let channel_hash = serve.channel_hash;
+        let metrics = server.rpc_metrics_arc().for_service("dx");
+
+        const DIRECT_NODE: u64 = 0x71;
+        const RELAY_NODE: u64 = 0x72;
+        let direct_entity = EntityKeypair::generate().entity_id().clone();
+        let relay_entity = EntityKeypair::generate().entity_id().clone();
+        let direct_origin = direct_entity.origin_hash();
+        let relay_origin = relay_entity.origin_hash();
+        server.test_pin_peer_entity(DIRECT_NODE, direct_entity);
+        server.test_pin_peer_entity(RELAY_NODE, relay_entity);
+        let victim = relay_origin ^ 0xFFFF_FFFF;
+        let dx_flags = FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
+
+        let event = |from_node: u64,
+                     packet_origin: u64,
+                     payload_origin: u64,
+                     call_id: u64,
+                     window: Option<&[u8]>| {
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: packet_origin,
+                from_node,
+                payload: rpc_request_frame(
+                    payload_origin,
+                    call_id,
+                    DISPATCH_RPC_REQUEST,
+                    "dx",
+                    dx_flags,
+                    window,
+                ),
+            }
+        };
+
+        // Origin mismatch → dropped before fold.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(DIRECT_NODE, direct_origin, victim, 1, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(
+                || metrics
+                    .packet_origin_mismatch_dropped_total
+                    .load(Ordering::Relaxed),
+                1
+            )
+            .await,
+            "an origin-mismatch frame is dropped and metered on the duplex bridge",
+        );
+        // Relayed flow-controlled → rejected before fold.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(RELAY_NODE, victim, victim, 2, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(
+                || metrics
+                    .relayed_flow_controlled_rejected_total
+                    .load(Ordering::Relaxed),
+                1
+            )
+            .await,
+            "a relayed flow-controlled frame is rejected and metered on the duplex bridge",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the duplex handler must not run for a rejected frame",
+        );
+
+        // Direct flow-controlled → admitted; handler runs.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(DIRECT_NODE, direct_origin, direct_origin, 3, Some(b"32"))
+        ));
+        assert!(
+            wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 1).await,
+            "a direct flow-controlled duplex REQUEST is admitted and the handler runs",
         );
     }
 

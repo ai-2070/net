@@ -12539,6 +12539,37 @@ impl MeshNode {
             .unwrap_or(false)
     }
 
+    /// Test-only: deliver a synthetic `RpcInboundEvent` to the registered serve
+    /// bridge for `channel_hash`, exactly as the packet-ingress path does — so
+    /// a test can drive the REAL bridge task (preflight → reject → fold) with a
+    /// crafted frame that the honest `call*` path could never produce (e.g. a
+    /// packet/payload origin mismatch, or a relayed caller). Returns `true` iff
+    /// a matching dispatcher was found and invoked. The dispatcher snapshot +
+    /// lock release mirror the production ingress path (mesh.rs ingress).
+    #[cfg(feature = "cortex")]
+    pub fn deliver_rpc_inbound_for_test(
+        &self,
+        channel_hash: ChannelHash,
+        event: crate::adapter::net::cortex::RpcInboundEvent,
+    ) -> bool {
+        let dispatcher = {
+            let Some(entry) = self.rpc_inbound_dispatchers.get(&(channel_hash as u16)) else {
+                return false;
+            };
+            entry
+                .iter()
+                .find(|(c, _, _)| *c == channel_hash)
+                .map(|(_, _, d)| d.clone())
+        };
+        match dispatcher {
+            Some(d) => {
+                d(event);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Per-Mesh shared `RpcClientPending` — accessor for the
     /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
     /// RESPONSE events live here.
