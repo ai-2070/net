@@ -104,7 +104,7 @@ impl<H: RpcHandler> Loopback<H> {
         // need a separate handle on the fold — `pending` is the
         // shared state that both sides observe.
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let ev = response_event(origin, call_id, &resp);
             // Drive the client fold synchronously. In the real
             // Mesh wire-up the emit closure publishes the RESPONSE

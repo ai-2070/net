@@ -475,7 +475,10 @@ fn cache_authenticated_response_destination(
         // sessions sharing one entity/origin route each response to the
         // node that issued THAT call, rather than clobbering each other.
         if let Some(m) = meta {
-            cache.insert((inbound.origin_hash, m.seq_or_ts), inbound.from_node);
+            cache.insert(
+                (inbound.from_node, inbound.origin_hash, m.seq_or_ts),
+                inbound.from_node,
+            );
         }
     }
 }
@@ -1989,7 +1992,7 @@ fn build_request_grant_emitter(
 /// distinct `(origin, call_id)` keys and amplify server memory. The LRU
 /// caps the footprint; eviction costs only a response-path cache miss
 /// (roster fallback), never correctness.
-type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64), u64>>;
+type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64, u64), u64>>;
 
 /// Capacity bound for the per-`serve_rpc` caller-keyed caches
 /// ([`RpcOriginNodeCache`] and the §8b reply-channel cache). Sized for the
@@ -2347,8 +2350,8 @@ impl MeshNode {
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
         let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
-        let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
+        let emit: RpcResponseEmitter = Arc::new(move |from_node, caller_origin, call_id, resp| {
+            let target_hint = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
             let cached = match reply_channel_cache.get(caller_origin) {
@@ -2410,7 +2413,7 @@ impl MeshNode {
             // AV-4 item 4: a unary call emits exactly one, always-
             // terminal RESPONSE — retire its cached response route now
             // (target_hint for THIS response was already captured above).
-            origin_node_cache_for_emit.remove((caller_origin, call_id));
+            origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
         });
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
@@ -2608,63 +2611,65 @@ impl MeshNode {
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         // Async emit so the streaming fold's pump can `.await` each
         // publish — guarantees per-call chunk ordering on the wire.
-        let emit: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let mesh = Arc::clone(&mesh_for_emit);
-            let service = service_for_emit.clone();
-            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
-            // AV-4 item 4: a streaming call fires many RESPONSE frames;
-            // retire its cached route only on the terminal frame (the
-            // direct hint for THIS frame was already captured above).
-            if streaming_response_is_terminal(&resp) {
-                origin_node_cache_for_emit.remove((caller_origin, call_id));
-            }
-            Box::pin(async move {
-                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                let reply_channel = match ChannelName::new(&reply_channel_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = %reply_channel_name,
+        let emit: RpcAsyncResponseEmitter =
+            Arc::new(move |from_node, caller_origin, call_id, resp| {
+                let mesh = Arc::clone(&mesh_for_emit);
+                let service = service_for_emit.clone();
+                let target_hint =
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                // AV-4 item 4: a streaming call fires many RESPONSE frames;
+                // retire its cached route only on the terminal frame (the
+                // direct hint for THIS frame was already captured above).
+                if streaming_response_is_terminal(&resp) {
+                    origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
+                }
+                Box::pin(async move {
+                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_streaming: invalid reply channel name");
-                        return;
-                    }
-                };
-                let meta = EventMeta::new(
-                    super::cortex::DISPATCH_RPC_RESPONSE,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                buf.extend_from_slice(&meta.to_bytes());
-                resp.encode_into(&mut buf);
-                // PERF_AUDIT §3.10: compute hash + stream_id at the
-                // call site. These legacy streaming paths don't yet
-                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
-                // wiring them up is a follow-up — for now the
-                // compute happens here per response, same as the
-                // pre-fix in-function shape.
-                let reply_channel_id = ChannelId::new(reply_channel.clone());
-                let reply_channel_hash = reply_channel_id.hash();
-                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
-                if let Err(e) = publish_response_to_caller(
-                    &mesh,
-                    caller_origin,
-                    target_hint,
-                    &reply_channel,
-                    reply_channel_hash,
-                    reply_stream_id,
-                    Bytes::from(buf),
-                )
-                .await
-                {
-                    tracing::warn!(error = %e,
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    resp.encode_into(&mut buf);
+                    // PERF_AUDIT §3.10: compute hash + stream_id at the
+                    // call site. These legacy streaming paths don't yet
+                    // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
+                    // wiring them up is a follow-up — for now the
+                    // compute happens here per response, same as the
+                    // pre-fix in-function shape.
+                    let reply_channel_id = ChannelId::new(reply_channel.clone());
+                    let reply_channel_hash = reply_channel_id.hash();
+                    let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+                    if let Err(e) = publish_response_to_caller(
+                        &mesh,
+                        caller_origin,
+                        target_hint,
+                        &reply_channel,
+                        reply_channel_hash,
+                        reply_stream_id,
+                        Bytes::from(buf),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_streaming: chunk publish failed");
-                }
-            })
-        });
+                    }
+                })
+            });
 
         // Attach per-service metrics so the spawned handler tasks
         // + pump task bump server-side counters (including the
@@ -2794,61 +2799,63 @@ impl MeshNode {
         let emit_resp_mesh = Arc::clone(&mesh_for_emit);
         let emit_resp_service = service_for_emit.clone();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
-        let emit_resp: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let mesh = Arc::clone(&emit_resp_mesh);
-            let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
-            tokio::spawn(async move {
-                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                let reply_channel = match ChannelName::new(&reply_channel_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = %reply_channel_name,
+        let emit_resp: RpcResponseEmitter =
+            Arc::new(move |from_node, caller_origin, call_id, resp| {
+                let mesh = Arc::clone(&emit_resp_mesh);
+                let service = emit_resp_service.clone();
+                let target_hint =
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                tokio::spawn(async move {
+                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_client_stream: invalid reply channel name");
-                        return;
-                    }
-                };
-                let meta = EventMeta::new(
-                    super::cortex::DISPATCH_RPC_RESPONSE,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                buf.extend_from_slice(&meta.to_bytes());
-                resp.encode_into(&mut buf);
-                // PERF_AUDIT §3.10: compute hash + stream_id at the
-                // call site. These legacy streaming paths don't yet
-                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
-                // wiring them up is a follow-up — for now the
-                // compute happens here per response, same as the
-                // pre-fix in-function shape.
-                let reply_channel_id = ChannelId::new(reply_channel.clone());
-                let reply_channel_hash = reply_channel_id.hash();
-                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
-                if let Err(e) = publish_response_to_caller(
-                    &mesh,
-                    caller_origin,
-                    target_hint,
-                    &reply_channel,
-                    reply_channel_hash,
-                    reply_stream_id,
-                    Bytes::from(buf),
-                )
-                .await
-                {
-                    tracing::warn!(error = %e,
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    resp.encode_into(&mut buf);
+                    // PERF_AUDIT §3.10: compute hash + stream_id at the
+                    // call site. These legacy streaming paths don't yet
+                    // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
+                    // wiring them up is a follow-up — for now the
+                    // compute happens here per response, same as the
+                    // pre-fix in-function shape.
+                    let reply_channel_id = ChannelId::new(reply_channel.clone());
+                    let reply_channel_hash = reply_channel_id.hash();
+                    let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+                    if let Err(e) = publish_response_to_caller(
+                        &mesh,
+                        caller_origin,
+                        target_hint,
+                        &reply_channel,
+                        reply_channel_hash,
+                        reply_stream_id,
+                        Bytes::from(buf),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_client_stream: terminal RESPONSE publish failed");
-                }
+                    }
+                });
+                // AV-4 item 4: a client-streaming call emits exactly one
+                // terminal RESPONSE — retire its cached response route now
+                // (the direct hint for it was already captured above).
+                origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
             });
-            // AV-4 item 4: a client-streaming call emits exactly one
-            // terminal RESPONSE — retire its cached response route now
-            // (the direct hint for it was already captured above).
-            origin_node_cache_for_emit.remove((caller_origin, call_id));
-        });
 
         // REQUEST_GRANT emitter — coalesces per-chunk credits into
         // a single drainer task that batches by call_id. Avoids the
@@ -3093,63 +3100,65 @@ impl MeshNode {
         let emit_resp_mesh = Arc::clone(&mesh_for_emit);
         let emit_resp_service = service_for_emit.clone();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
-        let emit_resp: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let mesh = Arc::clone(&emit_resp_mesh);
-            let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
-            // AV-4 item 4: retire the cached route only on the duplex
-            // call's terminal RESPONSE frame (the direct hint for THIS
-            // frame was already captured above).
-            if streaming_response_is_terminal(&resp) {
-                origin_node_cache_for_emit.remove((caller_origin, call_id));
-            }
-            Box::pin(async move {
-                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                let reply_channel = match ChannelName::new(&reply_channel_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = %reply_channel_name,
+        let emit_resp: RpcAsyncResponseEmitter =
+            Arc::new(move |from_node, caller_origin, call_id, resp| {
+                let mesh = Arc::clone(&emit_resp_mesh);
+                let service = emit_resp_service.clone();
+                let target_hint =
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                // AV-4 item 4: retire the cached route only on the duplex
+                // call's terminal RESPONSE frame (the direct hint for THIS
+                // frame was already captured above).
+                if streaming_response_is_terminal(&resp) {
+                    origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
+                }
+                Box::pin(async move {
+                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_duplex: invalid reply channel name");
-                        return;
-                    }
-                };
-                let meta = EventMeta::new(
-                    super::cortex::DISPATCH_RPC_RESPONSE,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                buf.extend_from_slice(&meta.to_bytes());
-                resp.encode_into(&mut buf);
-                // PERF_AUDIT §3.10: compute hash + stream_id at the
-                // call site. These legacy streaming paths don't yet
-                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
-                // wiring them up is a follow-up — for now the
-                // compute happens here per response, same as the
-                // pre-fix in-function shape.
-                let reply_channel_id = ChannelId::new(reply_channel.clone());
-                let reply_channel_hash = reply_channel_id.hash();
-                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
-                if let Err(e) = publish_response_to_caller(
-                    &mesh,
-                    caller_origin,
-                    target_hint,
-                    &reply_channel,
-                    reply_channel_hash,
-                    reply_stream_id,
-                    Bytes::from(buf),
-                )
-                .await
-                {
-                    tracing::warn!(error = %e,
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    resp.encode_into(&mut buf);
+                    // PERF_AUDIT §3.10: compute hash + stream_id at the
+                    // call site. These legacy streaming paths don't yet
+                    // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
+                    // wiring them up is a follow-up — for now the
+                    // compute happens here per response, same as the
+                    // pre-fix in-function shape.
+                    let reply_channel_id = ChannelId::new(reply_channel.clone());
+                    let reply_channel_hash = reply_channel_id.hash();
+                    let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+                    if let Err(e) = publish_response_to_caller(
+                        &mesh,
+                        caller_origin,
+                        target_hint,
+                        &reply_channel,
+                        reply_channel_hash,
+                        reply_stream_id,
+                        Bytes::from(buf),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_duplex: chunk publish failed");
-                }
-            })
-        });
+                    }
+                })
+            });
 
         // Request-direction grant emitter — same coalescing
         // drainer shape as serve_rpc_client_stream.
@@ -4856,30 +4865,30 @@ mod origin_cache_tests {
         );
     }
 
-    /// AV-4 item 4: the response-route cache is keyed by the CALL
-    /// `(origin, call_id)`, so two calls from the same origin resolve
-    /// to their own destinations and retiring one leaves the other
-    /// intact — a completed call's stale route can't misdirect a
-    /// concurrent one. (With the pre-fix origin-only key, the second
-    /// insert would clobber the first and both would resolve to the
-    /// same node.)
+    /// R2-5 (Kyra addendum): the response-route cache is keyed by the
+    /// FULL `(from_node, origin, call_id)` — so two authenticated
+    /// sessions pinned to the SAME entity/origin that submit the SAME
+    /// call_id resolve to their OWN destination and retiring one leaves
+    /// the other intact. (With the AV-4 `(origin, call_id)` key the
+    /// second session's insert clobbered the first, and either response
+    /// could route to the wrong session.)
     #[test]
-    fn origin_node_cache_is_call_scoped_and_retires_per_call() {
-        let cache: BoundedLru<(u64, u64), u64> = BoundedLru::new();
+    fn response_route_cache_is_session_scoped_and_retires_per_call() {
+        let cache: BoundedLru<(u64, u64, u64), u64> = BoundedLru::new();
         const ORIGIN: u64 = 0xAA;
-        const CALL_A: u64 = 1;
-        const CALL_B: u64 = 2;
+        const CALL: u64 = 7; // SAME call_id for both sessions
         const NODE_A: u64 = 0x10;
         const NODE_B: u64 = 0x20;
-        cache.insert((ORIGIN, CALL_A), NODE_A);
-        cache.insert((ORIGIN, CALL_B), NODE_B);
-        // Same origin, different calls — no clobber.
-        assert_eq!(cache.get((ORIGIN, CALL_A)), Some(NODE_A));
-        assert_eq!(cache.get((ORIGIN, CALL_B)), Some(NODE_B));
-        // Retiring call A's route leaves call B's intact.
-        cache.remove((ORIGIN, CALL_A));
-        assert_eq!(cache.get((ORIGIN, CALL_A)), None);
-        assert_eq!(cache.get((ORIGIN, CALL_B)), Some(NODE_B));
+        // Two sessions, same origin, SAME call_id.
+        cache.insert((NODE_A, ORIGIN, CALL), NODE_A);
+        cache.insert((NODE_B, ORIGIN, CALL), NODE_B);
+        // No clobber — each resolves to its own session.
+        assert_eq!(cache.get((NODE_A, ORIGIN, CALL)), Some(NODE_A));
+        assert_eq!(cache.get((NODE_B, ORIGIN, CALL)), Some(NODE_B));
+        // Retiring session A's route leaves session B's intact.
+        cache.remove((NODE_A, ORIGIN, CALL));
+        assert_eq!(cache.get((NODE_A, ORIGIN, CALL)), None);
+        assert_eq!(cache.get((NODE_B, ORIGIN, CALL)), Some(NODE_B));
     }
 
     /// AV-4 item 4: the multi-fire (server-streaming / duplex) emit

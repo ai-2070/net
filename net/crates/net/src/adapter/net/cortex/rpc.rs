@@ -1529,8 +1529,13 @@ pub trait RpcHandler: Send + Sync + 'static {
 /// `<service>.replies.<caller_origin>`. Type-erased so the fold
 /// doesn't depend on the mesh layer directly.
 ///
-/// Arguments: `(caller_origin, call_id, response_payload)`.
-pub type RpcResponseEmitter = Arc<dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
+/// Arguments: `(from_node, caller_origin, call_id, response_payload)`.
+/// `from_node` (R2-5) is the AEAD-authenticated session peer that
+/// delivered the REQUEST — the authoritative response destination, so
+/// two sessions pinned to the same entity/origin submitting the same
+/// call_id each route their response to their OWN session.
+pub type RpcResponseEmitter =
+    Arc<dyn Fn(u64, u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
 
 /// Async counterpart of [`RpcResponseEmitter`] used by the
 /// streaming fold's pump task to serialize per-call publishes.
@@ -1542,7 +1547,7 @@ pub type RpcResponseEmitter = Arc<dyn Fn(u64, u64, RpcResponsePayload) + Send + 
 /// — it emits exactly one RESPONSE per call — so it sticks with
 /// the simpler sync `RpcResponseEmitter`.)
 pub type RpcAsyncResponseEmitter = Arc<
-    dyn Fn(u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
+    dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
         + Send
         + Sync
         + 'static,
@@ -1733,7 +1738,7 @@ impl RpcServerFold {
                             headers: vec![],
                             body: Bytes::from(format!("malformed request: {e}")),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 };
@@ -1749,7 +1754,7 @@ impl RpcServerFold {
                         headers: vec![],
                         body: Bytes::from_static(b"deadline already passed when request landed"),
                     };
-                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -1776,7 +1781,7 @@ impl RpcServerFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 }
@@ -1900,7 +1905,7 @@ impl RpcServerFold {
                         }
                     };
                     in_flight.lock().remove(&key);
-                    emit(caller_origin, call_id, resp);
+                    emit(from_node, caller_origin, call_id, resp);
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -2417,7 +2422,7 @@ impl RpcServerStreamingFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -2459,7 +2464,7 @@ impl RpcServerStreamingFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -2573,7 +2578,7 @@ impl RpcServerStreamingFold {
                             // publish path and arrive out of order
                             // (or be eclipsed by the terminal frame
                             // and lost entirely on the caller side).
-                            pump_emit(caller_origin, call_id, resp).await;
+                            pump_emit(from_node, caller_origin, call_id, resp).await;
                         }
                     });
                     // Run the handler. Catch panics so a
@@ -2662,7 +2667,7 @@ impl RpcServerStreamingFold {
                     // wire (the pump has already drained, but the
                     // emit itself is still async and we must await
                     // it before the spawned task ends).
-                    emit(caller_origin, call_id, terminal).await;
+                    emit(from_node, caller_origin, call_id, terminal).await;
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -2973,7 +2978,7 @@ impl RpcStreamingRequestFold {
                             headers: vec![],
                             body: Bytes::from(format!("malformed request: {e}")),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 };
@@ -2994,7 +2999,7 @@ impl RpcStreamingRequestFold {
                             b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST",
                         ),
                     };
-                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -3019,7 +3024,7 @@ impl RpcStreamingRequestFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 }
@@ -3214,7 +3219,7 @@ impl RpcStreamingRequestFold {
                     // that returned without consuming all chunks
                     // doesn't leak the entry).
                     senders.lock().remove(&key);
-                    (emit)(caller_origin, call_id, terminal);
+                    (emit)(from_node, caller_origin, call_id, terminal);
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
@@ -3396,7 +3401,7 @@ impl RpcDuplexFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -3428,7 +3433,7 @@ impl RpcDuplexFold {
                     let caller_origin = meta.origin_hash;
                     let call_id = meta.seq_or_ts;
                     tokio::spawn(async move {
-                        emit(caller_origin, call_id, resp).await;
+                        emit(from_node, caller_origin, call_id, resp).await;
                     });
                     return Ok(());
                 }
@@ -3456,7 +3461,7 @@ impl RpcDuplexFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -3551,7 +3556,7 @@ impl RpcDuplexFold {
                             )],
                             body: chunk.clone(),
                         };
-                        pump_emit(caller_origin, call_id, resp).await;
+                        pump_emit(from_node, caller_origin, call_id, resp).await;
                     }
                 });
 
@@ -3665,7 +3670,7 @@ impl RpcDuplexFold {
                     };
                     in_flight.lock().remove(&key);
                     senders.lock().remove(&key);
-                    emit(caller_origin, call_id, terminal).await;
+                    emit(from_node, caller_origin, call_id, terminal).await;
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
@@ -4978,7 +4983,7 @@ mod tests {
     fn capturing_emitter() -> (RpcResponseEmitter, CapturedResponses) {
         let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
-        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             captured_clone.lock().push((origin, call_id, resp));
         });
         (emit, captured)
@@ -6557,7 +6562,7 @@ mod tests {
     fn capturing_async_emitter() -> (RpcAsyncResponseEmitter, CapturedResponses) {
         let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
-        let emit: RpcAsyncResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let captured_clone = captured_clone.clone();
             Box::pin(async move {
                 captured_clone.lock().push((origin, call_id, resp));
