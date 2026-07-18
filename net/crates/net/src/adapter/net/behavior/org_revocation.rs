@@ -583,25 +583,38 @@ impl SubscriptionLease {
         }
     }
 
-    /// Teardown: mark the lease dead, then block until every in-flight
-    /// callback EXCEPT this thread's own frames has left.
+    /// Teardown: mark the lease dead so no NEW callback body starts, then —
+    /// only when the caller holds none of this lease's own frames — block
+    /// until every in-flight callback has left.
     ///
     /// - External teardown (the common case: the guard is dropped from a
     ///   thread that is NOT inside this callback) has `own_frames == 0`, so
-    ///   it drains ALL in-flight callbacks — the strong guarantee that no
-    ///   callback is in flight when the guard's `Drop` returns.
-    /// - Self-unsubscription (the guard is dropped from INSIDE its own
-    ///   callback) excludes this thread's own frames, so it never waits for
-    ///   the frame that is dropping it (which would deadlock — that frame
-    ///   cannot reach its `LeaveOnDrop` until this returns). `dead` is set
-    ///   first, so no NEW callback (including a re-entrant one) starts; the
-    ///   current frame's `LeaveOnDrop` performs the final retirement (R3-4).
+    ///   it BLOCKS until `in_flight` reaches zero — the strong guarantee that
+    ///   no callback is in flight when the guard's `Drop` returns. `leave`
+    ///   signals `drained` at exactly that boundary.
+    /// - Self-unsubscription (the guard is dropped from INSIDE one or more of
+    ///   this lease's own callback frames, `own_frames > 0`) does NOT wait at
+    ///   all. Waiting would be wrong for two independent reasons (R3-4): this
+    ///   thread's own frame(s) cannot reach their `LeaveOnDrop` until this drop
+    ///   returns, so waiting for them self-deadlocks; and a callback of the
+    ///   SAME lease running on ANOTHER thread may be blocked on a user lock
+    ///   THIS callback still holds, so waiting for that foreign frame would
+    ///   deadlock across threads. Setting `dead` first stops every new
+    ///   (including re-entrant) callback; the current frame's `LeaveOnDrop`
+    ///   retires the subscription and each in-flight frame — own and foreign —
+    ///   retires through its own `LeaveOnDrop` once it finishes. Return
+    ///   immediately: non-blocking and non-reentrant.
     fn kill_and_drain(self: &Arc<Self>) {
         let ptr = Arc::as_ptr(self);
         let own_frames = ACTIVE_LEASES.with(|a| a.borrow().iter().filter(|&&p| p == ptr).count());
         let mut st = self.state.lock();
         st.dead = true;
-        while st.in_flight > own_frames {
+        if own_frames > 0 {
+            // Self-unsubscription: never wait (see doc — self- and cross-thread
+            // deadlock). `dead` gates new entries; live frames self-retire.
+            return;
+        }
+        while st.in_flight > 0 {
             self.drained.wait(&mut st);
         }
     }
@@ -2617,6 +2630,124 @@ mod tests {
             store.subscriber_count(),
             0,
             "the self-drop removed the subscription",
+        );
+    }
+
+    /// R3-4 (cross-thread): a callback that self-unsubscribes while ANOTHER
+    /// thread is inside a callback of the SAME subscription must not wait for
+    /// that foreign frame — even (especially) when the foreign frame is
+    /// blocked on a user lock the self-unsubscribing callback holds.
+    ///
+    /// Timeline: A enters and takes a user lock; B enters and blocks needing
+    /// that lock; A self-unsubscribes (dropping its own guard) WHILE holding
+    /// the lock and while B is in-flight, then releases the lock so B can
+    /// finish.
+    ///
+    /// Red-witness: the pre-fix `while in_flight > own_frames` wait blocks A
+    /// (in_flight == 2, own_frames == 1) on B; B is blocked on the user lock A
+    /// holds; A cannot release it until the wait returns → cross-thread
+    /// deadlock, and the bounded `recv_timeout`s below expire. `leave`'s
+    /// notify-only-at-zero made even relaxing the threshold insufficient; the
+    /// fix is to not wait at all when `own_frames > 0`.
+    #[test]
+    fn self_unsubscribe_does_not_wait_for_a_concurrent_foreign_callback() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+
+        // A user lock A holds across its self-unsubscribe and B needs.
+        let user_lock = Arc::new(Mutex::new(()));
+        // First entrant is role A (self-unsubscriber), second is role B.
+        let role = Arc::new(AtomicUsize::new(0));
+        // A's own guard, taken + dropped from inside A's callback.
+        let slot: Arc<Mutex<Option<RaiseSubscription>>> = Arc::new(Mutex::new(None));
+
+        let (a_holds_tx, a_holds_rx) = mpsc::channel::<()>();
+        let (b_entered_tx, b_entered_rx) = mpsc::channel::<()>();
+        let (proceed_a_tx, proceed_a_rx) = mpsc::channel::<()>();
+        // The callback is `Fn + Send + Sync`; the mpsc endpoints are `!Sync`.
+        let a_holds_tx = Mutex::new(a_holds_tx);
+        let b_entered_tx = Mutex::new(b_entered_tx);
+        let proceed_a_rx = Mutex::new(proceed_a_rx);
+
+        let user_lock_cb = Arc::clone(&user_lock);
+        let role_cb = Arc::clone(&role);
+        let slot_cb = Arc::clone(&slot);
+        let sub = store.subscribe_floors_raised(move |_raised| {
+            if role_cb.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Role A: hold the user lock, announce, await the go-ahead,
+                // then self-unsubscribe WHILE holding the lock and while B is
+                // in-flight, and only then release the lock.
+                let held = user_lock_cb.lock();
+                a_holds_tx
+                    .lock()
+                    .send(())
+                    .expect("A announces it holds the lock");
+                proceed_a_rx.lock().recv().expect("A awaits go-ahead");
+                drop(slot_cb.lock().take()); // self-unsubscribe (must not block)
+                drop(held); // release → B can proceed
+            } else {
+                // Role B: needs the user lock A holds.
+                b_entered_tx.lock().send(()).expect("B announces entry");
+                let _held = user_lock_cb.lock();
+            }
+        });
+        *slot.lock() = Some(sub);
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        // Fire A on thread 1; wait until it holds the user lock (role 0 taken).
+        let store1 = Arc::clone(&store);
+        let done1 = done_tx.clone();
+        let t1 = std::thread::spawn(move || {
+            store1.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+            done1.send(()).expect("t1 done");
+        });
+        a_holds_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A entered and holds the user lock");
+
+        // Fire B on thread 2; wait until it has entered (in_flight == 2).
+        let store2 = Arc::clone(&store);
+        let done2 = done_tx.clone();
+        let t2 = std::thread::spawn(move || {
+            store2.apply_bundle(&bundle_with_floor(6)).expect("apply 6");
+            done2.send(()).expect("t2 done");
+        });
+        b_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("B entered the callback");
+
+        // Release A: self-unsubscribe must return without waiting for B, so A
+        // releases the user lock and BOTH workers finish within the bound.
+        proceed_a_tx.send(()).expect("release A");
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a worker deadlocked in self-unsubscribe");
+        }
+        t1.join().expect("thread 1 joined");
+        t2.join().expect("thread 2 joined");
+
+        assert_eq!(
+            role.load(Ordering::SeqCst),
+            2,
+            "exactly A and B ran (each once)",
+        );
+        assert_eq!(
+            store.subscriber_count(),
+            0,
+            "the self-drop removed the subscription",
+        );
+        // No future callback enters: the subscriber is gone, so a later raise
+        // fires nothing and the role counter stays at 2.
+        store.apply_bundle(&bundle_with_floor(7)).expect("apply 7");
+        assert_eq!(
+            role.load(Ordering::SeqCst),
+            2,
+            "no callback runs after self-unsubscription removed the subscriber",
         );
     }
 
