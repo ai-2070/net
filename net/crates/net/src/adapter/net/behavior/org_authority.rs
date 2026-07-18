@@ -1000,6 +1000,36 @@ fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create every missing component of `dir` (intermediate parents AND the final
+/// directory) with permissions no broader than 0700 (Gate-1, Unix). A
+/// permissive umask must not leave a 0777 intermediate parent through which
+/// another account could later replace the final authority directory. Uses a
+/// non-recursive `DirBuilder::create` per component, shallowest-first, so a
+/// component another account planted between the existence check and the create
+/// fails loudly with `AlreadyExists` rather than being silently adopted.
+#[cfg(unix)]
+fn create_missing_components_0700(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // Collect the missing chain from `dir` up to the deepest existing ancestor.
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cursor: &Path = dir;
+    loop {
+        if cursor.exists() {
+            break;
+        }
+        missing.push(cursor);
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+            _ => break,
+        }
+    }
+    // Create shallowest → deepest so each component's parent already exists.
+    for component in missing.iter().rev() {
+        std::fs::DirBuilder::new().mode(0o700).create(component)?;
+    }
+    Ok(())
+}
+
 /// Create or validate the authority directory as a trusted local security
 /// boundary (Gate-1). This is the DEDICATED authority scaffold — the only
 /// layer that may create the directory owner-only or tighten its mode; the
@@ -1012,15 +1042,16 @@ fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
 /// already attack the surrounding configuration and process state.
 ///
 /// - Unix: the resolved ancestor chain is validated first
-///   ([`validate_unix_ancestor_chain`]) so no other account can replace the
-///   directory's entry through a writable-non-sticky parent. A MISSING
-///   directory is then created with permissions no broader than 0700 (the
-///   `DirBuilder` mode is filtered through umask, so possibly narrower) and an
-///   EXISTING one must be a directory owned by the effective user and not
-///   group/other-writable; either way it is finally tightened to EXACTLY 0700
-///   by the owner before use (a restrictive-umask create + owner chmod(0700)
-///   is safe; the dangerous pattern was permissive create then tighten).
-///   State / lock / audience files are 0600.
+///   ([`validate_unix_ancestor_chain`]) so no other account owns, or can
+///   replace the directory's entry through, an ancestor. A MISSING directory —
+///   and any missing intermediate parents — is then created no broader than
+///   0700 ([`create_missing_components_0700`]; never a umask-moded 0777
+///   intermediate) and the completed chain is RE-validated; an EXISTING one
+///   must be a directory owned by the effective user and not group/other-
+///   writable; either way it is finally tightened to EXACTLY 0700 by the owner
+///   before use (a restrictive-umask create + owner chmod(0700) is safe; the
+///   dangerous pattern was permissive create then tighten). State / lock /
+///   audience files are 0600.
 /// - Non-Unix: a newly-created directory is restricted to the owner via an
 ///   explicit DACL ([`restrict_dir_to_owner`], the Windows analogue of 0700).
 ///   A pre-existing directory's ACL is operator-owned and NOT re-validated
@@ -1035,7 +1066,7 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // Validate the trusted-ancestor chain BEFORE any operation on `dir`
         // (no authority file is created or read before this).
         validate_unix_ancestor_chain(dir)?;
@@ -1059,17 +1090,15 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = dir.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(io)?;
-                    }
-                }
-                // `mode(0o700)` is filtered through umask — "no broader than
-                // 0700", possibly narrower; the tighten below makes it exact.
-                std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(dir)
-                    .map_err(io)?;
+                // Create every missing component (intermediate parents AND the
+                // final dir) no broader than 0700 — a permissive umask must not
+                // leave a 0777 intermediate through which another account could
+                // later replace the final directory. Then RE-validate the now-
+                // complete resolved chain, which also closes a race where
+                // another account created an intermediate between the
+                // prevalidation above and this creation.
+                create_missing_components_0700(dir).map_err(io)?;
+                validate_unix_ancestor_chain(dir)?;
             }
             Err(e) => return Err(io(e)),
         }
@@ -1587,6 +1616,40 @@ mod tests {
             .expect("adopt into a fresh subdir");
         for name in NodeAuthority::file_names() {
             assert!(authority.join(name).exists(), "{name} must be provisioned");
+        }
+    }
+
+    /// Gate-1 (Unix): adopting into a MISSING nested chain creates every
+    /// intermediate parent owner-only (0700), even under a permissive umask —
+    /// a naive create_dir_all would leave 0777 intermediates through which
+    /// another account could later replace the final directory.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_creates_intermediate_parents_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        // Permissive umask for the create window; restored immediately after.
+        let saved = unsafe { libc::umask(0) };
+        let a = scratch.dir().join("a");
+        let b = a.join("b");
+        let authority = b.join("authority");
+        let kp = node_identity();
+        let res = NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None);
+        unsafe {
+            libc::umask(saved);
+        }
+        res.expect("adopt creates a nested chain securely");
+        for comp in [&a, &b, &authority] {
+            let mode = std::fs::metadata(comp)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} must be owner-only (mode {mode:o})",
+                comp.display()
+            );
         }
     }
 
