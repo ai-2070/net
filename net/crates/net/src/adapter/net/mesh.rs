@@ -2623,11 +2623,17 @@ struct SendSecuritySnapshot {
 }
 
 /// The node's slot in the installed revocation store's
-/// raise-subscriber registry — the store it subscribed on plus the
-/// removable token (review-9 addendum).
+/// raise-subscriber registry — the store it subscribed on, the
+/// removable token (review-9 addendum), and an owner-liveness token
+/// (AV-10). `notify` clones the callback `Arc`s before invoking them
+/// outside the registry lock, so an unsubscribe cannot recall a
+/// callback already snapshotted; the liveness token — invalidated
+/// BEFORE the unsubscribe on teardown — makes such a late callback
+/// inert instead of mutating a fold the node no longer owns.
 type OrgRaiseSubscription = Option<(
     Arc<super::behavior::org_revocation::OrgRevocationStore>,
     u64,
+    Arc<std::sync::atomic::AtomicBool>,
 )>;
 
 /// Signal-carrying wrapper around the `nrpc:` local-service set
@@ -7003,7 +7009,19 @@ impl MeshNode {
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
         let me = Arc::downgrade(&store);
+        // AV-10: owner-liveness token, checked FIRST in the callback. On
+        // teardown the node invalidates it BEFORE unsubscribing, so a
+        // callback already snapshotted by `notify` (which clones the
+        // callback Arcs outside the registry lock) is inert when it
+        // fires afterward rather than retracting a fold it no longer
+        // owns — the `still_installed` check below is a runtime read of
+        // the slot, which the invalidation makes authoritative.
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive_cb = Arc::clone(&alive);
         let token = store.subscribe_floors_raised(move |raised| {
+            if !alive_cb.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             let installed = slot.load_full();
             let still_installed = match (&installed, me.upgrade()) {
                 (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
@@ -7037,10 +7055,13 @@ impl MeshNode {
         // steals this node's notifications (review-9 addendum).
         {
             let mut subscription = self.org_raise_subscription.lock();
-            if let Some((old_store, old_token)) = subscription.take() {
+            if let Some((old_store, old_token, old_alive)) = subscription.take() {
+                // AV-10: invalidate the outgoing owner token BEFORE the
+                // unsubscribe, so a snapshotted old callback is inert.
+                old_alive.store(false, std::sync::atomic::Ordering::Release);
                 old_store.unsubscribe_floors_raised(old_token);
             }
-            *subscription = Some((store.clone(), token));
+            *subscription = Some((store.clone(), token, alive));
         }
         self.org_revocation.store(Some(store.clone()));
         drop(_pin);
@@ -22648,7 +22669,14 @@ impl Drop for MeshNode {
         // it captures never drop. Removing the callback breaks the
         // cycle so the core is released once the last store handle
         // drops.
-        if let Some((store, token)) = self.org_raise_subscription.lock().take() {
+        if let Some((store, token, alive)) = self.org_raise_subscription.lock().take() {
+            // AV-10: invalidate the owner-liveness token BEFORE the
+            // unsubscribe. `notify` clones subscriber callbacks outside
+            // the registry lock, so a raise landing concurrently with
+            // this teardown could have already snapshotted this
+            // callback; the invalidation makes that late invocation
+            // inert instead of retracting a fold the node no longer owns.
+            alive.store(false, std::sync::atomic::Ordering::Release);
             store.unsubscribe_floors_raised(token);
         }
     }

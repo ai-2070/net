@@ -668,6 +668,23 @@ pub struct OrgRevocationStore {
     own_subscription: Mutex<Option<u64>>,
 }
 
+impl Drop for OrgRevocationStore {
+    /// AV-10: RAII cleanup of THIS facade's own subscription. A facade
+    /// that installed a callback via [`Self::set_on_floors_raised`]
+    /// must unregister it on drop — otherwise, when a sibling handle
+    /// keeps the shared core alive, the core retains a callback that
+    /// can capture this facade (core → callback → … → core), leaking
+    /// the core and the stale projections the callback holds. Other
+    /// handles' registrations, and explicit
+    /// [`Self::subscribe_floors_raised`] tokens the caller owns, are
+    /// untouched.
+    fn drop(&mut self) {
+        if let Some(token) = self.own_subscription.lock().take() {
+            self.unsubscribe_floors_raised(token);
+        }
+    }
+}
+
 impl OrgRevocationStore {
     /// Adopt-time entry point: load the existing file if present
     /// (re-adoption preserves maxima — monotonicity survives even
@@ -900,6 +917,21 @@ impl OrgRevocationStore {
     #[doc(hidden)]
     pub fn subscriber_count(&self) -> usize {
         self.core.subscribers.read().len()
+    }
+
+    /// Test-only (AV-10): snapshot the core's subscriber callbacks
+    /// EXACTLY as [`StoreCore::notify`] does — clone the callback
+    /// `Arc`s outside the registry lock. Lets a witness capture a
+    /// callback BEFORE a node teardown and invoke it afterward to prove
+    /// the owner-liveness token makes such a late callback inert.
+    #[doc(hidden)]
+    pub fn snapshot_subscribers_for_test(&self) -> Vec<FloorsRaisedCallback> {
+        self.core
+            .subscribers
+            .read()
+            .iter()
+            .map(|(_, callback)| callback.clone())
+            .collect()
     }
 
     /// Register `callback` as ONE subscriber in the core's raise

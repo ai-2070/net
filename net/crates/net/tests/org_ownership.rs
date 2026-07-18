@@ -1939,3 +1939,97 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// AV-10: dropping an `OrgRevocationStore` FACADE that installed a
+/// callback via `set_on_floors_raised` unregisters that callback (the
+/// facade's RAII `Drop`), even while a sibling handle keeps the shared
+/// core alive — so a dropped facade never leaks its own callback into
+/// the core. (Red: without the facade `Drop`, the count stays 1.)
+#[test]
+fn dropping_a_store_facade_unsubscribes_its_own_callback() {
+    let dir = scratch_dir("av10-facade-drop");
+    let path = dir.join("revocation-state.json");
+    let a = OrgRevocationStore::init(&path).expect("init a");
+    let b = OrgRevocationStore::open_existing(&path).expect("open b");
+    assert!(a.shares_core_with(&b), "same path shares one core");
+    assert_eq!(b.subscriber_count(), 0);
+
+    a.set_on_floors_raised(|_raised| {});
+    assert_eq!(
+        b.subscriber_count(),
+        1,
+        "facade A's callback is registered on the shared core"
+    );
+
+    drop(a);
+    assert_eq!(
+        b.subscriber_count(),
+        0,
+        "dropping facade A must unregister its own callback from the shared core",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AV-10: a raise callback SNAPSHOTTED before node teardown (exactly as
+/// `StoreCore::notify` snapshots callbacks outside the registry lock)
+/// is INERT when invoked afterward — the owner-liveness token,
+/// invalidated by `MeshNode::drop` BEFORE it unsubscribes, gates it, so
+/// it does not retract a fold projection the node no longer owns.
+/// Subscriber count also returns to baseline. (Red: without the token
+/// invalidation, the snapshotted callback still finds its store
+/// "installed" and retracts the projection.)
+#[tokio::test]
+async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
+    let dir = scratch_dir("av10-snapshot");
+    let store =
+        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let node = build_node().await;
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    assert_eq!(store.subscriber_count(), 1);
+
+    // Project ownership under the installed store (cert generation 4).
+    let publisher = EntityKeypair::generate();
+    let publisher_node_id = publisher.node_id();
+    let cert4 = OrgMembershipCert::try_issue(&org(), publisher.entity_id().clone(), 4, 3600)
+        .expect("issue");
+    let mut ann = CapabilityAnnouncement::new(
+        publisher_node_id,
+        publisher.entity_id().clone(),
+        100,
+        CapabilitySet::new().add_tag("nrpc:oa1-echo"),
+    )
+    .with_owner_cert(Some(cert4));
+    ann.sign(&publisher);
+    node.test_inject_capability_announcement(ann);
+
+    // Hold the fold and SNAPSHOT the node's raise callback, both BEFORE
+    // teardown — exactly what `notify` captures.
+    let fold = node.capability_fold().clone();
+    assert_eq!(
+        owner_org_for(&fold, publisher_node_id),
+        Some(org().org_id())
+    );
+    let snapshot = store.snapshot_subscribers_for_test();
+    assert_eq!(snapshot.len(), 1);
+
+    // Tear the node down: MeshNode::drop invalidates the owner token
+    // BEFORE unsubscribing, so the count returns to baseline…
+    drop(node);
+    assert_eq!(store.subscriber_count(), 0, "teardown unsubscribes");
+
+    // …and the callback snapshotted before teardown, invoked afterward
+    // with a floor raise above the projection's generation, is INERT:
+    // the projection SURVIVES (no fold mutation after owner teardown).
+    for callback in &snapshot {
+        callback(&[(org().org_id(), publisher.entity_id().clone(), 5u32)]);
+    }
+    assert_eq!(
+        owner_org_for(&fold, publisher_node_id),
+        Some(org().org_id()),
+        "a callback snapshotted before teardown must not retract the fold afterward",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
