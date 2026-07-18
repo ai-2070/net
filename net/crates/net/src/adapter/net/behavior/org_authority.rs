@@ -33,6 +33,25 @@
 //! material never rides a wire object (plan §Deliberately-NOT-in-v1).
 //! At-rest protection is a 0600 plain file, matching the repo's
 //! `EntityKeypair` storage convention (plan Q2).
+//!
+//! **Local filesystem threat boundary (Gate-1).** The authority directory
+//! is a TRUSTED local security boundary. Concurrent mutation by another
+//! process running with write access to it — replacing directory entries or
+//! the stable `.lock` sidecar mid-transaction — is explicitly OUT OF SCOPE:
+//! a same-account attacker who can write into the authority directory can
+//! already attack the surrounding configuration and process state, so
+//! hardening one sidecar protocol against it while the rest of the local
+//! boundary trusts the account would be incoherent. Supported Net writers
+//! never unlink or replace the sidecar. R3-3 (`OrgRevocationStore::apply_bundle`)
+//! detects sidecar replacement occurring BETWEEN legitimate transactions and
+//! common operator/startup mistakes; it does not claim to protect against an
+//! actor concurrently mutating directory entries DURING a transaction.
+//! [`ensure_secure_authority_dir`] enforces the boundary at its edges:
+//! new authority directories are created owner-only (Unix 0700, atomically),
+//! and an existing one must be owned by the current user and not
+//! group/other-writable. On Windows the per-user protected profile
+//! application-data directory plus its inherited DACL is the boundary (the
+//! user account, SYSTEM, and local administrators are trusted principals).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -380,6 +399,22 @@ pub enum OrgAuthorityError {
         /// The observed mode bits.
         mode: u32,
     },
+    /// The authority directory is not a safe local security boundary
+    /// (Gate-1): on Unix it is owned by another user, is group/other-
+    /// writable, or is not a directory. The authority directory is a
+    /// TRUSTED local boundary — concurrent mutation by another process with
+    /// write access to it is explicitly out of scope — but a wrong-owner or
+    /// world-writable directory means that trust does not hold, so adoption
+    /// and startup refuse loudly rather than provisioning or reading secrets
+    /// inside it. Only constructed on Unix (the directory-mode/ownership
+    /// gate); non-Unix relies on the per-user profile DACL boundary.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    InsecureAuthorityDir {
+        /// The authority directory path.
+        path: String,
+        /// Why the directory was refused.
+        reason: String,
+    },
     /// Owner-cert emission was enabled on a node with no installed
     /// [`NodeAuthority`]. Emission is sourced EXCLUSIVELY from the
     /// loaded, self-verified authority (review-8 §3) — there is no
@@ -455,6 +490,13 @@ impl std::fmt::Display for OrgAuthorityError {
                 "owner audience key {path} has permissive mode {mode:#o} (group/other \
                  readable); tighten to 0600 — refusing to treat a possibly-disclosed \
                  audience key as installed"
+            ),
+            Self::InsecureAuthorityDir { path, reason } => write!(
+                f,
+                "authority directory {path} is not a trusted local boundary: {reason}; \
+                 it must be a directory owned by the current user and not group/other-\
+                 writable (owner-only 0700) — refusing to provision or open authority \
+                 state inside it"
             ),
             Self::NoAuthorityInstalled => write!(
                 f,
@@ -569,6 +611,12 @@ impl NodeAuthority {
         let membership_path = dir.join(OWNER_MEMBERSHIP_FILE);
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
+
+        // Gate-1: the authority directory is a trusted local security
+        // boundary. Create it owner-only (0700) if missing, or validate an
+        // existing one (a directory owned by the current user and not
+        // group/other-writable), BEFORE provisioning any secrets into it.
+        ensure_secure_authority_dir(dir)?;
 
         // 0. The ceremony lock: one adoption at a time per
         //    authority directory, held from the ownership decision
@@ -728,6 +776,10 @@ impl NodeAuthority {
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
 
+        // Gate-1: validate the authority directory boundary (owner-only,
+        // owned by the current user) before reading any authority state.
+        ensure_secure_authority_dir(dir)?;
+
         let membership_bytes = read_required(&membership_path)?;
         let config = parse_membership(&membership_bytes, &membership_path)?;
 
@@ -811,6 +863,98 @@ fn lock_ceremony(dir: &Path) -> Result<std::fs::File, OrgAuthorityError> {
         reason: format!("ceremony lock: {e}"),
     };
     super::org_revocation::open_lock_file(&lock_path).map_err(io)
+}
+
+/// Policy decision for an EXISTING authority directory's Unix metadata
+/// (Gate-1): the owner must be the effective user and the directory must not
+/// be group/other-writable. Returns `Some(reason)` on violation, `None` when
+/// acceptable. Kept as a pure `u32` function — independent of the OS `stat`
+/// call — so the decision is unit-testable on every platform.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn authority_dir_policy_violation(owner_uid: u32, mode: u32, euid: u32) -> Option<String> {
+    if owner_uid != euid {
+        return Some(format!(
+            "owned by uid {owner_uid}, not the current effective user {euid}"
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Some(format!("group/other-writable (mode {:04o})", mode & 0o777));
+    }
+    None
+}
+
+/// Create or validate the authority directory as a trusted local security
+/// boundary (Gate-1). This is the DEDICATED authority scaffold — the only
+/// layer that may create the directory owner-only or tighten its mode; the
+/// generic, path-agnostic [`OrgRevocationStore`] API never chmods a supplied
+/// parent directory.
+///
+/// Threat boundary (see the module docs): the authority directory is TRUSTED.
+/// Concurrent mutation by another process running with write access to it is
+/// explicitly out of scope — a same-account attacker who can write here can
+/// already attack the surrounding configuration and process state.
+///
+/// - Unix, MISSING: parents are created with normal permissions and the
+///   authority directory itself is created ATOMICALLY at mode 0700 (never
+///   create-then-chmod).
+/// - Unix, EXISTING: it must be a directory owned by the effective user and
+///   not group/other-writable (else refuse loudly), then it is tightened to
+///   0700 (this scaffold owns that tightening).
+/// - Non-Unix: the per-user protected profile application-data directory plus
+///   its inherited DACL is the boundary — the user account, SYSTEM, and local
+///   administrators are trusted local principals — so the directory tree is
+///   created without Unix 0700 semantics.
+fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
+    let io = |e: std::io::Error| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("authority directory: {e}"),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(OrgAuthorityError::InsecureAuthorityDir {
+                        path: dir.display().to_string(),
+                        reason: "path exists but is not a directory".to_string(),
+                    });
+                }
+                // SAFETY: geteuid() reads the caller's effective uid; it has
+                // no preconditions, cannot fail, and touches no memory.
+                let euid = unsafe { libc::geteuid() };
+                if let Some(reason) = authority_dir_policy_violation(meta.uid(), meta.mode(), euid)
+                {
+                    return Err(OrgAuthorityError::InsecureAuthorityDir {
+                        path: dir.display().to_string(),
+                        reason,
+                    });
+                }
+                // Owner-controlled and not group/other-writable: tighten to
+                // 0700, clearing any group/other read bits a lax umask left.
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(io)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(io)?;
+                    }
+                }
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(io)?;
+            }
+            Err(e) => return Err(io(e)),
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(io)?;
+        Ok(())
+    }
 }
 
 /// Open, mode-check, and read the audience key through ONE
@@ -1061,6 +1205,92 @@ mod tests {
             0,
             "owner-audience.key must not be group/other readable (mode {mode:o})"
         );
+    }
+
+    /// Gate-1: the PURE authority-directory policy decision (owner must be the
+    /// effective user; the directory must not be group/other-writable). A
+    /// plain `u32` function, so it runs on every platform — the wrong-owner
+    /// case cannot be produced from an integration test without root.
+    #[test]
+    fn authority_dir_policy_rejects_wrong_owner_and_world_writable() {
+        // Owner == effective user, owner-only → accepted.
+        assert_eq!(authority_dir_policy_violation(1000, 0o700, 1000), None);
+        // Group/other READ (not write) is accepted; the scaffold tightens it.
+        assert_eq!(authority_dir_policy_violation(1000, 0o755, 1000), None);
+        // Wrong owner → refused.
+        assert!(authority_dir_policy_violation(0, 0o700, 1000)
+            .unwrap()
+            .contains("uid 0"));
+        // Group-writable → refused.
+        assert!(authority_dir_policy_violation(1000, 0o770, 1000)
+            .unwrap()
+            .contains("group/other-writable"));
+        // Other-writable → refused.
+        assert!(authority_dir_policy_violation(1000, 0o707, 1000)
+            .unwrap()
+            .contains("group/other-writable"));
+    }
+
+    /// Gate-1 (Unix): adopting into a MISSING authority directory creates it
+    /// owner-only (0700), and the provisioned membership + state files are
+    /// owner-only (0600). Red-witness: reverting the `DirBuilder::mode(0o700)`
+    /// create to a plain `create_dir_all` leaves the dir at the umask default.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_creates_owner_only_authority_dir_and_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        // A fresh authority subdir that does NOT exist yet.
+        let authority_dir = scratch.dir().join("authority");
+        NodeAuthority::adopt(&authority_dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let dir_mode = std::fs::metadata(&authority_dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "authority dir must be owner-only 0700 (mode {dir_mode:o})",
+        );
+        for name in [
+            OWNER_MEMBERSHIP_FILE,
+            REVOCATION_STATE_FILE,
+            OWNER_AUDIENCE_FILE,
+        ] {
+            let mode = std::fs::metadata(authority_dir.join(name))
+                .expect("file metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{name} must be owner-only (mode {mode:o})");
+        }
+    }
+
+    /// Gate-1 (Unix): adoption refuses an EXISTING authority directory that is
+    /// group/other-writable — the trusted-boundary precondition does not hold,
+    /// so no secrets are provisioned into it.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_group_or_other_writable_authority_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        // The scratch dir already exists; make it world-writable.
+        std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o777))
+            .expect("chmod 0777");
+        let err = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("a group/other-writable authority dir must be refused");
+        assert!(
+            matches!(
+                &err,
+                OrgAuthorityError::InsecureAuthorityDir { reason, .. }
+                    if reason.contains("group/other-writable")
+            ),
+            "got: {err}",
+        );
+        // Restore owner-only so Scratch::drop can clean up.
+        let _ = std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o700));
     }
 
     #[test]

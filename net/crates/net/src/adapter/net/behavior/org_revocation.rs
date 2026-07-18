@@ -3206,6 +3206,34 @@ mod tests {
         );
     }
 
+    /// Gate-1: the generic, path-agnostic store API must NOT chmod a supplied
+    /// parent directory — only the dedicated authority scaffold
+    /// (`org_authority::ensure_secure_authority_dir`) creates/tightens the
+    /// owner-only authority root. Create a parent with a known loose mode,
+    /// init a store under it, and assert the parent's mode is untouched (so
+    /// a legitimate shared application directory is never mutated).
+    #[cfg(unix)]
+    #[test]
+    fn generic_store_init_does_not_chmod_the_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let parent = scratch.0.join("shared-app-dir");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        let store = OrgRevocationStore::init(parent.join("revocation-state.json")).expect("init");
+        drop(store);
+        let mode = std::fs::metadata(&parent)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "generic store init must not chmod the parent (mode {mode:o})",
+        );
+    }
+
     /// R3-3: an existing live handle's `apply_bundle` verifies the opened
     /// `.lock` sidecar identity against its core's BEFORE reread/merge/
     /// write. If the sidecar was replaced under the live handle (fresh

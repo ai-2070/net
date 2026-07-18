@@ -639,6 +639,27 @@ handle) plus, newly explicit:
 12. Wire evolution honest; unit-explicit timestamps; dual size
     bounds with typed errors, never silent trimming; constants
     freeze only after measurement.
+13. **The authority directory is a trusted local security boundary.**
+    Concurrent mutation by another process running with write access
+    to it — replacing directory entries or the stable `.lock` sidecar
+    mid-transaction — is explicitly OUT OF SCOPE: a same-account
+    attacker who can write there can already attack the surrounding
+    configuration and process state, so hardening one sidecar protocol
+    against it while the rest of the local boundary trusts the account
+    would be incoherent. Supported Net writers never unlink or replace
+    the sidecar. R3-3 detects sidecar replacement occurring BETWEEN
+    legitimate transactions and common operator/startup mistakes; it
+    does NOT claim protection against an actor concurrently mutating
+    directory entries DURING a transaction. The boundary is enforced
+    at its edges (`org_authority::ensure_secure_authority_dir`): a new
+    authority directory is created owner-only (Unix 0700, atomically —
+    never create-then-chmod), an existing one must be owned by the
+    current user and not group/other-writable, and state/lock/audience
+    files are 0600; the generic path-agnostic store API never chmods a
+    supplied parent. On Windows the per-user protected profile
+    application-data directory plus its inherited DACL is the boundary
+    (user account, SYSTEM, and local administrators are trusted local
+    principals).
 
 ---
 

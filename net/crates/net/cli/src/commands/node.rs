@@ -172,9 +172,11 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         .authority_dir
         .clone()
         .unwrap_or_else(default_authority_dir);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| generic(format!("failed to create {}: {e}", dir.display())))?;
+    // The authority scaffold (`NodeAuthority::adopt`) owns creating the
+    // authority directory as an owner-only (0700, atomic) local security
+    // boundary and validating an existing one. We deliberately do NOT
+    // pre-create it here with a lax umask — that create-then-chmod pattern is
+    // exactly what the scaffold avoids (Gate-1).
 
     // Adopt — the ceremony validates EVERYTHING (including the
     // supplied bundle's resulting floors) before writing, applies
