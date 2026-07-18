@@ -657,44 +657,112 @@ enum BackingId {
     /// `(volume_serial, file_index)` of the OPENED `.lock` sidecar. Two
     /// differently-cased path aliases of one sidecar share this.
     FileId { device: u64, inode: u64 },
-    /// Last-resort key on a platform with no file-identity API (or if the
-    /// fstat fails): the FULL normalized path. R2-4 — never a lossy 64-bit
+    /// Last-resort key on a platform with no file-identity API (or if a Unix
+    /// `fstat` fails): the FULL normalized path. R2-4 — never a lossy 64-bit
     /// path hash, so two distinct paths can NEVER collide onto one core or
     /// poison entry (the pre-R2-4 `DefaultHasher` fallback could, at the
-    /// ~2^32 birthday bound).
+    /// ~2^32 birthday bound). Never constructed on Windows: a missing file
+    /// identity there fails loud (see [`BackingId::of`]) rather than degrading
+    /// to a case-sensitive literal path.
+    #[cfg_attr(windows, allow(dead_code))]
     Path(PathBuf),
 }
 
 impl BackingId {
     /// Derive the identity from the opened lock sidecar. `path` (already
-    /// normalized by the caller) backs the fallback key on platforms with
-    /// no file-identity API or if the fstat fails.
-    fn of(lock: &std::fs::File, path: &Path) -> Self {
+    /// normalized by the caller) backs the fallback key on a platform with
+    /// no file-identity API, or if a Unix `fstat` somehow fails.
+    ///
+    /// On Windows the identity comes from the stable `GetFileInformationByHandle`
+    /// Win32 call: the `std` `MetadataExt::{volume_serial_number, file_index}`
+    /// accessors require the unstable `windows_by_handle` feature and do NOT
+    /// build on stable Rust. A Windows identity read that fails is a LOUD
+    /// error — never a silent degradation to a case-sensitive literal path,
+    /// which would reopen AV-9 by letting two differently-cased aliases of one
+    /// sidecar key two DISTINCT cores.
+    fn of(lock: &std::fs::File, path: &Path) -> Result<Self, OrgRevocationError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = lock.metadata() {
-                return BackingId::FileId {
+            // `fstat` on an open fd effectively never fails; degrade to the
+            // full-path fallback key (R2-4) if it somehow does.
+            Ok(match lock.metadata() {
+                Ok(meta) => BackingId::FileId {
                     device: meta.dev(),
                     inode: meta.ino(),
-                };
-            }
+                },
+                Err(_) => BackingId::Path(path.to_path_buf()),
+            })
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            if let Ok(meta) = lock.metadata() {
-                if let (Some(vol), Some(idx)) = (meta.volume_serial_number(), meta.file_index()) {
-                    return BackingId::FileId {
-                        device: u64::from(vol),
-                        inode: idx,
-                    };
-                }
+            // Stable Win32 `(dwVolumeSerialNumber, nFileIndex)` identity; a
+            // read failure fails loud rather than degrading to a literal path.
+            match windows_file_identity(lock) {
+                Ok((device, inode, _links)) => Ok(BackingId::FileId { device, inode }),
+                Err(e) => Err(OrgRevocationError::Io {
+                    path: path.display().to_string(),
+                    reason: format!("state lock: cannot read Windows file identity: {e}"),
+                }),
             }
         }
-        let _ = lock;
-        BackingId::Path(path.to_path_buf())
+        // Fallback key (R2-4: the FULL normalized path, never a lossy 64-bit
+        // hash) on a platform with no file-identity API.
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = lock;
+            Ok(BackingId::Path(path.to_path_buf()))
+        }
     }
+}
+
+/// Read the stable Win32 `BY_HANDLE_FILE_INFORMATION` for an open handle and
+/// return `(volume serial, file index, hard-link count)`.
+///
+/// `std`'s equivalents (`MetadataExt::volume_serial_number` / `file_index`,
+/// and any link count at all) require the unstable `windows_by_handle`
+/// feature and do not build on stable Rust, and there is no Win32 bindings
+/// crate in this workspace — so we declare the one call we need directly, the
+/// same hand-rolled `extern "system"` idiom the crate already uses elsewhere.
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64, u32)> {
+    use std::os::windows::io::AsRawHandle;
+
+    // `BY_HANDLE_FILE_INFORMATION`; `FILETIME` is two `DWORD`s. `#[repr(C)]`
+    // so the field offsets match the Win32 ABI exactly.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: `file` owns a valid, open handle for the duration of this call,
+    // and `info` is a live, correctly-sized, writable output buffer.
+    // `as_raw_handle()` is already `*mut c_void` — the exact `h_file` type.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let volume = u64::from(info.dw_volume_serial_number);
+    let index = (u64::from(info.n_file_index_high) << 32) | u64::from(info.n_file_index_low);
+    Ok((volume, index, info.n_number_of_links))
 }
 
 /// Process-wide core registry (AV-9 + R2-4). `cores` maps a backing
@@ -909,7 +977,7 @@ impl OrgRevocationStore {
         let lock = lock_state_file(&path)?;
         // AV-9: identity is the stable `.lock` inode, so case-aliases
         // share one core + poison entry.
-        let backing_id = BackingId::of(&lock, &path);
+        let backing_id = BackingId::of(&lock, &path)?;
         let was_poisoned = is_poisoned(&backing_id, &path);
         if was_poisoned {
             prove_entry_durable(&path)?;
@@ -957,7 +1025,7 @@ impl OrgRevocationStore {
         let path = normalize_backing_path(&path.into())?;
         let lock = lock_state_file(&path)?;
         // AV-9: stable `.lock` inode identity (case-aliases collapse).
-        let backing_id = BackingId::of(&lock, &path);
+        let backing_id = BackingId::of(&lock, &path)?;
         let was_poisoned = is_poisoned(&backing_id, &path);
         if was_poisoned {
             prove_entry_durable(&path)?;
@@ -1258,7 +1326,7 @@ impl OrgRevocationStore {
             // but the existing handle would sail on). Refuse loudly BEFORE
             // any reread / merge / write, so disk and the live view are
             // both untouched.
-            let opened_id = BackingId::of(&lock, path);
+            let opened_id = BackingId::of(&lock, path)?;
             if opened_id != self.core.backing_id {
                 drop(lock);
                 return Err(OrgRevocationError::BackingIdentityConflict {
@@ -1557,16 +1625,22 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> std::io::Result<std::fs::Fil
             ));
         }
     }
-    let file = opts.open(path).map_err(|e| {
-        #[cfg(unix)]
+    let opened = opts.open(path);
+    // Map the Unix `O_NOFOLLOW` symlink rejection (`ELOOP`) to a clear typed
+    // error. Unix-only: `#[cfg(not(unix))]` has no `O_NOFOLLOW`, and mapping
+    // there would be an identity map (`|e| e`).
+    #[cfg(unix)]
+    let opened = opened.map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
-            return std::io::Error::new(
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "refusing symlink: authority files must be regular files",
-            );
+            )
+        } else {
+            e
         }
-        e
-    })?;
+    });
+    let file = opened?;
     // Type check on the opened descriptor — immune to a swap
     // between check and use.
     let meta = file.metadata()?;
@@ -1608,22 +1682,28 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocatio
     // link count above one means someone hard-linked this sidecar's inode
     // to a SECOND name — the attack that would otherwise collapse two
     // distinct state paths onto one [`BackingId`] (and thus one core /
-    // poison entry). Refuse fail-closed. (Unix only; the Windows
-    // `file_index` identity plus the binding registry cover the same
-    // hazard where `std` exposes no link count.)
+    // poison entry). Refuse fail-closed on every platform. `std` exposes the
+    // link count on Unix (`nlink`) and on Windows only via the stable Win32
+    // `GetFileInformationByHandle` (`nNumberOfLinks`), read here directly.
     #[cfg(unix)]
-    {
+    let nlink = {
         use std::os::unix::fs::MetadataExt;
-        let nlink = lock.metadata().map_err(io)?.nlink();
-        if nlink != 1 {
-            return Err(OrgRevocationError::Io {
-                path: path.display().to_string(),
-                reason: format!(
-                    "state lock: refusing .lock sidecar with {nlink} hard links \
-                     (expected 1) — a hard-linked sidecar would alias two backing paths"
-                ),
-            });
-        }
+        u64::from(lock.metadata().map_err(io)?.nlink())
+    };
+    #[cfg(windows)]
+    let nlink = {
+        let (_volume, _index, links) = windows_file_identity(&lock).map_err(io)?;
+        u64::from(links)
+    };
+    #[cfg(any(unix, windows))]
+    if nlink != 1 {
+        return Err(OrgRevocationError::Io {
+            path: path.display().to_string(),
+            reason: format!(
+                "state lock: refusing .lock sidecar with {nlink} hard links \
+                 (expected 1) — a hard-linked sidecar would alias two backing paths"
+            ),
+        });
     }
     Ok(lock)
 }
@@ -2226,7 +2306,7 @@ mod tests {
         let mut stronger = OrgRevocationState::empty();
         stronger.merge_bundle(&bundle_with_floor(9));
         write_atomic(&norm, &stronger.to_file_bytes().expect("bytes")).expect("write");
-        mark_poisoned(&BackingId::of(&lock, &norm), &norm);
+        mark_poisoned(&BackingId::of(&lock, &norm).expect("backing id"), &norm);
 
         // Lock releases → the opener proceeds: it must observe the
         // poison, recover (reread + successful parent fsync), and
@@ -2648,9 +2728,11 @@ mod tests {
     /// backing paths onto one [`BackingId`] (one core + one poison
     /// entry).
     ///
-    /// Red-witness: dropping the `nlink != 1` check in `lock_state_file`
-    /// lets the reopen succeed.
-    #[cfg(unix)]
+    /// Red-witness: dropping the link-count check in `lock_state_file` lets
+    /// the reopen succeed. Runs on both Unix (`nlink`) and Windows
+    /// (`GetFileInformationByHandle`'s `nNumberOfLinks`) — a hard-linked
+    /// sidecar must be refused identically on each.
+    #[cfg(any(unix, windows))]
     #[test]
     fn hard_linked_lock_sidecar_is_refused() {
         let scratch = Scratch::new();
