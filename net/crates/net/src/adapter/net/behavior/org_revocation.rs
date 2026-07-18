@@ -67,9 +67,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use super::org::{OrgError, OrgId, OrgRevocationBundle};
@@ -466,6 +466,122 @@ impl StoreCore {
             callback(raised);
         }
     }
+
+    /// Remove the subscriber registered under `token`. Unknown tokens
+    /// are a no-op. Called by [`RaiseSubscription`]'s Drop through a
+    /// `Weak<StoreCore>` (R2-2), so a subscription is retired
+    /// deterministically by dropping its guard — never dependent on a
+    /// facade `Drop` a capture cycle could keep from running.
+    fn remove_subscriber(&self, token: u64) {
+        self.subscribers.write().retain(|(t, _)| *t != token);
+    }
+}
+
+/// The exclusion lease shared between one raise subscription's wrapped
+/// callback and its [`RaiseSubscription`] guard (R2-3). It is the
+/// re-entrancy-safe "in-flight lease drained by teardown" variant: the
+/// wrapped callback registers itself as in-flight for the *duration of the
+/// user callback* (never holding the lease's own lock across it, so a
+/// re-entrant `apply_bundle` cannot self-deadlock), and teardown marks the
+/// lease dead and BLOCKS until every in-flight callback has left.
+///
+/// Guarantees, jointly:
+/// - a callback that has passed the liveness check and is mid-mutation
+///   keeps teardown blocked until it finishes (no torn retraction);
+/// - once teardown has marked the lease dead, no *new* callback body runs
+///   — including one already snapshotted by [`StoreCore::notify`] outside
+///   the registry lock, or a re-entrant one.
+struct SubscriptionLease {
+    state: Mutex<LeaseState>,
+    /// Signalled when `in_flight` reaches zero, so a draining teardown
+    /// wakes exactly when the last in-flight callback leaves.
+    drained: Condvar,
+}
+
+struct LeaseState {
+    /// Set once by teardown; gates every subsequent callback entry.
+    dead: bool,
+    /// Count of callback bodies currently executing under this lease.
+    in_flight: usize,
+}
+
+impl SubscriptionLease {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(LeaseState {
+                dead: false,
+                in_flight: 0,
+            }),
+            drained: Condvar::new(),
+        })
+    }
+
+    /// Enter the callback body: `true` if admitted (caller MUST pair with
+    /// [`Self::leave`]), `false` if the lease is dead (caller returns
+    /// without running the user callback). The lease lock is held only for
+    /// this check-and-count, never across the user callback itself.
+    fn enter(&self) -> bool {
+        let mut st = self.state.lock();
+        if st.dead {
+            return false;
+        }
+        st.in_flight += 1;
+        true
+    }
+
+    /// Leave the callback body, waking a draining teardown if this was the
+    /// last in-flight callback.
+    fn leave(&self) {
+        let mut st = self.state.lock();
+        st.in_flight -= 1;
+        if st.in_flight == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    /// Teardown: mark the lease dead, then block until every in-flight
+    /// callback has left. After this returns, no callback body is running
+    /// and none can start.
+    fn kill_and_drain(&self) {
+        let mut st = self.state.lock();
+        st.dead = true;
+        while st.in_flight > 0 {
+            self.drained.wait(&mut st);
+        }
+    }
+}
+
+/// An externally-owned RAII handle to one raise subscription (R2-2 +
+/// R2-3). Dropping it:
+/// 1. marks the exclusion lease dead and drains any in-flight callback
+///    ([`SubscriptionLease::kill_and_drain`]), then
+/// 2. removes the callback from the shared core's registry via a
+///    `Weak<StoreCore>`.
+///
+/// Because removal goes through the `Weak` — not the owning
+/// [`OrgRevocationStore`] facade's `Drop` — a
+/// `core → callback → Arc<store> → core` capture cycle that keeps the
+/// facade alive can no longer strand the callback in the core: whoever
+/// holds this guard (the node, a sibling handle) retires the subscription
+/// by dropping it.
+#[must_use = "dropping the RaiseSubscription immediately unsubscribes and drains the callback"]
+pub struct RaiseSubscription {
+    core: Weak<StoreCore>,
+    token: u64,
+    lease: Arc<SubscriptionLease>,
+}
+
+impl Drop for RaiseSubscription {
+    fn drop(&mut self) {
+        // R2-3: block until no callback observed live is still mutating,
+        // and stop any snapshotted-but-not-yet-run callback, BEFORE the
+        // token is removed.
+        self.lease.kill_and_drain();
+        // R2-2: retire through the Weak core, independent of the facade.
+        if let Some(core) = self.core.upgrade() {
+            core.remove_subscriber(self.token);
+        }
+    }
 }
 
 /// A stable identity for a store's backing file, derived from the
@@ -661,28 +777,15 @@ pub(crate) fn publish_guard_pair<'a>(
 pub struct OrgRevocationStore {
     /// The shared per-path core.
     core: Arc<StoreCore>,
-    /// This handle's own slot in the core's subscriber registry —
-    /// the one [`Self::set_on_floors_raised`] replaces. Other
-    /// handles' and [`Self::subscribe_floors_raised`] registrations
-    /// are untouched by it.
-    own_subscription: Mutex<Option<u64>>,
-}
-
-impl Drop for OrgRevocationStore {
-    /// AV-10: RAII cleanup of THIS facade's own subscription. A facade
-    /// that installed a callback via [`Self::set_on_floors_raised`]
-    /// must unregister it on drop — otherwise, when a sibling handle
-    /// keeps the shared core alive, the core retains a callback that
-    /// can capture this facade (core → callback → … → core), leaking
-    /// the core and the stale projections the callback holds. Other
-    /// handles' registrations, and explicit
-    /// [`Self::subscribe_floors_raised`] tokens the caller owns, are
-    /// untouched.
-    fn drop(&mut self) {
-        if let Some(token) = self.own_subscription.lock().take() {
-            self.unsubscribe_floors_raised(token);
-        }
-    }
+    /// This handle's own [`RaiseSubscription`] guard — the one
+    /// [`Self::set_on_floors_raised`] replaces. Holding the RAII guard
+    /// directly in the facade means the callback is retired when this
+    /// field drops (AV-10), with no explicit `Drop` impl to forget:
+    /// the guard removes itself from the shared core via a
+    /// `Weak<StoreCore>` (R2-2) and drains any in-flight callback (R2-3).
+    /// Other handles' guards, and guards a caller obtained from
+    /// [`Self::subscribe_floors_raised`], are untouched.
+    own_subscription: Mutex<Option<RaiseSubscription>>,
 }
 
 impl OrgRevocationStore {
@@ -935,40 +1038,64 @@ impl OrgRevocationStore {
     }
 
     /// Register `callback` as ONE subscriber in the core's raise
-    /// registry and return its removable token (review-9 addendum:
-    /// subscription is a registry, not a single replaceable slot —
-    /// a second observer must never silently steal the first one's
-    /// notifications). Subscribers fire after a reload publishes
-    /// floors above the previously enforced view — including
-    /// floors learned from OTHER writers via the under-lock
+    /// registry and return an externally-owned [`RaiseSubscription`]
+    /// RAII guard (review-9 addendum: subscription is a registry, not a
+    /// single replaceable slot — a second observer must never silently
+    /// steal the first one's notifications). Subscribers fire after a
+    /// reload publishes floors above the previously enforced view —
+    /// including floors learned from OTHER writers via the under-lock
     /// reread, and raises published by same-path sibling handles.
+    ///
+    /// The callback is wrapped in an exclusion lease (R2-3): its body
+    /// runs only while registered as in-flight, and a teardown draining
+    /// the lease blocks until it leaves. Dropping the returned guard
+    /// retires the subscription — draining any in-flight callback and
+    /// removing it from the core through a `Weak<StoreCore>` (R2-2), so
+    /// cleanup never depends on this facade's own drop.
+    #[must_use = "dropping the returned guard immediately unsubscribes the callback"]
     pub fn subscribe_floors_raised(
         &self,
         callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static,
-    ) -> u64 {
+    ) -> RaiseSubscription {
+        let lease = SubscriptionLease::new();
+        let lease_cb = Arc::clone(&lease);
+        let wrapped: FloorsRaisedCallback = Arc::new(move |raised: &[RaisedFloor]| {
+            // R2-3: admit under the lease, run the user callback OUTSIDE
+            // the lease lock (re-entrant `apply_bundle` and long
+            // retractions must not self-deadlock), then leave — even on
+            // panic, via the drop guard.
+            if !lease_cb.enter() {
+                return;
+            }
+            struct LeaveOnDrop<'a>(&'a SubscriptionLease);
+            impl Drop for LeaveOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.leave();
+                }
+            }
+            let _leave = LeaveOnDrop(&lease_cb);
+            callback(raised);
+        });
         let token = self.core.next_subscriber.fetch_add(1, Ordering::Relaxed);
-        self.core
-            .subscribers
-            .write()
-            .push((token, Arc::new(callback)));
-        token
-    }
-
-    /// Remove the subscriber registered under `token`. Unknown
-    /// tokens are a no-op.
-    pub fn unsubscribe_floors_raised(&self, token: u64) {
-        self.core.subscribers.write().retain(|(t, _)| *t != token);
+        self.core.subscribers.write().push((token, wrapped));
+        RaiseSubscription {
+            core: Arc::downgrade(&self.core),
+            token,
+            lease,
+        }
     }
 
     /// Install THIS HANDLE's raise callback (review-8 §9),
     /// replacing only the callback this same handle previously set
     /// through this method — never another handle's or an explicit
-    /// [`Self::subscribe_floors_raised`] registration.
+    /// [`Self::subscribe_floors_raised`] registration. Storing the new
+    /// guard drops the old one, which drains and unsubscribes it.
     pub fn set_on_floors_raised(&self, callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static) {
         let mut own = self.own_subscription.lock();
-        if let Some(token) = own.take() {
-            self.unsubscribe_floors_raised(token);
-        }
+        // Drop the previous guard FIRST (drain + unsubscribe the old
+        // callback) so no both-registered gap lets it fire once more,
+        // THEN install the replacement.
+        own.take();
         *own = Some(self.subscribe_floors_raised(callback));
     }
 
@@ -2031,7 +2158,7 @@ mod tests {
             sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
         });
         let sink = seen_tok.clone();
-        let token = store_a.subscribe_floors_raised(move |raised| {
+        let subscription = store_a.subscribe_floors_raised(move |raised| {
             sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
         });
 
@@ -2046,14 +2173,129 @@ mod tests {
         assert_eq!(*seen_b.lock(), vec![5]);
         assert_eq!(*seen_tok.lock(), vec![5]);
 
-        // Unsubscribing the token removes ONLY that registration.
-        store_a.unsubscribe_floors_raised(token);
+        // Dropping the RAII guard removes ONLY that registration.
+        drop(subscription);
         store_b
             .apply_bundle(&bundle_with_floor(7))
             .expect("apply 7");
         assert_eq!(*seen_a.lock(), vec![5, 7]);
         assert_eq!(*seen_b.lock(), vec![5, 7]);
         assert_eq!(*seen_tok.lock(), vec![5], "unsubscribed token is silent");
+    }
+
+    /// R2-2: `subscribe_floors_raised` hands back an externally-owned
+    /// RAII guard; dropping the GUARD retires the subscription even while
+    /// the owning store facade is still very much alive — removal goes
+    /// through the guard's `Weak<StoreCore>`, not the facade's `Drop`
+    /// (which a `core → callback → Arc<store> → core` capture cycle could
+    /// keep from ever running).
+    ///
+    /// Red-witness: making `RaiseSubscription::drop` skip
+    /// `core.remove_subscriber` leaves the count at 1.
+    #[test]
+    fn dropping_the_subscription_guard_unsubscribes_while_the_store_lives() {
+        let scratch = Scratch::new();
+        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+        assert_eq!(store.subscriber_count(), 0);
+        let subscription = store.subscribe_floors_raised(|_raised| {});
+        assert_eq!(
+            store.subscriber_count(),
+            1,
+            "subscribe registers one callback"
+        );
+        drop(subscription);
+        assert_eq!(
+            store.subscriber_count(),
+            0,
+            "dropping the guard unsubscribed while the store handle is still alive",
+        );
+    }
+
+    /// R2-3: teardown EXCLUDES an in-flight callback. A callback that has
+    /// passed the liveness check and is mid-body keeps the subscription's
+    /// Drop BLOCKED (draining the exclusion lease) until it leaves — so a
+    /// retraction can never be torn in half by a concurrent teardown, and
+    /// no new callback starts once teardown has begun.
+    ///
+    /// Deterministic barrier: the callback signals `entered` (now counted
+    /// in-flight) and blocks; a teardown thread drops the guard and must
+    /// park in `kill_and_drain`; while parked it provably cannot signal
+    /// completion (asserted via a bounded `recv_timeout` that MUST expire);
+    /// releasing the callback lets it leave, the drain completes, and only
+    /// then does teardown finish.
+    ///
+    /// Red-witness: dropping the `while in_flight > 0` drain loop in
+    /// `kill_and_drain` lets teardown complete while the callback is still
+    /// in-flight, so the "must block" `recv_timeout` receives early and the
+    /// assertion fails.
+    #[test]
+    fn teardown_blocks_until_an_in_flight_callback_leaves() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // The callback must be `Fn + Send + Sync`; the mpsc endpoints are
+        // `!Sync`, so guard them.
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_cb = Arc::clone(&ran);
+        let subscription = store.subscribe_floors_raised(move |_raised| {
+            ran_cb.fetch_add(1, Ordering::SeqCst);
+            entered_tx.lock().send(()).expect("signal entered");
+            // Block INSIDE the callback body: the exclusion lease counts
+            // this run as in-flight for the whole duration.
+            release_rx.lock().recv().expect("await release");
+        });
+
+        // Fire a raise on a worker thread so the callback blocks there.
+        let store_fire = Arc::clone(&store);
+        let fire = std::thread::spawn(move || {
+            store_fire
+                .apply_bundle(&bundle_with_floor(5))
+                .expect("apply 5");
+        });
+
+        // The callback is now in-flight (blocked on release).
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("callback entered");
+
+        // Tear down on another thread; it must PARK in kill_and_drain.
+        let (teardown_done_tx, teardown_done_rx) = mpsc::channel::<()>();
+        let teardown = std::thread::spawn(move || {
+            drop(subscription);
+            teardown_done_tx.send(()).expect("signal teardown done");
+        });
+
+        // Block proof: while the callback is in-flight, teardown cannot
+        // complete — this `recv_timeout` MUST expire.
+        assert!(
+            teardown_done_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "teardown must block while a callback is in-flight",
+        );
+
+        // Release the callback → it leaves → the drain wakes → teardown
+        // completes.
+        release_tx.send(()).expect("release callback");
+        teardown_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("teardown completes after the callback drains");
+
+        fire.join().expect("fire thread");
+        teardown.join().expect("teardown thread");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "callback ran exactly once");
+        assert_eq!(
+            store.subscriber_count(),
+            0,
+            "the drained guard removed the subscriber",
+        );
     }
 
     /// Review-9 addendum: aliased pathnames — `..` hops, `./`

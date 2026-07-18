@@ -2650,11 +2650,13 @@ struct SendSecuritySnapshot {
 /// callback already snapshotted; the liveness token — invalidated
 /// BEFORE the unsubscribe on teardown — makes such a late callback
 /// inert instead of mutating a fold the node no longer owns.
-type OrgRaiseSubscription = Option<(
-    Arc<super::behavior::org_revocation::OrgRevocationStore>,
-    u64,
-    Arc<std::sync::atomic::AtomicBool>,
-)>;
+/// The node's live raise-subscription guard (R2-2/R2-3). Dropping it
+/// drains any in-flight retraction callback and unsubscribes the node's
+/// callback from the installed store's shared core via a
+/// `Weak<StoreCore>` — so teardown and store replacement retire the
+/// subscription deterministically, without the old `(store, token, alive)`
+/// tuple or a `has_peer_session`-style check.
+type OrgRaiseSubscription = Option<super::behavior::org_revocation::RaiseSubscription>;
 
 /// Signal-carrying wrapper around the `nrpc:` local-service set
 /// (RT-2). `serve_rpc` inserts and `ServeHandle::drop` removes
@@ -7029,19 +7031,16 @@ impl MeshNode {
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
         let me = Arc::downgrade(&store);
-        // AV-10: owner-liveness token, checked FIRST in the callback. On
-        // teardown the node invalidates it BEFORE unsubscribing, so a
-        // callback already snapshotted by `notify` (which clones the
-        // callback Arcs outside the registry lock) is inert when it
-        // fires afterward rather than retracting a fold it no longer
-        // owns — the `still_installed` check below is a runtime read of
-        // the slot, which the invalidation makes authoritative.
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let alive_cb = Arc::clone(&alive);
-        let token = store.subscribe_floors_raised(move |raised| {
-            if !alive_cb.load(std::sync::atomic::Ordering::Acquire) {
-                return;
-            }
+        // AV-10 / R2-3: liveness is enforced by the subscription's
+        // exclusion lease inside `subscribe_floors_raised`, not a separate
+        // owner token. Dropping the returned guard on teardown/replacement
+        // marks the lease dead and DRAINS any in-flight run of this
+        // callback before removing it, so a callback already snapshotted
+        // by `notify` (which clones the callback Arcs outside the registry
+        // lock) never runs afterward, and one mid-retraction keeps
+        // teardown blocked until it finishes. The `still_installed` check
+        // below remains the store-identity gate for the replacement case.
+        let subscription = store.subscribe_floors_raised(move |raised| {
             let installed = slot.load_full();
             let still_installed = match (&installed, me.upgrade()) {
                 (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
@@ -7070,18 +7069,15 @@ impl MeshNode {
                 }
             }
         });
-        // Swap the node's observer slot: drop the token held on the
-        // outgoing store so a detached store neither keeps nor
-        // steals this node's notifications (review-9 addendum).
+        // Swap the node's observer slot: drop the guard held on the
+        // outgoing store FIRST so a detached store neither keeps nor
+        // steals this node's notifications (review-9 addendum). The old
+        // guard's Drop drains any in-flight old callback and unsubscribes
+        // it via the Weak core (R2-2/R2-3) before the new one is stored.
         {
-            let mut subscription = self.org_raise_subscription.lock();
-            if let Some((old_store, old_token, old_alive)) = subscription.take() {
-                // AV-10: invalidate the outgoing owner token BEFORE the
-                // unsubscribe, so a snapshotted old callback is inert.
-                old_alive.store(false, std::sync::atomic::Ordering::Release);
-                old_store.unsubscribe_floors_raised(old_token);
-            }
-            *subscription = Some((store.clone(), token, alive));
+            let mut slot = self.org_raise_subscription.lock();
+            slot.take();
+            *slot = Some(subscription);
         }
         self.org_revocation.store(Some(store.clone()));
         drop(_pin);
@@ -22727,16 +22723,15 @@ impl Drop for MeshNode {
         // it captures never drop. Removing the callback breaks the
         // cycle so the core is released once the last store handle
         // drops.
-        if let Some((store, token, alive)) = self.org_raise_subscription.lock().take() {
-            // AV-10: invalidate the owner-liveness token BEFORE the
-            // unsubscribe. `notify` clones subscriber callbacks outside
-            // the registry lock, so a raise landing concurrently with
-            // this teardown could have already snapshotted this
-            // callback; the invalidation makes that late invocation
-            // inert instead of retracting a fold the node no longer owns.
-            alive.store(false, std::sync::atomic::Ordering::Release);
-            store.unsubscribe_floors_raised(token);
-        }
+        // AV-10 / R2-2 / R2-3: dropping the node's raise-subscription
+        // guard marks its exclusion lease dead and DRAINS any in-flight
+        // run of the retraction callback (`notify` clones subscriber
+        // callbacks outside the registry lock, so a raise landing
+        // concurrently with teardown could already be executing this one),
+        // then removes it from the installed store's shared core via a
+        // `Weak<StoreCore>`. So a late callback neither starts nor is left
+        // mid-retraction against a fold the node no longer owns.
+        drop(self.org_raise_subscription.lock().take());
     }
 }
 
@@ -25240,12 +25235,18 @@ mod heartbeat_aead_tests {
     /// flag for `is_priority` / `is_control`, and `is_reliable` is
     /// the obvious next addition. This source-level pin ensures the
     /// fix doesn't get reverted before the dispatch path catches up.
+    ///
+    /// R2-6 moved the packet-build body into the atomic
+    /// [`MeshNode::try_publish_to_peer`] delegate (`publish_to_peer` is
+    /// now a thin `Result`-flattening wrapper), so the pin scans there —
+    /// that is where the wire packet, and thus the `reliable` flag, is
+    /// built.
     #[test]
     fn publish_to_peer_propagates_reliable_to_packet_flags() {
         let src = include_str!("mesh.rs");
         let start = src
-            .find("async fn publish_to_peer(")
-            .expect("publish_to_peer must exist");
+            .find("async fn try_publish_to_peer(")
+            .expect("try_publish_to_peer must exist");
         // Round down to a char boundary — the source has multibyte
         // box-drawing characters in doc comments, and a fixed-byte
         // window can land mid-UTF-8 sequence after edits to the
