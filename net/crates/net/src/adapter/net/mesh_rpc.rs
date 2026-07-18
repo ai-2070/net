@@ -495,6 +495,136 @@ fn response_route_is_trustworthy(
         && authenticated_peer_origin == Some(claimed_origin)
 }
 
+/// The verdict of the shared callee-side preflight
+/// ([`bridge_preflight`]) — what a serve bridge must do with one
+/// inbound frame BEFORE it reaches the fold.
+enum BridgePreflight {
+    /// Passed equality + the capability gate; the response route was
+    /// cached if authenticated. Hand the frame to the fold.
+    Proceed,
+    /// Cross-service confused deputy, malformed, or a denial with no
+    /// authenticated reply identity — drop silently.
+    Drop,
+    /// The capability gate denied this caller. Emit the terminal
+    /// denial ONLY to the AEAD-authenticated session peer `from_node`
+    /// (never fanned out to the claimed origin's roster — NC2), on the
+    /// reply channel for `claimed_origin`, tagged with `call_id`.
+    Deny {
+        claimed_origin: u64,
+        call_id: u64,
+        from_node: u64,
+    },
+}
+
+/// The ONE callee-side preflight shared by all four serve bridges
+/// (Kyra E1 audit — singular seam). Runs, in order:
+///
+/// 1. captured-service equality (E0.2 P0) — a cross-service REQUEST
+///    drops;
+/// 2. the public capability gate ([`capability_bridge::may_execute`],
+///    byte-for-byte the same call the unary/response-streaming paths
+///    already made) — skipped only for the `from_node == 0`
+///    loopback/test sentinel;
+/// 3. on accept, the authenticated response-route cache
+///    ([`cache_authenticated_response_destination`]).
+///
+/// On denial the reply is delivered ONLY to the AEAD-authenticated
+/// session peer `from_node` (NC2, via [`emit_capability_denial`]): a
+/// malicious peer that stamps a victim's origin on the wire header
+/// cannot reflect a forged `CapabilityDenied` into the victim's reply
+/// channel — the denial is unicast to the ATTACKER's own node, where
+/// the victim's reply channel has no subscriber, and is dropped.
+fn bridge_preflight(
+    mesh: &MeshNode,
+    cache: &RpcOriginNodeCache,
+    inbound: &RpcInboundEvent,
+    expected_service: &str,
+    tag: &str,
+) -> BridgePreflight {
+    if is_cross_service_request(&inbound.payload, expected_service) {
+        return BridgePreflight::Drop;
+    }
+    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
+        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
+    } else {
+        None
+    }) else {
+        return BridgePreflight::Drop;
+    };
+    let from_node = inbound.from_node;
+    if from_node != 0
+        && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
+            mesh.capability_fold(),
+            mesh.node_id(),
+            tag,
+            from_node,
+        )
+    {
+        return BridgePreflight::Deny {
+            claimed_origin: inbound.origin_hash,
+            call_id: meta.seq_or_ts,
+            from_node,
+        };
+    }
+    cache_authenticated_response_destination(mesh, cache, inbound);
+    BridgePreflight::Proceed
+}
+
+/// Emit a terminal `CapabilityDenied` for a gate-denied call, routed
+/// ONLY to the AEAD-authenticated session peer `from_node` (NC2 —
+/// Kyra E1 audit). The reply rides `<service>.replies.<claimed_origin>`
+/// so an HONEST caller (whose session peer IS its own node) receives
+/// it; a malicious peer that forged a victim's `claimed_origin` gets
+/// the denial unicast to ITS OWN node — where that reply channel has
+/// no subscriber — so a forged denial can never terminate a victim's
+/// pending call. It is NEVER fanned out to the claimed origin's
+/// subscriber roster.
+async fn emit_capability_denial(
+    mesh: &MeshNode,
+    service: &str,
+    claimed_origin: u64,
+    call_id: u64,
+    from_node: u64,
+) {
+    let resp = super::cortex::RpcResponsePayload {
+        status: RpcStatus::CapabilityDenied,
+        headers: vec![],
+        body: Bytes::from(format!(
+            "callee-side capability-auth gate denied nrpc:{service}"
+        )),
+    };
+    let meta = EventMeta::new(
+        super::cortex::DISPATCH_RPC_RESPONSE,
+        0,
+        mesh.identity_origin_hash(),
+        call_id,
+        0,
+    );
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+    buf.extend_from_slice(&meta.to_bytes());
+    resp.encode_into(&mut buf);
+
+    let reply_channel_name = format!("{service}.replies.{claimed_origin:016x}");
+    let Ok(reply_channel) = ChannelName::new(&reply_channel_name) else {
+        return;
+    };
+    let reply_channel_id = ChannelId::new(reply_channel.clone());
+    let reply_channel_hash = reply_channel_id.hash();
+    let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+    // `target_hint = Some(from_node)` forces a direct unicast to the
+    // authenticated session peer — never the roster fan-out fallback.
+    let _ = publish_response_to_caller(
+        mesh,
+        claimed_origin,
+        Some(from_node),
+        &reply_channel,
+        reply_channel_hash,
+        reply_stream_id,
+        Bytes::from(buf),
+    )
+    .await;
+}
+
 /// A response ready to publish, handed from a (synchronous) `serve_rpc`
 /// emit closure to the per-service response drainer task. Replaces the
 /// pre-§8a `tokio::spawn`-per-response: the emit closure builds the wire
@@ -2217,17 +2347,13 @@ impl MeshNode {
         // `&mut self`). Attach the per-service metrics handle so
         // the spawned handler tasks bump server-side counters.
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        // Keep a clone of the emit closure for the callee-side
-        // capability-auth defense-in-depth path in the bridge
-        // below — the fold owns its own clone, this one only
-        // emits the `CapabilityDenied` rejection before the fold
-        // sees the event.
-        let emit_for_bridge = Arc::clone(&emit);
         // Clone the per-service metrics handle so the bridge can
         // bump `capability_denied_total` on gate rejection. The
         // fold's own clone (passed via `with_metrics`) handles the
         // handler-side counters; this one covers the path BEFORE
         // the handler runs, which the fold-side metrics never see.
+        // (The denial itself is emitted by `emit_capability_denial`,
+        // which unicasts to the authenticated session peer — NC2.)
         let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
@@ -2274,92 +2400,44 @@ impl MeshNode {
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
-            use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
-                // OA2-E0.2 P0: captured-service equality. An initial
-                // REQUEST routed to THIS dispatcher whose payload
-                // names a different service is a cross-service
-                // confused deputy — drop it before the capability
-                // gate or any fold/handler state. Control frames
-                // inherit the route-selected active call and are not
-                // re-checked (see `is_cross_service_request`).
-                //
-                // KC7 (Kyra E1 audit): the origin→node response-route
-                // cache is populated LATER — after this equality check
-                // AND the capability gate, and only for an
-                // authenticated origin — so a denied/mismatched/forged
-                // frame can never poison a legitimate call's response
-                // routing (see `cache_authenticated_response_destination`).
-                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
-                    continue;
-                }
-                // Defense-in-depth check. Skip only when the wire
-                // session resolved no NodeId (`from_node == 0` is
-                // the loopback / test sentinel per
-                // `RpcInboundEvent::from_node` — production wire
-                // delivery drops events that fail NodeId
-                // resolution rather than passing 0). The cold-
-                // start "no self-ann" skip the original
-                // implementation carried was a permissive hole;
-                // `index_self_with_local_services` above
-                // guarantees a self-ann exists before the
-                // dispatcher is wired, so denying when the gate
-                // says no is now the safe failure mode.
-                let self_node = mesh_for_bridge.node_id();
-                let from_node = inbound.from_node;
-                if from_node != 0
-                    && !capability_bridge::may_execute(
-                        mesh_for_bridge.capability_fold(),
-                        self_node,
-                        &tag,
-                        from_node,
-                    )
-                {
-                    // Decode the EventMeta so we can address the
-                    // caller's reply channel (keyed on
-                    // `caller_origin`) and tag the response with
-                    // the correct `call_id`. A garbled meta means
-                    // the request would have been rejected by the
-                    // fold's own decode path too; drop silently
-                    // to match the existing skip-on-malformed
-                    // behavior there.
-                    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
-                        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
-                    } else {
-                        None
-                    }) else {
-                        continue;
-                    };
-                    let resp = super::cortex::RpcResponsePayload {
-                        status: RpcStatus::CapabilityDenied,
-                        headers: vec![],
-                        body: Bytes::from(format!(
-                            "callee-side capability-auth gate denied nrpc:{}",
-                            service_for_bridge
-                        )),
-                    };
-                    // Server-side metrics: bump `capability_denied_total`
-                    // on the per-service counter. The fold-side
-                    // metrics never see this path (the handler isn't
-                    // invoked), so without this bump a noisy
-                    // unauthorized caller is invisible to operators
-                    // watching `nrpc_handler_invocations_total` —
-                    // the dashboard sees "0 requests" while the
-                    // caller sees `CapabilityDenied`.
-                    metrics_for_bridge
-                        .capability_denied_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp);
-                    continue;
-                }
-                // KC7: the frame passed equality + the capability gate.
-                // NOW record its response destination — and only if the
-                // claimed origin is the authenticated session peer's own.
-                cache_authenticated_response_destination(
+                // The ONE shared callee preflight: captured-service
+                // equality → may_execute → authenticated response-route
+                // cache. On denial it hands back the AUTHENTICATED
+                // reply origin (NC2), never the wire-claimed one.
+                match bridge_preflight(
                     &mesh_for_bridge,
                     &origin_node_cache_for_bridge,
                     &inbound,
-                );
+                    &service_for_bridge,
+                    &tag,
+                ) {
+                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Drop => continue,
+                    BridgePreflight::Deny {
+                        claimed_origin,
+                        call_id,
+                        from_node,
+                    } => {
+                        // The handler never runs on this path, so bump
+                        // `capability_denied_total` so operators still see
+                        // the denied caller.
+                        metrics_for_bridge
+                            .capability_denied_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // NC2: the denial goes ONLY to the authenticated
+                        // session peer, never the claimed origin's roster.
+                        emit_capability_denial(
+                            &mesh_for_bridge,
+                            &service_for_bridge,
+                            claimed_origin,
+                            call_id,
+                            from_node,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2514,13 +2592,10 @@ impl MeshNode {
         // + pump task bump server-side counters (including the
         // streaming-only `streaming_chunks_emitted_total`).
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        // Keep clones of the emit closure + metrics handle for the
-        // callee-side capability-auth gate in the bridge below —
-        // same defense-in-depth shape as the unary `serve_rpc`
-        // bridge. The fold owns its own clones; these only serve
-        // the deny path, which runs BEFORE the fold (and therefore
-        // the handler) ever sees the event.
-        let emit_for_bridge = Arc::clone(&emit);
+        // The bridge's shared callee gate bumps the per-service
+        // `capability_denied_total`; the denial itself is emitted by
+        // `emit_capability_denial` (unicast to the authenticated
+        // session peer — NC2), so no emit clone is needed here.
         let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
@@ -2553,76 +2628,39 @@ impl MeshNode {
         let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
-            use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
-                // OA2-E0.2 P0: captured-service equality — see the
-                // unary bridge. A cross-service initial REQUEST is
-                // dropped before the capability gate or fold state.
-                // KC7: the response-route cache is populated only after
-                // the gate below, and only for an authenticated origin.
-                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
-                    continue;
-                }
-                // Callee-side capability-auth gate — the streaming
-                // mirror of the unary bridge's defense-in-depth
-                // check (the caller-side gate inside
-                // `call_service_streaming` covers the well-behaved
-                // client path). Skip only when the wire session
-                // resolved no NodeId (`from_node == 0` is the
-                // loopback / test sentinel per
-                // `RpcInboundEvent::from_node`).
-                let self_node = mesh_for_bridge.node_id();
-                let from_node = inbound.from_node;
-                if from_node != 0
-                    && !capability_bridge::may_execute(
-                        mesh_for_bridge.capability_fold(),
-                        self_node,
-                        &tag,
-                        from_node,
-                    )
-                {
-                    // Decode the EventMeta so we can address the
-                    // caller's reply channel (keyed on
-                    // `caller_origin`) and tag the response with
-                    // the correct `call_id`. A garbled meta would
-                    // have been rejected by the fold's own decode
-                    // path too; drop silently to match that
-                    // skip-on-malformed behavior.
-                    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
-                        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
-                    } else {
-                        None
-                    }) else {
-                        continue;
-                    };
-                    // Terminal frame: a non-`Ok` status closes the
-                    // caller's stream regardless of streaming
-                    // headers (`classify_streaming_chunk`), so this
-                    // single emit both denies and terminates.
-                    let resp = super::cortex::RpcResponsePayload {
-                        status: RpcStatus::CapabilityDenied,
-                        headers: vec![],
-                        body: Bytes::from(format!(
-                            "callee-side capability-auth gate denied nrpc:{}",
-                            service_for_bridge
-                        )),
-                    };
-                    // Same operator-visibility bump as the unary
-                    // deny path: the handler never runs, so the
-                    // fold-side metrics can't count this.
-                    metrics_for_bridge
-                        .capability_denied_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp).await;
-                    continue;
-                }
-                // KC7: cache the response destination only past the gate
-                // and only for an authenticated direct-session origin.
-                cache_authenticated_response_destination(
+                // The shared callee preflight (see the unary bridge).
+                match bridge_preflight(
                     &mesh_for_bridge,
                     &origin_node_cache_for_bridge,
                     &inbound,
-                );
+                    &service_for_bridge,
+                    &tag,
+                ) {
+                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Drop => continue,
+                    BridgePreflight::Deny {
+                        claimed_origin,
+                        call_id,
+                        from_node,
+                    } => {
+                        metrics_for_bridge
+                            .capability_denied_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // A non-`Ok` status closes the caller's stream
+                        // regardless of streaming headers; NC2 delivers it
+                        // only to the authenticated session peer.
+                        emit_capability_denial(
+                            &mesh_for_bridge,
+                            &service_for_bridge,
+                            claimed_origin,
+                            call_id,
+                            from_node,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2743,6 +2781,10 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        // NC1: the bridge now runs the shared callee gate, so it needs
+        // a metrics handle of its own (the denial is emitted by
+        // `emit_capability_denial`, not the fold's emitter).
+        let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcStreamingRequestFold::new(handler as Arc<dyn RpcClientStreamingHandler>, emit_resp)
                 .with_grant_emitter(emit_grant)
@@ -2770,23 +2812,40 @@ impl MeshNode {
         let service_for_bridge = service.to_string();
         let mesh_for_bridge = Arc::clone(self);
         let bridge = tokio::spawn(async move {
+            let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
-                // OA2-E0.2 P0: captured-service equality — a
-                // cross-service initial REQUEST is dropped before any
-                // fold state. Control frames inherit the
-                // route-selected active call (see the unary bridge).
-                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
-                    continue;
-                }
-                // KC7: record the response destination only after the
-                // equality check and only for an authenticated
-                // direct-session origin — never from a forged/denied
-                // frame (see `cache_authenticated_response_destination`).
-                cache_authenticated_response_destination(
+                // NC1: the SAME shared callee preflight the unary /
+                // response-streaming bridges run — client-streaming
+                // used to skip may_execute entirely, leaving it
+                // transport-authenticated but not capability-authorized.
+                match bridge_preflight(
                     &mesh_for_bridge,
                     &origin_node_cache_for_bridge,
                     &inbound,
-                );
+                    &service_for_bridge,
+                    &tag,
+                ) {
+                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Drop => continue,
+                    BridgePreflight::Deny {
+                        claimed_origin,
+                        call_id,
+                        from_node,
+                    } => {
+                        metrics_for_bridge
+                            .capability_denied_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        emit_capability_denial(
+                            &mesh_for_bridge,
+                            &service_for_bridge,
+                            claimed_origin,
+                            call_id,
+                            from_node,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -3018,6 +3077,9 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        // NC1: clone the metrics handle for the bridge's shared callee
+        // gate (the denial is emitted by `emit_capability_denial`).
+        let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
                 .with_grant_emitter(emit_grant)
@@ -3041,23 +3103,39 @@ impl MeshNode {
         let service_for_bridge = service.to_string();
         let mesh_for_bridge = Arc::clone(self);
         let bridge = tokio::spawn(async move {
+            let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
-                // OA2-E0.2 P0: captured-service equality — a
-                // cross-service initial REQUEST is dropped before any
-                // fold state. Control frames inherit the
-                // route-selected active call (see the unary bridge).
-                if is_cross_service_request(&inbound.payload, &service_for_bridge) {
-                    continue;
-                }
-                // KC7: record the response destination only after the
-                // equality check and only for an authenticated
-                // direct-session origin — never from a forged/denied
-                // frame (see `cache_authenticated_response_destination`).
-                cache_authenticated_response_destination(
+                // NC1: the shared callee preflight — duplex used to skip
+                // may_execute entirely (transport-authenticated but not
+                // capability-authorized).
+                match bridge_preflight(
                     &mesh_for_bridge,
                     &origin_node_cache_for_bridge,
                     &inbound,
-                );
+                    &service_for_bridge,
+                    &tag,
+                ) {
+                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Drop => continue,
+                    BridgePreflight::Deny {
+                        claimed_origin,
+                        call_id,
+                        from_node,
+                    } => {
+                        metrics_for_bridge
+                            .capability_denied_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        emit_capability_denial(
+                            &mesh_for_bridge,
+                            &service_for_bridge,
+                            claimed_origin,
+                            call_id,
+                            from_node,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
