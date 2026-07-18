@@ -1472,18 +1472,25 @@ static PATH_POISON: std::sync::OnceLock<Mutex<PoisonRegistry>> = std::sync::Once
 ///
 /// - `by_id` — the live `.lock` sidecar identity ([`BackingId`]), which
 ///   is what same-path handles join their core on; and
-/// - `by_path` — the CANONICAL state-file path, which survives `.lock`
-///   sidecar replacement. Keying poison only on the sidecar identity let
-///   a durability-uncertain path be laundered by dropping every handle
-///   and recreating the `.lock` (new inode ⇒ new `BackingId` ⇒
-///   `by_id` miss ⇒ recovery skipped). The path tombstone closes that:
-///   once poisoned, the path stays poisoned across sidecar recreation
-///   until explicit recovery, and case-aliases collapse through the
-///   actual filesystem (`canonicalize`), not blind case-folding.
+/// - `by_path` — the CANONICAL state-file path mapped to the SET of every
+///   sidecar identity ever poisoned under it. The path key survives `.lock`
+///   sidecar replacement: keying poison only on the sidecar identity let a
+///   durability-uncertain path be laundered by dropping every handle and
+///   recreating the `.lock` (new inode ⇒ new `BackingId` ⇒ `by_id` miss ⇒
+///   recovery skipped). The path tombstone closes that — once poisoned, the
+///   path stays poisoned across sidecar recreation until explicit recovery,
+///   and case-aliases collapse through the actual filesystem
+///   (`canonicalize`), not blind case-folding.
+///
+///   Tracking the id SET per path (not just the path itself) lets recovery
+///   retire EVERY stale old `BackingId` for that path in one step (P2
+///   hygiene): a sidecar that was unlinked and recreated stranded its old id
+///   in `by_id`, and a later store re-using that recycled inode would
+///   otherwise trip redundant recovery on the dead id's residue.
 #[derive(Default)]
 struct PoisonRegistry {
     by_id: std::collections::HashSet<BackingId>,
-    by_path: std::collections::HashSet<PathBuf>,
+    by_path: std::collections::HashMap<PathBuf, std::collections::HashSet<BackingId>>,
 }
 
 fn poison_registry() -> &'static Mutex<PoisonRegistry> {
@@ -1500,12 +1507,13 @@ fn poison_path_key(normalized_path: &Path) -> PathBuf {
     std::fs::canonicalize(normalized_path).unwrap_or_else(|_| normalized_path.to_path_buf())
 }
 
-/// Poison `normalized_path` under BOTH indexes (R3-2).
+/// Poison `normalized_path` under BOTH indexes (R3-2), recording `id` in the
+/// path's id set so recovery can retire every id ever poisoned here.
 fn mark_poisoned(id: &BackingId, normalized_path: &Path) {
     let key = poison_path_key(normalized_path);
     let mut reg = poison_registry().lock();
     reg.by_id.insert(id.clone());
-    reg.by_path.insert(key);
+    reg.by_path.entry(key).or_default().insert(id.clone());
 }
 
 /// Poisoned iff EITHER the live sidecar identity OR the canonical state
@@ -1514,7 +1522,7 @@ fn mark_poisoned(id: &BackingId, normalized_path: &Path) {
 fn is_poisoned(id: &BackingId, normalized_path: &Path) -> bool {
     let key = poison_path_key(normalized_path);
     let reg = poison_registry().lock();
-    reg.by_id.contains(id) || reg.by_path.contains(&key)
+    reg.by_id.contains(id) || reg.by_path.contains_key(&key)
 }
 
 /// Normalize a backing pathname ONCE at store construction
@@ -1601,8 +1609,17 @@ fn clear_poison(id: &BackingId, path: &Path) {
     let key = poison_path_key(path);
     {
         let mut reg = poison_registry().lock();
+        // Retire EVERY sidecar identity ever poisoned under this canonical
+        // path, not just the recovering one (P2 hygiene): a prior sidecar
+        // that was unlinked and recreated left its old `BackingId` stranded
+        // in `by_id`, and a later store re-using that recycled inode would
+        // otherwise trip redundant recovery on the dead residue.
+        if let Some(ids) = reg.by_path.remove(&key) {
+            for stale in ids {
+                reg.by_id.remove(&stale);
+            }
+        }
         reg.by_id.remove(id);
-        reg.by_path.remove(&key);
     }
     tracing::warn!(
         path = %path.display(),
@@ -3149,6 +3166,44 @@ mod tests {
             .expect("chmod back");
         let recovered = OrgRevocationStore::open_existing(&upper).expect("recovered via alias");
         assert!(!recovered.is_poisoned());
+    }
+
+    /// P2 hygiene: recovering a canonical path retires EVERY sidecar identity
+    /// ever poisoned under it — not just the recovering one — so a stale old
+    /// `BackingId` (left behind when a sidecar was unlinked and recreated)
+    /// does not linger in `by_id` to trip redundant recovery after inode
+    /// reuse. Directly exercises the poison registry (no filesystem poison
+    /// needed), so it runs on every platform.
+    ///
+    /// Red-witness: reverting `clear_poison` to remove only the passed `id`
+    /// leaves `old_id` poisoned, so the final `is_poisoned(&old_id, ..)` holds.
+    #[test]
+    fn clear_poison_retires_all_stale_ids_for_the_path() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let old_id = BackingId::FileId {
+            device: 0x5005,
+            inode: 0xF00D_0001,
+        };
+        let new_id = BackingId::FileId {
+            device: 0x5005,
+            inode: 0xF00D_0002,
+        };
+        // Two sidecar identities poisoned under the SAME path — the
+        // unlink+recreate that strands the old id in `by_id`.
+        mark_poisoned(&old_id, &path);
+        mark_poisoned(&new_id, &path);
+        assert!(is_poisoned(&old_id, &path));
+        assert!(is_poisoned(&new_id, &path));
+
+        // Recovery through the CURRENT (new) id clears the path tombstone AND
+        // retires the stale old id in lockstep — no dead residue survives.
+        clear_poison(&new_id, &path);
+        assert!(!is_poisoned(&new_id, &path), "recovered id cleared");
+        assert!(
+            !is_poisoned(&old_id, &path),
+            "stale old id retired with the path recovery — no dead residue",
+        );
     }
 
     /// R3-3: an existing live handle's `apply_bundle` verifies the opened
