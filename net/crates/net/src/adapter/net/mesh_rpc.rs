@@ -47,7 +47,7 @@ use super::cortex::{
     FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL,
     HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_ROUTE_V1_SIZE,
 };
-use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
+use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome, ServiceMetricsAtomic};
 use crate::error::AdapterError;
 
 use super::mesh::{MeshNode, PeerPublishOutcome};
@@ -504,6 +504,49 @@ fn response_route_is_trustworthy(
         && authenticated_peer_origin == Some(claimed_origin)
 }
 
+/// Where an upload REQUEST_GRANT for a flow-controlled call may be routed,
+/// classified ONCE at request admission from the SAME authenticated-origin
+/// equality response routing uses (Kyra Gate-3). A secure upload grant must
+/// reach the caller's directly-authenticated session; deriving "direct" from
+/// `from_node != 0` alone would hand a relay's grant to the relay, or
+/// roster-fan it to a same-origin bystander.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RequestGrantRoute {
+    /// `from_node` is the caller's own AEAD-authenticated session: its pinned
+    /// peer origin equals the wire-claimed origin. Grants are
+    /// `DirectOnly(node)`.
+    TrustedDirect(u64),
+    /// The loopback / test sentinel (`from_node == 0`): local delivery, the
+    /// roster path is preserved.
+    Loopback,
+    /// A nonzero `from_node` whose pinned origin does NOT match the claimed
+    /// caller origin — a relayed frame (the last hop is a relay) or a forged
+    /// origin. No end-to-end recipient correlation exists to deliver a grant
+    /// to the true caller, so a flow-controlled call on this route is
+    /// rejected before the fold rather than admitted and silently stalled.
+    RelayedOrUntrusted,
+}
+
+/// Classify the grant route of an inbound flow-controlled REQUEST using the
+/// same equality as [`response_route_is_trustworthy`]: `from_node == 0` is
+/// loopback; a nonzero `from_node` whose pinned peer origin equals the
+/// wire-claimed origin is a trusted direct session; anything else is relayed
+/// or untrusted. Pure and deterministically testable. Captured at admission
+/// (never recomputed later from an evictable route cache).
+fn classify_request_grant_route(
+    from_node: u64,
+    claimed_origin: u64,
+    authenticated_peer_origin: Option<u64>,
+) -> RequestGrantRoute {
+    if from_node == 0 {
+        RequestGrantRoute::Loopback
+    } else if authenticated_peer_origin == Some(claimed_origin) {
+        RequestGrantRoute::TrustedDirect(from_node)
+    } else {
+        RequestGrantRoute::RelayedOrUntrusted
+    }
+}
+
 /// Whether a server-streaming / duplex RESPONSE frame terminates its
 /// call — a non-`Ok` status (error / cancel / deadline) or the explicit
 /// `nrpc-streaming: end` marker. The multi-fire emit closures use this
@@ -661,6 +704,75 @@ async fn emit_capability_denial(
         ResponseRouteFallback::DirectOnly,
     )
     .await;
+}
+
+/// Reject a relayed/untrusted flow-controlled upload REQUEST at admission —
+/// BEFORE the fold, handler, or grant emitter runs (Kyra Gate-3). Only the
+/// two flow-controlled serve bridges (client-streaming, duplex) call this;
+/// unary and server-streaming public calls are unaffected.
+///
+/// A relayed frame arrives with a nonzero `from_node` (the relay's own
+/// authenticated session) whose pinned origin does NOT equal the claimed
+/// caller origin. A secure upload grant can only reach a directly
+/// authenticated caller session — there is no end-to-end recipient
+/// correlation to deliver it to the true caller through a relay — so rather
+/// than admit the call and then silently lose its grants (partial execution
+/// followed by an unexplained stall), the initial REQUEST is DROPPED: the
+/// fold is not fed, a dedicated counter is bumped, and a structured warning
+/// is logged. Nothing is reflected onto the untrusted claimed origin's
+/// roster (contrast [`emit_capability_denial`], which unicasts a denial to
+/// the authenticated peer — here there is no trusted peer to answer).
+///
+/// Returns `true` if the frame was rejected and the bridge must `continue`.
+/// Only the initial REQUEST is classified/rejected; later frames for a call
+/// that was never admitted are harmlessly ignored by the fold, so metering
+/// stays per-call rather than per-frame.
+fn reject_relayed_flow_controlled_request(
+    mesh: &MeshNode,
+    metrics: &ServiceMetricsAtomic,
+    inbound: &RpcInboundEvent,
+    service: &str,
+    tag: &str,
+) -> bool {
+    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
+        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
+    } else {
+        None
+    }) else {
+        return false;
+    };
+    // Classify (and reject) only the initial REQUEST; CHUNK / CANCEL / GRANT
+    // control frames inherit the call the REQUEST already admitted-or-dropped.
+    if meta.dispatch != DISPATCH_RPC_REQUEST {
+        return false;
+    }
+    let authenticated_peer_origin = mesh
+        .peer_entity_id(inbound.from_node)
+        .map(|e| e.origin_hash());
+    if RequestGrantRoute::RelayedOrUntrusted
+        == classify_request_grant_route(
+            inbound.from_node,
+            inbound.origin_hash,
+            authenticated_peer_origin,
+        )
+    {
+        metrics
+            .relayed_flow_controlled_rejected_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            service = service,
+            tag = tag,
+            from_node = format!("{:#x}", inbound.from_node),
+            claimed_origin = format!("{:#x}", inbound.origin_hash),
+            call_id = meta.seq_or_ts,
+            "nrpc: rejecting relayed/untrusted flow-controlled upload before fold — \
+             secure upload grants require a directly authenticated caller session; \
+             relayed flow-controlled nRPC is unsupported until end-to-end recipient \
+             correlation exists",
+        );
+        return true;
+    }
+    false
 }
 
 /// A response ready to publish, handed from a (synchronous) `serve_rpc`
@@ -1905,18 +2017,26 @@ fn add_request_grant_credits(sem: &tokio::sync::Semaphore, credits: u32) {
 /// returned emitter (mpsc sender count > 0). When the fold and all
 /// in-flight handlers release the emitter, `rx.recv` returns `None`
 /// and the drainer exits naturally.
-/// R3-1 routing policy for an upload REQUEST_GRANT. A grant is a
-/// server→caller frame on the caller's reply channel, so it funnels
-/// through the SAME session-scoped router as responses:
+/// R3-1 / Gate-3 routing policy for an upload REQUEST_GRANT. A grant is a
+/// server→caller frame on the caller's reply channel, so it funnels through
+/// the SAME session-scoped router as responses.
 ///
-/// - a trusted direct route (`from_node != 0`) is `DirectOnly` to the
-///   authenticated session — the grant is DROPPED, never roster-fanned to
-///   a same-origin sibling, if that session vanished (the server fold
-///   binds continuation frames to the original session anyway, so a
-///   sibling's request semaphore must never be refilled by it);
-/// - a call with no trusted direct route (`from_node == 0`: loopback /
-///   relayed public) keeps the roster path so relayed public behavior is
-///   preserved.
+/// This runs ONLY for admitted flow-controlled calls: a REQUEST whose caller
+/// session is relayed/untrusted is rejected at admission, BEFORE the fold or
+/// this emitter runs (see [`reject_relayed_flow_controlled_request`] /
+/// [`classify_request_grant_route`]). So here a nonzero `from_node` provably
+/// names the caller's OWN AEAD-authenticated session
+/// ([`RequestGrantRoute::TrustedDirect`]), never a relay — the false "nonzero
+/// last hop ⟹ direct" invariant is ENFORCED upstream, not assumed here:
+///
+/// - a trusted direct route (`from_node != 0`) is `DirectOnly` to that
+///   authenticated session — the grant is DROPPED, never roster-fanned to a
+///   same-origin sibling, if the session vanished (the server fold binds
+///   continuation frames to the original session anyway, so a sibling's
+///   request semaphore must never be refilled by it);
+/// - the loopback / test sentinel (`from_node == 0`,
+///   [`RequestGrantRoute::Loopback`]) keeps the roster path so local/test
+///   behavior is preserved.
 fn request_grant_route(from_node: u64) -> (Option<u64>, ResponseRouteFallback) {
     if from_node != 0 {
         (Some(from_node), ResponseRouteFallback::DirectOnly)
@@ -3019,7 +3139,22 @@ impl MeshNode {
                     &service_for_bridge,
                     &tag,
                 ) {
-                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Proceed => {
+                        // Gate-3: a relayed/untrusted caller cannot be issued
+                        // secure upload grants (no e2e recipient correlation),
+                        // so reject a flow-controlled REQUEST here — BEFORE the
+                        // fold — rather than admit it and silently starve it of
+                        // grants (partial execution then an unexplained stall).
+                        if reject_relayed_flow_controlled_request(
+                            &mesh_for_bridge,
+                            &metrics_for_bridge,
+                            &inbound,
+                            &service_for_bridge,
+                            &tag,
+                        ) {
+                            continue;
+                        }
+                    }
                     BridgePreflight::Drop => continue,
                     BridgePreflight::Deny {
                         claimed_origin,
@@ -3316,7 +3451,22 @@ impl MeshNode {
                     &service_for_bridge,
                     &tag,
                 ) {
-                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Proceed => {
+                        // Gate-3: a relayed/untrusted caller cannot be issued
+                        // secure upload grants (no e2e recipient correlation),
+                        // so reject a flow-controlled REQUEST here — BEFORE the
+                        // fold — rather than admit it and silently starve it of
+                        // grants (partial execution then an unexplained stall).
+                        if reject_relayed_flow_controlled_request(
+                            &mesh_for_bridge,
+                            &metrics_for_bridge,
+                            &inbound,
+                            &service_for_bridge,
+                            &tag,
+                        ) {
+                            continue;
+                        }
+                    }
                     BridgePreflight::Drop => continue,
                     BridgePreflight::Deny {
                         claimed_origin,
@@ -5076,6 +5226,157 @@ mod roster_fallback_tests {
             request_grant_route(0),
             (None, ResponseRouteFallback::RosterOnStaleDirect),
             "the loopback/relayed sentinel keeps the roster path",
+        );
+    }
+
+    /// Gate-3: the upload-grant route is classified ONCE at admission from the
+    /// SAME authenticated-origin equality as response-route trust — never from
+    /// `from_node != 0` alone. Direct (pinned origin == claimed) →
+    /// `TrustedDirect(node)`; the loopback sentinel → `Loopback`; a nonzero
+    /// last hop whose pinned origin != the claimed caller origin (a relayed
+    /// frame or forged origin), or an unpinned peer, → `RelayedOrUntrusted`.
+    /// Two authenticated sessions sharing one origin + call_id but a different
+    /// `from_node` each classify to their OWN `TrustedDirect(node)` — distinct
+    /// grant targets, no coalescing collision (witness 3).
+    ///
+    /// Red-witness: reverting to `from_node != 0 ⇒ TrustedDirect` collapses the
+    /// forged/relayed and unpinned cases to `TrustedDirect`, failing here.
+    #[test]
+    fn classify_request_grant_route_matches_authenticated_origin_equality() {
+        const ORIGIN: u64 = 0x1111_2222_3333_4444;
+        const NODE_A: u64 = 0xABCD;
+        const NODE_B: u64 = 0xBEEF;
+        // Direct: the pinned last-hop origin equals the claimed caller origin.
+        assert_eq!(
+            classify_request_grant_route(NODE_A, ORIGIN, Some(ORIGIN)),
+            RequestGrantRoute::TrustedDirect(NODE_A),
+        );
+        // Relayed / forged: the claim differs from the pinned last-hop origin.
+        assert_eq!(
+            classify_request_grant_route(NODE_A, ORIGIN, Some(0x9999_9999_9999_9999)),
+            RequestGrantRoute::RelayedOrUntrusted,
+        );
+        // Unpinned peer (connected but never announced) → untrusted.
+        assert_eq!(
+            classify_request_grant_route(NODE_A, ORIGIN, None),
+            RequestGrantRoute::RelayedOrUntrusted,
+        );
+        // Loopback / test sentinel.
+        assert_eq!(
+            classify_request_grant_route(0, ORIGIN, Some(ORIGIN)),
+            RequestGrantRoute::Loopback,
+        );
+        // Two direct sessions, same origin (+ implicitly same call_id),
+        // different authenticated node → distinct TrustedDirect targets.
+        assert_eq!(
+            classify_request_grant_route(NODE_A, ORIGIN, Some(ORIGIN)),
+            RequestGrantRoute::TrustedDirect(NODE_A),
+        );
+        assert_eq!(
+            classify_request_grant_route(NODE_B, ORIGIN, Some(ORIGIN)),
+            RequestGrantRoute::TrustedDirect(NODE_B),
+        );
+    }
+
+    /// Gate-3 (production seam): the flow-controlled serve bridges reject a
+    /// relayed/untrusted upload REQUEST BEFORE the fold via
+    /// [`reject_relayed_flow_controlled_request`]. A caller whose pinned
+    /// last-hop origin does NOT match its claimed origin (a relayed frame) is
+    /// dropped and metered; a directly-authenticated caller and the loopback
+    /// sentinel are admitted; only the initial REQUEST is classified, so
+    /// metering stays per-call. The bridge does `if reject(..) { continue }`,
+    /// so a `true` here means the fold / handler / grant emitter never run and
+    /// nothing is published — no roster reflection through the claimed origin.
+    ///
+    /// Red-witness: classifying from `from_node != 0` (dropping the pinned-
+    /// origin equality) admits the relayed caller — the first assert fails and
+    /// the counter never moves.
+    #[tokio::test]
+    async fn reject_relayed_flow_controlled_request_drops_only_relayed_callers() {
+        use std::sync::atomic::Ordering;
+        let server = build_server().await;
+        let metrics = server.rpc_metrics_arc().for_service("svc.upload");
+        const DIRECT_NODE: u64 = 0x51;
+        const RELAY_NODE: u64 = 0x52;
+
+        // Pin two authenticated peers with known, distinct origins.
+        let direct_entity = EntityKeypair::generate().entity_id().clone();
+        let relay_entity = EntityKeypair::generate().entity_id().clone();
+        let direct_origin = direct_entity.origin_hash();
+        let relay_origin = relay_entity.origin_hash();
+        server.test_pin_peer_entity(DIRECT_NODE, direct_entity);
+        server.test_pin_peer_entity(RELAY_NODE, relay_entity);
+
+        let chan = ChannelId::new(ChannelName::new("svc.upload.requests").unwrap()).hash();
+        let frame =
+            |from_node: u64, claimed_origin: u64, call_id: u64, dispatch: u8| RpcInboundEvent {
+                channel_hash: chan,
+                origin_hash: claimed_origin,
+                from_node,
+                payload: Bytes::copy_from_slice(
+                    &EventMeta::new(dispatch, 0, claimed_origin, call_id, 0).to_bytes(),
+                ),
+            };
+        let reject = |ev: &RpcInboundEvent| {
+            reject_relayed_flow_controlled_request(
+                &server,
+                &metrics,
+                ev,
+                "svc.upload",
+                "nrpc:svc.upload",
+            )
+        };
+
+        // Direct: pinned origin == claimed origin → admitted (not rejected).
+        assert!(
+            !reject(&frame(DIRECT_NODE, direct_origin, 1, DISPATCH_RPC_REQUEST)),
+            "a directly authenticated caller must be admitted",
+        );
+        // Loopback sentinel (from_node == 0) → admitted.
+        assert!(
+            !reject(&frame(0, 0xDEAD_BEEF, 2, DISPATCH_RPC_REQUEST)),
+            "the loopback/test sentinel must be admitted",
+        );
+        assert_eq!(
+            metrics
+                .relayed_flow_controlled_rejected_total
+                .load(Ordering::Relaxed),
+            0,
+            "admitted callers must not bump the rejection counter",
+        );
+
+        // Relayed: pinned last-hop origin != claimed caller origin → rejected.
+        let victim_origin = relay_origin ^ 0xFFFF_FFFF; // guaranteed distinct
+        assert!(
+            reject(&frame(RELAY_NODE, victim_origin, 3, DISPATCH_RPC_REQUEST)),
+            "a relayed caller (pinned origin != claimed origin) must be rejected before the fold",
+        );
+        assert_eq!(
+            metrics
+                .relayed_flow_controlled_rejected_total
+                .load(Ordering::Relaxed),
+            1,
+            "the relayed rejection bumps the dedicated counter exactly once",
+        );
+
+        // A CHUNK from the same relayed session is left to the fold (which
+        // ignores frames for a call it never admitted), so metering stays
+        // per-call, not per-frame.
+        assert!(
+            !reject(&frame(
+                RELAY_NODE,
+                victim_origin,
+                3,
+                DISPATCH_RPC_REQUEST_CHUNK
+            )),
+            "only the initial REQUEST is classified; control frames pass through",
+        );
+        assert_eq!(
+            metrics
+                .relayed_flow_controlled_rejected_total
+                .load(Ordering::Relaxed),
+            1,
+            "a relayed control frame must not re-meter",
         );
     }
 
