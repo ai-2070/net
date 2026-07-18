@@ -178,6 +178,21 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
     // pre-create it here with a lax umask — that create-then-chmod pattern is
     // exactly what the scaffold avoids (Gate-1).
 
+    // Gate-1 (Windows): a CUSTOM authority directory is operator-asserted —
+    // its ACL is owned/managed by the operator and is not validated here. Only
+    // the default per-user profile path (`%APPDATA%`) is covered by profile
+    // inheritance; a freshly-created custom dir gets an owner-only DACL, but a
+    // pre-existing one's ACL is the operator's responsibility.
+    #[cfg(windows)]
+    if args.authority_dir.is_some() {
+        eprintln!(
+            "warning: custom --authority-dir {} on Windows: its ACL is operator-owned \
+             and not validated; ensure it is under a per-user protected location \
+             restricted to your account",
+            dir.display()
+        );
+    }
+
     // Adopt — the ceremony validates EVERYTHING (including the
     // supplied bundle's resulting floors) before writing, applies
     // floors durably, and publishes membership last. Sync file I/O

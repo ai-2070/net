@@ -651,15 +651,22 @@ handle) plus, newly explicit:
     legitimate transactions and common operator/startup mistakes; it
     does NOT claim protection against an actor concurrently mutating
     directory entries DURING a transaction. The boundary is enforced
-    at its edges (`org_authority::ensure_secure_authority_dir`): a new
-    authority directory is created owner-only (Unix 0700, atomically —
-    never create-then-chmod), an existing one must be owned by the
-    current user and not group/other-writable, and state/lock/audience
-    files are 0600; the generic path-agnostic store API never chmods a
-    supplied parent. On Windows the per-user protected profile
-    application-data directory plus its inherited DACL is the boundary
-    (user account, SYSTEM, and local administrators are trusted local
-    principals).
+    at its edges (`org_authority::ensure_secure_authority_dir`): on Unix
+    the resolved ancestor chain is validated (no group/other-writable,
+    non-sticky parent through which another account could rename the
+    owned entry — sticky writable parents like `/tmp` are fine), a new
+    authority directory is created no broader than 0700 (the `DirBuilder`
+    mode is filtered through umask) and then tightened to exactly 0700 —
+    a restrictive-umask create + owner chmod(0700) is safe; the dangerous
+    pattern was permissive-create-then-tighten — an existing one must be
+    owned by the current user and not group/other-writable, and
+    state/lock/audience files are 0600; the generic path-agnostic store
+    API never chmods a supplied parent. On Windows a freshly-created
+    authority directory gets an explicit owner-only DACL; a pre-existing
+    directory's ACL is operator-owned (the default `%APPDATA%` path is
+    covered by profile inheritance, a custom `--authority-dir` is
+    operator-asserted and the CLI warns). The user account, SYSTEM, and
+    local administrators are trusted local principals.
 
 ---
 

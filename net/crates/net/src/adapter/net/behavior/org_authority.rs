@@ -46,12 +46,16 @@
 //! detects sidecar replacement occurring BETWEEN legitimate transactions and
 //! common operator/startup mistakes; it does not claim to protect against an
 //! actor concurrently mutating directory entries DURING a transaction.
-//! [`ensure_secure_authority_dir`] enforces the boundary at its edges:
-//! new authority directories are created owner-only (Unix 0700, atomically),
-//! and an existing one must be owned by the current user and not
-//! group/other-writable. On Windows the per-user protected profile
-//! application-data directory plus its inherited DACL is the boundary (the
-//! user account, SYSTEM, and local administrators are trusted principals).
+//! [`ensure_secure_authority_dir`] enforces the boundary at its edges: on Unix
+//! the resolved ancestor chain is checked (no group/other-writable, non-sticky
+//! parent through which another account could swap the directory's entry), a
+//! new authority directory is created no broader than 0700 (umask) and then
+//! tightened to exactly 0700, and an existing one must be owned by the current
+//! user and not group/other-writable. On Windows a newly-created directory is
+//! restricted to the owner via an explicit DACL; a pre-existing directory's
+//! ACL is operator-owned (the default `%APPDATA%` path is protected by profile
+//! inheritance, a custom `--authority-dir` is operator-asserted). The user
+//! account, SYSTEM, and local administrators are trusted principals.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -406,9 +410,7 @@ pub enum OrgAuthorityError {
     /// write access to it is explicitly out of scope — but a wrong-owner or
     /// world-writable directory means that trust does not hold, so adoption
     /// and startup refuse loudly rather than provisioning or reading secrets
-    /// inside it. Only constructed on Unix (the directory-mode/ownership
-    /// gate); non-Unix relies on the per-user profile DACL boundary.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// inside it.
     InsecureAuthorityDir {
         /// The authority directory path.
         path: String,
@@ -883,6 +885,98 @@ fn authority_dir_policy_violation(owner_uid: u32, mode: u32, euid: u32) -> Optio
     None
 }
 
+/// Validate the resolved ancestor chain of the authority directory (Gate-1,
+/// Unix). Validating only the final directory as owner-only 0700 is
+/// insufficient if an ancestor is group/other-writable WITHOUT the sticky
+/// bit: another account with write access to that ancestor could rename the
+/// owned authority directory's entry and plant a replacement, so subsequent
+/// pathname-based operations would enter it. That is cross-account mutation
+/// THROUGH the parent — inside the declared account boundary — distinct from
+/// same-account TOCTOU inside the directory, which stays out of scope.
+///
+/// Each ancestor of `dir` (its parent up to the filesystem root) must be
+/// either not group/other-writable, or group/other-writable WITH the sticky
+/// bit (e.g. `/tmp` at 01777 — sticky forbids a non-owner from renaming an
+/// owned child). Symlinked components are resolved by canonicalizing the
+/// deepest existing ancestor before the walk. Root / OS-administrator-owned
+/// ancestors are trusted principals.
+#[cfg(unix)]
+fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
+    use std::os::unix::fs::MetadataExt;
+    let io = |e: std::io::Error| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("authority directory ancestor: {e}"),
+    };
+    // `dir` may not exist yet (create path): find the deepest EXISTING
+    // ancestor, then canonicalize it so symlinked components resolve to the
+    // real chain that will actually be traversed.
+    let mut cursor = dir;
+    let existing = loop {
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if parent.exists() {
+                    break parent;
+                }
+                cursor = parent;
+            }
+            // Reached the root with no existing ancestor left to check.
+            _ => return Ok(()),
+        }
+    };
+    let real = std::fs::canonicalize(existing).map_err(io)?;
+    for ancestor in real.ancestors() {
+        let meta = std::fs::symlink_metadata(ancestor).map_err(io)?;
+        let mode = meta.mode();
+        let group_or_other_writable = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        if group_or_other_writable && !sticky {
+            return Err(OrgAuthorityError::InsecureAuthorityDir {
+                path: dir.display().to_string(),
+                reason: format!(
+                    "ancestor {} is group/other-writable without the sticky bit \
+                     (mode {:04o}) — another account could replace the authority \
+                     directory entry through it",
+                    ancestor.display(),
+                    mode & 0o7777
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Windows analogue of Unix owner-only mode for a directory: strip inherited
+/// ACEs and grant only the current user full control
+/// (`icacls <dir> /inheritance:r /grant:r <user>:F`), so a freshly-created
+/// authority directory is restricted to its owner regardless of where it was
+/// placed. New files created inside inherit this owner-only DACL.
+#[cfg(windows)]
+fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !domain.is_empty() => format!("{domain}\\{user}"),
+        (_, Ok(user)) if !user.is_empty() => user,
+        _ => {
+            return Err(std::io::Error::other(
+                "USERNAME is not set; cannot restrict the authority directory ACL",
+            ))
+        }
+    };
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "icacls could not restrict {} to {user}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Create or validate the authority directory as a trusted local security
 /// boundary (Gate-1). This is the DEDICATED authority scaffold — the only
 /// layer that may create the directory owner-only or tighten its mode; the
@@ -894,16 +988,23 @@ fn authority_dir_policy_violation(owner_uid: u32, mode: u32, euid: u32) -> Optio
 /// explicitly out of scope — a same-account attacker who can write here can
 /// already attack the surrounding configuration and process state.
 ///
-/// - Unix, MISSING: parents are created with normal permissions and the
-///   authority directory itself is created ATOMICALLY at mode 0700 (never
-///   create-then-chmod).
-/// - Unix, EXISTING: it must be a directory owned by the effective user and
-///   not group/other-writable (else refuse loudly), then it is tightened to
-///   0700 (this scaffold owns that tightening).
-/// - Non-Unix: the per-user protected profile application-data directory plus
-///   its inherited DACL is the boundary — the user account, SYSTEM, and local
-///   administrators are trusted local principals — so the directory tree is
-///   created without Unix 0700 semantics.
+/// - Unix: the resolved ancestor chain is validated first
+///   ([`validate_unix_ancestor_chain`]) so no other account can replace the
+///   directory's entry through a writable-non-sticky parent. A MISSING
+///   directory is then created with permissions no broader than 0700 (the
+///   `DirBuilder` mode is filtered through umask, so possibly narrower) and an
+///   EXISTING one must be a directory owned by the effective user and not
+///   group/other-writable; either way it is finally tightened to EXACTLY 0700
+///   by the owner before use (a restrictive-umask create + owner chmod(0700)
+///   is safe; the dangerous pattern was permissive create then tighten).
+///   State / lock / audience files are 0600.
+/// - Non-Unix: a newly-created directory is restricted to the owner via an
+///   explicit DACL ([`restrict_dir_to_owner`], the Windows analogue of 0700).
+///   A pre-existing directory's ACL is operator-owned and NOT re-validated
+///   here: the default authority path under the per-user protected profile
+///   (`%APPDATA%`) is covered by profile inheritance, and a custom
+///   `--authority-dir` is operator-asserted (the CLI warns when one is set).
+///   The user account, SYSTEM, and local administrators are trusted principals.
 fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: dir.display().to_string(),
@@ -912,6 +1013,9 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        // Validate the trusted-ancestor chain BEFORE any operation on `dir`
+        // (no authority file is created or read before this).
+        validate_unix_ancestor_chain(dir)?;
         match std::fs::symlink_metadata(dir) {
             Ok(meta) => {
                 if !meta.file_type().is_dir() {
@@ -930,10 +1034,6 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                         reason,
                     });
                 }
-                // Owner-controlled and not group/other-writable: tighten to
-                // 0700, clearing any group/other read bits a lax umask left.
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(io)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(parent) = dir.parent() {
@@ -941,6 +1041,8 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                         std::fs::create_dir_all(parent).map_err(io)?;
                     }
                 }
+                // `mode(0o700)` is filtered through umask — "no broader than
+                // 0700", possibly narrower; the tighten below makes it exact.
                 std::fs::DirBuilder::new()
                     .mode(0o700)
                     .create(dir)
@@ -948,11 +1050,54 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
             }
             Err(e) => return Err(io(e)),
         }
+        // Tighten to EXACTLY 0700 (create was no-broader-than-0700; an existing
+        // owner-controlled dir may carry group/other READ bits a lax umask
+        // left). This scaffold owns the tightening.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(dir).map_err(io)?;
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(OrgAuthorityError::InsecureAuthorityDir {
+                        path: dir.display().to_string(),
+                        reason: "path exists but is not a directory".to_string(),
+                    });
+                }
+                // The directory's ACL is operator-owned; reading the Windows
+                // DACL needs Win32 security APIs and is not done here. The
+                // default path under the per-user profile is protected by
+                // inheritance; a custom path is operator-asserted (CLI warns).
+                tracing::debug!(
+                    path = %dir.display(),
+                    "authority directory exists; ACL is operator-owned and not \
+                     re-validated on this platform",
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(io)?;
+                    }
+                }
+                std::fs::create_dir(dir).map_err(io)?;
+                // Restrict the freshly-created directory to the owner (Windows
+                // analogue of 0700), so even a custom path is owner-only. Best-
+                // effort: a failure warns rather than aborting, matching the
+                // operator-asserted posture for custom Windows paths.
+                #[cfg(windows)]
+                if let Err(e) = restrict_dir_to_owner(dir) {
+                    tracing::warn!(
+                        path = %dir.display(), error = %e,
+                        "could not restrict the authority directory ACL to the \
+                         owner; ensure it is under a per-user protected location",
+                    );
+                }
+            }
+            Err(e) => return Err(io(e)),
+        }
         Ok(())
     }
 }
@@ -1291,6 +1436,108 @@ mod tests {
         );
         // Restore owner-only so Scratch::drop can clean up.
         let _ = std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o700));
+    }
+
+    /// Gate-1 (Unix): adoption into an owner-only authority dir is refused
+    /// when an ANCESTOR is group/other-writable and NOT sticky — another
+    /// account could rename the owned directory's entry through that parent
+    /// and plant a replacement.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_writable_nonsticky_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let shared = scratch.dir().join("shared");
+        std::fs::create_dir_all(&shared).expect("mkdir shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o0777))
+            .expect("chmod 0777 non-sticky");
+        let kp = node_identity();
+        let err = NodeAuthority::adopt(
+            &shared.join("authority"),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            None,
+        )
+        .expect_err("a writable-nonsticky ancestor must be refused");
+        assert!(
+            matches!(
+                &err,
+                OrgAuthorityError::InsecureAuthorityDir { reason, .. } if reason.contains("sticky")
+            ),
+            "got: {err}",
+        );
+        let _ = std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o0755));
+    }
+
+    /// Gate-1 (Unix): a group/other-writable ancestor WITH the sticky bit
+    /// (e.g. `/tmp` at 01777) is accepted when the owned child is created
+    /// there — sticky forbids a non-owner from renaming the owned entry.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_accepts_sticky_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let shared = scratch.dir().join("sticky-shared");
+        std::fs::create_dir_all(&shared).expect("mkdir");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("chmod 1777 sticky");
+        let kp = node_identity();
+        NodeAuthority::adopt(
+            &shared.join("authority"),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            None,
+        )
+        .expect("a sticky writable ancestor with an owned child is accepted");
+        let _ = std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o0755));
+    }
+
+    /// Gate-1 (Unix): a SYMLINKED parent component is resolved before the
+    /// ancestor walk, so an authority path that resolves through an insecure
+    /// (writable-nonsticky) real ancestor is refused.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_symlinked_insecure_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let insecure = scratch.dir().join("insecure");
+        std::fs::create_dir_all(&insecure).expect("mkdir insecure");
+        std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o0777))
+            .expect("chmod 0777");
+        let link = scratch.dir().join("link");
+        std::os::unix::fs::symlink(&insecure, &link).expect("symlink");
+        let kp = node_identity();
+        let err = NodeAuthority::adopt(
+            &link.join("authority"),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            None,
+        )
+        .expect_err("a symlinked insecure ancestor must be refused");
+        assert!(
+            matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {err}",
+        );
+        let _ = std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o0755));
+    }
+
+    /// Gate-1 (all platforms): adopting into a MISSING nested authority
+    /// directory creates it and provisions all three files. Exercises the
+    /// create path (Unix atomic-0700 create; Windows create + owner-only
+    /// DACL).
+    #[test]
+    fn adopt_into_a_missing_subdir_creates_the_authority_dir() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let authority = scratch.dir().join("nested").join("authority");
+        NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt into a fresh subdir");
+        for name in NodeAuthority::file_names() {
+            assert!(authority.join(name).exists(), "{name} must be provisioned");
+        }
     }
 
     #[test]
