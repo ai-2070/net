@@ -451,8 +451,8 @@ fn cache_authenticated_response_destination(
     cache: &RpcOriginNodeCache,
     inbound: &RpcInboundEvent,
 ) {
-    let dispatch = if inbound.payload.len() >= EVENT_META_SIZE {
-        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE]).map(|m| m.dispatch)
+    let meta = if inbound.payload.len() >= EVENT_META_SIZE {
+        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
     } else {
         None
     };
@@ -465,11 +465,18 @@ fn cache_authenticated_response_destination(
         .map(|e| e.origin_hash());
     if response_route_is_trustworthy(
         inbound.from_node,
-        dispatch,
+        meta.as_ref().map(|m| m.dispatch),
         inbound.origin_hash,
         authenticated_peer_origin,
     ) {
-        cache.insert(inbound.origin_hash, inbound.from_node);
+        // Trustworthiness requires `dispatch == DISPATCH_RPC_REQUEST`,
+        // so `meta` is always `Some` here. Key the route by the call
+        // `(origin, call_id)` (AV-4 item 4) so two authenticated
+        // sessions sharing one entity/origin route each response to the
+        // node that issued THAT call, rather than clobbering each other.
+        if let Some(m) = meta {
+            cache.insert((inbound.origin_hash, m.seq_or_ts), inbound.from_node);
+        }
     }
 }
 
@@ -492,6 +499,20 @@ fn response_route_is_trustworthy(
     from_node != 0
         && dispatch == Some(DISPATCH_RPC_REQUEST)
         && authenticated_peer_origin == Some(claimed_origin)
+}
+
+/// Whether a server-streaming / duplex RESPONSE frame terminates its
+/// call — a non-`Ok` status (error / cancel / deadline) or the explicit
+/// `nrpc-streaming: end` marker. The multi-fire emit closures use this
+/// to retire the call's cached response route on the terminal frame
+/// only (AV-4 item 4). Unary and client-streaming emit exactly one,
+/// always-terminal RESPONSE, so they retire unconditionally instead.
+fn streaming_response_is_terminal(resp: &RpcResponsePayload) -> bool {
+    resp.status != RpcStatus::Ok
+        || resp.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(super::cortex::HEADER_NRPC_STREAMING)
+                && value.as_slice() == super::cortex::HEADER_NRPC_STREAMING_END
+        })
 }
 
 /// The verdict of the shared callee-side preflight
@@ -571,13 +592,16 @@ fn bridge_preflight(
 
 /// Emit a terminal `CapabilityDenied` for a gate-denied call, routed
 /// ONLY to the AEAD-authenticated session peer `from_node` (NC2 —
-/// Kyra E1 audit). The reply rides `<service>.replies.<claimed_origin>`
-/// so an HONEST caller (whose session peer IS its own node) receives
-/// it; a malicious peer that forged a victim's `claimed_origin` gets
-/// the denial unicast to ITS OWN node — where that reply channel has
-/// no subscriber — so a forged denial can never terminate a victim's
-/// pending call. It is NEVER fanned out to the claimed origin's
-/// subscriber roster.
+/// Kyra E1 audit). The reply origin is derived from the peer's PINNED
+/// session entity when known (AV-3 nit — Kyra item 3), so the reply
+/// channel is `<service>.replies.<authenticated_origin>`, never the
+/// wire-claimed one: a malicious peer that forged a victim's
+/// `claimed_origin` gets the denial addressed to ITS OWN origin channel
+/// and unicast to ITS OWN node, so a forged denial can never terminate
+/// a victim's pending call. When the peer has no pinned entity (a
+/// caller that connected but never announced), the reply falls back to
+/// the claimed origin — still harmless, because it is unicast to
+/// `from_node` and never fanned out to the claimed origin's roster.
 async fn emit_capability_denial(
     mesh: &MeshNode,
     service: &str,
@@ -603,7 +627,16 @@ async fn emit_capability_denial(
     buf.extend_from_slice(&meta.to_bytes());
     resp.encode_into(&mut buf);
 
-    let reply_channel_name = format!("{service}.replies.{claimed_origin:016x}");
+    // AV-3 nit (Kyra item 3): address the reply to the peer's PINNED
+    // authenticated origin when known, never the wire-claimed one, so a
+    // forger's denial can't be aimed at a victim's reply channel. Falls
+    // back to the claimed origin only for an unpinned (non-announced)
+    // peer — safe because the send is unicast to `from_node` below.
+    let reply_origin = mesh
+        .peer_entity_id(from_node)
+        .map(|e| e.origin_hash())
+        .unwrap_or(claimed_origin);
+    let reply_channel_name = format!("{service}.replies.{reply_origin:016x}");
     let Ok(reply_channel) = ChannelName::new(&reply_channel_name) else {
         return;
     };
@@ -614,7 +647,7 @@ async fn emit_capability_denial(
     // authenticated session peer — never the roster fan-out fallback.
     let _ = publish_response_to_caller(
         mesh,
-        claimed_origin,
+        reply_origin,
         Some(from_node),
         &reply_channel,
         reply_channel_hash,
@@ -640,7 +673,7 @@ struct RpcResponseJob {
     /// `ChannelId::new(reply_channel).hash()`, populated by the
     /// emit closure's `reply_channel_cache` lookup. Pre-fix the
     /// drainer re-ran xxh3 over the channel name per response;
-    /// the same `OriginKeyedLru` now caches the triple so a
+    /// the same `BoundedLru` now caches the triple so a
     /// cache hit is one Arc bump + two `u64` copies.
     reply_channel_hash: ChannelHash,
     /// PERF_AUDIT §3.10 — cached
@@ -651,7 +684,7 @@ struct RpcResponseJob {
 
 /// Cached triple `(ChannelName, ChannelHash, stream_id)` for the
 /// per-caller reply channel. Stored in the per-`serve_rpc`
-/// `OriginKeyedLru` so each subsequent response to the same
+/// `BoundedLru` so each subsequent response to the same
 /// caller is one Arc bump on the name + two `u64` copies — no
 /// xxh3, no `publish_stream_id`.
 ///
@@ -1926,11 +1959,21 @@ fn build_request_grant_emitter(
     })
 }
 
-/// Per-service map from a caller's `origin_hash` (wire field) to the
-/// AEAD-verified `from_node` of the session that delivered their
+/// Per-service map from a call `(caller origin_hash, call_id)` to the
+/// AEAD-verified `from_node` of the session that delivered that
 /// inbound REQUEST. Populated by the serve_rpc bridge tasks at
 /// REQUEST-receipt time; consulted by [`publish_response_to_caller`]
 /// to skip the roster fan-out on the response leg.
+///
+/// **Call-scoped** (AV-4 item 4): keying on `(origin, call_id)` rather
+/// than `origin` alone means two authenticated sessions that share one
+/// entity/origin (a caller reconnecting under a new NodeId, or the same
+/// entity running on two nodes) route each response to the node that
+/// actually issued THAT call, instead of clobbering one another's
+/// destination. Entries are retired when the call's terminal RESPONSE
+/// is emitted (which also covers the cancel / deadline / fold-rejection
+/// paths, since each of those emits a terminal frame); bridge teardown
+/// drops the whole cache with the registration.
 ///
 /// Lives per `serve_rpc*` registration rather than mesh-wide because
 /// the source-of-truth `MeshNode::origin_hash_to_node` is only safe
@@ -1941,12 +1984,12 @@ fn build_request_grant_emitter(
 /// peer can at most misdirect responses for THEIR own request — they
 /// already could.
 ///
-/// **Bounded** ([`OriginKeyedLru`]): the key is the wire-claimed
-/// `origin_hash` and the bridge inserts it *before* the capability gate,
-/// so an unbounded map would let one authed peer spray distinct origins and
-/// amplify server memory. The LRU caps the footprint; eviction costs only a
-/// response-path cache miss (roster fallback), never correctness.
-type RpcOriginNodeCache = Arc<OriginKeyedLru<u64>>;
+/// **Bounded** ([`BoundedLru`]): the bridge inserts *before* the
+/// capability gate, so an unbounded map would let one authed peer spray
+/// distinct `(origin, call_id)` keys and amplify server memory. The LRU
+/// caps the footprint; eviction costs only a response-path cache miss
+/// (roster fallback), never correctness.
+type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64), u64>>;
 
 /// Capacity bound for the per-`serve_rpc` caller-keyed caches
 /// ([`RpcOriginNodeCache`] and the §8b reply-channel cache). Sized for the
@@ -1958,7 +2001,7 @@ type RpcOriginNodeCache = Arc<OriginKeyedLru<u64>>;
 const RPC_CALLER_CACHE_CAP: usize = 4096;
 
 /// Non-zero form of [`RPC_CALLER_CACHE_CAP`], validated at compile time so
-/// `OriginKeyedLru::new` carries no runtime `unwrap`/`expect`. A zero cap
+/// `BoundedLru::new` carries no runtime `unwrap`/`expect`. A zero cap
 /// would fail the build here rather than panic at startup.
 const RPC_CALLER_CACHE_CAP_NZ: std::num::NonZeroUsize =
     match std::num::NonZeroUsize::new(RPC_CALLER_CACHE_CAP) {
@@ -1966,31 +2009,38 @@ const RPC_CALLER_CACHE_CAP_NZ: std::num::NonZeroUsize =
         None => panic!("RPC_CALLER_CACHE_CAP must be non-zero"),
     };
 
-/// Thread-safe, bounded LRU keyed by the wire-claimed caller `origin_hash`.
-///
-/// Backs both [`RpcOriginNodeCache`] and the §8b reply-channel cache. Wraps
-/// `lru::LruCache` (which needs `&mut` even to read, to bump the entry to
-/// most-recently-used) in a `parking_lot::Mutex`. The per-response lock is
-/// uncontended in the common case — one fold drives a given service — and is
-/// far cheaper than the `format!` + `ChannelName` allocation / roster fan-out
-/// the caches exist to avoid. Eviction is always safe: a miss just recomputes
-/// the value (channel name) or falls back to the roster lookup.
-struct OriginKeyedLru<V>(Mutex<lru::LruCache<u64, V>>);
+/// Thread-safe, bounded LRU. Backs both the call-scoped
+/// [`RpcOriginNodeCache`] (keyed `(origin, call_id)`, AV-4 item 4) and
+/// the §8b reply-channel cache (keyed `origin`). Wraps `lru::LruCache`
+/// (which needs `&mut` even to read, to bump the entry to
+/// most-recently-used) in a `parking_lot::Mutex`. The per-response lock
+/// is uncontended in the common case — one fold drives a given service
+/// — and is far cheaper than the `format!` + `ChannelName` allocation /
+/// roster fan-out the caches exist to avoid. Eviction is always safe: a
+/// miss just recomputes the value (channel name) or falls back to the
+/// roster lookup.
+struct BoundedLru<K, V>(Mutex<lru::LruCache<K, V>>);
 
-impl<V: Clone> OriginKeyedLru<V> {
+impl<K: std::hash::Hash + Eq, V: Clone> BoundedLru<K, V> {
     fn new() -> Self {
         Self(Mutex::new(lru::LruCache::new(RPC_CALLER_CACHE_CAP_NZ)))
     }
 
-    /// Look up `origin`, promoting it to most-recently-used on a hit.
-    fn get(&self, origin: u64) -> Option<V> {
-        self.0.lock().get(&origin).cloned()
+    /// Look up `key`, promoting it to most-recently-used on a hit.
+    fn get(&self, key: K) -> Option<V> {
+        self.0.lock().get(&key).cloned()
     }
 
-    /// Insert / refresh `origin`, evicting the least-recently-used entry
+    /// Insert / refresh `key`, evicting the least-recently-used entry
     /// when at capacity.
-    fn insert(&self, origin: u64, value: V) {
-        self.0.lock().put(origin, value);
+    fn insert(&self, key: K, value: V) {
+        self.0.lock().put(key, value);
+    }
+
+    /// Retire `key` (AV-4 item 4 lifecycle retirement). Idempotent —
+    /// removing an absent key is a no-op.
+    fn remove(&self, key: K) {
+        self.0.lock().pop(&key);
     }
 }
 
@@ -2013,7 +2063,7 @@ impl<V: Clone> OriginKeyedLru<V> {
 /// PERF_AUDIT §3.10 — accepts pre-computed
 /// `reply_channel_hash` and `reply_stream_id` so the per-response
 /// path doesn't re-run `ChannelId::new` + xxh3 + `publish_stream_id`
-/// on every send. The emit closure's `OriginKeyedLru<CachedReplyChannel>`
+/// on every send. The emit closure's `BoundedLru<u64, CachedReplyChannel>`
 /// caches the triple per caller_origin.
 async fn publish_response_to_caller(
     mesh: &MeshNode,
@@ -2264,7 +2314,7 @@ impl MeshNode {
         // its REQUEST. Populated by the bridge below; consumed by
         // the emit closure so [`publish_response_to_caller`] can
         // skip the roster fan-out on the response leg.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
 
         // Build the emit closure. When the handler completes, the
         // fold calls this (synchronously) with `(caller_origin, call_id,
@@ -2286,19 +2336,19 @@ impl MeshNode {
         // (and the per-call `service.clone()`) the emit closure used to pay on
         // every response. Keyed by the wire-claimed `caller_origin` and so
         // bounded the same way as `origin_node_cache` above — an
-        // `OriginKeyedLru`, not an unbounded map, so a crafted-origin flood
+        // `BoundedLru`, not an unbounded map, so a crafted-origin flood
         // can't amplify server memory (a miss just rebuilds the name).
         // PERF_AUDIT §3.10 — cache the triple (name, hash, stream_id)
         // per caller_origin so the per-response drainer doesn't
         // recompute xxh3 + publish_stream_id on every send.
-        let reply_channel_cache: Arc<OriginKeyedLru<CachedReplyChannel>> =
-            Arc::new(OriginKeyedLru::new());
+        let reply_channel_cache: Arc<BoundedLru<u64, CachedReplyChannel>> =
+            Arc::new(BoundedLru::new());
         // §8a response drainer channel. Bounded like the inbound channel; a
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
         let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
         let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let target_hint = origin_node_cache_for_emit.get(caller_origin);
+            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
             let cached = match reply_channel_cache.get(caller_origin) {
@@ -2357,6 +2407,10 @@ impl MeshNode {
                     "rpc serve_rpc: response drainer at capacity; dropping response"
                 );
             }
+            // AV-4 item 4: a unary call emits exactly one, always-
+            // terminal RESPONSE — retire its cached response route now
+            // (target_hint for THIS response was already captured above).
+            origin_node_cache_for_emit.remove((caller_origin, call_id));
         });
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
@@ -2546,7 +2600,7 @@ impl MeshNode {
         // T1.2 cache: bridge populates from inbound.from_node, emit
         // closure consults to skip roster fan-out. See the unary
         // serve_rpc above for the full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -2557,7 +2611,13 @@ impl MeshNode {
         let emit: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&mesh_for_emit);
             let service = service_for_emit.clone();
-            let target_hint = origin_node_cache_for_emit.get(caller_origin);
+            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
+            // AV-4 item 4: a streaming call fires many RESPONSE frames;
+            // retire its cached route only on the terminal frame (the
+            // direct hint for THIS frame was already captured above).
+            if streaming_response_is_terminal(&resp) {
+                origin_node_cache_for_emit.remove((caller_origin, call_id));
+            }
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2580,7 +2640,7 @@ impl MeshNode {
                 resp.encode_into(&mut buf);
                 // PERF_AUDIT §3.10: compute hash + stream_id at the
                 // call site. These legacy streaming paths don't yet
-                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
                 // wiring them up is a follow-up — for now the
                 // compute happens here per response, same as the
                 // pre-fix in-function shape.
@@ -2722,7 +2782,7 @@ impl MeshNode {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -2737,7 +2797,7 @@ impl MeshNode {
         let emit_resp: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get(caller_origin);
+            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
             tokio::spawn(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2760,7 +2820,7 @@ impl MeshNode {
                 resp.encode_into(&mut buf);
                 // PERF_AUDIT §3.10: compute hash + stream_id at the
                 // call site. These legacy streaming paths don't yet
-                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
                 // wiring them up is a follow-up — for now the
                 // compute happens here per response, same as the
                 // pre-fix in-function shape.
@@ -2784,6 +2844,10 @@ impl MeshNode {
                             "rpc serve_rpc_client_stream: terminal RESPONSE publish failed");
                 }
             });
+            // AV-4 item 4: a client-streaming call emits exactly one
+            // terminal RESPONSE — retire its cached response route now
+            // (the direct hint for it was already captured above).
+            origin_node_cache_for_emit.remove((caller_origin, call_id));
         });
 
         // REQUEST_GRANT emitter — coalesces per-chunk credits into
@@ -3017,7 +3081,7 @@ impl MeshNode {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -3032,7 +3096,13 @@ impl MeshNode {
         let emit_resp: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get(caller_origin);
+            let target_hint = origin_node_cache_for_emit.get((caller_origin, call_id));
+            // AV-4 item 4: retire the cached route only on the duplex
+            // call's terminal RESPONSE frame (the direct hint for THIS
+            // frame was already captured above).
+            if streaming_response_is_terminal(&resp) {
+                origin_node_cache_for_emit.remove((caller_origin, call_id));
+            }
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -3055,7 +3125,7 @@ impl MeshNode {
                 resp.encode_into(&mut buf);
                 // PERF_AUDIT §3.10: compute hash + stream_id at the
                 // call site. These legacy streaming paths don't yet
-                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // cache the triple via `BoundedLru<u64, CachedReplyChannel>`;
                 // wiring them up is a follow-up — for now the
                 // compute happens here per response, same as the
                 // pre-fix in-function shape.
@@ -4570,10 +4640,13 @@ mod origin_cache_tests {
     /// it stays pinned at `RPC_CALLER_CACHE_CAP`, evicting the coldest.
     #[test]
     fn origin_keyed_lru_bounds_under_crafted_origin_flood() {
-        let cache: OriginKeyedLru<u64> = OriginKeyedLru::new();
+        let cache: BoundedLru<(u64, u64), u64> = BoundedLru::new();
         let flood = (RPC_CALLER_CACHE_CAP as u64) * 4;
         for origin in 0..flood {
-            cache.insert(origin, origin);
+            // Call-scoped key: a peer sprays distinct `(origin, call_id)`
+            // keys just as easily as distinct origins; the LRU still
+            // bounds the footprint.
+            cache.insert((origin, origin), origin);
         }
         assert_eq!(
             cache.0.lock().len(),
@@ -4581,8 +4654,8 @@ mod origin_cache_tests {
             "cache must stay at its capacity bound under a crafted-origin flood"
         );
         // The most-recently-seen window survives; the cold prefix is evicted.
-        assert_eq!(cache.get(flood - 1), Some(flood - 1));
-        assert_eq!(cache.get(0), None);
+        assert_eq!(cache.get((flood - 1, flood - 1)), Some(flood - 1));
+        assert_eq!(cache.get((0, 0)), None);
     }
 
     /// PERF_AUDIT §3.8 — `mint_random_call_id` mints thousands of
@@ -4764,15 +4837,94 @@ mod origin_cache_tests {
     /// in-flight exchange).
     #[test]
     fn origin_keyed_lru_get_promotes_to_mru() {
-        let cache: OriginKeyedLru<u64> = OriginKeyedLru::new();
+        let cache: BoundedLru<(u64, u64), u64> = BoundedLru::new();
         for origin in 0..(RPC_CALLER_CACHE_CAP as u64) {
-            cache.insert(origin, origin);
+            cache.insert((origin, 0), origin);
         }
-        // Touch origin 0 (otherwise the LRU), then overflow by one entry.
-        assert_eq!(cache.get(0), Some(0));
-        cache.insert(u64::MAX, 1);
-        assert_eq!(cache.get(0), Some(0), "touched entry must survive eviction");
-        assert_eq!(cache.get(1), None, "the now-LRU entry (1) must be evicted");
+        // Touch (0, 0) (otherwise the LRU), then overflow by one entry.
+        assert_eq!(cache.get((0, 0)), Some(0));
+        cache.insert((u64::MAX, 0), 1);
+        assert_eq!(
+            cache.get((0, 0)),
+            Some(0),
+            "touched entry must survive eviction"
+        );
+        assert_eq!(
+            cache.get((1, 0)),
+            None,
+            "the now-LRU entry (1) must be evicted"
+        );
+    }
+
+    /// AV-4 item 4: the response-route cache is keyed by the CALL
+    /// `(origin, call_id)`, so two calls from the same origin resolve
+    /// to their own destinations and retiring one leaves the other
+    /// intact — a completed call's stale route can't misdirect a
+    /// concurrent one. (With the pre-fix origin-only key, the second
+    /// insert would clobber the first and both would resolve to the
+    /// same node.)
+    #[test]
+    fn origin_node_cache_is_call_scoped_and_retires_per_call() {
+        let cache: BoundedLru<(u64, u64), u64> = BoundedLru::new();
+        const ORIGIN: u64 = 0xAA;
+        const CALL_A: u64 = 1;
+        const CALL_B: u64 = 2;
+        const NODE_A: u64 = 0x10;
+        const NODE_B: u64 = 0x20;
+        cache.insert((ORIGIN, CALL_A), NODE_A);
+        cache.insert((ORIGIN, CALL_B), NODE_B);
+        // Same origin, different calls — no clobber.
+        assert_eq!(cache.get((ORIGIN, CALL_A)), Some(NODE_A));
+        assert_eq!(cache.get((ORIGIN, CALL_B)), Some(NODE_B));
+        // Retiring call A's route leaves call B's intact.
+        cache.remove((ORIGIN, CALL_A));
+        assert_eq!(cache.get((ORIGIN, CALL_A)), None);
+        assert_eq!(cache.get((ORIGIN, CALL_B)), Some(NODE_B));
+    }
+
+    /// AV-4 item 4: the multi-fire (server-streaming / duplex) emit
+    /// closures retire the cached route only on the TERMINAL frame.
+    /// `streaming_response_is_terminal` treats a non-`Ok` status
+    /// (error / cancel / deadline) or the explicit `nrpc-streaming:
+    /// end` marker as terminal; an `Ok` `continue` chunk is not.
+    #[test]
+    fn streaming_terminal_detection_recognizes_end_and_errors() {
+        use crate::adapter::net::cortex::{
+            HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE, HEADER_NRPC_STREAMING_END,
+        };
+        let continue_chunk = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![(
+                HEADER_NRPC_STREAMING.to_string(),
+                HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
+            )],
+            body: Bytes::from_static(b"chunk"),
+        };
+        assert!(
+            !streaming_response_is_terminal(&continue_chunk),
+            "a continue chunk must NOT be treated as terminal",
+        );
+        let end_chunk = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![(
+                HEADER_NRPC_STREAMING.to_string(),
+                HEADER_NRPC_STREAMING_END.to_vec(),
+            )],
+            body: Bytes::new(),
+        };
+        assert!(
+            streaming_response_is_terminal(&end_chunk),
+            "the nrpc-streaming end marker is terminal",
+        );
+        let error_frame = RpcResponsePayload {
+            status: RpcStatus::Internal,
+            headers: vec![],
+            body: Bytes::from_static(b"boom"),
+        };
+        assert!(
+            streaming_response_is_terminal(&error_frame),
+            "a non-Ok status is terminal",
+        );
     }
 }
 
