@@ -300,6 +300,16 @@ pub enum OrgRevocationError {
         /// The candidate store's state-file path.
         path: String,
     },
+    /// R2-4: this backing path is already bound, for the lifetime of a
+    /// live core, to a DIFFERENT `.lock` sidecar identity than the one
+    /// just opened — the sidecar was recreated or replaced underneath a
+    /// core that same-path siblings still hold. Joining under the new
+    /// identity would fork the path into two independent security views,
+    /// so it is refused loudly.
+    BackingIdentityConflict {
+        /// The normalized state-file path whose sidecar identity changed.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for OrgRevocationError {
@@ -341,6 +351,13 @@ impl std::fmt::Display for OrgRevocationError {
                 "refusing to replace the installed revocation store with {path}: its \
                  live view is lower on at least one (org, member) floor — an installed \
                  floor never lowers; apply a bundle instead"
+            ),
+            Self::BackingIdentityConflict { path } => write!(
+                f,
+                "revocation store path {path} is bound to a different .lock sidecar \
+                 identity than the one just opened — the sidecar was recreated or \
+                 replaced while a same-path core is still live; refusing to fork the \
+                 path into two independent security views"
             ),
         }
     }
@@ -595,23 +612,30 @@ impl Drop for RaiseSubscription {
 /// those aliases to one core (shared live view + publish lock) and one
 /// poison entry, while `normalize_backing_path` / `open_lock_file`
 /// still refuse a symlinked or non-regular final component.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct BackingId {
-    device: u64,
-    inode: u64,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BackingId {
+    /// Filesystem file-identity: the unix `(device, inode)` or windows
+    /// `(volume_serial, file_index)` of the OPENED `.lock` sidecar. Two
+    /// differently-cased path aliases of one sidecar share this.
+    FileId { device: u64, inode: u64 },
+    /// Last-resort key on a platform with no file-identity API (or if the
+    /// fstat fails): the FULL normalized path. R2-4 — never a lossy 64-bit
+    /// path hash, so two distinct paths can NEVER collide onto one core or
+    /// poison entry (the pre-R2-4 `DefaultHasher` fallback could, at the
+    /// ~2^32 birthday bound).
+    Path(PathBuf),
 }
 
 impl BackingId {
-    /// Derive the identity from the opened lock sidecar. `path` is a
-    /// last-resort fallback key on platforms with no file-identity API
-    /// (or if the fstat fails) — it reproduces the pre-AV-9 path-keyed
-    /// behavior, which splits case-aliases but is otherwise correct.
+    /// Derive the identity from the opened lock sidecar. `path` (already
+    /// normalized by the caller) backs the fallback key on platforms with
+    /// no file-identity API or if the fstat fails.
     fn of(lock: &std::fs::File, path: &Path) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if let Ok(meta) = lock.metadata() {
-                return BackingId {
+                return BackingId::FileId {
                     device: meta.dev(),
                     inode: meta.ino(),
                 };
@@ -622,7 +646,7 @@ impl BackingId {
             use std::os::windows::fs::MetadataExt;
             if let Ok(meta) = lock.metadata() {
                 if let (Some(vol), Some(idx)) = (meta.volume_serial_number(), meta.file_index()) {
-                    return BackingId {
+                    return BackingId::FileId {
                         device: u64::from(vol),
                         inode: idx,
                     };
@@ -630,26 +654,36 @@ impl BackingId {
             }
         }
         let _ = lock;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(path, &mut hasher);
-        BackingId {
-            device: u64::MAX,
-            inode: std::hash::Hasher::finish(&hasher),
-        }
+        BackingId::Path(path.to_path_buf())
     }
 }
 
-/// Process-wide core registry, keyed by the backing file's stable
-/// [`BackingId`] (AV-9). `Weak` so a backing file whose handles all
-/// dropped releases its core; the POISON registry is separate precisely
-/// because poison must outlive every handle.
-static CORES: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<BackingId, std::sync::Weak<StoreCore>>>,
-> = std::sync::OnceLock::new();
+/// Process-wide core registry (AV-9 + R2-4). `cores` maps a backing
+/// file's stable [`BackingId`] to its live core (`Weak`, so a backing
+/// file whose handles all dropped releases its core; the POISON registry
+/// is separate precisely because poison must outlive every handle).
+///
+/// `bindings` (R2-4) maps a normalized backing PATH to the sidecar
+/// identity currently bound to it. It is GC'd in lockstep with dead cores
+/// (a binding whose id has no live core is dropped), so a *surviving*
+/// binding always names a LIVE core — a path resolving to a different
+/// identity while its binding survives means the sidecar was recreated or
+/// replaced under a still-held core, which
+/// [`join_or_create_core`] refuses loudly.
+struct CoreRegistry {
+    cores: std::collections::HashMap<BackingId, std::sync::Weak<StoreCore>>,
+    bindings: std::collections::HashMap<PathBuf, BackingId>,
+}
 
-fn core_registry(
-) -> &'static Mutex<std::collections::HashMap<BackingId, std::sync::Weak<StoreCore>>> {
-    CORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+static CORES: std::sync::OnceLock<Mutex<CoreRegistry>> = std::sync::OnceLock::new();
+
+fn core_registry() -> &'static Mutex<CoreRegistry> {
+    CORES.get_or_init(|| {
+        Mutex::new(CoreRegistry {
+            cores: std::collections::HashMap::new(),
+            bindings: std::collections::HashMap::new(),
+        })
+    })
 }
 
 /// Join the existing core for `path`, republishing the state just
@@ -674,23 +708,49 @@ fn join_or_create_core(
     backing_id: BackingId,
     path: &Path,
     disk: OrgRevocationState,
-) -> (Arc<StoreCore>, Vec<RaisedFloor>) {
-    let mut cores = core_registry().lock();
-    cores.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(core) = cores.get(&backing_id).and_then(std::sync::Weak::upgrade) {
-        drop(cores);
+) -> Result<(Arc<StoreCore>, Vec<RaisedFloor>), OrgRevocationError> {
+    let mut guard = core_registry().lock();
+    // Reborrow as `&mut CoreRegistry` so disjoint field borrows (immutable
+    // `cores`, mutable `bindings`) are allowed — a `MutexGuard`'s Deref
+    // would otherwise borrow the whole guard.
+    let reg = &mut *guard;
+    // GC dead cores AND the bindings that named them, in lockstep: after
+    // this, every surviving binding points at a LIVE core.
+    reg.cores.retain(|_, weak| weak.strong_count() > 0);
+    let live_ids = &reg.cores;
+    reg.bindings.retain(|_, id| live_ids.contains_key(id));
+    // R2-4 binding check: if this path is already bound (to a still-live
+    // core) under a DIFFERENT sidecar identity, the sidecar was recreated
+    // or replaced underneath that core — refuse loudly rather than fork
+    // the path into two independent security views. A legitimate
+    // recreation (the old core fully dropped) left no surviving binding,
+    // so it falls through and rebinds.
+    if let Some(bound) = reg.bindings.get(path) {
+        if *bound != backing_id {
+            return Err(OrgRevocationError::BackingIdentityConflict {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    reg.bindings.insert(path.to_path_buf(), backing_id.clone());
+    let existing = reg
+        .cores
+        .get(&backing_id)
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(core) = existing {
+        drop(guard);
         let raised = {
             let _reload = core.reload.lock();
             core.publish(disk)
         };
-        return (core, raised);
+        return Ok((core, raised));
     }
     // Fresh core: nobody else can observe it until we insert, so
     // its first publish races nothing. Hold the registry lock
     // across the check-and-insert so two openers cannot both create.
     let core = Arc::new(StoreCore {
         path: path.to_path_buf(),
-        backing_id,
+        backing_id: backing_id.clone(),
         reload: Mutex::new(()),
         live: RwLock::new(Arc::new(disk)),
         generation: AtomicU64::new(0),
@@ -698,8 +758,8 @@ fn join_or_create_core(
         next_subscriber: AtomicU64::new(0),
         publish_pause: parking_lot::Mutex::new(None),
     });
-    cores.insert(backing_id, Arc::downgrade(&core));
-    (core, Vec::new())
+    reg.cores.insert(backing_id, Arc::downgrade(&core));
+    Ok((core, Vec::new()))
 }
 
 /// Exclusive guard over one or two stores' publish transactions.
@@ -809,7 +869,7 @@ impl OrgRevocationStore {
         // AV-9: identity is the stable `.lock` inode, so case-aliases
         // share one core + poison entry.
         let backing_id = BackingId::of(&lock, &path);
-        let was_poisoned = is_poisoned_id(backing_id);
+        let was_poisoned = is_poisoned_id(&backing_id);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -827,9 +887,9 @@ impl OrgRevocationStore {
                 })
             }
         };
-        let (core, raised) = join_or_create_core(backing_id, &path, state);
+        let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(backing_id, &path);
+            clear_poison(&backing_id, &path);
         }
         drop(lock);
         let store = Self {
@@ -860,7 +920,7 @@ impl OrgRevocationStore {
         let lock = lock_state_file(&path)?;
         // AV-9: stable `.lock` inode identity (case-aliases collapse).
         let backing_id = BackingId::of(&lock, &path);
-        let was_poisoned = is_poisoned_id(backing_id);
+        let was_poisoned = is_poisoned_id(&backing_id);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -883,9 +943,9 @@ impl OrgRevocationStore {
         let state = OrgRevocationState::from_file_bytes(&bytes, &path).inspect_err(|err| {
             tracing::error!("{err}");
         })?;
-        let (core, raised) = join_or_create_core(backing_id, &path, state);
+        let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(backing_id, &path);
+            clear_poison(&backing_id, &path);
         }
         drop(lock);
         let store = Self {
@@ -920,7 +980,7 @@ impl OrgRevocationStore {
     /// [`Self::open_existing`], [`Self::init`], or the next
     /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
-        is_poisoned_id(self.core.backing_id)
+        is_poisoned_id(&self.core.backing_id)
     }
 
     /// Test-only: mark this store's backing path poisoned so
@@ -932,7 +992,9 @@ impl OrgRevocationStore {
     /// production paths.
     #[doc(hidden)]
     pub fn mark_poisoned_for_test(&self) {
-        poison_registry().lock().insert(self.core.backing_id);
+        poison_registry()
+            .lock()
+            .insert(self.core.backing_id.clone());
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -1172,7 +1234,7 @@ impl OrgRevocationStore {
             //    truth through the shared core BEFORE the poison
             //    bit clears (review-9 addendum: recovery reloads
             //    live views, it never merely fsyncs).
-            let was_poisoned = is_poisoned_id(self.core.backing_id);
+            let was_poisoned = is_poisoned_id(&self.core.backing_id);
             if was_poisoned {
                 prove_entry_durable(path)?;
             }
@@ -1216,7 +1278,9 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        poison_registry().lock().insert(self.core.backing_id);
+                        poison_registry()
+                            .lock()
+                            .insert(self.core.backing_id.clone());
                         durability_uncertain = Some(reason);
                     }
                 }
@@ -1229,7 +1293,7 @@ impl OrgRevocationStore {
             //    notification happens outside.
             let raised = self.core.publish(merged);
             if was_poisoned && durability_uncertain.is_none() {
-                clear_poison(self.core.backing_id, path);
+                clear_poison(&self.core.backing_id, path);
             }
             drop(lock);
             match durability_uncertain {
@@ -1292,8 +1356,8 @@ fn poison_registry() -> &'static Mutex<std::collections::HashSet<BackingId>> {
     PATH_POISON.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-fn is_poisoned_id(id: BackingId) -> bool {
-    poison_registry().lock().contains(&id)
+fn is_poisoned_id(id: &BackingId) -> bool {
+    poison_registry().lock().contains(id)
 }
 
 /// Normalize a backing pathname ONCE at store construction
@@ -1376,8 +1440,8 @@ fn prove_entry_durable(path: &Path) -> Result<(), OrgRevocationError> {
 /// Second half of durability recovery: clear the path-wide bit
 /// after the entry was proven durable AND the reread state was
 /// republished through the shared core.
-fn clear_poison(id: BackingId, path: &Path) {
-    poison_registry().lock().remove(&id);
+fn clear_poison(id: &BackingId, path: &Path) {
+    poison_registry().lock().remove(id);
     tracing::warn!(
         path = %path.display(),
         "revocation-state durability uncertainty recovered \
@@ -1458,7 +1522,29 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocatio
     };
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
-    open_lock_file(&PathBuf::from(lock_path)).map_err(io)
+    let lock = open_lock_file(&PathBuf::from(lock_path)).map_err(io)?;
+    // R2-4: a legitimately-created sidecar has exactly ONE hard link. A
+    // link count above one means someone hard-linked this sidecar's inode
+    // to a SECOND name — the attack that would otherwise collapse two
+    // distinct state paths onto one [`BackingId`] (and thus one core /
+    // poison entry). Refuse fail-closed. (Unix only; the Windows
+    // `file_index` identity plus the binding registry cover the same
+    // hazard where `std` exposes no link count.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let nlink = lock.metadata().map_err(io)?.nlink();
+        if nlink != 1 {
+            return Err(OrgRevocationError::Io {
+                path: path.display().to_string(),
+                reason: format!(
+                    "state lock: refusing .lock sidecar with {nlink} hard links \
+                     (expected 1) — a hard-linked sidecar would alias two backing paths"
+                ),
+            });
+        }
+    }
+    Ok(lock)
 }
 
 /// Open-and-lock a lock inode (`.lock` sidecar, ceremony lock)
@@ -2398,6 +2484,92 @@ mod tests {
 
         let err = OrgRevocationStore::init(&path).expect_err("FIFO lock must refuse");
         assert!(matches!(err, OrgRevocationError::Io { .. }), "got: {err}");
+    }
+
+    /// R2-4 (#3): a `.lock` sidecar with more than one hard link is
+    /// refused fail-closed. Hard-linking a sidecar's inode to a second
+    /// name is the attack that would otherwise collapse two DISTINCT
+    /// backing paths onto one [`BackingId`] (one core + one poison
+    /// entry).
+    ///
+    /// Red-witness: dropping the `nlink != 1` check in `lock_state_file`
+    /// lets the reopen succeed.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_lock_sidecar_is_refused() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        // First open creates the sidecar (nlink == 1), then drops so its
+        // advisory lock and core are released.
+        drop(OrgRevocationStore::init(&path).expect("init"));
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let alias = scratch.0.join("alias.lock");
+        std::fs::hard_link(&lock_path, &alias).expect("hard-link the sidecar");
+        let err = OrgRevocationStore::open_existing(&path)
+            .expect_err("a hard-linked sidecar must be refused");
+        assert!(
+            matches!(&err, OrgRevocationError::Io { reason, .. } if reason.contains("hard links")),
+            "got: {err}",
+        );
+    }
+
+    /// R2-4 (#2): the file-identity fallback key carries the COMPLETE
+    /// normalized path, never a 64-bit hash — so two distinct paths can
+    /// never collide onto one core/poison entry (the pre-R2-4
+    /// `DefaultHasher` fallback could, at the ~2^32 birthday bound).
+    ///
+    /// This pins the fallback's TYPE (a `PathBuf`, not a hashed `u64`);
+    /// the fstat-failure branch that selects it cannot be provoked from a
+    /// unit test.
+    #[test]
+    fn path_fallback_backing_id_retains_the_full_path() {
+        let a = BackingId::Path(PathBuf::from("/x/alpha/revocation-state.json"));
+        let a2 = BackingId::Path(PathBuf::from("/x/alpha/revocation-state.json"));
+        let b = BackingId::Path(PathBuf::from("/x/beta/revocation-state.json"));
+        assert_eq!(a, a2, "the same normalized path is the same identity");
+        assert_ne!(a, b, "distinct paths never share a fallback identity");
+        assert_ne!(
+            BackingId::FileId {
+                device: 0,
+                inode: 0
+            },
+            BackingId::Path(PathBuf::new()),
+            "file-identity and path-fallback are distinct identity spaces",
+        );
+    }
+
+    /// R2-4 (#4): a backing path whose `.lock` sidecar is REPLACED under
+    /// a still-live core is refused loudly, rather than silently forking
+    /// the path into a second independent core (two security views of one
+    /// path).
+    ///
+    /// Red-witness: removing the binding check in `join_or_create_core`
+    /// lets the second open create a fresh core for the new sidecar
+    /// identity, so it succeeds instead of failing.
+    #[cfg(unix)]
+    #[test]
+    fn recreated_sidecar_under_a_live_core_is_refused() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        // Keep the first store ALIVE: its core (and the path→identity
+        // binding) survive the whole test.
+        let live = OrgRevocationStore::init(&path).expect("init");
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        // Replace the sidecar: unlink its directory entry (the original
+        // inode persists under `live`'s open fd + advisory lock) and let
+        // the next open create a FRESH inode under the same name.
+        std::fs::remove_file(&lock_path).expect("unlink the old sidecar");
+        let err = OrgRevocationStore::open_existing(&path)
+            .expect_err("a recreated sidecar under a live core must be refused");
+        assert!(
+            matches!(err, OrgRevocationError::BackingIdentityConflict { .. }),
+            "got: {err}",
+        );
+        drop(live);
     }
 
     /// Review-8 §9 plumbing: the raise callback fires with exactly
