@@ -869,7 +869,7 @@ impl OrgRevocationStore {
         // AV-9: identity is the stable `.lock` inode, so case-aliases
         // share one core + poison entry.
         let backing_id = BackingId::of(&lock, &path);
-        let was_poisoned = is_poisoned_id(&backing_id);
+        let was_poisoned = is_poisoned(&backing_id, &path);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -920,7 +920,7 @@ impl OrgRevocationStore {
         let lock = lock_state_file(&path)?;
         // AV-9: stable `.lock` inode identity (case-aliases collapse).
         let backing_id = BackingId::of(&lock, &path);
-        let was_poisoned = is_poisoned_id(&backing_id);
+        let was_poisoned = is_poisoned(&backing_id, &path);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -980,7 +980,7 @@ impl OrgRevocationStore {
     /// [`Self::open_existing`], [`Self::init`], or the next
     /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
-        is_poisoned_id(&self.core.backing_id)
+        is_poisoned(&self.core.backing_id, &self.core.path)
     }
 
     /// Test-only: mark this store's backing path poisoned so
@@ -992,9 +992,7 @@ impl OrgRevocationStore {
     /// production paths.
     #[doc(hidden)]
     pub fn mark_poisoned_for_test(&self) {
-        poison_registry()
-            .lock()
-            .insert(self.core.backing_id.clone());
+        mark_poisoned(&self.core.backing_id, &self.core.path);
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -1234,7 +1232,7 @@ impl OrgRevocationStore {
             //    truth through the shared core BEFORE the poison
             //    bit clears (review-9 addendum: recovery reloads
             //    live views, it never merely fsyncs).
-            let was_poisoned = is_poisoned_id(&self.core.backing_id);
+            let was_poisoned = is_poisoned(&self.core.backing_id, path);
             if was_poisoned {
                 prove_entry_durable(path)?;
             }
@@ -1278,9 +1276,7 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        poison_registry()
-                            .lock()
-                            .insert(self.core.backing_id.clone());
+                        mark_poisoned(&self.core.backing_id, path);
                         durability_uncertain = Some(reason);
                     }
                 }
@@ -1349,15 +1345,55 @@ pub(crate) enum WritePhase {
 /// (a locked reread republished through the shared core plus a
 /// SUCCESSFUL parent-directory fsync) clears it. Separate from the
 /// core registry because poison must outlive every handle.
-static PATH_POISON: std::sync::OnceLock<Mutex<std::collections::HashSet<BackingId>>> =
-    std::sync::OnceLock::new();
+static PATH_POISON: std::sync::OnceLock<Mutex<PoisonRegistry>> = std::sync::OnceLock::new();
 
-fn poison_registry() -> &'static Mutex<std::collections::HashSet<BackingId>> {
-    PATH_POISON.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// Two poison indexes that must BOTH be consulted (R3-2):
+///
+/// - `by_id` — the live `.lock` sidecar identity ([`BackingId`]), which
+///   is what same-path handles join their core on; and
+/// - `by_path` — the CANONICAL state-file path, which survives `.lock`
+///   sidecar replacement. Keying poison only on the sidecar identity let
+///   a durability-uncertain path be laundered by dropping every handle
+///   and recreating the `.lock` (new inode ⇒ new `BackingId` ⇒
+///   `by_id` miss ⇒ recovery skipped). The path tombstone closes that:
+///   once poisoned, the path stays poisoned across sidecar recreation
+///   until explicit recovery, and case-aliases collapse through the
+///   actual filesystem (`canonicalize`), not blind case-folding.
+#[derive(Default)]
+struct PoisonRegistry {
+    by_id: std::collections::HashSet<BackingId>,
+    by_path: std::collections::HashSet<PathBuf>,
 }
 
-fn is_poisoned_id(id: &BackingId) -> bool {
-    poison_registry().lock().contains(id)
+fn poison_registry() -> &'static Mutex<PoisonRegistry> {
+    PATH_POISON.get_or_init(|| Mutex::new(PoisonRegistry::default()))
+}
+
+/// The case-normalized poison-tombstone key for `normalized_path` (R3-2).
+/// `canonicalize` collapses case-aliases through the ACTUAL filesystem
+/// identity — not blind ASCII case-folding, which would over-poison two
+/// genuinely distinct files on a case-sensitive filesystem. Falls back to
+/// the normalized path when the state file does not yet exist (a fresh
+/// `init` before creation) or `canonicalize` otherwise fails.
+fn poison_path_key(normalized_path: &Path) -> PathBuf {
+    std::fs::canonicalize(normalized_path).unwrap_or_else(|_| normalized_path.to_path_buf())
+}
+
+/// Poison `normalized_path` under BOTH indexes (R3-2).
+fn mark_poisoned(id: &BackingId, normalized_path: &Path) {
+    let key = poison_path_key(normalized_path);
+    let mut reg = poison_registry().lock();
+    reg.by_id.insert(id.clone());
+    reg.by_path.insert(key);
+}
+
+/// Poisoned iff EITHER the live sidecar identity OR the canonical state
+/// path is tombstoned — so a recreated sidecar (new `BackingId`, same
+/// path) is still caught (R3-2).
+fn is_poisoned(id: &BackingId, normalized_path: &Path) -> bool {
+    let key = poison_path_key(normalized_path);
+    let reg = poison_registry().lock();
+    reg.by_id.contains(id) || reg.by_path.contains(&key)
 }
 
 /// Normalize a backing pathname ONCE at store construction
@@ -1441,7 +1477,12 @@ fn prove_entry_durable(path: &Path) -> Result<(), OrgRevocationError> {
 /// after the entry was proven durable AND the reread state was
 /// republished through the shared core.
 fn clear_poison(id: &BackingId, path: &Path) {
-    poison_registry().lock().remove(id);
+    let key = poison_path_key(path);
+    {
+        let mut reg = poison_registry().lock();
+        reg.by_id.remove(id);
+        reg.by_path.remove(&key);
+    }
     tracing::warn!(
         path = %path.display(),
         "revocation-state durability uncertainty recovered \
@@ -2145,7 +2186,7 @@ mod tests {
         let mut stronger = OrgRevocationState::empty();
         stronger.merge_bundle(&bundle_with_floor(9));
         write_atomic(&norm, &stronger.to_file_bytes().expect("bytes")).expect("write");
-        poison_registry().lock().insert(BackingId::of(&lock, &norm));
+        mark_poisoned(&BackingId::of(&lock, &norm), &norm);
 
         // Lock releases → the opener proceeds: it must observe the
         // poison, recover (reread + successful parent fsync), and
@@ -2663,6 +2704,123 @@ mod tests {
         assert!(!store.is_poisoned(), "recovery clears the path-wide bit");
         let reopened = OrgRevocationStore::open_existing(&path).expect("reopen");
         assert_eq!(reopened.floor_for(&org().org_id(), &member()), 11);
+    }
+
+    /// R3-2: durability poison SURVIVES dropping every handle and
+    /// recreating the `.lock` sidecar. Poison keyed only on the live
+    /// sidecar [`BackingId`] would be laundered — a recreated `.lock` is a
+    /// fresh, unpoisoned inode — so the canonical PATH tombstone keeps the
+    /// path poisoned until explicit recovery, exactly once.
+    ///
+    /// Red-witness: dropping the `by_path` arm of `is_poisoned` lets the
+    /// recreated-sidecar reopen skip recovery, so the "recovery still
+    /// mandatory" `is_err()` assertion fails.
+    #[cfg(unix)]
+    #[test]
+    fn poison_survives_dead_core_sidecar_recreation() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+
+        // 1. Create + poison via a real post-rename parent-fsync failure.
+        let store = OrgRevocationStore::init(&path).expect("init");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
+            .expect("chmod 0300");
+        let err = store
+            .apply_bundle(&bundle_with_floor(9))
+            .expect_err("dir fsync must fail");
+        assert!(
+            matches!(err, OrgRevocationError::DurabilityUncertain { .. }),
+            "got: {err}"
+        );
+        assert!(store.is_poisoned());
+
+        // 2. Drop every handle: the core dies and its path binding is
+        //    GC'd, so ONLY the poison registry remembers the uncertainty.
+        drop(store);
+
+        // 3. Replace the `.lock` sidecar with a fresh inode (new BackingId).
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        std::fs::remove_file(&lock_path).expect("unlink old sidecar");
+
+        // 4. Reopen with recovery still BLOCKED — the path poison survived
+        //    the sidecar swap, so the fsync-refused reopen is refused.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
+            .expect("chmod 0300 again");
+        assert!(
+            OrgRevocationStore::open_existing(&path).is_err(),
+            "recovery must still be mandatory after sidecar recreation — poison survived",
+        );
+
+        // 5. Repair: the reopen recovers and clears the poison exactly once.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        let recovered = OrgRevocationStore::open_existing(&path).expect("recovered reopen");
+        assert!(
+            !recovered.is_poisoned(),
+            "successful recovery clears poison"
+        );
+        assert_eq!(recovered.floor_for(&org().org_id(), &member()), 9);
+        let reopened = OrgRevocationStore::open_existing(&path).expect("clean reopen");
+        assert!(
+            !reopened.is_poisoned(),
+            "poison stays cleared (cleared exactly once)"
+        );
+    }
+
+    /// R3-2: the same survival holds when the recreated path is reopened
+    /// through a DIFFERENTLY-CASED alias on a case-insensitive filesystem —
+    /// the canonical tombstone collapses the alias through the actual
+    /// filesystem identity, so it is caught even after the sidecar swap.
+    #[cfg(unix)]
+    #[test]
+    fn poison_survives_sidecar_recreation_across_a_cased_alias() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let lower = scratch.0.join("revocation-state.json");
+        let upper = scratch.0.join("REVOCATION-STATE.JSON");
+
+        let store = OrgRevocationStore::init(&lower).expect("init lower");
+        // Case-insensitivity probe — a no-op on a case-sensitive FS.
+        if !upper.exists() {
+            return;
+        }
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
+            .expect("chmod 0300");
+        let err = store
+            .apply_bundle(&bundle_with_floor(9))
+            .expect_err("dir fsync must fail");
+        assert!(matches!(
+            err,
+            OrgRevocationError::DurabilityUncertain { .. }
+        ));
+        drop(store);
+
+        // Recreate the `.lock` sidecar (new inode).
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let mut lock_path = lower.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        std::fs::remove_file(PathBuf::from(lock_path)).expect("unlink sidecar");
+
+        // Reopen through the UPPER-cased alias with recovery still blocked:
+        // the tombstone must survive BOTH the sidecar swap and the alias.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
+            .expect("chmod 0300 again");
+        assert!(
+            OrgRevocationStore::open_existing(&upper).is_err(),
+            "poison must survive a sidecar swap AND a cased-alias reopen",
+        );
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        let recovered = OrgRevocationStore::open_existing(&upper).expect("recovered via alias");
+        assert!(!recovered.is_poisoned());
     }
 
     /// Review-9: raise callbacks run OUTSIDE both the file lock and
