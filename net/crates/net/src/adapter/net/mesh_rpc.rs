@@ -357,6 +357,12 @@ pub struct ServeHandle {
     /// Hold an Arc back to the mesh so we can unregister on Drop
     /// without the mesh having to track us.
     mesh: Arc<MeshNode>,
+    /// Test-only handle to this bridge's authenticated response-route cache
+    /// (the per-serve `origin_node_cache`), so a witness can DETERMINISTICALLY
+    /// assert that a rejected frame (origin mismatch / relayed) left no cached
+    /// route — the one preflight-side state a drop could otherwise touch.
+    #[cfg(test)]
+    origin_node_cache: RpcOriginNodeCache,
 }
 
 impl Drop for ServeHandle {
@@ -2848,6 +2854,8 @@ impl MeshNode {
             _bridge: bridge,
             _response_drain: Some(response_drain),
             mesh: Arc::clone(self),
+            #[cfg(test)]
+            origin_node_cache: origin_node_cache.clone(),
         })
     }
 
@@ -3032,6 +3040,8 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            #[cfg(test)]
+            origin_node_cache: origin_node_cache.clone(),
         })
     }
 
@@ -3239,6 +3249,8 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            #[cfg(test)]
+            origin_node_cache: origin_node_cache.clone(),
         })
     }
 
@@ -3552,6 +3564,8 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            #[cfg(test)]
+            origin_node_cache: origin_node_cache.clone(),
         })
     }
 
@@ -5576,6 +5590,7 @@ mod roster_fallback_tests {
         let event = |from_node: u64,
                      packet_origin: u64,
                      payload_origin: u64,
+                     dispatch: u8,
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
@@ -5585,7 +5600,7 @@ mod roster_fallback_tests {
                 payload: rpc_request_frame(
                     payload_origin,
                     call_id,
-                    DISPATCH_RPC_REQUEST,
+                    dispatch,
                     "cs",
                     FLAG_RPC_CLIENT_STREAMING_REQUEST,
                     window,
@@ -5593,10 +5608,18 @@ mod roster_fallback_tests {
             }
         };
 
-        // 1. Packet origin != payload origin (direct node) → dropped before fold.
+        // A. Packet origin != payload origin (direct node) → dropped in preflight
+        //    BEFORE the capability gate, the response-route cache, and the fold.
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(DIRECT_NODE, direct_origin, victim, 1, Some(b"32"))
+            event(
+                DIRECT_NODE,
+                direct_origin,
+                victim,
+                DISPATCH_RPC_REQUEST,
+                1,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(
@@ -5608,18 +5631,28 @@ mod roster_fallback_tests {
             .await,
             "an origin-mismatch frame is dropped and metered",
         );
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Deterministic, no sleep: the metric bump and the cache write live in
+        // the SAME synchronous preflight, so once the counter is visible the
+        // frame's drop has returned — the response-route cache was never touched.
         assert_eq!(
-            ran.load(Ordering::SeqCst),
-            0,
-            "the handler must not run for an origin-mismatch frame",
+            serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 1)),
+            None,
+            "an origin-mismatch frame must not mutate the response-route cache",
         );
 
-        // 2. Relayed (packet == payload == victim; pinned relay origin != victim),
-        //    flow-controlled → rejected before fold.
+        // B. Relayed (packet == payload == victim; pinned relay origin != victim),
+        //    flow-controlled → rejected before the fold. Its route is
+        //    untrustworthy, so even on the preflight Proceed path nothing caches.
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(RELAY_NODE, victim, victim, 2, Some(b"32"))
+            event(
+                RELAY_NODE,
+                victim,
+                victim,
+                DISPATCH_RPC_REQUEST,
+                2,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(
@@ -5631,33 +5664,85 @@ mod roster_fallback_tests {
             .await,
             "a relayed flow-controlled frame is rejected and metered",
         );
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert_eq!(
-            ran.load(Ordering::SeqCst),
-            0,
-            "the handler must not run for a relayed flow-controlled frame",
+            serve.origin_node_cache.get((RELAY_NODE, victim, 2)),
+            None,
+            "a relayed frame must not mutate the response-route cache",
         );
 
-        // 3. Relayed but NO window header → admitted (unbounded upload); handler runs.
+        // C. Continuation after a rejected initial: a CHUNK for the SAME (call 2)
+        //    that was just rejected. The initial never entered the fold, so no
+        //    request stream exists; the CHUNK reaches the fold and is a silent
+        //    no-op — no handler, no grant/response — and, being a control frame
+        //    rather than a flow-controlled initial REQUEST, it must NOT re-count
+        //    the per-call rejection counter.
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(RELAY_NODE, victim, victim, 3, None)
+            event(
+                RELAY_NODE,
+                victim,
+                victim,
+                DISPATCH_RPC_REQUEST_CHUNK,
+                2,
+                None
+            )
+        ));
+
+        // D. Relayed but NO window header → admitted (unbounded upload); handler
+        //    runs. Reaching `ran >= 1` is the FIFO barrier: this bridge is a
+        //    single consumer, so frames A–C (all delivered earlier) are fully
+        //    processed by the time D's handler runs.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(RELAY_NODE, victim, victim, DISPATCH_RPC_REQUEST, 3, None)
         ));
         assert!(
             wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 1).await,
             "a relayed non-flow-controlled REQUEST is admitted and the handler runs",
         );
+        assert_eq!(
+            metrics
+                .relayed_flow_controlled_rejected_total
+                .load(Ordering::Relaxed),
+            1,
+            "per-call counter: the continuation CHUNK must not re-count the rejection",
+        );
 
-        // 4. Direct, flow-controlled → admitted; handler runs (2 total).
+        // E. Direct, flow-controlled → admitted; handler runs (2 total). An
+        //    accepted, authenticated direct frame is the positive control: it
+        //    DOES cache its response route (proving the None assertions above are
+        //    meaningful, not vacuous).
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(DIRECT_NODE, direct_origin, direct_origin, 4, Some(b"32"))
+            event(
+                DIRECT_NODE,
+                direct_origin,
+                direct_origin,
+                DISPATCH_RPC_REQUEST,
+                4,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 2).await,
             "a direct flow-controlled REQUEST is admitted and the handler runs",
         );
+        assert_eq!(
+            serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 4)),
+            Some(DIRECT_NODE),
+            "an accepted authenticated direct frame DOES cache its response route",
+        );
 
+        // Deterministic negatives via the FIFO barrier: `ran == 2` (exactly the
+        // two admitted frames) proves the two rejected frames AND the
+        // continuation CHUNK never entered the fold — so no active-call state, no
+        // grant emission/coalescing, and no direct/roster response publication
+        // (all fold-driven) occurred for them.
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "only the two admitted frames ever ran the handler",
+        );
         assert_eq!(
             metrics
                 .packet_origin_mismatch_dropped_total
@@ -5701,6 +5786,7 @@ mod roster_fallback_tests {
         let event = |from_node: u64,
                      packet_origin: u64,
                      payload_origin: u64,
+                     dispatch: u8,
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
@@ -5710,7 +5796,7 @@ mod roster_fallback_tests {
                 payload: rpc_request_frame(
                     payload_origin,
                     call_id,
-                    DISPATCH_RPC_REQUEST,
+                    dispatch,
                     "dx",
                     dx_flags,
                     window,
@@ -5718,10 +5804,18 @@ mod roster_fallback_tests {
             }
         };
 
-        // Origin mismatch → dropped before fold.
+        // A. Origin mismatch → dropped in preflight; the response-route cache is
+        //    never touched (metric bump + non-write share one synchronous call).
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(DIRECT_NODE, direct_origin, victim, 1, Some(b"32"))
+            event(
+                DIRECT_NODE,
+                direct_origin,
+                victim,
+                DISPATCH_RPC_REQUEST,
+                1,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(
@@ -5733,10 +5827,23 @@ mod roster_fallback_tests {
             .await,
             "an origin-mismatch frame is dropped and metered on the duplex bridge",
         );
-        // Relayed flow-controlled → rejected before fold.
+        assert_eq!(
+            serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 1)),
+            None,
+            "an origin-mismatch frame must not mutate the response-route cache",
+        );
+
+        // B. Relayed flow-controlled → rejected before the fold; nothing caches.
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(RELAY_NODE, victim, victim, 2, Some(b"32"))
+            event(
+                RELAY_NODE,
+                victim,
+                victim,
+                DISPATCH_RPC_REQUEST,
+                2,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(
@@ -5748,21 +5855,70 @@ mod roster_fallback_tests {
             .await,
             "a relayed flow-controlled frame is rejected and metered on the duplex bridge",
         );
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert_eq!(
-            ran.load(Ordering::SeqCst),
-            0,
-            "the duplex handler must not run for a rejected frame",
+            serve.origin_node_cache.get((RELAY_NODE, victim, 2)),
+            None,
+            "a relayed frame must not mutate the response-route cache",
         );
 
-        // Direct flow-controlled → admitted; handler runs.
+        // C. Continuation after the rejected initial: a CHUNK for the SAME call 2.
+        //    No stream was opened, so it is a fold no-op; being a control frame it
+        //    must not re-count the per-call rejection.
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
-            event(DIRECT_NODE, direct_origin, direct_origin, 3, Some(b"32"))
+            event(
+                RELAY_NODE,
+                victim,
+                victim,
+                DISPATCH_RPC_REQUEST_CHUNK,
+                2,
+                None
+            )
+        ));
+
+        // D. Direct flow-controlled → admitted; handler runs. `ran >= 1` is the
+        //    FIFO barrier proving frames A–C were fully processed. The accepted
+        //    frame is the positive cache control.
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            event(
+                DIRECT_NODE,
+                direct_origin,
+                direct_origin,
+                DISPATCH_RPC_REQUEST,
+                3,
+                Some(b"32")
+            )
         ));
         assert!(
             wait_until_at_least(|| ran.load(Ordering::SeqCst) as u64, 1).await,
             "a direct flow-controlled duplex REQUEST is admitted and the handler runs",
+        );
+        assert_eq!(
+            serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 3)),
+            Some(DIRECT_NODE),
+            "an accepted authenticated direct frame DOES cache its response route",
+        );
+
+        // FIFO barrier: exactly the one admitted frame ran the handler — the two
+        // rejected frames and the continuation CHUNK never entered the fold, so
+        // no state / grant / publication occurred for them; counters stay per-call.
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "only the one admitted frame ran the duplex handler",
+        );
+        assert_eq!(
+            metrics
+                .packet_origin_mismatch_dropped_total
+                .load(Ordering::Relaxed),
+            1,
+        );
+        assert_eq!(
+            metrics
+                .relayed_flow_controlled_rejected_total
+                .load(Ordering::Relaxed),
+            1,
         );
     }
 
