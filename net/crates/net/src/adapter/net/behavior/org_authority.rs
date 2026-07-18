@@ -885,6 +885,30 @@ fn authority_dir_policy_violation(owner_uid: u32, mode: u32, euid: u32) -> Optio
     None
 }
 
+/// Policy decision for ONE resolved ancestor of the authority directory
+/// (Gate-1, Unix). An ancestor is unsafe if it is owned by another non-root
+/// account — that owner can rewrite its entries directly, and the sticky bit
+/// does NOT constrain a directory's own owner — or if it is group/other-
+/// writable without the sticky bit (a non-owner could then rename an owned
+/// child). Root-owned ancestors are trusted (OS administrator). Returns
+/// `Some(reason)` on violation. Pure `u32` logic, unit-testable on every
+/// platform.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn unix_ancestor_violation(owner_uid: u32, mode: u32, euid: u32) -> Option<String> {
+    if owner_uid != euid && owner_uid != 0 {
+        return Some(format!(
+            "owned by uid {owner_uid}, neither the current user {euid} nor root"
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
+            "group/other-writable without the sticky bit (mode {:04o})",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
 /// Validate the resolved ancestor chain of the authority directory (Gate-1,
 /// Unix). Validating only the final directory as owner-only 0700 is
 /// insufficient if an ancestor is group/other-writable WITHOUT the sticky
@@ -894,12 +918,13 @@ fn authority_dir_policy_violation(owner_uid: u32, mode: u32, euid: u32) -> Optio
 /// THROUGH the parent — inside the declared account boundary — distinct from
 /// same-account TOCTOU inside the directory, which stays out of scope.
 ///
-/// Each ancestor of `dir` (its parent up to the filesystem root) must be
-/// either not group/other-writable, or group/other-writable WITH the sticky
-/// bit (e.g. `/tmp` at 01777 — sticky forbids a non-owner from renaming an
-/// owned child). Symlinked components are resolved by canonicalizing the
-/// deepest existing ancestor before the walk. Root / OS-administrator-owned
-/// ancestors are trusted principals.
+/// Each ancestor of `dir` (its parent up to the filesystem root) must be owned
+/// by the effective user or by root — a foreign non-root owner can rewrite its
+/// entries directly (sticky does not constrain a directory's own owner) — and
+/// must be either not group/other-writable or group/other-writable WITH the
+/// sticky bit (e.g. `/tmp` at 01777 — sticky forbids a non-owner from renaming
+/// an owned child). Symlinked components are resolved by canonicalizing the
+/// deepest existing ancestor before the walk.
 #[cfg(unix)]
 fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
     use std::os::unix::fs::MetadataExt;
@@ -923,21 +948,19 @@ fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
             _ => return Ok(()),
         }
     };
+    // SAFETY: geteuid() reads the caller's effective uid; it has no
+    // preconditions, cannot fail, and touches no memory.
+    let euid = unsafe { libc::geteuid() };
     let real = std::fs::canonicalize(existing).map_err(io)?;
     for ancestor in real.ancestors() {
         let meta = std::fs::symlink_metadata(ancestor).map_err(io)?;
-        let mode = meta.mode();
-        let group_or_other_writable = mode & 0o022 != 0;
-        let sticky = mode & 0o1000 != 0;
-        if group_or_other_writable && !sticky {
+        if let Some(reason) = unix_ancestor_violation(meta.uid(), meta.mode(), euid) {
             return Err(OrgAuthorityError::InsecureAuthorityDir {
                 path: dir.display().to_string(),
                 reason: format!(
-                    "ancestor {} is group/other-writable without the sticky bit \
-                     (mode {:04o}) — another account could replace the authority \
-                     directory entry through it",
-                    ancestor.display(),
-                    mode & 0o7777
+                    "ancestor {} {reason} — another account could replace the \
+                     authority directory entry through it",
+                    ancestor.display()
                 ),
             });
         }
@@ -1374,6 +1397,33 @@ mod tests {
         assert!(authority_dir_policy_violation(1000, 0o707, 1000)
             .unwrap()
             .contains("group/other-writable"));
+    }
+
+    /// Gate-1: the PURE ancestor-policy decision (Unix). An ancestor must be
+    /// owned by the effective user or root, and not group/other-writable
+    /// without the sticky bit. Runs on every platform (plain u32 logic); the
+    /// foreign-owned cases cannot be produced from an integration test without
+    /// root.
+    #[test]
+    fn unix_ancestor_violation_covers_ownership_and_sticky() {
+        // euid-owned, owner-only → accepted.
+        assert_eq!(unix_ancestor_violation(1000, 0o755, 1000), None);
+        // root-owned (uid 0) → accepted, even world-writable + sticky (/tmp).
+        assert_eq!(unix_ancestor_violation(0, 0o1777, 1000), None);
+        // current-user-owned, sticky + writable → accepted.
+        assert_eq!(unix_ancestor_violation(1000, 0o1777, 1000), None);
+        // Foreign-owned non-root → refused, even at a tame 0755.
+        assert!(unix_ancestor_violation(1234, 0o755, 1000)
+            .unwrap()
+            .contains("uid 1234"));
+        // Foreign-owned + sticky → still refused (sticky does not bind the owner).
+        assert!(unix_ancestor_violation(1234, 0o1777, 1000)
+            .unwrap()
+            .contains("uid 1234"));
+        // euid-owned but group/other-writable non-sticky → refused.
+        assert!(unix_ancestor_violation(1000, 0o0777, 1000)
+            .unwrap()
+            .contains("sticky"));
     }
 
     /// Gate-1 (Unix): adopting into a MISSING authority directory creates it
