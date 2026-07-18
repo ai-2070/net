@@ -20395,6 +20395,18 @@ impl MeshNode {
         self.origin_hash_to_node.get(&origin_hash).map(|v| *v)
     }
 
+    /// Whether a peer entry exists for `node_id`. This is exactly the
+    /// gate [`Self::publish_to_peer`] consults before any send, so a
+    /// `false` here guarantees a direct publish would fail
+    /// *before* transmission — the response can safely fall back to
+    /// the subscriber roster without risk of duplicating a partial
+    /// send (AV-4/5 item 5). Not a liveness guarantee: the entry may
+    /// exist while its session drains, in which case the direct send
+    /// is attempted and its outcome is authoritative.
+    pub(super) fn has_peer_session(&self, node_id: u64) -> bool {
+        self.peers.contains_key(&node_id)
+    }
+
     /// Push the currently-stored local announcement (if any) to
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op

@@ -2031,19 +2031,37 @@ async fn publish_response_to_caller(
     // caller's mesh ingress selects exactly this dispatcher.
     let payload = super::cortex::insert_rpc_route(payload, reply_channel_hash);
     let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
+    // AV-4/5 item 5: only take the direct-send fast path when the
+    // resolved node actually has a peer session. A stale or non-direct
+    // reverse-index entry (the caller reconnected under a new NodeId,
+    // announced then dropped, etc.) otherwise made `publish_to_peer`
+    // return "no session" and the response was lost — this now falls
+    // through to the roster instead. The `has_peer_session` gate is the
+    // exact check `publish_to_peer` makes before it sends, so a `true`
+    // here means any subsequent failure is at/after transmission and
+    // must NOT be retried on the roster (that would duplicate the
+    // response).
     if let Some(target_node_id) = resolved {
-        return mesh
-            .publish_to_peer(
-                target_node_id,
-                reply_channel_hash,
-                reply_stream_id,
-                /* reliable */ true,
-                std::slice::from_ref(&payload),
-            )
-            .await;
+        if mesh.has_peer_session(target_node_id) {
+            return mesh
+                .publish_to_peer(
+                    target_node_id,
+                    reply_channel_hash,
+                    reply_stream_id,
+                    /* reliable */ true,
+                    std::slice::from_ref(&payload),
+                )
+                .await;
+        }
+        tracing::debug!(
+            caller_origin = format!("{caller_origin:#x}"),
+            target_node = format!("{target_node_id:#x}"),
+            "rpc response: resolved route has no peer session; roster fallback",
+        );
     }
     // Fallback: roster fan-out. Reached when the caller's origin is
-    // unknown to both the bridge cache AND the global reverse index.
+    // unknown to both the bridge cache AND the global reverse index, OR
+    // the resolved node has no live session (nothing was sent).
     let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
     mesh.publish(&publisher, payload).await.map(|_| ())
 }
@@ -4755,5 +4773,65 @@ mod origin_cache_tests {
         cache.insert(u64::MAX, 1);
         assert_eq!(cache.get(0), Some(0), "touched entry must survive eviction");
         assert_eq!(cache.get(1), None, "the now-LRU entry (1) must be evicted");
+    }
+}
+
+#[cfg(test)]
+mod roster_fallback_tests {
+    use super::*;
+    use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    async fn build_server() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x42u8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+            .with_handshake(3, Duration::from_secs(2));
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// AV-4/5 item 5: a response whose resolved route hint points at a
+    /// node with no peer session must fall back to the subscriber
+    /// roster instead of failing outright. Before the fix,
+    /// `publish_to_peer` returned "no session" and the function
+    /// returned that error — the response was silently lost. Now the
+    /// stale hint is skipped (it fails `has_peer_session`, so nothing
+    /// was sent) and the roster path is taken; with no subscriber the
+    /// empty roster fan-out is a clean `Ok`.
+    ///
+    /// Red-witness: removing the `has_peer_session` gate makes
+    /// `publish_to_peer(STALE_NODE)` return the "no session" error and
+    /// this assertion fails.
+    #[tokio::test]
+    async fn stale_route_hint_falls_back_to_the_roster() {
+        let server = build_server().await;
+        let reply = ChannelName::new("svc.replies.0000000000000001").unwrap();
+        let cid = ChannelId::new(reply.clone());
+        let reply_hash = cid.hash();
+        let reply_sid = MeshNode::publish_stream_id(&cid);
+        // A NodeId that was never connected: `has_peer_session` is
+        // false, so a direct publish would fail before transmission.
+        const STALE_NODE: u64 = 0xDEAD_BEEF_0000_0001;
+        assert!(!server.has_peer_session(STALE_NODE));
+        let result = publish_response_to_caller(
+            &server,
+            /* caller_origin */ 0x1,
+            Some(STALE_NODE),
+            &reply,
+            reply_hash,
+            reply_sid,
+            Bytes::from_static(b"resp"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a stale route hint must fall back to the roster, not error out: {result:?}",
+        );
     }
 }
