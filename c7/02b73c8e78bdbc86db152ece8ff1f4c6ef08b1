@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_9298fd786cc20e::t_8254a86bab3c10 4646-4649,4657-4658
+  s_9298fd786cc20e::t_6bfbde04a9a599 2410-2413
+  s_9298fd786cc20e::t_4507b254d13bee 4857-4927
+  s_9298fd786cc20e::t_bd821444615f69 1962-1963,1968-1977,1987-1992
+  s_9298fd786cc20e::t_e57f75319ba3f3 2847-2850
+  s_9298fd786cc20e::t_84eb55785a0a77 4643,4840
+  s_9298fd786cc20e::t_23e7f6f1345295 454-455,468,472-479
+  s_9298fd786cc20e::t_8fe5de00e7fe57 630-639,650
+  s_9298fd786cc20e::t_438e26257cc76e 504-510,516-517
+  s_9298fd786cc20e::t_4f3c8f7fbd7b0b 595-604
+  s_9298fd786cc20e::t_16cce7ec659cc2 676,687,2004,2066,2339,2643,2823,3128
+  s_9298fd786cc20e::t_616ca95597a1d9 2012-2024,2029-2031,2034,2036-2043
+  s_9298fd786cc20e::t_ff2aa28a84da3e 2317,2603,2785,3084
+  s_9298fd786cc20e::t_daaa66bbfd2371 2344-2345
+  s_9298fd786cc20e::t_6e7f06c357ce5c 2351,2614,2800,3099
+  s_9298fd786cc20e::t_1e490613f1cfc1 3100-3105
+  s_9298fd786cc20e::t_66916137a3be38 4842,4844-4856
+  s_9298fd786cc20e::t_3a97ace51cf08b 2615-2620
+  s_9298fd786cc20e::t_e9dd42df3851b1 511-515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "c702b73c8e78bdbc86db152ece8ff1f4c6ef08b1",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
