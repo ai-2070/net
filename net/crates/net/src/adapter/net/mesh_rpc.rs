@@ -51,7 +51,6 @@ use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
 
 use super::mesh::MeshNode;
-use super::redex::{RedexEntry, RedexEvent, RedexFold};
 
 // ============================================================================
 // Public types.
@@ -2438,10 +2437,11 @@ impl MeshNode {
                         continue;
                     }
                 }
-                let payload = inbound.payload;
-                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
-                let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                // AV-1 item 1: drive the fold with the AEAD-verified
+                // `inbound.from_node` so per-call state binds to the
+                // authenticated session peer, not the wire-claimed
+                // origin — a forged control frame misses the fold key.
+                if let Err(e) = fold.lock().apply_inbound(&inbound) {
                     tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                 }
             }
@@ -2661,10 +2661,8 @@ impl MeshNode {
                         continue;
                     }
                 }
-                let payload = inbound.payload;
-                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
-                let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                // AV-1 item 1: authenticated-peer-bound fold drive.
+                if let Err(e) = fold.lock().apply_inbound(&inbound) {
                     tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
                 }
             }
@@ -2846,10 +2844,8 @@ impl MeshNode {
                         continue;
                     }
                 }
-                let payload = inbound.payload;
-                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
-                let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                // AV-1 item 1: authenticated-peer-bound fold drive.
+                if let Err(e) = fold.lock().apply_inbound(&inbound) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_client_stream: fold apply error");
                 }
@@ -3136,10 +3132,8 @@ impl MeshNode {
                         continue;
                     }
                 }
-                let payload = inbound.payload;
-                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
-                let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                // AV-1 item 1: authenticated-peer-bound fold drive.
+                if let Err(e) = fold.lock().apply_inbound(&inbound) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_duplex: fold apply error");
                 }
