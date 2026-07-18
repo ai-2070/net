@@ -391,13 +391,15 @@ struct StoreCore {
     /// `live.write()` is still held. Lets a witness deterministically
     /// occupy the exact "new view installed, old generation still
     /// present" window the barriered readers must not observe.
-    #[cfg(test)]
+    /// Always `None` in production (armed only by
+    /// [`OrgRevocationStore::arm_publish_pause_for_test`], a
+    /// `#[doc(hidden)]` seam mirroring the review-11 `*_paused_for_test`
+    /// hooks); the per-publish check is an uncontended `Mutex::take`.
     publish_pause: parking_lot::Mutex<Option<PublishPauseHook>>,
 }
 
 /// The one-shot hook a test installs to pause [`StoreCore::publish`]
 /// between the view swap and the generation bump.
-#[cfg(test)]
 struct PublishPauseHook {
     /// Signalled once the view is swapped and the pause begins.
     swapped: std::sync::mpsc::Sender<()>,
@@ -425,11 +427,10 @@ impl StoreCore {
             .map(|((org, member), floor)| (*org, member.clone(), *floor))
             .collect();
         *live = Arc::new(next);
-        // Test-only: occupy the "new view installed, old generation
-        // still present" window while `live` (the write guard) is
-        // held, so a witness can prove the barriered readers never
-        // observe it. No-op in production (field absent).
-        #[cfg(test)]
+        // Occupy the "new view installed, old generation still present"
+        // window while `live` (the write guard) is held, so a witness
+        // can prove the barriered readers never observe it. A no-op
+        // (one uncontended `Mutex::take`) unless a test armed the hook.
         self.run_publish_pause_hook();
         self.generation.fetch_add(1, Ordering::Release);
         raised
@@ -437,7 +438,6 @@ impl StoreCore {
 
     /// Fire the one-shot publish pause hook if a test installed one.
     /// Runs while the caller holds `live.write()`.
-    #[cfg(test)]
     fn run_publish_pause_hook(&self) {
         if let Some(hook) = self.publish_pause.lock().take() {
             let _ = hook.swapped.send(());
@@ -519,7 +519,6 @@ fn join_or_create_core(
         generation: AtomicU64::new(0),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
-        #[cfg(test)]
         publish_pause: parking_lot::Mutex::new(None),
     });
     cores.insert(path.to_path_buf(), Arc::downgrade(&core));
@@ -797,14 +796,16 @@ impl OrgRevocationStore {
         (live.clone(), generation)
     }
 
-    /// Test-only: arm the one-shot publish pause. The NEXT
-    /// [`StoreCore::publish`] (e.g. via [`Self::apply_bundle`]) will,
-    /// after swapping the live view and while still holding
+    /// Test-only (`#[doc(hidden)]`, mirroring the review-11
+    /// `*_paused_for_test` seams): arm the one-shot publish pause. The
+    /// NEXT [`StoreCore::publish`] (e.g. via [`Self::apply_bundle`])
+    /// will, after swapping the live view and while still holding
     /// `live.write()`, signal the returned receiver and then block
     /// until the returned sender is used. Lets a witness sit in the
-    /// "new view, old generation" window.
-    #[cfg(test)]
-    fn arm_publish_pause_for_test(
+    /// "new view, old generation" window to prove the send-path /
+    /// admission barriered reads never observe it. Not for production.
+    #[doc(hidden)]
+    pub fn arm_publish_pause_for_test(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();

@@ -2608,6 +2608,20 @@ struct SendStamp {
     emission_generation: u64,
 }
 
+/// A [`SendStamp`] plus the exact authority/store `Arc`s it
+/// fingerprints, RETAINED for the send seqlock's lifetime (Kyra
+/// Gate-1 audit — pointer ABA). While this snapshot lives, the
+/// captured `store_ptr` / `authority_ptr` addresses cannot be reused
+/// by a different object, so the second stamp comparison cannot
+/// false-match "unchanged" after a replace/drop/realloc cycle.
+struct SendSecuritySnapshot {
+    stamp: SendStamp,
+    /// Pinned until the stability comparison completes; not read.
+    _authority: Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+    /// Pinned for the same reason.
+    _store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+}
+
 /// The node's slot in the installed revocation store's
 /// raise-subscriber registry — the store it subscribed on plus the
 /// removable token (review-9 addendum).
@@ -7260,19 +7274,39 @@ impl MeshNode {
     /// interval in which no store/authority (re)installation, no
     /// floor publish, and no emission toggle occurred.
     fn security_stamp(&self) -> SendStamp {
+        self.security_snapshot().stamp
+    }
+
+    /// Capture the [`SendStamp`] AND retain the exact authority/store
+    /// `Arc`s it fingerprints (Kyra Gate-1 audit). The seqlock holds
+    /// the returned snapshot across derive → serialize → the second
+    /// stamp comparison so those `Arc`s cannot be dropped and their
+    /// addresses reused for a DIFFERENT authority/store mid-send — the
+    /// pointer-ABA that a raw `Arc::as_ptr` comparison alone would
+    /// miss. The store generation is read via
+    /// [`OrgRevocationStore::barriered_generation`], which synchronizes
+    /// through the live-view lock, so a floor publish that has swapped
+    /// the view but not yet bumped the generation is never observed as
+    /// "unchanged".
+    fn security_snapshot(&self) -> SendSecuritySnapshot {
         let store = self.org_revocation.load_full();
         let authority = self.node_authority.load_full();
-        SendStamp {
+        let stamp = SendStamp {
             store_ptr: store
                 .as_ref()
                 .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
-            store_generation: store.as_ref().map_or(0, |s| s.publish_generation()),
+            store_generation: store.as_ref().map_or(0, |s| s.barriered_generation()),
             authority_ptr: authority
                 .as_ref()
                 .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
             emission_generation: self
                 .emission_generation
                 .load(std::sync::atomic::Ordering::Acquire),
+        };
+        SendSecuritySnapshot {
+            stamp,
+            _authority: authority,
+            _store: store,
         }
     }
 
@@ -7308,7 +7342,12 @@ impl MeshNode {
     fn announcement_bytes_for_send_probed(&self, probe: Option<&dyn Fn()>) -> Option<Vec<u8>> {
         for _ in 0..16 {
             let cached = self.local_announcement.load_full()?;
-            let stamp = self.security_stamp();
+            // Capture the stamp AND PIN the authority/store Arcs it
+            // fingerprints (Kyra Gate-1 audit — ABA). `snapshot` is
+            // held across the derive + serialize + recheck below, so
+            // the captured addresses cannot be reused mid-send.
+            let snapshot = self.security_snapshot();
+            let stamp = snapshot.stamp;
             // Derive what emission would attach right now. This
             // re-checks temporal validity every send, so a cert
             // that expired by wall clock (which bumps no
@@ -7323,7 +7362,10 @@ impl MeshNode {
                 }
                 // Emit only if nothing moved during the derive +
                 // serialize — else the enforced view changed and a
-                // retry re-derives against the new state.
+                // retry re-derives against the new state. The pinned
+                // `snapshot` Arcs are still alive for this comparison,
+                // so a swapped-away authority/store cannot reuse the
+                // captured addresses.
                 if self.security_stamp() == stamp {
                     return Some(bytes);
                 }

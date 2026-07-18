@@ -1671,6 +1671,165 @@ async fn concurrent_floor_publish_during_send_retries_to_cert_free() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// NC4 (Kyra Gate-1 audit) — the send seqlock PINS the exact
+/// authority/store `Arc`s its stamp fingerprints across the derive →
+/// serialize → stability-recheck window, so a replace/drop/realloc
+/// cycle cannot reuse their addresses and make the raw `Arc::as_ptr`
+/// comparison false-match. Observed by strong-count: the pin adds a
+/// reference DURING the send that is gone once it returns.
+#[tokio::test]
+async fn send_seqlock_pins_authority_and_store_arcs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let node = build_node().await;
+    let dir = scratch_dir("gate1-aba-pin");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt"));
+    node.install_node_authority(authority).expect("install");
+    node.set_owner_cert_emission(true).expect("enable");
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+
+    let store = node.org_revocation_store().expect("store");
+    let auth = node.node_authority().expect("authority");
+
+    // The probe fires INSIDE the send window, while the seqlock holds
+    // its pinned snapshot. Record the live strong counts there; it does
+    // NOT change any state, so the send emits the certified bytes.
+    let during_store = Arc::new(AtomicUsize::new(0));
+    let during_auth = Arc::new(AtomicUsize::new(0));
+    let (s_probe, a_probe) = (store.clone(), auth.clone());
+    let (ds, da) = (during_store.clone(), during_auth.clone());
+    let probe = move || {
+        ds.store(Arc::strong_count(&s_probe), Ordering::Release);
+        da.store(Arc::strong_count(&a_probe), Ordering::Release);
+    };
+    let bytes = node
+        .announcement_bytes_for_send_probed_for_test(&probe)
+        .expect("send bytes");
+    // The window closed — the pin is released.
+    let after_store = Arc::strong_count(&store);
+    let after_auth = Arc::strong_count(&auth);
+
+    assert!(
+        during_store.load(Ordering::Acquire) > after_store,
+        "the send must pin the store Arc during its window (during {} > after {})",
+        during_store.load(Ordering::Acquire),
+        after_store,
+    );
+    assert!(
+        during_auth.load(Ordering::Acquire) > after_auth,
+        "the send must pin the authority Arc during its window (during {} > after {})",
+        during_auth.load(Ordering::Acquire),
+        after_auth,
+    );
+    // The undisturbed send still ships the certified form.
+    let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+    assert!(sent.owner_cert.is_some(), "undisturbed send ships the cert");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// NC3 (Kyra Gate-1 audit) — the send stamp reads the store generation
+/// through the LIVE-VIEW BARRIER. A floor publish paused after the
+/// view swap but BEFORE the generation increment holds the exact
+/// "new view installed, old generation still present" window. The
+/// barriered stamp blocks on it and re-derives against the raised
+/// floor, so the send ships the cert-free form — a bare
+/// `publish_generation()` read would observe the stale generation,
+/// find the stamp "unchanged", and emit the now-below-floor certified
+/// bytes.
+#[tokio::test]
+async fn send_seqlock_barrier_catches_a_paused_mid_swap_publish() {
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let node = build_node().await;
+    let dir = scratch_dir("gate1-barrier");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt"));
+    node.install_node_authority(authority).expect("install");
+    node.set_owner_cert_emission(true).expect("enable");
+    node.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
+        .await
+        .expect("announce");
+
+    let store = node.org_revocation_store().expect("store");
+    // The next publish will pause between the view swap and the
+    // generation bump, holding `live.write()`.
+    let (swapped_rx, resume_tx) = store.arm_publish_pause_for_test();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let store_for_probe = store.clone();
+    let member = node.entity_id().clone();
+    let swapped_holder = PlMutex::new(Some(swapped_rx));
+    let done_holder = PlMutex::new(Some(done_tx));
+    // Fires inside the send's stability window (after the certified
+    // bytes are serialized, before the second stamp). It raises the
+    // node's own floor above the cert generation on another thread —
+    // which pauses mid-swap — then waits for that swap and signals.
+    let probe = move || {
+        if fired.swap(true, Ordering::AcqRel) {
+            return; // one-shot; let the retry converge
+        }
+        let s = store_for_probe.clone();
+        let m = member.clone();
+        std::thread::spawn(move || {
+            let mut floors = std::collections::BTreeMap::new();
+            floors.insert(m, 2u32);
+            let _ =
+                s.apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"));
+        });
+        if let Some(rx) = swapped_holder.lock().take() {
+            rx.recv()
+                .expect("publisher reached the paused mid-swap window");
+        }
+        if let Some(tx) = done_holder.lock().take() {
+            let _ = tx.send(());
+        }
+    };
+
+    // Run the (sync) send on its own thread; the barriered second
+    // stamp will BLOCK on the paused publisher until we release it.
+    let node_for_send = node.clone();
+    let send_thread = std::thread::spawn(move || {
+        node_for_send.announcement_bytes_for_send_probed_for_test(&probe)
+    });
+
+    // The publisher is paused mid-swap and the send is blocked at the
+    // barriered recheck. Release the publisher: it bumps the
+    // generation and drops the write lock, and the send observes the
+    // change and retries to cert-free.
+    done_rx
+        .recv()
+        .expect("probe reached the paused mid-swap window");
+    std::thread::sleep(Duration::from_millis(100));
+    resume_tx.send(()).expect("release publisher");
+
+    let bytes = send_thread
+        .join()
+        .expect("send thread")
+        .expect("send bytes");
+    let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+    assert!(
+        sent.owner_cert.is_none(),
+        "a floor published mid-swap must be caught by the barriered stamp; \
+         the send must NOT ship the now-below-floor certified form",
+    );
+    assert!(
+        sent.verify().is_ok(),
+        "the rebuilt announcement is re-signed"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Review-11 P1: certificate wall-clock expiry is honored on every
 /// reuse boundary even with NO authority/store/emission event —
 /// expiry bumps no generation, so the epoch mechanism (review-10)
