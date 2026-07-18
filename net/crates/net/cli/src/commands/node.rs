@@ -178,16 +178,19 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
     // pre-create it here with a lax umask — that create-then-chmod pattern is
     // exactly what the scaffold avoids (Gate-1).
 
-    // Gate-1 (Windows): a CUSTOM authority directory is operator-asserted —
-    // its ACL is owned/managed by the operator and is not validated here. Only
-    // the default per-user profile path (`%APPDATA%`) is covered by profile
-    // inheritance; a freshly-created custom dir gets an owner-only DACL, but a
-    // pre-existing one's ACL is the operator's responsibility.
+    // Gate-1 (Windows): the authority scaffold now creates a missing directory
+    // (and any missing parents) with a protected owner-only DACL, and
+    // re-validates an EXISTING directory's DACL (fail closed unless every
+    // write-capable ACE is a trusted principal). What it does NOT walk for a
+    // custom path is the PRE-EXISTING ancestor chain: a writable ancestor's
+    // owner could still replace the directory entry, which a child DACL cannot
+    // prevent. Warn so the operator keeps a custom dir under a protected parent.
     #[cfg(windows)]
     if args.authority_dir.is_some() {
         eprintln!(
-            "warning: custom --authority-dir {} on Windows: its ACL is operator-owned \
-             and not validated; ensure it is under a per-user protected location \
+            "warning: custom --authority-dir {}: the authority directory's own DACL is \
+             created owner-only / re-validated, but its PRE-EXISTING parent directories \
+             are not walked on Windows; keep it under a per-user protected location \
              restricted to your account",
             dir.display()
         );

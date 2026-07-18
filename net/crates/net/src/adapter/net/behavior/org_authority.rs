@@ -56,11 +56,12 @@
 //! parent through which another account could swap the directory's entry), a
 //! new authority directory is created no broader than 0700 (umask) and then
 //! tightened to exactly 0700, and an existing one must be owned by the current
-//! user and not group/other-writable. On Windows a newly-created directory is
-//! restricted to the owner via an explicit DACL; a pre-existing directory's
-//! ACL is operator-owned (the default `%APPDATA%` path is protected by profile
-//! inheritance, a custom `--authority-dir` is operator-asserted). The user
-//! account, SYSTEM, and local administrators are trusted principals.
+//! user and not group/other-writable. On Windows every missing component is
+//! created ATOMICALLY with a protected, owner-only DACL (`CreateDirectoryW` +
+//! `SECURITY_ATTRIBUTES`, no post-creation window), and a pre-existing directory
+//! is re-validated against its BINARY DACL and fails closed unless every
+//! write-capable ACE is a trusted principal. The user account, SYSTEM, and local
+//! administrators are trusted principals.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -992,34 +993,15 @@ fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
     Ok(())
 }
 
-/// The absolute path to the Windows system directory (e.g.
-/// `C:\Windows\System32`) obtained from the OS — NOT from `PATH` or an
-/// environment variable — so a trusted system executable can be invoked by
-/// absolute path.
-#[cfg(windows)]
-fn system_directory() -> std::io::Result<std::path::PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    extern "system" {
-        fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
-    }
-    let mut buf = [0u16; 260];
-    // SAFETY: `buf` is a valid, writable UTF-16 buffer of `buf.len()` elements;
-    // GetSystemDirectoryW writes at most that many code units and returns the
-    // count written (0 on failure, or the required size if too small).
-    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
-    if n == 0 || n as usize >= buf.len() {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(std::ffi::OsString::from_wide(&buf[..n as usize]).into())
-}
-
-/// The current process's user SID as a string (e.g. `S-1-5-21-…`), derived from
-/// the process access token — NOT from `USERNAME` / `USERDOMAIN`, which a
-/// caller can spoof. Used to grant the authority directory's DACL by SID.
+/// The current process user's SID, copied into an aligned owned buffer derived
+/// from the process access token — NOT from `USERNAME` (spoofable). Returned as
+/// `Vec<u32>` so `as_ptr()` is 4-byte aligned: a `SID`'s trailing
+/// `SubAuthority` array is `u32` and the Win32 SID APIs require aligned access
+/// (a byte `Vec` would be only 1-aligned). A SID is self-contained (no interior
+/// pointers), so the copy is a valid `PSID` for as long as the buffer lives.
 #[cfg(windows)]
 #[allow(clippy::multiple_unsafe_ops_per_block)]
-fn current_process_sid_string() -> std::io::Result<String> {
-    use std::os::windows::ffi::OsStringExt;
+fn process_user_sid() -> std::io::Result<Vec<u32>> {
     type Handle = *mut std::ffi::c_void;
     extern "system" {
         fn GetCurrentProcess() -> Handle;
@@ -1031,24 +1013,24 @@ fn current_process_sid_string() -> std::io::Result<String> {
             len: u32,
             ret_len: *mut u32,
         ) -> i32;
-        fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, string_sid: *mut *mut u16) -> i32;
+        fn GetLengthSid(sid: *const std::ffi::c_void) -> u32;
+        fn CopySid(dest_len: u32, dest: *mut std::ffi::c_void, src: *const std::ffi::c_void)
+            -> i32;
         fn CloseHandle(handle: Handle) -> i32;
-        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     }
     const TOKEN_QUERY: u32 = 0x0008;
     const TOKEN_USER: i32 = 1; // TOKEN_INFORMATION_CLASS::TokenUser
-                               // SAFETY: the standard Win32 token → SID → string sequence. Every call's
-                               // return value is checked; `buf` is sized by the first GetTokenInformation
-                               // probe; `psid` points INTO `buf`, which stays alive across
-                               // ConvertSidToStringSidW; the LocalAlloc'd wide string is copied out then
-                               // LocalFree'd; and the token handle is closed on every path.
+                               // SAFETY: the standard token → TOKEN_USER → SID copy. Every return value is
+                               // checked; `buf` is sized by the first probe; `psid` points INTO `buf`,
+                               // which stays alive across GetLengthSid + CopySid; the copy target `sid`
+                               // is `GetLengthSid` bytes rounded up to whole `u32`s (so 4-aligned and
+                               // large enough); the token handle is closed on every path.
     unsafe {
         let mut token: Handle = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return Err(std::io::Error::last_os_error());
         }
         let mut len: u32 = 0;
-        // First call sizes the buffer (fails with ERROR_INSUFFICIENT_BUFFER).
         GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
         if len == 0 {
             let e = std::io::Error::last_os_error();
@@ -1064,51 +1046,374 @@ fn current_process_sid_string() -> std::io::Result<String> {
         // TOKEN_USER's first field is a SID_AND_ATTRIBUTES whose first field is
         // the PSID (a pointer into `buf`). `read_unaligned` because a `Vec<u8>`
         // is only byte-aligned.
-        let psid = (buf.as_ptr() as *const *mut std::ffi::c_void).read_unaligned();
-        let mut string_sid: *mut u16 = std::ptr::null_mut();
-        if ConvertSidToStringSidW(psid, &mut string_sid) == 0 {
+        let psid = (buf.as_ptr() as *const *const std::ffi::c_void).read_unaligned();
+        let sid_len = GetLengthSid(psid);
+        if sid_len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let words = (sid_len as usize).div_ceil(4);
+        let mut sid = vec![0u32; words];
+        if CopySid(sid_len, sid.as_mut_ptr().cast(), psid) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(sid)
+    }
+}
+
+/// Convert a `PSID` to its canonical string form (`S-1-5-…`) via
+/// `ConvertSidToStringSidW`. `psid` must point at a valid SID that outlives the
+/// call (from [`process_user_sid`] or a live security descriptor buffer).
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn sid_to_string(psid: *const std::ffi::c_void) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStringExt;
+    extern "system" {
+        fn ConvertSidToStringSidW(sid: *const std::ffi::c_void, out: *mut *mut u16) -> i32;
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    // SAFETY: `psid` is a valid SID pointer per the contract above. The
+    // LocalAlloc'd wide string is measured, copied out, then LocalFree'd; the
+    // out-param is checked.
+    unsafe {
+        let mut out: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(psid, &mut out) == 0 {
             return Err(std::io::Error::last_os_error());
         }
         let mut n = 0usize;
-        while *string_sid.add(n) != 0 {
+        while *out.add(n) != 0 {
             n += 1;
         }
-        let s = std::ffi::OsString::from_wide(std::slice::from_raw_parts(string_sid, n))
+        let s = std::ffi::OsString::from_wide(std::slice::from_raw_parts(out, n))
             .to_string_lossy()
             .into_owned();
-        LocalFree(string_sid.cast());
+        LocalFree(out.cast());
         Ok(s)
     }
 }
 
-/// Windows analogue of Unix owner-only mode for a directory: strip inherited
-/// ACEs and grant ONLY the current process's user SID full control with
-/// object + container inheritance, so a freshly-created authority directory —
-/// and the files created inside it — are restricted to the owner regardless of
-/// where it was placed. The principal is the process TOKEN SID (not a spoofable
-/// `USERNAME`), and `icacls` is invoked by absolute System32 path (not `PATH`).
-/// Any lookup / execution / non-success status is a loud error.
+/// The current process user's SID as a string (`S-1-5-21-…`). Thin wrapper over
+/// [`process_user_sid`] + [`sid_to_string`] so the token → SID path lives in one
+/// place. Used as a trusted principal when validating an existing DACL.
 #[cfg(windows)]
-fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
-    let sid = current_process_sid_string()?;
-    let icacls = system_directory()?.join("icacls.exe");
-    let out = std::process::Command::new(&icacls)
-        .arg(dir)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        // `*SID` grants by SID; `(OI)(CI)` makes the ACE inherit onto child
-        // files and directories; `F` is full control.
-        .arg(format!("*{sid}:(OI)(CI)F"))
-        .output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "icacls ({}) could not restrict {} to {sid}: {}",
-            icacls.display(),
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+fn current_process_sid_string() -> std::io::Result<String> {
+    let sid = process_user_sid()?;
+    sid_to_string(sid.as_ptr().cast())
+}
+
+/// Atomically create ONE directory with a PROTECTED, owner-only DACL (Gate-1,
+/// Windows). `CreateDirectoryW` is called with a security descriptor whose DACL
+/// grants ONLY `sid` full control, inheritable onto child files and directories
+/// (`OI|CI`), and is marked `SE_DACL_PROTECTED` so NO inheritable ACEs from the
+/// parent are merged in. Applying the protected DACL AT creation removes the
+/// post-creation-`icacls` window in which the directory briefly existed under
+/// inherited permissions, and — because creation is atomic — a failure leaves NO
+/// directory behind (no fail-once / pass-on-retry residue). `sid` must be an
+/// aligned, valid SID (see [`process_user_sid`]).
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn create_dir_with_owner_only_dacl(path: &Path, sid: &[u32]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    type Pv = *mut std::ffi::c_void;
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: Pv,
+        b_inherit_handle: i32,
+    }
+    // The absolute-form SECURITY_DESCRIPTOR (pointer fields, so 8-aligned).
+    #[repr(C)]
+    struct SecurityDescriptor {
+        revision: u8,
+        sbz1: u8,
+        control: u16,
+        owner: Pv,
+        group: Pv,
+        sacl: Pv,
+        dacl: Pv,
+    }
+    extern "system" {
+        fn InitializeAcl(acl: Pv, len: u32, revision: u32) -> i32;
+        fn AddAccessAllowedAceEx(acl: Pv, revision: u32, flags: u32, mask: u32, sid: Pv) -> i32;
+        fn InitializeSecurityDescriptor(sd: Pv, revision: u32) -> i32;
+        fn SetSecurityDescriptorDacl(sd: Pv, present: i32, dacl: Pv, defaulted: i32) -> i32;
+        fn SetSecurityDescriptorControl(sd: Pv, mask: u16, bits: u16) -> i32;
+        fn CreateDirectoryW(path: *const u16, sa: *const SecurityAttributes) -> i32;
+    }
+    const ACL_REVISION: u32 = 2;
+    const SD_REVISION: u32 = 1;
+    const OBJECT_INHERIT_ACE: u32 = 0x1;
+    const CONTAINER_INHERIT_ACE: u32 = 0x2;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    // SE_DACL_PROTECTED: do not merge inheritable ACEs from the parent, so the
+    // grant is EXACTLY the owner (the OI|CI flags still propagate the owner ACE
+    // down to child files/dirs, keeping them owner-only).
+    const SE_DACL_PROTECTED: u16 = 0x1000;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // 4-byte-aligned ACL storage; one ACE plus a user SID fits easily in 512 B.
+    let mut acl_buf = [0u32; 128];
+    let mut sd = SecurityDescriptor {
+        revision: 0,
+        sbz1: 0,
+        control: 0,
+        owner: std::ptr::null_mut(),
+        group: std::ptr::null_mut(),
+        sacl: std::ptr::null_mut(),
+        dacl: std::ptr::null_mut(),
+    };
+    // SAFETY: `acl_buf` (4-aligned, 512 B) receives one ACCESS_ALLOWED ACE for
+    // `sid` (aligned, valid). `sd` is a stack SECURITY_DESCRIPTOR whose DACL
+    // points into `acl_buf`; `sa` points at `sd`. All of `wide`, `acl_buf`,
+    // `sd`, `sid` outlive the single CreateDirectoryW call in this scope, so no
+    // pointer dangles. Every Win32 return value is checked.
+    unsafe {
+        let acl: Pv = acl_buf.as_mut_ptr().cast();
+        let sid_ptr = sid.as_ptr() as Pv;
+        let sd_ptr: Pv = (&mut sd as *mut SecurityDescriptor).cast();
+        if InitializeAcl(acl, (acl_buf.len() * 4) as u32, ACL_REVISION) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if AddAccessAllowedAceEx(
+            acl,
+            ACL_REVISION,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            FILE_ALL_ACCESS,
+            sid_ptr,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if InitializeSecurityDescriptor(sd_ptr, SD_REVISION) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if SetSecurityDescriptorDacl(sd_ptr, 1, acl, 0) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sa = SecurityAttributes {
+            n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd_ptr,
+            b_inherit_handle: 0,
+        };
+        if CreateDirectoryW(wide.as_ptr(), &sa) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     Ok(())
+}
+
+/// Create every missing component of `dir` (missing intermediate parents AND the
+/// final directory) each with a PROTECTED owner-only DACL (Gate-1, Windows).
+/// Mirrors the Unix `create_missing_components_0700`: a non-recursive,
+/// shallowest-first walk, so a component another account plants between the
+/// existence check and the create fails loudly (`CreateDirectoryW` →
+/// `ERROR_ALREADY_EXISTS`) rather than being adopted, and no intermediate is
+/// left under inherited (broad) permissions. A child DACL cannot stop a writable
+/// PARENT's owner from replacing the child entry, so securely creating the whole
+/// missing chain — not just the leaf — is what protects a custom nested
+/// `--authority-dir`.
+#[cfg(windows)]
+fn create_missing_components_owner_only(dir: &Path, sid: &[u32]) -> std::io::Result<()> {
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cursor: &Path = dir;
+    loop {
+        if cursor.exists() {
+            break;
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                missing.push(cursor);
+                cursor = parent;
+            }
+            // Reached a parentless component (e.g. a nonexistent drive root):
+            // do not try to create it; the shallowest real create fails loudly.
+            _ => break,
+        }
+    }
+    for component in missing.iter().rev() {
+        create_dir_with_owner_only_dacl(component, sid)?;
+    }
+    Ok(())
+}
+
+/// One access-allowed / -denied ACE from a DACL, in inspectable form (Gate-1,
+/// Windows). `sid` is the granted principal's string SID for the simple ACE
+/// types (0 = ACCESS_ALLOWED, 1 = ACCESS_DENIED); for any other ACE type it is a
+/// sentinel so a validator treats it conservatively.
+#[cfg(windows)]
+#[derive(Debug)]
+struct AceInfo {
+    sid: String,
+    mask: u32,
+    ace_type: u8,
+    /// Inheritance / inherited-from-parent flags — inspected by the witnesses
+    /// (OI|CI on a fresh dir, INHERITED on a child file), not by the production
+    /// validator (which reasons about the mask + SID).
+    #[allow(dead_code)]
+    flags: u8,
+}
+
+/// The security-relevant view of a filesystem object's security descriptor
+/// (Gate-1, Windows), read via the BINARY Win32 security APIs — not by parsing
+/// localizable `icacls` text. `null_dacl` (a present-but-NULL or absent DACL,
+/// both of which grant everyone full access) must fail closed.
+#[cfg(windows)]
+#[derive(Debug)]
+struct DaclView {
+    /// Owner SID string — inspected by the witnesses (owner-is-trusted); the
+    /// production validator reasons about the DACL, not the owner (a foreign
+    /// owner cannot itself grant access — the DACL governs that).
+    #[allow(dead_code)]
+    owner_sid: String,
+    /// `SE_DACL_PROTECTED` — asserted on a FRESHLY created dir by the witnesses;
+    /// NOT a production criterion for a pre-existing dir, which may legitimately
+    /// inherit an owner-only ACL from a protected parent profile.
+    #[allow(dead_code)]
+    protected: bool,
+    null_dacl: bool,
+    aces: Vec<AceInfo>,
+}
+
+/// The access-mask bits that make an ACE write-capable (able to mutate the
+/// object, its contents, or its ACL/owner). Any allowed ACE carrying one of
+/// these for a non-trusted principal breaks the owner-only invariant.
+#[cfg(windows)]
+const WRITE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+    | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    | 0x0000_0010 // FILE_WRITE_EA
+    | 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// Read an existing filesystem object's owner + DACL through the binary Win32
+/// security APIs (Gate-1, Windows). Uses `GetFileSecurityW` into a caller-owned
+/// aligned buffer (no `LocalFree` bookkeeping): the returned owner / DACL
+/// pointers borrow into that buffer, so every string is copied out before it is
+/// dropped. Walks the ACL by index so no ACE ordering or count is assumed.
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn read_object_security(path: &Path) -> std::io::Result<DaclView> {
+    use std::os::windows::ffi::OsStrExt;
+    type Pv = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetFileSecurityW(name: *const u16, info: u32, sd: Pv, len: u32, needed: *mut u32)
+            -> i32;
+        fn GetSecurityDescriptorOwner(sd: Pv, owner: *mut Pv, defaulted: *mut i32) -> i32;
+        fn GetSecurityDescriptorControl(sd: Pv, control: *mut u16, revision: *mut u32) -> i32;
+        fn GetSecurityDescriptorDacl(
+            sd: Pv,
+            present: *mut i32,
+            dacl: *mut Pv,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn GetAce(acl: Pv, index: u32, ace: *mut Pv) -> i32;
+    }
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const SE_DACL_PROTECTED: u16 = 0x1000;
+    const INFO: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a valid NUL-terminated path. The first GetFileSecurityW
+    // sizes the SD; `sd_buf` (Vec<u32>, 4-aligned) then receives the whole
+    // self-relative descriptor. GetSecurityDescriptorOwner/Control/Dacl return
+    // pointers INTO `sd_buf`, valid while it lives; each ACE is fetched by index
+    // in `[0, ace_count)` and its {type, flags, mask, SID} read at fixed offsets
+    // (SID at byte 8 for the simple ACE types). All strings are copied out
+    // before `sd_buf` drops; every Win32 return value is checked.
+    unsafe {
+        let mut needed: u32 = 0;
+        // Probe for the required length (this call is expected to fail).
+        GetFileSecurityW(wide.as_ptr(), INFO, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut sd_buf = vec![0u32; (needed as usize).div_ceil(4)];
+        let sd: Pv = sd_buf.as_mut_ptr().cast();
+        if GetFileSecurityW(
+            wide.as_ptr(),
+            INFO,
+            sd,
+            (sd_buf.len() * 4) as u32,
+            &mut needed,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut owner: Pv = std::ptr::null_mut();
+        let mut defaulted: i32 = 0;
+        if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owner_sid = sid_to_string(owner)?;
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+
+        let mut present: i32 = 0;
+        let mut dacl: Pv = std::ptr::null_mut();
+        let mut dacl_defaulted: i32 = 0;
+        if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut dacl_defaulted) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // An absent (present == 0) or NULL DACL grants everyone full access.
+        if present == 0 || dacl.is_null() {
+            return Ok(DaclView {
+                owner_sid,
+                protected,
+                null_dacl: true,
+                aces: Vec::new(),
+            });
+        }
+
+        // ACL header: { AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, .. }.
+        let ace_count = (dacl.cast::<u8>().add(4) as *const u16).read_unaligned();
+        let mut aces = Vec::with_capacity(ace_count as usize);
+        for i in 0..u32::from(ace_count) {
+            let mut ace: Pv = std::ptr::null_mut();
+            if GetAce(dacl, i, &mut ace) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let base = ace.cast::<u8>();
+            let ace_type = *base;
+            let flags = *base.add(1);
+            // Mask sits at byte 4 for every ACE_HEADER-prefixed ACE.
+            let mask = (base.add(4) as *const u32).read_unaligned();
+            // The SID begins at byte 8 for the SIMPLE ACE types only; other
+            // (e.g. object) ACEs place it elsewhere, so record a sentinel and
+            // let the validator treat a write-capable one conservatively.
+            let sid = if ace_type == 0 || ace_type == 1 {
+                sid_to_string(base.add(8).cast())?
+            } else {
+                String::from("<non-simple-ace>")
+            };
+            aces.push(AceInfo {
+                sid,
+                mask,
+                ace_type,
+                flags,
+            });
+        }
+        Ok(DaclView {
+            owner_sid,
+            protected,
+            null_dacl: false,
+            aces,
+        })
+    }
 }
 
 /// Create every missing component of `dir` (intermediate parents AND the final
@@ -1192,18 +1497,21 @@ fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
 ///   before use (a restrictive-umask create + owner chmod(0700) is safe; the
 ///   dangerous pattern was permissive create then tighten). State / lock /
 ///   audience files are 0600.
-/// - Non-Unix: a newly-created directory (and its child files, via
-///   inheritance) is restricted to the current process's TOKEN SID with an
-///   explicit owner-only DACL ([`restrict_dir_to_owner`] — icacls invoked by
-///   absolute System32 path, granting `*SID:(OI)(CI)F`); a failure to apply it
-///   is a LOUD error, never a silent downgrade. A pre-existing directory's ACL
-///   is operator-owned and NOT re-validated here: the default authority path
-///   under the per-user protected profile (`%APPDATA%`) is covered by profile
-///   inheritance, and a custom `--authority-dir` is operator-asserted (the CLI
-///   warns when one is set). A DACL on the child cannot stop a writable
-///   parent's owner from replacing the child entry, so custom paths remain an
-///   operator trust issue. The user account, SYSTEM, and local administrators
-///   are trusted principals.
+/// - Windows: every MISSING component (intermediate parents AND the final
+///   directory) is created ATOMICALLY with a protected, owner-only DACL
+///   ([`create_missing_components_owner_only`] → [`create_dir_with_owner_only_dacl`]:
+///   `CreateDirectoryW` with a `SECURITY_ATTRIBUTES` whose DACL grants only the
+///   process TOKEN SID full control, `OI|CI`-inheritable onto child files, and
+///   is `SE_DACL_PROTECTED` so no parent ACEs are merged). There is no
+///   post-creation window under inherited permissions, and a failure leaves NO
+///   directory behind — so a retry cannot adopt an insecure residue. Securely
+///   creating the WHOLE missing chain (not just the leaf) is what protects a
+///   custom nested path, since a child DACL cannot stop a writable parent's
+///   owner from replacing the child entry. A pre-existing directory is
+///   re-validated against its BINARY DACL ([`validate_existing_dir_dacl`]) and
+///   fails closed unless every write-capable ACE grants only a trusted
+///   principal. The user account, SYSTEM, and local administrators are trusted
+///   principals.
 fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: dir.display().to_string(),
@@ -1263,35 +1571,95 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                         reason: "path exists but is not a directory".to_string(),
                     });
                 }
-                // The directory's ACL is operator-owned; reading the Windows
-                // DACL needs Win32 security APIs and is not done here. The
-                // default path under the per-user profile is protected by
-                // inheritance; a custom path is operator-asserted (CLI warns).
+                // Gate-1 (Windows): re-validate the EXISTING directory's BINARY
+                // DACL and fail CLOSED unless every write-capable ACE is a
+                // trusted principal. A modified `%APPDATA%` directory, a
+                // permissive custom `--authority-dir`, or a directory left by an
+                // older or aborted run must NOT be adopted merely because it
+                // exists — that was the operator-asserted downgrade Kyra flagged.
+                #[cfg(windows)]
+                validate_existing_dir_dacl(dir)?;
+                #[cfg(not(windows))]
                 tracing::debug!(
                     path = %dir.display(),
-                    "authority directory exists; ACL is operator-owned and not \
-                     re-validated on this platform",
+                    "authority directory exists; binary ACL validation is \
+                     unavailable on this platform",
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = dir.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(io)?;
-                    }
-                }
-                std::fs::create_dir(dir).map_err(io)?;
-                // Restrict the freshly-created directory to the owner (Windows
-                // analogue of 0700). FAIL LOUD: authority secrets must never be
-                // provisioned into a directory whose owner-only ACL could not be
-                // applied — that would silently degrade to the operator-asserted
-                // posture reserved for a pre-existing custom directory.
+                // Gate-1 (Windows): create every missing component (intermediate
+                // parents AND the final directory) ATOMICALLY with a protected
+                // owner-only DACL — there is no post-creation window under
+                // inherited permissions, and a failure leaves NO directory
+                // behind, so a retry cannot adopt an insecure residue.
                 #[cfg(windows)]
-                restrict_dir_to_owner(dir).map_err(io)?;
+                {
+                    let sid = process_user_sid().map_err(io)?;
+                    create_missing_components_owner_only(dir, &sid).map_err(io)?;
+                }
+                #[cfg(not(windows))]
+                {
+                    if let Some(parent) = dir.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent).map_err(io)?;
+                        }
+                    }
+                    std::fs::create_dir(dir).map_err(io)?;
+                }
             }
             Err(e) => return Err(io(e)),
         }
         Ok(())
     }
+}
+
+/// Validate an EXISTING authority directory's DACL (Gate-1, Windows) — fail
+/// CLOSED unless every write-capable ALLOWED ACE grants only a trusted
+/// principal: the current process user, Local System (`S-1-5-18`), or the local
+/// Administrators group (`S-1-5-32-544`). A present-but-NULL or absent DACL
+/// (everyone full access) is rejected outright. Read-only grants to other
+/// principals are tolerated — only write-capable ACEs threaten the owner-only
+/// invariant. Reads the BINARY security descriptor ([`read_object_security`]),
+/// never localizable `icacls` text.
+#[cfg(windows)]
+fn validate_existing_dir_dacl(dir: &Path) -> Result<(), OrgAuthorityError> {
+    let view = read_object_security(dir).map_err(|e| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("read authority directory security descriptor: {e}"),
+    })?;
+    if view.null_dacl {
+        return Err(OrgAuthorityError::InsecureAuthorityDir {
+            path: dir.display().to_string(),
+            reason: "authority directory has a NULL/absent DACL (grants everyone full access)"
+                .to_string(),
+        });
+    }
+    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("resolve current user SID: {e}"),
+    })?;
+    const LOCAL_SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    for ace in &view.aces {
+        // Only ALLOWED ACEs (type 0) grant access; a DENY cannot broaden it.
+        if ace.ace_type != 0 {
+            continue;
+        }
+        if ace.mask & WRITE_MASK == 0 {
+            continue; // a read-only grant to anyone is tolerated
+        }
+        if ace.sid != user_sid && ace.sid != LOCAL_SYSTEM && ace.sid != ADMINISTRATORS {
+            return Err(OrgAuthorityError::InsecureAuthorityDir {
+                path: dir.display().to_string(),
+                reason: format!(
+                    "authority directory grants write access to untrusted principal {} \
+                     (mask {:#010x}) — only the owner, SYSTEM, and Administrators are trusted",
+                    ace.sid, ace.mask
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Open, mode-check, and read the audience key through ONE
@@ -2061,70 +2429,180 @@ mod tests {
         );
     }
 
-    /// Gate-1 (Windows): a freshly-created authority directory gets an
-    /// owner-only, INHERITABLE DACL (granted by the process token SID via the
-    /// absolute System32 icacls), and the provisioned child files inherit it —
-    /// no broad principal retains access. Reads the resulting security
-    /// descriptor via icacls. Broad principals are matched fully-qualified
-    /// (`BUILTIN\Users`), never the bare word — the temp path itself contains
-    /// "Users".
+    /// Gate-1 (Windows): a freshly-created authority directory carries a
+    /// PROTECTED, owner-only DACL — granted to the process token SID with full
+    /// control and object+container inheritance — and both a probe file created
+    /// directly in it and the provisioned authority files are owner-only, with
+    /// no write-capable ACE for any broad principal. Inspects the BINARY security
+    /// descriptor via `read_object_security` (`GetFileSecurityW` + `GetAce`),
+    /// never localizable icacls text.
     #[cfg(windows)]
     #[test]
     fn adopt_windows_authority_dir_and_files_are_owner_only() {
+        const OI: u8 = 0x01;
+        const CI: u8 = 0x02;
+        const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+        const LOCAL_SYSTEM: &str = "S-1-5-18";
+        const ADMINISTRATORS: &str = "S-1-5-32-544";
+
         let scratch = Scratch::new();
         let kp = node_identity();
         let authority = scratch.dir().join("nested").join("authority");
         NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None).expect("adopt");
 
-        let icacls = system_directory().expect("system dir").join("icacls.exe");
-        let read_acl = |p: &std::path::Path| -> String {
-            let out = std::process::Command::new(&icacls)
-                .arg(p)
-                .output()
-                .expect("run icacls");
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        const BROAD: [&str; 3] = ["Everyone", "BUILTIN\\Users", "Authenticated Users"];
+        let user = current_process_sid_string().expect("user sid");
+        let trusted = |sid: &str| sid == user || sid == LOCAL_SYSTEM || sid == ADMINISTRATORS;
 
-        // Directory: inheritance stripped → no broad principal; the sole grant
-        // carries object+container inheritance and full control.
-        let dir_acl = read_acl(&authority);
+        // Directory: protected DACL, owner is a trusted principal, one
+        // full-control inheritable ACE for the owner, and NO write-capable grant
+        // to a non-trusted principal.
+        let dir_view = read_object_security(&authority).expect("read dir sd");
+        assert!(!dir_view.null_dacl, "dir DACL must not be NULL");
         assert!(
-            dir_acl.contains("(OI)(CI)(F)"),
-            "dir must carry an inheritable full-control ACE; got:\n{dir_acl}"
+            dir_view.protected,
+            "dir DACL must be protected (parent inheritance stripped)"
         );
-        for broad in BROAD {
-            assert!(
-                !dir_acl.contains(broad),
-                "dir ACL must not grant {broad}; got:\n{dir_acl}"
-            );
-        }
-        // A provisioned child file inherits the owner-only ACE.
-        let file_acl = read_acl(&authority.join(OWNER_MEMBERSHIP_FILE));
         assert!(
-            file_acl.contains("(I)") && file_acl.contains("(F)"),
-            "child file must inherit full control; got:\n{file_acl}"
+            trusted(&dir_view.owner_sid),
+            "dir owner must be a trusted principal, got {}",
+            dir_view.owner_sid
         );
-        for broad in BROAD {
-            assert!(
-                !file_acl.contains(broad),
-                "child file ACL must not grant {broad}; got:\n{file_acl}"
-            );
+        let owner_ace = dir_view
+            .aces
+            .iter()
+            .find(|a| a.ace_type == 0 && a.sid == user)
+            .expect("dir must carry an allowed ACE for the owner");
+        assert_eq!(
+            owner_ace.mask & FILE_ALL_ACCESS,
+            FILE_ALL_ACCESS,
+            "owner ACE must grant full control"
+        );
+        assert_eq!(
+            owner_ace.flags & (OI | CI),
+            OI | CI,
+            "owner ACE must be object+container inheritable"
+        );
+        for ace in &dir_view.aces {
+            if ace.ace_type == 0 && ace.mask & WRITE_MASK != 0 {
+                assert!(
+                    trusted(&ace.sid),
+                    "dir grants write to non-trusted {}",
+                    ace.sid
+                );
+            }
         }
+
+        // Child files are owner-only. `owner_only` asserts the SECURITY property
+        // — the owner holds a full-control ACE and NO non-trusted principal has
+        // any write-capable ACE — rather than the inheritance-model-dependent
+        // binary INHERITED_ACE flag (legacy CreateFile inheritance copies the
+        // ACE down flagless even though icacls renders it `(I)`).
+        let owner_only = |view: &DaclView| -> bool {
+            let owner_full = view.aces.iter().any(|a| {
+                a.ace_type == 0 && a.sid == user && a.mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+            });
+            let no_foreign_write = view
+                .aces
+                .iter()
+                .all(|a| a.ace_type != 0 || a.mask & WRITE_MASK == 0 || trusted(&a.sid));
+            !view.null_dacl && owner_full && no_foreign_write
+        };
+
+        // A file created DIRECTLY in the protected dir is owner-only — it can be
+        // so only by inheriting the dir's owner-only ACE (a non-inheriting create
+        // would pick up the token default DACL).
+        let probe = authority.join("probe");
+        std::fs::write(&probe, b"x").expect("write probe file");
+        let probe_view = read_object_security(&probe).expect("read probe sd");
+        assert!(
+            owner_only(&probe_view),
+            "a file created in the protected dir must be owner-only; got {:?}",
+            probe_view.aces,
+        );
+
+        // Every provisioned authority file is likewise owner-only (`write_atomic`
+        // gives each an explicit owner-only DACL via `create_new` + rename).
+        let file_view =
+            read_object_security(&authority.join(OWNER_MEMBERSHIP_FILE)).expect("read file sd");
+        assert!(
+            owner_only(&file_view),
+            "a provisioned authority file must be owner-only; got {:?}",
+            file_view.aces,
+        );
     }
 
-    /// Gate-1 (Windows): applying the owner-only DACL fails LOUD when icacls
-    /// cannot process the target — so adoption aborts (via `?` in
-    /// ensure_secure_authority_dir) before provisioning any authority files.
+    /// Gate-1 (Windows): an EXISTING authority directory is re-validated against
+    /// its BINARY DACL — `validate_existing_dir_dacl` ACCEPTS an owner-only
+    /// directory and REJECTS one that grants a broad principal (Everyone) write
+    /// access, both directly and through the full `adopt` ceremony. Proves a
+    /// pre-existing directory is checked, not adopted on trust.
     #[cfg(windows)]
     #[test]
-    fn restrict_dir_to_owner_fails_loudly_on_a_bad_path() {
+    fn existing_windows_dir_dacl_is_revalidated_binary() {
         let scratch = Scratch::new();
-        let missing = scratch.dir().join("does-not-exist");
+        let kp = node_identity();
+
+        // Accept: adopt builds a protected owner-only dir; re-validation passes.
+        let ok_dir = scratch.dir().join("secure");
+        NodeAuthority::adopt(&ok_dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt secure");
+        validate_existing_dir_dacl(&ok_dir).expect("an owner-only dir must validate");
+
+        // Reject: a directory granting Everyone (S-1-1-0) full control fails
+        // closed — directly and through adopt.
+        let bad_dir = scratch.dir().join("permissive");
+        std::fs::create_dir(&bad_dir).expect("mkdir permissive");
+        let status = std::process::Command::new("icacls")
+            .arg(&bad_dir)
+            .arg("/grant")
+            .arg("*S-1-1-0:(OI)(CI)F") // Everyone, by SID
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls grant Everyone must succeed");
+        let err = validate_existing_dir_dacl(&bad_dir)
+            .expect_err("a dir granting Everyone write must be refused");
         assert!(
-            restrict_dir_to_owner(&missing).is_err(),
-            "restrict_dir_to_owner must fail when icacls cannot process the path",
+            matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {err}",
         );
+        let adopt_err = NodeAuthority::adopt(&bad_dir, cert_for(&kp, 2), kp.entity_id(), 0, None)
+            .expect_err("adopt into an Everyone-writable dir must be refused");
+        assert!(
+            matches!(&adopt_err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {adopt_err}",
+        );
+    }
+
+    /// Gate-1 (Windows, item 9): when protected creation cannot complete (an
+    /// uncreatable path), `adopt` fails CLOSED — no residual directory, no
+    /// authority files — and a retry stays fail-closed, so there is no
+    /// fail-once / pass-on-retry adoption of an insecure residue.
+    #[cfg(windows)]
+    #[test]
+    fn adopt_fails_closed_on_uncreatable_windows_path_without_residue() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        // `|` is invalid in an NTFS name, so CreateDirectoryW fails deterministically.
+        let bad_parent = scratch.dir().join("inva|lid");
+        let authority = bad_parent.join("authority");
+
+        let e1 = NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("adopt onto an uncreatable path must fail");
+        assert!(matches!(&e1, OrgAuthorityError::Io { .. }), "got: {e1}");
+        assert!(
+            !bad_parent.exists(),
+            "no residual directory may be left behind",
+        );
+        for name in NodeAuthority::file_names() {
+            assert!(
+                !authority.join(name).exists(),
+                "no authority file may be provisioned on failure",
+            );
+        }
+        // Retry: still fail-closed — no pre-existing insecure directory to adopt.
+        let e2 = NodeAuthority::adopt(&authority, cert_for(&kp, 2), kp.entity_id(), 0, None)
+            .expect_err("retry must remain fail-closed");
+        assert!(matches!(&e2, OrgAuthorityError::Io { .. }), "got: {e2}");
     }
 
     #[test]

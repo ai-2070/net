@@ -650,8 +650,14 @@ handle) plus, newly explicit:
     the sidecar. R3-3 detects sidecar replacement occurring BETWEEN
     legitimate transactions and common operator/startup mistakes; it
     does NOT claim protection against an actor concurrently mutating
-    directory entries DURING a transaction. The boundary is enforced
-    at its edges (`org_authority::ensure_secure_authority_dir`): on Unix
+    directory entries DURING a transaction. The supplied path is first
+    normalized ONCE (`normalize_authority_dir`, applied by both `adopt`
+    and `open`): a relative path is resolved against the current directory
+    (a bare relative name has an empty parent, so its ancestor chain would
+    otherwise go unchecked) and a trailing separator is stripped (so
+    `symlink_metadata` on a final symlink reports the link, not its
+    followed target). The boundary is then enforced at its edges
+    (`org_authority::ensure_secure_authority_dir`): on Unix
     the resolved ancestor chain is validated (no group/other-writable,
     non-sticky parent through which another account could rename the
     owned entry — sticky writable parents like `/tmp` are fine), a new
@@ -661,12 +667,19 @@ handle) plus, newly explicit:
     pattern was permissive-create-then-tighten — an existing one must be
     owned by the current user and not group/other-writable, and
     state/lock/audience files are 0600; the generic path-agnostic store
-    API never chmods a supplied parent. On Windows a freshly-created
-    authority directory gets an explicit owner-only DACL; a pre-existing
-    directory's ACL is operator-owned (the default `%APPDATA%` path is
-    covered by profile inheritance, a custom `--authority-dir` is
-    operator-asserted and the CLI warns). The user account, SYSTEM, and
-    local administrators are trusted local principals.
+    API never chmods a supplied parent. On Windows every missing component
+    (missing intermediate parents AND the final directory) is created
+    ATOMICALLY with a protected, owner-only DACL (`CreateDirectoryW` with a
+    `SECURITY_ATTRIBUTES` whose DACL grants only the process token SID full
+    control, `OI|CI`-inheritable and `SE_DACL_PROTECTED`) — there is no
+    post-creation window under inherited permissions, and a failure leaves
+    no directory behind, so a retry cannot adopt an insecure residue. A
+    pre-existing directory is re-validated against its BINARY DACL and fails
+    closed unless every write-capable ACE grants only a trusted principal.
+    A custom path's PRE-EXISTING ancestor chain is not walked on Windows (a
+    writable ancestor's owner could replace the entry, which a child DACL
+    cannot prevent — the CLI warns). The user account, SYSTEM, and local
+    administrators are trusted local principals.
 
 ---
 
