@@ -1718,7 +1718,8 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocatio
     #[cfg(unix)]
     let nlink = {
         use std::os::unix::fs::MetadataExt;
-        u64::from(lock.metadata().map_err(io)?.nlink())
+        // `MetadataExt::nlink()` is already `u64` on every Unix — no conversion.
+        lock.metadata().map_err(io)?.nlink()
     };
     #[cfg(windows)]
     let nlink = {
