@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_4d84fc036dad77 581-582
+  s_9298fd786cc20e::t_aa39847a7fe377 1095-1098
+  s_9298fd786cc20e::t_42e2e23c772109 780-788
+  s_9298fd786cc20e::t_35ed000e97c093 548
+  s_9298fd786cc20e::t_fe718d30965513 2161,2176-2177
+  s_9298fd786cc20e::t_b9dc2977095643 1041-1046,1048-1055,1059-1078,1080-1085,1091-1092
+  s_9298fd786cc20e::t_64d3d3f505fc96 2186-2200,2206-2300
+  s_9298fd786cc20e::t_a08b3decc7489d 2201-2205
+  s_9298fd786cc20e::t_7a9fb2e243300e 469-547,549-580,583-584
+  s_9298fd786cc20e::t_433df39da057ca 70,72
+net/crates/net/src/adapter/net/mesh.rs
+  s_9298fd786cc20e::t_e5147f3680ed2e 7072-7076,7078-7080
+  s_9298fd786cc20e::t_8dff9d8349cd57 7034-7043
+  s_9298fd786cc20e::t_601858fb21e3cc 2653-2659
+  s_9298fd786cc20e::t_57ad3f2eacd544 22726-22734
+  s_9298fd786cc20e::t_560cb83787b7c1 25238-25243,25248-25249
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "da10a48f35e820f0dad899d51feb6a8cc90db5d5",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
