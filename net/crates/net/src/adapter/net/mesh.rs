@@ -610,6 +610,26 @@ enum PunchIntroduceOutcome {
     Rejected(super::traversal::rendezvous::RejectReason),
 }
 
+/// Typed outcome of [`MeshNode::try_publish_to_peer`] — distinguishes a
+/// *pre-send* missing session (nothing was transmitted, so a caller may
+/// safely fall back to another route) from an at/after-send failure
+/// (bytes may already be committed to the wire; retrying would duplicate
+/// the frame) and from success. The nRPC response router relies on this
+/// to route around a stale direct hint atomically, without a
+/// `has_peer_session`-then-`publish` TOCTOU (R2-6).
+pub(super) enum PeerPublishOutcome {
+    /// The frame was handed to the socket for the target peer.
+    Sent,
+    /// No session existed for the target peer at the instant we looked —
+    /// nothing was built or transmitted. Falling back to another route
+    /// cannot duplicate the frame.
+    NoSession,
+    /// A failure at or after the point where the frame could have hit the
+    /// wire (backpressure, closed/partitioned stream, socket error). The
+    /// caller MUST NOT retry on another route.
+    SendFailed(AdapterError),
+}
+
 /// Rendezvous abuse budgets (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2,
 /// closing review Finding 5). Three independent limiters:
 ///
@@ -17563,6 +17583,14 @@ impl MeshNode {
     /// (which routes via the subscriber roster) and by the
     /// `mesh_rpc` glue (which knows the target directly and bypasses
     /// the roster).
+    ///
+    /// A thin `Result`-flattening wrapper over [`Self::try_publish_to_peer`]:
+    /// the *pre-send* missing-session outcome collapses back into the same
+    /// `Connection("publish: no session ...")` error every existing caller
+    /// already expects, so this seam is behaviourally unchanged. Callers
+    /// that must distinguish "nothing was transmitted, a fallback is safe"
+    /// from an at/after-send failure (the nRPC response router — R2-6) call
+    /// [`Self::try_publish_to_peer`] directly for the typed outcome.
     pub(super) async fn publish_to_peer(
         &self,
         peer_node_id: u64,
@@ -17571,18 +17599,46 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> Result<(), AdapterError> {
+        match self
+            .try_publish_to_peer(peer_node_id, channel_hash, stream_id, reliable, events)
+            .await
+        {
+            PeerPublishOutcome::Sent => Ok(()),
+            // Preserve the exact pre-refactor error the None branch used to
+            // return, so string-scraping / logging callers see no drift.
+            PeerPublishOutcome::NoSession => Err(AdapterError::Connection(format!(
+                "publish: no session for subscriber {:#x}",
+                peer_node_id
+            ))),
+            PeerPublishOutcome::SendFailed(e) => Err(e),
+        }
+    }
+
+    /// Atomic direct-to-peer publish that reports *why* it did or did not
+    /// transmit as a typed [`PeerPublishOutcome`] rather than a stringly
+    /// `Result`. The session lookup is the single gate: if `peer_node_id`
+    /// has no session at the instant we look, nothing is built or sent and
+    /// [`PeerPublishOutcome::NoSession`] is returned — so a caller can fall
+    /// back to another route without a check-then-act TOCTOU (R2-6). Every
+    /// path that reaches the socket (or fails at/after the credit acquire)
+    /// returns [`PeerPublishOutcome::Sent`] or
+    /// [`PeerPublishOutcome::SendFailed`]; a `SendFailed` MUST NOT be retried
+    /// on another route (bytes may already be committed to the wire).
+    pub(super) async fn try_publish_to_peer(
+        &self,
+        peer_node_id: u64,
+        channel_hash: ChannelHash,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+    ) -> PeerPublishOutcome {
         let (dest_addr, session) = match self.peers.get(&peer_node_id) {
             Some(p) => (p.value().addr, p.value().session.clone()),
-            None => {
-                return Err(AdapterError::Connection(format!(
-                    "publish: no session for subscriber {:#x}",
-                    peer_node_id
-                )));
-            }
+            None => return PeerPublishOutcome::NoSession,
         };
 
         if self.partition_filter.contains(&dest_addr) {
-            return Err(AdapterError::Connection(format!(
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish: peer {:#x} is partitioned",
                 peer_node_id
             )));
@@ -17603,13 +17659,13 @@ impl MeshNode {
         let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
             TxAdmit::Acquired { guard, seq } => (guard, seq),
             TxAdmit::WindowFull => {
-                return Err(AdapterError::Connection(format!(
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                     "publish: stream {:#x} backpressured",
                     stream_id
                 )));
             }
             TxAdmit::StreamClosed => {
-                return Err(AdapterError::Connection(format!(
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                     "publish: stream {:#x} closed",
                     stream_id
                 )));
@@ -17674,15 +17730,17 @@ impl MeshNode {
             .lookup(peer_node_id)
             .unwrap_or(dest_addr);
 
-        self.socket
-            .send_to(&packet, next_hop)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("publish send failed: {}", e)))?;
+        if let Err(e) = self.socket.send_to(&packet, next_hop).await {
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                "publish send failed: {}",
+                e
+            )));
+        }
         guard.commit(); // wire-accepted — bytes now belong to the receiver
 
         drop(builder);
         session.touch();
-        Ok(())
+        PeerPublishOutcome::Sent
     }
 
     /// Encode a [`super::behavior::fold::SignedAnnouncement`] and
@@ -20446,14 +20504,14 @@ impl MeshNode {
         self.origin_hash_to_node.get(&origin_hash).map(|v| *v)
     }
 
-    /// Whether a peer entry exists for `node_id`. This is exactly the
-    /// gate [`Self::publish_to_peer`] consults before any send, so a
-    /// `false` here guarantees a direct publish would fail
-    /// *before* transmission — the response can safely fall back to
-    /// the subscriber roster without risk of duplicating a partial
-    /// send (AV-4/5 item 5). Not a liveness guarantee: the entry may
-    /// exist while its session drains, in which case the direct send
-    /// is attempted and its outcome is authoritative.
+    /// Whether a peer entry exists for `node_id`. Once AV-5's production
+    /// caller — a `has_peer_session`-then-`publish_to_peer` pre-check —
+    /// was replaced by the atomic [`Self::try_publish_to_peer`] (R2-6,
+    /// which folds the session-existence check into the single send gate
+    /// with no check-then-act TOCTOU), the only remaining callers are
+    /// tests that assert a node is genuinely disconnected before
+    /// exercising the fallback/drop policies, so this is `#[cfg(test)]`.
+    #[cfg(test)]
     pub(super) fn has_peer_session(&self, node_id: u64) -> bool {
         self.peers.contains_key(&node_id)
     }

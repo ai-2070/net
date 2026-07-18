@@ -50,7 +50,7 @@ use super::cortex::{
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
 
-use super::mesh::MeshNode;
+use super::mesh::{MeshNode, PeerPublishOutcome};
 
 // ============================================================================
 // Public types.
@@ -646,8 +646,10 @@ async fn emit_capability_denial(
     let reply_channel_id = ChannelId::new(reply_channel.clone());
     let reply_channel_hash = reply_channel_id.hash();
     let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
-    // `target_hint = Some(from_node)` forces a direct unicast to the
-    // authenticated session peer — never the roster fan-out fallback.
+    // `target_hint = Some(from_node)` + `DirectOnly` force a direct
+    // unicast to the AEAD-authenticated session peer and NOTHING else:
+    // if that session is gone the denial is dropped, never reflected onto
+    // the (possibly forged) claimed origin's roster channel (NC2 / R2-7).
     let _ = publish_response_to_caller(
         mesh,
         reply_origin,
@@ -656,6 +658,7 @@ async fn emit_capability_denial(
         reply_channel_hash,
         reply_stream_id,
         Bytes::from(buf),
+        ResponseRouteFallback::DirectOnly,
     )
     .await;
 }
@@ -2068,6 +2071,33 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedLru<K, V> {
 /// path doesn't re-run `ChannelId::new` + xxh3 + `publish_stream_id`
 /// on every send. The emit closure's `BoundedLru<u64, CachedReplyChannel>`
 /// caches the triple per caller_origin.
+/// Routing policy for a server→caller frame when the resolved direct
+/// route has no live session at send time (R2-7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResponseRouteFallback {
+    /// AV-5: a normal RESPONSE frame. An honest caller that reconnected
+    /// under a new NodeId (its cached direct route went stale) is still
+    /// reachable via its *signed* subscriber roster subscription, so a
+    /// pre-send miss falls back to the roster fan-out rather than
+    /// dropping the response.
+    RosterOnStaleDirect,
+    /// NC2 / R2-7: a capability denial (or any authenticated-only frame)
+    /// is delivered ONLY to the AEAD-authenticated session peer named by
+    /// the explicit `target_hint`. If that session is gone the frame is
+    /// DROPPED — never resolved via the origin reverse-index and never
+    /// fanned out to a (possibly forged) claimed origin's roster channel,
+    /// which is exactly the reflection NC2 forbids.
+    DirectOnly,
+}
+
+// The reply-channel triple (`reply_channel`, `reply_channel_hash`,
+// `reply_stream_id`) is deliberately passed pre-split rather than bundled:
+// PERF_AUDIT §3.10 computes and caches the hash + stream_id per caller so
+// the emit hot path never re-derives them, and every call site already
+// holds the three values separately. Adding the R2-7 `fallback` policy
+// pushes this focused internal helper to 8 args — the same accepted
+// tradeoff the crate makes in ~24 other places.
+#[allow(clippy::too_many_arguments)]
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
@@ -2076,6 +2106,7 @@ async fn publish_response_to_caller(
     reply_channel_hash: ChannelHash,
     reply_stream_id: u64,
     payload: Bytes,
+    fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
     // OA2-E0.2: every server→caller frame (RESPONSE / DEADLINE /
     // REQUEST_GRANT / STREAM_GRANT built for the reply channel)
@@ -2083,38 +2114,70 @@ async fn publish_response_to_caller(
     // the reply channel's canonical hash — once, centrally. The
     // caller's mesh ingress selects exactly this dispatcher.
     let payload = super::cortex::insert_rpc_route(payload, reply_channel_hash);
-    let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
-    // AV-4/5 item 5: only take the direct-send fast path when the
-    // resolved node actually has a peer session. A stale or non-direct
-    // reverse-index entry (the caller reconnected under a new NodeId,
-    // announced then dropped, etc.) otherwise made `publish_to_peer`
-    // return "no session" and the response was lost — this now falls
-    // through to the roster instead. The `has_peer_session` gate is the
-    // exact check `publish_to_peer` makes before it sends, so a `true`
-    // here means any subsequent failure is at/after transmission and
-    // must NOT be retried on the roster (that would duplicate the
-    // response).
-    if let Some(target_node_id) = resolved {
-        if mesh.has_peer_session(target_node_id) {
-            return mesh
-                .publish_to_peer(
-                    target_node_id,
-                    reply_channel_hash,
-                    reply_stream_id,
-                    /* reliable */ true,
-                    std::slice::from_ref(&payload),
-                )
-                .await;
+    // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
+    // AEAD-authenticated session peer): it must never resolve a
+    // destination through the origin reverse-index, which could point at
+    // a different node claiming this origin (NC2). A normal RESPONSE may
+    // resolve the caller's node via the reverse-index when no hint is
+    // cached.
+    let resolved = match fallback {
+        ResponseRouteFallback::DirectOnly => target_hint,
+        ResponseRouteFallback::RosterOnStaleDirect => {
+            target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
         }
-        tracing::debug!(
-            caller_origin = format!("{caller_origin:#x}"),
-            target_node = format!("{target_node_id:#x}"),
-            "rpc response: resolved route has no peer session; roster fallback",
-        );
+    };
+    // R2-6: attempt the direct send and branch on the ATOMIC typed
+    // outcome, eliminating the `has_peer_session`-then-`publish` TOCTOU
+    // that AV-5 used. `try_publish_to_peer` makes the session-existence
+    // check its single gate:
+    //
+    // - `Sent`       — the frame reached the socket; done.
+    // - `SendFailed` — a failure at/after transmission; MUST NOT be
+    //                  retried on the roster (that would duplicate).
+    // - `NoSession`  — no session existed at send time, so nothing was
+    //                  transmitted. Safe to fall back per `fallback`.
+    if let Some(target_node_id) = resolved {
+        match mesh
+            .try_publish_to_peer(
+                target_node_id,
+                reply_channel_hash,
+                reply_stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload),
+            )
+            .await
+        {
+            PeerPublishOutcome::Sent => return Ok(()),
+            PeerPublishOutcome::SendFailed(e) => return Err(e),
+            PeerPublishOutcome::NoSession => {
+                if fallback == ResponseRouteFallback::DirectOnly {
+                    // The authenticated peer's session vanished. Drop the
+                    // frame — a denial must never reflect onto a claimed
+                    // origin's roster channel (NC2).
+                    tracing::debug!(
+                        caller_origin = format!("{caller_origin:#x}"),
+                        target_node = format!("{target_node_id:#x}"),
+                        "rpc direct-only frame: peer session gone at send time; dropping",
+                    );
+                    return Ok(());
+                }
+                tracing::debug!(
+                    caller_origin = format!("{caller_origin:#x}"),
+                    target_node = format!("{target_node_id:#x}"),
+                    "rpc response: resolved route has no peer session; roster fallback",
+                );
+            }
+        }
+    } else if fallback == ResponseRouteFallback::DirectOnly {
+        // No explicit direct target to unicast to — a direct-only frame
+        // has nowhere authenticated to go, so drop it rather than
+        // roster-fanning it out.
+        return Ok(());
     }
-    // Fallback: roster fan-out. Reached when the caller's origin is
-    // unknown to both the bridge cache AND the global reverse index, OR
-    // the resolved node has no live session (nothing was sent).
+    // Fallback: roster fan-out. Reached only for `RosterOnStaleDirect`
+    // when the caller's origin is unknown to both the bridge cache AND
+    // the global reverse index, OR the resolved node had no live session
+    // at send time (nothing was sent).
     let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
     mesh.publish(&publisher, payload).await.map(|_| ())
 }
@@ -2538,6 +2601,7 @@ impl MeshNode {
                     job.reply_channel_hash,
                     job.reply_stream_id,
                     job.payload,
+                    ResponseRouteFallback::RosterOnStaleDirect,
                 )
                 .await
                 {
@@ -2660,6 +2724,7 @@ impl MeshNode {
                         reply_channel_hash,
                         reply_stream_id,
                         Bytes::from(buf),
+                        ResponseRouteFallback::RosterOnStaleDirect,
                     )
                     .await
                     {
@@ -2842,6 +2907,7 @@ impl MeshNode {
                         reply_channel_hash,
                         reply_stream_id,
                         Bytes::from(buf),
+                        ResponseRouteFallback::RosterOnStaleDirect,
                     )
                     .await
                     {
@@ -3149,6 +3215,7 @@ impl MeshNode {
                         reply_channel_hash,
                         reply_stream_id,
                         Bytes::from(buf),
+                        ResponseRouteFallback::RosterOnStaleDirect,
                     )
                     .await
                     {
@@ -4957,18 +5024,133 @@ mod roster_fallback_tests {
         )
     }
 
-    /// AV-4/5 item 5: a response whose resolved route hint points at a
-    /// node with no peer session must fall back to the subscriber
-    /// roster instead of failing outright. Before the fix,
-    /// `publish_to_peer` returned "no session" and the function
-    /// returned that error — the response was silently lost. Now the
-    /// stale hint is skipped (it fails `has_peer_session`, so nothing
-    /// was sent) and the roster path is taken; with no subscriber the
-    /// empty roster fan-out is a clean `Ok`.
+    /// Like [`build_server`], but installs a channel-config registry that
+    /// token-gates `reply` on a root the node cannot chain to. The local
+    /// node holds no matching token, so any *roster* fan-out on `reply`
+    /// is denied publisher-side (`publish` returns
+    /// `Connection("channel: publish denied by channel ACL")`) — a clean,
+    /// live-session-free, deterministic observable for "did the roster
+    /// path run?". A DirectOnly frame that correctly drops never consults
+    /// the roster, so it stays `Ok`; a frame that (incorrectly)
+    /// roster-fell-back surfaces the ACL `Err`.
+    async fn build_server_with_token_gated_reply(reply: &ChannelName) -> Arc<MeshNode> {
+        use crate::adapter::net::channel::{ChannelConfig, ChannelConfigRegistry};
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x42u8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+            .with_handshake(3, Duration::from_secs(2));
+        let mut node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+        let registry = ChannelConfigRegistry::new();
+        // A root the local node has no chain to → `can_publish` fails
+        // closed (no chain presented), so the roster path errors.
+        let foreign_root = EntityKeypair::generate().entity_id().clone();
+        registry.insert(
+            ChannelConfig::new(ChannelId::new(reply.clone())).with_token_roots(vec![foreign_root]),
+        );
+        node.set_channel_configs(Arc::new(registry));
+        Arc::new(node)
+    }
+
+    /// R2-6: the atomic pre-send outcome. A never-connected peer must
+    /// report [`PeerPublishOutcome::NoSession`] from the production seam
+    /// `try_publish_to_peer` — the single session-existence gate that
+    /// replaced AV-5's `has_peer_session`-then-`publish` TOCTOU. Nothing
+    /// is built or transmitted, so a caller may safely fall back.
     ///
-    /// Red-witness: removing the `has_peer_session` gate makes
-    /// `publish_to_peer(STALE_NODE)` return the "no session" error and
-    /// this assertion fails.
+    /// Red-witness: making the `None` arm of `try_publish_to_peer` return
+    /// `Sent` (or `SendFailed`) instead of `NoSession` fails the match.
+    #[tokio::test]
+    async fn try_publish_to_peer_reports_pre_send_no_session() {
+        let server = build_server().await;
+        let reply = ChannelName::new("svc.replies.0000000000000002").unwrap();
+        let cid = ChannelId::new(reply);
+        let reply_hash = cid.hash();
+        let reply_sid = MeshNode::publish_stream_id(&cid);
+        const NEVER_CONNECTED: u64 = 0xDEAD_BEEF_0000_0002;
+        assert!(!server.has_peer_session(NEVER_CONNECTED));
+        let outcome = server
+            .try_publish_to_peer(
+                NEVER_CONNECTED,
+                reply_hash,
+                reply_sid,
+                /* reliable */ true,
+                std::slice::from_ref(&Bytes::from_static(b"resp")),
+            )
+            .await;
+        assert!(
+            matches!(outcome, PeerPublishOutcome::NoSession),
+            "a never-connected peer must report the pre-send NoSession outcome",
+        );
+    }
+
+    /// R2-7: the routing policy — proved by DIVERGENCE on identical input.
+    /// The reply channel is token-gated so a roster fan-out errors; the
+    /// target peer session is gone. Over the SAME gone peer:
+    ///
+    /// - `DirectOnly` DROPS (never consults the roster) → `Ok`;
+    /// - `RosterOnStaleDirect` reaches the (ACL-denied) roster → `Err`.
+    ///
+    /// The Ok/Err split — same call, same gone peer, only the policy
+    /// differs — is the exactly-once routing decision Kyra's addendum
+    /// asked for, not merely "Ok against an empty roster". A denial can
+    /// never reflect onto the claimed origin's roster channel (NC2).
+    ///
+    /// Red-witness: deleting the DirectOnly `return Ok(())` drop (letting
+    /// it fall through to the roster) makes the DirectOnly call surface
+    /// the ACL `Err`, failing the first assertion.
+    #[tokio::test]
+    async fn direct_only_frame_drops_while_normal_response_rosters_when_peer_gone() {
+        let reply = ChannelName::new("svc.replies.0000000000000003").unwrap();
+        let server = build_server_with_token_gated_reply(&reply).await;
+        let cid = ChannelId::new(reply.clone());
+        let reply_hash = cid.hash();
+        let reply_sid = MeshNode::publish_stream_id(&cid);
+        const GONE_NODE: u64 = 0xDEAD_BEEF_0000_0003;
+        assert!(!server.has_peer_session(GONE_NODE));
+
+        let direct = publish_response_to_caller(
+            &server,
+            /* caller_origin */ 0x3,
+            Some(GONE_NODE),
+            &reply,
+            reply_hash,
+            reply_sid,
+            Bytes::from_static(b"deny"),
+            ResponseRouteFallback::DirectOnly,
+        )
+        .await;
+        assert!(
+            direct.is_ok(),
+            "a direct-only frame to a gone peer must DROP (never roster-fallback): {direct:?}",
+        );
+
+        let roster = publish_response_to_caller(
+            &server,
+            /* caller_origin */ 0x3,
+            Some(GONE_NODE),
+            &reply,
+            reply_hash,
+            reply_sid,
+            Bytes::from_static(b"resp"),
+            ResponseRouteFallback::RosterOnStaleDirect,
+        )
+        .await;
+        assert!(
+            roster.is_err(),
+            "a normal response to a gone peer must REACH the (ACL-denied) roster, \
+             proving the divergence is the routing policy not an empty roster: {roster:?}",
+        );
+    }
+
+    /// AV-5 regression (retained): a normal RESPONSE whose resolved route
+    /// hint points at a node with no peer session must still fall back to
+    /// the subscriber roster rather than erroring out — on a genuinely
+    /// open (empty) roster that fan-out is a clean `Ok`, so the response
+    /// is never lost. The stronger reachability proof lives in
+    /// [`direct_only_frame_drops_while_normal_response_rosters_when_peer_gone`].
     #[tokio::test]
     async fn stale_route_hint_falls_back_to_the_roster() {
         let server = build_server().await;
@@ -4976,8 +5158,8 @@ mod roster_fallback_tests {
         let cid = ChannelId::new(reply.clone());
         let reply_hash = cid.hash();
         let reply_sid = MeshNode::publish_stream_id(&cid);
-        // A NodeId that was never connected: `has_peer_session` is
-        // false, so a direct publish would fail before transmission.
+        // A NodeId that was never connected: the atomic `try_publish_to_peer`
+        // reports NoSession, so nothing is sent and the roster path is taken.
         const STALE_NODE: u64 = 0xDEAD_BEEF_0000_0001;
         assert!(!server.has_peer_session(STALE_NODE));
         let result = publish_response_to_caller(
@@ -4988,6 +5170,7 @@ mod roster_fallback_tests {
             reply_hash,
             reply_sid,
             Bytes::from_static(b"resp"),
+            ResponseRouteFallback::RosterOnStaleDirect,
         )
         .await;
         assert!(
