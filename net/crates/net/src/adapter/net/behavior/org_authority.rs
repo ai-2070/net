@@ -46,7 +46,12 @@
 //! detects sidecar replacement occurring BETWEEN legitimate transactions and
 //! common operator/startup mistakes; it does not claim to protect against an
 //! actor concurrently mutating directory entries DURING a transaction.
-//! [`ensure_secure_authority_dir`] enforces the boundary at its edges: on Unix
+//! [`ensure_secure_authority_dir`] enforces the boundary at its edges. The
+//! supplied path is first normalized ONCE ([`normalize_authority_dir`]): a
+//! relative path is resolved against the current directory (a bare relative
+//! name has an empty parent, so its ancestor chain would otherwise go
+//! unchecked) and a trailing separator is stripped (so `symlink_metadata` on a
+//! final symlink reports the link, not its followed target). On Unix
 //! the resolved ancestor chain is checked (no group/other-writable, non-sticky
 //! parent through which another account could swap the directory's entry), a
 //! new authority directory is created no broader than 0700 (umask) and then
@@ -610,6 +615,17 @@ impl NodeAuthority {
         skew_secs: u64,
         owner_floors: Option<&OrgRevocationBundle>,
     ) -> Result<Self, OrgAuthorityError> {
+        // Gate-1: normalize the authority path ONCE, up front — resolve a
+        // relative path against the current directory and strip a trailing
+        // separator so a final symlink cannot be followed. EVERY path below
+        // (the security checks, the ceremony lock, and the authority files)
+        // derives from this single normalized form.
+        let dir_buf = normalize_authority_dir(dir).map_err(|e| OrgAuthorityError::Io {
+            path: dir.display().to_string(),
+            reason: format!("normalize authority directory: {e}"),
+        })?;
+        let dir: &Path = &dir_buf;
+
         let membership_path = dir.join(OWNER_MEMBERSHIP_FILE);
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
@@ -774,6 +790,14 @@ impl NodeAuthority {
     /// 0600 is insufficient, symlinks are refused, and there is no
     /// check-to-read window.
     pub fn open(dir: &Path, local_entity: &EntityId) -> Result<Self, OrgAuthorityError> {
+        // Gate-1: normalize ONCE (relative → cwd; strip a trailing separator so
+        // a final symlink is not followed) before reading any authority state.
+        let dir_buf = normalize_authority_dir(dir).map_err(|e| OrgAuthorityError::Io {
+            path: dir.display().to_string(),
+            reason: format!("normalize authority directory: {e}"),
+        })?;
+        let dir: &Path = &dir_buf;
+
         let membership_path = dir.join(OWNER_MEMBERSHIP_FILE);
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
@@ -1115,6 +1139,35 @@ fn create_missing_components_0700(dir: &Path) -> std::io::Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(component)?;
     }
     Ok(())
+}
+
+/// Normalize an authority directory path ONCE, before any validation, lock, or
+/// file I/O (Gate-1). Two path hazards are closed here, at a single choke point:
+///
+/// - A bare relative path (`authority`) has an EMPTY [`Path::parent`], so the
+///   ancestor-chain check would traverse nothing and provision beneath an
+///   unvalidated working directory; the path is resolved against the current
+///   directory captured once here.
+/// - A trailing separator makes a follow-symlink `stat` resolve a FINAL symlink
+///   to its target (`symlink_metadata("link/")` reports the target directory
+///   while `symlink_metadata("link")` reports the link itself), which would slip
+///   a final-symlink authority directory past the "not a directory" refusal and
+///   redirect authority I/O into the link target. Re-collecting
+///   [`Path::components`] strips trailing separators (and `.` / redundant
+///   separators) WITHOUT following any symlink or touching the filesystem,
+///   preserving the root prefix and the intended final component.
+///
+/// The returned path is the one EVERY subsequent step (prevalidation, creation,
+/// postvalidation, lock acquisition, file operations) must use.
+fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
+    let base = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    // `components()` yields no trailing-separator artifact and drops `CurDir`
+    // (`.`) components; collecting rebuilds a clean, symlink-preserving path.
+    Ok(base.components().collect())
 }
 
 /// Create or validate the authority directory as a trusted local security
@@ -1782,6 +1835,229 @@ mod tests {
                     );
                 }
             },
+        );
+    }
+
+    /// Gate-1 (Unix): a bare relative authority path is resolved against the
+    /// current directory and adopted when that directory (and its ancestors)
+    /// are secure. A bare relative name has an empty `parent()`, so this proves
+    /// normalization runs and the resolved ancestor chain is actually checked.
+    /// Isolated child: it mutates the process current directory.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_resolves_secure_relative_path_against_cwd() {
+        run_in_isolated_child(
+            "adapter::net::behavior::org_authority::tests::\
+             adopt_resolves_secure_relative_path_against_cwd",
+            || {
+                use std::os::unix::fs::PermissionsExt;
+                let scratch = Scratch::new();
+                // Secure cwd: owner-only, euid-owned; the temp root is trusted.
+                std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod 0700");
+                std::env::set_current_dir(scratch.dir()).expect("set cwd");
+                let kp = node_identity();
+                NodeAuthority::adopt(
+                    Path::new("authority"),
+                    cert_for(&kp, 1),
+                    kp.entity_id(),
+                    0,
+                    None,
+                )
+                .expect("a relative authority path under a secure cwd must adopt");
+                assert!(
+                    scratch
+                        .dir()
+                        .join("authority")
+                        .join(OWNER_MEMBERSHIP_FILE)
+                        .exists(),
+                    "the authority dir must be created under the resolved cwd",
+                );
+            },
+        );
+    }
+
+    /// Gate-1 (Unix): a bare relative authority path under a HOSTILE current
+    /// directory (group/other-writable without the sticky bit — another account
+    /// could rename the authority entry through it) is refused, and nothing is
+    /// provisioned. Isolated child: it mutates the process current directory.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_relative_path_under_writable_nonsticky_cwd() {
+        run_in_isolated_child(
+            "adapter::net::behavior::org_authority::tests::\
+             adopt_refuses_relative_path_under_writable_nonsticky_cwd",
+            || {
+                use std::os::unix::fs::PermissionsExt;
+                let scratch = Scratch::new();
+                std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o777))
+                    .expect("chmod 0777");
+                std::env::set_current_dir(scratch.dir()).expect("set cwd");
+                let kp = node_identity();
+                let err = NodeAuthority::adopt(
+                    Path::new("authority"),
+                    cert_for(&kp, 1),
+                    kp.entity_id(),
+                    0,
+                    None,
+                )
+                .expect_err("a relative path under a writable-nonsticky cwd must be refused");
+                assert!(
+                    matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+                    "got: {err}",
+                );
+                assert!(
+                    !scratch.dir().join("authority").exists(),
+                    "no authority dir may be created when the cwd chain is refused",
+                );
+            },
+        );
+    }
+
+    /// Gate-1 (Unix): a relative authority path whose resolved cwd sits BENEATH
+    /// a foreign-owned (non-root) ancestor is refused — that owner could replace
+    /// the directory entry through the ancestor. Requires root to create the
+    /// foreign-owned ancestor; a no-op otherwise. Isolated child: it mutates the
+    /// process current directory.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_relative_path_beneath_foreign_owned_ancestor() {
+        run_in_isolated_child(
+            "adapter::net::behavior::org_authority::tests::\
+             adopt_refuses_relative_path_beneath_foreign_owned_ancestor",
+            || {
+                use std::os::unix::ffi::OsStrExt;
+                use std::os::unix::fs::DirBuilderExt;
+                // SAFETY: geteuid() has no preconditions and cannot fail.
+                if unsafe { libc::geteuid() } != 0 {
+                    eprintln!("skipped: requires root to create a foreign-owned ancestor");
+                    return;
+                }
+                let scratch = Scratch::new(); // root-owned
+                let foreign = scratch.dir().join("foreign");
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(&foreign)
+                    .expect("mkdir foreign");
+                let cpath =
+                    std::ffi::CString::new(foreign.as_os_str().as_bytes()).expect("cstring");
+                // SAFETY: `cpath` is a valid NUL-terminated path; chown touches
+                // no Rust memory and its result is checked.
+                let rc = unsafe { libc::chown(cpath.as_ptr(), 12345, 12345) };
+                assert_eq!(rc, 0, "chown to a foreign uid must succeed as root");
+                let work = foreign.join("work");
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&work)
+                    .expect("mkdir work");
+                std::env::set_current_dir(&work).expect("set cwd");
+                let kp = node_identity();
+                let err = NodeAuthority::adopt(
+                    Path::new("authority"),
+                    cert_for(&kp, 1),
+                    kp.entity_id(),
+                    0,
+                    None,
+                )
+                .expect_err("a relative path beneath a foreign-owned ancestor must be refused");
+                assert!(
+                    matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+                    "got: {err}",
+                );
+            },
+        );
+    }
+
+    /// Gate-1 (Unix): a relative MISSING nested chain is created owner-only
+    /// (0700) under a secure cwd and re-validated — proving normalization feeds
+    /// the secure-creation path for relative inputs too. Isolated child: it
+    /// mutates the process current directory and umask.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_creates_relative_nested_missing_chain_owner_only() {
+        run_in_isolated_child(
+            "adapter::net::behavior::org_authority::tests::\
+             adopt_creates_relative_nested_missing_chain_owner_only",
+            || {
+                use std::os::unix::fs::PermissionsExt;
+                let scratch = Scratch::new();
+                std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod 0700");
+                std::env::set_current_dir(scratch.dir()).expect("set cwd");
+                // SAFETY: single-threaded child; the permissive mask proves the
+                // scaffold forces 0700 on every created relative component.
+                unsafe { libc::umask(0) };
+                let kp = node_identity();
+                NodeAuthority::adopt(
+                    Path::new("nested/authority"),
+                    cert_for(&kp, 1),
+                    kp.entity_id(),
+                    0,
+                    None,
+                )
+                .expect("a relative nested chain under a secure cwd must adopt");
+                for rel in ["nested", "nested/authority"] {
+                    let mode = std::fs::metadata(scratch.dir().join(rel))
+                        .expect("metadata")
+                        .permissions()
+                        .mode();
+                    assert_eq!(mode & 0o077, 0, "{rel} must be owner-only (mode {mode:o})");
+                }
+                assert!(scratch
+                    .dir()
+                    .join("nested/authority")
+                    .join(OWNER_MEMBERSHIP_FILE)
+                    .exists());
+            },
+        );
+    }
+
+    /// Gate-1 (Unix): a FINAL authority component that is a symlink is refused —
+    /// including with a TRAILING SEPARATOR. `symlink_metadata("link/")` follows
+    /// the link and reports its (attacker-chosen) target directory, which would
+    /// slip past the "not a directory" refusal and redirect authority I/O into
+    /// the target; `symlink_metadata("link")` reports the link. Normalization
+    /// strips the trailing separator so BOTH forms hit the refusal. Uses
+    /// absolute paths (no cwd change), so it needs no isolated child.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_refuses_final_symlink_even_with_trailing_separator() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        // Clean, owner-only ancestor so the ONLY possible refusal is the symlink.
+        std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let target = scratch.dir().join("target");
+        std::fs::create_dir(&target).expect("mkdir target");
+        let link = scratch.dir().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let kp = node_identity();
+
+        let bare = NodeAuthority::adopt(&link, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("a final-symlink authority dir must be refused");
+        assert!(
+            matches!(&bare, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {bare}",
+        );
+
+        let mut trailing = link.clone().into_os_string();
+        trailing.push("/");
+        let slashed = NodeAuthority::adopt(
+            Path::new(&trailing),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            None,
+        )
+        .expect_err("a final-symlink authority dir with a trailing '/' must be refused");
+        assert!(
+            matches!(&slashed, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {slashed}",
+        );
+
+        assert!(
+            !target.join(OWNER_MEMBERSHIP_FILE).exists(),
+            "refusing the symlink must not provision into its target",
         );
     }
 
