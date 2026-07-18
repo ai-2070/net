@@ -1226,6 +1226,25 @@ impl OrgRevocationStore {
             let lock = lock_state_file(path)?;
             let _guard = self.core.reload.lock();
 
+            // R3-3: the `.lock` sidecar just opened MUST be the SAME
+            // identity this live core was created on. If the sidecar was
+            // deleted and recreated (fresh inode) beneath a still-live
+            // handle — which the `nlink != 1` refusal does NOT catch, since
+            // the replacement has one link — this transaction would lock
+            // and publish through a DIFFERENT backing identity than its
+            // core's, operating outside its original lock / publication
+            // domain (a new opener is refused by `BackingIdentityConflict`,
+            // but the existing handle would sail on). Refuse loudly BEFORE
+            // any reread / merge / write, so disk and the live view are
+            // both untouched.
+            let opened_id = BackingId::of(&lock, path);
+            if opened_id != self.core.backing_id {
+                drop(lock);
+                return Err(OrgRevocationError::BackingIdentityConflict {
+                    path: path.display().to_string(),
+                });
+            }
+
             // 2. Interprocess critical section. A poisoned path
             //    must first prove its directory entry durable; the
             //    reread + publish below then republish the ground
@@ -2821,6 +2840,52 @@ mod tests {
             .expect("chmod back");
         let recovered = OrgRevocationStore::open_existing(&upper).expect("recovered via alias");
         assert!(!recovered.is_poisoned());
+    }
+
+    /// R3-3: an existing live handle's `apply_bundle` verifies the opened
+    /// `.lock` sidecar identity against its core's BEFORE reread/merge/
+    /// write. If the sidecar was replaced under the live handle (fresh
+    /// inode — which the `nlink` refusal does not catch), the transaction
+    /// is refused loudly with `BackingIdentityConflict` and neither the
+    /// live view nor the disk floors advance.
+    ///
+    /// Red-witness: dropping the `opened_id != core.backing_id` check lets
+    /// the existing handle lock and publish through the replaced sidecar,
+    /// so `apply_bundle` returns `Ok` and the floor advances to 9.
+    #[cfg(unix)]
+    #[test]
+    fn existing_handle_refuses_a_replaced_sidecar() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path).expect("init");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+
+        // Replace the `.lock` sidecar under the LIVE store: unlink it (the
+        // old inode persists via the store's open fd + advisory lock); the
+        // next lock open recreates it with a fresh inode.
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        std::fs::remove_file(PathBuf::from(lock_path)).expect("unlink sidecar");
+
+        let err = store
+            .apply_bundle(&bundle_with_floor(9))
+            .expect_err("existing handle must refuse a replaced sidecar");
+        assert!(
+            matches!(err, OrgRevocationError::BackingIdentityConflict { .. }),
+            "got: {err}"
+        );
+        // The live view never advanced past 5.
+        assert_eq!(store.floor_for(&org().org_id(), &member()), 5);
+
+        // Nor did the disk: a fresh handle (after the live core drops so
+        // its stale path binding is released) reads 5, never 9.
+        drop(store);
+        let reopened = OrgRevocationStore::open_existing(&path).expect("reopen after drop");
+        assert_eq!(
+            reopened.floor_for(&org().org_id(), &member()),
+            5,
+            "the refused transaction must not have written floor 9 to disk",
+        );
     }
 
     /// Review-9: raise callbacks run OUTSIDE both the file lock and
