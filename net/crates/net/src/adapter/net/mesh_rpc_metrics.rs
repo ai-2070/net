@@ -1025,6 +1025,26 @@ mod tests {
         );
     }
 
+    /// Gate-3: `packet_origin_mismatch_dropped_total` is bumped when a bridge
+    /// drops an inbound frame whose packet (transport) origin != the payload
+    /// (EventMeta) origin, and surfaces through the snapshot + Prometheus path
+    /// (atomic → snapshot field → Prometheus text), distinct from the relayed
+    /// flow-controlled counter.
+    #[test]
+    fn packet_origin_mismatch_dropped_counter_surfaces_through_snapshot_and_prometheus() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("upload");
+        m.packet_origin_mismatch_dropped_total
+            .fetch_add(5, Ordering::Relaxed);
+        let snap = r.snapshot();
+        assert_eq!(snap.services[0].packet_origin_mismatch_dropped_total, 5);
+        let txt = snap.prometheus_text();
+        assert!(
+            txt.contains("nrpc_packet_origin_mismatch_dropped_total{service=\"upload\"} 5"),
+            "prometheus output must surface the counter; got:\n{txt}",
+        );
+    }
+
     #[test]
     fn record_handler_duration_lands_in_buckets() {
         let r = RpcMetricsRegistry::new();
