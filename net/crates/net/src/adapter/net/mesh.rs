@@ -12546,8 +12546,13 @@ impl MeshNode {
     /// packet/payload origin mismatch, or a relayed caller). Returns `true` iff
     /// a matching dispatcher was found and invoked. The dispatcher snapshot +
     /// lock release mirror the production ingress path (mesh.rs ingress).
-    #[cfg(feature = "cortex")]
-    pub fn deliver_rpc_inbound_for_test(
+    ///
+    /// `#[cfg(test)]` + `pub(crate)`: this bypasses packet ingress (and could
+    /// inject the `from_node == 0` loopback-compat path), so it MUST NOT exist
+    /// in a non-test library build — a production build exposes no synthetic
+    /// inbound-delivery API.
+    #[cfg(all(test, feature = "cortex"))]
+    pub(crate) fn deliver_rpc_inbound_for_test(
         &self,
         channel_hash: ChannelHash,
         event: crate::adapter::net::cortex::RpcInboundEvent,
