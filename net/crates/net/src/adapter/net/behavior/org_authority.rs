@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::org::{OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
+use super::org::{current_timestamp, OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
 use super::org_revocation::{
     write_atomic, OrgRevocationError, OrgRevocationState, OrgRevocationStore,
 };
@@ -154,9 +154,28 @@ impl NodeAuthorityConfig {
         local_entity: &EntityId,
         floors: &OrgRevocationState,
     ) -> Result<(), OrgAuthorityError> {
+        self.self_verify_at(local_entity, floors, current_timestamp())
+    }
+
+    /// Explicit-time variant of [`Self::self_verify`] (AV-6 item 6):
+    /// the wall-clock validity is checked against the caller-supplied
+    /// `now_secs` rather than a fresh `current_timestamp()` read. The
+    /// admission path captures ONE [`ClockSample`] and threads its
+    /// `wall_secs()` through both the provider owner-cert check here
+    /// and the caller credential checks, so a wall-clock step between
+    /// the two can never open a window where the provider verifies
+    /// against a different instant than the caller.
+    ///
+    /// [`ClockSample`]: super::admission_clock::ClockSample
+    pub fn self_verify_at(
+        &self,
+        local_entity: &EntityId,
+        floors: &OrgRevocationState,
+        now_secs: u64,
+    ) -> Result<(), OrgAuthorityError> {
         self.verify_binding(local_entity)?;
         self.owner_cert
-            .is_valid_with_skew(self.verification_skew_secs)
+            .is_valid_at_with_skew(now_secs, self.verification_skew_secs)
             .map_err(OrgAuthorityError::CertInvalid)?;
         let floor = floors.floor_for(&self.owner_cert.org_id, &self.owner_cert.member);
         if self.owner_cert.generation < floor {

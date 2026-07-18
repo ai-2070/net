@@ -67,6 +67,15 @@ impl ClockSample {
         let remaining_ns = wall_deadline_ns.saturating_sub(self.wall_ns);
         self.monotonic + Duration::from_nanos(remaining_ns)
     }
+
+    /// This sample's wall clock in whole unix seconds — the single
+    /// ns→s conversion the second-granularity credential checks
+    /// (`is_valid_at_with_skew`, provider `self_verify_at`) share, so
+    /// caller AND provider verification read the SAME instant with no
+    /// hidden second wall read (AV-6 item 6).
+    pub fn wall_secs(&self) -> u64 {
+        self.wall_ns / 1_000_000_000
+    }
 }
 
 #[cfg(test)]

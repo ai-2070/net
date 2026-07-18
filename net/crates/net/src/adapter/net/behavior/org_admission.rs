@@ -372,7 +372,7 @@ pub fn verify_org_admission(
     //    never a freshly-sampled `current_timestamp()` — so a
     //    wall-clock jump mid-admission cannot make one check disagree
     //    with another or with the replay retention below.
-    let now_secs = clock.wall_ns / 1_000_000_000;
+    let now_secs = clock.wall_secs();
     proof
         .caller_membership
         .is_valid_at_with_skew(now_secs, ctx.skew_secs)

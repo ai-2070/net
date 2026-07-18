@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use super::behavior::admission_clock::ClockSample;
 use super::behavior::org::OrgId;
 use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
 use super::behavior::org_authority::NodeAuthority;
@@ -190,7 +191,10 @@ pub struct ProviderFacts {
 /// and the handler stays dark. On success returns the four provider
 /// facts the admission engine needs plus the security stamp matching
 /// the captured floors.
-pub fn verify_provider_authority(mesh: &MeshNode) -> Result<ProviderFacts, AdmissionDenied> {
+pub fn verify_provider_authority(
+    mesh: &MeshNode,
+    clock: &ClockSample,
+) -> Result<ProviderFacts, AdmissionDenied> {
     let authority = mesh
         .node_authority()
         .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
@@ -205,11 +209,15 @@ pub fn verify_provider_authority(mesh: &MeshNode) -> Result<ProviderFacts, Admis
     // generation cannot lag an in-progress floor swap.
     let (floors, store_generation) = store.snapshot_with_generation();
     let provider = mesh.entity_id().clone();
-    // Live self-verify: an expired / below-floor / foreign-bound
-    // owner cert fails here even though it verified at registration.
+    // Live self-verify against the ONE admission ClockSample (AV-6
+    // item 6): an expired / below-floor / foreign-bound owner cert
+    // fails here even though it verified at registration, and it reads
+    // the SAME instant the caller-credential checks will, so no
+    // wall-clock step can open a window between provider and caller
+    // verification.
     authority
         .config
-        .self_verify(&provider, &floors)
+        .self_verify_at(&provider, &floors, clock.wall_secs())
         .map_err(|_| AdmissionDenied::ProviderAuthorityUnavailable)?;
     // A poison could have raced in after the check above; deny rather
     // than admit against a durability-uncertain store.

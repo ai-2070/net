@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use net::adapter::net::behavior::admission_clock::ClockSample;
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_admission::AdmissionDenied;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
@@ -76,7 +77,8 @@ async fn verify_provider_authority_returns_facts_for_a_healthy_provider() {
     let node = build_node().await;
     let dir = adopt_and_install(&node, "healthy").await;
 
-    let facts = verify_provider_authority(&node).expect("healthy provider admits");
+    let facts =
+        verify_provider_authority(&node, &ClockSample::now()).expect("healthy provider admits");
     assert_eq!(facts.provider, *node.entity_id());
     assert_eq!(facts.provider_owner_org, org().org_id());
     assert_ne!(facts.stamp.authority_ptr, 0, "authority installed");
@@ -108,7 +110,7 @@ async fn provider_facts_pins_the_authority_and_store_arcs() {
     let auth_before = Arc::strong_count(&authority);
     let store_before = Arc::strong_count(&store);
 
-    let facts = verify_provider_authority(&node).expect("healthy");
+    let facts = verify_provider_authority(&node, &ClockSample::now()).expect("healthy");
     assert!(
         Arc::strong_count(&authority) > auth_before,
         "facts must pin the authority Arc",
@@ -143,7 +145,7 @@ async fn authority_dark_node_cannot_admit() {
     assert!(node.node_authority().is_none());
 
     assert_eq!(
-        verify_provider_authority(&node).map(|_| ()),
+        verify_provider_authority(&node, &ClockSample::now()).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
     );
 
@@ -185,7 +187,7 @@ async fn provider_below_its_own_floor_cannot_admit() {
     let node = build_node().await;
     let dir = adopt_and_install(&node, "below-floor").await;
     // Healthy first.
-    assert!(verify_provider_authority(&node).is_ok());
+    assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
     // Raise the floor for THIS node's membership (cert generation 1)
     // to 5 via a real bundle apply on the installed store.
@@ -197,7 +199,7 @@ async fn provider_below_its_own_floor_cannot_admit() {
         .expect("apply floor");
 
     assert_eq!(
-        verify_provider_authority(&node).map(|_| ()),
+        verify_provider_authority(&node, &ClockSample::now()).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "a below-floor owner cert cannot admit",
     );
@@ -220,14 +222,14 @@ async fn provider_with_expired_cert_cannot_admit() {
     node.install_node_authority(Arc::new(authority))
         .expect("install");
     // Valid immediately after install.
-    assert!(verify_provider_authority(&node).is_ok());
+    assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
     // Let the window close (> 2s so the second-granularity not_after
     // is definitely reached).
     tokio::time::sleep(Duration::from_millis(2_500)).await;
 
     assert_eq!(
-        verify_provider_authority(&node).map(|_| ()),
+        verify_provider_authority(&node, &ClockSample::now()).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "an expired owner cert cannot admit",
     );
@@ -240,14 +242,14 @@ async fn provider_with_expired_cert_cannot_admit() {
 async fn provider_with_poisoned_store_cannot_admit() {
     let node = build_node().await;
     let dir = adopt_and_install(&node, "poisoned").await;
-    assert!(verify_provider_authority(&node).is_ok());
+    assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
     node.org_revocation_store()
         .expect("store")
         .mark_poisoned_for_test();
 
     assert_eq!(
-        verify_provider_authority(&node).map(|_| ()),
+        verify_provider_authority(&node, &ClockSample::now()).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "a poisoned store cannot admit",
     );
@@ -265,7 +267,7 @@ async fn stamp_notices_a_floor_raise() {
     let node = build_node().await;
     let dir = adopt_and_install(&node, "floor").await;
 
-    let facts = verify_provider_authority(&node).expect("healthy");
+    let facts = verify_provider_authority(&node, &ClockSample::now()).expect("healthy");
     let before = facts.stamp;
 
     // Raise a floor on the installed store (a real bundle apply).
@@ -285,6 +287,49 @@ async fn stamp_notices_a_floor_raise() {
     assert!(
         after.store_generation > before.store_generation,
         "the store generation advanced",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AV-6 item 6: `verify_provider_authority` checks the provider's OWN
+/// owner cert against the SUPPLIED `ClockSample`, never a fresh
+/// `current_timestamp()` read. A sample far outside the cert's validity
+/// window is refused even though `ClockSample::now()` admits — proving
+/// the single admission clock is threaded into provider verification,
+/// so it can't diverge from the caller-credential checks that read the
+/// same sample. (Neuter: revert `self_verify_at(clock.wall_secs())` to
+/// `self_verify` and the far-future sample is ignored → admits → red.)
+#[tokio::test]
+async fn provider_self_verify_reads_the_supplied_clock_sample() {
+    let node = build_node().await;
+    let dir = adopt_and_install(&node, "clock-thread").await;
+
+    // The real clock admits (cert is fresh, valid ~3600s).
+    assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
+
+    let now_ns = ClockSample::now().wall_ns;
+    const HUGE_NS: u64 = 100_000 * 1_000_000_000; // ~100_000 s
+
+    // A sample far in the FUTURE (past not_after, skew 0) → refused.
+    let far_future = ClockSample {
+        wall_ns: now_ns.saturating_add(HUGE_NS),
+        monotonic: std::time::Instant::now(),
+    };
+    assert_eq!(
+        verify_provider_authority(&node, &far_future).map(|_| ()),
+        Err(AdmissionDenied::ProviderAuthorityUnavailable),
+        "provider verification must read the supplied clock, not a fresh wall read",
+    );
+
+    // A sample far in the PAST (before not_before) → likewise refused.
+    let far_past = ClockSample {
+        wall_ns: now_ns.saturating_sub(HUGE_NS),
+        monotonic: std::time::Instant::now(),
+    };
+    assert_eq!(
+        verify_provider_authority(&node, &far_past).map(|_| ()),
+        Err(AdmissionDenied::ProviderAuthorityUnavailable),
     );
 
     let _ = std::fs::remove_dir_all(&dir);
