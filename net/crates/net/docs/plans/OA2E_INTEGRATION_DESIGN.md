@@ -1,20 +1,57 @@
-# OA2-E Live Integration — Design v2 (PROPOSAL, not authorized)
+# OA2-E Live Integration — Design v3
 
-**Status:** DESIGN ONLY. No code, no behavior change. Revised per the
-OA2-E design verdict (CHANGES REQUESTED) + independent-review addendum,
-then v3 per the v2 acceptance corrections.
+**Status (2026-07-18):** the design of record. E0 substrate + E1
+provider-admission PRIMITIVES are IMPLEMENTED (E1 primitives unwired); the
+E1 **live wiring** (`#47`) remains HELD pending two review gates.
+
+The design body below is unchanged as the specification; see the
+**Progress ledger** for what has landed and the live gate state.
 
 **Authorization is SPLIT — E0 is OA-2-neutral, so it does not inherit
 the OA-1 gate:**
 
-- **OA2-E0** (nRPC substrate hardening) — authorized once this revised
-  design is accepted, ONE amendment resolved (the E0.2 control-frame
-  discriminator, §E0.2). It may proceed INDEPENDENTLY: it enables no
-  organization authority and therefore does not wait on OA-1.
-- **OA2-E1 / OA2-E2** (provider admission + caller/wire) — HOLD until
-  ALL of: (1) OA-1 review-11 independently signed off; (2) OA2-A–E-
-  partial primitives audited as unwired; (3) OA2-E0 landed and
-  reviewed.
+- **OA2-E0** (nRPC substrate hardening) — LANDED and independently
+  signed off (E0.1/E0.2/E0.3/E0.4). It enabled no organization authority
+  and did not wait on OA-1.
+- **OA2-E1 / OA2-E2** (provider admission + caller/wire) — the primitives
+  are landed UNWIRED; the live wiring (`#47`) is HELD until BOTH Gate 1
+  (OA-1 revocation store) and Gate 3 (E0/nRPC) are re-signed (see ledger).
+
+## Progress ledger (2026-07-18, branch `org-capability-auth`)
+
+`may_execute` (`capability_bridge.rs`) is **byte-for-byte unchanged**
+across the entire series; every fix carries a red-witnessed test.
+
+**Landed:**
+
+- **E0 substrate** — E0.1 non-destructive registration + generation
+  tokens; E0.2 channel/service equality + canonical-`u64` RpcRouteV1
+  discriminator on every nRPC frame; E0.3 direct-session caller identity;
+  E0.4 one wall+monotonic `ClockSample`. Plus E0-Fix1 captured-service
+  equality, Fix2 token-owned service retirement, Fix3 seven-frame
+  collision witness.
+- **E1 primitives (UNWIRED)** — E1.1/E1.3 `RegisteredRpcService` +
+  `verify_provider_authority`/`ProviderFacts`; E1.4 admission stamp +
+  §9.5 stability hook; E1.5 per-caller replay ceiling; E1.7 shared
+  canonical request digest (`org_admission_gate.rs`). Provider-local
+  admission engine `verify_org_admission` (`org_admission.rs`) present,
+  unwired. Nothing calls into a live serve path.
+- **Closure series** (all review-driven, red-witnessed, per-item commits):
+  KC1–KC10, NC1–NC5, the AV series (8 commits), R2-1..R2-7 (5 commits),
+  R3-1..R3-4 (4 commits, `e6b7925a5..fda5e2ed0`).
+
+**Gate ledger:**
+
+| Gate | Scope | State |
+|---|---|---|
+| Gate 2 | E1 primitives audit | **SIGNED OFF** (Kyra) |
+| Gate 1 | OA-1 revocation store | CHANGES REQUESTED → closures R3-2/3/4 landed, **awaiting re-review** |
+| Gate 3 | E0 / nRPC substrate | CHANGES REQUESTED → closure R3-1 landed, **awaiting re-review** |
+| `#47` | E1 **live wiring** (serve_rpc_protected, live gate, `RpcContext.org_admission`, `RpcStatus 0x0009`) | **FORBIDDEN** until Gate 1 + Gate 3 re-signed |
+
+**Not started:** the atomic `#47` live-wiring unit (E1.2 gate, E1.6
+`Admitted`+header-strip, E1.8 unary boundary), OA2-E2 (caller/wire),
+OA-3 (visibility), OA2-F (CLI/SDK + §2.6 gate).
 
 ## The core problem (why this is not one mechanical commit)
 
@@ -433,34 +470,48 @@ credential oracle.
 
 **OA2-E0 gate (independent — OA-2-neutral):**
 
-- [ ] This revised design accepted.
-- [ ] The E0.2 control-frame discriminator wire shape chosen (A canonical
-      channel identity / B per-call token) at E0 review.
-- [ ] → E0 AUTHORIZED to proceed (does not wait on OA-1).
+- [x] This revised design accepted.
+- [x] The E0.2 control-frame discriminator wire shape chosen — A,
+      canonical `u64` channel identity (RpcRouteV1), ratified at E0 review.
+- [x] → E0 AUTHORIZED to proceed (does not wait on OA-1).
 
 **OA2-E0 work (nRPC hardening, enables no org authority):**
 
-- [ ] Non-destructive vacant-only registration + generation tokens +
+- [x] Non-destructive vacant-only registration + generation tokens +
       conditional teardown (E0.1).
-- [ ] Channel/service equality on REQUEST + the chosen control-frame
-      discriminator + registration-bound call state (E0.2).
-- [ ] Direct-session caller-identity binding; relayed protected denied
+- [x] Channel/service equality on REQUEST + the chosen control-frame
+      discriminator + registration-bound call state (E0.2). Call/control
+      state re-bound to the authenticated `from_node` (AV-1).
+- [x] Direct-session caller-identity binding; relayed protected denied
       (E0.3).
-- [ ] Single wall+monotonic clock-sample helper (E0.4).
-- [ ] Witnesses 1–9; gates (fmt, both clippy, full suites).
+- [x] Single wall+monotonic clock-sample helper (E0.4).
+- [x] Witnesses 1–9; gates (fmt, both clippy, full suites). Plus the
+      E0-Fix1/2/3 closures and the R3-1 session-scoped REQUEST_GRANT
+      closure.
+- [ ] Gate 3 (E0/nRPC) RE-SIGNED after R3-1 — **awaiting Kyra**.
 
 **OA2-E1 / E2 gate (behind the org-authority gates):**
 
-- [ ] Gate 1: OA-1 review-11 signed off.
-- [ ] Gate 2: OA2-A–E-partial primitives audited.
-- [ ] Gate 3: OA2-E0 landed and reviewed.
+- [ ] Gate 1: OA-1 revocation store re-signed — closures R3-2/3/4 landed,
+      **awaiting Kyra**.
+- [x] Gate 2: OA2-A–E-partial primitives audited — **SIGNED OFF**.
+- [ ] Gate 3: OA2-E0 landed and reviewed — R3-1 landed, **awaiting Kyra**.
 
-**OA2-E1 / E2 work (authorized only after the gate above):**
+**OA2-E1 primitives (landed UNWIRED):**
 
-- [ ] OA2-E1: registration-owned policy; live self-verify; admission
-      stamp + §9.5 ordering; per-caller replay; policy + `Admitted`
-      wiring + header strip; shared canonical digest; unary boundary;
-      witnesses 10–25 (incl. the exhaustive enum→0x0009 test).
+- [x] Registration-owned policy (`RegisteredRpcService`, E1.1); live
+      self-verify (`verify_provider_authority`/`ProviderFacts`, E1.3);
+      admission stamp + §9.5 ordering (E1.4); per-caller replay (E1.5);
+      shared canonical digest (E1.7). All red-witnessed, `may_execute`
+      untouched.
+
+**OA2-E1 live wiring + E2 (the atomic `#47` unit — FORBIDDEN until Gate 1
++ Gate 3 re-signed):**
+
+- [ ] OA2-E1 wiring: the E1.2 gate in the unary serve bridge; `Admitted`
+      into `RpcContext` + proof-header strip (E1.6); unary-only boundary
+      rejection (E1.8); witnesses 10–25 (incl. the exhaustive
+      enum→`0x0009` test).
 - [ ] OA2-E2: proof-intent builder; `RpcStatus 0x0009` + coarse
       reasons; mixed-version fleet gate; witnesses 26–28.
 - [ ] Gates: `may_execute` byte-identity, fmt, both clippy, full lib +

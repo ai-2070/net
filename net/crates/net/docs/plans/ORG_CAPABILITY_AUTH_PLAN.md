@@ -10,10 +10,31 @@ witness matrix (§OA-4), and three OA-3 carry-forwards: the zero
 grant_id is reserved (grant issuance/decode rejects it), envelope
 dedup identity includes `grant_id`, and secret-bearing runtime
 types are structurally non-serializable.
-**Status:** **OA-1 implementation AUTHORIZED (review-7); proceed
-with OA-1 only, then stop at its review gate.** OA-2 held on the
-§2.4a correction (now applied in this document, pending its staged
-review); OA-3/OA-4 held behind their staged reviews.
+**Status (2026-07-18, branch `org-capability-auth`):**
+
+- **OA-1** — IMPLEMENTED and iterated through reviews 8–11 plus the
+  amended/consolidated closure rounds (revocation store, adopt ceremony,
+  fold projection, MeshNode install lifecycle, send seqlock). OA-1's
+  revocation-store hardening is Gate 1 of the OA-2 admission gates; its
+  latest closures (R3-2 poison survives sidecar recreation, R3-3
+  existing-handle sidecar-identity check, R3-4 externally-owned
+  subscription + safe self-unsubscription) are landed and **awaiting the
+  Gate-1 re-sign**.
+- **OA-2** — the substrate and primitives exist, review-gated. The nRPC
+  **E0 substrate** (registration, channel/service equality, RpcRouteV1
+  discriminator, direct-session identity, one clock sample) is landed
+  (Gate 3); the **E1 provider-admission primitives** (`RegisteredRpcService`,
+  `verify_org_admission`, replay guard, canonical digest, admission stamp)
+  are landed **UNWIRED** — Gate 2 SIGNED OFF. The atomic **E1 live wiring**
+  (`serve_rpc_protected`, the live gate, `RpcContext.org_admission`,
+  `RpcStatus 0x0009` — internally `#47`) is FORBIDDEN until BOTH Gate 1
+  (OA-1 store) and Gate 3 (E0/nRPC) are re-signed. See
+  `docs/plans/OA2E_INTEGRATION_DESIGN.md` for the E0/E1/E2 decomposition
+  and the live gate ledger.
+- **OA-3 / OA-4** — held behind their staged reviews.
+
+`may_execute` (`capability_bridge.rs`) is byte-for-byte unchanged across
+the whole OA-2 series; every fix is red-witnessed.
 
 **Scope — the compact core:**
 
@@ -205,6 +226,16 @@ corrupt bundle → last-good retained. Stop. Review.
 ---
 
 ## OA-2 — internal and cross-org admission (stop and review)
+
+> **Implementation note (2026-07-18):** §§2.1–2.5 are implemented as
+> self-contained, UNWIRED modules — `behavior/org_grant.rs` (§2.1–2.2),
+> `behavior/org_call.rs` (§2.3), `behavior/org_admission_replay.rs` (§2.5),
+> `behavior/org_admission.rs` (§2.4 `verify_org_admission`), and
+> `adapter/net/org_admission_gate.rs` (E1 provider self-verify + canonical
+> digest + admission stamp). Nothing calls them from a live serve path.
+> Their audit is **Gate 2 — SIGNED OFF**. The §2.4a registration/gate seam
+> is designed but its live wiring is the HELD `#47` unit (see the top-of-
+> file status and `OA2E_INTEGRATION_DESIGN.md`). §2.6 is not yet exercised.
 
 ### 2.1 `CapabilityAuthorityId` — as v1.1
 
