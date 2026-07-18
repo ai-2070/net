@@ -1357,6 +1357,41 @@ mod tests {
         }
     }
 
+    /// Run `body` in an ISOLATED child process so process-global state it
+    /// mutates — the `umask` and the current directory — cannot contaminate the
+    /// parallel unit-test suite. A shared in-process mutex would not suffice:
+    /// it would only serialize tests that opt into it, while EVERY file-touching
+    /// test in this binary observes the leaked mask / cwd. The parent re-execs
+    /// THIS test binary filtered to exactly `test_path` with `ISOLATED_CHILD_ENV`
+    /// set; the child (env present) runs `body` in its own process and reports
+    /// pass/fail through its exit status (libtest exits non-zero if `body`
+    /// panics). `test_path` MUST be the fully-qualified name of the calling
+    /// `#[test]` so the child re-enters it. In the child this returns after
+    /// `body`; in the parent it asserts the child exited 0, surfacing the
+    /// child's captured stdout/stderr on failure.
+    #[cfg(unix)]
+    fn run_in_isolated_child(test_path: &str, body: impl FnOnce()) {
+        const ISOLATED_CHILD_ENV: &str = "NET_AUTHORITY_ISOLATED_CHILD";
+        if std::env::var_os(ISOLATED_CHILD_ENV).is_some() {
+            body();
+            return;
+        }
+        let exe = std::env::current_exe().expect("locate the running test binary");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--nocapture", "--test-threads=1", test_path])
+            .env(ISOLATED_CHILD_ENV, "1")
+            .output()
+            .expect("spawn isolated child test process");
+        assert!(
+            out.status.success(),
+            "isolated child `{test_path}` failed (exit {:?})\n\
+             --- child stdout ---\n{}\n--- child stderr ---\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
     fn org() -> OrgKeypair {
         OrgKeypair::from_bytes([0x42u8; 32])
     }
@@ -1710,34 +1745,44 @@ mod tests {
     /// intermediate parent owner-only (0700), even under a permissive umask —
     /// a naive create_dir_all would leave 0777 intermediates through which
     /// another account could later replace the final directory.
+    ///
+    /// Runs in an ISOLATED child process: `umask` is process-global, so setting
+    /// it in the shared parallel test process contaminated every concurrently
+    /// running file-creating test (observed as spurious 022-mode failures). The
+    /// child sets the permissive mask, never restores it, and exits.
     #[cfg(unix)]
     #[test]
     fn adopt_creates_intermediate_parents_owner_only_under_permissive_umask() {
-        use std::os::unix::fs::PermissionsExt;
-        let scratch = Scratch::new();
-        // Permissive umask for the create window; restored immediately after.
-        let saved = unsafe { libc::umask(0) };
-        let a = scratch.dir().join("a");
-        let b = a.join("b");
-        let authority = b.join("authority");
-        let kp = node_identity();
-        let res = NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None);
-        unsafe {
-            libc::umask(saved);
-        }
-        res.expect("adopt creates a nested chain securely");
-        for comp in [&a, &b, &authority] {
-            let mode = std::fs::metadata(comp)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(
-                mode & 0o077,
-                0,
-                "{} must be owner-only (mode {mode:o})",
-                comp.display()
-            );
-        }
+        run_in_isolated_child(
+            "adapter::net::behavior::org_authority::tests::\
+             adopt_creates_intermediate_parents_owner_only_under_permissive_umask",
+            || {
+                use std::os::unix::fs::PermissionsExt;
+                let scratch = Scratch::new();
+                // SAFETY: `umask` has no preconditions and only affects THIS
+                // (single-threaded) child process; it is deliberately never
+                // restored because the child exits right after the assertions.
+                unsafe { libc::umask(0) };
+                let a = scratch.dir().join("a");
+                let b = a.join("b");
+                let authority = b.join("authority");
+                let kp = node_identity();
+                NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None)
+                    .expect("adopt creates a nested chain securely");
+                for comp in [&a, &b, &authority] {
+                    let mode = std::fs::metadata(comp)
+                        .expect("metadata")
+                        .permissions()
+                        .mode();
+                    assert_eq!(
+                        mode & 0o077,
+                        0,
+                        "{} must be owner-only (mode {mode:o})",
+                        comp.display()
+                    );
+                }
+            },
+        );
     }
 
     /// Gate-1 (Windows): a freshly-created authority directory gets an
