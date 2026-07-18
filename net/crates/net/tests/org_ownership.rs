@@ -1842,9 +1842,12 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
     let node = build_node().await;
     let dir = scratch_dir("r11-expiry");
 
-    // A 1-second membership cert, adopted with zero skew.
+    // AV-11: a GENEROUS validity window (not a 1-second one that could
+    // expire before adopt under parallel suite load), adopted with zero
+    // skew. The "while valid" phase is then deterministic, and expiry is
+    // driven by an explicit-time seam below rather than a real sleep.
     let cert =
-        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 1).expect("issue 1s");
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
     let authority =
         Arc::new(NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt"));
     node.install_node_authority(authority).expect("install");
@@ -1853,7 +1856,8 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
         .await
         .expect("announce");
 
-    // While valid: the cached bytes carry the certificate.
+    // While valid (real wall clock, well inside the 3600s window): the
+    // cached bytes carry the certificate.
     let certified = CapabilityAnnouncement::from_bytes(
         &node.announcement_bytes_for_send_for_test().expect("cached"),
     )
@@ -1861,12 +1865,18 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
     assert!(certified.owner_cert.is_some());
     assert!(certified.verify().is_ok());
 
-    // Wait past the validity window with NO further authority
-    // event (no floor raise, no reinstall, no emission toggle).
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-
+    // Evaluate the SAME cached announcement at an EXPLICIT wall time
+    // past the cert's window — no sleep, no race (AV-11). With NO
+    // authority event (expiry bumps no generation, so the epoch fast
+    // path would keep the certified form), the seqlock re-derives
+    // cert-free and version-bumps.
+    let far_future_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs()
+        + 4000;
     let bytes = node
-        .announcement_bytes_for_send_for_test()
+        .announcement_bytes_for_send_at_for_test(far_future_secs)
         .expect("post-expiry bytes");
     let sent = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
     assert!(

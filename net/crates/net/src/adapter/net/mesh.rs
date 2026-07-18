@@ -7234,6 +7234,18 @@ impl MeshNode {
     /// The certificate self-announcements attach right now: the
     /// installed authority's owner cert iff emission is enabled.
     fn owner_cert_for_emission(&self) -> Option<super::behavior::org::OrgMembershipCert> {
+        self.owner_cert_for_emission_at(super::behavior::org::current_timestamp())
+    }
+
+    /// Explicit-time variant of [`Self::owner_cert_for_emission`]
+    /// (AV-11): evaluates the owner cert's temporal validity against
+    /// `now_secs` rather than a fresh wall read, so the send seqlock —
+    /// and the deterministic expiry tests that drive it — can decide
+    /// expiry at a chosen instant with no real sleep.
+    fn owner_cert_for_emission_at(
+        &self,
+        now_secs: u64,
+    ) -> Option<super::behavior::org::OrgMembershipCert> {
         if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
             return None;
         }
@@ -7244,7 +7256,9 @@ impl MeshNode {
         // authority state — an expired window or a floor raised
         // above the cert's own generation (self-revocation) goes
         // loudly dark instead of continuing to claim belonging.
-        if let Err(e) = cert.is_valid_with_skew(authority.config.verification_skew_secs) {
+        if let Err(e) =
+            cert.is_valid_at_with_skew(now_secs, authority.config.verification_skew_secs)
+        {
             tracing::warn!(
                 org = %cert.org_id,
                 error = %e,
@@ -7328,7 +7342,7 @@ impl MeshNode {
     /// converge — skipping one send is fail-safe (never a stale
     /// cert).
     fn announcement_bytes_for_send(&self) -> Option<Vec<u8>> {
-        self.announcement_bytes_for_send_probed(None)
+        self.announcement_bytes_for_send_probed(None, super::behavior::org::current_timestamp())
     }
 
     /// Seqlock body of [`Self::announcement_bytes_for_send`].
@@ -7339,7 +7353,11 @@ impl MeshNode {
     /// catches it and the stale bytes are discarded rather than
     /// emitted. The closure fires every iteration; a one-shot test
     /// closure makes the loop converge.
-    fn announcement_bytes_for_send_probed(&self, probe: Option<&dyn Fn()>) -> Option<Vec<u8>> {
+    fn announcement_bytes_for_send_probed(
+        &self,
+        probe: Option<&dyn Fn()>,
+        now_secs: u64,
+    ) -> Option<Vec<u8>> {
         for _ in 0..16 {
             let cached = self.local_announcement.load_full()?;
             // Capture the stamp AND PIN the authority/store Arcs it
@@ -7354,7 +7372,7 @@ impl MeshNode {
             // generation) is caught here even with a stable stamp
             // (review-11 P1 — certificate expiry honored on every
             // reuse boundary).
-            let desired = self.owner_cert_for_emission();
+            let desired = self.owner_cert_for_emission_at(now_secs);
             if desired == cached.owner_cert {
                 let bytes = cached.to_bytes();
                 if let Some(probe) = probe {
@@ -7393,6 +7411,15 @@ impl MeshNode {
         self.announcement_bytes_for_send()
     }
 
+    /// Deterministic-witness seam (AV-11): run the send seqlock while
+    /// evaluating owner-cert temporal validity at an EXPLICIT wall time
+    /// `now_secs`, so an expiry test can drive the cert past its window
+    /// without a real sleep or a race against a deliberately-short one.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_at_for_test(&self, now_secs: u64) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send_probed(None, now_secs)
+    }
+
     /// Deterministic-witness seam: run the send seqlock with a probe
     /// fired inside the stability window (see
     /// [`Self::announcement_bytes_for_send_probed`]). Test-only.
@@ -7401,7 +7428,10 @@ impl MeshNode {
         &self,
         probe: &(dyn Fn() + Sync),
     ) -> Option<Vec<u8>> {
-        self.announcement_bytes_for_send_probed(Some(probe))
+        self.announcement_bytes_for_send_probed(
+            Some(probe),
+            super::behavior::org::current_timestamp(),
+        )
     }
 
     /// Rebuild the cached announcement so its owner certificate
