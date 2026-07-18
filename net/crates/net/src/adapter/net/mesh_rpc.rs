@@ -423,6 +423,78 @@ fn is_cross_service_request(frame: &[u8], expected: &str) -> bool {
     }
 }
 
+/// OA2-E1 (Kyra E1 audit) — cache the direct-send response
+/// destination for a call ONLY when it is trustworthy.
+///
+/// The origin→node cache is an optimization the response emit closure
+/// consults to skip the subscriber-roster fan-out. Populating it from
+/// EVERY inbound frame BEFORE the equality/capability gate let a
+/// forged frame poison it: an attacker whose frame claims a victim's
+/// `origin_hash` (but arrives on the attacker's own session) could
+/// overwrite `victim_origin → attacker_node` and redirect the
+/// victim's in-flight response. This closes that:
+///
+/// - only the initial `DISPATCH_RPC_REQUEST` establishes routing
+///   (CANCEL / CHUNK / GRANT never rewrite it);
+/// - the wire-claimed `origin_hash` is cached ONLY when it equals the
+///   AEAD-authenticated last-hop peer's OWN origin (`from_node`'s
+///   TOFU-pinned entity) — a forged or relayed origin is refused, so
+///   the cache only ever maps a real caller to its own node;
+/// - callers reach this ONLY on the accept path (after the
+///   service-equality check and the capability/admission gate), so a
+///   denied frame never mutates routing.
+///
+/// An unauthenticated / loopback / relayed call simply is not cached;
+/// the response falls back to the signed subscriber roster, preserving
+/// public behavior without the direct-send shortcut.
+fn cache_authenticated_response_destination(
+    mesh: &MeshNode,
+    cache: &RpcOriginNodeCache,
+    inbound: &RpcInboundEvent,
+) {
+    let dispatch = if inbound.payload.len() >= EVENT_META_SIZE {
+        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE]).map(|m| m.dispatch)
+    } else {
+        None
+    };
+    // Direct-session binding (E0.3): the wire-claimed `origin_hash` is
+    // trusted only when it matches the AEAD-authenticated `from_node`
+    // peer's OWN origin. A malicious node that stamps a victim's origin
+    // on the wire header is refused here.
+    let authenticated_peer_origin = mesh
+        .peer_entity_id(inbound.from_node)
+        .map(|e| e.origin_hash());
+    if response_route_is_trustworthy(
+        inbound.from_node,
+        dispatch,
+        inbound.origin_hash,
+        authenticated_peer_origin,
+    ) {
+        cache.insert(inbound.origin_hash, inbound.from_node);
+    }
+}
+
+/// The pure decision behind [`cache_authenticated_response_destination`]
+/// (Kyra E1 audit) — factored out so it is deterministically testable
+/// without a live session. A response destination is trustworthy iff:
+///
+/// - `from_node` is a real session (never the `0` loopback sentinel);
+/// - the frame is an initial `DISPATCH_RPC_REQUEST` (control frames
+///   carry no new routing and must not rewrite it);
+/// - the wire-claimed `claimed_origin` equals the AEAD-authenticated
+///   peer's OWN origin (`authenticated_peer_origin`) — a forged or
+///   relayed origin, or an unpinned peer (`None`), is refused.
+fn response_route_is_trustworthy(
+    from_node: u64,
+    dispatch: Option<u8>,
+    claimed_origin: u64,
+    authenticated_peer_origin: Option<u64>,
+) -> bool {
+    from_node != 0
+        && dispatch == Some(DISPATCH_RPC_REQUEST)
+        && authenticated_peer_origin == Some(claimed_origin)
+}
+
 /// A response ready to publish, handed from a (synchronous) `serve_rpc`
 /// emit closure to the per-service response drainer task. Replaces the
 /// pre-§8a `tokio::spawn`-per-response: the emit closure builds the wire
@@ -2204,17 +2276,6 @@ impl MeshNode {
             let tag = format!("nrpc:{}", service_for_bridge);
             use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
-                // T1.2 cache populate. `from_node` is the
-                // AEAD-verified session peer; `origin_hash` is the
-                // wire-claimed entity (untrusted on its own but
-                // bound here to a session peer we just authed).
-                // `from_node == 0` is the loopback/test sentinel —
-                // skip the insert so the response path falls back
-                // to the roster lookup instead of trying to send to
-                // node 0.
-                if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
-                }
                 // OA2-E0.2 P0: captured-service equality. An initial
                 // REQUEST routed to THIS dispatcher whose payload
                 // names a different service is a cross-service
@@ -2222,6 +2283,13 @@ impl MeshNode {
                 // gate or any fold/handler state. Control frames
                 // inherit the route-selected active call and are not
                 // re-checked (see `is_cross_service_request`).
+                //
+                // KC7 (Kyra E1 audit): the origin→node response-route
+                // cache is populated LATER — after this equality check
+                // AND the capability gate, and only for an
+                // authenticated origin — so a denied/mismatched/forged
+                // frame can never poison a legitimate call's response
+                // routing (see `cache_authenticated_response_destination`).
                 if is_cross_service_request(&inbound.payload, &service_for_bridge) {
                     continue;
                 }
@@ -2284,6 +2352,14 @@ impl MeshNode {
                     (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp);
                     continue;
                 }
+                // KC7: the frame passed equality + the capability gate.
+                // NOW record its response destination — and only if the
+                // claimed origin is the authenticated session peer's own.
+                cache_authenticated_response_destination(
+                    &mesh_for_bridge,
+                    &origin_node_cache_for_bridge,
+                    &inbound,
+                );
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2479,12 +2555,11 @@ impl MeshNode {
             let tag = format!("nrpc:{}", service_for_bridge);
             use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
-                if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
-                }
                 // OA2-E0.2 P0: captured-service equality — see the
                 // unary bridge. A cross-service initial REQUEST is
                 // dropped before the capability gate or fold state.
+                // KC7: the response-route cache is populated only after
+                // the gate below, and only for an authenticated origin.
                 if is_cross_service_request(&inbound.payload, &service_for_bridge) {
                     continue;
                 }
@@ -2541,6 +2616,13 @@ impl MeshNode {
                     (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp).await;
                     continue;
                 }
+                // KC7: cache the response destination only past the gate
+                // and only for an authenticated direct-session origin.
+                cache_authenticated_response_destination(
+                    &mesh_for_bridge,
+                    &origin_node_cache_for_bridge,
+                    &inbound,
+                );
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2686,11 +2768,9 @@ impl MeshNode {
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
+        let mesh_for_bridge = Arc::clone(self);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
-                if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
-                }
                 // OA2-E0.2 P0: captured-service equality — a
                 // cross-service initial REQUEST is dropped before any
                 // fold state. Control frames inherit the
@@ -2698,6 +2778,15 @@ impl MeshNode {
                 if is_cross_service_request(&inbound.payload, &service_for_bridge) {
                     continue;
                 }
+                // KC7: record the response destination only after the
+                // equality check and only for an authenticated
+                // direct-session origin — never from a forged/denied
+                // frame (see `cache_authenticated_response_destination`).
+                cache_authenticated_response_destination(
+                    &mesh_for_bridge,
+                    &origin_node_cache_for_bridge,
+                    &inbound,
+                );
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2950,11 +3039,9 @@ impl MeshNode {
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
+        let mesh_for_bridge = Arc::clone(self);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
-                if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
-                }
                 // OA2-E0.2 P0: captured-service equality — a
                 // cross-service initial REQUEST is dropped before any
                 // fold state. Control frames inherit the
@@ -2962,6 +3049,15 @@ impl MeshNode {
                 if is_cross_service_request(&inbound.payload, &service_for_bridge) {
                     continue;
                 }
+                // KC7: record the response destination only after the
+                // equality check and only for an authenticated
+                // direct-session origin — never from a forged/denied
+                // frame (see `cache_authenticated_response_destination`).
+                cache_authenticated_response_destination(
+                    &mesh_for_bridge,
+                    &origin_node_cache_for_bridge,
+                    &inbound,
+                );
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -4307,6 +4403,75 @@ fn _ensure_send_sync() {
 #[cfg(test)]
 mod origin_cache_tests {
     use super::*;
+
+    /// KC7 (Kyra E1 audit) — the response-route cache is populated
+    /// ONLY for a trustworthy destination. Because the cache is keyed
+    /// on the wire-claimed `origin_hash`, a frame whose claimed origin
+    /// does not match the AEAD-authenticated `from_node` peer's OWN
+    /// origin (a malicious node stamping a victim's origin), a control
+    /// frame, an unpinned peer, or the loopback sentinel must NEVER
+    /// establish a destination — so a denied/forged frame can't
+    /// redirect a legitimate call's response.
+    #[test]
+    fn response_route_trust_requires_authenticated_direct_origin() {
+        let victim_origin = 0x1111_2222_3333_4444u64;
+        let peer_node = 0xABCDu64;
+
+        // Honest: REQUEST, authenticated peer's own origin → trusted.
+        assert!(response_route_is_trustworthy(
+            peer_node,
+            Some(DISPATCH_RPC_REQUEST),
+            victim_origin,
+            Some(victim_origin),
+        ));
+
+        // Forged: the claim (victim_origin) ≠ the authenticated peer's
+        // real origin → REFUSED (the poison the fix prevents).
+        assert!(!response_route_is_trustworthy(
+            peer_node,
+            Some(DISPATCH_RPC_REQUEST),
+            victim_origin,
+            Some(0x9999_9999_9999_9999),
+        ));
+
+        // Control frames never establish routing, even authenticated.
+        for dispatch in [
+            DISPATCH_RPC_CANCEL,
+            DISPATCH_RPC_REQUEST_CHUNK,
+            DISPATCH_RPC_REQUEST_GRANT,
+        ] {
+            assert!(!response_route_is_trustworthy(
+                peer_node,
+                Some(dispatch),
+                victim_origin,
+                Some(victim_origin),
+            ));
+        }
+
+        // Unpinned peer (no authenticated entity) → refused.
+        assert!(!response_route_is_trustworthy(
+            peer_node,
+            Some(DISPATCH_RPC_REQUEST),
+            victim_origin,
+            None,
+        ));
+
+        // Loopback/test sentinel (from_node == 0) → refused.
+        assert!(!response_route_is_trustworthy(
+            0,
+            Some(DISPATCH_RPC_REQUEST),
+            victim_origin,
+            Some(victim_origin),
+        ));
+
+        // Non-decodable dispatch → refused.
+        assert!(!response_route_is_trustworthy(
+            peer_node,
+            None,
+            victim_origin,
+            Some(victim_origin),
+        ));
+    }
 
     /// The crafted-origin memory-amplification guard (cubic P2): the reply-
     /// channel / origin-node caches are keyed by the *wire-claimed*
