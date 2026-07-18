@@ -20,7 +20,7 @@ use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
 use super::behavior::org_authority::NodeAuthority;
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
 use super::behavior::org_revocation::{OrgRevocationState, OrgRevocationStore};
-use super::cortex::{RpcHeader, RpcRequestPayload};
+use super::cortex::{RpcCodecError, RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
 use super::mesh::MeshNode;
 
@@ -55,7 +55,7 @@ pub const ORG_RPC_REQUEST_DIGEST_CONTEXT: &str = "net-org-rpc-request-v1";
 /// (E2, minting the proof) call THIS function over the SAME finalized
 /// request, so a mismatch is impossible for a well-formed call and a
 /// tampered body/header set/order fails the binding.
-pub fn org_request_digest(req: &RpcRequestPayload) -> [u8; 32] {
+pub fn org_request_digest(req: &RpcRequestPayload) -> Result<[u8; 32], RpcCodecError> {
     // Strip the admission headers ONLY; the relative order of every
     // other header is preserved exactly as the application will see it.
     let headers: Vec<RpcHeader> = req
@@ -73,9 +73,15 @@ pub fn org_request_digest(req: &RpcRequestPayload) -> [u8; 32] {
         // `Bytes` clone is a refcount bump, not a copy.
         body: req.body.clone(),
     };
+    // AV-7 item 7: refuse an over-cap request rather than hash a
+    // release-truncated, ambiguous encoding. encode_into's length
+    // prefixes are `as u8`/`as u16`/`as u32` casts guarded only by
+    // debug_assert, so an oversized publicly-constructed request could
+    // otherwise round-trip to a colliding digest.
+    canonical.validate_wire_bounds()?;
     let mut encoded = Vec::with_capacity(canonical.encoded_len());
     canonical.encode_into(&mut encoded);
-    blake3::derive_key(ORG_RPC_REQUEST_DIGEST_CONTEXT, &encoded)
+    Ok(blake3::derive_key(ORG_RPC_REQUEST_DIGEST_CONTEXT, &encoded))
 }
 
 /// A cheap fingerprint of the provider's admission-relevant security
@@ -387,6 +393,74 @@ mod tests {
         (name.to_string(), value.to_vec())
     }
 
+    /// Well-formed fixtures always encode; unwrap for the equality
+    /// tests. The fallible surface (AV-7 item 7) is exercised by
+    /// `digest_refuses_over_cap_requests`.
+    fn digest(req: &RpcRequestPayload) -> [u8; 32] {
+        org_request_digest(req).expect("well-formed fixture digests")
+    }
+
+    /// AV-7 item 7: an over-cap request is REFUSED (release-safe) rather
+    /// than silently truncated into a collision-prone digest — one
+    /// witness per length ceiling the codec's `u8`/`u16`/`u32` prefixes
+    /// enforce. Runs in release too, where `encode_into` would truncate
+    /// instead of `debug_assert`.
+    #[test]
+    fn digest_refuses_over_cap_requests() {
+        use super::super::cortex::{
+            MAX_RPC_BODY_LEN, MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN,
+            MAX_RPC_SERVICE_NAME_LEN,
+        };
+        let mut over_service = req(vec![], b"x");
+        over_service.service = "s".repeat(MAX_RPC_SERVICE_NAME_LEN + 1);
+        assert!(matches!(
+            org_request_digest(&over_service),
+            Err(RpcCodecError::TooLarge {
+                field: "service",
+                ..
+            })
+        ));
+        let too_many = req(
+            (0..=MAX_RPC_HEADERS)
+                .map(|i| h(&format!("h{i}"), b"v"))
+                .collect(),
+            b"x",
+        );
+        assert!(matches!(
+            org_request_digest(&too_many),
+            Err(RpcCodecError::TooLarge {
+                field: "headers",
+                ..
+            })
+        ));
+        let over_name = req(
+            vec![h(&"n".repeat(MAX_RPC_HEADER_NAME_LEN + 1), b"v")],
+            b"x",
+        );
+        assert!(matches!(
+            org_request_digest(&over_name),
+            Err(RpcCodecError::TooLarge {
+                field: "header name",
+                ..
+            })
+        ));
+        let over_value = req(vec![h("k", &vec![0u8; MAX_RPC_HEADER_VALUE_LEN + 1])], b"x");
+        assert!(matches!(
+            org_request_digest(&over_value),
+            Err(RpcCodecError::TooLarge {
+                field: "header value",
+                ..
+            })
+        ));
+        let over_body = req(vec![], &vec![0u8; MAX_RPC_BODY_LEN + 1]);
+        assert!(matches!(
+            org_request_digest(&over_body),
+            Err(RpcCodecError::TooLarge { field: "body", .. })
+        ));
+        // A well-formed request at the ceiling still digests fine.
+        assert!(org_request_digest(&req(vec![h("k", b"v")], b"body")).is_ok());
+    }
+
     /// Header ORDER is BOUND (Kyra E1 audit): two requests with the
     /// same duplicate header in opposite orders — which order-sensitive
     /// parsers interpret differently — must sign DIFFERENT digests.
@@ -395,14 +469,14 @@ mod tests {
         let allow_then_deny = req(vec![h("x", b"allow"), h("x", b"deny")], b"body");
         let deny_then_allow = req(vec![h("x", b"deny"), h("x", b"allow")], b"body");
         assert_ne!(
-            org_request_digest(&allow_then_deny),
-            org_request_digest(&deny_then_allow),
+            digest(&allow_then_deny),
+            digest(&deny_then_allow),
             "reversed duplicate headers must not collide",
         );
         // A plain reordering of distinct headers also changes it.
         let abc = req(vec![h("a", b"1"), h("b", b"2"), h("c", b"3")], b"body");
         let bac = req(vec![h("b", b"2"), h("a", b"1"), h("c", b"3")], b"body");
-        assert_ne!(org_request_digest(&abc), org_request_digest(&bac));
+        assert_ne!(digest(&abc), digest(&bac));
     }
 
     /// The admission header is stripped before hashing — so the proof
@@ -422,7 +496,7 @@ mod tests {
             ],
             b"body",
         );
-        assert_eq!(org_request_digest(&bare), org_request_digest(&with_proof));
+        assert_eq!(digest(&bare), digest(&with_proof));
 
         // Even MULTIPLE admission headers are all stripped, order kept.
         let with_two = req(
@@ -434,7 +508,7 @@ mod tests {
             ],
             b"body",
         );
-        assert_eq!(org_request_digest(&bare), org_request_digest(&with_two));
+        assert_eq!(digest(&bare), digest(&with_two));
     }
 
     /// Duplicate non-admission headers ARE bound — dropping one
@@ -443,28 +517,28 @@ mod tests {
     fn digest_binds_header_multiplicity() {
         let one = req(vec![h("x", b"1")], b"body");
         let two = req(vec![h("x", b"1"), h("x", b"1")], b"body");
-        assert_ne!(org_request_digest(&one), org_request_digest(&two));
+        assert_ne!(digest(&one), digest(&two));
     }
 
     /// Body, service, deadline, and flags all change the digest.
     #[test]
     fn digest_binds_request_fields() {
         let base = req(vec![], b"body");
-        let base_d = org_request_digest(&base);
+        let base_d = digest(&base);
 
-        assert_ne!(base_d, org_request_digest(&req(vec![], b"other")));
+        assert_ne!(base_d, digest(&req(vec![], b"other")));
 
         let mut svc = req(vec![], b"body");
         svc.service = "different".to_string();
-        assert_ne!(base_d, org_request_digest(&svc));
+        assert_ne!(base_d, digest(&svc));
 
         let mut dl = req(vec![], b"body");
         dl.deadline_ns += 1;
-        assert_ne!(base_d, org_request_digest(&dl));
+        assert_ne!(base_d, digest(&dl));
 
         let mut fl = req(vec![], b"body");
         fl.flags = 1;
-        assert_ne!(base_d, org_request_digest(&fl));
+        assert_ne!(base_d, digest(&fl));
     }
 
     /// KC9 — RegisteredRpcService is built only through the validated
@@ -568,13 +642,13 @@ mod tests {
             0x66, 0xb1, 0x8c, 0x0e, 0xae, 0x77, 0x90, 0xe1, 0xaa, 0xdf, 0x52, 0x26, 0xc7, 0x62,
             0xac, 0x6f, 0x70, 0xbb,
         ];
-        let got = org_request_digest(&golden_fixture());
+        let got = digest(&golden_fixture());
         assert_eq!(got, GOLDEN, "wire digest drifted: {got:02x?}");
         assert_ne!(got, [0u8; 32]);
         // Reversing the duplicate x-tag headers changes the digest —
         // the golden binds their order.
         let mut reversed = golden_fixture();
         reversed.headers.swap(2, 3);
-        assert_ne!(org_request_digest(&reversed), GOLDEN);
+        assert_ne!(digest(&reversed), GOLDEN);
     }
 }

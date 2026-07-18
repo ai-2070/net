@@ -560,6 +560,57 @@ pub enum RpcCodecError {
 }
 
 impl RpcRequestPayload {
+    /// Validate every length field against the wire ceilings the codec's
+    /// `u8` / `u16` / `u32` length prefixes assume, BEFORE any encode.
+    /// In release builds [`Self::encode_into`] truncates an over-cap
+    /// length via its `as u8` / `as u16` / `as u32` casts (debug builds
+    /// `debug_assert`), which would let an oversized, publicly-
+    /// constructed request produce an ambiguous / non-round-tripping
+    /// encoding. Any caller that must NOT silently truncate — the org
+    /// request digest (AV-7 item 7), and any future checked send path —
+    /// validates first and refuses rather than hashing a collision-prone
+    /// encoding.
+    pub fn validate_wire_bounds(&self) -> Result<(), RpcCodecError> {
+        if self.service.len() > MAX_RPC_SERVICE_NAME_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "service",
+                actual: self.service.len(),
+                limit: MAX_RPC_SERVICE_NAME_LEN,
+            });
+        }
+        if self.headers.len() > MAX_RPC_HEADERS {
+            return Err(RpcCodecError::TooLarge {
+                field: "headers",
+                actual: self.headers.len(),
+                limit: MAX_RPC_HEADERS,
+            });
+        }
+        for (name, value) in &self.headers {
+            if name.len() > MAX_RPC_HEADER_NAME_LEN {
+                return Err(RpcCodecError::TooLarge {
+                    field: "header name",
+                    actual: name.len(),
+                    limit: MAX_RPC_HEADER_NAME_LEN,
+                });
+            }
+            if value.len() > MAX_RPC_HEADER_VALUE_LEN {
+                return Err(RpcCodecError::TooLarge {
+                    field: "header value",
+                    actual: value.len(),
+                    limit: MAX_RPC_HEADER_VALUE_LEN,
+                });
+            }
+        }
+        if self.body.len() > MAX_RPC_BODY_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "body",
+                actual: self.body.len(),
+                limit: MAX_RPC_BODY_LEN,
+            });
+        }
+        Ok(())
+    }
+
     /// Compute the encoded byte length WITHOUT actually encoding.
     /// Used by [`request_wire_size`] and any caller that needs to
     /// budget event size at the bus layer (e.g., to refuse a
