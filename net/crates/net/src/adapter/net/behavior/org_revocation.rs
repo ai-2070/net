@@ -365,9 +365,13 @@ type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 /// generation, ONE subscriber registry. Handles are cheap facades;
 /// the core is the security object.
 struct StoreCore {
-    /// The NORMALIZED backing path — also the key in the core and
-    /// poison registries.
+    /// The NORMALIZED backing path — used for reads / writes / the
+    /// interprocess lock. NOT the registry key (that is [`BackingId`],
+    /// so case-aliases collapse — AV-9).
     path: PathBuf,
+    /// Stable backing-file identity (the `.lock` sidecar inode) — the
+    /// key in the core and poison registries (AV-9).
+    backing_id: BackingId,
     /// Serializes merge→persist→publish transactions in-process
     /// (the sidecar file lock serializes across processes). Also
     /// exposed to the node as [`PublishGuard`] so store
@@ -464,16 +468,71 @@ impl StoreCore {
     }
 }
 
-/// Process-wide core registry, keyed by the normalized backing
-/// path. `Weak` so a path whose handles all dropped releases its
-/// core; the POISON registry is separate precisely because poison
-/// must outlive every handle.
+/// A stable identity for a store's backing file, derived from the
+/// OPENED `.lock` sidecar's inode (AV-9 item 9). The sidecar is created
+/// once and NEVER renamed — only the state file is rename-replaced by
+/// `write_atomic`, so the sidecar's inode is stable across every write,
+/// and two differently-cased path aliases (`revocation-state.json` vs
+/// `REVOCATION-STATE.JSON`) resolve to the SAME sidecar inode on a
+/// case-insensitive filesystem. Keying the core and poison registries
+/// on this — rather than the literal-cased normalized path — collapses
+/// those aliases to one core (shared live view + publish lock) and one
+/// poison entry, while `normalize_backing_path` / `open_lock_file`
+/// still refuse a symlinked or non-regular final component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BackingId {
+    device: u64,
+    inode: u64,
+}
+
+impl BackingId {
+    /// Derive the identity from the opened lock sidecar. `path` is a
+    /// last-resort fallback key on platforms with no file-identity API
+    /// (or if the fstat fails) — it reproduces the pre-AV-9 path-keyed
+    /// behavior, which splits case-aliases but is otherwise correct.
+    fn of(lock: &std::fs::File, path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = lock.metadata() {
+                return BackingId {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                };
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if let Ok(meta) = lock.metadata() {
+                if let (Some(vol), Some(idx)) = (meta.volume_serial_number(), meta.file_index()) {
+                    return BackingId {
+                        device: u64::from(vol),
+                        inode: idx,
+                    };
+                }
+            }
+        }
+        let _ = lock;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(path, &mut hasher);
+        BackingId {
+            device: u64::MAX,
+            inode: std::hash::Hasher::finish(&hasher),
+        }
+    }
+}
+
+/// Process-wide core registry, keyed by the backing file's stable
+/// [`BackingId`] (AV-9). `Weak` so a backing file whose handles all
+/// dropped releases its core; the POISON registry is separate precisely
+/// because poison must outlive every handle.
 static CORES: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StoreCore>>>,
+    Mutex<std::collections::HashMap<BackingId, std::sync::Weak<StoreCore>>>,
 > = std::sync::OnceLock::new();
 
-fn core_registry() -> &'static Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<StoreCore>>>
-{
+fn core_registry(
+) -> &'static Mutex<std::collections::HashMap<BackingId, std::sync::Weak<StoreCore>>> {
     CORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -496,12 +555,13 @@ fn core_registry() -> &'static Mutex<std::collections::HashMap<PathBuf, std::syn
 /// cycle exists. The registry lock is released before `reload` is
 /// acquired so no `registry → reload` nesting can form.
 fn join_or_create_core(
+    backing_id: BackingId,
     path: &Path,
     disk: OrgRevocationState,
 ) -> (Arc<StoreCore>, Vec<RaisedFloor>) {
     let mut cores = core_registry().lock();
     cores.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(core) = cores.get(path).and_then(std::sync::Weak::upgrade) {
+    if let Some(core) = cores.get(&backing_id).and_then(std::sync::Weak::upgrade) {
         drop(cores);
         let raised = {
             let _reload = core.reload.lock();
@@ -514,6 +574,7 @@ fn join_or_create_core(
     // across the check-and-insert so two openers cannot both create.
     let core = Arc::new(StoreCore {
         path: path.to_path_buf(),
+        backing_id,
         reload: Mutex::new(()),
         live: RwLock::new(Arc::new(disk)),
         generation: AtomicU64::new(0),
@@ -521,7 +582,7 @@ fn join_or_create_core(
         next_subscriber: AtomicU64::new(0),
         publish_pause: parking_lot::Mutex::new(None),
     });
-    cores.insert(path.to_path_buf(), Arc::downgrade(&core));
+    cores.insert(backing_id, Arc::downgrade(&core));
     (core, Vec::new())
 }
 
@@ -625,7 +686,10 @@ impl OrgRevocationStore {
         }
         let path = normalize_backing_path(&path)?;
         let lock = lock_state_file(&path)?;
-        let was_poisoned = is_path_poisoned(&path);
+        // AV-9: identity is the stable `.lock` inode, so case-aliases
+        // share one core + poison entry.
+        let backing_id = BackingId::of(&lock, &path);
+        let was_poisoned = is_poisoned_id(backing_id);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -643,9 +707,9 @@ impl OrgRevocationStore {
                 })
             }
         };
-        let (core, raised) = join_or_create_core(&path, state);
+        let (core, raised) = join_or_create_core(backing_id, &path, state);
         if was_poisoned {
-            clear_poison(&path);
+            clear_poison(backing_id, &path);
         }
         drop(lock);
         let store = Self {
@@ -674,7 +738,9 @@ impl OrgRevocationStore {
     pub fn open_existing(path: impl Into<PathBuf>) -> Result<Self, OrgRevocationError> {
         let path = normalize_backing_path(&path.into())?;
         let lock = lock_state_file(&path)?;
-        let was_poisoned = is_path_poisoned(&path);
+        // AV-9: stable `.lock` inode identity (case-aliases collapse).
+        let backing_id = BackingId::of(&lock, &path);
+        let was_poisoned = is_poisoned_id(backing_id);
         if was_poisoned {
             prove_entry_durable(&path)?;
         }
@@ -697,9 +763,9 @@ impl OrgRevocationStore {
         let state = OrgRevocationState::from_file_bytes(&bytes, &path).inspect_err(|err| {
             tracing::error!("{err}");
         })?;
-        let (core, raised) = join_or_create_core(&path, state);
+        let (core, raised) = join_or_create_core(backing_id, &path, state);
         if was_poisoned {
-            clear_poison(&path);
+            clear_poison(backing_id, &path);
         }
         drop(lock);
         let store = Self {
@@ -734,7 +800,7 @@ impl OrgRevocationStore {
     /// [`Self::open_existing`], [`Self::init`], or the next
     /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
-        is_path_poisoned(&self.core.path)
+        is_poisoned_id(self.core.backing_id)
     }
 
     /// Test-only: mark this store's backing path poisoned so
@@ -746,7 +812,7 @@ impl OrgRevocationStore {
     /// production paths.
     #[doc(hidden)]
     pub fn mark_poisoned_for_test(&self) {
-        poison_registry().lock().insert(self.core.path.clone());
+        poison_registry().lock().insert(self.core.backing_id);
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -947,7 +1013,7 @@ impl OrgRevocationStore {
             //    truth through the shared core BEFORE the poison
             //    bit clears (review-9 addendum: recovery reloads
             //    live views, it never merely fsyncs).
-            let was_poisoned = is_path_poisoned(path);
+            let was_poisoned = is_poisoned_id(self.core.backing_id);
             if was_poisoned {
                 prove_entry_durable(path)?;
             }
@@ -991,7 +1057,7 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        poison_registry().lock().insert(path.clone());
+                        poison_registry().lock().insert(self.core.backing_id);
                         durability_uncertain = Some(reason);
                     }
                 }
@@ -1004,7 +1070,7 @@ impl OrgRevocationStore {
             //    notification happens outside.
             let raised = self.core.publish(merged);
             if was_poisoned && durability_uncertain.is_none() {
-                clear_poison(path);
+                clear_poison(self.core.backing_id, path);
             }
             drop(lock);
             match durability_uncertain {
@@ -1060,15 +1126,15 @@ pub(crate) enum WritePhase {
 /// (a locked reread republished through the shared core plus a
 /// SUCCESSFUL parent-directory fsync) clears it. Separate from the
 /// core registry because poison must outlive every handle.
-static PATH_POISON: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+static PATH_POISON: std::sync::OnceLock<Mutex<std::collections::HashSet<BackingId>>> =
     std::sync::OnceLock::new();
 
-fn poison_registry() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+fn poison_registry() -> &'static Mutex<std::collections::HashSet<BackingId>> {
     PATH_POISON.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-fn is_path_poisoned(key: &Path) -> bool {
-    poison_registry().lock().contains(key)
+fn is_poisoned_id(id: BackingId) -> bool {
+    poison_registry().lock().contains(&id)
 }
 
 /// Normalize a backing pathname ONCE at store construction
@@ -1151,8 +1217,8 @@ fn prove_entry_durable(path: &Path) -> Result<(), OrgRevocationError> {
 /// Second half of durability recovery: clear the path-wide bit
 /// after the entry was proven durable AND the reread state was
 /// republished through the shared core.
-fn clear_poison(path: &Path) {
-    poison_registry().lock().remove(path);
+fn clear_poison(id: BackingId, path: &Path) {
+    poison_registry().lock().remove(&id);
     tracing::warn!(
         path = %path.display(),
         "revocation-state durability uncertainty recovered \
@@ -1487,6 +1553,58 @@ mod tests {
         OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
     }
 
+    /// AV-9 item 9: on a case-INSENSITIVE filesystem, two
+    /// differently-cased aliases of one backing file resolve to the
+    /// SAME `.lock` inode, so they must collapse to ONE core (shared
+    /// live view + publish lock + poison) — not split as the pre-AV-9
+    /// literal-cased path key did. On a case-SENSITIVE filesystem the
+    /// two names ARE distinct files, so the assertions are skipped (the
+    /// fix is correctly a no-op there).
+    ///
+    /// Red-witness (on a case-insensitive FS): reverting the CORES /
+    /// PATH_POISON key from [`BackingId`] to the normalized path makes
+    /// the two aliases distinct keys — `shares_core_with` is then false
+    /// and this fails.
+    #[test]
+    fn case_aliased_paths_share_one_core_on_case_insensitive_fs() {
+        let scratch = Scratch::new();
+        let lower = scratch.0.join("revocation-state.json");
+        let upper = scratch.0.join("REVOCATION-STATE.JSON");
+
+        let a = OrgRevocationStore::init(&lower).expect("init lower alias");
+
+        // Probe the filesystem: does the upper-cased alias resolve to
+        // the file just created? If not (case-sensitive FS), there is
+        // no alias to unify and the fix is a no-op.
+        if !upper.exists() {
+            return;
+        }
+
+        let b = OrgRevocationStore::open_existing(&upper).expect("open upper alias");
+        assert!(
+            a.shares_core_with(&b),
+            "case-aliases on a case-insensitive FS must share ONE core (same .lock inode)",
+        );
+
+        // A floor published through one alias is visible through the
+        // other immediately (shared live view).
+        a.apply_bundle(&bundle_with_floor(5))
+            .expect("apply floor via lower alias");
+        assert_eq!(
+            b.floor_for(&org().org_id(), &member()),
+            5,
+            "a floor published through one alias must be visible through the other",
+        );
+
+        // Poison registered through one alias is visible through the
+        // other (shared poison entry).
+        a.mark_poisoned_for_test();
+        assert!(
+            b.is_poisoned(),
+            "poison under one alias must be visible through the other",
+        );
+    }
+
     #[test]
     fn init_creates_empty_state_and_open_existing_loads_it() {
         let scratch = Scratch::new();
@@ -1782,7 +1900,7 @@ mod tests {
         let mut stronger = OrgRevocationState::empty();
         stronger.merge_bundle(&bundle_with_floor(9));
         write_atomic(&norm, &stronger.to_file_bytes().expect("bytes")).expect("write");
-        poison_registry().lock().insert(norm.clone());
+        poison_registry().lock().insert(BackingId::of(&lock, &norm));
 
         // Lock releases → the opener proceeds: it must observe the
         // poison, recover (reread + successful parent fsync), and
