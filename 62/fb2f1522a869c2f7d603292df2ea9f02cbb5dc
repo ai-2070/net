@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_9298fd786cc20e::t_4fd9ac1f1c653f 471-507,509-529,531,534-535
+  s_9298fd786cc20e::t_637d5315f7bc2f 689-692,710,712
+  s_9298fd786cc20e::t_64120fc6062402 558,564,577,585
+  s_9298fd786cc20e::t_96f9d77a8e6ec4 1129,1132,1136-1137
+  s_9298fd786cc20e::t_fcdda02aeee1e5 1220-1221
+  s_9298fd786cc20e::t_14a8251afd9c0f 368-370,372-374
+  s_9298fd786cc20e::t_d41b5eea218c24 741-743
+  s_9298fd786cc20e::t_f96acccf52f20a 1060
+  s_9298fd786cc20e::t_aa5f7c5ea90919 1073
+  s_9298fd786cc20e::t_e72948de03033e 1556-1607
+  s_9298fd786cc20e::t_9e8fd6086b0c96 803
+  s_9298fd786cc20e::t_9cf8a35e60f814 508
+  s_9298fd786cc20e::t_4e6cd5e7d35f6f 1903
+  s_9298fd786cc20e::t_d159f08c0c8632 815
+  s_9298fd786cc20e::t_a15fb13331c61b 766,768
+  s_9298fd786cc20e::t_a216ef7c2c629e 1016
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "62fb2f1522a869c2f7d603292df2ea9f02cbb5dc",
+  "prompts": {},
+  "sessions": {
+    "s_9298fd786cc20e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b66914e-9464-4925-9eaf-43ca3fe549a1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
