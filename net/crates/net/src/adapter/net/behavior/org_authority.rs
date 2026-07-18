@@ -968,31 +968,118 @@ fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
     Ok(())
 }
 
+/// The absolute path to the Windows system directory (e.g.
+/// `C:\Windows\System32`) obtained from the OS — NOT from `PATH` or an
+/// environment variable — so a trusted system executable can be invoked by
+/// absolute path.
+#[cfg(windows)]
+fn system_directory() -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    extern "system" {
+        fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
+    }
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` is a valid, writable UTF-16 buffer of `buf.len()` elements;
+    // GetSystemDirectoryW writes at most that many code units and returns the
+    // count written (0 on failure, or the required size if too small).
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(std::ffi::OsString::from_wide(&buf[..n as usize]).into())
+}
+
+/// The current process's user SID as a string (e.g. `S-1-5-21-…`), derived from
+/// the process access token — NOT from `USERNAME` / `USERDOMAIN`, which a
+/// caller can spoof. Used to grant the authority directory's DACL by SID.
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn current_process_sid_string() -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStringExt;
+    type Handle = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn OpenProcessToken(process: Handle, desired: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, string_sid: *mut *mut u16) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: i32 = 1; // TOKEN_INFORMATION_CLASS::TokenUser
+                               // SAFETY: the standard Win32 token → SID → string sequence. Every call's
+                               // return value is checked; `buf` is sized by the first GetTokenInformation
+                               // probe; `psid` points INTO `buf`, which stays alive across
+                               // ConvertSidToStringSidW; the LocalAlloc'd wide string is copied out then
+                               // LocalFree'd; and the token handle is closed on every path.
+    unsafe {
+        let mut token: Handle = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut len: u32 = 0;
+        // First call sizes the buffer (fails with ERROR_INSUFFICIENT_BUFFER).
+        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            let e = std::io::Error::last_os_error();
+            CloseHandle(token);
+            return Err(e);
+        }
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len);
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // TOKEN_USER's first field is a SID_AND_ATTRIBUTES whose first field is
+        // the PSID (a pointer into `buf`). `read_unaligned` because a `Vec<u8>`
+        // is only byte-aligned.
+        let psid = (buf.as_ptr() as *const *mut std::ffi::c_void).read_unaligned();
+        let mut string_sid: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(psid, &mut string_sid) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut n = 0usize;
+        while *string_sid.add(n) != 0 {
+            n += 1;
+        }
+        let s = std::ffi::OsString::from_wide(std::slice::from_raw_parts(string_sid, n))
+            .to_string_lossy()
+            .into_owned();
+        LocalFree(string_sid.cast());
+        Ok(s)
+    }
+}
+
 /// Windows analogue of Unix owner-only mode for a directory: strip inherited
-/// ACEs and grant only the current user full control
-/// (`icacls <dir> /inheritance:r /grant:r <user>:F`), so a freshly-created
-/// authority directory is restricted to its owner regardless of where it was
-/// placed. New files created inside inherit this owner-only DACL.
+/// ACEs and grant ONLY the current process's user SID full control with
+/// object + container inheritance, so a freshly-created authority directory —
+/// and the files created inside it — are restricted to the owner regardless of
+/// where it was placed. The principal is the process TOKEN SID (not a spoofable
+/// `USERNAME`), and `icacls` is invoked by absolute System32 path (not `PATH`).
+/// Any lookup / execution / non-success status is a loud error.
 #[cfg(windows)]
 fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
-    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-        (Ok(domain), Ok(user)) if !domain.is_empty() => format!("{domain}\\{user}"),
-        (_, Ok(user)) if !user.is_empty() => user,
-        _ => {
-            return Err(std::io::Error::other(
-                "USERNAME is not set; cannot restrict the authority directory ACL",
-            ))
-        }
-    };
-    let out = std::process::Command::new("icacls")
+    let sid = current_process_sid_string()?;
+    let icacls = system_directory()?.join("icacls.exe");
+    let out = std::process::Command::new(&icacls)
         .arg(dir)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{user}:F"))
+        // `*SID` grants by SID; `(OI)(CI)` makes the ACE inherit onto child
+        // files and directories; `F` is full control.
+        .arg(format!("*{sid}:(OI)(CI)F"))
         .output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
-            "icacls could not restrict {} to {user}: {}",
+            "icacls ({}) could not restrict {} to {sid}: {}",
+            icacls.display(),
             dir.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         )));
@@ -1052,13 +1139,18 @@ fn create_missing_components_0700(dir: &Path) -> std::io::Result<()> {
 ///   before use (a restrictive-umask create + owner chmod(0700) is safe; the
 ///   dangerous pattern was permissive create then tighten). State / lock /
 ///   audience files are 0600.
-/// - Non-Unix: a newly-created directory is restricted to the owner via an
-///   explicit DACL ([`restrict_dir_to_owner`], the Windows analogue of 0700).
-///   A pre-existing directory's ACL is operator-owned and NOT re-validated
-///   here: the default authority path under the per-user protected profile
-///   (`%APPDATA%`) is covered by profile inheritance, and a custom
-///   `--authority-dir` is operator-asserted (the CLI warns when one is set).
-///   The user account, SYSTEM, and local administrators are trusted principals.
+/// - Non-Unix: a newly-created directory (and its child files, via
+///   inheritance) is restricted to the current process's TOKEN SID with an
+///   explicit owner-only DACL ([`restrict_dir_to_owner`] — icacls invoked by
+///   absolute System32 path, granting `*SID:(OI)(CI)F`); a failure to apply it
+///   is a LOUD error, never a silent downgrade. A pre-existing directory's ACL
+///   is operator-owned and NOT re-validated here: the default authority path
+///   under the per-user protected profile (`%APPDATA%`) is covered by profile
+///   inheritance, and a custom `--authority-dir` is operator-asserted (the CLI
+///   warns when one is set). A DACL on the child cannot stop a writable
+///   parent's owner from replacing the child entry, so custom paths remain an
+///   operator trust issue. The user account, SYSTEM, and local administrators
+///   are trusted principals.
 fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: dir.display().to_string(),
@@ -1136,17 +1228,12 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                 }
                 std::fs::create_dir(dir).map_err(io)?;
                 // Restrict the freshly-created directory to the owner (Windows
-                // analogue of 0700), so even a custom path is owner-only. Best-
-                // effort: a failure warns rather than aborting, matching the
-                // operator-asserted posture for custom Windows paths.
+                // analogue of 0700). FAIL LOUD: authority secrets must never be
+                // provisioned into a directory whose owner-only ACL could not be
+                // applied — that would silently degrade to the operator-asserted
+                // posture reserved for a pre-existing custom directory.
                 #[cfg(windows)]
-                if let Err(e) = restrict_dir_to_owner(dir) {
-                    tracing::warn!(
-                        path = %dir.display(), error = %e,
-                        "could not restrict the authority directory ACL to the \
-                         owner; ensure it is under a per-user protected location",
-                    );
-                }
+                restrict_dir_to_owner(dir).map_err(io)?;
             }
             Err(e) => return Err(io(e)),
         }
@@ -1651,6 +1738,72 @@ mod tests {
                 comp.display()
             );
         }
+    }
+
+    /// Gate-1 (Windows): a freshly-created authority directory gets an
+    /// owner-only, INHERITABLE DACL (granted by the process token SID via the
+    /// absolute System32 icacls), and the provisioned child files inherit it —
+    /// no broad principal retains access. Reads the resulting security
+    /// descriptor via icacls. Broad principals are matched fully-qualified
+    /// (`BUILTIN\Users`), never the bare word — the temp path itself contains
+    /// "Users".
+    #[cfg(windows)]
+    #[test]
+    fn adopt_windows_authority_dir_and_files_are_owner_only() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let authority = scratch.dir().join("nested").join("authority");
+        NodeAuthority::adopt(&authority, cert_for(&kp, 1), kp.entity_id(), 0, None).expect("adopt");
+
+        let icacls = system_directory().expect("system dir").join("icacls.exe");
+        let read_acl = |p: &std::path::Path| -> String {
+            let out = std::process::Command::new(&icacls)
+                .arg(p)
+                .output()
+                .expect("run icacls");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        const BROAD: [&str; 3] = ["Everyone", "BUILTIN\\Users", "Authenticated Users"];
+
+        // Directory: inheritance stripped → no broad principal; the sole grant
+        // carries object+container inheritance and full control.
+        let dir_acl = read_acl(&authority);
+        assert!(
+            dir_acl.contains("(OI)(CI)(F)"),
+            "dir must carry an inheritable full-control ACE; got:\n{dir_acl}"
+        );
+        for broad in BROAD {
+            assert!(
+                !dir_acl.contains(broad),
+                "dir ACL must not grant {broad}; got:\n{dir_acl}"
+            );
+        }
+        // A provisioned child file inherits the owner-only ACE.
+        let file_acl = read_acl(&authority.join(OWNER_MEMBERSHIP_FILE));
+        assert!(
+            file_acl.contains("(I)") && file_acl.contains("(F)"),
+            "child file must inherit full control; got:\n{file_acl}"
+        );
+        for broad in BROAD {
+            assert!(
+                !file_acl.contains(broad),
+                "child file ACL must not grant {broad}; got:\n{file_acl}"
+            );
+        }
+    }
+
+    /// Gate-1 (Windows): applying the owner-only DACL fails LOUD when icacls
+    /// cannot process the target — so adoption aborts (via `?` in
+    /// ensure_secure_authority_dir) before provisioning any authority files.
+    #[cfg(windows)]
+    #[test]
+    fn restrict_dir_to_owner_fails_loudly_on_a_bad_path() {
+        let scratch = Scratch::new();
+        let missing = scratch.dir().join("does-not-exist");
+        assert!(
+            restrict_dir_to_owner(&missing).is_err(),
+            "restrict_dir_to_owner must fail when icacls cannot process the path",
+        );
     }
 
     #[test]
