@@ -56,6 +56,14 @@ pub const ORG_RPC_REQUEST_DIGEST_CONTEXT: &str = "net-org-rpc-request-v1";
 /// request, so a mismatch is impossible for a well-formed call and a
 /// tampered body/header set/order fails the binding.
 pub fn org_request_digest(req: &RpcRequestPayload) -> Result<[u8; 32], RpcCodecError> {
+    // R2-1 (Kyra addendum): validate the FINALIZED request — the exact
+    // bytes the caller signs and the provider decodes, proof headers
+    // INCLUDED — before stripping. Stripping first would let a
+    // structurally invalid finalized request (33 exact proof headers
+    // over `MAX_RPC_HEADERS`, or an oversized proof-header value) reduce
+    // to a valid canonical after the strip and hash `Ok`, so the proof
+    // would bind a request no honest party could have put on the wire.
+    req.validate_wire_bounds()?;
     // Strip the admission headers ONLY; the relative order of every
     // other header is preserved exactly as the application will see it.
     let headers: Vec<RpcHeader> = req
@@ -459,6 +467,50 @@ mod tests {
         ));
         // A well-formed request at the ceiling still digests fine.
         assert!(org_request_digest(&req(vec![h("k", b"v")], b"body")).is_ok());
+    }
+
+    /// R2-1 (Kyra addendum): the FINALIZED request — proof headers
+    /// INCLUDED — is validated BEFORE stripping. A finalized request
+    /// that is structurally invalid ONLY in its proof headers (which
+    /// the digest strips) must still be refused, not reduce to a valid
+    /// canonical and hash `Ok`.
+    #[test]
+    fn digest_refuses_over_cap_finalized_requests() {
+        use super::super::cortex::{MAX_RPC_HEADERS, MAX_RPC_HEADER_VALUE_LEN};
+        // 33 exact proof headers (> MAX_RPC_HEADERS) — every one is
+        // stripped, so the canonical would be empty and pass; the
+        // finalized request must be refused first.
+        let many_proof = req(
+            (0..=MAX_RPC_HEADERS)
+                .map(|_| h(ORG_ADMISSION_HEADER, b"p"))
+                .collect(),
+            b"x",
+        );
+        assert!(matches!(
+            org_request_digest(&many_proof),
+            Err(RpcCodecError::TooLarge {
+                field: "headers",
+                ..
+            })
+        ));
+        // An oversized proof-header VALUE — stripped from the canonical,
+        // so only finalized validation catches it.
+        let big_proof = req(
+            vec![h(
+                ORG_ADMISSION_HEADER,
+                &vec![0u8; MAX_RPC_HEADER_VALUE_LEN + 1],
+            )],
+            b"x",
+        );
+        assert!(matches!(
+            org_request_digest(&big_proof),
+            Err(RpcCodecError::TooLarge {
+                field: "header value",
+                ..
+            })
+        ));
+        // A single proof header at the ceiling still digests fine.
+        assert!(org_request_digest(&req(vec![h(ORG_ADMISSION_HEADER, b"ok")], b"body")).is_ok());
     }
 
     /// Header ORDER is BOUND (Kyra E1 audit): two requests with the
