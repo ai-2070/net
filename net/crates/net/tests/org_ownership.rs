@@ -1940,33 +1940,45 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AV-10: dropping an `OrgRevocationStore` FACADE that installed a
-/// callback via `set_on_floors_raised` unregisters that callback (the
-/// facade's RAII `Drop`), even while a sibling handle keeps the shared
-/// core alive — so a dropped facade never leaks its own callback into
-/// the core. (Red: without the facade `Drop`, the count stays 1.)
+/// R3-4: a raise subscription is owned EXTERNALLY through the
+/// `RaiseSubscription` guard. Dropping the guard unregisters its callback
+/// from the shared core even while a sibling handle keeps the core alive.
+/// The removed `set_on_floors_raised` instead stored its guard INSIDE the
+/// facade, which a callback capturing `Arc<store>` could keep alive
+/// forever (`core → callback → Arc<store> → guard → …`), so the facade's
+/// own drop never ran and the callback leaked — the cycle Kyra flagged.
+/// The facade now owns no subscription, so dropping a handle removes
+/// nothing.
+///
+/// Red: making `RaiseSubscription::drop` skip `remove_subscriber` leaves
+/// the count at 1.
 #[test]
-fn dropping_a_store_facade_unsubscribes_its_own_callback() {
-    let dir = scratch_dir("av10-facade-drop");
+fn dropping_the_external_guard_unsubscribes_from_the_shared_core() {
+    let dir = scratch_dir("r34-guard-drop");
     let path = dir.join("revocation-state.json");
     let a = OrgRevocationStore::init(&path).expect("init a");
     let b = OrgRevocationStore::open_existing(&path).expect("open b");
     assert!(a.shares_core_with(&b), "same path shares one core");
     assert_eq!(b.subscriber_count(), 0);
 
-    a.set_on_floors_raised(|_raised| {});
+    let sub = a.subscribe_floors_raised(|_raised| {});
     assert_eq!(
         b.subscriber_count(),
         1,
-        "facade A's callback is registered on the shared core"
+        "the external guard's callback is registered on the shared core"
     );
 
-    drop(a);
+    drop(sub);
     assert_eq!(
         b.subscriber_count(),
         0,
-        "dropping facade A must unregister its own callback from the shared core",
+        "dropping the external guard must unregister the callback from the shared core",
     );
+
+    // The facade owns no subscription: dropping `a` while `b` keeps the
+    // core alive changes nothing.
+    drop(a);
+    assert_eq!(b.subscriber_count(), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

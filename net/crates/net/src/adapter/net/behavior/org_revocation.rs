@@ -522,6 +522,19 @@ struct LeaseState {
     in_flight: usize,
 }
 
+thread_local! {
+    /// Leases whose callback body the CURRENT thread is executing (R3-4).
+    /// Pushed by the wrapped callback on entry, popped on leave. A guard
+    /// dropped from INSIDE its own callback consults this so
+    /// [`SubscriptionLease::kill_and_drain`] does not wait for the very
+    /// frame that is dropping it (which would self-deadlock). Raw pointers
+    /// are only compared for identity and are only ever present while the
+    /// callback holds a live `Arc` to that lease, so there is no
+    /// use-after-free.
+    static ACTIVE_LEASES: std::cell::RefCell<Vec<*const SubscriptionLease>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl SubscriptionLease {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -537,18 +550,32 @@ impl SubscriptionLease {
     /// [`Self::leave`]), `false` if the lease is dead (caller returns
     /// without running the user callback). The lease lock is held only for
     /// this check-and-count, never across the user callback itself.
-    fn enter(&self) -> bool {
-        let mut st = self.state.lock();
-        if st.dead {
-            return false;
+    fn enter(self: &Arc<Self>) -> bool {
+        {
+            let mut st = self.state.lock();
+            if st.dead {
+                return false;
+            }
+            st.in_flight += 1;
         }
-        st.in_flight += 1;
+        // R3-4: record this thread as executing under this lease, so a
+        // self-drop from inside the callback does not drain-wait for its
+        // own frame.
+        let ptr = Arc::as_ptr(self);
+        ACTIVE_LEASES.with(|a| a.borrow_mut().push(ptr));
         true
     }
 
     /// Leave the callback body, waking a draining teardown if this was the
     /// last in-flight callback.
-    fn leave(&self) {
+    fn leave(self: &Arc<Self>) {
+        let ptr = Arc::as_ptr(self);
+        ACTIVE_LEASES.with(|a| {
+            let mut v = a.borrow_mut();
+            if let Some(i) = v.iter().rposition(|&p| p == ptr) {
+                v.remove(i);
+            }
+        });
         let mut st = self.state.lock();
         st.in_flight -= 1;
         if st.in_flight == 0 {
@@ -557,12 +584,24 @@ impl SubscriptionLease {
     }
 
     /// Teardown: mark the lease dead, then block until every in-flight
-    /// callback has left. After this returns, no callback body is running
-    /// and none can start.
-    fn kill_and_drain(&self) {
+    /// callback EXCEPT this thread's own frames has left.
+    ///
+    /// - External teardown (the common case: the guard is dropped from a
+    ///   thread that is NOT inside this callback) has `own_frames == 0`, so
+    ///   it drains ALL in-flight callbacks — the strong guarantee that no
+    ///   callback is in flight when the guard's `Drop` returns.
+    /// - Self-unsubscription (the guard is dropped from INSIDE its own
+    ///   callback) excludes this thread's own frames, so it never waits for
+    ///   the frame that is dropping it (which would deadlock — that frame
+    ///   cannot reach its `LeaveOnDrop` until this returns). `dead` is set
+    ///   first, so no NEW callback (including a re-entrant one) starts; the
+    ///   current frame's `LeaveOnDrop` performs the final retirement (R3-4).
+    fn kill_and_drain(self: &Arc<Self>) {
+        let ptr = Arc::as_ptr(self);
+        let own_frames = ACTIVE_LEASES.with(|a| a.borrow().iter().filter(|&&p| p == ptr).count());
         let mut st = self.state.lock();
         st.dead = true;
-        while st.in_flight > 0 {
+        while st.in_flight > own_frames {
             self.drained.wait(&mut st);
         }
     }
@@ -836,16 +875,18 @@ pub(crate) fn publish_guard_pair<'a>(
 /// subscriber registry (review-9 addendum). See the module docs.
 pub struct OrgRevocationStore {
     /// The shared per-path core.
+    ///
+    /// R3-4: the facade holds NO subscription of its own. A raise
+    /// subscription is always owned EXTERNALLY through the
+    /// [`RaiseSubscription`] guard returned by
+    /// [`Self::subscribe_floors_raised`] — the node's install path holds
+    /// it, a test holds it. The removed `set_on_floors_raised` stored its
+    /// guard inside the facade, which a callback capturing `Arc<Self>`
+    /// (`core → callback → Arc<store> → own_subscription → …`) could keep
+    /// alive forever, so the facade's own drop never ran and the callback
+    /// leaked. Whoever holds the external guard breaks that cycle by
+    /// dropping it.
     core: Arc<StoreCore>,
-    /// This handle's own [`RaiseSubscription`] guard — the one
-    /// [`Self::set_on_floors_raised`] replaces. Holding the RAII guard
-    /// directly in the facade means the callback is retired when this
-    /// field drops (AV-10), with no explicit `Drop` impl to forget:
-    /// the guard removes itself from the shared core via a
-    /// `Weak<StoreCore>` (R2-2) and drains any in-flight callback (R2-3).
-    /// Other handles' guards, and guards a caller obtained from
-    /// [`Self::subscribe_floors_raised`], are untouched.
-    own_subscription: Mutex<Option<RaiseSubscription>>,
 }
 
 impl OrgRevocationStore {
@@ -892,10 +933,7 @@ impl OrgRevocationStore {
             clear_poison(&backing_id, &path);
         }
         drop(lock);
-        let store = Self {
-            core,
-            own_subscription: Mutex::new(None),
-        };
+        let store = Self { core };
         store.core.notify(&raised);
         Ok(store)
     }
@@ -948,10 +986,7 @@ impl OrgRevocationStore {
             clear_poison(&backing_id, &path);
         }
         drop(lock);
-        let store = Self {
-            core,
-            own_subscription: Mutex::new(None),
-        };
+        let store = Self { core };
         store.core.notify(&raised);
         Ok(store)
     }
@@ -1127,7 +1162,7 @@ impl OrgRevocationStore {
             if !lease_cb.enter() {
                 return;
             }
-            struct LeaveOnDrop<'a>(&'a SubscriptionLease);
+            struct LeaveOnDrop<'a>(&'a Arc<SubscriptionLease>);
             impl Drop for LeaveOnDrop<'_> {
                 fn drop(&mut self) {
                     self.0.leave();
@@ -1143,20 +1178,6 @@ impl OrgRevocationStore {
             token,
             lease,
         }
-    }
-
-    /// Install THIS HANDLE's raise callback (review-8 §9),
-    /// replacing only the callback this same handle previously set
-    /// through this method — never another handle's or an explicit
-    /// [`Self::subscribe_floors_raised`] registration. Storing the new
-    /// guard drops the old one, which drains and unsubscribes it.
-    pub fn set_on_floors_raised(&self, callback: impl Fn(&[RaisedFloor]) + Send + Sync + 'static) {
-        let mut own = self.own_subscription.lock();
-        // Drop the previous guard FIRST (drain + unsubscribe the old
-        // callback) so no both-registered gap lets it fire once more,
-        // THEN install the replacement.
-        own.take();
-        *own = Some(self.subscribe_floors_raised(callback));
     }
 
     /// Apply an operator bundle under the locked reload order
@@ -2296,11 +2317,11 @@ mod tests {
         let seen_b: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_tok: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = seen_a.clone();
-        store_a.set_on_floors_raised(move |raised| {
+        let _sub_a = store_a.subscribe_floors_raised(move |raised| {
             sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
         });
         let sink = seen_b.clone();
-        store_b.set_on_floors_raised(move |raised| {
+        let _sub_b = store_b.subscribe_floors_raised(move |raised| {
             sink.lock().extend(raised.iter().map(|(_, _, f)| *f));
         });
         let sink = seen_tok.clone();
@@ -2441,6 +2462,81 @@ mod tests {
             store.subscriber_count(),
             0,
             "the drained guard removed the subscriber",
+        );
+    }
+
+    /// R3-4: dropping the externally-owned guard BREAKS the
+    /// `core → subscribers → callback → Arc<store> → Arc<core> → core`
+    /// capture cycle, so a callback that captures `Arc<store>` no longer
+    /// leaks the store. (The removed `set_on_floors_raised` stored its
+    /// guard inside the facade, which that same cycle kept alive forever,
+    /// so its drop never ran.)
+    ///
+    /// Red-witness: making `RaiseSubscription::drop` skip
+    /// `remove_subscriber` leaves the capturing callback in the core, so
+    /// the store never frees and `weak.upgrade()` stays `Some`.
+    #[test]
+    fn dropping_the_external_guard_breaks_a_store_capturing_cycle() {
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let weak = Arc::downgrade(&store);
+        // The callback CAPTURES the store Arc — the exact cycle.
+        let captured = Arc::clone(&store);
+        let sub = store.subscribe_floors_raised(move |_raised| {
+            let _keep = &captured;
+        });
+        // Dropping the external guard removes the callback, releasing its
+        // captured `Arc<store>`; then the last external handle drops.
+        drop(sub);
+        drop(store);
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping the external guard must break the callback→store cycle so the store frees",
+        );
+    }
+
+    /// R3-4: a callback that drops its OWN guard from inside the callback
+    /// must not deadlock. `kill_and_drain` excludes this thread's own
+    /// in-flight frame (via the thread-local lease tracking), so it does
+    /// not wait for the frame that is dropping it; that frame's
+    /// `LeaveOnDrop` performs the final retirement.
+    ///
+    /// Red-witness: reverting `kill_and_drain` to wait for `in_flight == 0`
+    /// unconditionally deadlocks the self-dropping callback, so the worker
+    /// never signals and the bounded `recv_timeout` expires.
+    #[test]
+    fn a_callback_can_drop_its_own_guard_without_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let scratch = Scratch::new();
+        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        // The guard lives in a slot the callback takes + drops from inside.
+        let slot: Arc<Mutex<Option<RaiseSubscription>>> = Arc::new(Mutex::new(None));
+        let slot_cb = Arc::clone(&slot);
+        let sub = store.subscribe_floors_raised(move |_raised| {
+            // Self-unsubscribe: drop this subscription's own guard.
+            let _dropped = slot_cb.lock().take();
+        });
+        *slot.lock() = Some(sub);
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let store_t = Arc::clone(&store);
+        let worker = std::thread::spawn(move || {
+            store_t
+                .apply_bundle(&bundle_with_floor(5))
+                .expect("apply 5");
+            done_tx.send(()).expect("signal done");
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a callback dropping its own guard must not deadlock",
+        );
+        worker.join().expect("worker joined");
+        assert_eq!(
+            store.subscriber_count(),
+            0,
+            "the self-drop removed the subscription",
         );
     }
 
@@ -2641,7 +2737,7 @@ mod tests {
 
         let seen: Arc<Mutex<Vec<RaisedFloor>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        store.set_on_floors_raised(move |raised| {
+        let _sub = store.subscribe_floors_raised(move |raised| {
             sink.lock().extend_from_slice(raised);
         });
 
@@ -2900,7 +2996,7 @@ mod tests {
         let reentered = Arc::new(Mutex::new(false));
         let store_for_callback = Arc::downgrade(&store);
         let flag = reentered.clone();
-        store.set_on_floors_raised(move |raised| {
+        let _sub = store.subscribe_floors_raised(move |raised| {
             // Re-enter once, from the first raise only.
             if raised.iter().any(|(_, _, floor)| *floor == 5) {
                 if let Some(store) = store_for_callback.upgrade() {
