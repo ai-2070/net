@@ -5823,6 +5823,25 @@ impl MeshNode {
             .map(|e| e.value().clone())
     }
 
+    /// OA-2 (E0.3): resolve the DIRECT-session caller entity for a protected
+    /// admission — the AEAD-authenticated session peer for `from_node` whose
+    /// PINNED origin equals the wire-`claimed_origin_hash`. Binds the
+    /// authenticated identity to the claimed routing origin: loopback
+    /// (`from_node == 0`), an unpinned peer, and an origin/peer mismatch are all
+    /// refused, so a peer cannot admit under its OWN proof while stamping a
+    /// victim's origin into the frame (split authenticated/claimed identity).
+    pub(crate) fn resolve_direct_caller(
+        &self,
+        from_node: u64,
+        claimed_origin_hash: u64,
+    ) -> Result<EntityId, super::behavior::caller_identity::CallerIdentityError> {
+        super::behavior::caller_identity::resolve_direct_caller(
+            &self.peer_entity_ids,
+            from_node,
+            claimed_origin_hash,
+        )
+    }
+
     /// The peer's socket address, if we have an active session
     /// with them. Used by the migration subprotocol to route
     /// orchestrator-originated messages (e.g. `TakeSnapshot`) to

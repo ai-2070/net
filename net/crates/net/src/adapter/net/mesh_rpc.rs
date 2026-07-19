@@ -922,20 +922,28 @@ async fn admit_and_dispatch_protected(
         return;
     }
 
-    // E0.3: protected calls are DIRECT-SESSION-ONLY. Loopback (`from_node == 0`)
-    // and a peer with no pinned session entity have no authenticated caller
-    // identity, so they cannot be admitted.
-    let Some(caller) = mesh.peer_entity_id(from_node) else {
-        emit_admission_denial(
-            mesh,
-            service,
-            claimed_origin,
-            call_id,
-            from_node,
-            CoarseAdmissionReason::Denied,
-        )
-        .await;
-        return;
+    // E0.3 (Kyra #47 B1): resolve the DIRECT-session caller AND bind the
+    // authenticated session entity's origin to the wire-claimed origin. Loopback
+    // (`from_node == 0`), an unpinned peer, and — critically — a pinned peer
+    // whose origin != the claimed origin are all refused. Without this binding a
+    // peer could admit under its OWN proof while stamping a victim's origin into
+    // both packet and payload, splitting `org_admission.caller` (authenticated
+    // peer) from `RpcContext::caller_origin` (attacker-selected) and aiming the
+    // response at the victim.
+    let caller = match mesh.resolve_direct_caller(from_node, claimed_origin) {
+        Ok(caller) => caller,
+        Err(_) => {
+            emit_admission_denial(
+                mesh,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                CoarseAdmissionReason::Denied,
+            )
+            .await;
+            return;
+        }
     };
 
     // E1.2: the PROVIDER must itself hold the capability. `has_local_capability`
@@ -7017,6 +7025,128 @@ mod roster_fallback_tests {
         assert_ne!(
             admitted.acting_org, admitted.provider_org,
             "cross-org: A and B are distinct",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kyra #47 B1: the gate binds the AUTHENTICATED session entity's origin to
+    /// the wire-claimed origin. A pinned peer with a VALID proof for itself, but
+    /// stamping a DIFFERENT origin (packet == payload == victim) into the frame,
+    /// is DENIED — split authenticated/claimed identity cannot reach the handler
+    /// (nor aim a response at the victim). A correctly-stamped follow-up admits,
+    /// so `admits == 1` at the FIFO barrier proves the mismatched call was denied.
+    #[tokio::test]
+    async fn protected_gate_binds_authenticated_identity_to_claimed_origin() {
+        use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-b1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0x99;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        let victim_origin = caller_origin ^ 0xFFFF_FFFF; // a DIFFERENT origin
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let intent = OrgProofIntent {
+            caller: std::sync::Arc::new(caller_kp),
+            membership,
+            dispatcher,
+            capability_grant: None,
+            acting_org: org_b.org_id(),
+            provider_owner_org: org_b.org_id(),
+            provider: node_entity.clone(),
+            capability: cap,
+            proof_ttl_secs: 30,
+        };
+        // A valid self-proof for `intent` at `call_id`, stamped with `frame_origin`.
+        let frame = |call_id: u64, frame_origin: u64| {
+            let mut req = RpcRequestPayload {
+                service: "svc".to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: vec![],
+                body: Bytes::from_static(b"ping"),
+            };
+            req.headers
+                .push(sign_admission_proof(&intent, call_id, &req).expect("sign"));
+            let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, frame_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut f, 0);
+            f.extend_from_slice(&req.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: frame_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(f),
+            }
+        };
+
+        // Split identity (valid self-proof, VICTIM origin stamped) → denied.
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, frame(1, victim_origin)));
+        // Honest (matched origin) → admitted; the FIFO barrier for the deny.
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, frame(2, caller_origin)));
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 1).await,
+            "the origin-matched call is admitted",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            1,
+            "the origin-mismatched call was denied — the handler stayed dark",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
