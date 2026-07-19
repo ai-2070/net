@@ -50,7 +50,7 @@ use crate::adapter::net::cortex::{
 };
 use crate::error::AdapterError;
 
-use super::behavior::org::{current_timestamp, OrgId, OrgMembershipCert};
+use super::behavior::org::{OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
@@ -3716,6 +3716,16 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<ClientStreamCallRaw, RpcError> {
+        // Org admission is unary-only (E1.8): a proof intent on a streaming call
+        // shape is a caller error, never a silently-ignored security intent.
+        if opts.org_proof_intent.is_some() {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
+                          protected service"
+                    .to_string(),
+            });
+        }
         // `request_window_initial = Some(0)` would deadlock the
         // caller: every `send` awaits a credit, but the initial
         // REQUEST is lazy (not emitted until the first send), so
@@ -4027,6 +4037,16 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<DuplexCallRaw, RpcError> {
+        // Org admission is unary-only (E1.8): a proof intent on a streaming call
+        // shape is a caller error, never a silently-ignored security intent.
+        if opts.org_proof_intent.is_some() {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
+                          protected service"
+                    .to_string(),
+            });
+        }
         // Same deadlock guard as `call_client_stream`: Some(0)
         // means "send must await a credit that can never arrive"
         // because the initial REQUEST is lazy.
@@ -4143,6 +4163,16 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcStream, RpcError> {
+        // Org admission is unary-only (E1.8): a proof intent on a streaming call
+        // shape is a caller error, never a silently-ignored security intent.
+        if opts.org_proof_intent.is_some() {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
+                          protected service"
+                    .to_string(),
+            });
+        }
         // `stream_window_initial = Some(0)` would deadlock the
         // RESPONSE direction by default: server's pump awaits one
         // credit per chunk, the caller's auto-grant only fires on
@@ -5125,18 +5155,43 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// the shared [`org_request_digest`], which strips any admission header, so the
 /// caller signing and the provider verifying derive the SAME digest) under the
 /// caller's [`OrgProofIntent`]. Returns the single header the caller appends.
+/// Ceiling on a caller-supplied org-admission proof TTL (Kyra #47 tail). A
+/// per-call proof is short-lived; capping it locally bounds how long a captured
+/// proof can be replayed within the provider's retention window.
+const MAX_ORG_PROOF_TTL_SECS: u64 = 300;
+
 fn sign_admission_proof(
     intent: &OrgProofIntent,
     call_id: u64,
     req: &RpcRequestPayload,
 ) -> Result<(String, Vec<u8>), RpcError> {
+    // The intent's capability must match the invoked service (`nrpc:<service>`),
+    // else the provider would deny `CapabilityMismatch` — fail the caller locally
+    // (Kyra #47 tail).
+    let expected = CapabilityAuthorityId::for_tag(&format!("nrpc:{}", req.service));
+    if intent.capability != expected {
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: intent capability does not match the invoked service `{}`",
+                req.service
+            ),
+        });
+    }
     let digest = org_request_digest(req).map_err(|e| RpcError::Codec {
         direction: CodecDirection::Encode,
         message: format!("org admission: request digest failed: {e}"),
     })?;
-    let expiry = current_timestamp()
-        .saturating_add(intent.proof_ttl_secs)
-        .saturating_mul(1_000_000_000);
+    // Bound the TTL and derive the expiry from a NANOSECOND base (Kyra #47 tail):
+    // `current_timestamp()` is whole seconds, so `secs * 1e9` truncates the
+    // sub-second remainder and expires a proof up to ~1s early; a nanosecond
+    // `now` avoids that, and the ceiling caps how long a captured proof lives.
+    let ttl_secs = intent.proof_ttl_secs.min(MAX_ORG_PROOF_TTL_SECS);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let expiry = now_ns.saturating_add(ttl_secs.saturating_mul(1_000_000_000));
     let proof = OrgCallProof::sign_for_call(
         &intent.caller,
         intent.membership.clone(),
@@ -6700,6 +6755,52 @@ mod roster_fallback_tests {
             0,
             "the over-cap failure must not leak a pending entry",
         );
+    }
+
+    /// Kyra #47 tail (caller/API): a proof intent is REFUSED on every streaming
+    /// call shape (org admission is unary-only, E1.8 — never silently ignored),
+    /// and an intent whose capability does not match the invoked service fails
+    /// LOCALLY (before it can reach a provider as a CapabilityMismatch denial).
+    #[tokio::test]
+    async fn org_proof_intent_rejected_on_streaming_and_capability_mismatch() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        const TARGET: u64 = 0xDEAD_BEEF;
+        let server = build_server().await;
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        let intent_opts = || CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider.clone(),
+            )),
+            ..Default::default()
+        };
+
+        // Streaming shapes refuse a proof intent up front.
+        assert!(matches!(
+            server
+                .call_streaming(TARGET, "svc", Bytes::new(), intent_opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
+        assert!(matches!(
+            server.call_client_stream(TARGET, "svc", intent_opts()).await,
+            Err(RpcError::Codec { .. })
+        ));
+        assert!(matches!(
+            server.call_duplex(TARGET, "svc", intent_opts()).await,
+            Err(RpcError::Codec { .. })
+        ));
+
+        // The intent's capability is `nrpc:svc`; invoking a DIFFERENT service is
+        // a local capability mismatch.
+        assert!(matches!(
+            server
+                .call(TARGET, "other", Bytes::from_static(b"x"), intent_opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
     }
 
     /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
