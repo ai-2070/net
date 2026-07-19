@@ -1,6 +1,6 @@
-//! `net org (keygen|issue-cert|issue-floors|grant-dispatcher)` —
-//! organization root authority authoring (OA-1 belonging + OA-2 grant
-//! issuance, `ORG_CAPABILITY_AUTH_PLAN.md`).
+//! `net org (keygen|issue-cert|issue-floors|grant-dispatcher|
+//! grant-capability)` — organization root authority authoring (OA-1
+//! belonging + OA-2 grant issuance, `ORG_CAPABILITY_AUTH_PLAN.md`).
 //!
 //! The org root key is OFFLINE key material: it lives on an
 //! operator machine, signs membership certificates and
@@ -25,8 +25,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use net_sdk::org::{
-    CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant, OrgKeypair, OrgMembershipCert,
-    OrgRevocationBundle, ORG_CERT_TTL_SECS_RECOMMENDED,
+    CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
+    OrgDispatcherGrant, OrgId, OrgKeypair, OrgMembershipCert, OrgRevocationBundle,
+    ORG_CERT_TTL_SECS_RECOMMENDED,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,12 @@ pub enum OrgCommand {
     /// one is never invocation authority — the provider still
     /// verifies the full per-call proof.
     GrantDispatcher(GrantDispatcherArgs),
+    /// Issue a capability grant: "org <grantee> holds <rights> on
+    /// <capability> over <target>", signed by THIS (provider) org.
+    /// B -> A cross-org access. With --discover a fresh audience
+    /// secret is minted and written 0600; only its commitment rides
+    /// in the signed grant (the raw key never touches the wire).
+    GrantCapability(GrantCapabilityArgs),
 }
 
 #[derive(Args, Debug)]
@@ -184,12 +191,72 @@ pub struct GrantDispatcherArgs {
     pub insecure_permissions: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct GrantCapabilityArgs {
+    /// Path to the org root key file for the ISSUING (provider) org B
+    /// — the grant is signed by THIS org.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+
+    /// The grantee org id (OrgId of org A, 64 hex chars, optional
+    /// `0x`).
+    #[arg(long = "grantee-org")]
+    pub grantee_org: String,
+
+    /// The capability tag being granted, e.g. `nrpc:my-service`.
+    #[arg(long)]
+    pub capability: String,
+
+    /// Grant INVOKE rights (call the capability).
+    #[arg(long)]
+    pub invoke: bool,
+
+    /// Grant DISCOVER rights (privately find B-owned providers of the
+    /// capability). Requires `--audience-out`: a fresh audience
+    /// secret is minted and written 0600.
+    #[arg(long)]
+    pub discover: bool,
+
+    /// Target an EXACT provider node by entity id (64 hex chars).
+    /// Mutually exclusive with `--target-any-owned-by`.
+    #[arg(long = "target-node")]
+    pub target_node: Option<String>,
+
+    /// Target ANY node owned by this org id (64 hex chars). Mutually
+    /// exclusive with `--target-node`.
+    #[arg(long = "target-any-owned-by")]
+    pub target_any_owned_by: Option<String>,
+
+    /// Grant TTL in seconds. Defaults to 7 days; hard-capped at 30
+    /// days (rejected at issue AND at every verifier).
+    #[arg(long = "ttl-secs", default_value_t = GRANT_TTL_SECS_DEFAULT)]
+    pub ttl_secs: u64,
+
+    /// Output path for the grant JSON.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Output path for the minted audience secret (written 0600).
+    /// REQUIRED with `--discover`; rejected without it.
+    #[arg(long = "audience-out", value_name = "PATH")]
+    pub audience_out: Option<PathBuf>,
+
+    /// Overwrite existing output files. Refuses by default.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Allow permissive org-key file modes on Unix.
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
 pub async fn run(cmd: OrgCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
     match cmd {
         OrgCommand::Keygen(args) => run_keygen(args, output).await,
         OrgCommand::IssueCert(args) => run_issue_cert(args, output).await,
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
         OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
+        OrgCommand::GrantCapability(args) => run_grant_capability(args, output).await,
     }
 }
 
@@ -388,6 +455,134 @@ async fn run_grant_dispatcher(
 }
 
 // =========================================================================
+// grant-capability
+// =========================================================================
+
+async fn run_grant_capability(
+    args: GrantCapabilityArgs,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let issuer = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let grantee_org = parse_org_hex(&args.grantee_org)?;
+    let capability = CapabilityAuthorityId::for_tag(&args.capability);
+
+    // Rights: at least one of --invoke / --discover.
+    let rights = match (args.invoke, args.discover) {
+        (false, false) => {
+            return Err(invalid_args(
+                "at least one of --invoke or --discover is required",
+            ))
+        }
+        (true, false) => GrantRights::INVOKE,
+        (false, true) => GrantRights::DISCOVER,
+        (true, true) => GrantRights::INVOKE.union(GrantRights::DISCOVER),
+    };
+    let mut rights_labels = Vec::new();
+    if args.invoke {
+        rights_labels.push("invoke");
+    }
+    if args.discover {
+        rights_labels.push("discover");
+    }
+
+    // Audience-secret discipline: an audience file is minted iff
+    // --discover, so require --audience-out exactly then.
+    match (args.discover, &args.audience_out) {
+        (true, None) => return Err(invalid_args(
+            "--discover requires --audience-out <PATH> (where to write the minted audience secret)",
+        )),
+        (false, Some(_)) => {
+            return Err(invalid_args(
+                "--audience-out is only valid with --discover (no secret is minted otherwise)",
+            ))
+        }
+        _ => {}
+    }
+
+    // Target: exactly one of --target-node / --target-any-owned-by.
+    let (target_scope, target_label) = match (&args.target_node, &args.target_any_owned_by) {
+        (Some(entity_hex), None) => {
+            let entity = parse_entity_hex(entity_hex)?;
+            let label = format!("node:{}", hex::encode(entity.as_bytes()));
+            (GrantTargetScope::ExactNode(entity), label)
+        }
+        (None, Some(org_hex)) => {
+            let org = parse_org_hex(org_hex)?;
+            let label = format!("any-owned-by:{}", hex::encode(org.as_bytes()));
+            (GrantTargetScope::AnyNodeOwnedBy(org), label)
+        }
+        (Some(_), Some(_)) => {
+            return Err(invalid_args(
+                "--target-node and --target-any-owned-by are mutually exclusive",
+            ))
+        }
+        (None, None) => {
+            return Err(invalid_args(
+                "one of --target-node <entity> or --target-any-owned-by <org> is required",
+            ))
+        }
+    };
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &issuer,
+        grantee_org,
+        capability,
+        rights,
+        target_scope,
+        args.ttl_secs,
+    )
+    .map_err(|e| invalid_args(format!("grant-capability: {e}")))?;
+
+    // Refuse existing outputs BEFORE writing either, so a partial run
+    // never leaves a grant without its secret (or the reverse).
+    refuse_existing(&args.out, args.force).await?;
+    if let Some(audience_out) = &args.audience_out {
+        refuse_existing(audience_out, args.force).await?;
+    }
+
+    // Write the minted audience secret 0600 (present iff --discover;
+    // mirrors the OA-1 owner-audience.key publish). The raw discovery
+    // key lives ONLY in this file — never in the grant, never on the
+    // wire.
+    let audience_out_label = match secret {
+        Some(secret) => {
+            let audience_out = args
+                .audience_out
+                .as_ref()
+                .expect("--discover requires --audience-out (validated above)");
+            write_secret_file(audience_out, &secret.encode_config()).await?;
+            Some(audience_out.display().to_string())
+        }
+        None => None,
+    };
+
+    write_json_envelope(
+        &args.out,
+        &OrgCapabilityGrantFile {
+            version: ORG_FILE_VERSION,
+            grant: grant.clone(),
+        },
+    )
+    .await?;
+
+    let summary = GrantCapabilityOutput {
+        path: args.out.display().to_string(),
+        audience_out: audience_out_label,
+        grant_id_hex: hex::encode(grant.grant_id),
+        issuer_org_hex: hex::encode(grant.issuer_org.as_bytes()),
+        grantee_org_hex: hex::encode(grant.grantee_org.as_bytes()),
+        capability: args.capability.clone(),
+        rights: rights_labels.join(","),
+        target: target_label,
+        not_before: grant.not_before,
+        not_after: grant.not_after,
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &summary)
+        .map_err(|e| generic(format!("write summary: {e}")))?;
+    Ok(())
+}
+
+// =========================================================================
 // Disk shapes
 // =========================================================================
 
@@ -426,6 +621,16 @@ pub(crate) struct OrgDispatcherGrantFile {
     pub(crate) grant: OrgDispatcherGrant,
 }
 
+/// Versioned JSON envelope for a capability grant (the grant renders
+/// as hex of its canonical 318-byte wire form). The signed grant
+/// carries only the audience-key COMMITMENT — never the raw key.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrgCapabilityGrantFile {
+    pub(crate) version: u32,
+    pub(crate) grant: OrgCapabilityGrant,
+}
+
 #[derive(Debug, Serialize)]
 struct OrgKeySummary {
     path: String,
@@ -459,6 +664,21 @@ struct GrantDispatcherOutput {
     org_id_hex: String,
     dispatcher_hex: String,
     capability: String,
+    not_before: u64,
+    not_after: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GrantCapabilityOutput {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audience_out: Option<String>,
+    grant_id_hex: String,
+    issuer_org_hex: String,
+    grantee_org_hex: String,
+    capability: String,
+    rights: String,
+    target: String,
     not_before: u64,
     not_after: u64,
 }
@@ -505,6 +725,41 @@ async fn load_org_key(path: &Path, insecure_permissions: bool) -> Result<OrgKeyp
         )));
     }
     Ok(keypair)
+}
+
+/// Parse a 32-byte org id from hex (optional `0x` prefix).
+fn parse_org_hex(s: &str) -> Result<OrgId, CliError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes =
+        hex::decode(s).map_err(|e| invalid_args(format!("org id is not valid hex: {e}")))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        invalid_args(format!(
+            "org id must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(OrgId::from_bytes(arr))
+}
+
+/// Atomically publish a SECRET file at mode 0600 (same discipline as
+/// the org root key and the OA-1 `owner-audience.key`) — the raw
+/// audience key must never be world-readable, even transiently.
+async fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                generic(format!(
+                    "failed to create parent directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("tmp.{pid}"));
+    write_identity_atomically(&tmp, path, bytes).await?;
+    enforce_strict_permissions(path).await?;
+    Ok(())
 }
 
 async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
