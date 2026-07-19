@@ -7465,8 +7465,17 @@ impl MeshNode {
                     if shutdown.load(Ordering::Acquire) {
                         return;
                     }
-                    let baseline = node.user_caps_snapshot();
-                    if let Err(e) = node.announce_capabilities(baseline).await {
+                    // Rebuild from the CURRENT live baseline (`None`), never a
+                    // captured snapshot: a captured baseline would reintroduce the
+                    // RT-3 stale-baseline race — a concurrent explicit announce's
+                    // newer baseline could be clobbered when this task resumes and
+                    // republishes its stale copy (Kyra OA3-4b1 B2). `None` re-reads
+                    // the live user baseline at publish time. The default 300s TTL
+                    // matches the prior call's behavior.
+                    if let Err(e) = node
+                        .announce_from_baseline(None, Duration::from_secs(300), true)
+                        .await
+                    {
                         tracing::warn!(
                             error = %e,
                             "authority install: post-install re-announce failed"
