@@ -1,8 +1,10 @@
 # OA2-E Live Integration — Design v3
 
-**Status (2026-07-18):** the design of record. E0 substrate + E1
-provider-admission PRIMITIVES are IMPLEMENTED (E1 primitives unwired); the
-E1 **live wiring** (`#47`) remains HELD pending two review gates.
+**Status (2026-07-19):** the design of record. E0 substrate, the E1
+provider-admission primitives, AND the E1 **live wiring** + E2 caller seam
+(`#47`) are all IMPLEMENTED and **SIGNED OFF / CLOSED** (Kyra, `512cd1588`);
+**OA2-F** (CLI/SDK grant management + the §2.6 exit-gate closure witnesses) is
+landed. Gates 1–3 are all SIGNED OFF.
 
 The design body below is unchanged as the specification; see the
 **Progress ledger** for what has landed and the live gate state.
@@ -14,10 +16,10 @@ the OA-1 gate:**
   signed off (E0.1/E0.2/E0.3/E0.4). It enabled no organization authority
   and did not wait on OA-1.
 - **OA2-E1 / OA2-E2** (provider admission + caller/wire) — the primitives
-  are landed UNWIRED; the live wiring (`#47`) is HELD until BOTH Gate 1
-  (OA-1 revocation store) and Gate 3 (E0/nRPC) are re-signed (see ledger).
+  AND the live wiring (`#47`) are landed and **SIGNED OFF / CLOSED**; both
+  Gate 1 (OA-1 revocation store) and Gate 3 (E0/nRPC) are re-signed.
 
-## Progress ledger (2026-07-18, branch `org-capability-auth`)
+## Progress ledger (2026-07-19, branch `org-capability-auth`)
 
 `may_execute` (`capability_bridge.rs`) is **byte-for-byte unchanged**
 across the entire series; every fix carries a red-witnessed test.
@@ -30,12 +32,12 @@ across the entire series; every fix carries a red-witnessed test.
   E0.4 one wall+monotonic `ClockSample`. Plus E0-Fix1 captured-service
   equality, Fix2 token-owned service retirement, Fix3 seven-frame
   collision witness.
-- **E1 primitives (UNWIRED)** — E1.1/E1.3 `RegisteredRpcService` +
+- **E1 primitives** — E1.1/E1.3 `RegisteredRpcService` +
   `verify_provider_authority`/`ProviderFacts`; E1.4 admission stamp +
   §9.5 stability hook; E1.5 per-caller replay ceiling; E1.7 shared
   canonical request digest (`org_admission_gate.rs`). Provider-local
-  admission engine `verify_org_admission` (`org_admission.rs`) present,
-  unwired. Nothing calls into a live serve path.
+  admission engine `verify_org_admission` (`org_admission.rs`). Now
+  LIVE-WIRED through `serve_rpc_protected` + the unary bridge (`#47`).
 - **Closure series** (all review-driven, red-witnessed, per-item commits):
   KC1–KC10, NC1–NC5, the AV series (8 commits), R2-1..R2-7 (5 commits),
   R3-1..R3-4 (4 commits, `e6b7925a5..fda5e2ed0`).
@@ -490,16 +492,16 @@ credential oracle.
 - [x] Witnesses 1–9; gates (fmt, both clippy, full suites). Plus the
       E0-Fix1/2/3 closures and the R3-1 session-scoped REQUEST_GRANT
       closure.
-- [ ] Gate 3 (E0/nRPC) RE-SIGNED after R3-1 — **awaiting Kyra**.
+- [x] Gate 3 (E0/nRPC) RE-SIGNED after R3-1 — **SIGNED OFF (Kyra)**.
 
-**OA2-E1 / E2 gate (behind the org-authority gates):**
+**OA2-E1 / E2 gate:**
 
-- [ ] Gate 1: OA-1 revocation store re-signed — closures R3-2/3/4 landed,
-      **awaiting Kyra**.
+- [x] Gate 1: OA-1 revocation store re-signed — closures R3-2/3/4 landed —
+      **SIGNED OFF (Kyra)**.
 - [x] Gate 2: OA2-A–E-partial primitives audited — **SIGNED OFF**.
-- [ ] Gate 3: OA2-E0 landed and reviewed — R3-1 landed, **awaiting Kyra**.
+- [x] Gate 3: OA2-E0 landed and reviewed — R3-1 landed — **SIGNED OFF (Kyra)**.
 
-**OA2-E1 primitives (landed UNWIRED):**
+**OA2-E1 primitives (landed as primitives, since live-wired by `#47`):**
 
 - [x] Registration-owned policy (`RegisteredRpcService`, E1.1); live
       self-verify (`verify_provider_authority`/`ProviderFacts`, E1.3);

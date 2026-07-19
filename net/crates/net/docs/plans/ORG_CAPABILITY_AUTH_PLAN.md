@@ -18,8 +18,8 @@ types are structurally non-serializable.
   revocation-store hardening is Gate 1 of the OA-2 admission gates; its
   latest closures (R3-2 poison survives sidecar recreation, R3-3
   existing-handle sidecar-identity check, R3-4 externally-owned
-  subscription + safe self-unsubscription) are landed and **awaiting the
-  Gate-1 re-sign**.
+  subscription + safe self-unsubscription) are landed and **Gate 1 —
+  SIGNED OFF (Kyra)**.
 - **OA-2** — internal + cross-org admission is IMPLEMENTED end to end. The
   nRPC **E0 substrate** (registration, channel/service equality, RpcRouteV1
   discriminator, direct-session identity, one clock sample) is landed (Gate 3);
@@ -233,15 +233,21 @@ corrupt bundle → last-good retained. Stop. Review.
 
 ## OA-2 — internal and cross-org admission (stop and review)
 
-> **Implementation note (2026-07-18):** §§2.1–2.5 are implemented as
-> self-contained, UNWIRED modules — `behavior/org_grant.rs` (§2.1–2.2),
-> `behavior/org_call.rs` (§2.3), `behavior/org_admission_replay.rs` (§2.5),
-> `behavior/org_admission.rs` (§2.4 `verify_org_admission`), and
-> `adapter/net/org_admission_gate.rs` (E1 provider self-verify + canonical
-> digest + admission stamp). Nothing calls them from a live serve path.
-> Their audit is **Gate 2 — SIGNED OFF**. The §2.4a registration/gate seam
-> is designed but its live wiring is the HELD `#47` unit (see the top-of-
-> file status and `OA2E_INTEGRATION_DESIGN.md`). §2.6 is not yet exercised.
+> **Implementation note (2026-07-19):** §§2.1–2.5 landed as
+> `behavior/org_grant.rs` (§2.1–2.2), `behavior/org_call.rs` (§2.3),
+> `behavior/org_admission_replay.rs` (§2.5), `behavior/org_admission.rs`
+> (§2.4 `verify_org_admission`), and `adapter/net/org_admission_gate.rs` (E1
+> provider self-verify + canonical digest + admission stamp); their audit is
+> **Gate 2 — SIGNED OFF**. The §2.4a registration/gate seam is LIVE-WIRED
+> through `serve_rpc_protected` + the unary bridge (internally `#47`, **SIGNED
+> OFF / CLOSED** 2026-07-19, `512cd1588`), with live two-node witnesses in
+> `tests/integration_nrpc_protected.rs`. §2.6 is EXERCISED: golden vectors,
+> grant matrices (incl. `rights ⊇ DISCOVER ⇔ binding` + the `AnyNodeOwnedBy`
+> owner rule), binding transplant, replay, header/streaming/reason mapping, the
+> no-`discovery_key` byte-scan, and the installed-secret commitment mismatch
+> (`tests/org_admission_wire.rs` plus the `org_grant` / `org_call` units).
+> **OA2-F** (CLI/SDK grant management) is landed. See the top-of-file status and
+> `OA2E_INTEGRATION_DESIGN.md`.
 
 ### 2.1 `CapabilityAuthorityId` — as v1.1
 
