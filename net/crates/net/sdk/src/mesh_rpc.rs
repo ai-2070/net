@@ -31,7 +31,7 @@ pub use net::adapter::net::cortex::{
 };
 pub use net::adapter::net::mesh_rpc::{
     CallOptions, ClientStreamCallRaw, CodecDirection, DuplexCallRaw, DuplexSink, DuplexStream,
-    RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
+    OrgProofIntent, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
 };
 pub use net::adapter::net::mesh_rpc_metrics::{
     RpcMetricsSnapshot, ServiceMetrics, DEFAULT_LATENCY_BUCKETS_SECS,
@@ -1422,5 +1422,56 @@ where
                 code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })
+    }
+}
+
+#[cfg(test)]
+mod org_proof_intent_sdk_reexport {
+    //! Kyra #47 tail: `OrgProofIntent` is reachable through the SDK facade
+    //! (`net_mesh_sdk::mesh_rpc::OrgProofIntent`) — being `pub` in the lower
+    //! `net::adapter::net::mesh_rpc` module does NOT expose it here without the
+    //! explicit `pub use`. This is a compile-time proof of the re-export plus a
+    //! real construction that installs the intent on the SDK-facing
+    //! [`CallOptions::org_proof_intent`] field.
+
+    // Named through the SDK facade (`crate::mesh_rpc`), NOT the lower `net::`
+    // path — this line only compiles if the re-export exists.
+    use super::{CallOptions, OrgProofIntent};
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use net::adapter::net::behavior::org_grant::{
+        CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+    };
+    use net::adapter::net::identity::{EntityId, EntityKeypair};
+    use std::sync::Arc;
+
+    #[test]
+    fn org_proof_intent_constructs_through_sdk_facade() {
+        let org = OrgKeypair::from_bytes([0x42u8; 32]);
+        let caller = EntityKeypair::generate();
+        let caller_entity = caller.entity_id().clone();
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let membership =
+            OrgMembershipCert::try_issue(&org, caller_entity.clone(), 1, 3600).expect("cert");
+        let dispatcher =
+            OrgDispatcherGrant::try_issue(&org, caller_entity, DispatcherScope::Exact(cap), 3600)
+                .expect("dispatcher");
+        let intent = OrgProofIntent {
+            caller: Arc::new(caller),
+            membership,
+            dispatcher,
+            capability_grant: None,
+            acting_org: org.org_id(),
+            provider_owner_org: org.org_id(),
+            provider: EntityId::from_bytes([0x99u8; 32]),
+            capability: cap,
+            proof_ttl_secs: 30,
+        };
+        // Install it on the SDK-facing CallOptions field — the whole point of
+        // the re-export is that an SDK consumer can do exactly this.
+        let opts = CallOptions {
+            org_proof_intent: Some(intent),
+            ..Default::default()
+        };
+        assert!(opts.org_proof_intent.is_some());
     }
 }
