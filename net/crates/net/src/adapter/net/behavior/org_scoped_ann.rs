@@ -38,7 +38,7 @@ use chacha20poly1305::{
 };
 
 use super::org::{OrgId, OrgMembershipCert};
-use crate::adapter::net::identity::EntityId;
+use crate::adapter::net::identity::{EntityId, EntityKeypair};
 use crate::adapter::net::protocol::MAX_PACKET_SIZE;
 
 /// Signing domain for the scoped announcement's OUTER signature by the
@@ -128,8 +128,16 @@ pub enum ScopedAnnouncementError {
     /// reason is not a decryption oracle.
     SealOpenFailed,
     /// A structurally malformed input (e.g. a ciphertext shorter than the AEAD
-    /// tag).
+    /// tag, a bad version byte, a length that does not add up, or an
+    /// undecodable inline `owner_cert`).
     InvalidFormat,
+    /// The envelope's OUTER provider signature did not verify over the exact
+    /// encoded bytes. A single opaque variant — never a per-field oracle.
+    SignatureInvalid,
+    /// A GRANTED-audience envelope was asked to carry the reserved all-zero
+    /// grant id (which is exclusively the OWNER-audience sentinel). Distinct
+    /// builders prevent the two audiences from ever being confused.
+    ReservedGrantId,
 }
 
 impl std::fmt::Display for ScopedAnnouncementError {
@@ -143,8 +151,14 @@ impl std::fmt::Display for ScopedAnnouncementError {
                 f.write_str("scoped-announcement AEAD open failed")
             }
             ScopedAnnouncementError::InvalidFormat => {
-                f.write_str("scoped-announcement ciphertext is malformed")
+                f.write_str("scoped-announcement encoding is malformed")
             }
+            ScopedAnnouncementError::SignatureInvalid => {
+                f.write_str("scoped-announcement outer provider signature did not verify")
+            }
+            ScopedAnnouncementError::ReservedGrantId => f.write_str(
+                "a granted scoped announcement cannot use the reserved zero grant id (owner sentinel)",
+            ),
         }
     }
 }
@@ -266,6 +280,460 @@ pub fn open_descriptor(
         },
     )
     .map_err(|_| ScopedAnnouncementError::SealOpenFailed)
+}
+
+/// Wire-format version byte at the head of a serialized
+/// [`ScopedCapabilityAnnouncement`]. Producers always emit `1`; decoders reject
+/// any other value — there is no fallback probing (a format change bumps this
+/// byte and [`SCOPED_ANN_SIG_DOMAIN`] together).
+pub const SCOPED_ANN_WIRE_VERSION: u8 = 1;
+
+/// Length of the encoded envelope up to and including the `ciphertext_len`
+/// field — every fixed field before the variable ciphertext. The ciphertext and
+/// the trailing 64-byte signature follow.
+const SCOPED_ANN_PREFIX_LEN: usize = 1        // version
+    + 32                                       // provider
+    + 32                                       // owner_org
+    + OrgMembershipCert::WIRE_SIZE             // owner_cert (156)
+    + 32                                       // audience_handle
+    + 32                                       // grant_id
+    + 8                                        // generation (LE u64)
+    + 8                                        // expires_at (LE u64)
+    + SCOPED_ANN_NONCE_SIZE                    // nonce (24)
+    + 2; // ciphertext_len (LE u16)
+
+// The prefix plus the 64-byte signature is exactly the fixed overhead used in
+// OA3-1b to derive the plaintext cap — the two derivations must agree.
+const _: () = assert!(
+    SCOPED_ANN_PREFIX_LEN + 64 == SCOPED_ANN_FIXED_OVERHEAD,
+    "envelope prefix + signature must equal the fixed overhead"
+);
+
+/// An **outer-signature-authenticated** grant-scoped capability announcement
+/// (§3.1). The descriptor is sealed to exactly one audience under the AEAD of
+/// OA3-1b; the cleartext framing that routes the envelope is bound into that
+/// seal as associated data AND signed by the publishing provider P.
+///
+/// # Verified-by-construction invariant
+///
+/// Holding a value of this type means P's ed25519 signature over the exact
+/// encoded bytes (every field but the signature) verified — either we just
+/// built and signed it, or [`Self::from_bytes`] verified it. There is NO public
+/// constructor that skips signature verification, so an unverified value can
+/// never be confused with a verified one. It does NOT mean the inline
+/// `owner_cert`, revocation floors, freshness, or the sealed descriptor have
+/// been checked — those are ingest-authority concerns (OA3-3), performed via the
+/// accessors and [`Self::open_with`] below.
+#[derive(Clone)]
+pub struct ScopedCapabilityAnnouncement {
+    provider: EntityId,
+    owner_org: OrgId,
+    owner_cert: OrgMembershipCert,
+    audience_handle: [u8; 32],
+    grant_id: [u8; 32],
+    generation: u64,
+    expires_at: u64,
+    nonce: [u8; SCOPED_ANN_NONCE_SIZE],
+    ciphertext: Vec<u8>,
+    signature: [u8; 64],
+}
+
+impl ScopedCapabilityAnnouncement {
+    /// Build, seal, and sign an **owner-audience** envelope: `grant_id` is fixed
+    /// to the reserved zero sentinel ([`OWNER_AUDIENCE_GRANT_SENTINEL`]), both in
+    /// the envelope and in the AEAD associated data. `provider_keypair` is P's
+    /// entity key (it becomes `provider` and signs the outer signature);
+    /// `owner_discovery_key` is the owner audience's decryption key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_owner(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        audience_handle: [u8; 32],
+        owner_discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        Self::build_sealed(
+            provider_keypair,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            OWNER_AUDIENCE_GRANT_SENTINEL,
+            owner_discovery_key,
+            generation,
+            expires_at,
+            descriptor,
+        )
+    }
+
+    /// Build, seal, and sign a **granted-audience** envelope. Rejects the
+    /// reserved zero `grant_id` with [`ScopedAnnouncementError::ReservedGrantId`]
+    /// so a granted envelope can never masquerade as an owner one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_granted(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        grant_id: [u8; 32],
+        audience_handle: [u8; 32],
+        discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        if grant_id == OWNER_AUDIENCE_GRANT_SENTINEL {
+            return Err(ScopedAnnouncementError::ReservedGrantId);
+        }
+        Self::build_sealed(
+            provider_keypair,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            grant_id,
+            discovery_key,
+            generation,
+            expires_at,
+            descriptor,
+        )
+    }
+
+    /// Common build path: seal (enforcing the plaintext cap) then sign.
+    #[allow(clippy::too_many_arguments)]
+    fn build_sealed(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        audience_handle: [u8; 32],
+        grant_id: [u8; 32],
+        discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        let provider = provider_keypair.entity_id().clone();
+        let aad = scoped_ann_associated_data(
+            &provider,
+            &owner_org,
+            &audience_handle,
+            &grant_id,
+            generation,
+            expires_at,
+        );
+        let (nonce, ciphertext) = seal_descriptor(discovery_key, &aad, descriptor)?;
+        Ok(Self::finish(
+            provider_keypair,
+            provider,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            grant_id,
+            generation,
+            expires_at,
+            nonce,
+            ciphertext,
+        ))
+    }
+
+    /// Deterministic build hook for golden vectors: seal with a caller-supplied
+    /// nonce instead of a fresh random one. Test-only — real publication always
+    /// uses a fresh random nonce via [`Self::build_owner`] / [`Self::build_granted`].
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_granted_with_nonce(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        grant_id: [u8; 32],
+        audience_handle: [u8; 32],
+        discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        nonce: [u8; SCOPED_ANN_NONCE_SIZE],
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        if grant_id == OWNER_AUDIENCE_GRANT_SENTINEL {
+            return Err(ScopedAnnouncementError::ReservedGrantId);
+        }
+        let provider = provider_keypair.entity_id().clone();
+        let aad = scoped_ann_associated_data(
+            &provider,
+            &owner_org,
+            &audience_handle,
+            &grant_id,
+            generation,
+            expires_at,
+        );
+        let ciphertext = seal_descriptor_with_nonce(discovery_key, &nonce, &aad, descriptor)?;
+        Ok(Self::finish(
+            provider_keypair,
+            provider,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            grant_id,
+            generation,
+            expires_at,
+            nonce,
+            ciphertext,
+        ))
+    }
+
+    /// Assemble the struct and apply the outer signature. Infallible: the seal
+    /// already bounded the plaintext, so the ciphertext fits the `u16` length
+    /// prefix and the whole envelope fits [`MAX_SCOPED_ANN_ENCODED_BYTES`] by the
+    /// const-asserted budget partition (checked here with debug asserts).
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        provider_keypair: &EntityKeypair,
+        provider: EntityId,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        audience_handle: [u8; 32],
+        grant_id: [u8; 32],
+        generation: u64,
+        expires_at: u64,
+        nonce: [u8; SCOPED_ANN_NONCE_SIZE],
+        ciphertext: Vec<u8>,
+    ) -> Self {
+        debug_assert!(ciphertext.len() <= u16::MAX as usize);
+        debug_assert!(
+            SCOPED_ANN_PREFIX_LEN + ciphertext.len() + 64 <= MAX_SCOPED_ANN_ENCODED_BYTES
+        );
+        let mut env = Self {
+            provider,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            grant_id,
+            generation,
+            expires_at,
+            nonce,
+            ciphertext,
+            signature: [0u8; 64],
+        };
+        let signing_input = env.signing_input();
+        env.signature = provider_keypair.sign(&signing_input).to_bytes();
+        env
+    }
+
+    /// The encoded envelope WITHOUT the trailing signature — the exact bytes the
+    /// outer signature covers (after the domain prefix). `ciphertext_len` is
+    /// encoded as a little-endian `u16`; the value fits by construction and by
+    /// the decoder's bound check.
+    fn encode_unsigned(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(SCOPED_ANN_PREFIX_LEN + self.ciphertext.len());
+        buf.push(SCOPED_ANN_WIRE_VERSION);
+        buf.extend_from_slice(self.provider.as_bytes());
+        buf.extend_from_slice(self.owner_org.as_bytes());
+        buf.extend_from_slice(&self.owner_cert.to_bytes());
+        buf.extend_from_slice(&self.audience_handle);
+        buf.extend_from_slice(&self.grant_id);
+        buf.extend_from_slice(&self.generation.to_le_bytes());
+        buf.extend_from_slice(&self.expires_at.to_le_bytes());
+        buf.extend_from_slice(&self.nonce);
+        let ct_len = self.ciphertext.len() as u16;
+        buf.extend_from_slice(&ct_len.to_le_bytes());
+        buf.extend_from_slice(&self.ciphertext);
+        buf
+    }
+
+    /// The domain-prefixed message the outer signature signs/verifies:
+    /// `SCOPED_ANN_SIG_DOMAIN ‖ encode_unsigned`.
+    fn signing_input(&self) -> Vec<u8> {
+        let unsigned = self.encode_unsigned();
+        let mut buf = Vec::with_capacity(SCOPED_ANN_SIG_DOMAIN.len() + unsigned.len());
+        buf.extend_from_slice(SCOPED_ANN_SIG_DOMAIN);
+        buf.extend_from_slice(&unsigned);
+        buf
+    }
+
+    /// Serialize to canonical wire bytes: `encode_unsigned ‖ signature`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.encode_unsigned();
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Decode and AUTHENTICATE an envelope from wire bytes. Order (per §3.1 and
+    /// review): structural decode + bounds (with checked length arithmetic —
+    /// `prefix + ciphertext_len + signature == input.len()`), THEN the outer
+    /// provider signature is verified LAST; only a value whose signature checks
+    /// out is returned. Does NOT open the AEAD or check the cert/floors — that is
+    /// ingest (OA3-3).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "every fixed-offset slice is length-checked before the infallible array conversion"
+    )]
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ScopedAnnouncementError> {
+        // Whole-envelope bound first — reject an oversized frame before parsing.
+        if data.len() > MAX_SCOPED_ANN_ENCODED_BYTES {
+            return Err(ScopedAnnouncementError::DescriptorTooLarge {
+                encoded: data.len(),
+                maximum: MAX_SCOPED_ANN_ENCODED_BYTES,
+            });
+        }
+        if data.len() < SCOPED_ANN_PREFIX_LEN + 64 {
+            return Err(ScopedAnnouncementError::InvalidFormat);
+        }
+        if data[0] != SCOPED_ANN_WIRE_VERSION {
+            return Err(ScopedAnnouncementError::InvalidFormat);
+        }
+        let mut off = 1;
+        let provider = EntityId::from_bytes(data[off..off + 32].try_into().unwrap());
+        off += 32;
+        let owner_org = OrgId::from_bytes(data[off..off + 32].try_into().unwrap());
+        off += 32;
+        let owner_cert =
+            OrgMembershipCert::from_bytes(&data[off..off + OrgMembershipCert::WIRE_SIZE])
+                .map_err(|_| ScopedAnnouncementError::InvalidFormat)?;
+        off += OrgMembershipCert::WIRE_SIZE;
+        let audience_handle: [u8; 32] = data[off..off + 32].try_into().unwrap();
+        off += 32;
+        let grant_id: [u8; 32] = data[off..off + 32].try_into().unwrap();
+        off += 32;
+        let generation = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let expires_at = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let nonce: [u8; SCOPED_ANN_NONCE_SIZE] =
+            data[off..off + SCOPED_ANN_NONCE_SIZE].try_into().unwrap();
+        off += SCOPED_ANN_NONCE_SIZE;
+        let ct_len = u16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as usize;
+        off += 2;
+        debug_assert_eq!(off, SCOPED_ANN_PREFIX_LEN);
+        // Checked length arithmetic: prefix + ciphertext + signature must equal
+        // the input EXACTLY — no trailing bytes, no truncation, no overflow.
+        let expected_total = SCOPED_ANN_PREFIX_LEN
+            .checked_add(ct_len)
+            .and_then(|x| x.checked_add(64))
+            .ok_or(ScopedAnnouncementError::InvalidFormat)?;
+        if expected_total != data.len() {
+            return Err(ScopedAnnouncementError::InvalidFormat);
+        }
+        // A valid AEAD ciphertext is at least the tag; anything shorter is
+        // structurally malformed.
+        if ct_len < SCOPED_ANN_AEAD_TAG_SIZE {
+            return Err(ScopedAnnouncementError::InvalidFormat);
+        }
+        // Plaintext-side bound (mirrors the builder).
+        if ct_len - SCOPED_ANN_AEAD_TAG_SIZE > MAX_SCOPED_ANN_CIPHERTEXT_BYTES {
+            return Err(ScopedAnnouncementError::DescriptorTooLarge {
+                encoded: ct_len - SCOPED_ANN_AEAD_TAG_SIZE,
+                maximum: MAX_SCOPED_ANN_CIPHERTEXT_BYTES,
+            });
+        }
+        let ciphertext = data[off..off + ct_len].to_vec();
+        off += ct_len;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&data[off..off + 64]);
+        let env = Self {
+            provider,
+            owner_org,
+            owner_cert,
+            audience_handle,
+            grant_id,
+            generation,
+            expires_at,
+            nonce,
+            ciphertext,
+            signature,
+        };
+        // Outer signature LAST — a value is returned ONLY if P's signature over
+        // the exact encoded bytes verifies. A transplanted owner_cert / nonce /
+        // ct_len / ciphertext all fail here.
+        env.provider
+            .verify_bytes(&env.signing_input(), &env.signature)
+            .map_err(|_| ScopedAnnouncementError::SignatureInvalid)?;
+        Ok(env)
+    }
+
+    /// The publishing provider P (also the outer-signature verifier).
+    pub fn provider(&self) -> &EntityId {
+        &self.provider
+    }
+    /// The org P claims to belong to (bound by the inline `owner_cert`, checked
+    /// at ingest).
+    pub fn owner_org(&self) -> &OrgId {
+        &self.owner_org
+    }
+    /// The inline membership certificate proving P ∈ `owner_org` (validity /
+    /// floors checked at ingest, OA3-3).
+    pub fn owner_cert(&self) -> &OrgMembershipCert {
+        &self.owner_cert
+    }
+    /// The audience routing handle this envelope is sealed to.
+    pub fn audience_handle(&self) -> &[u8; 32] {
+        &self.audience_handle
+    }
+    /// The grant id — the reserved zero sentinel for an owner-audience envelope,
+    /// a real grant id for a granted one.
+    pub fn grant_id(&self) -> &[u8; 32] {
+        &self.grant_id
+    }
+    /// Monotonic announcement generation (freshness / dedup).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// Envelope expiry (unix seconds).
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+    /// The AEAD nonce.
+    pub fn nonce(&self) -> &[u8; SCOPED_ANN_NONCE_SIZE] {
+        &self.nonce
+    }
+    /// The sealed descriptor ciphertext (opaque; includes the AEAD tag).
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+    /// True iff this is an owner-audience envelope (grant id is the reserved zero
+    /// sentinel).
+    pub fn is_owner_audience(&self) -> bool {
+        self.grant_id == OWNER_AUDIENCE_GRANT_SENTINEL
+    }
+
+    /// The AEAD associated data binding this envelope's framing, recomputed from
+    /// the authenticated fields — passed to [`open_descriptor`] at ingest.
+    pub fn associated_data(&self) -> Vec<u8> {
+        scoped_ann_associated_data(
+            &self.provider,
+            &self.owner_org,
+            &self.audience_handle,
+            &self.grant_id,
+            self.generation,
+            self.expires_at,
+        )
+    }
+
+    /// Open the sealed descriptor with an audience `discovery_key`. The caller
+    /// (OA3-3) is responsible for having established that this key belongs to
+    /// this envelope's audience (the owner credential, or an installed grant
+    /// secret whose commitment matches the signed grant). Returns the descriptor
+    /// plaintext, or an opaque failure that is not a decryption oracle.
+    pub fn open_with(&self, discovery_key: &[u8; 32]) -> Result<Vec<u8>, ScopedAnnouncementError> {
+        open_descriptor(
+            discovery_key,
+            &self.nonce,
+            &self.associated_data(),
+            &self.ciphertext,
+        )
+    }
+}
+
+impl std::fmt::Debug for ScopedCapabilityAnnouncement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedCapabilityAnnouncement")
+            .field("provider", &self.provider)
+            .field("owner_org", &self.owner_org)
+            .field("grant_id", &hex::encode(&self.grant_id[..8]))
+            .field("audience_handle", &hex::encode(&self.audience_handle[..8]))
+            .field("generation", &self.generation)
+            .field("expires_at", &self.expires_at)
+            .field("ciphertext_len", &self.ciphertext.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -405,4 +873,253 @@ mod tests {
         let (n2, _) = seal_descriptor(&KEY, b"", b"x").expect("seal");
         assert_ne!(n1, n2, "fresh random nonce per seal");
     }
+
+    // ---------------------------------------------------------------------
+    // OA3-2 — ScopedCapabilityAnnouncement envelope
+    // ---------------------------------------------------------------------
+
+    use super::super::org::OrgKeypair;
+
+    fn provider_keypair() -> EntityKeypair {
+        EntityKeypair::from_bytes([11u8; 32])
+    }
+
+    fn owner_keypair() -> OrgKeypair {
+        OrgKeypair::from_bytes([22u8; 32])
+    }
+
+    /// A deterministic membership cert (fixed window + nonce) binding `member`
+    /// to `org` — so the whole envelope is byte-reproducible for golden vectors.
+    fn deterministic_cert(org: &OrgKeypair, member: &EntityId) -> OrgMembershipCert {
+        OrgMembershipCert::issue_at(org, member.clone(), 3, 1_000, 1_000_000, 0xABCD)
+    }
+
+    #[test]
+    fn granted_envelope_round_trips_verifies_and_opens() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let key = [42u8; 32];
+        let env = ScopedCapabilityAnnouncement::build_granted(
+            &pk,
+            org.org_id(),
+            cert,
+            GRANT,
+            HANDLE,
+            &key,
+            7,
+            1_234,
+            b"descriptor-bytes",
+        )
+        .expect("build");
+        assert!(!env.is_owner_audience());
+
+        let bytes = env.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            SCOPED_ANN_PREFIX_LEN + env.ciphertext().len() + 64
+        );
+
+        let decoded = ScopedCapabilityAnnouncement::from_bytes(&bytes).expect("decode + verify");
+        assert_eq!(decoded.provider(), pk.entity_id());
+        assert_eq!(decoded.owner_org(), &org.org_id());
+        assert_eq!(decoded.grant_id(), &GRANT);
+        assert_eq!(decoded.generation(), 7);
+        assert_eq!(decoded.expires_at(), 1_234);
+        assert_eq!(decoded.open_with(&key).expect("open"), b"descriptor-bytes");
+    }
+
+    #[test]
+    fn owner_envelope_uses_the_zero_sentinel_and_opens() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let key = [7u8; 32];
+        let env = ScopedCapabilityAnnouncement::build_owner(
+            &pk,
+            org.org_id(),
+            cert,
+            HANDLE,
+            &key,
+            1,
+            99,
+            b"owner-descriptor",
+        )
+        .expect("build owner");
+        assert!(env.is_owner_audience());
+        assert_eq!(env.grant_id(), &OWNER_AUDIENCE_GRANT_SENTINEL);
+
+        let decoded =
+            ScopedCapabilityAnnouncement::from_bytes(&env.to_bytes()).expect("decode + verify");
+        assert!(decoded.is_owner_audience());
+        assert_eq!(decoded.open_with(&key).expect("open"), b"owner-descriptor");
+    }
+
+    #[test]
+    fn build_granted_rejects_the_reserved_sentinel() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let err = ScopedCapabilityAnnouncement::build_granted(
+            &pk,
+            org.org_id(),
+            cert,
+            OWNER_AUDIENCE_GRANT_SENTINEL,
+            HANDLE,
+            &[1u8; 32],
+            1,
+            1,
+            b"x",
+        )
+        .expect_err("granted with the owner sentinel must be refused");
+        assert_eq!(err, ScopedAnnouncementError::ReservedGrantId);
+    }
+
+    #[test]
+    fn tampering_any_signed_field_fails_the_outer_signature() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let env = ScopedCapabilityAnnouncement::build_granted(
+            &pk,
+            org.org_id(),
+            cert,
+            GRANT,
+            HANDLE,
+            &[42u8; 32],
+            7,
+            1_234,
+            b"descriptor-bytes",
+        )
+        .expect("build");
+        let good = env.to_bytes();
+        assert!(ScopedCapabilityAnnouncement::from_bytes(&good).is_ok());
+
+        // One representative byte in each signed field (per the encode layout).
+        let provider_off = 1;
+        let owner_cert_off = 1 + 32 + 32;
+        let handle_off = owner_cert_off + OrgMembershipCert::WIRE_SIZE;
+        let grant_off = handle_off + 32;
+        let generation_off = grant_off + 32;
+        let nonce_off = generation_off + 8 + 8;
+        let ciphertext_off = SCOPED_ANN_PREFIX_LEN;
+        for off in [
+            provider_off,
+            owner_cert_off,
+            handle_off,
+            grant_off,
+            generation_off,
+            nonce_off,
+            ciphertext_off,
+        ] {
+            let mut tampered = good.clone();
+            tampered[off] ^= 0x01;
+            assert_eq!(
+                ScopedCapabilityAnnouncement::from_bytes(&tampered).unwrap_err(),
+                ScopedAnnouncementError::SignatureInvalid,
+                "flipping a byte at offset {off} must fail the outer signature",
+            );
+        }
+        // The signature itself is likewise load-bearing.
+        let mut sig_tampered = good.clone();
+        let sig_off = SCOPED_ANN_PREFIX_LEN + env.ciphertext().len();
+        sig_tampered[sig_off] ^= 0x01;
+        assert_eq!(
+            ScopedCapabilityAnnouncement::from_bytes(&sig_tampered).unwrap_err(),
+            ScopedAnnouncementError::SignatureInvalid,
+        );
+    }
+
+    #[test]
+    fn decode_rejects_bad_version_length_and_bounds() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let env = ScopedCapabilityAnnouncement::build_granted(
+            &pk,
+            org.org_id(),
+            cert,
+            GRANT,
+            HANDLE,
+            &[42u8; 32],
+            1,
+            1,
+            b"desc",
+        )
+        .expect("build");
+        let good = env.to_bytes();
+
+        let mut bad_version = good.clone();
+        bad_version[0] = 2;
+        assert_eq!(
+            ScopedCapabilityAnnouncement::from_bytes(&bad_version).unwrap_err(),
+            ScopedAnnouncementError::InvalidFormat
+        );
+
+        // Truncated by one byte (length arithmetic no longer adds up).
+        assert_eq!(
+            ScopedCapabilityAnnouncement::from_bytes(&good[..good.len() - 1]).unwrap_err(),
+            ScopedAnnouncementError::InvalidFormat
+        );
+
+        // A trailing byte is rejected (no partial reads).
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert_eq!(
+            ScopedCapabilityAnnouncement::from_bytes(&trailing).unwrap_err(),
+            ScopedAnnouncementError::InvalidFormat
+        );
+
+        // Shorter than the fixed prefix + signature.
+        assert_eq!(
+            ScopedCapabilityAnnouncement::from_bytes(&[SCOPED_ANN_WIRE_VERSION; 10]).unwrap_err(),
+            ScopedAnnouncementError::InvalidFormat
+        );
+
+        // Oversized frame is refused before parsing.
+        let huge = vec![0u8; MAX_SCOPED_ANN_ENCODED_BYTES + 1];
+        assert!(matches!(
+            ScopedCapabilityAnnouncement::from_bytes(&huge),
+            Err(ScopedAnnouncementError::DescriptorTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn golden_vector_pins_the_full_encoded_envelope() {
+        // Fully deterministic: fixed entity/org seeds, fixed cert window+nonce,
+        // fixed AEAD nonce, deterministic ed25519 — so the ENTIRE encoded
+        // envelope (framing + ciphertext + outer signature) is byte-stable.
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let key = [42u8; 32];
+        let env = ScopedCapabilityAnnouncement::build_granted_with_nonce(
+            &pk,
+            org.org_id(),
+            cert,
+            GRANT,
+            HANDLE,
+            &key,
+            7,
+            1_234,
+            NONCE,
+            b"golden-descriptor",
+        )
+        .expect("build");
+        let encoded = hex::encode(env.to_bytes());
+        assert_eq!(encoded, GOLDEN_ENVELOPE_HEX, "GOLDEN={encoded}");
+
+        // And the pinned bytes decode, verify, and open.
+        let decoded = ScopedCapabilityAnnouncement::from_bytes(
+            &hex::decode(GOLDEN_ENVELOPE_HEX).expect("golden hex"),
+        )
+        .expect("decode + verify golden");
+        assert_eq!(decoded.open_with(&key).expect("open"), b"golden-descriptor");
+    }
+
+    // Pinned by the deterministic build above (captured once, then frozen). Any
+    // change to the wire layout, a field width, the signing domain, or the AEAD
+    // construction moves these bytes — the whole encoded envelope, including the
+    // deterministic ed25519 outer signature, is locked here.
+    const GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c04010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020700000000000000d2040000000000000303030303030303030303030303030303030303030303032100a7eee1241f24f2fa061e532b393aaf8aa5b73a76eef9afcd640df692b04e159d8740e97ea293f952f8fae84542d911648555f96846ad269115031cd46c1537ee36f78ca97f55f4d1e855708ace5e9453a9570228523ec61fa12cc50fdb8db3b409";
 }
