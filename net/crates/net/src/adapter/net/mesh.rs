@@ -16400,15 +16400,16 @@ impl MeshNode {
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        let now_secs = super::behavior::org::current_timestamp();
         let ctx = ScopedIngestContext {
             local_owner_org: owner_org,
             floors,
-            now_secs: super::behavior::org::current_timestamp(),
+            now_secs,
             skew_secs: authority.config.verification_skew_secs,
         };
         match verify_scoped_ingest(&envelope, &audience, &ctx) {
             Ok(verified) => {
-                let outcome = scoped_discovery.lock().ingest(verified);
+                let outcome = scoped_discovery.lock().ingest(verified, now_secs);
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,

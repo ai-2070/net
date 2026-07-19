@@ -40,6 +40,13 @@ pub enum ScopedStoreOutcome {
     /// capabilities live in the plaintext fold. The OA3-3 verify path never
     /// produces a `Public` scope, so this is a defensive guard.
     RejectedPublic,
+    /// The store is at [`ScopedDiscoveryStore::MAX_ENTRIES`] and a NEW
+    /// `(scope, provider)` key could not be admitted without evicting an
+    /// unexpired high-water mark — refused FAIL-CLOSED (Kyra OA3-5). Rollback
+    /// protection is never surrendered to admit a new provider; updates to
+    /// already-known keys are always permitted, and the provider is re-admitted
+    /// once a horizon-passed entry frees a slot.
+    AtCapacity,
 }
 
 /// One stored scoped capability plus the freshness/expiry it is ordered by. When
@@ -73,42 +80,27 @@ impl ScopedDiscoveryStore {
     /// Hard cap on stored `(scope, provider)` entries (live + tombstone). A flood
     /// of distinct providers — each a valid, org-certified envelope — must not
     /// grow the private-discovery store without bound before exposure (Kyra
-    /// OA3-5). At the cap, [`Self::evict_if_at_capacity`] drops the entries whose
-    /// relevance window ends soonest.
+    /// OA3-5). Enforced FAIL-CLOSED in [`Self::ingest`]: at the cap, only
+    /// fully-forgotten (tombstone-horizon-passed) keys are reclaimed, and if the
+    /// store is still full a NEW key is refused
+    /// ([`ScopedStoreOutcome::AtCapacity`]) rather than evicting an unexpired
+    /// high-water mark — so a distinct-provider flood can never roll a known
+    /// provider's freshness backward. Updates to already-known keys are never
+    /// capacity-gated.
     const MAX_ENTRIES: usize = 8192;
-    /// Post-eviction target: an overflow evicts down to this mark rather than one
-    /// entry at a time, so the O(n log n) scan is amortized over (MAX − LOW)
-    /// inserts (mirrors the withdrawal-seq-gate eviction discipline).
-    const LOW_WATER: usize = 6144;
-
-    /// When at [`Self::MAX_ENTRIES`], evict down to [`Self::LOW_WATER`] by
-    /// dropping the entries with the SMALLEST `tombstone_until` (the max expiry
-    /// ever seen for the key) — the ones closest to natural removal. An
-    /// evicted-but-still-valid capability is re-added on the provider's next
-    /// announcement; an evicted tombstone surrenders rollback protection only for
-    /// keys already nearest to being forgotten. Called before a NEW-key insert,
-    /// so the store never exceeds `MAX_ENTRIES`.
-    fn evict_if_at_capacity(&mut self) {
-        if self.entries.len() < Self::MAX_ENTRIES {
-            return;
-        }
-        let n_evict = self.entries.len() - Self::LOW_WATER;
-        let mut victims: Vec<((CapabilityAudienceScope, EntityId), u64)> = self
-            .entries
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.tombstone_until))
-            .collect();
-        victims.sort_unstable_by_key(|(_, watermark)| *watermark);
-        for (key, _) in victims.into_iter().take(n_evict) {
-            self.entries.remove(&key);
-        }
-    }
 
     /// Ingest a verified scoped capability. At most one entry is kept per
     /// `(scope, provider)`; the newest generation wins, and an older-or-equal
     /// generation is [`ScopedStoreOutcome::Stale`] and ignored. A `Public` scope
-    /// is refused ([`ScopedStoreOutcome::RejectedPublic`]).
-    pub fn ingest(&mut self, capability: VerifiedScopedCapability) -> ScopedStoreOutcome {
+    /// is refused ([`ScopedStoreOutcome::RejectedPublic`]); a NEW key that would
+    /// exceed [`Self::MAX_ENTRIES`] with no forgettable slot to reclaim is refused
+    /// [`ScopedStoreOutcome::AtCapacity`]. `now_secs` drives the fail-closed
+    /// horizon sweep.
+    pub fn ingest(
+        &mut self,
+        capability: VerifiedScopedCapability,
+        now_secs: u64,
+    ) -> ScopedStoreOutcome {
         if matches!(capability.scope(), CapabilityAudienceScope::Public) {
             return ScopedStoreOutcome::RejectedPublic;
         }
@@ -131,10 +123,19 @@ impl ScopedDiscoveryStore {
                 ScopedStoreOutcome::Updated
             }
             None => {
-                // Cardinality bound: a flood of distinct providers must not grow
-                // the store without limit. Make room BEFORE inserting the new key
-                // so the store never exceeds `MAX_ENTRIES` (Kyra OA3-5).
-                self.evict_if_at_capacity();
+                // Fail-closed cardinality (Kyra OA3-5): reclaim only
+                // FULLY-FORGOTTEN keys (tombstone horizon passed) before admitting
+                // a new one — NEVER evict an unexpired high-water mark, or an older
+                // generation could replay after its tombstone was dropped. If the
+                // store is still full of in-horizon entries, refuse the new key;
+                // the provider is re-admitted once a slot frees. (Updates to
+                // already-known keys, handled above, are never capacity-gated.)
+                if self.entries.len() >= Self::MAX_ENTRIES {
+                    self.sweep_expired(now_secs);
+                    if self.entries.len() >= Self::MAX_ENTRIES {
+                        return ScopedStoreOutcome::AtCapacity;
+                    }
+                }
                 self.entries.insert(
                     key,
                     StoredEntry {
@@ -300,26 +301,61 @@ mod tests {
         )
     }
 
-    /// OA3-5b: a flood of distinct providers cannot grow the store past the hard
-    /// cardinality cap; eviction keeps it bounded WITHOUT emptying it.
+    /// OA3-5b (Kyra closure): a distinct-provider flood is bounded at
+    /// MAX_ENTRIES and refused FAIL-CLOSED (`AtCapacity`) — never by evicting a
+    /// known provider's unexpired high-water mark. Updates to known keys are
+    /// never capacity-gated.
     #[test]
-    fn ingest_bounds_cardinality_under_a_distinct_provider_flood() {
+    fn ingest_bounds_cardinality_fail_closed_under_a_distinct_provider_flood() {
         let mut store = ScopedDiscoveryStore::new();
-        let flood = ScopedDiscoveryStore::MAX_ENTRIES + 500;
-        for index in 0..flood as u64 {
-            store.ingest(owner_cap_n(index, 1, 10_000));
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES as u64 {
+            assert_eq!(
+                store.ingest(owner_cap_n(index, 1, 10_000), 1),
+                ScopedStoreOutcome::Inserted
+            );
         }
-        // Every entry is live (nothing expired at ingest time), so `len` is the
-        // full BTreeMap cardinality here.
-        assert!(
-            store.len() <= ScopedDiscoveryStore::MAX_ENTRIES,
-            "store must stay within MAX_ENTRIES under a flood (len {})",
-            store.len(),
+        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        // A further DISTINCT provider is refused; nothing is evicted (every entry
+        // is in-horizon at now=1, so the fail-closed sweep frees no slot).
+        assert_eq!(
+            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
+            ScopedStoreOutcome::AtCapacity
         );
-        assert!(
-            store.len() >= ScopedDiscoveryStore::LOW_WATER,
-            "eviction bounds the store to LOW_WATER, it does not empty it (len {})",
-            store.len(),
+        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        // An UPDATE to an already-known key is never capacity-gated.
+        assert_eq!(
+            store.ingest(owner_cap_n(0, 2, 10_000), 1),
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+    }
+
+    /// OA3-5b (Kyra closure): capacity pressure never rolls a known provider's
+    /// freshness backward. A stored gen-2 high-water survives a full-store flood,
+    /// so an older gen-1 replay stays Stale (the flaw in the evict-based version).
+    #[test]
+    fn capacity_pressure_never_rolls_back_a_known_high_water() {
+        let mut store = ScopedDiscoveryStore::new();
+        // P (index 0) at generation 2, far-future expiry.
+        assert_eq!(
+            store.ingest(owner_cap_n(0, 2, 10_000), 1),
+            ScopedStoreOutcome::Inserted
+        );
+        // Fill the rest of the store to capacity with distinct providers.
+        for index in 1..ScopedDiscoveryStore::MAX_ENTRIES as u64 {
+            store.ingest(owner_cap_n(index, 1, 10_000), 1);
+        }
+        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        // A brand-new provider is refused rather than evicting P's high-water.
+        assert_eq!(
+            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
+            ScopedStoreOutcome::AtCapacity
+        );
+        // Replay P at the OLDER generation 1: still Stale — the gen-2 high-water
+        // was never evicted under capacity pressure.
+        assert_eq!(
+            store.ingest(owner_cap_n(0, 1, 10_000), 1),
+            ScopedStoreOutcome::Stale
         );
     }
 
@@ -327,21 +363,21 @@ mod tests {
     fn ingest_reports_insert_update_and_stale() {
         let mut store = ScopedDiscoveryStore::new();
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000)),
+            store.ingest(owner_cap(3, 1, 1000), 0),
             ScopedStoreOutcome::Inserted
         );
         // Newer generation for the same (scope, provider) updates.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000)),
+            store.ingest(owner_cap(3, 2, 1000), 0),
             ScopedStoreOutcome::Updated
         );
         // Older-or-equal generation is stale and ignored.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000)),
+            store.ingest(owner_cap(3, 2, 1000), 0),
             ScopedStoreOutcome::Stale
         );
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000)),
+            store.ingest(owner_cap(3, 1, 1000), 0),
             ScopedStoreOutcome::Stale
         );
         assert_eq!(store.len(), 1);
@@ -358,7 +394,7 @@ mod tests {
             1000,
             b"x".to_vec(),
         );
-        assert_eq!(store.ingest(public), ScopedStoreOutcome::RejectedPublic);
+        assert_eq!(store.ingest(public, 0), ScopedStoreOutcome::RejectedPublic);
         assert!(store.is_empty());
     }
 
@@ -367,9 +403,9 @@ mod tests {
         let mut store = ScopedDiscoveryStore::new();
         let grant_x = [0xAA; 32];
         let grant_y = [0xBB; 32];
-        store.ingest(owner_cap(3, 1, 1000));
-        store.ingest(grant_cap(grant_x, 4, 1, 1000));
-        store.ingest(grant_cap(grant_y, 5, 1, 1000));
+        store.ingest(owner_cap(3, 1, 1000), 0);
+        store.ingest(grant_cap(grant_x, 4, 1, 1000), 0);
+        store.ingest(grant_cap(grant_y, 5, 1, 1000), 0);
         assert_eq!(store.len(), 3);
 
         // The grant-X query sees only grant-X providers — not owner, not grant-Y.
@@ -397,8 +433,8 @@ mod tests {
     fn predicate_filters_within_a_partition() {
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000));
-        store.ingest(grant_cap(grant, 5, 1, 1000));
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
         // Predicate selecting only provider(5).
         let hits = store.find_capabilities_for_grant(&grant, 0, |c| c.provider() == &provider(5));
         assert_eq!(hits.len(), 1);
@@ -409,8 +445,8 @@ mod tests {
     fn distinct_providers_under_one_grant_coexist() {
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000));
-        store.ingest(grant_cap(grant, 5, 1, 1000));
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
         assert_eq!(
             store.find_capabilities_for_grant(&grant, 0, |_| true).len(),
             2
@@ -420,9 +456,9 @@ mod tests {
     #[test]
     fn sweep_removes_only_expired_entries() {
         let mut store = ScopedDiscoveryStore::new();
-        store.ingest(owner_cap(3, 1, 1000)); // expires 1000
-        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000)); // expires 5000
-                                                         // At t=2000 the owner entry (expires 1000) is gone; the grant survives.
+        store.ingest(owner_cap(3, 1, 1000), 0); // expires 1000
+        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0); // expires 5000
+                                                            // At t=2000 the owner entry (expires 1000) is gone; the grant survives.
         assert_eq!(store.sweep_expired(2000), 1);
         assert_eq!(store.len(), 1);
         assert!(store
@@ -441,7 +477,7 @@ mod tests {
         // Expiry safety is a property of the QUERY, not of remembering to sweep.
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000)); // expires 1000
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0); // expires 1000
         assert_eq!(
             store
                 .find_capabilities_for_grant(&grant, 500, |_| true)
@@ -464,9 +500,9 @@ mod tests {
         // revive the key (the generation high-water survives the sweep).
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 5000)); // gen 1, expires 5000
+        store.ingest(grant_cap(grant, 4, 1, 5000), 0); // gen 1, expires 5000
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 2, 2000)), // gen 2, expires 2000
+            store.ingest(grant_cap(grant, 4, 2, 2000), 0), // gen 2, expires 2000
             ScopedStoreOutcome::Updated
         );
         // Sweep at t=3000: gen 2's live capability (expired at 2000) becomes a
@@ -477,7 +513,7 @@ mod tests {
             .is_empty());
         // Replay the OLDER generation 1 (still unexpired at 3000): refused.
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 1, 5000)),
+            store.ingest(grant_cap(grant, 4, 1, 5000), 0),
             ScopedStoreOutcome::Stale
         );
         assert!(store
