@@ -6770,6 +6770,151 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Kyra #47 B2 (cross-service): the node-owned replay guard keys on
+    /// `(caller, call_id)` NODE-WIDE, not per service. A `(caller, call_id)`
+    /// admitted under protected service A cannot be reused under a DIFFERENT
+    /// protected service B — the second presentation (a fresh proof over B's
+    /// request, hence a different binding digest) is a `CallIdCollision` and is
+    /// DENIED. A fresh `call_id` on B still admits, proving B's path is live and
+    /// only the reused id was blocked.
+    #[tokio::test]
+    async fn admission_replay_guard_collides_across_services() {
+        use crate::adapter::net::behavior::org::OrgMembershipCert;
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let (server, node_entity, org_b, dir) = protected_provider("b2-xsvc").await;
+        const CALLER_NODE: u64 = 0x9c;
+        let caller_kp = std::sync::Arc::new(EntityKeypair::generate());
+        let caller_origin = caller_kp.entity_id().origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_kp.entity_id().clone());
+
+        // One intent per service for the SAME caller — capability `nrpc:<svc>`.
+        let intent_for = |service: &str| -> OrgProofIntent {
+            let caller_entity = caller_kp.entity_id().clone();
+            let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
+            let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+                .expect("cert");
+            let dispatcher = OrgDispatcherGrant::try_issue(
+                &org_b,
+                caller_entity,
+                DispatcherScope::Exact(cap),
+                3600,
+            )
+            .expect("dispatcher");
+            OrgProofIntent {
+                caller: caller_kp.clone(),
+                membership,
+                dispatcher,
+                capability_grant: None,
+                acting_org: org_b.org_id(),
+                provider_owner_org: org_b.org_id(),
+                provider: node_entity.clone(),
+                capability: cap,
+                proof_ttl_secs: 30,
+            }
+        };
+        let req_for = |service: &str| RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let make = |base: &RpcRequestPayload,
+                    header: &(String, Vec<u8>),
+                    call_id: u64,
+                    channel_hash: ChannelHash| {
+            let mut req = base.clone();
+            req.headers.push(header.clone());
+            let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut f, 0);
+            f.extend_from_slice(&req.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(f),
+            }
+        };
+
+        // Two protected services on the SAME node — both self-index their
+        // `nrpc:<svc>` capability so the provider self-check (E1.2) passes.
+        let admits_a = std::sync::Arc::new(AtomicUsize::new(0));
+        let admits_b = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve_a = server
+            .serve_rpc_protected(
+                "a",
+                std::sync::Arc::new(Counter(admits_a.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve a");
+        let serve_b = server
+            .serve_rpc_protected(
+                "b",
+                std::sync::Arc::new(Counter(admits_b.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve b");
+        let ch_a = serve_a.channel_hash;
+        let ch_b = serve_b.channel_hash;
+
+        // Admit (caller, call_id=7) under service A; wait so the replay slot is
+        // recorded before B is probed.
+        let intent_a = intent_for("a");
+        let req_a = req_for("a");
+        let header_a7 = sign_admission_proof(&intent_a, 7, &req_a).expect("sign a7");
+        assert!(server.deliver_rpc_inbound_for_test(ch_a, make(&req_a, &header_a7, 7, ch_a)));
+        assert!(
+            wait_until_at_least(|| admits_a.load(Ordering::SeqCst) as u64, 1).await,
+            "service A admits (caller, call_id=7)",
+        );
+
+        // Reuse call_id 7 under service B (fresh proof over B's request → a
+        // DIFFERENT binding digest → `CallIdCollision`), then a FRESH call_id 8
+        // under B. Same-channel FIFO: the fresh admit implies the collision was
+        // already processed, so `admits_b == 1` proves the reuse was denied.
+        let intent_b = intent_for("b");
+        let req_b = req_for("b");
+        let header_b7 = sign_admission_proof(&intent_b, 7, &req_b).expect("sign b7");
+        let header_b8 = sign_admission_proof(&intent_b, 8, &req_b).expect("sign b8");
+        assert!(server.deliver_rpc_inbound_for_test(ch_b, make(&req_b, &header_b7, 7, ch_b)));
+        assert!(server.deliver_rpc_inbound_for_test(ch_b, make(&req_b, &header_b8, 8, ch_b)));
+        assert!(
+            wait_until_at_least(|| admits_b.load(Ordering::SeqCst) as u64, 1).await,
+            "service B admits the fresh call_id 8",
+        );
+        assert_eq!(
+            admits_b.load(Ordering::SeqCst),
+            1,
+            "the cross-service call_id 7 reuse was DENIED (node-wide (caller, call_id) collision)",
+        );
+
+        drop(serve_a);
+        drop(serve_b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Kyra #47 B3: a protected `call` finalizes ATOMICALLY and validates the
     /// final wire BEFORE registering the pending oneshot. A caller-supplied
     /// admission header and an over-cap finalized request each fail LOCALLY (no
