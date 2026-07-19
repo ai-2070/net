@@ -4586,31 +4586,6 @@ impl MeshNode {
         let metrics_registry = self.rpc_metrics_arc();
         let mut metrics_guard = CallMetricsGuard::new(metrics_registry.for_service(service));
 
-        // Lazy reply-channel subscription. Once per (target, service).
-        // Reply channel + hash come from the cached `RpcRoute`; we
-        // only `.clone()` the `ChannelName` (cheap — internally an
-        // Arc<str>) instead of building it from scratch.
-        if let Err(e) = self
-            .ensure_reply_subscription(
-                target_node_id,
-                service,
-                route.reply_channel.clone(),
-                route.reply_hash,
-            )
-            .await
-        {
-            metrics_guard.record(CallOutcome::NoRoute);
-            self.fire_rpc_observer_outbound(
-                target_node_id,
-                service,
-                started_total.elapsed().as_millis() as u32,
-                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(e.to_string()),
-                request_bytes_len,
-                0,
-            );
-            return Err(e);
-        }
-
         // Allocate a fresh call_id. Random u64 from getrandom; a
         // sequential counter would let any session peer that
         // observed one of their own call_ids predict the next-
@@ -4619,14 +4594,6 @@ impl MeshNode {
         // probability 2^-64 per call and is unguessable from
         // another peer's perspective.
         let call_id = mint_random_call_id();
-
-        // Register the oneshot before publishing the REQUEST so a
-        // very-fast RESPONSE doesn't arrive before we're ready.
-        // S-4 part 2: bind the pending entry to target_node_id so
-        // the fold's deliver gate rejects spoofed RESPONSE frames
-        // arriving from any other session peer.
-        let pending = self.rpc_client_pending();
-        let rx = pending.register(call_id, target_node_id);
 
         // Build the REQUEST envelope. If a trace context is set,
         // emit `traceparent` / `tracestate` headers and signal
@@ -4656,14 +4623,73 @@ impl MeshNode {
             headers,
             body: payload.clone(),
         };
-        // E2.1: for a protected call, mint the admission proof over the
-        // FINALIZED request (the digest strips the header, so caller + provider
-        // agree) and append the `net-org-admission` header. Unary only — the
-        // protected admission gate serves unary (E1.8).
+        // E2.1 / Kyra #47 B3: finalize a protected call ATOMICALLY and validate
+        // the FINAL wire before registering the pending oneshot, so a local
+        // construction failure cannot leak a pending entry and an over-cap
+        // finalized frame cannot panic/truncate at encode.
         if let Some(intent) = opts.org_proof_intent.as_ref() {
+            // Exactly ONE proof header may ride, and only the builder sets it:
+            // reject a caller-supplied one here rather than appending a second
+            // and letting the provider deny MultipleHeaders.
+            if req
+                .headers
+                .iter()
+                .any(|(name, _)| name == ORG_ADMISSION_HEADER)
+            {
+                // Local caller-input error, before any network work — no
+                // CallOutcome fits; the guard's Drop decrements in_flight.
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: "org admission: request already carries a net-org-admission header"
+                        .to_string(),
+                });
+            }
+            // Sign over the FINALIZED request (the digest strips the header, so
+            // caller + provider agree), append exactly one proof header, then
+            // validate the FINAL bounds — 32 supplied headers + the proof header
+            // would otherwise be 33 > MAX_RPC_HEADERS and panic (debug) /
+            // truncate (release) at `encode_into`.
             let header = sign_admission_proof(intent, call_id, &req)?;
             req.headers.push(header);
+            req.validate_wire_bounds().map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: format!("org admission: finalized request exceeds wire bounds: {e}"),
+            })?;
         }
+
+        // Lazy reply-channel subscription — AFTER the request (incl. any proof)
+        // is finalized + wire-validated, so a malformed protected call fails
+        // before any subscription work. Once per (target, service); the reply
+        // channel + hash come from the cached `RpcRoute` (an `Arc<str>` clone).
+        if let Err(e) = self
+            .ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            )
+            .await
+        {
+            metrics_guard.record(CallOutcome::NoRoute);
+            self.fire_rpc_observer_outbound(
+                target_node_id,
+                service,
+                started_total.elapsed().as_millis() as u32,
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(e.to_string()),
+                request_bytes_len,
+                0,
+            );
+            return Err(e);
+        }
+
+        // Register the oneshot only NOW — after ALL fallible local construction
+        // (proof sign + final bounds) — so an error above returns WITHOUT leaking
+        // a pending entry. Still before publish, so a very-fast RESPONSE has
+        // somewhere to land (S-4 part 2: bound to target_node_id, so the deliver
+        // gate rejects a RESPONSE spoofed from any other session peer).
+        let pending = self.rpc_client_pending();
+        let rx = pending.register(call_id, target_node_id);
+
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
@@ -6603,6 +6629,77 @@ mod roster_fallback_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kyra #47 B3: a protected `call` finalizes ATOMICALLY and validates the
+    /// final wire BEFORE registering the pending oneshot. A caller-supplied
+    /// admission header and an over-cap finalized request each fail LOCALLY (no
+    /// panic, no send), and NEITHER leaks a pending entry (register happens only
+    /// after construction succeeds).
+    #[tokio::test]
+    async fn protected_call_finalization_is_atomic_bounded_and_leak_free() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::cortex::MAX_RPC_HEADERS;
+        const TARGET: u64 = 0xDEAD_BEEF;
+
+        let server = build_server().await;
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        let pending = server.rpc_client_pending();
+        assert_eq!(pending.pending_count(), 0);
+
+        // (1) caller-supplied admission header → local error; no pending leak.
+        let dup = CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider.clone(),
+            )),
+            request_headers: vec![("net-org-admission".to_string(), b"forged".to_vec())],
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                server
+                    .call(TARGET, "svc", Bytes::from_static(b"ping"), dup)
+                    .await,
+                Err(RpcError::Codec { .. })
+            ),
+            "a caller-supplied admission header must fail locally",
+        );
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "the dup-header failure must not leak a pending entry",
+        );
+
+        // (2) MAX_RPC_HEADERS ordinary headers + the proof header = over cap →
+        // final-bounds error (no debug panic / release truncation); no leak.
+        let over = CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider,
+            )),
+            request_headers: (0..MAX_RPC_HEADERS)
+                .map(|i| (format!("h{i}"), b"v".to_vec()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                server
+                    .call(TARGET, "svc", Bytes::from_static(b"ping"), over)
+                    .await,
+                Err(RpcError::Codec { .. })
+            ),
+            "an over-cap finalized request must fail locally",
+        );
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "the over-cap failure must not leak a pending entry",
+        );
     }
 
     /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
