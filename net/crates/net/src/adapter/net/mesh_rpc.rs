@@ -6529,6 +6529,144 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// E1 fail-closed, end-to-end: a REQUEST whose proof binds a DIFFERENT
+    /// call_id than the frame carries is DENIED (`BindingInvalid`) — the handler
+    /// NEVER runs — while a valid follow-up on the same single-consumer bridge
+    /// IS admitted. `admits == 1` at the FIFO barrier proves the tampered call
+    /// was denied, not merely slow.
+    #[tokio::test]
+    async fn protected_call_with_tampered_binding_is_denied_end_to_end() {
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                assert!(
+                    ctx.org_admission.is_some(),
+                    "only admitted calls may reach the handler",
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-wire-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0x93;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let expiry = (current_timestamp() + 20) * 1_000_000_000;
+
+        // Build a frame whose proof binds `signed_call_id`, delivered under
+        // `frame_call_id`'s EventMeta. Equal → admits; unequal → BindingInvalid.
+        let make_frame = |signed_call_id: u64, frame_call_id: u64| {
+            let proof = OrgCallProof::sign_for_call(
+                &caller_kp,
+                membership.clone(),
+                dispatcher.clone(),
+                None,
+                org_b.org_id(),
+                org_b.org_id(),
+                node_entity.clone(),
+                signed_call_id,
+                cap,
+                expiry,
+                digest,
+            );
+            let mut payload = base.clone();
+            payload.headers.push((
+                ORG_ADMISSION_HEADER.to_string(),
+                proof.encode().expect("encode"),
+            ));
+            let mut frame =
+                EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, frame_call_id, 0)
+                    .to_bytes()
+                    .to_vec();
+            encode_rpc_route(&mut frame, 0);
+            frame.extend_from_slice(&payload.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        };
+
+        // Tampered (signed 7, delivered 8) → denied; valid (9/9) → admitted.
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, make_frame(7, 8)));
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, make_frame(9, 9)));
+
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 1).await,
+            "the valid call must be admitted",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            1,
+            "the tampered-binding call was denied (handler never ran for it)",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Like [`build_server`], but installs a channel-config registry that
     /// token-gates `reply` on a root the node cannot chain to. The local
     /// node holds no matching token, so any *roster* fan-out on `reply`
