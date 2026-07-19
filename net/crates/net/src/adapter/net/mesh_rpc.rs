@@ -52,7 +52,7 @@ use crate::error::AdapterError;
 
 use super::behavior::org::{OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
-use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+use super::behavior::org_call::{OrgCallProof, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
 use super::mesh::{MeshNode, PeerPublishOutcome};
 use super::org_admission_gate::{org_request_digest, OrgProviderPolicy, RegisteredRpcService};
@@ -5155,11 +5155,6 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// the shared [`org_request_digest`], which strips any admission header, so the
 /// caller signing and the provider verifying derive the SAME digest) under the
 /// caller's [`OrgProofIntent`]. Returns the single header the caller appends.
-/// Ceiling on a caller-supplied org-admission proof TTL (Kyra #47 tail). A
-/// per-call proof is short-lived; capping it locally bounds how long a captured
-/// proof can be replayed within the provider's retention window.
-const MAX_ORG_PROOF_TTL_SECS: u64 = 300;
-
 fn sign_admission_proof(
     intent: &OrgProofIntent,
     call_id: u64,
@@ -5178,15 +5173,33 @@ fn sign_admission_proof(
             ),
         });
     }
+    // The requested TTL must be an honest, finite lifetime the provider will
+    // accept: fail the CALLER locally unless `1..=MAX_ORG_PROOF_TTL_SECS`
+    // (Kyra #47 tail). This is the SAME ceiling (`org_call::MAX_ORG_PROOF_TTL_SECS`,
+    // 30 s) the provider enforces at verify time (§2.3), so a caller cannot mint a
+    // proof the provider is guaranteed to reject as `TtlTooLong`. We do NOT clamp:
+    // silently capping would mint a proof with a lifetime the caller did not
+    // request. 0 is rejected too — a proof that expires within the same whole
+    // second is not a usable credential and only differs from a live one inside
+    // the provider's clock-skew tolerance, so it must not be treated as a valid
+    // request.
+    if intent.proof_ttl_secs == 0 || intent.proof_ttl_secs > MAX_ORG_PROOF_TTL_SECS {
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: proof TTL {}s out of range (1..={MAX_ORG_PROOF_TTL_SECS})",
+                intent.proof_ttl_secs
+            ),
+        });
+    }
     let digest = org_request_digest(req).map_err(|e| RpcError::Codec {
         direction: CodecDirection::Encode,
         message: format!("org admission: request digest failed: {e}"),
     })?;
-    // Bound the TTL and derive the expiry from a NANOSECOND base (Kyra #47 tail):
-    // `current_timestamp()` is whole seconds, so `secs * 1e9` truncates the
-    // sub-second remainder and expires a proof up to ~1s early; a nanosecond
-    // `now` avoids that, and the ceiling caps how long a captured proof lives.
-    let ttl_secs = intent.proof_ttl_secs.min(MAX_ORG_PROOF_TTL_SECS);
+    // Derive the expiry from a NANOSECOND base (Kyra #47 tail): `current_timestamp()`
+    // is whole seconds, so `secs * 1e9` truncates the sub-second remainder and
+    // expires a proof up to ~1s early; a nanosecond `now` avoids that.
+    let ttl_secs = intent.proof_ttl_secs;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -6801,6 +6814,44 @@ mod roster_fallback_tests {
             server
                 .call(TARGET, "other", Bytes::from_static(b"x"), intent_opts())
                 .await,
+            Err(RpcError::Codec { .. })
+        ));
+    }
+
+    /// Kyra #47 tail (caller/API): the requested proof TTL must be an honest,
+    /// finite lifetime within the SHARED `org_call::MAX_ORG_PROOF_TTL_SECS`
+    /// ceiling (30 s) the provider enforces at verify time — the caller fails
+    /// LOCALLY rather than silently clamping. `0` is rejected (a proof that
+    /// expires within the same whole second is only admissible inside provider
+    /// skew tolerance, not a usable credential); the exact ceiling admits; one
+    /// past it is rejected, NOT clamped down to the ceiling.
+    #[test]
+    fn org_proof_ttl_out_of_range_fails_locally() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let intent_with = |ttl: u64| {
+            let mut i = owner_delegated_intent(EntityKeypair::generate(), &org_b, provider.clone());
+            i.proof_ttl_secs = ttl;
+            i
+        };
+        // 0 → rejected: only "live" inside the provider's skew tolerance.
+        assert!(matches!(
+            sign_admission_proof(&intent_with(0), 1, &base),
+            Err(RpcError::Codec { .. })
+        ));
+        // Exactly the shared ceiling → admitted.
+        assert!(sign_admission_proof(&intent_with(MAX_ORG_PROOF_TTL_SECS), 2, &base).is_ok());
+        // One past the ceiling → rejected, NOT clamped to the ceiling.
+        assert!(matches!(
+            sign_admission_proof(&intent_with(MAX_ORG_PROOF_TTL_SECS + 1), 3, &base),
             Err(RpcError::Codec { .. })
         ));
     }
