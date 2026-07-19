@@ -6391,6 +6391,144 @@ mod roster_fallback_tests {
         );
     }
 
+    /// E1 witness 10/11 (owner-delegated), end-to-end through the LIVE gate:
+    /// a provider with an installed authority (owner org B) serves a protected
+    /// service; a caller ∈ B presents a valid `net-org-admission` proof; the
+    /// gate admits and the handler runs with the four-party `Admitted`
+    /// attribution in `RpcContext::org_admission` (proof header stripped). This
+    /// exercises serve_rpc_protected → admit_and_dispatch_protected →
+    /// verify_provider_authority → verify_org_admission → apply_inbound_admitted.
+    #[tokio::test]
+    async fn protected_owner_delegated_call_admits_end_to_end() {
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::{Admitted, OrgAdmission};
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+
+        type Seen = std::sync::Arc<Mutex<Option<Admitted>>>;
+        struct SpyHandler(Seen);
+        #[async_trait::async_trait]
+        impl RpcHandler for SpyHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.0.lock() = Some(ctx.org_admission.clone().expect("admitted call"));
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        // The node is a member of its OWNER org B; adopt + install its authority.
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-wire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let seen: Seen = std::sync::Arc::new(Mutex::new(None));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(SpyHandler(seen.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        // A caller ∈ org B (owner-delegated), pinned to its session node.
+        const CALLER_NODE: u64 = 0x91;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let call_id = 7u64;
+        // Digest is computed over the request WITHOUT the proof header (the gate
+        // strips it before hashing), so sign over the bare request then attach.
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let expiry = (current_timestamp() + 20) * 1_000_000_000;
+        let proof = OrgCallProof::sign_for_call(
+            &caller_kp,
+            membership,
+            dispatcher,
+            None,
+            org_b.org_id(),
+            org_b.org_id(),
+            node_entity.clone(),
+            call_id,
+            cap,
+            expiry,
+            digest,
+        );
+        let proof_bytes = proof.encode().expect("encode proof");
+
+        let mut payload = base.clone();
+        payload
+            .headers
+            .push((ORG_ADMISSION_HEADER.to_string(), proof_bytes));
+        let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut frame, 0);
+        frame.extend_from_slice(&payload.encode());
+        let event = RpcInboundEvent {
+            channel_hash,
+            origin_hash: caller_origin,
+            from_node: CALLER_NODE,
+            payload: Bytes::from(frame),
+        };
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, event));
+
+        assert!(
+            wait_until_at_least(|| seen.lock().is_some() as u64, 1).await,
+            "the handler must run for an admitted protected call",
+        );
+        let admitted = seen.lock().clone().expect("admitted");
+        assert_eq!(admitted.caller, caller_entity, "caller S");
+        assert_eq!(
+            admitted.acting_org,
+            org_b.org_id(),
+            "acting org A == owner B"
+        );
+        assert_eq!(admitted.provider_org, org_b.org_id(), "provider org B");
+        assert_eq!(admitted.provider, node_entity, "exact provider P");
+        assert_eq!(admitted.capability, cap, "capability C");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Like [`build_server`], but installs a channel-config registry that
     /// token-gates `reply` on a root the node cannot chain to. The local
     /// node holds no matching token, so any *roster* fan-out on `reply`
