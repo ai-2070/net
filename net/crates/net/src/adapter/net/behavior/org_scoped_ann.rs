@@ -138,6 +138,9 @@ pub enum ScopedAnnouncementError {
     /// grant id (which is exclusively the OWNER-audience sentinel). Distinct
     /// builders prevent the two audiences from ever being confused.
     ReservedGrantId,
+    /// The provider keypair cannot sign (it is public-only), so the outer
+    /// signature could not be produced. Surfaced instead of panicking.
+    SigningUnavailable,
 }
 
 impl std::fmt::Display for ScopedAnnouncementError {
@@ -159,6 +162,9 @@ impl std::fmt::Display for ScopedAnnouncementError {
             ScopedAnnouncementError::ReservedGrantId => f.write_str(
                 "a granted scoped announcement cannot use the reserved zero grant id (owner sentinel)",
             ),
+            ScopedAnnouncementError::SigningUnavailable => {
+                f.write_str("scoped-announcement provider keypair cannot sign (public-only)")
+            }
         }
     }
 }
@@ -422,7 +428,7 @@ impl ScopedCapabilityAnnouncement {
             expires_at,
         );
         let (nonce, ciphertext) = seal_descriptor(discovery_key, &aad, descriptor)?;
-        Ok(Self::finish(
+        Self::finish(
             provider_keypair,
             provider,
             owner_org,
@@ -433,7 +439,7 @@ impl ScopedCapabilityAnnouncement {
             expires_at,
             nonce,
             ciphertext,
-        ))
+        )
     }
 
     /// Deterministic build hook for golden vectors: seal with a caller-supplied
@@ -466,7 +472,7 @@ impl ScopedCapabilityAnnouncement {
             expires_at,
         );
         let ciphertext = seal_descriptor_with_nonce(discovery_key, &nonce, &aad, descriptor)?;
-        Ok(Self::finish(
+        Self::finish(
             provider_keypair,
             provider,
             owner_org,
@@ -477,13 +483,16 @@ impl ScopedCapabilityAnnouncement {
             expires_at,
             nonce,
             ciphertext,
-        ))
+        )
     }
 
-    /// Assemble the struct and apply the outer signature. Infallible: the seal
-    /// already bounded the plaintext, so the ciphertext fits the `u16` length
-    /// prefix and the whole envelope fits [`MAX_SCOPED_ANN_ENCODED_BYTES`] by the
-    /// const-asserted budget partition (checked here with debug asserts).
+    /// Assemble the struct and apply the outer signature. Fallible ONLY on a
+    /// public-only provider keypair: the seal already bounded the plaintext (so
+    /// the ciphertext fits the `u16` length prefix and the whole envelope fits
+    /// [`MAX_SCOPED_ANN_ENCODED_BYTES`] by the const-asserted budget partition,
+    /// checked here with debug asserts), but `try_sign` returns
+    /// [`ScopedAnnouncementError::SigningUnavailable`] rather than panic if the
+    /// keypair cannot sign (Kyra OA3 closure).
     #[allow(clippy::too_many_arguments)]
     fn finish(
         provider_keypair: &EntityKeypair,
@@ -496,7 +505,7 @@ impl ScopedCapabilityAnnouncement {
         expires_at: u64,
         nonce: [u8; SCOPED_ANN_NONCE_SIZE],
         ciphertext: Vec<u8>,
-    ) -> Self {
+    ) -> Result<Self, ScopedAnnouncementError> {
         debug_assert!(ciphertext.len() <= u16::MAX as usize);
         debug_assert!(
             SCOPED_ANN_PREFIX_LEN + ciphertext.len() + 64 <= MAX_SCOPED_ANN_ENCODED_BYTES
@@ -514,8 +523,14 @@ impl ScopedCapabilityAnnouncement {
             signature: [0u8; 64],
         };
         let signing_input = env.signing_input();
-        env.signature = provider_keypair.sign(&signing_input).to_bytes();
-        env
+        // `try_sign` (not `sign`): these builders return `Result`, and
+        // `EntityKeypair::sign` PANICS on a public-only keypair — surface it as a
+        // typed error instead.
+        env.signature = provider_keypair
+            .try_sign(&signing_input)
+            .map_err(|_| ScopedAnnouncementError::SigningUnavailable)?
+            .to_bytes();
+        Ok(env)
     }
 
     /// The encoded envelope WITHOUT the trailing signature — the exact bytes the

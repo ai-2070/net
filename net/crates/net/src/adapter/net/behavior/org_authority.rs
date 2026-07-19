@@ -364,6 +364,29 @@ impl Drop for OwnerAudienceCredential {
     }
 }
 
+/// RAII volatile-scrub for a transient key-bearing byte buffer (the file-backed
+/// owner audience material the ceremony reads/writes): zeroes its contents on
+/// EVERY exit — normal return, `?`, or unwind — so a copy of the owner discovery
+/// key never lingers in freed memory (Kyra OA3 closure). Volatile writes prevent
+/// optimizer elision, matching the crate's hand-rolled scrub convention (no
+/// `zeroize` crate for these buffers).
+struct ScrubbedBytes(Vec<u8>);
+
+impl ScrubbedBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ScrubbedBytes {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            // SAFETY: `byte` is a valid mutable reference into the owned Vec.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
 /// Errors from adoption / startup authority loading.
 #[derive(Debug)]
 pub enum OrgAuthorityError {
@@ -711,7 +734,9 @@ impl NodeAuthority {
         //    be silently re-blessed by a renewal).
         let have_audience = match read_audience_checked(&audience_path)? {
             Some(bytes) => {
-                let _ = OwnerAudienceCredential::decode_config(&bytes)?;
+                // The read buffer carries the raw key — scrub it on every exit.
+                let bytes = ScrubbedBytes(bytes);
+                let _ = OwnerAudienceCredential::decode_config(bytes.as_slice())?;
                 true
             }
             None => false,
@@ -764,7 +789,15 @@ impl NodeAuthority {
         //    now (0600, atomic, fresh temp inode).
         if !have_audience {
             let audience = OwnerAudienceCredential::generate();
-            write_atomic(&audience_path, &audience.encode_config())?;
+            // The serialized key buffer scrubs on every exit: the source array
+            // inline (before the `?`), the Vec copy via its RAII guard.
+            let mut raw = audience.encode_config();
+            let encoded = ScrubbedBytes(raw.to_vec());
+            for byte in raw.iter_mut() {
+                // SAFETY: `byte` is a valid mutable reference into the owned array.
+                unsafe { std::ptr::write_volatile(byte, 0) };
+            }
+            write_atomic(&audience_path, encoded.as_slice())?;
         }
 
         // 9. FINAL PHASE under the revocation-state lock (review-9):
@@ -844,14 +877,15 @@ impl NodeAuthority {
         let membership_bytes = read_required(&membership_path)?;
         let config = parse_membership(&membership_bytes, &membership_path)?;
 
-        let audience_bytes = read_audience_checked(&audience_path)?.ok_or_else(|| {
-            let err = OrgAuthorityError::MissingFile {
-                path: audience_path.display().to_string(),
-            };
-            tracing::error!("{err}");
-            err
-        })?;
-        let audience = OwnerAudienceCredential::decode_config(&audience_bytes)?;
+        let audience_bytes =
+            ScrubbedBytes(read_audience_checked(&audience_path)?.ok_or_else(|| {
+                let err = OrgAuthorityError::MissingFile {
+                    path: audience_path.display().to_string(),
+                };
+                tracing::error!("{err}");
+                err
+            })?);
+        let audience = OwnerAudienceCredential::decode_config(audience_bytes.as_slice())?;
 
         let revocation = Arc::new(OrgRevocationStore::open_existing(&revocation_path)?);
 
