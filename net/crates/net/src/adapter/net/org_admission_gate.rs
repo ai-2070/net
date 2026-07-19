@@ -266,15 +266,25 @@ pub fn verify_provider_authority(
     })
 }
 
-/// The visibility of a registered capability (E1.1). E1 protected
-/// registration accepts ONLY [`Self::Public`]; `OwnerScoped` /
-/// `GrantedAudience` are deferred to OA-3, where the announcement
-/// state machine lands, and a protected registration that requested
-/// them is loudly refused until then.
+/// The visibility of a registered capability (E1.1). Emission projects by
+/// visibility (Kyra OA3 ruling): `Public` → plaintext CAP-ANN; the two scoped
+/// forms → an encrypted `ScopedCapabilityAnnouncement` ONLY, never plaintext.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityVisibility {
     /// Announced in the clear, discoverable by anyone (v0.4 default).
     Public,
+    /// An internal private capability of the node's OWN org. Emitted ONLY as an
+    /// encrypted `ScopedCapabilityAnnouncement` under the owner audience (the
+    /// reserved zero `grant_id` sentinel) — never in a plaintext CAP-ANN.
+    /// Invocation still requires [`OrgAdmission::OwnerDelegated`]; the capability
+    /// enters the local self-fold for `has_local_capability` but never the wire
+    /// in the clear (OA3-4b1).
+    OwnerScoped,
+    /// A cross-org private capability. Emitted ONLY as an encrypted
+    /// `ScopedCapabilityAnnouncement` under a grant audience — never plaintext.
+    /// Emission needs the provider-side grant/secret store and is deferred to
+    /// OA3-4b2; a registration that requests it is refused until then.
+    GrantedAudience,
 }
 
 /// The provider-local application veto (E1.1/E1.6, verdict §7). Runs
@@ -351,6 +361,26 @@ impl RegisteredRpcService {
         })
     }
 
+    /// An OWNER-SCOPED registration (OA3-4b1): `OwnerScoped` visibility (emitted
+    /// only as an encrypted owner-audience announcement, never plaintext),
+    /// [`OrgAdmission::OwnerDelegated`] (internal invocation authority), and an
+    /// EXPLICIT `provider_policy`. The service enters the local self-fold so
+    /// `has_local_capability` admits it, but its tag never rides a plaintext
+    /// broadcast.
+    pub fn owner_scoped(
+        registration_id: u64,
+        service: Arc<str>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Self {
+        Self {
+            registration_id,
+            service,
+            visibility: CapabilityVisibility::OwnerScoped,
+            admission: OrgAdmission::OwnerDelegated,
+            provider_policy,
+        }
+    }
+
     /// The generation token (E0.1) this registration owns.
     pub fn registration_id(&self) -> u64 {
         self.registration_id
@@ -361,7 +391,8 @@ impl RegisteredRpcService {
         &self.service
     }
 
-    /// The announcement visibility (always `Public` in E1).
+    /// The announcement visibility — `Public` for legacy/protected services,
+    /// `OwnerScoped` for an owner-scoped registration (OA3-4b1).
     pub fn visibility(&self) -> CapabilityVisibility {
         self.visibility
     }
