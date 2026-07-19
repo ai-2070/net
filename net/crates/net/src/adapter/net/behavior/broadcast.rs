@@ -32,6 +32,17 @@ pub const SUBPROTOCOL_ROUTE_WITHDRAW: u16 = 0x0C01;
 // sensing-owned and live in `super::sensing::wire` — committed there
 // per the SENSING_INTEREST_COALESCING_PLAN review-7 sign-off.
 
+/// Subprotocol id for owner/granted-audience **encrypted** capability
+/// announcements ([`super::org_scoped_ann::ScopedCapabilityAnnouncement`],
+/// OA3-4b1). Same 0x0C mesh-state-broadcast family, next free after the
+/// sensing-reserved 0x0C02/0x0C03. A confidential owner-scoped service is
+/// advertised ONLY on this id, never inside a plaintext
+/// [`SUBPROTOCOL_CAPABILITY_ANN`] payload; a peer without the audience
+/// decryption key cannot open it, and a peer that does not know this id drops
+/// the packet at the dispatch loop's unknown-subprotocol guard (mixed-version
+/// degradation identical to [`SUBPROTOCOL_ROUTE_WITHDRAW`]).
+pub const SUBPROTOCOL_SCOPED_CAPABILITY_ANN: u16 = 0x0C04;
+
 /// Poison-reverse route withdrawal: the SENDER declares "I no longer
 /// forward toward `dest`". The `via` leg is implicit and
 /// authenticated — it is always the session peer the packet arrived

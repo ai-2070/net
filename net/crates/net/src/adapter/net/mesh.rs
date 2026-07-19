@@ -53,6 +53,7 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::{
     RouteWithdrawal, WithdrawalSeqGate, SUBPROTOCOL_CAPABILITY_ANN, SUBPROTOCOL_ROUTE_WITHDRAW,
+    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
 };
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
@@ -2821,10 +2822,11 @@ impl LocalServiceRegistry {
 /// exactly as before.
 struct LocalCapabilityEmission {
     public: CapabilityAnnouncement,
-    // Written empty in B1 (the atomic-publication refactor); the combined send
-    // helper that READS it lands in OA3-4b1 Commit B2, at which point this allow
-    // is removed.
-    #[allow(dead_code)]
+    // Cloned into the send-time [`SendEmission`] by the combined send helper
+    // ([`MeshNode::send_emission_to`]) and shipped on
+    // `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`, one packet per envelope. Built empty
+    // until OA3-4b1 Commit B2 populates the owner envelope; a cert-invalidating
+    // send-time rebuild clears it (see [`MeshNode::rebuild_cached_announcement`]).
     scoped: Vec<Vec<u8>>,
     /// The local-service-registry generation this emission's public/scoped
     /// projection was derived from. The send path rejects the emission if the
@@ -2832,6 +2834,18 @@ struct LocalCapabilityEmission {
     /// made a still-plaintext tag private (Kyra OA3 closure). `0` when there is no
     /// registry (non-`cortex`), where no owner-scoped service can exist.
     visibility_generation: u64,
+}
+
+/// One coherent send-time serialization of the published
+/// [`LocalCapabilityEmission`]: the plaintext public CAP-ANN `public` bytes and
+/// the encrypted owner-scoped envelopes `scoped`, BOTH taken from the same
+/// validated `local_emission` load (see
+/// [`MeshNode::announcement_bytes_for_send_probed`]) so a send can never pair a
+/// public generation with a stale scoped one (Kyra OA3 torn-snapshot invariant).
+/// An empty `scoped` ships nothing on `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`.
+struct SendEmission {
+    public: Vec<u8>,
+    scoped: Vec<Vec<u8>>,
 }
 
 #[cfg(all(test, feature = "cortex"))]
@@ -7571,11 +7585,12 @@ impl MeshNode {
     /// the certificate simply expired by wall clock) triggers a
     /// rebuild WITHOUT it — re-signed, version-bumped so it
     /// supersedes the certified form at peers that already hold it.
-    /// Returns `None` when nothing has been announced yet, or (only
-    /// under pathological continuous churn) when the seqlock cannot
-    /// converge — skipping one send is fail-safe (never a stale
-    /// cert).
-    fn announcement_bytes_for_send(&self) -> Option<Vec<u8>> {
+    /// Returns the coherent [`SendEmission`] — the public CAP-ANN bytes plus any
+    /// owner-scoped envelopes, both from one validated `local_emission` load — or
+    /// `None` when nothing has been announced yet, or (only under pathological
+    /// continuous churn) when the seqlock cannot converge — skipping one send is
+    /// fail-safe (never a stale cert).
+    fn announcement_bytes_for_send(&self) -> Option<SendEmission> {
         self.announcement_bytes_for_send_probed(None, super::behavior::org::current_timestamp())
     }
 
@@ -7591,7 +7606,7 @@ impl MeshNode {
         &self,
         probe: Option<&dyn Fn()>,
         now_secs: u64,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<SendEmission> {
         for _ in 0..16 {
             let cached = self.local_emission.load_full()?;
             // Reject an emission derived from a STALE visibility snapshot: if a
@@ -7638,7 +7653,15 @@ impl MeshNode {
                 // pinned `snapshot` Arcs are still alive for this comparison, so a
                 // swapped-away authority/store cannot reuse the captured addresses.
                 if self.security_stamp() == stamp && visibility_stable {
-                    return Some(bytes);
+                    // Pair the serialized public bytes with the owner-scoped
+                    // envelopes from the SAME validated `cached` load — one
+                    // coherent generation, never a torn public/scoped snapshot
+                    // (Kyra OA3). A cert-invalidating rebuild has already cleared
+                    // `scoped`, so an envelope embedding a stale cert cannot ship.
+                    return Some(SendEmission {
+                        public: bytes,
+                        scoped: cached.scoped.clone(),
+                    });
                 }
                 // A visibility change is terminal for this send — the bump already
                 // woke a re-announce that will publish a coherent emission; do not
@@ -7667,7 +7690,7 @@ impl MeshNode {
     /// use.
     #[doc(hidden)]
     pub fn announcement_bytes_for_send_for_test(&self) -> Option<Vec<u8>> {
-        self.announcement_bytes_for_send()
+        self.announcement_bytes_for_send().map(|e| e.public)
     }
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a
@@ -7687,6 +7710,7 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn announcement_bytes_for_send_at_for_test(&self, now_secs: u64) -> Option<Vec<u8>> {
         self.announcement_bytes_for_send_probed(None, now_secs)
+            .map(|e| e.public)
     }
 
     /// Deterministic-witness seam: run the send seqlock with a probe
@@ -7701,6 +7725,7 @@ impl MeshNode {
             Some(probe),
             super::behavior::org::current_timestamp(),
         )
+        .map(|e| e.public)
     }
 
     /// Rebuild the cached announcement so its owner certificate
@@ -18840,27 +18865,50 @@ impl MeshNode {
         if to_broadcast.is_none() {
             return Ok(());
         }
-        let Some(bytes) = self.announcement_bytes_for_send() else {
+        let Some(emission) = self.announcement_bytes_for_send() else {
             return Ok(());
         };
-        self.broadcast_announcement_bytes(&bytes).await;
+        self.broadcast_emission(&emission).await;
         Ok(())
     }
 
-    /// Broadcast a serialized `CapabilityAnnouncement` to every
-    /// currently-connected peer. Best-effort — a per-peer send failure
-    /// is logged and skipped rather than short-circuiting the fan-out.
-    /// Shared by the immediate announce path and the RT-1 trailing-edge
-    /// flush so the two can't drift (RT-1 review Finding 14).
-    async fn broadcast_announcement_bytes(&self, bytes: &[u8]) {
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
-        for addr in peer_addrs {
+    /// Send one coherent local emission to `addr`: the plaintext public CAP-ANN
+    /// on [`SUBPROTOCOL_CAPABILITY_ANN`], then each encrypted owner-scoped
+    /// envelope on [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`], one packet apiece. THE
+    /// single per-peer emit chokepoint — the broadcast fan-out and the late-join
+    /// unicast both route through it so the public and scoped forms can never
+    /// drift (Kyra OA3 — one combined send helper, no second forgettable path).
+    /// Best-effort per packet: a failure is logged and skipped.
+    async fn send_emission_to(&self, addr: SocketAddr, emission: &SendEmission) {
+        if let Err(e) = self
+            .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
+            .await
+        {
+            tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+        }
+        for envelope in &emission.scoped {
             if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, bytes)
+                .send_subprotocol(addr, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, envelope)
                 .await
             {
-                tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+                tracing::trace!(
+                    peer = %addr,
+                    error = %e,
+                    "capability: scoped announce send failed"
+                );
             }
+        }
+    }
+
+    /// Broadcast one coherent local emission (public + owner-scoped) to every
+    /// currently-connected peer via [`Self::send_emission_to`]. Best-effort — a
+    /// per-peer failure is logged and skipped rather than short-circuiting the
+    /// fan-out. Shared by the immediate announce path and the RT-1 trailing-edge
+    /// flush so the two can't drift (RT-1 review Finding 14).
+    async fn broadcast_emission(&self, emission: &SendEmission) {
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        for addr in peer_addrs {
+            self.send_emission_to(addr, emission).await;
         }
     }
 
@@ -18922,10 +18970,10 @@ impl MeshNode {
         // bytes are serialized through the epoch-checked path
         // (review-9 addendum): a self-floor raised during the
         // deferral window must not ship the certified form.
-        let Some(bytes) = self.announcement_bytes_for_send() else {
+        let Some(emission) = self.announcement_bytes_for_send() else {
             return;
         };
-        self.broadcast_announcement_bytes(&bytes).await;
+        self.broadcast_emission(&emission).await;
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
@@ -20874,19 +20922,10 @@ impl MeshNode {
         // addendum): a late joiner must receive what this node's
         // CURRENT state would emit, never a cached certificate a
         // floor raise has since invalidated.
-        let Some(bytes) = self.announcement_bytes_for_send() else {
+        let Some(emission) = self.announcement_bytes_for_send() else {
             return;
         };
-        if let Err(e) = self
-            .send_subprotocol(peer_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
-            .await
-        {
-            tracing::trace!(
-                peer = %peer_addr,
-                error = %e,
-                "capability: session-open push failed"
-            );
-        }
+        self.send_emission_to(peer_addr, &emission).await;
     }
 
     // ── Stream API ─────────────────────────────────────────────────────
