@@ -7872,6 +7872,29 @@ impl MeshNode {
             &self.scoped_discovery,
             envelope,
             0,
+            None,
+        );
+    }
+
+    /// Deterministic-witness seam (OA3-5 publication-race): drive the inbound
+    /// owner-scoped ingest with a `probe` fired in the exact window between a
+    /// successful verify and the pre-insert stability recheck — where a
+    /// concurrent floor publish / store swap / authority rotation would land. A
+    /// witness raises a floor (or rotates the authority) inside `probe` to prove
+    /// the recheck refuses the now-stale insert. Test-only.
+    #[doc(hidden)]
+    pub fn ingest_scoped_announcement_probed_for_test(
+        &self,
+        envelope: &[u8],
+        probe: &(dyn Fn() + Sync),
+    ) {
+        Self::ingest_scoped_announcement(
+            &self.node_authority,
+            &self.org_revocation,
+            &self.scoped_discovery,
+            envelope,
+            0,
+            Some(probe),
         );
     }
 
@@ -10755,6 +10778,7 @@ impl MeshNode {
                     &ctx.scoped_discovery,
                     &payload,
                     from_node,
+                    None,
                 );
             }
             return;
@@ -16365,6 +16389,7 @@ impl MeshNode {
         >,
         payload: &[u8],
         from_node: u64,
+        probe: Option<&dyn Fn()>,
     ) {
         use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
@@ -16406,10 +16431,23 @@ impl MeshNode {
         // Verify against the node's LIVE revocation floors, so a provider whose
         // cert generation the org has since floored is refused at ingest. Hold
         // the snapshot `Arc` and borrow through it; an un-adopted node with no
-        // revocation store floor-checks against an implicit empty floor set.
+        // revocation store floor-checks against an implicit empty floor set. PIN
+        // the security inputs verify runs against (Kyra OA3-5 publication-race
+        // closure): the authority + revocation-store Arcs — held alive for the
+        // whole call, so the address comparison below is ABA-safe — and the floor
+        // GENERATION the snapshot reflects (read under one guard with the floors,
+        // so the pair is internally consistent).
+        let authority_ptr = Arc::as_ptr(&authority) as *const () as usize;
+        let store_ptr = store
+            .as_ref()
+            .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
         let empty_floors = OrgRevocationState::empty();
-        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
-        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        let pinned = store.as_ref().map(|s| s.snapshot_with_generation());
+        let floors: &OrgRevocationState = pinned
+            .as_ref()
+            .map(|(f, _)| f.as_ref())
+            .unwrap_or(&empty_floors);
+        let pinned_generation = pinned.as_ref().map_or(0, |(_, g)| *g);
         let now_secs = super::behavior::org::current_timestamp();
         let ctx = ScopedIngestContext {
             local_owner_org: owner_org,
@@ -16419,6 +16457,47 @@ impl MeshNode {
         };
         match verify_scoped_ingest(&envelope, &audience, &ctx) {
             Ok(verified) => {
+                // A test probe fires in the exact verify→recheck window a
+                // concurrent floor publish / store swap / authority rotation would
+                // land in, proving the recheck below catches it.
+                if let Some(probe) = probe {
+                    probe();
+                }
+                // Publication-race recheck, FAIL-CLOSED (Kyra OA3-5): the
+                // capability was verified against an authority/store/floor view
+                // that must still be current at the instant of insert. If a
+                // same-org authority rotation, a revocation-store (re)install, a
+                // floor publish (generation bump), or a poison transition landed
+                // during verify, refuse — the sender re-announces against the
+                // settled view. Query-time currentness (3b) is the second line of
+                // defense; this stops a stale record from ever entering the store.
+                let authority_stable = node_authority
+                    .load_full()
+                    .as_ref()
+                    .map(|a| Arc::as_ptr(a) as *const () as usize == authority_ptr)
+                    .unwrap_or(false);
+                let current_store = org_revocation.load_full();
+                let store_ptr_now = current_store
+                    .as_ref()
+                    .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
+                let generation_now = current_store
+                    .as_ref()
+                    .map_or(0, |s| s.barriered_generation());
+                let poisoned_now = current_store
+                    .as_ref()
+                    .map(|s| s.is_poisoned())
+                    .unwrap_or(false);
+                let store_stable = store_ptr_now == store_ptr
+                    && generation_now == pinned_generation
+                    && !poisoned_now;
+                if !authority_stable || !store_stable {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: security view moved during verify; ingest refused \
+                         (publication race)"
+                    );
+                    return;
+                }
                 let outcome = scoped_discovery.lock().ingest(verified, now_secs);
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),

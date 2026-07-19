@@ -1091,6 +1091,110 @@ async fn an_inbound_owner_scoped_announcement_is_verified_and_stored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// OA3-5 (Kyra closure, publication race): an owner-scoped capability verified
+/// against a floor/authority/store view that MOVES before the store insert is
+/// refused FAIL-CLOSED, never landed stale. A concurrent revocation-floor
+/// publish landing in the exact verify→insert window (driven here through the
+/// probe seam) bumps the store generation; the pre-insert recheck sees the view
+/// moved and drops the insert. The refusal is isolated to the recheck: the raced
+/// provider's OWN floor is never touched, so query-time currentness (3b) would
+/// have kept it visible had it been stored — its absence proves it never
+/// entered. Re-announcing the identical envelope against the settled view lands.
+#[tokio::test]
+async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
+    use net::adapter::net::behavior::org_authority::NodeAuthority;
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use std::collections::BTreeMap;
+
+    let node = build_node_with(EntityKeypair::from_bytes([0x70u8; 32])).await;
+    let node_entity = node.entity_id().clone();
+    let org = OrgKeypair::from_bytes([0x89u8; 32]);
+    let node_cert =
+        OrgMembershipCert::try_issue(&org, node_entity.clone(), 1, 3600).expect("node cert");
+    let dir = std::env::temp_dir().join(format!("net-oa35-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt"));
+    // The authority's own revocation store BECOMES the node's live store on
+    // install — a floor published through this handle bumps the exact generation
+    // the ingest recheck reads (it is the same `Arc`, never swapped by a raise).
+    let store = authority.revocation.clone();
+    let handle = authority.audience.audience_handle;
+    let key = *authority.audience.discovery_key();
+    node.install_node_authority(authority)
+        .expect("install authority");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let descriptor = CapabilitySet::new()
+        .add_tag("nrpc:peer-secret")
+        .to_bytes_compact();
+
+    let make_envelope = |seed: u8| -> (EntityId, Vec<u8>) {
+        let provider_kp = EntityKeypair::from_bytes([seed; 32]);
+        let provider_entity = provider_kp.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(&org, provider_entity.clone(), 1, 3600)
+            .expect("provider cert");
+        let env = ScopedCapabilityAnnouncement::build_owner(
+            &provider_kp,
+            org.org_id(),
+            cert,
+            handle,
+            &key,
+            1,
+            now + 3600,
+            &descriptor,
+        )
+        .expect("build owner envelope");
+        (provider_entity, env.to_bytes())
+    };
+
+    // Baseline: a valid same-org envelope lands with the store installed.
+    let (clean_provider, clean_bytes) = make_envelope(0x71);
+    node.ingest_scoped_announcement_for_test(&clean_bytes);
+    assert!(
+        node.scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &clean_provider),
+        "a valid owner-scoped envelope lands under an installed revocation store",
+    );
+
+    // The raced envelope: a floor publish for an UNRELATED member fires between
+    // verify and the pre-insert recheck — bumping the store generation WITHOUT
+    // touching this provider's own floor.
+    let (raced_provider, raced_bytes) = make_envelope(0x72);
+    let unrelated_member = EntityKeypair::from_bytes([0xAAu8; 32]).entity_id().clone();
+    let race_probe = || {
+        let mut floors_map = BTreeMap::new();
+        floors_map.insert(unrelated_member.clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org, &floors_map).expect("issue race bundle");
+        store.apply_bundle(&bundle).expect("apply race floor");
+    };
+    node.ingest_scoped_announcement_probed_for_test(&raced_bytes, &race_probe);
+    assert!(
+        !node
+            .scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &raced_provider),
+        "an insert racing a floor publish is refused — the raced provider never enters the store",
+    );
+
+    // Its OWN floor was never raised, so the absence is purely the recheck:
+    // re-announce the IDENTICAL envelope against the now-settled view and it lands.
+    node.ingest_scoped_announcement_for_test(&raced_bytes);
+    assert!(
+        node.scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &raced_provider),
+        "the identical envelope re-announced against the settled view lands cleanly",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
 /// emission derived from the STALE visibility snapshot. The send-time generation
 /// check — shared by every self-emission path via `announcement_bytes_for_send`
