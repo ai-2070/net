@@ -288,7 +288,7 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
         created_at: now_iso8601(),
         note: args.note.clone(),
     };
-    let toml_text = toml::to_string_pretty(&file)
+    let mut toml_text = toml::to_string_pretty(&file)
         .map_err(|e| generic(format!("failed to serialize org key TOML: {e}")))?;
 
     // Same atomic, mode-restricted publish as operator identities —
@@ -298,6 +298,9 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
     let tmp = path.with_extension(format!("tmp.{pid}"));
     write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
     enforce_strict_permissions(&path).await?;
+    // Scrub the serialized seed buffer once published (Kyra OA2-F P1); `file`
+    // scrubs its own `seed_hex` on `Drop`.
+    zeroize_string(&mut toml_text);
 
     // Public summary only — never the seed.
     let summary = OrgKeySummary {
@@ -586,13 +589,22 @@ async fn run_grant_capability(
 // Disk shapes
 // =========================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OrgKeyFile {
     org_id_hex: String,
     seed_hex: String,
     created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+}
+
+impl Drop for OrgKeyFile {
+    fn drop(&mut self) {
+        // The org root seed rides in `seed_hex`; scrub it on drop so a lingering
+        // copy isn't left in freed memory (Kyra OA2-F P1). No `Debug` derive:
+        // this struct must never render the seed into a log line.
+        zeroize_string(&mut self.seed_hex);
+    }
 }
 
 /// Versioned JSON envelope for a membership certificate (the cert
@@ -687,44 +699,89 @@ struct GrantCapabilityOutput {
 // Helpers
 // =========================================================================
 
+/// Best-effort in-place scrub (volatile writes prevent optimizer elision —
+/// matching the core crate's convention, no `zeroize` dependency).
+fn zeroize_slice(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid mutable reference for this iteration.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+}
+
+/// Scrub a `String`'s backing bytes in place (writing `0x00` keeps the buffer
+/// valid UTF-8).
+fn zeroize_string(s: &mut String) {
+    // SAFETY: overwriting with 0 bytes preserves the UTF-8 invariant.
+    let bytes = unsafe { s.as_mut_vec() };
+    zeroize_slice(bytes);
+}
+
 /// Load + parse an org key file, honoring the ssh-style permission
 /// gate (the seed is root-of-trust material for the whole org).
 async fn load_org_key(path: &Path, insecure_permissions: bool) -> Result<OrgKeypair, CliError> {
     if !insecure_permissions {
         check_strict_permissions(path).await?;
     }
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+    // The file text carries the raw seed. Scrub it on EVERY exit.
+    let mut text = tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(
             "failed to read org key file {}: {e}",
             path.display()
         ))
     })?;
-    let parsed: OrgKeyFile = toml::from_str(&text).map_err(|e| {
+    let outcome = load_org_key_from_text(&text, path);
+    zeroize_string(&mut text);
+    outcome
+}
+
+/// Parse + validate the (secret-bearing) org key text. Kept separate so the
+/// caller can scrub the source text unconditionally on return.
+fn load_org_key_from_text(text: &str, path: &Path) -> Result<OrgKeypair, CliError> {
+    // NEVER interpolate the `toml::de::Error`: its `Display` embeds the
+    // offending source LINE, which for this file is the secret `seed_hex`
+    // (Kyra OA2-F P1 — a malformed seed line was reproduced verbatim in
+    // stderr). Report a sanitized category only. `parsed` scrubs `seed_hex`
+    // on its own `Drop` at the end of this function.
+    let parsed: OrgKeyFile = toml::from_str(text).map_err(|_| {
         invalid_args(format!(
-            "org key file {} failed to parse: {e}",
+            "org key file {} is not valid TOML (kind: parse_error)",
             path.display()
         ))
     })?;
-    let seed = hex::decode(&parsed.seed_hex)
-        .map_err(|e| invalid_args(format!("org key seed_hex is not valid hex: {e}")))?;
-    let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
+    // Decode into a scrubbed buffer; on error, report the category, never the
+    // offending value.
+    let mut seed_bytes = hex::decode(parsed.seed_hex.as_bytes()).map_err(|_| {
         invalid_args(format!(
-            "org key seed must be 32 bytes (64 hex chars), got {}",
-            seed.len()
+            "org key file {} seed_hex is not valid hex (kind: bad_seed_encoding)",
+            path.display()
         ))
     })?;
-    let keypair = OrgKeypair::from_bytes(seed);
-    // Consistency check: a hand-edited org_id_hex that disagrees
-    // with the seed would otherwise sign as one org while claiming
-    // another.
-    let derived = hex::encode(keypair.org_id().as_bytes());
-    if !parsed.org_id_hex.eq_ignore_ascii_case(&derived) {
-        return Err(invalid_args(format!(
-            "org key file {}: org_id_hex does not match the key derived from seed_hex",
-            path.display()
-        )));
-    }
-    Ok(keypair)
+    let result = (|| {
+        if seed_bytes.len() != 32 {
+            return Err(invalid_args(format!(
+                "org key file {} seed must be 32 bytes (64 hex chars), got {} (kind: \
+                 bad_seed_length)",
+                path.display(),
+                seed_bytes.len()
+            )));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let keypair = OrgKeypair::from_bytes(seed);
+        zeroize_slice(&mut seed);
+        // Consistency check: a hand-edited org_id_hex that disagrees with the
+        // seed would otherwise sign as one org while claiming another.
+        let derived = hex::encode(keypair.org_id().as_bytes());
+        if !parsed.org_id_hex.eq_ignore_ascii_case(&derived) {
+            return Err(invalid_args(format!(
+                "org key file {}: org_id_hex does not match the key derived from seed_hex",
+                path.display()
+            )));
+        }
+        Ok(keypair)
+    })();
+    zeroize_slice(&mut seed_bytes);
+    result
 }
 
 /// Parse a 32-byte org id from hex (optional `0x` prefix).

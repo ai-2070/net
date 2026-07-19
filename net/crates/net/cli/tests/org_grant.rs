@@ -290,3 +290,36 @@ fn grant_capability_discover_artifacts_are_a_consistent_pair() {
         "the CLI-written audience secret matches its grant",
     );
 }
+
+#[test]
+fn malformed_org_key_error_never_echoes_the_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("org.toml");
+    // A recognizable sentinel seed on a MALFORMED line (bare hex is not a valid
+    // TOML value): pre-fix, the toml parse error echoed this line — including the
+    // seed — verbatim to stderr.
+    const SENTINEL: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef01";
+    std::fs::write(
+        &key,
+        format!("org_id_hex = \"00\"\nseed_hex = {SENTINEL}\n"),
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-dispatcher", "--org-key"])
+        .arg(&key)
+        .args(["--dispatcher", DISPATCHER_HEX])
+        .arg("--any-capability")
+        .args(["--out"])
+        .arg(dir.path().join("g.json"))
+        .arg("--insecure-permissions")
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains(SENTINEL),
+        "the org-key parse error leaked the seed sentinel to stderr: {stderr}",
+    );
+}
