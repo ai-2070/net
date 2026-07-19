@@ -1,5 +1,6 @@
-//! `net org (keygen|issue-cert|issue-floors)` — organization root
-//! authority authoring (OA-1, `ORG_CAPABILITY_AUTH_PLAN.md`).
+//! `net org (keygen|issue-cert|issue-floors|grant-dispatcher)` —
+//! organization root authority authoring (OA-1 belonging + OA-2 grant
+//! issuance, `ORG_CAPABILITY_AUTH_PLAN.md`).
 //!
 //! The org root key is OFFLINE key material: it lives on an
 //! operator machine, signs membership certificates and
@@ -24,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use net_sdk::org::{
-    OrgKeypair, OrgMembershipCert, OrgRevocationBundle, ORG_CERT_TTL_SECS_RECOMMENDED,
+    CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant, OrgKeypair, OrgMembershipCert,
+    OrgRevocationBundle, ORG_CERT_TTL_SECS_RECOMMENDED,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,8 +37,13 @@ use crate::commands::identity::{
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 
-/// Format version of the cert / floors JSON envelopes.
+/// Format version of the cert / floors / grant JSON envelopes.
 pub(crate) const ORG_FILE_VERSION: u32 = 1;
+
+/// Default dispatcher/capability grant TTL — 7 days. Grant lifetimes are
+/// days–weeks (renewal is re-issue + revoke in v1); the primitive hard-caps at
+/// 30 days (`MAX_ORG_GRANT_TTL_SECS`), rejected at issue AND at every verifier.
+const GRANT_TTL_SECS_DEFAULT: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Subcommand, Debug)]
 pub enum OrgCommand {
@@ -51,6 +58,12 @@ pub enum OrgCommand {
     /// revoked. Nodes merge bundles monotonically — a lower floor
     /// never rolls back a higher one, including across restart.
     IssueFloors(IssueFloorsArgs),
+    /// Issue a dispatcher grant: "entity <dispatcher> may act FOR
+    /// this org" over a capability (or any). A -> S, org-root-signed;
+    /// the caller carries it inside the org-admission proof. Holding
+    /// one is never invocation authority — the provider still
+    /// verifies the full per-call proof.
+    GrantDispatcher(GrantDispatcherArgs),
 }
 
 #[derive(Args, Debug)]
@@ -131,11 +144,52 @@ pub struct IssueFloorsArgs {
     pub insecure_permissions: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct GrantDispatcherArgs {
+    /// Path to the org root key file for the org the dispatcher acts
+    /// FOR — the grant is signed by THIS org.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+
+    /// The dispatcher's entity id (32-byte ed25519 pubkey, 64 hex
+    /// chars, optional `0x`) empowered to act for the org.
+    #[arg(long)]
+    pub dispatcher: String,
+
+    /// The capability tag the dispatcher may act on, e.g.
+    /// `nrpc:my-service`. Mutually exclusive with `--any-capability`.
+    #[arg(long)]
+    pub capability: Option<String>,
+
+    /// Grant the dispatcher EVERY capability (`DispatcherScope::Any`).
+    /// Mutually exclusive with `--capability`.
+    #[arg(long = "any-capability")]
+    pub any_capability: bool,
+
+    /// Grant TTL in seconds. Defaults to 7 days; hard-capped at 30
+    /// days (rejected at issue AND at every verifier).
+    #[arg(long = "ttl-secs", default_value_t = GRANT_TTL_SECS_DEFAULT)]
+    pub ttl_secs: u64,
+
+    /// Output path for the grant JSON.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Overwrite an existing file. Refuses by default.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Allow permissive org-key file modes on Unix.
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
 pub async fn run(cmd: OrgCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
     match cmd {
         OrgCommand::Keygen(args) => run_keygen(args, output).await,
         OrgCommand::IssueCert(args) => run_issue_cert(args, output).await,
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
+        OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
     }
 }
 
@@ -278,6 +332,62 @@ async fn run_issue_floors(
 }
 
 // =========================================================================
+// grant-dispatcher
+// =========================================================================
+
+async fn run_grant_dispatcher(
+    args: GrantDispatcherArgs,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let dispatcher = parse_entity_hex(&args.dispatcher)?;
+
+    // Exactly one of --capability / --any-capability.
+    let (scope, capability_label) = match (&args.capability, args.any_capability) {
+        (Some(tag), false) => (
+            DispatcherScope::Exact(CapabilityAuthorityId::for_tag(tag)),
+            tag.clone(),
+        ),
+        (None, true) => (DispatcherScope::Any, "any".to_string()),
+        (Some(_), true) => {
+            return Err(invalid_args(
+                "--capability and --any-capability are mutually exclusive",
+            ))
+        }
+        (None, false) => {
+            return Err(invalid_args(
+                "one of --capability <tag> or --any-capability is required",
+            ))
+        }
+    };
+
+    let grant = OrgDispatcherGrant::try_issue(&keypair, dispatcher.clone(), scope, args.ttl_secs)
+        .map_err(|e| invalid_args(format!("grant-dispatcher: {e}")))?;
+
+    refuse_existing(&args.out, args.force).await?;
+    write_json_envelope(
+        &args.out,
+        &OrgDispatcherGrantFile {
+            version: ORG_FILE_VERSION,
+            grant: grant.clone(),
+        },
+    )
+    .await?;
+
+    let summary = GrantDispatcherOutput {
+        path: args.out.display().to_string(),
+        org_id_hex: hex::encode(grant.org_id.as_bytes()),
+        dispatcher_hex: hex::encode(dispatcher.as_bytes()),
+        capability: capability_label,
+        not_before: grant.not_before,
+        not_after: grant.not_after,
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &summary)
+        .map_err(|e| generic(format!("write summary: {e}")))?;
+    Ok(())
+}
+
+// =========================================================================
 // Disk shapes
 // =========================================================================
 
@@ -307,6 +417,15 @@ pub(crate) struct OrgFloorsFile {
     pub(crate) bundle: OrgRevocationBundle,
 }
 
+/// Versioned JSON envelope for a dispatcher grant (the grant renders
+/// as hex of its canonical 185-byte wire form).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrgDispatcherGrantFile {
+    pub(crate) version: u32,
+    pub(crate) grant: OrgDispatcherGrant,
+}
+
 #[derive(Debug, Serialize)]
 struct OrgKeySummary {
     path: String,
@@ -332,6 +451,16 @@ struct IssueFloorsOutput {
     org_id_hex: String,
     floors: usize,
     issued_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GrantDispatcherOutput {
+    path: String,
+    org_id_hex: String,
+    dispatcher_hex: String,
+    capability: String,
+    not_before: u64,
+    not_after: u64,
 }
 
 // =========================================================================
