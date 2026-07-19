@@ -337,6 +337,13 @@ pub enum OrgError {
     /// permits nothing is structurally meaningless — minting or
     /// accepting it can only hide a caller bug.
     EmptyRights,
+    /// A capability grant's `AnyNodeOwnedBy(org)` target names an org
+    /// OTHER than the issuer (OA-2, Kyra OA2-F). B grants access to
+    /// nodes IT owns; `AnyNodeOwnedBy(C != B)` names providers owned
+    /// by a foreign org C and can NEVER admit (admission requires the
+    /// provider's owner == issuer), so it is refused at issue AND
+    /// decode rather than minting a permanently-unusable credential.
+    TargetOrgNotIssuer,
 }
 
 impl std::fmt::Display for OrgError {
@@ -375,6 +382,10 @@ impl std::fmt::Display for OrgError {
             ),
             Self::UnknownRights => write!(f, "grant rights carry unknown bits"),
             Self::EmptyRights => write!(f, "grant rights are empty"),
+            Self::TargetOrgNotIssuer => write!(
+                f,
+                "grant AnyNodeOwnedBy target org is not the issuer org (permanently unusable)"
+            ),
         }
     }
 }

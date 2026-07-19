@@ -21,6 +21,21 @@ fn keygen(dir: &Path, name: &str) -> std::path::PathBuf {
     key
 }
 
+/// Extract `org_id_hex` from a `net org keygen` TOML key file.
+fn org_id_of(key: &Path) -> String {
+    let text = std::fs::read_to_string(key).unwrap();
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("org_id_hex") {
+            return rest
+                .trim_start_matches(['=', ' '])
+                .trim()
+                .trim_matches('"')
+                .to_string();
+        }
+    }
+    panic!("org_id_hex not found in {}", key.display());
+}
+
 /// A stable fake dispatcher entity id (any 32 bytes decode as an
 /// EntityId; issuance only binds the public half).
 const DISPATCHER_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
@@ -126,7 +141,7 @@ fn grant_capability_invoke_only_writes_grant_without_secret() {
         .args(["--grantee-org", GRANTEE_ORG_HEX])
         .args(["--capability", "nrpc:svc"])
         .arg("--invoke")
-        .args(["--target-any-owned-by", TARGET_ORG_HEX])
+        .args(["--target-node", TARGET_NODE_HEX])
         .args(["--out"])
         .arg(&grant)
         .assert()
@@ -322,4 +337,53 @@ fn malformed_org_key_error_never_echoes_the_seed() {
         !stderr.contains(SENTINEL),
         "the org-key parse error leaked the seed sentinel to stderr: {stderr}",
     );
+}
+
+#[test]
+fn grant_capability_rejects_foreign_owner_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let grant = dir.path().join("foreign.grant.json");
+    // TARGET_ORG_HEX is not the keygen'd issuer org, so `AnyNodeOwnedBy(foreign)`
+    // is permanently unusable (admission requires the provider's owner == issuer)
+    // and is refused locally.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .args(["--target-any-owned-by", TARGET_ORG_HEX])
+        .args(["--out"])
+        .arg(&grant)
+        .assert()
+        .code(2);
+    assert!(
+        !grant.exists(),
+        "no grant written on a rejected foreign-owner target"
+    );
+}
+
+#[test]
+fn grant_capability_any_node_owned_by_self_admits() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let issuer_org = org_id_of(&key);
+    let grant = dir.path().join("self.grant.json");
+    // AnyNodeOwnedBy(issuer) is the valid form — the issuer grants access to
+    // nodes it owns.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .args(["--target-any-owned-by", issuer_org.as_str()])
+        .args(["--out"])
+        .arg(&grant)
+        .assert()
+        .code(0);
+    assert!(grant.exists(), "AnyNodeOwnedBy(issuer) is a valid grant");
 }

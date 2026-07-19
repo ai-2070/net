@@ -755,6 +755,24 @@ impl OrgCapabilityGrant {
     /// Total serialized size.
     pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 318
 
+    /// The target-scope owner rule (Kyra OA2-F): an `AnyNodeOwnedBy(org)` target
+    /// must name the ISSUER's own org. A grant B→A over `AnyNodeOwnedBy(C != B)`
+    /// names providers owned by a FOREIGN org C and can never admit (admission
+    /// requires the provider's owner == issuer), so it is refused rather than
+    /// minted as a permanently-unusable credential. `ExactNode` carries no org —
+    /// its owner is checked only at admission. Enforced at issue AND decode/verify.
+    fn check_target_owner(
+        issuer_org: &OrgId,
+        target_scope: &GrantTargetScope,
+    ) -> Result<(), OrgError> {
+        match target_scope {
+            GrantTargetScope::AnyNodeOwnedBy(org) if org != issuer_org => {
+                Err(OrgError::TargetOrgNotIssuer)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Issue a capability grant valid from now for
     /// `duration_secs`.
     ///
@@ -784,6 +802,7 @@ impl OrgCapabilityGrant {
         if duration_secs > MAX_ORG_GRANT_TTL_SECS {
             return Err(OrgError::TtlTooLong);
         }
+        Self::check_target_owner(&issuer.org_id(), &target_scope)?;
         let mut grant_id = [0u8; 32];
         if let Err(e) = getrandom::fill(&mut grant_id) {
             eprintln!(
@@ -932,6 +951,7 @@ impl OrgCapabilityGrant {
         if rights.contains(GrantRights::DISCOVER) != self.discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
+        Self::check_target_owner(&self.issuer_org, &self.target_scope)?;
         let sig = Signature::from_bytes(&self.signature);
         self.issuer_org.verify(&self.signing_input(), &sig)
     }
@@ -1021,6 +1041,7 @@ impl OrgCapabilityGrant {
         if rights.contains(GrantRights::DISCOVER) != discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
+        Self::check_target_owner(&issuer_org, &target_scope)?;
         let not_before = u64::from_le_bytes(data[230..238].try_into().unwrap());
         let not_after = u64::from_le_bytes(data[238..246].try_into().unwrap());
         let nonce = u64::from_le_bytes(data[246..254].try_into().unwrap());
@@ -1393,6 +1414,61 @@ mod tests {
         assert!(!reloaded.matches_grant(&wrong_commitment));
         assert!(!reloaded.matches_grant(&wrong_handle));
         assert!(!reloaded.matches_grant(&wrong_grant_id));
+    }
+
+    /// Kyra OA2-F: an `AnyNodeOwnedBy(org)` target whose org is NOT the issuer
+    /// is a permanently-unusable grant (admission requires the provider's owner
+    /// == issuer) — refused at issue AND decode/verify. `AnyNodeOwnedBy(issuer)`
+    /// is fine; `ExactNode` carries no org and is checked only at admission.
+    #[test]
+    fn foreign_owner_any_node_target_is_refused_at_issue_and_decode() {
+        // Issue path: self-owned OK, foreign-owned refused.
+        assert!(OrgCapabilityGrant::try_issue(
+            &org_b(),
+            org_a().org_id(),
+            cap(),
+            GrantRights::INVOKE,
+            GrantTargetScope::AnyNodeOwnedBy(org_b().org_id()),
+            3600,
+        )
+        .is_ok());
+        assert_eq!(
+            OrgCapabilityGrant::try_issue(
+                &org_b(),
+                org_a().org_id(),
+                cap(),
+                GrantRights::INVOKE,
+                GrantTargetScope::AnyNodeOwnedBy(org_a().org_id()),
+                3600,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            OrgError::TargetOrgNotIssuer,
+        );
+
+        // Decode/verify path: forge a foreign-owner grant through the raw pin
+        // surface (issue_at bypasses the issue check), then verify() and
+        // from_bytes both reject it.
+        let now = current_timestamp();
+        let forged = OrgCapabilityGrant::issue_at(
+            &org_b(),
+            [7u8; 32],
+            org_a().org_id(),
+            cap(),
+            GrantRights::INVOKE,
+            GrantTargetScope::AnyNodeOwnedBy(org_a().org_id()),
+            None,
+            now,
+            now + 3600,
+            1,
+        );
+        assert_eq!(forged.verify(), Err(OrgError::TargetOrgNotIssuer));
+        assert_eq!(
+            OrgCapabilityGrant::from_bytes(&forged.to_bytes())
+                .map(|_| ())
+                .unwrap_err(),
+            OrgError::TargetOrgNotIssuer,
+        );
     }
 
     #[test]
