@@ -1497,6 +1497,16 @@ pub struct RpcContext {
     /// trace. `None` for calls that didn't propagate trace
     /// context.
     pub trace_context: Option<TraceContext>,
+    /// OA-2 org-admission attribution (E1.6). `Some(Admitted)` for a
+    /// call that passed the PROTECTED-service admission gate — the
+    /// four-party verified identity (caller, acting org, provider org,
+    /// exact provider, capability). The raw `net-org-admission` proof
+    /// header is STRIPPED from `payload.headers` before the handler
+    /// sees it, so application code receives verified attribution, never
+    /// raw credential material. `None` for public
+    /// (`PublicAuthenticated`) calls, which keep existing header
+    /// behavior.
+    pub org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
 }
 
 /// Handler-side error that doesn't fit the application's normal
@@ -1703,13 +1713,36 @@ impl RpcServerFold {
     /// another peer's call by copying its origin + call_id (AV-1
     /// item 1).
     pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
-        self.apply_frame(ev.from_node, &ev.payload)
+        self.apply_frame(ev.from_node, &ev.payload, None)
+    }
+
+    /// OA-2 protected entry point (E1.6). The protected serve bridge
+    /// calls this AFTER `verify_org_admission` succeeds, handing the
+    /// four-party [`Admitted`](crate::adapter::net::behavior::org_admission::Admitted)
+    /// attribution the fold places into `RpcContext::org_admission`; the
+    /// fold also STRIPS every `net-org-admission` header from the payload
+    /// so the handler never sees the raw proof. Unary-only — the
+    /// streaming/duplex folds have no admitted entry point (E1.8).
+    pub fn apply_inbound_admitted(
+        &mut self,
+        ev: &RpcInboundEvent,
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+    ) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload, Some(admitted))
     }
 
     /// Core frame application shared by [`Self::apply_inbound`] (real
     /// authenticated `from_node`) and the [`RedexFold`] loopback shim
     /// (`from_node = 0`, test / loopback paths with no session peer).
-    fn apply_frame(&mut self, from_node: u64, frame: &Bytes) -> Result<(), RedexError> {
+    /// `org_admission` is `Some` only on the initial REQUEST of an
+    /// admitted protected call; it is placed into the handler's
+    /// `RpcContext` and its presence triggers the proof-header strip.
+    fn apply_frame(
+        &mut self,
+        from_node: u64,
+        frame: &Bytes,
+        org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
+    ) -> Result<(), RedexError> {
         // Decode the meta header. A garbled meta means the event
         // doesn't even claim to be an RPC packet — log and skip
         // rather than killing the fold. Returning `Err(Decode)`
@@ -1730,31 +1763,42 @@ impl RpcServerFold {
         let key = (from_node, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Malformed request payload. Surface as
-                        // `UnknownVersion` to the caller — they sent
-                        // bytes we couldn't parse, which usually
-                        // means a wire-format mismatch (the most
-                        // common cause). Log so operators can
-                        // diagnose.
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc server fold: malformed request payload",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                };
+                let mut payload =
+                    match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // Malformed request payload. Surface as
+                            // `UnknownVersion` to the caller — they sent
+                            // bytes we couldn't parse, which usually
+                            // means a wire-format mismatch (the most
+                            // common cause). Log so operators can
+                            // diagnose.
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc server fold: malformed request payload",
+                            );
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                            return Ok(());
+                        }
+                    };
+                // E1.6: an admitted protected call STRIPS the raw
+                // `net-org-admission` proof header(s) before the handler
+                // sees the payload — application code receives verified
+                // attribution via `RpcContext::org_admission`, never the
+                // credential material. Public calls (`org_admission` None)
+                // keep their headers untouched.
+                if org_admission.is_some() {
+                    payload.headers.retain(|(name, _)| {
+                        name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+                    });
+                }
                 // Fast deadline-already-passed short-circuit.
                 // Server-side `Timeout` without invoking the
                 // handler. Includes a clock-skew tolerance window
@@ -1840,6 +1884,7 @@ impl RpcServerFold {
                         payload,
                         cancellation,
                         trace_context,
+                        org_admission,
                     };
                     // Catch panics so a misbehaving handler can't
                     // take down the runtime. `AssertUnwindSafe` is
@@ -1948,7 +1993,7 @@ impl RedexFold<()> for RpcServerFold {
     /// drives `apply_frame` with `from_node = 0` (AV-1 item 1). The
     /// production wire path uses [`RpcServerFold::apply_inbound`].
     fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
-        self.apply_frame(0, &ev.payload)
+        self.apply_frame(0, &ev.payload, None)
     }
 }
 
@@ -2540,6 +2585,8 @@ impl RpcServerStreamingFold {
                         payload,
                         cancellation,
                         trace_context,
+                        // Streaming is never protected (E1.8) — always public.
+                        org_admission: None,
                     };
                     // Build the sink + receive end. Spawn a
                     // pump that forwards each chunk to the emit
@@ -5145,6 +5192,80 @@ mod tests {
         assert_eq!(resp.body.as_ref(), b"hello");
         // In-flight set is cleaned up after the handler completes.
         assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// E1.6: `apply_inbound_admitted` delivers the four-party `Admitted`
+    /// to the handler via `RpcContext::org_admission` AND strips every
+    /// `net-org-admission` proof header from the payload the handler
+    /// sees, preserving the surrounding headers in order. (The public
+    /// `apply_inbound` path leaves `org_admission` `None` — the other
+    /// fold tests never set it, and their handlers keep their headers.)
+    #[tokio::test]
+    async fn admitted_request_delivers_attribution_and_strips_proof_header() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_admission::Admitted;
+        use crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER;
+        use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
+        use crate::adapter::net::identity::EntityId;
+
+        type Seen = Arc<Mutex<Option<(Option<Admitted>, Vec<RpcHeader>)>>>;
+        struct SpyHandler(Seen);
+        #[async_trait::async_trait]
+        impl RpcHandler for SpyHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.0.lock() = Some((ctx.org_admission.clone(), ctx.payload.headers.clone()));
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let seen: Seen = Arc::new(Mutex::new(None));
+        let (emit, _captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(SpyHandler(seen.clone())), emit);
+
+        let admitted = Admitted {
+            caller: EntityId::from_bytes([0x24u8; 32]),
+            acting_org: OrgKeypair::from_bytes([0x77u8; 32]).org_id(),
+            provider_org: OrgKeypair::from_bytes([0x42u8; 32]).org_id(),
+            provider: EntityId::from_bytes([0x99u8; 32]),
+            capability: CapabilityAuthorityId::for_tag("nrpc:oa2-echo"),
+        };
+        let req = RpcRequestPayload {
+            service: "oa2-echo".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![
+                ("x-keep".to_string(), b"1".to_vec()),
+                (ORG_ADMISSION_HEADER.to_string(), b"opaque-proof".to_vec()),
+                ("y-keep".to_string(), b"2".to_vec()),
+            ],
+            body: Bytes::from_static(b"hi"),
+        };
+        let frame = rpc_request_event(0xCAFE, 7, req).payload;
+        fold.apply_inbound_admitted(&inbound(0x61, frame), admitted.clone())
+            .unwrap();
+
+        assert!(
+            wait_until(|| seen.lock().is_some(), Duration::from_secs(2)).await,
+            "handler must run for an admitted request",
+        );
+        let (got_admission, got_headers) = seen.lock().clone().unwrap();
+        assert_eq!(
+            got_admission,
+            Some(admitted),
+            "the four-party Admitted must reach the handler",
+        );
+        assert_eq!(
+            got_headers,
+            vec![
+                ("x-keep".to_string(), b"1".to_vec()),
+                ("y-keep".to_string(), b"2".to_vec()),
+            ],
+            "the proof header is stripped; surrounding headers stay, in order",
+        );
     }
 
     /// Application error: handler returns
