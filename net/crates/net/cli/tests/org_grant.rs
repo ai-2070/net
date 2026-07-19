@@ -1,9 +1,12 @@
-//! OA-2 grant CLI flow — `net org grant-dispatcher` (grant-capability
-//! lands in OA2-F3). Drives the real `net-mesh` binary against a
-//! tempdir: a dispatcher grant is written as a versioned JSON
-//! envelope, overwrite is refused, and scope selection is validated.
+//! OA-2 grant CLI flow — `net org (grant-dispatcher|grant-capability)`.
+//! Drives the real `net-mesh` binary against a tempdir: grants are
+//! written as versioned JSON envelopes, overwrite is refused, scope /
+//! rights / target selection is validated, a `--discover` grant mints a
+//! 0600 audience secret, and the written secret + grant are a consistent
+//! pair under `matches_grant`.
 
 use assert_cmd::prelude::*;
+use net_sdk::org::{OrgAudienceSecret, OrgCapabilityGrant};
 use std::path::Path;
 use std::process::Command;
 
@@ -245,5 +248,45 @@ fn grant_capability_flag_validation() {
     assert!(
         !stray_secret.exists(),
         "no secret written on a rejected run"
+    );
+}
+
+#[test]
+fn grant_capability_discover_artifacts_are_a_consistent_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let grant_path = dir.path().join("cap.grant.json");
+    let secret_path = dir.path().join("cap.audience.key");
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .arg("--discover")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(&grant_path)
+        .args(["--audience-out"])
+        .arg(&secret_path)
+        .assert()
+        .code(0);
+
+    // Load both artifacts through the SDK and confirm they are a consistent
+    // pair via the whole-object `matches_grant` primitive — not by manually
+    // remembering part of the relation.
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
+    let grant_hex = envelope["grant"].as_str().expect("grant hex in envelope");
+    let grant = OrgCapabilityGrant::from_bytes(&hex::decode(grant_hex).unwrap())
+        .expect("decode grant from CLI envelope");
+    let secret = OrgAudienceSecret::decode_config(&std::fs::read(&secret_path).unwrap())
+        .expect("decode audience secret from CLI file");
+
+    assert!(
+        secret.matches_grant(&grant),
+        "the CLI-written audience secret matches its grant",
     );
 }

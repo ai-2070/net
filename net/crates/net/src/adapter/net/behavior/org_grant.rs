@@ -359,6 +359,21 @@ impl OrgAudienceSecret {
             && audience_key_commitment(&self.discovery_key) == binding.key_commitment
     }
 
+    /// Whole-object match against a capability GRANT (Kyra OA2-F): the secret
+    /// is the out-of-band key for THIS grant iff its `grant_id` matches AND the
+    /// grant carries a discovery binding this secret satisfies. Prefer this over
+    /// [`Self::matches_binding`] at call sites — a bare binding cannot express
+    /// the `grant_id`, so matching a binding alone leaves grant-id validation to
+    /// the caller (and a same-`grant_id`/wrong-`key_commitment` mismatch must
+    /// still be rejected on the commitment, not merely on a differing handle).
+    pub fn matches_grant(&self, grant: &OrgCapabilityGrant) -> bool {
+        self.grant_id == grant.grant_id
+            && grant
+                .discovery
+                .as_ref()
+                .is_some_and(|binding| self.matches_binding(binding))
+    }
+
     /// Explicit config-file codec:
     /// `version ‖ grant_id ‖ handle ‖ key`, exactly
     /// [`Self::ENCODED_SIZE`] bytes.
@@ -1298,14 +1313,14 @@ mod tests {
         );
     }
 
-    /// §2.6 (Kyra OA2-F): an "installed" audience secret — round-tripped through
-    /// its on-disk `encode_config`/`decode_config` form (exactly how `net org
-    /// grant-capability --discover` writes the 0600 file) — still enforces its
-    /// commitment: it matches ONLY the binding it was minted for and REJECTS a
-    /// foreign grant's binding locally (mismatched `key_commitment` → wrong
-    /// audience → not admitted).
+    /// §2.6 (Kyra OA2-F): `matches_grant` pins EACH relation field
+    /// independently — the earlier "secret1 vs grant2's binding" negative was a
+    /// false-green (it changed BOTH handle AND commitment, so deleting the
+    /// production commitment check would still reject on the differing handle).
+    /// Mutate exactly one field at a time, and confirm an "installed" secret
+    /// (round-tripped through its on-disk `encode_config` form) behaves the same.
     #[test]
-    fn installed_audience_secret_rejects_a_foreign_binding() {
+    fn matches_grant_pins_each_field_independently() {
         let issue = || {
             OrgCapabilityGrant::try_issue(
                 &org_b(),
@@ -1317,26 +1332,67 @@ mod tests {
             )
             .expect("issue")
         };
-        let (grant1, secret1) = issue();
-        let (grant2, _secret2) = issue();
-        let secret1 = secret1.expect("DISCOVER mints a secret");
-        let binding1 = grant1.discovery.expect("grant1 binding");
-        let binding2 = grant2.discovery.expect("grant2 binding");
+        let (grant, secret) = issue();
+        let secret = secret.expect("DISCOVER mints a secret");
 
-        // Persist + reload exactly as the CLI writes the 0600 audience file.
-        let reloaded = OrgAudienceSecret::decode_config(&secret1.encode_config())
+        // Own grant → true.
+        assert!(
+            secret.matches_grant(&grant),
+            "the secret matches its own grant"
+        );
+
+        // Same handle, WRONG commitment → false (rejected on the COMMITMENT,
+        // not merely on a differing handle).
+        let mut wrong_commitment = grant.clone();
+        wrong_commitment.discovery.as_mut().unwrap().key_commitment[0] ^= 0xFF;
+        assert!(
+            !secret.matches_grant(&wrong_commitment),
+            "wrong commitment rejected even with a matching handle",
+        );
+
+        // Same commitment, WRONG handle → false.
+        let mut wrong_handle = grant.clone();
+        wrong_handle.discovery.as_mut().unwrap().audience_handle[0] ^= 0xFF;
+        assert!(
+            !secret.matches_grant(&wrong_handle),
+            "wrong handle rejected even with a matching commitment",
+        );
+
+        // Matching binding, WRONG grant_id → false (the piece `matches_binding`
+        // alone cannot express).
+        let mut wrong_grant_id = grant.clone();
+        wrong_grant_id.grant_id[0] ^= 0xFF;
+        assert!(
+            secret.matches_binding(wrong_grant_id.discovery.as_ref().unwrap()),
+            "the binding still matches — only the grant_id differs",
+        );
+        assert!(
+            !secret.matches_grant(&wrong_grant_id),
+            "wrong grant_id rejected despite a matching binding",
+        );
+
+        // Grant with NO discovery binding → false.
+        let (invoke_only, _none) = OrgCapabilityGrant::try_issue(
+            &org_b(),
+            org_a().org_id(),
+            cap(),
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(provider()),
+            3600,
+        )
+        .expect("invoke-only");
+        assert!(
+            !secret.matches_grant(&invoke_only),
+            "a grant with no discovery binding never matches",
+        );
+
+        // The "installed" secret (encode_config round-trip) → same results.
+        let reloaded = OrgAudienceSecret::decode_config(&secret.encode_config())
             .expect("decode_config round-trips the installed secret");
-        assert_eq!(reloaded.grant_id, secret1.grant_id);
-
-        // The installed secret matches ONLY its own grant's binding.
-        assert!(
-            reloaded.matches_binding(&binding1),
-            "installed secret matches its own binding",
-        );
-        assert!(
-            !reloaded.matches_binding(&binding2),
-            "installed secret REJECTS a foreign grant's binding (key_commitment mismatch)",
-        );
+        assert!(reloaded.matches_grant(&grant));
+        assert!(!reloaded.matches_grant(&wrong_commitment));
+        assert!(!reloaded.matches_grant(&wrong_handle));
+        assert!(!reloaded.matches_grant(&wrong_grant_id));
     }
 
     #[test]
