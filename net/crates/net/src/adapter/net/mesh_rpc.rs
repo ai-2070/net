@@ -55,7 +55,9 @@ use super::behavior::org_admission::OrgAdmission;
 use super::behavior::org_call::{OrgCallProof, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
 use super::mesh::{MeshNode, PeerPublishOutcome};
-use super::org_admission_gate::{org_request_digest, OrgProviderPolicy, RegisteredRpcService};
+use super::org_admission_gate::{
+    org_request_digest, CapabilityVisibility, OrgProviderPolicy, RegisteredRpcService,
+};
 
 // ============================================================================
 // Public types.
@@ -3001,6 +3003,32 @@ impl MeshNode {
         )
     }
 
+    /// Register an OWNER-SCOPED unary RPC handler (OA3-4b1): an internal private
+    /// capability of this node's OWN org. Its `nrpc:<service>` tag is NEVER
+    /// broadcast in the clear — the capability is emitted only as an encrypted
+    /// owner-audience `ScopedCapabilityAnnouncement` — but it enters the local
+    /// self-fold so [`OrgAdmission::OwnerDelegated`] admission can dispatch it.
+    /// REQUIRES an installed node authority (the owner audience credential; else
+    /// [`ServeError::ProtectedAuthorityRequired`]). Unary only (E1.8).
+    pub fn serve_rpc_owner_scoped<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        // Owner-scoped registration requires an installed authority — both for
+        // the `OwnerDelegated` admission gate and for the owner audience
+        // credential the encrypted emission consumes.
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::OwnerScoped { provider_policy },
+        )
+    }
+
     /// Shared unary serve implementation for the public [`Self::serve_rpc`] and
     /// protected [`Self::serve_rpc_protected`] wrappers. The bridge branches on
     /// the captured [`RegisteredRpcService`]'s admission mode: public runs the
@@ -3170,8 +3198,12 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
+        // OA3-4b1: the visibility rides into the local-service registry so
+        // emission projects correctly — an owner-scoped tag is excluded from the
+        // plaintext broadcast, a public one is not.
+        let visibility = mode.visibility();
         self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
+            .insert(service.to_string(), registration_id, visibility);
         self.index_self_with_local_services();
 
         // E1.1: the immutable registration the bridge captures — ONE truth, the
@@ -3203,6 +3235,14 @@ impl MeshNode {
                     return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
                 }
             },
+            // OA3-4b1: owner-scoped — internal private capability of this node's
+            // own org. `OwnerScoped` visibility (encrypted-only emission) +
+            // `OwnerDelegated` invocation authority.
+            UnaryAdmission::OwnerScoped { provider_policy } => RegisteredRpcService::owner_scoped(
+                registration_id,
+                Arc::from(service),
+                provider_policy,
+            ),
         });
         // E1.5 (Kyra #47 B2): the NODE-owned admission replay guard, shared
         // across every protected registration on this node — so `(caller,
@@ -3478,8 +3518,11 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
+        self.rpc_local_services_arc().insert(
+            service.to_string(),
+            registration_id,
+            CapabilityVisibility::Public,
+        );
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let mesh_for_bridge = Arc::clone(self);
@@ -3671,8 +3714,11 @@ impl MeshNode {
         // response-streaming paths already do this). The dispatcher
         // above only buffers into the mpsc; the bridge that drains it
         // is spawned LAST.
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
+        self.rpc_local_services_arc().insert(
+            service.to_string(),
+            registration_id,
+            CapabilityVisibility::Public,
+        );
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
@@ -3997,8 +4043,11 @@ impl MeshNode {
         // OA2-E0 (Kyra E0 review): publish + self-index BEFORE the
         // bridge is exposed (see serve_rpc_client_stream). The
         // dispatcher only buffers; the bridge drains it LAST.
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id);
+        self.rpc_local_services_arc().insert(
+            service.to_string(),
+            registration_id,
+            CapabilityVisibility::Public,
+        );
         self.index_self_with_local_services();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let service_for_bridge = service.to_string();
@@ -5490,6 +5539,23 @@ enum UnaryAdmission {
         admission: OrgAdmission,
         provider_policy: OrgProviderPolicy,
     },
+    /// OA3-4b1 owner-scoped: `OwnerScoped` visibility (emitted only as an
+    /// encrypted owner-audience announcement, never plaintext),
+    /// [`OrgAdmission::OwnerDelegated`] invocation authority, and an explicit
+    /// provider policy.
+    OwnerScoped { provider_policy: OrgProviderPolicy },
+}
+
+impl UnaryAdmission {
+    /// The announcement visibility this registration mode carries — the
+    /// discriminator the local-service registry stores so emission can exclude
+    /// owner-scoped `nrpc:` tags from the plaintext broadcast (OA3-4b1).
+    fn visibility(&self) -> CapabilityVisibility {
+        match self {
+            Self::Public | Self::Protected { .. } => CapabilityVisibility::Public,
+            Self::OwnerScoped { .. } => CapabilityVisibility::OwnerScoped,
+        }
+    }
 }
 
 // ============================================================================

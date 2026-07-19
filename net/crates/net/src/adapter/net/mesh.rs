@@ -2674,10 +2674,22 @@ type OrgRaiseSubscription = Option<super::behavior::org_revocation::RaiseSubscri
 /// tag-removal could delete a live replacement's service projection
 /// — the dispatcher stays registered but discovery/announcements
 /// lose the service.
+/// One registered local service: the owning registration id plus its
+/// announcement visibility. Visibility drives emission projection (OA3-4b1) —
+/// only `Public` services contribute an `nrpc:` tag to the plaintext broadcast;
+/// an `OwnerScoped` service is emitted solely as an encrypted owner-audience
+/// announcement and never rides a plaintext CAP-ANN.
+#[cfg(feature = "cortex")]
+#[derive(Clone, Copy)]
+struct LocalServiceEntry {
+    registration_id: u64,
+    visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+}
+
 #[cfg(feature = "cortex")]
 pub(super) struct LocalServiceRegistry {
-    /// `service name → owning registration id`.
-    map: dashmap::DashMap<String, u64>,
+    /// `service name → { owning registration id, visibility }`.
+    map: dashmap::DashMap<String, LocalServiceEntry>,
     change_signal: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
@@ -2690,15 +2702,28 @@ impl LocalServiceRegistry {
         }
     }
 
-    /// Install `service` owned by `registration_id`. Upserts: a
-    /// replacement (new id for the same name, after the incumbent's
-    /// dispatcher slot was freed) installs its own token over any
-    /// lingering stale entry. Bumps the local-caps generation only
-    /// when the NAME is newly present — the announced capability set
-    /// is keyed by name, so re-tokening an existing name is not a
-    /// capability change and must not wake the announcer.
-    pub(super) fn insert(&self, service: String, registration_id: u64) -> bool {
-        let newly_present = self.map.insert(service, registration_id).is_none();
+    /// Install `service` owned by `registration_id` with `visibility`. Upserts: a
+    /// replacement (new id for the same name, after the incumbent's dispatcher
+    /// slot was freed) installs its own token over any lingering stale entry.
+    /// Bumps the local-caps generation only when the NAME is newly present — the
+    /// announced capability set is keyed by name, so re-tokening an existing name
+    /// is not a capability change and must not wake the announcer.
+    pub(super) fn insert(
+        &self,
+        service: String,
+        registration_id: u64,
+        visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+    ) -> bool {
+        let newly_present = self
+            .map
+            .insert(
+                service,
+                LocalServiceEntry {
+                    registration_id,
+                    visibility,
+                },
+            )
+            .is_none();
         if newly_present {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
@@ -2712,7 +2737,7 @@ impl LocalServiceRegistry {
     pub(super) fn remove_if(&self, service: &str, registration_id: u64) -> bool {
         let removed = self
             .map
-            .remove_if(service, |_, &id| id == registration_id)
+            .remove_if(service, |_, entry| entry.registration_id == registration_id)
             .is_some();
         if removed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
@@ -2724,10 +2749,33 @@ impl LocalServiceRegistry {
         self.map.is_empty()
     }
 
-    /// Cloned name list for the announce-path tag merge. Announces
-    /// are rare relative to lookups; the allocation keeps the
-    /// DashMap's guard types out of the public surface.
-    pub(super) fn snapshot(&self) -> Vec<String> {
+    /// Names of `Public` services — the ONLY services whose `nrpc:` tag may enter
+    /// a plaintext CAP-ANN (OA3-4b1 confidentiality projection: an owner-scoped
+    /// tag must never appear in the clear).
+    pub(super) fn public_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::Public))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Names of `OwnerScoped` services — emitted only inside the encrypted owner
+    /// audience announcement, never plaintext.
+    pub(super) fn owner_scoped_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::OwnerScoped))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// ALL registered service names regardless of visibility — for the LOCAL
+    /// self-fold, so `has_local_capability` admits every locally registered
+    /// service (§2.4a). This set NEVER reaches the wire.
+    pub(super) fn all_snapshot(&self) -> Vec<String> {
         self.map.iter().map(|e| e.key().clone()).collect()
     }
 }
@@ -2735,6 +2783,7 @@ impl LocalServiceRegistry {
 #[cfg(all(test, feature = "cortex"))]
 mod local_service_registry_tests {
     use super::LocalServiceRegistry;
+    use crate::adapter::net::org_admission_gate::CapabilityVisibility;
     use std::sync::Arc;
 
     fn registry() -> (LocalServiceRegistry, tokio::sync::watch::Receiver<u64>) {
@@ -2763,14 +2812,17 @@ mod local_service_registry_tests {
         let (reg, _rx) = registry();
 
         // (1) incumbent registration installs its tag.
-        assert!(reg.insert("svc".to_string(), 1), "first insert is new");
-        assert_eq!(reg.snapshot(), vec!["svc".to_string()]);
+        assert!(
+            reg.insert("svc".to_string(), 1, CapabilityVisibility::Public),
+            "first insert is new"
+        );
+        assert_eq!(reg.all_snapshot(), vec!["svc".to_string()]);
 
         // (2) replacement upserts under a new id while the incumbent
         //     handle is mid-drop. Same NAME, so no capability change
         //     — `insert` reports "not newly present".
         assert!(
-            !reg.insert("svc".to_string(), 2),
+            !reg.insert("svc".to_string(), 2, CapabilityVisibility::Public),
             "re-tokening an existing name is not a new capability",
         );
 
@@ -2780,7 +2832,7 @@ mod local_service_registry_tests {
             "a stale-id retirement must be a no-op",
         );
         assert_eq!(
-            reg.snapshot(),
+            reg.all_snapshot(),
             vec!["svc".to_string()],
             "the replacement's live tag must survive the stale retirement",
         );
@@ -2804,11 +2856,11 @@ mod local_service_registry_tests {
         let gen = |rx: &tokio::sync::watch::Receiver<u64>| *rx.borrow();
 
         let g0 = gen(&rx);
-        assert!(reg.insert("svc".to_string(), 1));
+        assert!(reg.insert("svc".to_string(), 1, CapabilityVisibility::Public));
         assert_ne!(gen(&rx), g0, "new name bumps");
 
         let g1 = gen(&rx);
-        assert!(!reg.insert("svc".to_string(), 2));
+        assert!(!reg.insert("svc".to_string(), 2, CapabilityVisibility::Public));
         assert_eq!(gen(&rx), g1, "re-token of same name is silent");
 
         assert!(!reg.remove_if("svc", 1));
@@ -2816,6 +2868,25 @@ mod local_service_registry_tests {
 
         assert!(reg.remove_if("svc", 2));
         assert_ne!(gen(&rx), g1, "name leaving the set bumps");
+    }
+
+    /// OA3-4b1 confidentiality projection: `public_snapshot` (→ the plaintext
+    /// broadcast) excludes an owner-scoped service, while `all_snapshot` (→ the
+    /// local self-fold, so `has_local_capability` admits it) includes it.
+    #[test]
+    fn snapshots_partition_by_visibility() {
+        let (reg, _rx) = registry();
+        reg.insert("pub-svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("own-svc".to_string(), 2, CapabilityVisibility::OwnerScoped);
+
+        // The plaintext broadcast set carries ONLY the public service.
+        assert_eq!(reg.public_snapshot(), vec!["pub-svc".to_string()]);
+        // The owner-scoped service is visible only to the encrypted-emission path.
+        assert_eq!(reg.owner_scoped_snapshot(), vec!["own-svc".to_string()]);
+        // The self-fold sees both (deterministic order for the assert).
+        let mut all = reg.all_snapshot();
+        all.sort();
+        assert_eq!(all, vec!["own-svc".to_string(), "pub-svc".to_string()]);
     }
 }
 
@@ -18126,9 +18197,12 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(crate) fn index_self_with_local_services(&self) {
         let baseline = self.user_caps_snapshot();
+        // Self-fold: ALL locally registered services regardless of visibility, so
+        // `has_local_capability` admits owner-scoped services too (§2.4a). This
+        // set is local-only and never reaches the wire.
         let merged = {
             let mut m = baseline;
-            for svc in self.rpc_local_services.snapshot() {
+            for svc in self.rpc_local_services.all_snapshot() {
                 m = m.add_tag(format!("nrpc:{}", svc.as_str()));
             }
             m
@@ -18263,12 +18337,16 @@ impl MeshNode {
             // Gated on `cortex` because `rpc_local_services` only
             // exists when the cortex layer (which provides serve_rpc)
             // is compiled in.
+            // OA3-4b1 confidentiality projection: ONLY `Public` services
+            // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
+            // Owner-scoped services are emitted solely as an encrypted
+            // owner-audience announcement and must never appear in the clear.
             #[cfg(feature = "cortex")]
             let caps = if self.rpc_local_services.is_empty() {
                 caps
             } else {
                 let mut merged = caps;
-                for svc in self.rpc_local_services.snapshot() {
+                for svc in self.rpc_local_services.public_snapshot() {
                     let tag = format!("nrpc:{}", svc.as_str());
                     // Phase A.5.N.2: tags is HashSet<Tag>; insert via
                     // builder so the parsed-tag form lands and dedupes
@@ -18430,13 +18508,19 @@ impl MeshNode {
             // rate-limit branch, same as the self-index below, so a
             // coalesced announce still refreshes the local pingwave
             // state.
+            // Proximity pingwaves piggyback the CURRENT capability summary and
+            // ride to peers, so they carry the PUBLIC set only (never an
+            // owner-scoped tag).
             self.proximity_graph.set_local_capabilities(caps.clone());
 
-            let mut ann = CapabilityAnnouncement::new(
+            // The PUBLIC broadcast announcement — the ONLY object every plaintext
+            // send path reads (`local_announcement`). Owner-scoped `nrpc:` tags
+            // were already excluded from `caps` above (OA3-4b1).
+            let mut broadcast_ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
                 version,
-                caps,
+                caps.clone(),
             )
             .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
             // OA-1: attach the INSTALLED authority's owner cert iff
@@ -18445,11 +18529,47 @@ impl MeshNode {
             .with_owner_cert(self.owner_cert_for_emission());
             #[cfg(feature = "nat-traversal")]
             {
-                ann = ann.with_reflex_addr(reflex_snapshot);
+                broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
             if sign {
-                ann.sign(&self.identity);
+                broadcast_ann.sign(&self.identity);
             }
+
+            // The SELF-FOLD announcement — the PUBLIC set plus owner-scoped
+            // `nrpc:` tags. LOCAL ONLY: it feeds the self-fold so
+            // `has_local_capability` admits owner-scoped services (§2.4a), and is
+            // NEVER stored in `local_announcement` or sent. When no owner-scoped
+            // service is registered it is identical to the broadcast form.
+            #[cfg(feature = "cortex")]
+            let self_ann = {
+                let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
+                if owner_scoped.is_empty() {
+                    broadcast_ann.clone()
+                } else {
+                    let mut self_caps = caps;
+                    for svc in owner_scoped {
+                        self_caps = self_caps.add_tag(format!("nrpc:{}", svc.as_str()));
+                    }
+                    let mut a = CapabilityAnnouncement::new(
+                        self.node_id,
+                        self.identity.entity_id().clone(),
+                        version,
+                        self_caps,
+                    )
+                    .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
+                    .with_owner_cert(self.owner_cert_for_emission());
+                    #[cfg(feature = "nat-traversal")]
+                    {
+                        a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    if sign {
+                        a.sign(&self.identity);
+                    }
+                    a
+                }
+            };
+            #[cfg(not(feature = "cortex"))]
+            let self_ann = broadcast_ann.clone();
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -18457,19 +18577,20 @@ impl MeshNode {
             // verification as inbound ingest (see
             // `index_self_with_local_services`); the outer-signature
             // precondition is `sign` — an unsigned announcement
-            // projects no ownership even for ourselves.
+            // projects no ownership even for ourselves. Uses the FULL
+            // (self-fold) announcement so owner-scoped tags land locally.
             let verified_owner = {
                 let store = self.org_revocation.load();
                 let floors = store.as_ref().map(|s| s.snapshot());
                 super::behavior::fold::capability_bridge::verify_announced_owner_cert(
-                    &ann,
+                    &self_ann,
                     sign,
                     floors.as_deref(),
                     0,
                 )
             };
             let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
-                &ann,
+                &self_ann,
                 verified_owner,
             );
             let _ = self.capability_fold.apply(fold_ann);
@@ -18481,19 +18602,18 @@ impl MeshNode {
                 super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
                     &self.capability_fold,
                     floors.as_deref(),
-                    &ann.entity_id,
+                    &self_ann.entity_id,
                     owner,
                 );
             }
 
-            // Publish as the latest local announcement so future
-            // session-opens push this version to new peers. Also always
+            // Publish the PUBLIC announcement as the latest local announcement so
+            // future session-opens push this version to new peers. Also always
             // runs so late joiners get the latest caps even when we've
-            // rate-limited away the broadcast. The send path
-            // re-validates the owner cert against live state via the
-            // [`SendStamp`] seqlock, so no build-time stamp is stored
-            // (review-11 P1).
-            self.local_announcement.store(Some(Arc::new(ann.clone())));
+            // rate-limited away the broadcast. The send path re-validates the
+            // owner cert against live state via the [`SendStamp`] seqlock, so no
+            // build-time stamp is stored (review-11 P1).
+            self.local_announcement.store(Some(Arc::new(broadcast_ann)));
 
             // Origin-side rate limit: within-window calls update the
             // self-index + `local_announcement` and coalesce into one
