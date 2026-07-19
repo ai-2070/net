@@ -332,6 +332,17 @@ pub enum RpcStatus {
     /// gRPC equivalent: `PERMISSION_DENIED` (7) — same outward
     /// shape as `Unauthorized` but a separate substrate code.
     CapabilityDenied = 0x0008,
+    /// OA-2 org admission (E2.2): a PROTECTED service denied this call —
+    /// the caller's `net-org-admission` proof failed verification, the
+    /// provider cannot admit right now, or the call shape is unsupported.
+    /// A COARSE reason (denied / not-supported / unavailable) rides the
+    /// response; the DETAILED `AdmissionDenied` variant stays provider-
+    /// side audit only, so denial is not a credential oracle. Distinct
+    /// from `CapabilityDenied` (v0.4 allow-list) and `Unauthorized`
+    /// (channel-auth / token-scope) so operators can tell the
+    /// enforcement surfaces apart.
+    /// gRPC equivalent: `PERMISSION_DENIED` (7).
+    AdmissionDenied = 0x0009,
     /// Application-defined status. The wire carries the raw u16;
     /// callers / servers agree on the meaning out of band.
     Application(u16),
@@ -350,12 +361,13 @@ impl RpcStatus {
             Self::Internal => 0x0006,
             Self::UnknownVersion => 0x0007,
             Self::CapabilityDenied => 0x0008,
+            Self::AdmissionDenied => 0x0009,
             Self::Application(v) => v,
         }
     }
 
     /// Decode from the wire `u16`. Reserved values
-    /// (`0x0009..=0x7FFF`) decode as `Application(v)` rather than
+    /// (`0x000A..=0x7FFF`) decode as `Application(v)` rather than
     /// failing — forward-compat with future status assignments.
     pub fn from_wire(v: u16) -> Self {
         match v {
@@ -368,6 +380,7 @@ impl RpcStatus {
             0x0006 => Self::Internal,
             0x0007 => Self::UnknownVersion,
             0x0008 => Self::CapabilityDenied,
+            0x0009 => Self::AdmissionDenied,
             other => Self::Application(other),
         }
     }
@@ -4426,22 +4439,23 @@ mod tests {
             (RpcStatus::Internal, 0x0006),
             (RpcStatus::UnknownVersion, 0x0007),
             (RpcStatus::CapabilityDenied, 0x0008),
+            (RpcStatus::AdmissionDenied, 0x0009),
         ] {
             assert_eq!(status.to_wire(), expected, "{status:?}");
             assert_eq!(RpcStatus::from_wire(expected), status);
         }
     }
 
-    /// Reserved numeric range (`0x0009..=0x7FFF`) decodes as
+    /// Reserved numeric range (`0x000A..=0x7FFF`) decodes as
     /// `Application(v)` for forward-compat with future canonical
-    /// assignments. A future status numbered `0x0009` would round-
-    /// trip via `from_wire(0x0009)` until that variant is added,
+    /// assignments. A future status numbered `0x000A` would round-
+    /// trip via `from_wire(0x000A)` until that variant is added,
     /// at which point the variant takes precedence.
     #[test]
     fn reserved_status_range_decodes_as_application_for_forward_compat() {
-        let decoded = RpcStatus::from_wire(0x0009);
-        assert_eq!(decoded, RpcStatus::Application(0x0009));
-        assert_eq!(decoded.to_wire(), 0x0009);
+        let decoded = RpcStatus::from_wire(0x000A);
+        assert_eq!(decoded, RpcStatus::Application(0x000A));
+        assert_eq!(decoded.to_wire(), 0x000A);
     }
 
     /// Application range (`0x8000..=0xFFFF`) encodes / decodes

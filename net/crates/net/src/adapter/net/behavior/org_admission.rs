@@ -189,6 +189,90 @@ impl std::fmt::Display for AdmissionDenied {
 
 impl std::error::Error for AdmissionDenied {}
 
+/// The COARSE, wire-stable admission-denial reason (E2.2). The DETAILED
+/// [`AdmissionDenied`] variant stays PROVIDER-SIDE audit only — surfacing it on
+/// the wire would make denial a credential oracle (which check failed) and could
+/// leak the provider's authority / replay state. A caller sees only one of three
+/// buckets, enough to decide retry behavior without learning why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoarseAdmissionReason {
+    /// Rejected on the merits — a credential, binding, replay, or provider-
+    /// policy failure. Retrying the SAME proof will not succeed.
+    Denied,
+    /// The provider does not support this call shape (a streaming frame on a
+    /// protected unary service). Not retryable as-is.
+    NotSupported,
+    /// The provider cannot admit right now — its own authority is unavailable,
+    /// its security view changed mid-admission, or a replay allocation is full.
+    /// A transient state; a later retry may succeed.
+    Unavailable,
+}
+
+impl CoarseAdmissionReason {
+    /// The stable wire byte for this coarse reason.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Denied => 0,
+            Self::NotSupported => 1,
+            Self::Unavailable => 2,
+        }
+    }
+
+    /// Decode a coarse reason from its wire byte (`None` on an unknown byte).
+    pub fn from_wire(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Denied),
+            1 => Some(Self::NotSupported),
+            2 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+impl AdmissionDenied {
+    /// Map this detailed reason to the COARSE wire reason (E2.2). The match is
+    /// EXHAUSTIVE (no wildcard) BY DESIGN: a newly added [`AdmissionDenied`]
+    /// variant forces a compile error here, so it can never silently fall into a
+    /// default bucket and escape the caller-facing classification.
+    pub fn coarse(self) -> CoarseAdmissionReason {
+        use AdmissionDenied as D;
+        use CoarseAdmissionReason as C;
+        match self {
+            // The provider cannot admit right now — transient / retryable.
+            D::ProviderAuthorityUnavailable
+            | D::AuthorityChanged
+            | D::ReplayCapacity
+            | D::PerCallerReplayCapacity => C::Unavailable,
+            // The call shape is unsupported on a protected unary service.
+            D::StreamingUnsupported => C::NotSupported,
+            // Everything else is a denial on the merits.
+            D::NotOrgProtected
+            | D::MissingHeader
+            | D::MultipleHeaders
+            | D::MalformedProof
+            | D::MemberBindingMismatch
+            | D::ActingOrgMismatch
+            | D::UnexpectedCapabilityGrant
+            | D::MissingCapabilityGrant
+            | D::ForeignIssuer
+            | D::GranteeMismatch
+            | D::InsufficientRights
+            | D::CapabilityMismatch
+            | D::TargetNotCovered
+            | D::DispatcherGrantScope
+            | D::DispatcherGrantInvalid
+            | D::MembershipInvalid
+            | D::MembershipRevoked
+            | D::CapabilityGrantInvalid
+            | D::ProofExpired
+            | D::BindingInvalid
+            | D::Replay
+            | D::CallIdCollision
+            | D::ProviderPolicyRejected => C::Denied,
+        }
+    }
+}
+
 /// The full four-party attribution of an admitted call (audit
 /// identity, Locked #11): actor S, acting for org A, under a grant
 /// from provider org B, invoking capability C on exact provider P.
@@ -1133,5 +1217,76 @@ mod tests {
             admit(&ctx, &proof, &replay),
             Err(AdmissionDenied::ProofExpired)
         );
+    }
+
+    /// E2.2: EVERY `AdmissionDenied` variant maps to a defined coarse reason
+    /// that round-trips through its wire byte, so a denial never leaks the
+    /// detailed reason yet is always classified. The `coarse()` match is
+    /// exhaustive (no wildcard), so a new variant forces classification; this
+    /// list enumerates them for the runtime round-trip and pins the anchors of
+    /// each bucket.
+    #[test]
+    fn every_denial_maps_to_a_defined_coarse_reason() {
+        const ALL: &[AdmissionDenied] = &[
+            AdmissionDenied::NotOrgProtected,
+            AdmissionDenied::MissingHeader,
+            AdmissionDenied::MultipleHeaders,
+            AdmissionDenied::MalformedProof,
+            AdmissionDenied::StreamingUnsupported,
+            AdmissionDenied::MemberBindingMismatch,
+            AdmissionDenied::ActingOrgMismatch,
+            AdmissionDenied::UnexpectedCapabilityGrant,
+            AdmissionDenied::MissingCapabilityGrant,
+            AdmissionDenied::ForeignIssuer,
+            AdmissionDenied::GranteeMismatch,
+            AdmissionDenied::InsufficientRights,
+            AdmissionDenied::CapabilityMismatch,
+            AdmissionDenied::TargetNotCovered,
+            AdmissionDenied::DispatcherGrantScope,
+            AdmissionDenied::DispatcherGrantInvalid,
+            AdmissionDenied::MembershipInvalid,
+            AdmissionDenied::MembershipRevoked,
+            AdmissionDenied::CapabilityGrantInvalid,
+            AdmissionDenied::ProofExpired,
+            AdmissionDenied::BindingInvalid,
+            AdmissionDenied::ProviderAuthorityUnavailable,
+            AdmissionDenied::AuthorityChanged,
+            AdmissionDenied::Replay,
+            AdmissionDenied::CallIdCollision,
+            AdmissionDenied::ReplayCapacity,
+            AdmissionDenied::PerCallerReplayCapacity,
+            AdmissionDenied::ProviderPolicyRejected,
+        ];
+        for &d in ALL {
+            let c = d.coarse();
+            assert_eq!(
+                CoarseAdmissionReason::from_wire(c.to_wire()),
+                Some(c),
+                "coarse reason for {d:?} must round-trip through its wire byte",
+            );
+        }
+        // Bucket anchors.
+        assert_eq!(
+            AdmissionDenied::StreamingUnsupported.coarse(),
+            CoarseAdmissionReason::NotSupported,
+        );
+        for unavailable in [
+            AdmissionDenied::ProviderAuthorityUnavailable,
+            AdmissionDenied::AuthorityChanged,
+            AdmissionDenied::ReplayCapacity,
+            AdmissionDenied::PerCallerReplayCapacity,
+        ] {
+            assert_eq!(unavailable.coarse(), CoarseAdmissionReason::Unavailable);
+        }
+        for denied in [
+            AdmissionDenied::BindingInvalid,
+            AdmissionDenied::Replay,
+            AdmissionDenied::ProviderPolicyRejected,
+            AdmissionDenied::MembershipRevoked,
+        ] {
+            assert_eq!(denied.coarse(), CoarseAdmissionReason::Denied);
+        }
+        // Every coarse byte decodes; an unknown byte does not.
+        assert_eq!(CoarseAdmissionReason::from_wire(3), None);
     }
 }
