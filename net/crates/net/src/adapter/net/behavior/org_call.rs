@@ -437,6 +437,66 @@ mod tests {
         proof.check_expiry(0).expect("live");
     }
 
+    /// §2.6 (Kyra OA2-F): the raw discovery key NEVER appears in an encoded call
+    /// proof. A DISCOVER capability grant carries only its 32-byte COMMITMENT;
+    /// the raw key lives out of band in the audience secret. Mint one, build a
+    /// proof carrying that grant, encode it, and byte-scan for the key.
+    #[test]
+    fn encoded_call_proof_carries_no_discovery_key() {
+        use crate::adapter::net::behavior::org_grant::audience_key_commitment;
+        let caller = caller();
+        let membership =
+            OrgMembershipCert::try_issue(&org_a(), caller.entity_id().clone(), 1, 3600)
+                .expect("cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_a(),
+            caller.entity_id().clone(),
+            DispatcherScope::Exact(cap()),
+            3600,
+        )
+        .expect("dispatcher");
+        let (capability_grant, secret) = OrgCapabilityGrant::try_issue(
+            &org_b(),
+            org_a().org_id(),
+            cap(),
+            GrantRights::INVOKE.union(GrantRights::DISCOVER),
+            GrantTargetScope::ExactNode(provider()),
+            3600,
+        )
+        .expect("discover cap grant");
+        let secret = secret.expect("a DISCOVER grant mints an audience secret");
+        let discovery_key = *secret.discovery_key();
+
+        let expiry = (current_timestamp() + 20) * 1_000_000_000;
+        let proof = OrgCallProof::sign_for_call(
+            &caller,
+            membership,
+            dispatcher,
+            Some(capability_grant),
+            org_a().org_id(),
+            org_b().org_id(),
+            provider(),
+            7,
+            cap(),
+            expiry,
+            [0x11u8; 32],
+        );
+        let encoded = proof.encode().expect("encode proof");
+
+        // The raw key must appear NOWHERE in the encoded proof...
+        assert!(
+            !encoded.windows(32).any(|w| w == discovery_key),
+            "the raw discovery key leaked into the encoded call proof",
+        );
+        // ...while the safe-to-carry COMMITMENT DOES ride in the grant, so the
+        // scan is meaningful (it can find 32-byte patterns, just not the key).
+        let commitment = audience_key_commitment(&discovery_key);
+        assert!(
+            encoded.windows(32).any(|w| w == commitment),
+            "the grant's discovery-key commitment should ride in the proof",
+        );
+    }
+
     #[test]
     fn binding_transplant_matrix_every_bound_field_is_load_bearing() {
         let digest = [0x11u8; 32];

@@ -1297,6 +1297,47 @@ mod tests {
         );
     }
 
+    /// §2.6 (Kyra OA2-F): an "installed" audience secret — round-tripped through
+    /// its on-disk `encode_config`/`decode_config` form (exactly how `net org
+    /// grant-capability --discover` writes the 0600 file) — still enforces its
+    /// commitment: it matches ONLY the binding it was minted for and REJECTS a
+    /// foreign grant's binding locally (mismatched `key_commitment` → wrong
+    /// audience → not admitted).
+    #[test]
+    fn installed_audience_secret_rejects_a_foreign_binding() {
+        let issue = || {
+            OrgCapabilityGrant::try_issue(
+                &org_b(),
+                org_a().org_id(),
+                cap(),
+                GrantRights::DISCOVER,
+                GrantTargetScope::ExactNode(provider()),
+                3600,
+            )
+            .expect("issue")
+        };
+        let (grant1, secret1) = issue();
+        let (grant2, _secret2) = issue();
+        let secret1 = secret1.expect("DISCOVER mints a secret");
+        let binding1 = grant1.discovery.expect("grant1 binding");
+        let binding2 = grant2.discovery.expect("grant2 binding");
+
+        // Persist + reload exactly as the CLI writes the 0600 audience file.
+        let reloaded = OrgAudienceSecret::decode_config(&secret1.encode_config())
+            .expect("decode_config round-trips the installed secret");
+        assert_eq!(reloaded.grant_id, secret1.grant_id);
+
+        // The installed secret matches ONLY its own grant's binding.
+        assert!(
+            reloaded.matches_binding(&binding1),
+            "installed secret matches its own binding",
+        );
+        assert!(
+            !reloaded.matches_binding(&binding2),
+            "installed secret REJECTS a foreign grant's binding (key_commitment mismatch)",
+        );
+    }
+
     #[test]
     fn structural_rule_enforced_at_decode_and_verify_both_directions() {
         // DISCOVER rights without a binding (crafted through the
