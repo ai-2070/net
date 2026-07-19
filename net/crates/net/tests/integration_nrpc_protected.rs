@@ -840,6 +840,170 @@ async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// OA3-4b1 B2 audience-rotation safety (Kyra): a same-org authority replacement
+/// rotates the owner audience key while keeping the membership cert equal. The
+/// public-cert and visibility checks therefore see no change — only the recorded
+/// sealing-authority identity does. The cached scoped envelope sealed under the
+/// OLD key must NOT ship after the rotation; only a rebuild under the NEW key may.
+#[tokio::test]
+async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use net::adapter::net::behavior::org_authority::NodeAuthority;
+    use net::adapter::net::behavior::org_revocation::OrgRevocationState;
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use net::adapter::net::behavior::org_scoped_ingest::{
+        verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
+    };
+
+    let server = build_node_with(EntityKeypair::from_bytes([0x54u8; 32])).await;
+    let node_entity = server.entity_id().clone();
+    let org = OrgKeypair::from_bytes([0x77u8; 32]);
+    // ONE membership cert C, shared by both authorities — only the audience key
+    // rotates (each `adopt` generates a fresh random OwnerAudienceCredential).
+    let cert = OrgMembershipCert::try_issue(&org, node_entity.clone(), 1, 3600).expect("cert C");
+    let owner_org = cert.org_id;
+
+    let dir_a = std::env::temp_dir().join(format!("net-b2-rot-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("net-b2-rot-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let authority_a = Arc::new(
+        NodeAuthority::adopt(&dir_a, cert.clone(), &node_entity, 0, None).expect("adopt A"),
+    );
+    let authority_b = Arc::new(
+        NodeAuthority::adopt(&dir_b, cert.clone(), &node_entity, 0, None).expect("adopt B"),
+    );
+    // Capture each audience (handle + key) BEFORE installing, since install
+    // consumes the Arc. The rotation must actually change the key.
+    let handle_a = authority_a.audience.audience_handle;
+    let key_a = *authority_a.audience.discovery_key();
+    let handle_b = authority_b.audience.audience_handle;
+    let key_b = *authority_b.audience.discovery_key();
+    assert_ne!(key_a, key_b, "the rotation must change the audience key");
+
+    server
+        .install_node_authority(authority_a)
+        .expect("install A");
+    server
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+    let _secret = server
+        .serve_rpc_owner_scoped("secret", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("owner-scoped serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce under A");
+
+    // E1 published under authority A.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_scoped_for_send_for_test().len() == 1
+        })
+        .await,
+        "E1 published under authority A",
+    );
+    let e1 = server.announcement_scoped_for_send_for_test();
+    let env1 = ScopedCapabilityAnnouncement::from_bytes(&e1[0]).expect("decode E1");
+
+    // Rotate: replace with same-org authority B (same cert C, new audience K2).
+    // The bare test node has no `self_weak`, so no auto re-announce fires; the
+    // stale E1 stays cached until we rebuild explicitly. Critically, there is NO
+    // await between the sync `install` and the sync scoped read below, so on the
+    // current-thread test runtime no re-announce task can interpose — the refusal
+    // is observed deterministically.
+    server
+        .install_node_authority(authority_b)
+        .expect("install B (same-org rotation)");
+    let after_rotation = server.announcement_scoped_for_send_for_test();
+    assert!(
+        after_rotation.is_empty(),
+        "a rotation must refuse the stale scoped envelope until the emission is rebuilt",
+    );
+
+    // Rebuild under B → E2, sealed under K2.
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce under B");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_scoped_for_send_for_test().len() == 1
+        })
+        .await,
+        "E2 published under authority B",
+    );
+    let e2 = server.announcement_scoped_for_send_for_test();
+    let env2 = ScopedCapabilityAnnouncement::from_bytes(&e2[0]).expect("decode E2");
+
+    let floors = OrgRevocationState::empty();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+
+    // E1 opens under K1; E2 opens under K2 — both to the owner-scoped descriptor.
+    let v1 = verify_scoped_ingest(
+        &env1,
+        &AudienceAuthority::Owner {
+            owner_org,
+            audience_handle: handle_a,
+            discovery_key: &key_a,
+        },
+        &ScopedIngestContext {
+            local_owner_org: owner_org,
+            floors: &floors,
+            now_secs,
+            skew_secs: 5,
+        },
+    )
+    .expect("E1 opens under K1");
+    assert!(CapabilitySet::from_bytes(v1.descriptor())
+        .expect("E1 descriptor")
+        .has_tag("nrpc:secret"));
+    let v2 = verify_scoped_ingest(
+        &env2,
+        &AudienceAuthority::Owner {
+            owner_org,
+            audience_handle: handle_b,
+            discovery_key: &key_b,
+        },
+        &ScopedIngestContext {
+            local_owner_org: owner_org,
+            floors: &floors,
+            now_secs,
+            skew_secs: 5,
+        },
+    )
+    .expect("E2 opens under K2");
+    assert!(CapabilitySet::from_bytes(v2.descriptor())
+        .expect("E2 descriptor")
+        .has_tag("nrpc:secret"));
+
+    // E2 (sealed under K2) must NOT open under the rotated-out K1.
+    assert!(
+        verify_scoped_ingest(
+            &env2,
+            &AudienceAuthority::Owner {
+                owner_org,
+                audience_handle: handle_b,
+                discovery_key: &key_a,
+            },
+            &ScopedIngestContext {
+                local_owner_org: owner_org,
+                floors: &floors,
+                now_secs,
+                skew_secs: 5,
+            },
+        )
+        .is_err(),
+        "E2 sealed under the new key must not open under the rotated-out K1",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
 /// emission derived from the STALE visibility snapshot. The send-time generation
 /// check — shared by every self-emission path via `announcement_bytes_for_send`

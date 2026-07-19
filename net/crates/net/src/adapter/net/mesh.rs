@@ -2828,6 +2828,15 @@ struct LocalCapabilityEmission {
     // until OA3-4b1 Commit B2 populates the owner envelope; a cert-invalidating
     // send-time rebuild clears it (see [`MeshNode::rebuild_cached_announcement`]).
     scoped: Vec<Vec<u8>>,
+    /// The exact `Arc<NodeAuthority>` whose owner audience sealed `scoped` (Kyra
+    /// OA3-4b1 B2 rotation safety). `Some` only when `scoped` is nonempty. The
+    /// send path pointer-compares it against the currently-installed authority
+    /// and refuses the send if they differ: a same-org authority replacement
+    /// rotates the audience key while keeping the public cert equal, so neither
+    /// the cert rebuild nor the visibility check would otherwise catch it.
+    /// Holding the original Arc makes the comparison ABA-safe — a replacement is
+    /// necessarily a distinct allocation.
+    scoped_authority: Option<Arc<super::behavior::org_authority::NodeAuthority>>,
     /// The local-service-registry generation this emission's public/scoped
     /// projection was derived from. The send path rejects the emission if the
     /// current generation has advanced — a concurrent visibility change may have
@@ -7436,6 +7445,36 @@ impl MeshNode {
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
         // (review-11 P1).
+        //
+        // Kyra OA3-4b1 B2 point 5: a same-org authority replacement rotates the
+        // owner audience key. The send path already refuses cached scoped
+        // ciphertext sealed under the OLD authority (pointer mismatch), but that
+        // stale emission must also be REBUILT under the new key. Wake an
+        // immediate re-announce so a fresh emission is published; until it lands,
+        // the send path keeps the stale scoped envelopes off the wire.
+        // Best-effort — only a node started via `start_arc` (populated
+        // `self_weak`) inside a runtime can spawn; a bare node reconciles on its
+        // next explicit announce.
+        if let Some(weak) = self.self_weak.get().cloned() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let shutdown = self.shutdown.clone();
+                handle.spawn(async move {
+                    let Some(node) = weak.upgrade() else {
+                        return;
+                    };
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let baseline = node.user_caps_snapshot();
+                    if let Err(e) = node.announce_capabilities(baseline).await {
+                        tracing::warn!(
+                            error = %e,
+                            "authority install: post-install re-announce failed"
+                        );
+                    }
+                });
+            }
+        }
         Ok(())
     }
 
@@ -7486,29 +7525,24 @@ impl MeshNode {
     /// advertises to the node's OWN owner audience; a single envelope carries all
     /// of them (granted-audience fanout is a later slice).
     ///
-    /// Empty when emission is dark — no installed authority, or the owner cert is
-    /// no longer valid (floored / expired). The envelope embeds that cert and
-    /// rides its validity exactly like the public announcement, so a floored or
-    /// expired provider never ships a scoped envelope with a stale cert (Kyra
-    /// OA3 — scoped rides public-cert validity). A seal/sign failure logs and
-    /// drops the envelope (fail-safe) without blocking the plaintext announcement.
+    /// `authority` and `owner_cert` are PINNED by the caller — the same
+    /// `Arc<NodeAuthority>` that supplied the public announcement's cert also
+    /// supplies the audience key here, so a concurrent same-org rotation cannot
+    /// pair one authority's cert with another's key (Kyra OA3-4b1 B2). The caller
+    /// records that Arc in the emission so the send path refuses if it is later
+    /// replaced. A seal/sign failure logs and drops the envelope (fail-safe)
+    /// without blocking the plaintext announcement.
     #[cfg(feature = "cortex")]
     fn owner_scoped_envelopes(
         &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        owner_cert: super::behavior::org::OrgMembershipCert,
         owner_scoped: &[String],
         generation: u64,
+        now_secs: u64,
         ttl: Duration,
     ) -> Vec<Vec<u8>> {
         use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
-        let now_secs = super::behavior::org::current_timestamp();
-        // Gate on the SAME temporal cert validity the public announcement uses:
-        // no valid emission cert ⇒ no envelope.
-        let Some(owner_cert) = self.owner_cert_for_emission_at(now_secs) else {
-            return Vec::new();
-        };
-        let Some(authority) = self.node_authority.load_full() else {
-            return Vec::new();
-        };
         let mut descriptor_caps = CapabilitySet::new();
         for svc in owner_scoped {
             descriptor_caps = descriptor_caps.add_tag(format!("nrpc:{}", svc.as_str()));
@@ -7551,10 +7585,24 @@ impl MeshNode {
         &self,
         now_secs: u64,
     ) -> Option<super::behavior::org::OrgMembershipCert> {
+        let authority = self.node_authority.load_full()?;
+        self.owner_cert_under(&authority, now_secs)
+    }
+
+    /// The valid emission cert under a SPECIFIC pinned authority — the shared
+    /// body of [`Self::owner_cert_for_emission_at`]. `announce_from_baseline`
+    /// pins one `Arc<NodeAuthority>` and derives BOTH the public cert (here) and
+    /// the scoped envelope's audience key from it, so a concurrent same-org
+    /// rotation cannot pair one authority's cert with another's key (Kyra
+    /// OA3-4b1 B2).
+    fn owner_cert_under(
+        &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        now_secs: u64,
+    ) -> Option<super::behavior::org::OrgMembershipCert> {
         if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
             return None;
         }
-        let authority = self.node_authority.load_full()?;
         let cert = &authority.config.owner_cert;
         // Review-9: emission must not keep advertising a
         // certificate that is no longer valid against the ACTIVE
@@ -7705,11 +7753,30 @@ impl MeshNode {
                     cached.visibility_generation == self.rpc_local_services.generation();
                 #[cfg(not(feature = "cortex"))]
                 let visibility_stable = true;
+                // Kyra OA3-4b1 B2 rotation safety: the owner-scoped envelopes in
+                // `cached.scoped` were sealed under a specific owner audience key,
+                // recorded as `scoped_authority`. If a same-org authority
+                // replacement rotated that key after this emission was built, the
+                // public cert stays equal (so the cert rebuild above does not fire)
+                // and the visibility generation is unchanged — only a direct
+                // authority-identity comparison catches it. Pointer comparison is
+                // ABA-safe: `cached` holds the original Arc alive, so a replacement
+                // is necessarily a different allocation.
+                let authority_stable = match &cached.scoped_authority {
+                    Some(built) => self
+                        .node_authority
+                        .load_full()
+                        .as_ref()
+                        .map(|current| Arc::ptr_eq(current, built))
+                        .unwrap_or(false),
+                    None => true,
+                };
                 // Emit only if nothing moved during the derive + serialize — the
-                // security stamp AND the visibility generation both still hold. The
-                // pinned `snapshot` Arcs are still alive for this comparison, so a
-                // swapped-away authority/store cannot reuse the captured addresses.
-                if self.security_stamp() == stamp && visibility_stable {
+                // security stamp, the visibility generation, AND the sealing
+                // authority all still hold. The pinned `snapshot` Arcs are still
+                // alive for this comparison, so a swapped-away authority/store
+                // cannot reuse the captured addresses.
+                if self.security_stamp() == stamp && visibility_stable && authority_stable {
                     // Pair the serialized public bytes with the owner-scoped
                     // envelopes from the SAME validated `cached` load — one
                     // coherent generation, never a torn public/scoped snapshot
@@ -7720,10 +7787,10 @@ impl MeshNode {
                         scoped: cached.scoped.clone(),
                     });
                 }
-                // A visibility change is terminal for this send — the bump already
-                // woke a re-announce that will publish a coherent emission; do not
-                // retry against a set that just changed.
-                if !visibility_stable {
+                // A visibility change or an authority rotation is terminal for this
+                // send — each already woke a re-announce that will publish a
+                // coherent emission; do not retry against state that just changed.
+                if !visibility_stable || !authority_stable {
                     return None;
                 }
                 continue;
@@ -7867,6 +7934,8 @@ impl MeshNode {
             .store(Some(Arc::new(LocalCapabilityEmission {
                 public: ann,
                 scoped: Vec::new(),
+                // Scoped cleared ⇒ no sealing authority to track (Kyra B2).
+                scoped_authority: None,
                 // A cert rebuild does NOT change visibility — preserve the
                 // generation so the send-time freshness check still holds.
                 visibility_generation: cached.visibility_generation,
@@ -18758,6 +18827,18 @@ impl MeshNode {
             // The PUBLIC broadcast announcement — the ONLY object every plaintext
             // send path reads (`local_announcement`). Owner-scoped `nrpc:` tags
             // were already excluded from `caps` above (OA3-4b1).
+            // Kyra OA3-4b1 B2 rotation safety: pin ONE authority for BOTH the
+            // public cert and the scoped envelope's audience key, and derive the
+            // cert from it exactly as `owner_cert_for_emission` would. A
+            // concurrent same-org rotation therefore cannot pair one authority's
+            // cert with another's key; the emission records this exact Arc so the
+            // send path refuses a rotation that lands after the build.
+            let now_secs = super::behavior::org::current_timestamp();
+            let emission_authority = self.node_authority.load_full();
+            let owner_cert = emission_authority
+                .as_ref()
+                .and_then(|authority| self.owner_cert_under(authority, now_secs));
+
             let mut broadcast_ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
@@ -18765,10 +18846,10 @@ impl MeshNode {
                 caps.clone(),
             )
             .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
-            // OA-1: attach the INSTALLED authority's owner cert iff
-            // emission is enabled (Migration step 3 switch; `None`
-            // keeps pre-OA-1 bytes; no other cert source exists).
-            .with_owner_cert(self.owner_cert_for_emission());
+            // OA-1: attach the pinned authority's owner cert iff emission is
+            // enabled (Migration step 3 switch; `None` keeps pre-OA-1 bytes; no
+            // other cert source exists).
+            .with_owner_cert(owner_cert.clone());
             #[cfg(feature = "nat-traversal")]
             {
                 broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
@@ -18783,10 +18864,10 @@ impl MeshNode {
             // NEVER stored in `local_announcement` or sent. When no owner-scoped
             // service is registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
-            let (self_ann, scoped_envelopes) = {
+            let (self_ann, scoped_envelopes, scoped_authority) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
                 if owner_scoped.is_empty() {
-                    (broadcast_ann.clone(), Vec::new())
+                    (broadcast_ann.clone(), Vec::new(), None)
                 } else {
                     let mut self_caps = caps;
                     for svc in &owner_scoped {
@@ -18799,7 +18880,7 @@ impl MeshNode {
                         self_caps,
                     )
                     .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
-                    .with_owner_cert(self.owner_cert_for_emission());
+                    .with_owner_cert(owner_cert.clone());
                     #[cfg(feature = "nat-traversal")]
                     {
                         a = a.with_reflex_addr(reflex_snapshot);
@@ -18810,15 +18891,37 @@ impl MeshNode {
                     // OA3-4b1 Commit B2: seal the owner-scoped services into an
                     // encrypted owner-audience envelope carried on
                     // SUBPROTOCOL_SCOPED_CAPABILITY_ANN — never in the plaintext
-                    // `broadcast_ann`. Empty when emission is dark (no valid cert).
-                    let scoped = self.owner_scoped_envelopes(&owner_scoped, version, ttl);
-                    (a, scoped)
+                    // `broadcast_ann`. Sealed under the SAME pinned authority
+                    // whose cert `a`/`broadcast_ann` embed; a nonempty result
+                    // retains that exact Arc so the send path refuses a later
+                    // same-org rotation (Kyra OA3-4b1 B2).
+                    match (emission_authority.as_ref(), owner_cert.as_ref()) {
+                        (Some(authority), Some(cert)) => {
+                            let scoped = self.owner_scoped_envelopes(
+                                authority,
+                                cert.clone(),
+                                &owner_scoped,
+                                version,
+                                now_secs,
+                                ttl,
+                            );
+                            if scoped.is_empty() {
+                                (a, Vec::new(), None)
+                            } else {
+                                (a, scoped, Some(Arc::clone(authority)))
+                            }
+                        }
+                        _ => (a, Vec::new(), None),
+                    }
                 }
             };
             #[cfg(not(feature = "cortex"))]
             let self_ann = broadcast_ann.clone();
             #[cfg(not(feature = "cortex"))]
-            let scoped_envelopes: Vec<Vec<u8>> = Vec::new();
+            let (scoped_envelopes, scoped_authority): (
+                Vec<Vec<u8>>,
+                Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+            ) = (Vec::new(), None);
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -18871,6 +18974,7 @@ impl MeshNode {
                 .store(Some(Arc::new(LocalCapabilityEmission {
                     public: broadcast_ann,
                     scoped: scoped_envelopes,
+                    scoped_authority,
                     visibility_generation,
                 })));
 
