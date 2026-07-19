@@ -353,3 +353,140 @@ async fn live_two_node_missing_proof_denied() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// LIVE provider-state deny: the provider's revocation store is poisoned AFTER
+/// registration, so the call-time `verify_provider_authority` self-check fails
+/// closed. A VALID owner-delegated proof is denied `Unavailable` (the provider's
+/// authority is durability-uncertain), the handler stays dark, and the caller
+/// sees 0x0009 — proving the live gate reads current provider state, not
+/// registration-time state.
+#[tokio::test]
+async fn live_two_node_provider_store_poison_denies() {
+    const CALLER_SEED: [u8; 32] = [0x09u8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (org_b, dir) = install_authority(&server, "poison");
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // Poison the provider's store AFTER a healthy registration.
+    server
+        .org_revocation_store()
+        .expect("a revocation store is installed")
+        .mark_poisoned_for_test();
+
+    let intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        provider,
+        "svc",
+    );
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let err = caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect_err("a poisoned provider store must deny even a valid proof");
+
+    match err {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
+            assert_eq!(status, 0x0009, "status is AdmissionDenied (0x0009)");
+            assert_eq!(
+                message.as_bytes(),
+                &[2u8],
+                "coarse reason is exactly Unavailable (provider authority unavailable)",
+            );
+        }
+        other => panic!("expected an AdmissionDenied ServerError, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark under the poisoned store",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// LIVE provider-state deny: the captured `provider_policy` is the final live
+/// veto (E1.2). A structurally VALID owner-delegated proof whose provider policy
+/// returns `false` is denied, the handler stays dark, and the caller sees 0x0009
+/// with a single coarse byte — never a timeout.
+#[tokio::test]
+async fn live_two_node_policy_veto_denies() {
+    const CALLER_SEED: [u8; 32] = [0x0au8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (org_b, dir) = install_authority(&server, "veto");
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    // The provider policy vetoes EVERY proof.
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| false),
+        )
+        .expect("serve protected");
+
+    let intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        provider,
+        "svc",
+    );
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let err = caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect_err("a vetoing provider policy must deny a valid proof");
+
+    match err {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
+            assert_eq!(status, 0x0009, "status is AdmissionDenied (0x0009)");
+            assert_eq!(
+                message.as_bytes().len(),
+                1,
+                "the deny body carries exactly one coarse reason byte",
+            );
+        }
+        other => {
+            panic!("expected an AdmissionDenied ServerError, got {other:?} (no timeout masquerade)")
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark under the policy veto",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
