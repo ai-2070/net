@@ -956,10 +956,10 @@ fn metrics_snapshot_invariants_fixture_is_well_formed() {
         .get("service_metrics_fields")
         .and_then(|v| v.as_array())
         .expect("service_metrics_fields is an array");
-    // The substrate's ServiceMetrics has 19 documented fields
-    // (1 identity + 9 caller-side + 9 server-side). Pin so a
+    // The substrate's ServiceMetrics has 21 documented fields
+    // (1 identity + 9 caller-side + 11 server-side). Pin so a
     // substrate-side field add/remove surfaces here.
-    assert_eq!(fields.len(), 19, "ServiceMetrics has 19 documented fields",);
+    assert_eq!(fields.len(), 21, "ServiceMetrics has 21 documented fields",);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for f in fields {
         let name = f
@@ -1071,7 +1071,7 @@ fn service_metrics_fields_match_fixture() {
     // a field rename surfaces the same way. A field ADDITION
     // surfaces via the
     // metrics_snapshot_invariants_fixture_is_well_formed test's
-    // 19-field count assertion.
+    // 21-field count assertion.
     let svc = ServiceMetrics {
         service: "test_service".to_string(),
         calls_total: 0,
@@ -1092,6 +1092,8 @@ fn service_metrics_fields_match_fixture() {
         streaming_chunks_emitted_total: 0,
         streaming_chunks_dropped_total: 0,
         capability_denied_total: 0,
+        relayed_flow_controlled_rejected_total: 0,
+        packet_origin_mismatch_dropped_total: 0,
     };
     // Touch every field — read-side mirror of the literal above
     // so a field rename caught at construction also catches at
@@ -1115,6 +1117,8 @@ fn service_metrics_fields_match_fixture() {
     let _: u64 = svc.streaming_chunks_emitted_total;
     let _: u64 = svc.streaming_chunks_dropped_total;
     let _: u64 = svc.capability_denied_total;
+    let _: u64 = svc.relayed_flow_controlled_rejected_total;
+    let _: u64 = svc.packet_origin_mismatch_dropped_total;
 
     // Sanity: the fixture lists the same field names.
     let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
