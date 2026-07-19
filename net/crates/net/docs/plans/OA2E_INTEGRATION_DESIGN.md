@@ -44,14 +44,16 @@ across the entire series; every fix carries a red-witnessed test.
 
 | Gate | Scope | State |
 |---|---|---|
+| Gate 1 | OA-1 revocation store | **SIGNED OFF** (Kyra) |
 | Gate 2 | E1 primitives audit | **SIGNED OFF** (Kyra) |
-| Gate 1 | OA-1 revocation store | CHANGES REQUESTED → closures R3-2/3/4 landed, **awaiting re-review** |
-| Gate 3 | E0 / nRPC substrate | CHANGES REQUESTED → closure R3-1 landed, **awaiting re-review** |
-| `#47` | E1 **live wiring** (serve_rpc_protected, live gate, `RpcContext.org_admission`, `RpcStatus 0x0009`) | **FORBIDDEN** until Gate 1 + Gate 3 re-signed |
+| Gate 3 | E0 / nRPC substrate | **SIGNED OFF** (Kyra) |
+| `#47` | E1 **live wiring** + E2 caller seam (serve_rpc_protected, live gate, `RpcContext.org_admission`, `RpcStatus 0x0009`, proof-intent builder) | **SIGNED OFF / CLOSED** (Kyra, 2026-07-19, `512cd1588`) |
 
-**Not started:** the atomic `#47` live-wiring unit (E1.2 gate, E1.6
-`Admitted`+header-strip, E1.8 unary boundary), OA2-E2 (caller/wire),
-OA-3 (visibility), OA2-F (CLI/SDK + §2.6 gate).
+**Landed since:** OA2-F (CLI/SDK grant management + §2.6 exit-gate closure
+witnesses), 2026-07-19.
+
+**Not started:** OA-3 (grant-scoped private discovery / visibility state
+machine) → OA-4 (end-to-end seam witnesses).
 
 ## The core problem (why this is not one mechanical commit)
 
@@ -505,20 +507,28 @@ credential oracle.
       shared canonical digest (E1.7). All red-witnessed, `may_execute`
       untouched.
 
-**OA2-E1 live wiring + E2 (the atomic `#47` unit — FORBIDDEN until Gate 1
-+ Gate 3 re-signed):**
+**OA2-E1 live wiring + E2 (the atomic `#47` unit — SIGNED OFF / CLOSED
+by Kyra 2026-07-19, `512cd1588`):**
 
-- [ ] OA2-E1 wiring: the E1.2 gate in the unary serve bridge; `Admitted`
+- [x] OA2-E1 wiring: the E1.2 gate in the unary serve bridge; `Admitted`
       into `RpcContext` + proof-header strip (E1.6); unary-only boundary
       rejection (E1.8); witnesses 10–25 (incl. the exhaustive
-      enum→`0x0009` test).
-- [ ] OA2-E2: proof-intent builder; `RpcStatus 0x0009` + coarse
-      reasons; mixed-version fleet gate; witnesses 26–28.
-- [ ] Gates: `may_execute` byte-identity, fmt, both clippy, full lib +
-      org_ownership + CLI + new org_admission_wire integration file.
+      enum→`0x0009` test). Plus B1 direct-session identity, B2 node-owned
+      replay, B3 atomic caller construction, and the protected `call_service`
+      authority split.
+- [x] OA2-E2: proof-intent builder; `RpcStatus 0x0009` + coarse
+      reasons; mixed-version fleet gate; witnesses 26–28. Plus the shared 30 s
+      TTL (fail-loud), exact provider binding, SDK re-export, and the live
+      two-node transport/provider-state/mixed-version witnesses
+      (`tests/integration_nrpc_protected.rs`).
+- [x] Gates: `may_execute` byte-identity, fmt, both clippy, full lib +
+      org_ownership + CLI + the `org_admission_wire` integration file.
 
 **Later:**
 
 - [ ] OA-3 (separate): visibility state machine.
-- [ ] OA2-F: CLI/SDK grant management + §2.6 gate.
+- [x] OA2-F: CLI/SDK grant management + §2.6 gate — LANDED 2026-07-19
+      (`net_sdk::org` grant re-exports; `net org grant-dispatcher` /
+      `grant-capability` incl. `--discover`; the two §2.6 closure witnesses +
+      `tests/org_admission_wire.rs`).
 ```

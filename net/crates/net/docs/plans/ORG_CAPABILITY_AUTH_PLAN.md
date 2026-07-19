@@ -10,7 +10,7 @@ witness matrix (§OA-4), and three OA-3 carry-forwards: the zero
 grant_id is reserved (grant issuance/decode rejects it), envelope
 dedup identity includes `grant_id`, and secret-bearing runtime
 types are structurally non-serializable.
-**Status (2026-07-18, branch `org-capability-auth`):**
+**Status (2026-07-19, branch `org-capability-auth`):**
 
 - **OA-1** — IMPLEMENTED and iterated through reviews 8–11 plus the
   amended/consolidated closure rounds (revocation store, adopt ceremony,
@@ -20,18 +20,24 @@ types are structurally non-serializable.
   existing-handle sidecar-identity check, R3-4 externally-owned
   subscription + safe self-unsubscription) are landed and **awaiting the
   Gate-1 re-sign**.
-- **OA-2** — the substrate and primitives exist, review-gated. The nRPC
-  **E0 substrate** (registration, channel/service equality, RpcRouteV1
-  discriminator, direct-session identity, one clock sample) is landed
-  (Gate 3); the **E1 provider-admission primitives** (`RegisteredRpcService`,
-  `verify_org_admission`, replay guard, canonical digest, admission stamp)
-  are landed **UNWIRED** — Gate 2 SIGNED OFF. The atomic **E1 live wiring**
+- **OA-2** — internal + cross-org admission is IMPLEMENTED end to end. The
+  nRPC **E0 substrate** (registration, channel/service equality, RpcRouteV1
+  discriminator, direct-session identity, one clock sample) is landed (Gate 3);
+  the **E1 provider-admission primitives** (`RegisteredRpcService`,
+  `verify_org_admission`, replay guard, canonical digest, admission stamp) are
+  landed (Gate 2 SIGNED OFF). The atomic **E1 live wiring + E2 caller seam**
   (`serve_rpc_protected`, the live gate, `RpcContext.org_admission`,
-  `RpcStatus 0x0009` — internally `#47`) is FORBIDDEN until BOTH Gate 1
-  (OA-1 store) and Gate 3 (E0/nRPC) are re-signed. See
-  `docs/plans/OA2E_INTEGRATION_DESIGN.md` for the E0/E1/E2 decomposition
-  and the live gate ledger.
-- **OA-3 / OA-4** — held behind their staged reviews.
+  `RpcStatus 0x0009`, the proof-intent builder — internally `#47`) is landed and
+  **SIGNED OFF / CLOSED** (2026-07-19, `512cd1588`), with live two-node
+  transport, provider-state, and mixed-version witnesses in
+  `tests/integration_nrpc_protected.rs`. **OA2-F** — CLI/SDK grant management
+  (`net org grant-dispatcher` / `grant-capability` incl. `--discover`, the
+  `net_sdk::org` grant re-exports) plus the §2.6 exit-gate closure witnesses
+  (no `discovery_key` in the proof/header; installed-secret commitment
+  mismatch → local reject; `tests/org_admission_wire.rs`) — is landed. See
+  `docs/plans/OA2E_INTEGRATION_DESIGN.md` for the E0/E1/E2 decomposition and the
+  live-gate ledger.
+- **OA-3 / OA-4** — held behind their staged reviews (next in sequence).
 
 `may_execute` (`capability_bridge.rs`) is byte-for-byte unchanged across
 the whole OA-2 series; every fix is red-witnessed.
@@ -80,7 +86,7 @@ AUTHORITY OBJECTS
        issuer_org: B, grantee_org: A,
        capability: CapabilityAuthorityId,
        rights: GrantRights,                    // DISCOVER | INVOKE
-       target_scope: ExactNode(NodeId) | AnyNodeOwnedBy(OrgId),
+       target_scope: ExactNode(EntityId) | AnyNodeOwnedBy(OrgId),  // EntityId, not the short NodeId (collision-safe; OA2-F)
        discovery: Option<GrantedDiscoveryBinding>,
        not_before, not_after, nonce, sig }
 

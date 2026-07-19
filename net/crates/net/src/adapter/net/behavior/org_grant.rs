@@ -201,8 +201,9 @@ pub enum DispatcherScope {
 /// TOFU-authenticated cryptographic identity — deliberately NOT
 /// the derived 64-bit `node_id`: an org-signed authority object
 /// must not be satisfiable by a ~2³²-work grinding collision on
-/// the short id. (Deviation from the plan's `ExactNode(NodeId)`
-/// sketch, strictly narrower; flagged for OA-2 review.)
+/// the short id. (Narrower than the plan's original
+/// `ExactNode(NodeId)` sketch; reconciled to `EntityId` at the OA-2
+/// exit gate — OA2-F.)
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GrantTargetScope {
     /// Exactly this provider entity.
