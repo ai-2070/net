@@ -403,10 +403,15 @@ partitioned discovery, baseline sanitization, and the full send-path
 leak matrix (immediate / explicit-baseline / change-driven / keepalive
 / rate-limited flush / late-join push / unregister / restart). E1
 registration rejects non-`Public` visibility until this lands.
-`OwnerScoped` wording corrected: a reserved plaintext scoped tag
-excluded from generic lookup is **query-projection control**, not
-fanout control, unless recipients and forwarded propagation are
-actually restricted.
+**`OwnerScoped` = ENCRYPTED-only (Kyra OA3 ruling):** an `OwnerScoped`
+capability is emitted ONLY as an encrypted `ScopedCapabilityAnnouncement`
+under the owner audience (zero grant_id sentinel), never as a plaintext
+tag. The earlier "reserved plaintext scoped tag hidden from generic
+lookup" idea is rejected — a tag that ships in the clear but is excluded
+from unscoped queries is access-control theater (every receiving peer can
+still decode the metadata off the wire), not confidentiality. The
+lightweight plaintext tenant/region/subnet scoping lives separately in
+`SCOPED_CAPABILITIES_PLAN.md` (`scope:*` tags) and is not this.
 
 ---
 

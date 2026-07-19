@@ -118,13 +118,16 @@ AUTHORITY OBJECTS
 CAPABILITY REGISTRATION (provider-local; the §2.4a seam)
     RegisteredCapability { descriptor, visibility, admission }
     Local registry/fold ALWAYS receives the capability;
-    EMISSION projects by visibility:
+    EMISSION projects by visibility (Kyra OA3 ruling — both
+    non-Public forms are ENCRYPTED-only; "plaintext but hidden from
+    unscoped queries" is access-control theater, since every peer can
+    still decode the metadata off the wire):
         Public          → plaintext CAP-ANN
-        OwnerScoped     → plaintext scoped form, excluded from
-                          unscoped query projection (fanout
-                          control, not confidentiality)
+        OwnerScoped     → encrypted ScopedCapabilityAnnouncement
+                          under the OWNER audience (reserved zero
+                          grant_id sentinel); never plaintext
         GrantedAudience → encrypted ScopedCapabilityAnnouncement
-                          ONLY
+                          under the GRANT audience; never plaintext
 
 AUDIENCE SCOPES (fold partitioning; mutually invisible)
     enum CapabilityAudienceScope {
@@ -356,11 +359,15 @@ RegisteredCapability {
   authority through it. **`OrgAdmission` is the load-bearing
   authority** (red-witnessed without depending on the legacy gate
   returning any particular value).
-- Emission projects by visibility: `Public` → plaintext CAP-ANN;
-  `OwnerScoped` → plaintext scoped form excluded from unscoped
-  query projection; `GrantedAudience` → encrypted envelope only.
-  A `GrantedAudience` descriptor never appears in plaintext
-  broadcast bytes (witnessed).
+- Emission projects by visibility (Kyra OA3 ruling — both non-Public
+  forms are ENCRYPTED-only): `Public` → plaintext CAP-ANN;
+  `OwnerScoped` → encrypted `ScopedCapabilityAnnouncement` under the
+  owner audience (zero grant_id sentinel); `GrantedAudience` →
+  encrypted envelope under the grant audience. Neither `OwnerScoped`
+  nor `GrantedAudience` descriptors ever appear in plaintext broadcast
+  bytes (witnessed). No plaintext "scoped tag" compatibility mode —
+  hiding a tag from unscoped queries while shipping it in the clear is
+  access-control theater, not confidentiality.
 
 **Migration implication, explicit:** an OLD provider with a
 permissive local entry would serve any authenticated caller.
