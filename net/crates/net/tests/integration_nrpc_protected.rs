@@ -365,7 +365,7 @@ async fn live_two_node_missing_proof_denied() {
         } => {
             assert_eq!(status, 0x0009, "status is exactly AdmissionDenied (0x0009)");
             assert_eq!(
-                message.as_bytes().len(),
+                message.len(),
                 1,
                 "the deny body carries exactly one coarse reason byte",
             );
@@ -507,7 +507,7 @@ async fn live_two_node_policy_veto_denies() {
         } => {
             assert_eq!(status, 0x0009, "status is AdmissionDenied (0x0009)");
             assert_eq!(
-                message.as_bytes().len(),
+                message.len(),
                 1,
                 "the deny body carries exactly one coarse reason byte",
             );
