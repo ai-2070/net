@@ -222,6 +222,7 @@ jobs:
           --test integration_mesh_cancel
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
+          --test integration_nrpc_protected
           --test integration_nrpc_streaming
           --test integration_nrpc_client_streaming
           --test integration_nrpc_duplex

@@ -25,12 +25,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use net::adapter::net::behavior::capability::CapabilitySet;
-use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
 };
+use net::adapter::net::behavior::CapabilityAnnouncement;
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
@@ -137,6 +138,26 @@ fn install_authority(server: &Arc<MeshNode>, tag: &str) -> (OrgKeypair, std::pat
     (org_b, dir)
 }
 
+/// Fold a hand-built restrictive `nrpc:<service>` announcement into each node's
+/// capability index (sidestepping broadcast), so the caller-side `may_execute`
+/// gate observes an allow-list that admits ONLY `allowed_nodes`. `version` must
+/// exceed `serve_rpc`'s auto self-index (v=1/2) to supersede it — use e.g. 100.
+fn fold_restrictive_announcement(
+    nodes: &[&Arc<MeshNode>],
+    target: &Arc<MeshNode>,
+    version: u64,
+    tag: &str,
+    allowed_nodes: Vec<u64>,
+) {
+    let caps = CapabilitySet::new().add_tag(tag);
+    let mut ann =
+        CapabilityAnnouncement::new(target.node_id(), target.entity_id().clone(), version, caps);
+    ann.allowed_nodes = allowed_nodes;
+    for n in nodes {
+        n.test_inject_capability_announcement(ann.clone());
+    }
+}
+
 /// An owner-delegated intent for `caller_kp` (a member of org B) targeting
 /// `provider` on `nrpc:<service>`.
 fn owner_delegated_intent(
@@ -172,7 +193,10 @@ struct AdmitHandler {
     attribution_ok: Arc<AtomicBool>,
     proof_stripped: Arc<AtomicBool>,
     expected_caller: EntityId,
+    expected_acting_org: OrgId,
+    expected_provider_org: OrgId,
     expected_provider: EntityId,
+    expected_capability: CapabilityAuthorityId,
 }
 
 #[async_trait::async_trait]
@@ -181,8 +205,13 @@ impl RpcHandler for AdmitHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(admitted) = ctx.org_admission.as_ref() {
             self.saw_admission.store(true, Ordering::SeqCst);
+            // ALL FOUR parties plus the exact capability (E1.6) — not just
+            // caller + provider (Kyra #47 final).
             if admitted.caller == self.expected_caller
+                && admitted.acting_org == self.expected_acting_org
+                && admitted.provider_org == self.expected_provider_org
                 && admitted.provider == self.expected_provider
+                && admitted.capability == self.expected_capability
             {
                 self.attribution_ok.store(true, Ordering::SeqCst);
             }
@@ -246,7 +275,11 @@ async fn live_two_node_owner_delegated_admit() {
                 attribution_ok: attribution_ok.clone(),
                 proof_stripped: stripped.clone(),
                 expected_caller: caller_entity,
+                // Owner-delegated: the caller acts for org B, which also owns P.
+                expected_acting_org: org_b.org_id(),
+                expected_provider_org: org_b.org_id(),
                 expected_provider: provider.clone(),
+                expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
             }),
             OrgAdmission::OwnerDelegated,
             Arc::new(|_| true),
@@ -279,7 +312,8 @@ async fn live_two_node_owner_delegated_admit() {
     );
     assert!(
         attribution_ok.load(Ordering::SeqCst),
-        "four-party attribution matches the caller and provider identities",
+        "all four attribution parties (caller, acting org, provider org, provider) plus the \
+         exact nrpc:svc capability match",
     );
     assert!(
         stripped.load(Ordering::SeqCst),
@@ -570,4 +604,92 @@ async fn live_two_node_public_handler_never_sees_proof_header() {
         !saw_proof.load(Ordering::SeqCst),
         "the public handler never saw the org-admission proof header (stripped by the bridge)",
     );
+}
+
+/// LIVE routing authority split (Kyra #47 final): a PROTECTED `call_service`
+/// must route on the ORG PROOF, not the legacy `may_execute` allow-list. The
+/// provider advertises `nrpc:svc` with an allow-list that EXCLUDES the caller.
+///   * control — WITHOUT a proof intent, `call_service` applies the legacy gate
+///     and denies the caller (`CapabilityDenied`); the handler stays dark.
+///   * protected — WITH a proof intent, `call_service` bypasses `may_execute`,
+///     selects the exact pinned provider, and the live org gate admits — so the
+///     handler runs, proving protected routing is consistent with direct
+///     protected `call()`.
+#[tokio::test]
+async fn live_two_node_protected_call_service_bypasses_legacy_gate() {
+    const CALLER_SEED: [u8; 32] = [0x0cu8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (org_b, dir) = install_authority(&server, "callservice");
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // Restrictive announcement folded into the CALLER's index only: the legacy
+    // gate admits ONLY the server itself, so the caller is excluded. The server
+    // keeps its permissive self-index, so `has_local_capability` (possession)
+    // stays true for the protected admit. Version 100 supersedes serve's auto
+    // self-index (v=1/2).
+    fold_restrictive_announcement(&[&caller], &server, 100, "nrpc:svc", vec![server.node_id()]);
+
+    // Control: no proof intent → the legacy `may_execute` gate denies locally.
+    let deny = caller
+        .call_service(
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a public call_service must be denied by the legacy allow-list");
+    assert!(
+        matches!(deny, RpcError::CapabilityDenied { .. }),
+        "public call_service is denied by the legacy allow-list, got {deny:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the denied public call never reached the handler",
+    );
+
+    // Protected: proof intent → call_service bypasses `may_execute`, selects the
+    // exact provider, and the live org gate admits.
+    let intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        provider,
+        "svc",
+    );
+    caller
+        .call_service(
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("protected call_service must bypass the legacy gate and admit");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the protected call bypassed the legacy gate and reached the handler exactly once",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

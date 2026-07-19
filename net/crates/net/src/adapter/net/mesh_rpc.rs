@@ -896,6 +896,17 @@ async fn emit_admission_denial(
 /// returns `None` — never an incorrect rewrite (the removal is header-name
 /// scoped). Only genuinely admission-bearing frames pay the decode/re-encode.
 fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInboundEvent> {
+    // REQUEST-only (Kyra #47 final): only the initial REQUEST carries request
+    // headers. A CANCEL / control frame for an already-dispatched call has no
+    // header to strip, so short-circuit before the scan and never rewrite a
+    // non-REQUEST frame.
+    if inbound.payload.len() < EVENT_META_SIZE {
+        return None;
+    }
+    match EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE]) {
+        Some(meta) if meta.dispatch == DISPATCH_RPC_REQUEST => {}
+        _ => return None,
+    }
     let needle = ORG_ADMISSION_HEADER.as_bytes();
     if inbound.payload.len() < RPC_FRAME_BODY_OFFSET
         || !inbound.payload.windows(needle.len()).any(|w| w == needle)
@@ -4413,54 +4424,28 @@ impl MeshNode {
         // small.
         candidates.sort_unstable();
 
-        // v0.4 capability-auth caller-side gate. Filter the
-        // candidate set BEFORE target selection so the routing
-        // policy never picks a peer the caller can't actually
-        // reach. Pre-fix `select_target` could pick a denied
-        // candidate even when authorized peers existed in the
-        // set, and the resulting `CapabilityDenied` masked the
-        // fact that the call would have succeeded against B or
-        // C. Each candidate's own announcement lists
-        // `nrpc:<service>` (otherwise it wouldn't be a
-        // `find_service_nodes` candidate), so the gate's
-        // `has_tag` arm short-circuits in the common case; the
-        // new work is the allow-list scan. Permissive
-        // announcements (all three lists empty) admit any
-        // caller — the byte-identity wire-compat tests pin that
-        // an unmodified peer's announcement stays unrestricted.
-        // See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
-        let tag = format!("nrpc:{service}");
-        use crate::adapter::net::behavior::fold::capability_bridge;
-        let self_id = self.node_id();
-        let any_candidate = candidates[0];
-        let fold = self.capability_fold();
-        // PERF_AUDIT §4.2 — batch the per-candidate gate so the
-        // fold read lock is taken once and the caller's subnet +
-        // groups are parsed once, not N times.
-        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
-        let mut iter = verdicts.into_iter();
-        candidates.retain(|_| iter.next().unwrap_or(false));
-        if candidates.is_empty() {
-            return Err(RpcError::CapabilityDenied {
-                // No authorized target; surface one of the
-                // originally-advertised candidates so the caller
-                // can correlate the denial with a real peer. The
-                // semantic is "no peer advertising `nrpc:<service>`
-                // authorizes this caller" — `any_candidate` is a
-                // representative, not necessarily the strictest.
-                target: any_candidate,
-                capability: service.to_string(),
-            });
-        }
-
-        // A protected intent binds ONE exact provider. Narrow the candidate set
-        // to that provider BEFORE target selection so routing never picks a peer
-        // the proof isn't addressed to (and the round-robin / consistent-hash
-        // state isn't advanced toward a target we'd only reject locally in
-        // `call`). If the bound provider is not among the authorized candidates,
-        // fail LOCALLY rather than minting a proof for a peer that can't be
-        // selected (Kyra #47 tail). `call` re-checks the binding as defense in
-        // depth.
+        // OA-2 authority split (Kyra #47 final): the caller's authorization for a
+        // PROTECTED call is the org proof the PROVIDER's live admission gate
+        // verifies — NOT the legacy `may_execute` announcement allow-list. Branch
+        // the candidate authorization on the intent so protected routing is
+        // semantically consistent with a direct protected `call()`:
+        //
+        //   * protected (`Some` intent) → do NOT apply `may_execute`. A legacy
+        //     allow-list that excludes the caller must not delete a valid
+        //     protected provider (the caller's authority is the proof, not the
+        //     announcement). Keep ONLY the candidate that IS the exact pinned
+        //     provider the proof binds — it already advertises `nrpc:<service>`
+        //     (else it wouldn't be a `find_service_nodes` candidate), and its own
+        //     org gate is the authority. Fail LOCALLY if the bound provider isn't
+        //     advertising, rather than minting a proof for a peer that can't be
+        //     selected. `call` re-checks the binding (defense in depth).
+        //   * public (`None`) → the existing v0.4 caller-side `may_execute` gate,
+        //     unchanged (permissive announcements admit any caller). See
+        //     `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
+        //
+        // Health filtering has already run above; this filtering precedes
+        // `select_target` so routing never picks a peer the call would only
+        // reject afterward.
         if let Some(intent) = opts.org_proof_intent.as_ref() {
             candidates
                 .retain(|node_id| self.peer_entity_id(*node_id).as_ref() == Some(&intent.provider));
@@ -4471,6 +4456,27 @@ impl MeshNode {
                         "org admission: no advertising candidate for `nrpc:{service}` matches \
                          the proof's bound provider"
                     ),
+                });
+            }
+        } else {
+            let tag = format!("nrpc:{service}");
+            use crate::adapter::net::behavior::fold::capability_bridge;
+            let self_id = self.node_id();
+            let any_candidate = candidates[0];
+            let fold = self.capability_fold();
+            // PERF_AUDIT §4.2 — batch the per-candidate gate so the fold read
+            // lock is taken once and the caller's subnet + groups are parsed
+            // once, not N times.
+            let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+            let mut iter = verdicts.into_iter();
+            candidates.retain(|_| iter.next().unwrap_or(false));
+            if candidates.is_empty() {
+                return Err(RpcError::CapabilityDenied {
+                    // No authorized target; surface one of the originally-
+                    // advertised candidates so the caller can correlate the
+                    // denial with a real peer.
+                    target: any_candidate,
+                    capability: service.to_string(),
                 });
             }
         }
@@ -6903,6 +6909,12 @@ mod roster_fallback_tests {
         // `nrpc:<svc>` capability so the provider self-check (E1.2) passes.
         let admits_a = std::sync::Arc::new(AtomicUsize::new(0));
         let admits_b = std::sync::Arc::new(AtomicUsize::new(0));
+        // Count service B's PROVIDER-POLICY invocations. The policy runs
+        // SYNCHRONOUSLY in the admission transaction, AFTER the replay insert and
+        // BEFORE fold/handler dispatch — so it is a deterministic signal that
+        // does NOT depend on handler (`tokio::spawn`) scheduling order (Kyra #47
+        // final): a call denied at the replay insert never reaches the policy.
+        let policy_calls_b = std::sync::Arc::new(AtomicUsize::new(0));
         let serve_a = server
             .serve_rpc_protected(
                 "a",
@@ -6916,7 +6928,13 @@ mod roster_fallback_tests {
                 "b",
                 std::sync::Arc::new(Counter(admits_b.clone())),
                 OrgAdmission::OwnerDelegated,
-                std::sync::Arc::new(|_| true),
+                {
+                    let policy_calls_b = policy_calls_b.clone();
+                    std::sync::Arc::new(move |_: &_| {
+                        policy_calls_b.fetch_add(1, Ordering::SeqCst);
+                        true
+                    })
+                },
             )
             .expect("serve b");
         let ch_a = serve_a.channel_hash;
@@ -6947,10 +6965,20 @@ mod roster_fallback_tests {
             wait_until_at_least(|| admits_b.load(Ordering::SeqCst) as u64, 1).await,
             "service B admits the fresh call_id 8",
         );
+        // DETERMINISTIC check (not handler-count-race dependent): only the fresh
+        // call_id 8 reached B's policy. The reused call_id 7 was denied at the
+        // replay insert — BEFORE the policy — so it never incremented this
+        // counter. Were the collision incorrectly admitted, the count would be 2.
+        assert_eq!(
+            policy_calls_b.load(Ordering::SeqCst),
+            1,
+            "only the fresh call reached service B's policy — the reused call_id 7 was denied at \
+             the replay insert (node-wide (caller, call_id) collision)",
+        );
         assert_eq!(
             admits_b.load(Ordering::SeqCst),
             1,
-            "the cross-service call_id 7 reuse was DENIED (node-wide (caller, call_id) collision)",
+            "service B's handler ran exactly once (only the fresh call)",
         );
 
         drop(serve_a);
@@ -6964,7 +6992,7 @@ mod roster_fallback_tests {
     /// case, where the byte prefilter skips without any decode).
     #[test]
     fn public_admission_strip_removes_only_the_proof_header() {
-        let frame = |headers: Vec<(String, Vec<u8>)>| -> RpcInboundEvent {
+        let frame = |dispatch: u8, headers: Vec<(String, Vec<u8>)>| -> RpcInboundEvent {
             let req = RpcRequestPayload {
                 service: "svc".to_string(),
                 deadline_ns: 0,
@@ -6972,9 +7000,7 @@ mod roster_fallback_tests {
                 headers,
                 body: Bytes::from_static(b"ping"),
             };
-            let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0)
-                .to_bytes()
-                .to_vec();
+            let mut f = EventMeta::new(dispatch, 0, 0, 1, 0).to_bytes().to_vec();
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
@@ -6987,16 +7013,33 @@ mod roster_fallback_tests {
 
         // No proof header → no rewrite (definitive skip via the byte prefilter).
         assert!(
-            strip_public_admission_header(&frame(vec![("keep".to_string(), b"v".to_vec())]))
-                .is_none(),
+            strip_public_admission_header(&frame(
+                DISPATCH_RPC_REQUEST,
+                vec![("keep".to_string(), b"v".to_vec())]
+            ))
+            .is_none(),
             "a request with no proof header is a no-op",
         );
 
+        // A non-REQUEST (CANCEL) frame is left untouched even if the header
+        // bytes appear — the REQUEST-only guard short-circuits first.
+        assert!(
+            strip_public_admission_header(&frame(
+                DISPATCH_RPC_CANCEL,
+                vec![(ORG_ADMISSION_HEADER.to_string(), b"proofbytes".to_vec())]
+            ))
+            .is_none(),
+            "a non-REQUEST frame is never rewritten",
+        );
+
         // Proof header present → rewritten without it; unrelated headers kept.
-        let with_proof = frame(vec![
-            ("keep".to_string(), b"v".to_vec()),
-            (ORG_ADMISSION_HEADER.to_string(), b"proofbytes".to_vec()),
-        ]);
+        let with_proof = frame(
+            DISPATCH_RPC_REQUEST,
+            vec![
+                ("keep".to_string(), b"v".to_vec()),
+                (ORG_ADMISSION_HEADER.to_string(), b"proofbytes".to_vec()),
+            ],
+        );
         let stripped = strip_public_admission_header(&with_proof)
             .expect("rewrites when the proof header is present");
         let req = RpcRequestPayload::decode(stripped.payload.slice(RPC_FRAME_BODY_OFFSET..))
