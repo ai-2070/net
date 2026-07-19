@@ -6891,6 +6891,137 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// E1 witness 10 (cross-org), end-to-end: a caller in org A holding a
+    /// capability grant B→A (INVOKE, covering this provider) is admitted by a
+    /// provider owned by org B — exercising the CrossOrgGranted grant checks
+    /// (issuer == owner, grantee == acting org, rights ⊇ INVOKE, capability,
+    /// target covers P) through the live gate, with A ≠ B in the attribution.
+    #[tokio::test]
+    async fn protected_cross_org_call_admits_end_to_end() {
+        use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+        use crate::adapter::net::behavior::org_admission::{Admitted, OrgAdmission};
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+
+        type Seen = std::sync::Arc<Mutex<Option<Admitted>>>;
+        struct SpyHandler(Seen);
+        #[async_trait::async_trait]
+        impl RpcHandler for SpyHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.0.lock() = Some(ctx.org_admission.clone().expect("admitted call"));
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]); // provider owner
+        let org_a = OrgKeypair::from_bytes([0x77u8; 32]); // caller org
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-xorg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let seen: Seen = std::sync::Arc::new(Mutex::new(None));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(SpyHandler(seen.clone())),
+                OrgAdmission::CrossOrgGranted,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0x97;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let membership = OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_a,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let (grant, _) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("capability grant");
+        let intent = OrgProofIntent {
+            caller: std::sync::Arc::new(caller_kp),
+            membership,
+            dispatcher,
+            capability_grant: Some(grant),
+            acting_org: org_a.org_id(),
+            provider_owner_org: org_b.org_id(),
+            provider: node_entity.clone(),
+            capability: cap,
+            proof_ttl_secs: 30,
+        };
+
+        let call_id = 13u64;
+        let mut req = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        req.headers
+            .push(sign_admission_proof(&intent, call_id, &req).expect("sign proof"));
+        let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut frame, 0);
+        frame.extend_from_slice(&req.encode());
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        ));
+
+        assert!(
+            wait_until_at_least(|| seen.lock().is_some() as u64, 1).await,
+            "a valid cross-org call must be admitted",
+        );
+        let admitted = seen.lock().clone().expect("admitted");
+        assert_eq!(admitted.acting_org, org_a.org_id(), "acting org A");
+        assert_eq!(admitted.provider_org, org_b.org_id(), "provider org B");
+        assert_ne!(
+            admitted.acting_org, admitted.provider_org,
+            "cross-org: A and B are distinct",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Like [`build_server`], but installs a channel-config registry that
     /// token-gates `reply` on a root the node cannot chain to. The local
     /// node holds no matching token, so any *roster* fan-out on `reply`
