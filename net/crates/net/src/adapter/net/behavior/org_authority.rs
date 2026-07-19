@@ -238,6 +238,27 @@ pub struct OwnerAudienceCredential {
     discovery_key: [u8; 32],
 }
 
+/// Type-level assertion (mirroring [`OrgAudienceSecret`], plan v1.3
+/// carry-forward): `OwnerAudienceCredential` must never implement
+/// `serde::Serialize`, so the raw owner discovery key can never become a
+/// member of any wire object via a `derive` slipping in. If it ever gains
+/// `Serialize`, the blanket impl below becomes ambiguous with the `()` impl
+/// and this constant fails to compile (the inlined
+/// `static_assertions::assert_not_impl_any` mechanism — the review-7 witness
+/// covers BOTH the granted and owner secret types).
+///
+/// [`OrgAudienceSecret`]: super::org_grant::OrgAudienceSecret
+const _: fn() = || {
+    trait AmbiguousIfSerialize<A> {
+        fn guard() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+    #[allow(dead_code)]
+    struct IsSerialize;
+    impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<IsSerialize> for T {}
+    let _ = <OwnerAudienceCredential as AmbiguousIfSerialize<_>>::guard;
+};
+
 impl OwnerAudienceCredential {
     /// Encoded size of the explicit config codec:
     /// version byte ‖ handle (32) ‖ key (32).
@@ -327,6 +348,19 @@ impl std::fmt::Debug for OwnerAudienceCredential {
             .field("audience_handle", &hex::encode(self.audience_handle))
             .field("discovery_key", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl Drop for OwnerAudienceCredential {
+    fn drop(&mut self) {
+        // Zeroize the key on drop (mirroring `OrgAudienceSecret`) — volatile
+        // writes prevent optimizer elision so a lingering copy is not left in
+        // freed memory.
+        for byte in self.discovery_key.iter_mut() {
+            // SAFETY: `byte` is a valid mutable reference into the owned array
+            // for this iteration, which is all `ptr::write_volatile` requires.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
     }
 }
 
