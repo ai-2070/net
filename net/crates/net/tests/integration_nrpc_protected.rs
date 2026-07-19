@@ -490,3 +490,84 @@ async fn live_two_node_policy_veto_denies() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Records whether the handler's request headers carried the org-admission proof.
+struct HeaderSpyHandler {
+    calls: Arc<AtomicUsize>,
+    saw_proof: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for HeaderSpyHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if ctx
+            .payload
+            .headers
+            .iter()
+            .any(|(name, _)| name == ORG_ADMISSION_HEADER)
+        {
+            self.saw_proof.store(true, Ordering::SeqCst);
+        }
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: Bytes::from_static(b"pong"),
+        })
+    }
+}
+
+/// LIVE mixed-version: a PUBLIC service must never deliver org-admission
+/// credential material to its handler. The caller attaches a proof (believing
+/// the service protected, or a protected→public downgrade), but the #47 public
+/// bridge strips the `net-org-admission` header before dispatch — the handler
+/// runs, returns its reply, and never sees the proof.
+#[tokio::test]
+async fn live_two_node_public_handler_never_sees_proof_header() {
+    const CALLER_SEED: [u8; 32] = [0x0bu8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    // A PUBLIC service needs no authority; org B only mints the stray proof.
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_proof = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc(
+            "pub",
+            Arc::new(HeaderSpyHandler {
+                calls: calls.clone(),
+                saw_proof: saw_proof.clone(),
+            }),
+        )
+        .expect("serve public");
+
+    let intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        provider,
+        "pub",
+    );
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let reply = caller
+        .call(server.node_id(), "pub", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect("a public call carrying a stray proof still succeeds");
+
+    assert_eq!(reply.body.as_ref(), b"pong");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the public handler ran once"
+    );
+    assert!(
+        !saw_proof.load(Ordering::SeqCst),
+        "the public handler never saw the org-admission proof header (stripped by the bridge)",
+    );
+}

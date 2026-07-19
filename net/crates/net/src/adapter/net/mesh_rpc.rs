@@ -881,6 +881,44 @@ async fn emit_admission_denial(
     .await;
 }
 
+/// Strip a stray `net-org-admission` proof header from a PUBLIC-service inbound
+/// before it reaches the handler (Kyra #47 mixed-version tail): a public (or
+/// legacy) handler must NEVER receive org-admission credential material a caller
+/// attached — e.g. a caller that believed the service was protected, or a
+/// protected→public downgrade. Returns `Some(rewritten)` ONLY when a header was
+/// actually removed; `None` (the overwhelming common case) means "dispatch the
+/// original inbound" with zero decode or re-encode.
+///
+/// The raw-bytes prefilter keeps this off the hot path: the header NAME appears
+/// verbatim in the postcard-encoded request iff some header carries it, so the
+/// absence of those bytes is a definitive skip. A rare coincidental match inside
+/// a request body only triggers a wasted decode that finds no such HEADER and
+/// returns `None` — never an incorrect rewrite (the removal is header-name
+/// scoped). Only genuinely admission-bearing frames pay the decode/re-encode.
+fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInboundEvent> {
+    let needle = ORG_ADMISSION_HEADER.as_bytes();
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET
+        || !inbound.payload.windows(needle.len()).any(|w| w == needle)
+    {
+        return None;
+    }
+    let mut req = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
+    if !req.headers.iter().any(|(n, _)| n == ORG_ADMISSION_HEADER) {
+        return None;
+    }
+    req.headers.retain(|(n, _)| n != ORG_ADMISSION_HEADER);
+    // Preserve the frame prefix (EventMeta + route) verbatim; only the request
+    // body is re-encoded without the proof header.
+    let mut buf = inbound.payload[..RPC_FRAME_BODY_OFFSET].to_vec();
+    req.encode_into(&mut buf);
+    Some(RpcInboundEvent {
+        channel_hash: inbound.channel_hash,
+        origin_hash: inbound.origin_hash,
+        from_node: inbound.from_node,
+        payload: Bytes::from(buf),
+    })
+}
+
 /// The E1.2 protected admission gate for ONE inbound frame on a protected unary
 /// service, run on the captured immutable [`RegisteredRpcService`]. On the
 /// initial REQUEST it runs, in order: the shared origin check, direct-session
@@ -3212,8 +3250,13 @@ impl MeshNode {
                         }
                         // AV-1 item 1: drive the fold with the AEAD-verified
                         // `inbound.from_node` so per-call state binds to the
-                        // authenticated session peer.
-                        if let Err(e) = fold.lock().apply_inbound(&inbound) {
+                        // authenticated session peer. Kyra #47 mixed-version: a
+                        // public/legacy handler must never receive org-admission
+                        // credential material, so strip a stray proof header
+                        // first (cheap — only rewrites when one is present).
+                        let stripped = strip_public_admission_header(&inbound);
+                        let ev = stripped.as_ref().unwrap_or(&inbound);
+                        if let Err(e) = fold.lock().apply_inbound(ev) {
                             tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                         }
                     }
@@ -6913,6 +6956,59 @@ mod roster_fallback_tests {
         drop(serve_a);
         drop(serve_b);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kyra #47 mixed-version: `strip_public_admission_header` removes ONLY the
+    /// org-admission proof header (retaining any other header) and is a true
+    /// no-op — `None` — for a request that carries none (the hot-path common
+    /// case, where the byte prefilter skips without any decode).
+    #[test]
+    fn public_admission_strip_removes_only_the_proof_header() {
+        let frame = |headers: Vec<(String, Vec<u8>)>| -> RpcInboundEvent {
+            let req = RpcRequestPayload {
+                service: "svc".to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers,
+                body: Bytes::from_static(b"ping"),
+            };
+            let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut f, 0);
+            f.extend_from_slice(&req.encode());
+            RpcInboundEvent {
+                channel_hash: 0,
+                origin_hash: 0,
+                from_node: 1,
+                payload: Bytes::from(f),
+            }
+        };
+
+        // No proof header → no rewrite (definitive skip via the byte prefilter).
+        assert!(
+            strip_public_admission_header(&frame(vec![("keep".to_string(), b"v".to_vec())]))
+                .is_none(),
+            "a request with no proof header is a no-op",
+        );
+
+        // Proof header present → rewritten without it; unrelated headers kept.
+        let with_proof = frame(vec![
+            ("keep".to_string(), b"v".to_vec()),
+            (ORG_ADMISSION_HEADER.to_string(), b"proofbytes".to_vec()),
+        ]);
+        let stripped = strip_public_admission_header(&with_proof)
+            .expect("rewrites when the proof header is present");
+        let req = RpcRequestPayload::decode(stripped.payload.slice(RPC_FRAME_BODY_OFFSET..))
+            .expect("decode rewritten request");
+        assert!(
+            !req.headers.iter().any(|(n, _)| n == ORG_ADMISSION_HEADER),
+            "the proof header was removed",
+        );
+        assert!(
+            req.headers.iter().any(|(n, _)| n == "keep"),
+            "an unrelated header was retained",
+        );
     }
 
     /// Kyra #47 B3: a protected `call` finalizes ATOMICALLY and validates the
