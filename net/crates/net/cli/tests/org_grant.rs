@@ -525,3 +525,39 @@ fn grant_dispatcher_does_not_follow_a_leaf_symlink() {
         "the symlink target was not truncated through the leaf",
     );
 }
+
+// On Windows the 0600 mode is not enforced, so a --discover run warns about the
+// inherited DACL by default and is silenced by --insecure-permissions.
+#[cfg(windows)]
+#[test]
+fn grant_capability_discover_warns_about_windows_dacl() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let run = |extra: &[&str], name: &str| -> String {
+        let assert = Command::cargo_bin("net-mesh")
+            .unwrap()
+            .args(["org", "grant-capability", "--org-key"])
+            .arg(&key)
+            .args(["--grantee-org", GRANTEE_ORG_HEX])
+            .args(["--capability", "nrpc:svc"])
+            .arg("--invoke")
+            .arg("--discover")
+            .args(["--target-node", TARGET_NODE_HEX])
+            .args(["--out"])
+            .arg(dir.path().join(format!("{name}.grant.json")))
+            .args(["--audience-out"])
+            .arg(dir.path().join(format!("{name}.key")))
+            .args(extra)
+            .assert()
+            .code(0);
+        String::from_utf8_lossy(&assert.get_output().stderr).to_string()
+    };
+    assert!(
+        run(&[], "warned").contains("not enforced on Windows"),
+        "a --discover run warns about the Windows DACL by default",
+    );
+    assert!(
+        !run(&["--insecure-permissions"], "silent").contains("not enforced on Windows"),
+        "--insecure-permissions silences the Windows DACL warning",
+    );
+}

@@ -68,8 +68,9 @@ pub enum OrgCommand {
     /// Issue a capability grant: "org <grantee> holds <rights> on
     /// <capability> over <target>", signed by THIS (provider) org.
     /// B -> A cross-org access. With --discover a fresh audience
-    /// secret is minted and written 0600; only its commitment rides
-    /// in the signed grant (the raw key never touches the wire).
+    /// secret is minted and written owner-only (0600 on Unix; parent
+    /// DACL on Windows); only its commitment rides in the signed
+    /// grant (the raw key never touches the wire).
     GrantCapability(GrantCapabilityArgs),
 }
 
@@ -213,7 +214,9 @@ pub struct GrantCapabilityArgs {
 
     /// Grant DISCOVER rights (privately find B-owned providers of the
     /// capability). Requires `--audience-out`: a fresh audience
-    /// secret is minted and written 0600.
+    /// secret is minted and written owner-only (0600 on Unix; on
+    /// Windows it inherits the parent directory's DACL and a warning
+    /// is emitted — see `--insecure-permissions`).
     #[arg(long)]
     pub discover: bool,
 
@@ -236,8 +239,11 @@ pub struct GrantCapabilityArgs {
     #[arg(long)]
     pub out: PathBuf,
 
-    /// Output path for the minted audience secret (written 0600).
-    /// REQUIRED with `--discover`; rejected without it.
+    /// Output path for the minted audience secret. REQUIRED with
+    /// `--discover`; rejected without it. Written owner-only: mode
+    /// 0600 on Unix; on Windows it inherits the parent directory's
+    /// NTFS DACL (a loud warning is emitted unless
+    /// `--insecure-permissions`), so point it at an owner-only parent.
     #[arg(long = "audience-out", value_name = "PATH")]
     pub audience_out: Option<PathBuf>,
 
@@ -245,7 +251,8 @@ pub struct GrantCapabilityArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// Allow permissive org-key file modes on Unix.
+    /// Allow permissive org-key file modes on Unix, and silence the
+    /// Windows audience-secret DACL warning.
     #[arg(long)]
     pub insecure_permissions: bool,
 }
@@ -595,6 +602,7 @@ async fn run_grant_capability(
                 let _ = tokio::fs::remove_file(&args.out).await;
                 return Err(e);
             }
+            warn_secret_permissions(audience_out, args.insecure_permissions);
             Some(audience_out.display().to_string())
         }
         None => {
@@ -881,7 +889,8 @@ fn stage_nonce() -> String {
 }
 
 /// Stage `bytes` as a temp file in the SAME directory as `final_path`
-/// (`create_new` + `fsync`; mode 0600 when `secret`, else 0644). The temp is
+/// (`create_new` + `fsync`; on Unix mode 0600 when `secret`, else 0644; on
+/// Windows the file inherits the parent directory's DACL). The temp is
 /// hard-linked onto the final path at publish, so a pre-existing leaf (incl. a
 /// symlink) is never followed or truncated. Returns the temp path.
 async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<PathBuf, CliError> {
@@ -965,6 +974,28 @@ async fn publish_staged(tmp: &Path, final_path: &Path, force: bool) -> Result<()
     sync_parent_dir(final_path).await;
     Ok(())
 }
+
+/// On Windows the CLI has no clean 0600 analog from `std::fs`, so a secret file
+/// inherits its parent directory's NTFS DACL. Surface the SAME loud warning the
+/// org-key read path uses so a permissive ACL is at least observable in operator
+/// logs; `--insecure-permissions` suppresses it (matching the Unix gate's escape
+/// hatch). No-op on Unix, where the file was already created mode 0600. No new
+/// ACL engine — the custom `--audience-out` parent is operator-asserted trusted
+/// (Kyra OA2-F).
+#[cfg(not(unix))]
+fn warn_secret_permissions(path: &Path, insecure_permissions: bool) {
+    if !insecure_permissions {
+        eprintln!(
+            "warning: the 0600 audience-secret mode is not enforced on Windows; {} inherits its \
+             parent directory's NTFS DACL. Ensure the parent is owner-only (or pass \
+             --insecure-permissions to silence).",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+fn warn_secret_permissions(_path: &Path, _insecure_permissions: bool) {}
 
 /// `fsync` the parent directory so a link/rename is durable (Unix; best-effort
 /// no-op where the platform doesn't support directory fsync).
