@@ -606,24 +606,30 @@ enum BridgePreflight {
 /// cannot reflect a forged `CapabilityDenied` into the victim's reply
 /// channel — the denial is unicast to the ATTACKER's own node, where
 /// the victim's reply channel has no subscriber, and is dropped.
-fn bridge_preflight(
-    mesh: &MeshNode,
-    cache: &RpcOriginNodeCache,
+/// The origin-and-service portion of the callee preflight, shared by the public
+/// [`bridge_preflight`] and the protected admission bridge (E1.2): captured-
+/// service equality (E0.2), EventMeta decode, and the Gate-3 packet↔payload
+/// origin binding. Returns the decoded `EventMeta` to proceed, or `None` to DROP
+/// (a cross-service confused deputy, a too-short frame, or an origin mismatch —
+/// the last bumps `packet_origin_mismatch_dropped_total`). The CAPABILITY gate
+/// diverges after this: the public path runs `may_execute`; the protected path
+/// runs `has_local_capability` + org admission. The response-route cache
+/// mutation is likewise the caller's, so the two paths share exactly this origin
+/// check and nothing else.
+fn bridge_origin_check(
     inbound: &RpcInboundEvent,
     expected_service: &str,
     tag: &str,
     metrics: &ServiceMetricsAtomic,
-) -> BridgePreflight {
+) -> Option<EventMeta> {
     if is_cross_service_request(&inbound.payload, expected_service) {
-        return BridgePreflight::Drop;
+        return None;
     }
-    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
+    let meta = (if inbound.payload.len() >= EVENT_META_SIZE {
         EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
     } else {
         None
-    }) else {
-        return BridgePreflight::Drop;
-    };
+    })?;
     let from_node = inbound.from_node;
     // Gate-3: bind the packet (transport) origin to the payload (EventMeta)
     // origin. The response-route cache keys on the packet origin
@@ -650,8 +656,23 @@ fn bridge_preflight(
              before admission — a direct peer must not run the fold under a forged \
              payload origin",
         );
-        return BridgePreflight::Drop;
+        return None;
     }
+    Some(meta)
+}
+
+fn bridge_preflight(
+    mesh: &MeshNode,
+    cache: &RpcOriginNodeCache,
+    inbound: &RpcInboundEvent,
+    expected_service: &str,
+    tag: &str,
+    metrics: &ServiceMetricsAtomic,
+) -> BridgePreflight {
+    let Some(meta) = bridge_origin_check(inbound, expected_service, tag, metrics) else {
+        return BridgePreflight::Drop;
+    };
+    let from_node = inbound.from_node;
     if from_node != 0
         && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
             mesh.capability_fold(),
