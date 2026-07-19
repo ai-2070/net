@@ -740,7 +740,7 @@ pub type OrgFloor = (EntityId, u32);
 /// refuse-to-recanonicalize discipline).
 ///
 /// Distribution is operator-side (plain local files); a node merges
-/// verified bundles into its persisted [`OrgRevocationState`]
+/// verified bundles into its persisted [`OrgRevocationState`](super::org_revocation::OrgRevocationState)
 /// maxima, where a lower floor never rolls back a higher one — see
 /// `org_revocation.rs`.
 #[derive(Clone, PartialEq, Eq)]

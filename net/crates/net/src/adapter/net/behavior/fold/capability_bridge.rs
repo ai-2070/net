@@ -383,7 +383,7 @@ pub(crate) fn recheck_projected_owner_floor(
 
 /// The verified owner org projected for `node_id`, if any — walks
 /// the publisher's fold entries via the `by_node` reverse index and
-/// returns the first `Some` (mirrors [`reflex_addr_for`]'s
+/// returns the first `Some` (mirrors `reflex_addr_for`'s
 /// one-publisher-one-value shape).
 pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<OrgId> {
     fold.with_state(|state| {
@@ -910,7 +910,7 @@ fn may_execute_with_caller(
 /// transparently against this layout.
 ///
 /// `verified_owner` is the OA-1 ownership projection and MUST
-/// come from [`verify_announced_owner_cert`] (or be `None`). The
+/// come from `verify_announced_owner_cert` (or be `None`). The
 /// parameter is deliberately explicit rather than derived here:
 /// this function is pure and is also reached from paths that never
 /// verified anything (test injection, fixture priming), so the

@@ -2,7 +2,7 @@
 //! `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md`.
 //!
 //! An in-memory monotone merge of
-//! [`OrgRevocationBundle`](super::org::OrgRevocationBundle) floors
+//! [`OrgRevocationBundle`] floors
 //! is insufficient: if config management replaces the operator's
 //! bundle file with an OLDER (still validly signed) bundle and the
 //! node restarts, there is no prior maximum left to compare
@@ -53,7 +53,7 @@
 //! # One path, one security view
 //!
 //! Within a process, every [`OrgRevocationStore`] handle backed by
-//! the same NORMALIZED pathname shares one [`StoreCore`] (review-9
+//! the same NORMALIZED pathname shares one `StoreCore` (review-9
 //! addendum): one live floor view, one reload/publish transaction
 //! lock, one publish generation, and one subscriber registry. A
 //! same-path sibling therefore observes a raise the instant it is
@@ -623,7 +623,7 @@ impl SubscriptionLease {
 /// An externally-owned RAII handle to one raise subscription (R2-2 +
 /// R2-3). Dropping it:
 /// 1. marks the exclusion lease dead and drains any in-flight callback
-///    ([`SubscriptionLease::kill_and_drain`]), then
+///    (`SubscriptionLease::kill_and_drain`), then
 /// 2. removes the callback from the shared core's registry via a
 ///    `Weak<StoreCore>`.
 ///
@@ -952,7 +952,7 @@ pub(crate) fn publish_guard_pair<'a>(
 /// never lower a live view.
 ///
 /// Within one process, same-path handles additionally share one
-/// [`StoreCore`] — one live view, one publish transaction, one
+/// `StoreCore` — one live view, one publish transaction, one
 /// subscriber registry (review-9 addendum). See the module docs.
 pub struct OrgRevocationStore {
     /// The shared per-path core.
@@ -1133,7 +1133,7 @@ impl OrgRevocationStore {
     }
 
     /// The publish generation read UNDER a `live.read()` barrier
-    /// (OA2-E1 Kyra review). [`StoreCore::publish`] swaps the live
+    /// (OA2-E1 Kyra review). `StoreCore::publish` swaps the live
     /// view and bumps the generation while holding `live.write()`, so
     /// acquiring a read guard first guarantees no publication is
     /// mid-flight: the returned generation always matches the

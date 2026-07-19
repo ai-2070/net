@@ -5,7 +5,7 @@
 //!
 //! The plan sketches scoped capabilities as entries "in the fold, under
 //! `Owner{…}` / `Grant{…}`". This implementation instead keeps them in a store
-//! STRUCTURALLY SEPARATE from the plaintext [`CapabilityFold`], so the mutual
+//! STRUCTURALLY SEPARATE from the plaintext [`CapabilityFold`](super::fold::CapabilityFold), so the mutual
 //! invisibility the plan requires (Owner ↔ Grant ↔ Public all invisible to one
 //! another and to unscoped queries) is a property of the DATA STRUCTURE rather
 //! than of every existing fold query remembering to filter a scope dimension. A

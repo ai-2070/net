@@ -224,7 +224,7 @@ impl Default for CallOptions {
 /// grant-management CLI (OA2-F). Set it on [`CallOptions::org_proof_intent`] to
 /// call a PROTECTED service: `call` mints the `call_id`, finalizes the request,
 /// computes the shared
-/// [`org_request_digest`](crate::adapter::net::org_admission_gate::org_request_digest),
+/// [`org_request_digest`],
 /// signs an [`OrgCallProof`] binding THIS call, and appends the
 /// `net-org-admission` header. Protected admission is unary-only (E1.8).
 #[derive(Clone)]

@@ -197,7 +197,7 @@ impl OrgCallProof {
     ///
     /// Does not itself enforce grant validity or the expiry
     /// ceiling — issuing is the caller's, verification is
-    /// [`Self::verify`]'s, and the full admission order is §2.4's.
+    /// [`CallBinding::verify`]'s, and the full admission order is §2.4's.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_for_call(
         caller_keypair: &EntityKeypair,

@@ -46,8 +46,8 @@
 //! detects sidecar replacement occurring BETWEEN legitimate transactions and
 //! common operator/startup mistakes; it does not claim to protect against an
 //! actor concurrently mutating directory entries DURING a transaction.
-//! [`ensure_secure_authority_dir`] enforces the boundary at its edges. The
-//! supplied path is first normalized ONCE ([`normalize_authority_dir`]): a
+//! `ensure_secure_authority_dir` enforces the boundary at its edges. The
+//! supplied path is first normalized ONCE (`normalize_authority_dir`): a
 //! relative path is resolved against the current directory (a bare relative
 //! name has an empty parent, so its ancestor chain would otherwise go
 //! unchecked) and a trailing separator is stripped (so `symlink_metadata` on a

@@ -2,7 +2,7 @@
 //!
 //! The behavior-layer admission engine
 //! ([`org_admission`](super::behavior::org_admission)) verifies a
-//! decoded [`OrgCallProof`](super::behavior::org_call::OrgCallProof)
+//! decoded [`OrgCallProof`]
 //! against the provider's own facts, deliberately WITHOUT importing
 //! the cortex RPC payload types. This module is the thin bridge the
 //! mesh gate uses: it computes the canonical request digest the proof
