@@ -153,6 +153,7 @@ jobs:
           --test capability_auth_conformance
           --test capability_schema_doc_guard
           --test capability_aggregation_e2e
+          --test org_ownership
           --test gang_claim_node
           --test chain_discovery
           --test cross_lang_capability_fixtures
@@ -232,6 +233,13 @@ jobs:
           --test integration_nrpc_cross_lang_streaming
           --test integration_tool_announce
           --test nrpc_inbound_dispatcher
+          --test nrpc_call_hijack
+          --test nrpc_registration_order
+          --test nrpc_response_routing
+          --test nrpc_route_discriminator
+          --test nrpc_service_equality
+          --test nrpc_streaming_gate
+          --test org_admission_gate
           --test queue_group_dispatch
           --test aggregator_fold_query
           --test aggregator_registry_rpc
