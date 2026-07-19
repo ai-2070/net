@@ -36,6 +36,13 @@ fn org_id_of(key: &Path) -> String {
     panic!("org_id_hex not found in {}", key.display());
 }
 
+/// True if any `*.stage.*` publish temp was left behind in `dir`.
+fn has_stage_temp(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().contains(".stage."))
+}
+
 /// A stable fake dispatcher entity id (any 32 bytes decode as an
 /// EntityId; issuance only binds the public half).
 const DISPATCHER_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
@@ -386,4 +393,135 @@ fn grant_capability_any_node_owned_by_self_admits() {
         .assert()
         .code(0);
     assert!(grant.exists(), "AnyNodeOwnedBy(issuer) is a valid grant");
+}
+
+#[test]
+fn grant_capability_rejects_aliased_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let same = dir.path().join("same.json");
+
+    // --out aliased onto --audience-out → refused (would collide the pair).
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .arg("--discover")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(&same)
+        .args(["--audience-out"])
+        .arg(&same)
+        .assert()
+        .code(2);
+
+    // --out aliased onto the org key → refused (would clobber the root seed).
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(&key)
+        .assert()
+        .code(2);
+    assert!(
+        std::fs::read_to_string(&key).unwrap().contains("seed_hex"),
+        "the org key was not clobbered",
+    );
+}
+
+#[test]
+fn grant_capability_force_with_discover_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .arg("--discover")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(dir.path().join("g.json"))
+        .args(["--audience-out"])
+        .arg(dir.path().join("s.key"))
+        .arg("--force")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn grant_capability_pair_rollback_leaves_no_grant_when_secret_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let grant = dir.path().join("cap.grant.json");
+    let secret = dir.path().join("cap.audience.key");
+    // Pre-create the audience-out path so the SECOND publish (secret) fails
+    // no-clobber AFTER the grant is published — forcing a rollback of the grant.
+    std::fs::write(&secret, b"preexisting").unwrap();
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .arg("--discover")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(&grant)
+        .args(["--audience-out"])
+        .arg(&secret)
+        .assert()
+        .code(2);
+
+    assert!(
+        !grant.exists(),
+        "the grant was rolled back after the secret publish failed"
+    );
+    assert_eq!(
+        std::fs::read(&secret).unwrap(),
+        b"preexisting",
+        "the pre-existing secret file was left untouched",
+    );
+    assert!(!has_stage_temp(dir.path()), "no .stage. temp files remain");
+}
+
+// A leaf symlink at the output path is never followed or truncated — the
+// no-clobber publish refuses (Unix; the CLI has no clean Windows analog).
+#[cfg(unix)]
+#[test]
+fn grant_dispatcher_does_not_follow_a_leaf_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"important").unwrap();
+    let out = dir.path().join("g.json");
+    std::os::unix::fs::symlink(&victim, &out).unwrap();
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-dispatcher", "--org-key"])
+        .arg(&key)
+        .args(["--dispatcher", DISPATCHER_HEX])
+        .arg("--any-capability")
+        .args(["--out"])
+        .arg(&out)
+        .assert()
+        .code(2);
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"important",
+        "the symlink target was not truncated through the leaf",
+    );
 }

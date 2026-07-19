@@ -434,15 +434,15 @@ async fn run_grant_dispatcher(
     let grant = OrgDispatcherGrant::try_issue(&keypair, dispatcher.clone(), scope, args.ttl_secs)
         .map_err(|e| invalid_args(format!("grant-dispatcher: {e}")))?;
 
-    refuse_existing(&args.out, args.force).await?;
-    write_json_envelope(
-        &args.out,
-        &OrgDispatcherGrantFile {
-            version: ORG_FILE_VERSION,
-            grant: grant.clone(),
-        },
-    )
-    .await?;
+    // No-clobber atomic publish — never overwrite the org key, never follow /
+    // truncate a leaf symlink (Kyra OA2-F); `--force` replaces symlink-safe.
+    refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", &args.out)])?;
+    let json = serialize_json(&OrgDispatcherGrantFile {
+        version: ORG_FILE_VERSION,
+        grant: grant.clone(),
+    })?;
+    let tmp = stage_beside(&args.out, &json, false).await?;
+    publish_staged(&tmp, &args.out, args.force).await?;
 
     let summary = GrantDispatcherOutput {
         path: args.out.display().to_string(),
@@ -502,6 +502,27 @@ async fn run_grant_capability(
         _ => {}
     }
 
+    // Aliased paths would clobber the org key or collide the two output
+    // artifacts (Kyra OA2-F).
+    let mut alias_paths: Vec<(&str, &Path)> = vec![
+        ("--org-key", args.org_key.as_path()),
+        ("--out", args.out.as_path()),
+    ];
+    if let Some(audience_out) = &args.audience_out {
+        alias_paths.push(("--audience-out", audience_out.as_path()));
+    }
+    refuse_aliased_paths(&alias_paths)?;
+
+    // The grant + audience-secret PAIR is published atomically no-clobber, so
+    // `--force` (replace) is incompatible with `--discover` — write to fresh
+    // output paths instead (Kyra OA2-F).
+    if args.discover && args.force {
+        return Err(invalid_args(
+            "--force cannot be combined with --discover: the grant + audience-secret pair is \
+             published atomically no-clobber; write to fresh output paths instead",
+        ));
+    }
+
     // Target: exactly one of --target-node / --target-any-owned-by.
     let (target_scope, target_label) = match (&args.target_node, &args.target_any_owned_by) {
         (Some(entity_hex), None) => {
@@ -536,37 +557,52 @@ async fn run_grant_capability(
     )
     .map_err(|e| invalid_args(format!("grant-capability: {e}")))?;
 
-    // Refuse existing outputs BEFORE writing either, so a partial run
-    // never leaves a grant without its secret (or the reverse).
-    refuse_existing(&args.out, args.force).await?;
-    if let Some(audience_out) = &args.audience_out {
-        refuse_existing(audience_out, args.force).await?;
-    }
-
-    // Write the minted audience secret 0600 (present iff --discover;
-    // mirrors the OA-1 owner-audience.key publish). The raw discovery
-    // key lives ONLY in this file — never in the grant, never on the
-    // wire.
+    // Publish TRANSACTIONALLY (Kyra OA2-F): stage both artifacts in their
+    // destination dirs, then publish each no-clobber; if the second publish
+    // fails, roll back the first so a partial run never leaves a grant without
+    // its secret (or the reverse). Temps are cleaned up synchronously on any
+    // failure. Single-file grants honor --force (symlink-safe replace); the
+    // --discover pair does not (rejected above). The raw discovery key lives
+    // ONLY in the audience file — never in the grant, never on the wire.
+    let grant_json = serialize_json(&OrgCapabilityGrantFile {
+        version: ORG_FILE_VERSION,
+        grant: grant.clone(),
+    })?;
     let audience_out_label = match secret {
         Some(secret) => {
             let audience_out = args
                 .audience_out
                 .as_ref()
                 .expect("--discover requires --audience-out (validated above)");
-            write_secret_file(audience_out, &secret.encode_config()).await?;
+            let mut secret_bytes = secret.encode_config();
+            let grant_tmp = stage_beside(&args.out, &grant_json, false).await?;
+            let secret_tmp = match stage_beside(audience_out, &secret_bytes, true).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&grant_tmp).await;
+                    zeroize_slice(&mut secret_bytes);
+                    return Err(e);
+                }
+            };
+            zeroize_slice(&mut secret_bytes);
+            // Grant first (no-clobber; --discover forbids --force).
+            if let Err(e) = publish_staged(&grant_tmp, &args.out, false).await {
+                let _ = tokio::fs::remove_file(&secret_tmp).await;
+                return Err(e);
+            }
+            // Then the secret; roll back the grant if it fails.
+            if let Err(e) = publish_staged(&secret_tmp, audience_out, false).await {
+                let _ = tokio::fs::remove_file(&args.out).await;
+                return Err(e);
+            }
             Some(audience_out.display().to_string())
         }
-        None => None,
+        None => {
+            let tmp = stage_beside(&args.out, &grant_json, false).await?;
+            publish_staged(&tmp, &args.out, args.force).await?;
+            None
+        }
     };
-
-    write_json_envelope(
-        &args.out,
-        &OrgCapabilityGrantFile {
-            version: ORG_FILE_VERSION,
-            grant: grant.clone(),
-        },
-    )
-    .await?;
 
     let summary = GrantCapabilityOutput {
         path: args.out.display().to_string(),
@@ -801,8 +837,55 @@ fn parse_org_hex(s: &str) -> Result<OrgId, CliError> {
 /// Atomically publish a SECRET file at mode 0600 (same discipline as
 /// the org root key and the OA-1 `owner-audience.key`) — the raw
 /// audience key must never be world-readable, even transiently.
-async fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
+/// Lexically normalize a path (absolute, `.`-collapsed) for alias comparison —
+/// enough to catch a path passed as two outputs or aliased onto the input,
+/// within the trustworthy-parent boundary (no fs access, so `..` / symlinks are
+/// not resolved).
+fn normalize_for_alias(p: &Path) -> PathBuf {
+    std::path::absolute(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .components()
+        .collect()
+}
+
+/// Refuse aliased input/output paths (Kyra OA2-F): the org key must not be
+/// overwritten, and two output artifacts must not collide (which would leave a
+/// grant without its secret, or the reverse).
+fn refuse_aliased_paths(paths: &[(&str, &Path)]) -> Result<(), CliError> {
+    for i in 0..paths.len() {
+        for j in (i + 1)..paths.len() {
+            if normalize_for_alias(paths[i].1) == normalize_for_alias(paths[j].1) {
+                return Err(invalid_args(format!(
+                    "{} and {} resolve to the same path; refusing to alias them",
+                    paths[i].0, paths[j].0
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn serialize_json<T: Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
+    serde_json::to_vec_pretty(value).map_err(|e| generic(format!("failed to serialize: {e}")))
+}
+
+/// A per-run stage nonce (pid + wall-clock nanos) so a stale temp left by a
+/// crashed prior run never blocks a fresh `create_new`.
+fn stage_nonce() -> String {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid}.{nanos}")
+}
+
+/// Stage `bytes` as a temp file in the SAME directory as `final_path`
+/// (`create_new` + `fsync`; mode 0600 when `secret`, else 0644). The temp is
+/// hard-linked onto the final path at publish, so a pre-existing leaf (incl. a
+/// symlink) is never followed or truncated. Returns the temp path.
+async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<PathBuf, CliError> {
+    if let Some(parent) = final_path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 generic(format!(
@@ -812,11 +895,96 @@ async fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
             })?;
         }
     }
-    let pid = std::process::id();
-    let tmp = path.with_extension(format!("tmp.{pid}"));
-    write_identity_atomically(&tmp, path, bytes).await?;
-    enforce_strict_permissions(path).await?;
+    let file_name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact");
+    let tmp = final_path.with_file_name(format!(".{file_name}.stage.{}", stage_nonce()));
+    let tmp_owned = tmp.clone();
+    let bytes_owned = bytes.to_vec();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(if secret { 0o600 } else { 0o644 });
+        }
+        let mut f = opts.open(&tmp_owned)?;
+        std::io::Write::write_all(&mut f, &bytes_owned)?;
+        f.sync_all()?;
+        // Scrub the staged copy of a secret payload once fsynced.
+        let mut bytes_owned = bytes_owned;
+        if secret {
+            zeroize_slice(&mut bytes_owned);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| generic(format!("stage-write task panicked: {e}")))?
+    .map_err(|e| generic(format!("failed to stage {}: {e}", tmp.display())))?;
+    Ok(tmp)
+}
+
+/// Publish a staged temp onto `final_path` with NO-CLOBBER semantics: hard-link
+/// (fails if `final_path` exists — never follows/truncates a leaf), then unlink
+/// the temp and `fsync` the parent dir. With `force`, first remove any existing
+/// leaf (symlink-safe: `remove_file` does not follow the link) before linking.
+/// On any failure the temp is cleaned up SYNCHRONOUSLY (no detached task that
+/// may not run before process exit — Kyra OA2-F).
+async fn publish_staged(tmp: &Path, final_path: &Path, force: bool) -> Result<(), CliError> {
+    if force {
+        if let Err(e) = tokio::fs::remove_file(final_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = tokio::fs::remove_file(tmp).await;
+                return Err(generic(format!(
+                    "failed to replace {}: {e}",
+                    final_path.display()
+                )));
+            }
+        }
+    }
+    let tmp_owned = tmp.to_path_buf();
+    let final_owned = final_path.to_path_buf();
+    let link = tokio::task::spawn_blocking(move || std::fs::hard_link(&tmp_owned, &final_owned))
+        .await
+        .map_err(|e| generic(format!("publish task panicked: {e}")))?;
+    if let Err(e) = link {
+        let _ = tokio::fs::remove_file(tmp).await;
+        return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+            invalid_args(format!(
+                "file already exists at {}; pass --force to overwrite",
+                final_path.display()
+            ))
+        } else {
+            generic(format!("failed to publish {}: {e}", final_path.display()))
+        });
+    }
+    // The final path is now an independent name for the inode; drop the temp.
+    let _ = tokio::fs::remove_file(tmp).await;
+    sync_parent_dir(final_path).await;
     Ok(())
+}
+
+/// `fsync` the parent directory so a link/rename is durable (Unix; best-effort
+/// no-op where the platform doesn't support directory fsync).
+async fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
