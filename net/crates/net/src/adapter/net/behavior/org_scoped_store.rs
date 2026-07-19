@@ -70,6 +70,40 @@ impl ScopedDiscoveryStore {
         Self::default()
     }
 
+    /// Hard cap on stored `(scope, provider)` entries (live + tombstone). A flood
+    /// of distinct providers — each a valid, org-certified envelope — must not
+    /// grow the private-discovery store without bound before exposure (Kyra
+    /// OA3-5). At the cap, [`Self::evict_if_at_capacity`] drops the entries whose
+    /// relevance window ends soonest.
+    const MAX_ENTRIES: usize = 8192;
+    /// Post-eviction target: an overflow evicts down to this mark rather than one
+    /// entry at a time, so the O(n log n) scan is amortized over (MAX − LOW)
+    /// inserts (mirrors the withdrawal-seq-gate eviction discipline).
+    const LOW_WATER: usize = 6144;
+
+    /// When at [`Self::MAX_ENTRIES`], evict down to [`Self::LOW_WATER`] by
+    /// dropping the entries with the SMALLEST `tombstone_until` (the max expiry
+    /// ever seen for the key) — the ones closest to natural removal. An
+    /// evicted-but-still-valid capability is re-added on the provider's next
+    /// announcement; an evicted tombstone surrenders rollback protection only for
+    /// keys already nearest to being forgotten. Called before a NEW-key insert,
+    /// so the store never exceeds `MAX_ENTRIES`.
+    fn evict_if_at_capacity(&mut self) {
+        if self.entries.len() < Self::MAX_ENTRIES {
+            return;
+        }
+        let n_evict = self.entries.len() - Self::LOW_WATER;
+        let mut victims: Vec<((CapabilityAudienceScope, EntityId), u64)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.tombstone_until))
+            .collect();
+        victims.sort_unstable_by_key(|(_, watermark)| *watermark);
+        for (key, _) in victims.into_iter().take(n_evict) {
+            self.entries.remove(&key);
+        }
+    }
+
     /// Ingest a verified scoped capability. At most one entry is kept per
     /// `(scope, provider)`; the newest generation wins, and an older-or-equal
     /// generation is [`ScopedStoreOutcome::Stale`] and ignored. A `Public` scope
@@ -97,6 +131,10 @@ impl ScopedDiscoveryStore {
                 ScopedStoreOutcome::Updated
             }
             None => {
+                // Cardinality bound: a flood of distinct providers must not grow
+                // the store without limit. Make room BEFORE inserting the new key
+                // so the store never exceeds `MAX_ENTRIES` (Kyra OA3-5).
+                self.evict_if_at_capacity();
                 self.entries.insert(
                     key,
                     StoredEntry {
@@ -234,6 +272,55 @@ mod tests {
             expires_at,
             b"grant-descriptor".to_vec(),
         )
+    }
+
+    /// A distinct provider entity per index — the `u8` `provider` seed only spans
+    /// 256, too few for the cardinality flood.
+    fn provider_n(index: u64) -> EntityId {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        EntityId::from_bytes(bytes)
+    }
+
+    fn owner_cap_n(
+        provider_index: u64,
+        generation: u64,
+        expires_at: u64,
+    ) -> VerifiedScopedCapability {
+        VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org(1),
+                audience_handle: [0x11; 32],
+            },
+            provider_n(provider_index),
+            org(1),
+            generation,
+            expires_at,
+            b"owner-descriptor".to_vec(),
+        )
+    }
+
+    /// OA3-5b: a flood of distinct providers cannot grow the store past the hard
+    /// cardinality cap; eviction keeps it bounded WITHOUT emptying it.
+    #[test]
+    fn ingest_bounds_cardinality_under_a_distinct_provider_flood() {
+        let mut store = ScopedDiscoveryStore::new();
+        let flood = ScopedDiscoveryStore::MAX_ENTRIES + 500;
+        for index in 0..flood as u64 {
+            store.ingest(owner_cap_n(index, 1, 10_000));
+        }
+        // Every entry is live (nothing expired at ingest time), so `len` is the
+        // full BTreeMap cardinality here.
+        assert!(
+            store.len() <= ScopedDiscoveryStore::MAX_ENTRIES,
+            "store must stay within MAX_ENTRIES under a flood (len {})",
+            store.len(),
+        );
+        assert!(
+            store.len() >= ScopedDiscoveryStore::LOW_WATER,
+            "eviction bounds the store to LOW_WATER, it does not empty it (len {})",
+            store.len(),
+        );
     }
 
     #[test]

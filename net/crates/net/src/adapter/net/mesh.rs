@@ -16379,12 +16379,26 @@ impl MeshNode {
         };
         let owner_org = authority.owner_org();
         let audience = AudienceAuthority::owner(owner_org, &authority.audience);
+        let store = org_revocation.load_full();
+        // Fail-closed on a POISONED (durability-uncertain) revocation view: while
+        // a floor raise's durability is unproven, the private-discovery plane must
+        // not admit new capabilities — recovery re-opens ingest (Kyra OA3-5). The
+        // in-memory floors are already never-weaker, so the floor check itself is
+        // poison-safe; this adds the conservative refusal for the more-sensitive
+        // private plane.
+        if store.as_ref().map(|s| s.is_poisoned()).unwrap_or(false) {
+            tracing::warn!(
+                from_node = format!("{:#x}", from_node),
+                "scoped-ann: revocation view poisoned; ingest refused until recovery"
+            );
+            return;
+        }
         // Verify against the node's LIVE revocation floors, so a provider whose
         // cert generation the org has since floored is refused at ingest. Hold
         // the snapshot `Arc` and borrow through it; an un-adopted node with no
         // revocation store floor-checks against an implicit empty floor set.
         let empty_floors = OrgRevocationState::empty();
-        let floors_snapshot = org_revocation.load_full().map(|s| s.snapshot());
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         let ctx = ScopedIngestContext {
             local_owner_org: owner_org,
