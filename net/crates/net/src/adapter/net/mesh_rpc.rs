@@ -4461,6 +4461,20 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcStream, RpcError> {
+        // Org admission is unary-only (E1.8): reject a proof intent at the TOP,
+        // BEFORE discovery / target selection (Kyra #47 tail). Falling through to
+        // `find_service_nodes` + `select_target` would advance round-robin /
+        // consistent-hash routing state (or surface an unrelated NoRoute) before
+        // the promised unary-only failure — a caller error must not perturb
+        // routing.
+        if opts.org_proof_intent.is_some() {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "org admission (org_proof_intent) is unary-only; use `call_service` \
+                          for a protected service"
+                    .to_string(),
+            });
+        }
         let mut candidates = self.find_service_nodes(service);
         if candidates.is_empty() {
             return Err(RpcError::NoRoute {
@@ -6864,6 +6878,16 @@ mod roster_fallback_tests {
         ));
         assert!(matches!(
             server.call_duplex(TARGET, "svc", intent_opts()).await,
+            Err(RpcError::Codec { .. })
+        ));
+        // Service-routed streaming rejects the intent at the TOP, before
+        // discovery: with NO service advertised, empty discovery would yield
+        // `NoRoute` — a `Codec` proves the unary-only guard fired first and
+        // routing state was never touched.
+        assert!(matches!(
+            server
+                .call_service_streaming("svc", Bytes::new(), intent_opts())
+                .await,
             Err(RpcError::Codec { .. })
         ));
 
