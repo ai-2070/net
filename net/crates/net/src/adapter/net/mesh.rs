@@ -2780,6 +2780,27 @@ impl LocalServiceRegistry {
     }
 }
 
+/// One coherent publication of this node's local capability emission (Kyra OA3
+/// torn-snapshot invariant): the plaintext `public` announcement and the
+/// encrypted owner-scoped announcement bytes in `scoped` are stored and read as a
+/// SINGLE `ArcSwapOption` unit, so a late-join or deferred send can never pair a
+/// public generation with a stale scoped one.
+///
+/// `scoped` is populated only when `public` carries a valid owner cert; a
+/// cert-invalidating send-time rebuild (see [`MeshNode::rebuild_cached_announcement`])
+/// clears it, so a floored/expired provider never ships an owner-scoped envelope
+/// with a stale embedded certificate. It is empty until OA3-4b1 Commit B
+/// populates it — the review-11 P1 send-time seqlock re-validates `public`
+/// exactly as before.
+struct LocalCapabilityEmission {
+    public: CapabilityAnnouncement,
+    // Written empty in B1 (the atomic-publication refactor); the combined send
+    // helper that READS it lands in OA3-4b1 Commit B2, at which point this allow
+    // is removed.
+    #[allow(dead_code)]
+    scoped: Vec<Vec<u8>>,
+}
+
 #[cfg(all(test, feature = "cortex"))]
 mod local_service_registry_tests {
     use super::LocalServiceRegistry;
@@ -4801,7 +4822,7 @@ pub struct MeshNode {
     /// [`MeshNode::announcement_bytes_for_send`], which
     /// re-validates the embedded owner certificate on an epoch
     /// mismatch. `None` until the first `announce_*` call.
-    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
+    local_emission: Arc<ArcSwapOption<LocalCapabilityEmission>>,
     /// User-supplied capability baseline — the pre-augmentation set
     /// the most recent `announce_capabilities` call published. The
     /// `announce_chain` / `announce_chain_range` / `withdraw_chain`
@@ -5776,7 +5797,7 @@ impl MeshNode {
                 deferred_scheduled: false,
                 deferral_generation: 0,
             })),
-            local_announcement: Arc::new(ArcSwapOption::empty()),
+            local_emission: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
@@ -7509,7 +7530,7 @@ impl MeshNode {
         now_secs: u64,
     ) -> Option<Vec<u8>> {
         for _ in 0..16 {
-            let cached = self.local_announcement.load_full()?;
+            let cached = self.local_emission.load_full()?;
             // Capture the stamp AND PIN the authority/store Arcs it
             // fingerprints (Kyra Gate-1 audit — ABA). `snapshot` is
             // held across the derive + serialize + recheck below, so
@@ -7523,8 +7544,8 @@ impl MeshNode {
             // (review-11 P1 — certificate expiry honored on every
             // reuse boundary).
             let desired = self.owner_cert_for_emission_at(now_secs);
-            if desired == cached.owner_cert {
-                let bytes = cached.to_bytes();
+            if desired == cached.public.owner_cert {
+                let bytes = cached.public.to_bytes();
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -7597,20 +7618,20 @@ impl MeshNode {
         desired: Option<super::behavior::org::OrgMembershipCert>,
     ) {
         let _announce_guard = self.announce_mu.lock();
-        let Some(cached) = self.local_announcement.load_full() else {
+        let Some(cached) = self.local_emission.load_full() else {
             return;
         };
-        if cached.owner_cert == desired {
+        if cached.public.owner_cert == desired {
             return; // already reconciled by another send
         }
-        let mut ann = (*cached).clone();
+        let mut ann = cached.public.clone();
         ann.owner_cert = desired;
         ann.version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
         ann.timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let signed = cached.signature.is_some();
+        let signed = cached.public.signature.is_some();
         if signed {
             ann.sign(&self.identity);
         }
@@ -7644,7 +7665,16 @@ impl MeshNode {
 
         let has_cert = ann.owner_cert.is_some();
         let version = ann.version;
-        self.local_announcement.store(Some(Arc::new(ann)));
+        // Republish the rebuilt PUBLIC announcement with `scoped` CLEARED: an
+        // owner-scoped envelope embeds the previous owner cert, so once that cert
+        // changed (floor rise / expiry / authority swap) it must not ship. The
+        // next full announce rebuilds `scoped` against the current cert (Kyra
+        // OA3 — scoped rides public-cert validity, one coherent generation).
+        self.local_emission
+            .store(Some(Arc::new(LocalCapabilityEmission {
+                public: ann,
+                scoped: Vec::new(),
+            })));
         tracing::info!(
             version,
             has_cert,
@@ -17370,10 +17400,10 @@ impl MeshNode {
         if let Some(cfg) = cfg_snapshot.as_ref() {
             if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
-                    .local_announcement
+                    .local_emission
                     .load()
                     .as_deref()
-                    .map(|ann| ann.capabilities.clone())
+                    .map(|e| e.public.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
                 // Build the publish chain. Prefer an explicitly-held
@@ -18613,7 +18643,14 @@ impl MeshNode {
             // rate-limited away the broadcast. The send path re-validates the
             // owner cert against live state via the [`SendStamp`] seqlock, so no
             // build-time stamp is stored (review-11 P1).
-            self.local_announcement.store(Some(Arc::new(broadcast_ann)));
+            // Publish public + scoped as ONE unit (Kyra OA3 torn-snapshot
+            // invariant). `scoped` is empty until Commit B populates the owner
+            // envelope; the review-11 P1 send-time seqlock re-validates `public`.
+            self.local_emission
+                .store(Some(Arc::new(LocalCapabilityEmission {
+                    public: broadcast_ann,
+                    scoped: Vec::new(),
+                })));
 
             // Origin-side rate limit: within-window calls update the
             // self-index + `local_announcement` and coalesce into one
@@ -22336,13 +22373,13 @@ impl MeshNode {
         if self.reflex_override_active.load(AtOrd::Acquire) {
             return false;
         }
-        let Some(published) = self.local_announcement.load_full() else {
+        let Some(published) = self.local_emission.load_full() else {
             return false;
         };
         let Some(observed) = self.reflex_addr() else {
             return false;
         };
-        if published.reflex_addr == Some(observed) {
+        if published.public.reflex_addr == Some(observed) {
             return false;
         }
         self.reclassify_nat().await;
@@ -22400,7 +22437,9 @@ impl MeshNode {
     /// return torn pairs under concurrent mutation.
     #[doc(hidden)]
     pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
-        self.local_announcement.load_full()
+        self.local_emission
+            .load_full()
+            .map(|e| Arc::new(e.public.clone()))
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking
