@@ -56,6 +56,7 @@ pub mod org_authority;
 pub mod org_call;
 pub mod org_grant;
 pub mod org_revocation;
+pub mod org_scoped_ann;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;
