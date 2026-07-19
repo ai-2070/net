@@ -183,6 +183,14 @@ async fn accept_verify_rejected_still_persists_claim_and_release() {
         }
     ));
     let ino0 = ino(&path);
+    // Pin ino0 across the second write so its inode cannot be recycled onto the
+    // atomic-rename save's fresh temp on an inode-reusing filesystem (ext4),
+    // where `ino` could otherwise read equal despite a genuine write — the same
+    // hazard the org-revocation sidecar witnesses hit. `release_claim` uses the
+    // UNCONDITIONAL `mutate_json` (engine/mod.rs), so a verify_rejected always
+    // writes; holding this fd keeps the old inode allocated, so that write is
+    // forced onto a DISTINCT inode and the assertion below is deterministic.
+    let _pin = std::fs::File::open(&path).expect("pin the pre-write state inode");
 
     // A second verify_rejected still writes (claim + release) → inode moves.
     let q2 = engine
