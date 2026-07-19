@@ -798,3 +798,43 @@ async fn a_send_after_a_visibility_change_refuses_the_stale_emission() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// OA3 closure item-2 race (Kyra re-review): a visibility change landing INSIDE
+/// the send seqlock — AFTER the plaintext bytes are serialized but BEFORE the
+/// final stability check — must NOT release the already-serialized stale bytes.
+/// The probed-send seam fires the probe in exactly that window.
+#[tokio::test]
+async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
+    let server = build_node_with(EntityKeypair::from_bytes([0x53u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "vis-serialize-race");
+
+    let _svc = server
+        .serve_rpc("svc", Arc::new(TrivialHandler))
+        .expect("public serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_bytes_for_send_for_test().is_some()
+        })
+        .await,
+        "an emission is published",
+    );
+
+    // The probe fires inside the send seqlock — after serialize, before the final
+    // stability recheck — and advances the visibility generation there. The final
+    // recheck (beside the security-stamp comparison) must refuse the already
+    // serialized stale plaintext bytes.
+    let server_probe = server.clone();
+    let probe = move || server_probe.test_advance_visibility_generation();
+    assert!(
+        server
+            .announcement_bytes_for_send_probed_for_test(&probe)
+            .is_none(),
+        "a visibility change during serialization must refuse the stale bytes",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -7622,14 +7622,29 @@ impl MeshNode {
                 if let Some(probe) = probe {
                     probe();
                 }
-                // Emit only if nothing moved during the derive +
-                // serialize — else the enforced view changed and a
-                // retry re-derives against the new state. The pinned
-                // `snapshot` Arcs are still alive for this comparison,
-                // so a swapped-away authority/store cannot reuse the
-                // captured addresses.
-                if self.security_stamp() == stamp {
+                // Recheck the visibility generation BESIDE the final security-stamp
+                // comparison (Kyra OA3 item-2 race): a Public -> OwnerScoped
+                // transition landing AFTER serialization but before this check must
+                // not release the already-serialized stale plaintext bytes. The
+                // early check at the top of the loop is only a cheap fast-path; THIS
+                // is the correctness boundary.
+                #[cfg(feature = "cortex")]
+                let visibility_stable =
+                    cached.visibility_generation == self.rpc_local_services.generation();
+                #[cfg(not(feature = "cortex"))]
+                let visibility_stable = true;
+                // Emit only if nothing moved during the derive + serialize — the
+                // security stamp AND the visibility generation both still hold. The
+                // pinned `snapshot` Arcs are still alive for this comparison, so a
+                // swapped-away authority/store cannot reuse the captured addresses.
+                if self.security_stamp() == stamp && visibility_stable {
                     return Some(bytes);
+                }
+                // A visibility change is terminal for this send — the bump already
+                // woke a re-announce that will publish a coherent emission; do not
+                // retry against a set that just changed.
+                if !visibility_stable {
+                    return None;
                 }
                 continue;
             }
