@@ -173,6 +173,11 @@ pub struct ProviderFacts {
     /// This provider's PROVEN owner org (B) — from the installed
     /// authority scaffold, never fold state.
     pub provider_owner_org: OrgId,
+    /// The clock-skew tolerance persisted in the provider's authority
+    /// config — the SAME tolerance the ceremony accepted, applied to
+    /// every wall-clock check in the admission (caller credentials +
+    /// proof freshness), read from the authority verified above.
+    pub skew_secs: u64,
     /// The floor snapshot the admission is verified against, paired
     /// with the generation recorded in `stamp`.
     pub floors: Arc<OrgRevocationState>,
@@ -247,9 +252,11 @@ pub fn verify_provider_authority(
         poisoned: false,
     };
     let provider_owner_org = authority.owner_org();
+    let skew_secs = authority.config.verification_skew_secs;
     Ok(ProviderFacts {
         provider,
         provider_owner_org,
+        skew_secs,
         floors,
         stamp,
         // Pin the exact Arcs the stamp fingerprints, so their

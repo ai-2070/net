@@ -50,7 +50,10 @@ use crate::adapter::net::cortex::{
 };
 use crate::error::AdapterError;
 
+use super::behavior::org_admission::OrgAdmission;
+use super::behavior::org_admission_replay::AdmissionReplayGuard;
 use super::mesh::{MeshNode, PeerPublishOutcome};
+use super::org_admission_gate::{OrgProviderPolicy, RegisteredRpcService};
 
 // ============================================================================
 // Public types.
@@ -759,6 +762,248 @@ async fn emit_capability_denial(
         ResponseRouteFallback::DirectOnly,
     )
     .await;
+}
+
+/// Emit a terminal `AdmissionDenied` (0x0009) for an org-protected call the
+/// admission gate rejected (E1.2 / E2.2). Like [`emit_capability_denial`] it is
+/// unicast ONLY to the AEAD-authenticated session peer `from_node`, on the reply
+/// channel for the peer's PINNED origin (never the wire-claimed one, NC2), so a
+/// forged proof cannot aim a denial at a victim's reply channel. The response
+/// body carries ONLY the single COARSE reason byte — the detailed
+/// `AdmissionDenied` variant stays provider-side audit (a caller must not learn
+/// which check failed).
+async fn emit_admission_denial(
+    mesh: &MeshNode,
+    service: &str,
+    claimed_origin: u64,
+    call_id: u64,
+    from_node: u64,
+    coarse: crate::adapter::net::behavior::org_admission::CoarseAdmissionReason,
+) {
+    let resp = crate::adapter::net::cortex::RpcResponsePayload {
+        status: RpcStatus::AdmissionDenied,
+        headers: vec![],
+        body: Bytes::copy_from_slice(&[coarse.to_wire()]),
+    };
+    let meta = EventMeta::new(
+        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+        0,
+        mesh.identity_origin_hash(),
+        call_id,
+        0,
+    );
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 16);
+    buf.extend_from_slice(&meta.to_bytes());
+    resp.encode_into(&mut buf);
+    let reply_origin = mesh
+        .peer_entity_id(from_node)
+        .map(|e| e.origin_hash())
+        .unwrap_or(claimed_origin);
+    let Ok(reply_channel) = ChannelName::new(&format!("{service}.replies.{reply_origin:016x}"))
+    else {
+        return;
+    };
+    let reply_channel_id = ChannelId::new(reply_channel.clone());
+    let reply_channel_hash = reply_channel_id.hash();
+    let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+    // `target_hint = Some(from_node)` + `DirectOnly`: unicast to the
+    // authenticated peer and nothing else — never reflected onto a forged
+    // origin's roster (NC2 / R2-7).
+    let _ = publish_response_to_caller(
+        mesh,
+        reply_origin,
+        Some(from_node),
+        &reply_channel,
+        reply_channel_hash,
+        reply_stream_id,
+        Bytes::from(buf),
+        ResponseRouteFallback::DirectOnly,
+    )
+    .await;
+}
+
+/// The E1.2 protected admission gate for ONE inbound frame on a protected unary
+/// service, run on the captured immutable [`RegisteredRpcService`]. On the
+/// initial REQUEST it runs, in order: the shared origin check, direct-session
+/// caller identity (E0.3), local capability (E1.2 — `has_local_capability`, not
+/// `may_execute`), provider self-verify (E1.3), and `verify_org_admission`
+/// (E1.4/E1.5 stability recheck plus the captured provider policy, one clock
+/// sample), then `apply_inbound_admitted`. Any denial is unicast as an
+/// `AdmissionDenied` (0x0009 with a coarse reason) to the authenticated peer and
+/// the handler NEVER runs. A non-REQUEST frame (a CANCEL for an already-admitted
+/// call) passes to the fold unchanged — no re-admission.
+#[allow(clippy::too_many_arguments)]
+async fn admit_and_dispatch_protected(
+    mesh: &Arc<MeshNode>,
+    cache: &RpcOriginNodeCache,
+    inbound: &RpcInboundEvent,
+    service: &str,
+    tag: &str,
+    metrics: &ServiceMetricsAtomic,
+    reg: &crate::adapter::net::org_admission_gate::RegisteredRpcService,
+    replay: &crate::adapter::net::behavior::org_admission_replay::AdmissionReplayGuard,
+    fold: &Arc<Mutex<RpcServerFold>>,
+) {
+    use crate::adapter::net::behavior::org_admission::{AdmissionContext, CoarseAdmissionReason};
+    use crate::adapter::net::org_admission_gate as gate;
+
+    let Some(meta) = bridge_origin_check(inbound, service, tag, metrics) else {
+        return;
+    };
+    let from_node = inbound.from_node;
+    let claimed_origin = meta.origin_hash;
+    let call_id = meta.seq_or_ts;
+
+    // Only the initial REQUEST is admitted; a CANCEL (or any control frame) for
+    // an already-admitted call reaches the fold WITHOUT re-admission — the fold
+    // keys it on the authenticated session peer + call id.
+    if meta.dispatch != DISPATCH_RPC_REQUEST {
+        if let Err(e) = fold.lock().apply_inbound(inbound) {
+            tracing::warn!(error = %e, "rpc serve_rpc_protected: fold apply error");
+        }
+        return;
+    }
+
+    // E0.3: protected calls are DIRECT-SESSION-ONLY. Loopback (`from_node == 0`)
+    // and a peer with no pinned session entity have no authenticated caller
+    // identity, so they cannot be admitted.
+    let Some(caller) = mesh.peer_entity_id(from_node) else {
+        emit_admission_denial(
+            mesh,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Denied,
+        )
+        .await;
+        return;
+    };
+
+    // E1.2: the PROVIDER must itself hold the capability. `has_local_capability`
+    // (not `may_execute`) — the caller's authorization is the org proof, never
+    // the announcement allow-list.
+    if !crate::adapter::net::behavior::fold::capability_bridge::has_local_capability(
+        mesh.capability_fold(),
+        mesh.node_id(),
+        tag,
+    ) {
+        emit_admission_denial(
+            mesh,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Denied,
+        )
+        .await;
+        return;
+    }
+
+    // Decode the finalized request for the digest + admission header(s).
+    let Ok(payload) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..))
+    else {
+        emit_admission_denial(
+            mesh,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Denied,
+        )
+        .await;
+        return;
+    };
+    let Ok(request_digest) = gate::org_request_digest(&payload) else {
+        emit_admission_denial(
+            mesh,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Denied,
+        )
+        .await;
+        return;
+    };
+    let admission_headers: Vec<&[u8]> = payload
+        .headers
+        .iter()
+        .filter(|(n, _)| n == crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER)
+        .map(|(_, v)| v.as_slice())
+        .collect();
+    // Unary only (E1.8): a streaming flag on a protected REQUEST is a distinct
+    // "not supported" denial, never admitted under a unary binding.
+    let is_unary =
+        payload.flags & (FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE) == 0;
+
+    // Provider self-verify (E1.3) against ONE clock sample.
+    let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+    let facts = match gate::verify_provider_authority(mesh, &clock) {
+        Ok(f) => f,
+        Err(d) => {
+            emit_admission_denial(
+                mesh,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                d.coarse(),
+            )
+            .await;
+            return;
+        }
+    };
+    let invoked_capability =
+        crate::adapter::net::behavior::org_grant::CapabilityAuthorityId::for_tag(tag);
+    let ctx = AdmissionContext {
+        mode: reg.admission(),
+        authenticated_caller: &caller,
+        provider: &facts.provider,
+        provider_owner_org: facts.provider_owner_org,
+        invoked_capability,
+        call_id,
+        request_digest,
+        is_unary,
+        floors: facts.floors.as_ref(),
+        skew_secs: facts.skew_secs,
+    };
+    let captured_stamp = facts.stamp;
+    let outcome = crate::adapter::net::behavior::org_admission::verify_org_admission(
+        &ctx,
+        &admission_headers,
+        replay,
+        clock,
+        // §9.5 stability: the view captured before verification must still be
+        // live at the replay insert, or the stale decision is denied without
+        // consuming a slot.
+        || captured_stamp.is_current(&gate::capture_admission_stamp(mesh)),
+        |proof| (reg.provider_policy())(proof),
+    );
+    match outcome {
+        Ok(admitted) => {
+            // Cache the authenticated response route (as the public accept path
+            // does), then hand the fold the admitted REQUEST — the handler runs
+            // with `RpcContext::org_admission = Some(admitted)` and the raw proof
+            // header stripped.
+            cache_authenticated_response_destination(mesh, cache, inbound);
+            if let Err(e) = fold.lock().apply_inbound_admitted(inbound, admitted) {
+                tracing::warn!(error = %e, "rpc serve_rpc_protected: fold apply error");
+            }
+        }
+        Err(denied) => {
+            tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
+            emit_admission_denial(
+                mesh,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                denied.coarse(),
+            )
+            .await;
+        }
+    }
 }
 
 /// Reject a relayed/untrusted flow-controlled upload REQUEST at admission —
@@ -2597,6 +2842,59 @@ impl MeshNode {
         service: &str,
         handler: Arc<H>,
     ) -> Result<ServeHandle, ServeError> {
+        self.serve_rpc_unary_impl(service, handler, UnaryAdmission::Public)
+    }
+
+    /// Register a PROTECTED unary RPC handler (E1.1/E1.2). Every call must carry
+    /// a `net-org-admission` proof that [`verify_org_admission`] accepts under
+    /// `admission` (owner-delegated or cross-org); the captured `provider_policy`
+    /// is the final application veto. REQUIRES an installed node authority (else
+    /// [`ServeError::ProtectedAuthorityRequired`]) and an org-protected mode
+    /// (never `PublicAuthenticated`). Unary only (E1.8). Denied calls receive
+    /// [`RpcStatus::AdmissionDenied`] (0x0009 + a coarse reason); the handler
+    /// runs ONLY on an admitted call and reads the four-party attribution via
+    /// [`RpcContext::org_admission`](crate::adapter::net::cortex::RpcContext).
+    ///
+    /// [`verify_org_admission`]: crate::adapter::net::behavior::org_admission::verify_org_admission
+    pub fn serve_rpc_protected<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        admission: OrgAdmission,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(ServeError::InvalidProtectedRegistration(
+                "admission mode must be org-protected (OwnerDelegated / CrossOrgGranted), \
+                 not PublicAuthenticated"
+                    .to_string(),
+            ));
+        }
+        // E1.1: protected registration requires an installed authority — checked
+        // up front so the registration below cannot half-succeed then unwind.
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::Protected {
+                admission,
+                provider_policy,
+            },
+        )
+    }
+
+    /// Shared unary serve implementation for the public [`Self::serve_rpc`] and
+    /// protected [`Self::serve_rpc_protected`] wrappers. The bridge branches on
+    /// the captured [`RegisteredRpcService`]'s admission mode: public runs the
+    /// v0.4 `may_execute` gate; protected runs the E1.2 org-admission gate.
+    fn serve_rpc_unary_impl<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        mode: UnaryAdmission,
+    ) -> Result<ServeHandle, ServeError> {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
@@ -2760,61 +3058,113 @@ impl MeshNode {
             .insert(service.to_string(), registration_id);
         self.index_self_with_local_services();
 
-        // Spawn the bridge task. It reads inbound events, runs
-        // the v0.4 capability-auth callee-side gate (defense in
-        // depth — the caller-side gate inside `call_service`
-        // covers the well-behaved client path), and on accept
-        // feeds them to the fold.
+        // E1.1: the immutable registration the bridge captures — ONE truth, the
+        // provider policy captured WITH the handler (no name→policy side map, no
+        // unknown-policy fallback). Public is a trivial allow-all; protected
+        // carries the org-protected mode + explicit policy.
+        let reg = Arc::new(match mode {
+            UnaryAdmission::Public => {
+                RegisteredRpcService::public(registration_id, Arc::from(service))
+            }
+            UnaryAdmission::Protected {
+                admission,
+                provider_policy,
+            } => match RegisteredRpcService::protected(
+                registration_id,
+                Arc::from(service),
+                admission,
+                provider_policy,
+            ) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    // Roll back the just-installed registration so no dispatcher
+                    // or tag is left behind (the mode is pre-validated in
+                    // `serve_rpc_protected`, so this is a belt-and-suspenders
+                    // path).
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
+        });
+        // E1.5: per-service replay guard (consulted only by the protected gate).
+        let admission_replay = Arc::new(AdmissionReplayGuard::with_defaults());
+
+        // Spawn the bridge task. It reads inbound events and runs the
+        // registration's callee-side gate: public → the v0.4 `may_execute`
+        // preflight; protected → the E1.2 org-admission gate. On accept it feeds
+        // the fold; the caller-side gate inside `call_service` covers the
+        // well-behaved public client path.
         let mesh_for_bridge = Arc::clone(self);
         let service_for_bridge = service.to_string();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
+        let reg_for_bridge = Arc::clone(&reg);
+        let replay_for_bridge = Arc::clone(&admission_replay);
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
-                // The ONE shared callee preflight: captured-service
-                // equality → may_execute → authenticated response-route
-                // cache. On denial it hands back the AUTHENTICATED
-                // reply origin (NC2), never the wire-claimed one.
-                match bridge_preflight(
-                    &mesh_for_bridge,
-                    &origin_node_cache_for_bridge,
-                    &inbound,
-                    &service_for_bridge,
-                    &tag,
-                    &metrics_for_bridge,
-                ) {
-                    BridgePreflight::Proceed => {}
-                    BridgePreflight::Drop => continue,
-                    BridgePreflight::Deny {
-                        claimed_origin,
-                        call_id,
-                        from_node,
-                    } => {
-                        // The handler never runs on this path, so bump
-                        // `capability_denied_total` so operators still see
-                        // the denied caller.
-                        metrics_for_bridge
-                            .capability_denied_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // NC2: the denial goes ONLY to the authenticated
-                        // session peer, never the claimed origin's roster.
-                        emit_capability_denial(
+                match reg_for_bridge.admission() {
+                    OrgAdmission::PublicAuthenticated => {
+                        // The ONE shared public callee preflight: captured-
+                        // service equality → may_execute → authenticated
+                        // response-route cache. On denial it hands back the
+                        // AUTHENTICATED reply origin (NC2), never the wire-
+                        // claimed one.
+                        match bridge_preflight(
                             &mesh_for_bridge,
+                            &origin_node_cache_for_bridge,
+                            &inbound,
                             &service_for_bridge,
-                            claimed_origin,
-                            call_id,
-                            from_node,
+                            &tag,
+                            &metrics_for_bridge,
+                        ) {
+                            BridgePreflight::Proceed => {}
+                            BridgePreflight::Drop => continue,
+                            BridgePreflight::Deny {
+                                claimed_origin,
+                                call_id,
+                                from_node,
+                            } => {
+                                metrics_for_bridge
+                                    .capability_denied_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                emit_capability_denial(
+                                    &mesh_for_bridge,
+                                    &service_for_bridge,
+                                    claimed_origin,
+                                    call_id,
+                                    from_node,
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        // AV-1 item 1: drive the fold with the AEAD-verified
+                        // `inbound.from_node` so per-call state binds to the
+                        // authenticated session peer.
+                        if let Err(e) = fold.lock().apply_inbound(&inbound) {
+                            tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
+                        }
+                    }
+                    OrgAdmission::OwnerDelegated | OrgAdmission::CrossOrgGranted => {
+                        // E1.2: the org-admission gate. Verifies the proof,
+                        // hands the fold the admitted REQUEST (handler runs with
+                        // `RpcContext::org_admission = Some(..)`), or unicasts an
+                        // `AdmissionDenied` (0x0009) to the authenticated peer.
+                        admit_and_dispatch_protected(
+                            &mesh_for_bridge,
+                            &origin_node_cache_for_bridge,
+                            &inbound,
+                            &service_for_bridge,
+                            &tag,
+                            &metrics_for_bridge,
+                            &reg_for_bridge,
+                            &replay_for_bridge,
+                            &fold,
                         )
                         .await;
-                        continue;
                     }
-                }
-                // AV-1 item 1: drive the fold with the AEAD-verified
-                // `inbound.from_node` so per-call state binds to the
-                // authenticated session peer, not the wire-claimed
-                // origin — a forged control frame misses the fold key.
-                if let Err(e) = fold.lock().apply_inbound(&inbound) {
-                    tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                 }
             }
         });
@@ -4786,6 +5136,33 @@ pub enum ServeError {
          attach terms to the descriptor, or serve it free via Mesh::serve_tool"
     )]
     MissingPricingTerms(String),
+    /// A protected (`serve_rpc_protected`) registration was attempted with no
+    /// installed node authority (E1.1). Org admission needs the provider's
+    /// proven owner org + revocation store; without them the handler could
+    /// never admit, so registration is refused up front rather than serving a
+    /// service that denies every call.
+    #[error(
+        "protected service `{0}` requires an installed node authority; adopt one before serving"
+    )]
+    ProtectedAuthorityRequired(String),
+    /// A protected registration was given an admission mode that is not
+    /// org-protected (`PublicAuthenticated`), or otherwise failed the
+    /// [`RegisteredRpcService::protected`] shape check.
+    #[error("invalid protected registration: {0}")]
+    InvalidProtectedRegistration(String),
+}
+
+/// The admission shape for a unary serve registration (E1.1), threaded from the
+/// public `serve_rpc` / protected `serve_rpc_protected` wrappers into the shared
+/// `serve_rpc_unary_impl`. Streaming / duplex have no protected form (E1.8).
+enum UnaryAdmission {
+    /// Legacy v0.4 public: `PublicAuthenticated` + a trivial allow-all policy.
+    Public,
+    /// Org-protected: an org admission mode + the explicit provider policy.
+    Protected {
+        admission: OrgAdmission,
+        provider_policy: OrgProviderPolicy,
+    },
 }
 
 // ============================================================================
@@ -5954,6 +6331,64 @@ mod roster_fallback_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
+    /// mode is not org-protected, and an org-protected mode with NO installed
+    /// node authority could never admit — so both fail cleanly (no dangling
+    /// registration) rather than serving a service that denies every call. A
+    /// public `serve_rpc` on the same name then still succeeds, proving nothing
+    /// was left behind.
+    #[tokio::test]
+    async fn serve_rpc_protected_refuses_bad_mode_and_missing_authority() {
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        struct H;
+        #[async_trait::async_trait]
+        impl RpcHandler for H {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+        let server = build_server().await; // no authority installed
+        let policy: OrgProviderPolicy = std::sync::Arc::new(|_| true);
+
+        // PublicAuthenticated is rejected before the authority check.
+        assert!(
+            matches!(
+                server.serve_rpc_protected(
+                    "p",
+                    std::sync::Arc::new(H),
+                    OrgAdmission::PublicAuthenticated,
+                    policy.clone(),
+                ),
+                Err(ServeError::InvalidProtectedRegistration(_))
+            ),
+            "PublicAuthenticated is not a protected mode",
+        );
+
+        // A valid org-protected mode still fails with no installed authority.
+        assert!(
+            matches!(
+                server.serve_rpc_protected(
+                    "p",
+                    std::sync::Arc::new(H),
+                    OrgAdmission::CrossOrgGranted,
+                    policy,
+                ),
+                Err(ServeError::ProtectedAuthorityRequired(_))
+            ),
+            "protected registration requires an installed authority",
+        );
+
+        // Neither refusal left a registration behind — the slot is free.
+        assert!(
+            server.serve_rpc("p", std::sync::Arc::new(H)).is_ok(),
+            "no dangling protected registration blocks the slot",
+        );
     }
 
     /// Like [`build_server`], but installs a channel-config registry that
