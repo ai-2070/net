@@ -4300,6 +4300,15 @@ pub struct MeshNode {
     /// `node_authority_dir` config at construction); replacement by
     /// a DIFFERENT owner org is refused — one node, one owner.
     node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
+    /// shared across EVERY protected `serve_rpc_protected` registration on this
+    /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
+    /// holds provider-wide: a captured proof cannot re-execute after a service
+    /// is torn down and re-registered, colliding call ids across distinct
+    /// protected services are caught, and the global replay capacity is one
+    /// budget, not one-per-service.
+    #[cfg(feature = "cortex")]
+    rpc_admission_replay: Arc<super::behavior::org_admission_replay::AdmissionReplayGuard>,
     /// Review-9: serializes authority/store installation. The
     /// check-then-store sequences (dominance validation, one-owner
     /// comparison, callback wiring, reconciliation) must be one
@@ -5600,6 +5609,10 @@ impl MeshNode {
             migration_handler: Arc::new(ArcSwapOption::empty()),
             org_revocation: Arc::new(ArcSwapOption::empty()),
             node_authority: Arc::new(ArcSwapOption::empty()),
+            #[cfg(feature = "cortex")]
+            rpc_admission_replay: Arc::new(
+                super::behavior::org_admission_replay::AdmissionReplayGuard::with_defaults(),
+            ),
             org_install: Arc::new(parking_lot::Mutex::new(())),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
@@ -7137,6 +7150,16 @@ impl MeshNode {
         &self,
     ) -> Option<Arc<super::behavior::org_revocation::OrgRevocationStore>> {
         self.org_revocation.load_full()
+    }
+
+    /// OA-2 (Kyra #47 B2): the node-owned admission replay guard shared by every
+    /// protected serve registration on this node — so `(caller, call_id)`
+    /// uniqueness is enforced provider-wide, not fragmented per service.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn rpc_admission_replay_arc(
+        &self,
+    ) -> Arc<super::behavior::org_admission_replay::AdmissionReplayGuard> {
+        self.rpc_admission_replay.clone()
     }
 
     /// OA-1 (review-8 §2/§3): install the node's loaded,

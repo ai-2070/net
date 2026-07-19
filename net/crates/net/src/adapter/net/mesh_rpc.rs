@@ -52,7 +52,6 @@ use crate::error::AdapterError;
 
 use super::behavior::org::{current_timestamp, OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
-use super::behavior::org_admission_replay::AdmissionReplayGuard;
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
 use super::mesh::{MeshNode, PeerPublishOutcome};
@@ -3154,8 +3153,11 @@ impl MeshNode {
                 }
             },
         });
-        // E1.5: per-service replay guard (consulted only by the protected gate).
-        let admission_replay = Arc::new(AdmissionReplayGuard::with_defaults());
+        // E1.5 (Kyra #47 B2): the NODE-owned admission replay guard, shared
+        // across every protected registration on this node — so `(caller,
+        // call_id)` uniqueness holds provider-wide (across services AND across a
+        // teardown / re-registration), not fragmented per registration.
+        let admission_replay = self.rpc_admission_replay_arc();
 
         // Spawn the bridge task. It reads inbound events and runs the
         // registration's callee-side gate: public → the v0.4 `may_execute`
@@ -6442,6 +6444,165 @@ mod roster_fallback_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// A provider `MeshNode` owned by org B with an installed authority, for the
+    /// protected-admission witnesses. Returns (server, node entity P, org B, a
+    /// scratch dir the caller removes at the end).
+    async fn protected_provider(
+        tag: &str,
+    ) -> (
+        Arc<MeshNode>,
+        crate::adapter::net::identity::EntityId,
+        crate::adapter::net::behavior::org::OrgKeypair,
+        std::path::PathBuf,
+    ) {
+        use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+        (server, node_entity, org_b, dir)
+    }
+
+    /// An owner-delegated proof intent for `caller_kp` acting in org B, targeting
+    /// `provider` on `nrpc:svc`.
+    fn owner_delegated_intent(
+        caller_kp: EntityKeypair,
+        org_b: &crate::adapter::net::behavior::org::OrgKeypair,
+        provider: crate::adapter::net::identity::EntityId,
+    ) -> OrgProofIntent {
+        use crate::adapter::net::behavior::org::OrgMembershipCert;
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        let caller_entity = caller_kp.entity_id().clone();
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let membership =
+            OrgMembershipCert::try_issue(org_b, caller_entity.clone(), 1, 3600).expect("cert");
+        let dispatcher =
+            OrgDispatcherGrant::try_issue(org_b, caller_entity, DispatcherScope::Exact(cap), 3600)
+                .expect("dispatcher");
+        OrgProofIntent {
+            caller: std::sync::Arc::new(caller_kp),
+            membership,
+            dispatcher,
+            capability_grant: None,
+            acting_org: org_b.org_id(),
+            provider_owner_org: org_b.org_id(),
+            provider,
+            capability: cap,
+            proof_ttl_secs: 30,
+        }
+    }
+
+    /// Kyra #47 B2: the admission replay guard is NODE-owned. A proof admitted
+    /// under one registration is a REPLAY after that service is torn down and
+    /// re-registered — the guard is not per-registration. A fresh proof still
+    /// admits (FIFO barrier: exactly one admit on the second registration).
+    #[tokio::test]
+    async fn admission_replay_guard_is_node_owned_across_reregistration() {
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let (server, node_entity, org_b, dir) = protected_provider("b2").await;
+        const CALLER_NODE: u64 = 0x9b;
+        let caller_kp = EntityKeypair::generate();
+        let caller_origin = caller_kp.entity_id().origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_kp.entity_id().clone());
+        let intent = owner_delegated_intent(caller_kp, &org_b, node_entity);
+
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        // Sign ONE proof (call_id 1) — the exact bytes are replayed later.
+        let header1 = sign_admission_proof(&intent, 1, &base).expect("sign");
+        let make = |header: &(String, Vec<u8>), call_id: u64, channel_hash: ChannelHash| {
+            let mut req = base.clone();
+            req.headers.push(header.clone());
+            let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut f, 0);
+            f.extend_from_slice(&req.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(f),
+            }
+        };
+
+        // Registration #1: admit the proof.
+        let admits1 = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve1 = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits1.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve #1");
+        let channel_hash = serve1.channel_hash;
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, make(&header1, 1, channel_hash)));
+        assert!(
+            wait_until_at_least(|| admits1.load(Ordering::SeqCst) as u64, 1).await,
+            "the first call admits",
+        );
+        drop(serve1); // unregister
+
+        // Registration #2 (same service): the SAME proof is a replay; a fresh
+        // proof still admits.
+        let admits2 = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve2 = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits2.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve #2");
+        let ch2 = serve2.channel_hash;
+        assert!(server.deliver_rpc_inbound_for_test(ch2, make(&header1, 1, ch2))); // replay
+        let header2 = sign_admission_proof(&intent, 2, &base).expect("sign fresh");
+        assert!(server.deliver_rpc_inbound_for_test(ch2, make(&header2, 2, ch2))); // fresh
+        assert!(
+            wait_until_at_least(|| admits2.load(Ordering::SeqCst) as u64, 1).await,
+            "the fresh call admits on the second registration",
+        );
+        assert_eq!(
+            admits2.load(Ordering::SeqCst),
+            1,
+            "the replayed proof was DENIED across re-registration (node-owned guard)",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
