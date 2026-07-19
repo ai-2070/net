@@ -194,7 +194,9 @@ pub struct CallOptions {
     /// over the finalized request and appends the `net-org-admission` header, so
     /// a PROTECTED provider's admission gate can verify the call. `None` (the
     /// default) → an ordinary public call. Protected admission is unary-only
-    /// (E1.8), so this is ignored by the streaming / duplex call shapes.
+    /// (E1.8): the streaming / duplex call shapes do NOT silently ignore an
+    /// intent set here — they REJECT it with a local [`RpcError::Codec`] error
+    /// (fail-loud), so a credential can never be dropped on the floor.
     pub org_proof_intent: Option<OrgProofIntent>,
 }
 
@@ -4642,16 +4644,6 @@ impl MeshNode {
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
 
-        // Caller-side metrics guard. Bumps `in_flight` immediately;
-        // each early-return path calls `metrics_guard.record(...)`
-        // with the outcome, and Drop records the latency + bumps
-        // the matching counter. A future dropped before any
-        // `record(...)` call (e.g. a hedge loser) leaves the guard
-        // with `outcome = None` so `in_flight` decrements but no
-        // outcome is double-counted.
-        let metrics_registry = self.rpc_metrics_arc();
-        let mut metrics_guard = CallMetricsGuard::new(metrics_registry.for_service(service));
-
         // Allocate a fresh call_id. Random u64 from getrandom; a
         // sequential counter would let any session peer that
         // observed one of their own call_ids predict the next-
@@ -4731,8 +4723,9 @@ impl MeshNode {
                 .iter()
                 .any(|(name, _)| name == ORG_ADMISSION_HEADER)
             {
-                // Local caller-input error, before any network work — no
-                // CallOutcome fits; the guard's Drop decrements in_flight.
+                // Local caller-input error, before any network work AND before
+                // the metrics guard is created — no `in_flight` bump to undo and
+                // no CallOutcome to record.
                 return Err(RpcError::Codec {
                     direction: CodecDirection::Encode,
                     message: "org admission: request already carries a net-org-admission header"
@@ -4751,6 +4744,19 @@ impl MeshNode {
                 message: format!("org admission: finalized request exceeds wire bounds: {e}"),
             })?;
         }
+
+        // Caller-side metrics guard, created ONLY after all fallible LOCAL
+        // request construction (provider binding, proof signing, final wire
+        // bounds) has succeeded (Kyra #47 tail): a call rejected on local caller
+        // input never got off the ground, so it must not bump `in_flight` or
+        // record any outcome. From here on the guard bumps `in_flight`
+        // immediately; each early-return path calls `metrics_guard.record(...)`
+        // with the outcome, and Drop records the latency + bumps the matching
+        // counter. A future dropped before any `record(...)` call (e.g. a hedge
+        // loser) leaves the guard with `outcome = None` so `in_flight`
+        // decrements but no outcome is double-counted.
+        let metrics_registry = self.rpc_metrics_arc();
+        let mut metrics_guard = CallMetricsGuard::new(metrics_registry.for_service(service));
 
         // Lazy reply-channel subscription — AFTER the request (incl. any proof)
         // is finalized + wire-validated, so a malformed protected call fails
