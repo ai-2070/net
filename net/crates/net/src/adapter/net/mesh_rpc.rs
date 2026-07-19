@@ -4408,6 +4408,28 @@ impl MeshNode {
             });
         }
 
+        // A protected intent binds ONE exact provider. Narrow the candidate set
+        // to that provider BEFORE target selection so routing never picks a peer
+        // the proof isn't addressed to (and the round-robin / consistent-hash
+        // state isn't advanced toward a target we'd only reject locally in
+        // `call`). If the bound provider is not among the authorized candidates,
+        // fail LOCALLY rather than minting a proof for a peer that can't be
+        // selected (Kyra #47 tail). `call` re-checks the binding as defense in
+        // depth.
+        if let Some(intent) = opts.org_proof_intent.as_ref() {
+            candidates
+                .retain(|node_id| self.peer_entity_id(*node_id).as_ref() == Some(&intent.provider));
+            if candidates.is_empty() {
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: format!(
+                        "org admission: no advertising candidate for `nrpc:{service}` matches \
+                         the proof's bound provider"
+                    ),
+                });
+            }
+        }
+
         let target = self.select_target(&candidates, &opts.routing_policy);
         self.call(target, service, payload, opts).await
     }
@@ -4658,6 +4680,35 @@ impl MeshNode {
         // construction failure cannot leak a pending entry and an over-cap
         // finalized frame cannot panic/truncate at encode.
         if let Some(intent) = opts.org_proof_intent.as_ref() {
+            // The proof binds EXACTLY ONE provider (P). Refuse to publish it to a
+            // transport target that is not P: look up the pinned entity for
+            // `target_node_id` and require it to equal `intent.provider`.
+            // Publishing an A-bound proof to provider B would DISCLOSE the
+            // credential to the wrong peer and can only end in a remote binding
+            // denial — fail the caller LOCALLY instead (Kyra #47 tail). An
+            // unpinned target (no TOFU binding yet) is refused too: we cannot
+            // prove it is P.
+            match self.peer_entity_id(target_node_id) {
+                Some(pinned) if pinned == intent.provider => {}
+                Some(_) => {
+                    return Err(RpcError::Codec {
+                        direction: CodecDirection::Encode,
+                        message: format!(
+                            "org admission: proof provider does not match the pinned entity \
+                             of target {target_node_id:#x}"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(RpcError::Codec {
+                        direction: CodecDirection::Encode,
+                        message: format!(
+                            "org admission: target {target_node_id:#x} has no pinned entity \
+                             to bind the proof to"
+                        ),
+                    });
+                }
+            }
             // Exactly ONE proof header may ride, and only the builder sets it:
             // reject a caller-supplied one here rather than appending a second
             // and letting the provider deny MultipleHeaders.
@@ -6713,6 +6764,10 @@ mod roster_fallback_tests {
         let server = build_server().await;
         let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
         let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        // Pin the target to the proof's bound provider so the binding check
+        // passes and the dup-header / over-cap paths below are genuinely reached
+        // (Kyra #47 tail — provider binding precedes finalization).
+        server.test_pin_peer_entity(TARGET, provider.clone());
         let pending = server.rpc_client_pending();
         assert_eq!(pending.pending_count(), 0);
 
@@ -6781,6 +6836,10 @@ mod roster_fallback_tests {
         let server = build_server().await;
         let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
         let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        // Pin the target to the proof's bound provider so the unary
+        // capability-mismatch path is reached (provider binding is checked
+        // first, before the capability match).
+        server.test_pin_peer_entity(TARGET, provider.clone());
         let intent_opts = || CallOptions {
             org_proof_intent: Some(owner_delegated_intent(
                 EntityKeypair::generate(),
@@ -6854,6 +6913,49 @@ mod roster_fallback_tests {
             sign_admission_proof(&intent_with(MAX_ORG_PROOF_TTL_SECS + 1), 3, &base),
             Err(RpcError::Codec { .. })
         ));
+    }
+
+    /// Kyra #47 tail (caller/API): a protected `call` refuses to publish a proof
+    /// to a transport target that is not the EXACT provider the proof binds. An
+    /// UNPINNED target (we cannot prove it is P) and a target pinned to a
+    /// DIFFERENT entity each fail LOCALLY — no proof leaves the node — and leak
+    /// no pending entry (the binding check precedes registration).
+    #[tokio::test]
+    async fn protected_call_refuses_provider_target_mismatch() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        const TARGET: u64 = 0xDEAD_BEEF;
+        let server = build_server().await;
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        let other = crate::adapter::net::identity::EntityId::from_bytes([0x11u8; 32]);
+        let pending = server.rpc_client_pending();
+        let opts = || CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider.clone(),
+            )),
+            ..Default::default()
+        };
+
+        // Unpinned target: cannot prove it is the bound provider → local error.
+        assert!(matches!(
+            server
+                .call(TARGET, "svc", Bytes::from_static(b"x"), opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
+        assert_eq!(pending.pending_count(), 0, "no pending leak on unpinned target");
+
+        // Target pinned to a DIFFERENT entity → mismatch, local error, no leak.
+        server.test_pin_peer_entity(TARGET, other);
+        assert!(matches!(
+            server
+                .call(TARGET, "svc", Bytes::from_static(b"x"), opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
+        assert_eq!(pending.pending_count(), 0, "no pending leak on provider mismatch");
     }
 
     /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
