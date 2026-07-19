@@ -7877,12 +7877,22 @@ impl MeshNode {
 
     /// Test seam (OA3-5): the provider entity ids of the owner-scoped
     /// capabilities the private-discovery store exposes at `now_secs`
-    /// (expiry-safe — tombstoned/expired entries excluded).
+    /// (expiry-safe — tombstoned/expired entries excluded; currentness-safe —
+    /// entries whose provider floor has since risen are excluded against the
+    /// node's LIVE revocation snapshot, exactly as a real query would).
     #[doc(hidden)]
     pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
+        // node with no revocation store queries against an implicit empty floor
+        // set), so the currentness filter reflects real node state.
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         self.scoped_discovery
             .lock()
-            .find_owner_private_capabilities(now_secs, |_| true)
+            .find_owner_private_capabilities(now_secs, floors, |_| true)
             .into_iter()
             .map(|c| c.provider().clone())
             .collect()

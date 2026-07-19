@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 
+use super::org_revocation::OrgRevocationState;
 use super::org_scoped_ingest::{CapabilityAudienceScope, VerifiedScopedCapability};
 use crate::adapter::net::identity::EntityId;
 
@@ -154,12 +155,17 @@ impl ScopedDiscoveryStore {
     /// `Grant` with this `grant_id`, filtered by `predicate`. EXPIRY-SAFE: an
     /// entry past its `expires_at` at `now_secs` is excluded even if it has not
     /// yet been swept, so sweeping is an optimization, not the correctness
-    /// boundary (Kyra OA3 closure). Tombstones, owner entries, and entries from
-    /// other grants are invisible.
+    /// boundary (Kyra OA3 closure). CURRENTNESS-SAFE: an entry whose provider
+    /// membership floor in `floors` has risen above the generation it was
+    /// admitted against is excluded at read time, so a floor raised AFTER a
+    /// successful insert retracts the record immediately — without waiting for a
+    /// re-announce or sweep (Kyra OA3-5 closure). Tombstones, owner entries, and
+    /// entries from other grants are invisible.
     pub fn find_capabilities_for_grant<F>(
         &self,
         grant_id: &[u8; 32],
         now_secs: u64,
+        floors: &OrgRevocationState,
         mut predicate: F,
     ) -> Vec<&VerifiedScopedCapability>
     where
@@ -175,16 +181,19 @@ impl ScopedDiscoveryStore {
                     CapabilityAudienceScope::Grant { grant_id: g, .. } if g == grant_id
                 )
             })
+            .filter(|c| is_current(c, floors))
             .filter(|c| predicate(c))
             .collect()
     }
 
     /// Owner-scoped internal private capabilities, filtered by `predicate`.
-    /// EXPIRY-SAFE (see [`Self::find_capabilities_for_grant`]). Grant entries,
-    /// tombstones, and (structurally) public capabilities are invisible.
+    /// EXPIRY-SAFE and CURRENTNESS-SAFE (see
+    /// [`Self::find_capabilities_for_grant`]). Grant entries, tombstones, and
+    /// (structurally) public capabilities are invisible.
     pub fn find_owner_private_capabilities<F>(
         &self,
         now_secs: u64,
+        floors: &OrgRevocationState,
         mut predicate: F,
     ) -> Vec<&VerifiedScopedCapability>
     where
@@ -195,6 +204,7 @@ impl ScopedDiscoveryStore {
             .filter(|e| now_secs < e.expires_at)
             .filter_map(|e| e.capability.as_ref())
             .filter(|c| matches!(c.scope(), CapabilityAudienceScope::Owner { .. }))
+            .filter(|c| is_current(c, floors))
             .filter(|c| predicate(c))
             .collect()
     }
@@ -229,10 +239,33 @@ impl ScopedDiscoveryStore {
     }
 }
 
+/// Query-time revocation currentness (Kyra OA3-5 closure): a stored record stays
+/// visible only while its provider membership floor is still at or below the
+/// generation it was admitted against. If the floor for `(owner_org, provider)`
+/// has since RISEN above that generation the record is stale and must not be
+/// returned — the exact `cert.generation < floor` gate the ingest path applied,
+/// re-evaluated against the CURRENT floor view so a post-insert revocation
+/// retracts the record without a re-announce or sweep.
+fn is_current(cap: &VerifiedScopedCapability, floors: &OrgRevocationState) -> bool {
+    floors.floor_for(cap.owner_org(), cap.provider()) <= cap.provider_cert_generation()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::org::OrgId;
+    use crate::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgRevocationBundle};
+    use std::collections::BTreeMap;
+
+    /// Fixed membership-cert generation the store fixtures are admitted against.
+    /// The currentness witness raises a floor above this to retract a record.
+    const FIXTURE_CERT_GEN: u32 = 5;
+
+    /// An empty floor view — the default for tests that don't exercise
+    /// query-time revocation currentness (every record admitted against
+    /// [`FIXTURE_CERT_GEN`] stays visible under a floor of 0).
+    fn no_floors() -> OrgRevocationState {
+        OrgRevocationState::empty()
+    }
 
     fn provider(seed: u8) -> EntityId {
         EntityId::from_bytes([seed; 32])
@@ -252,6 +285,7 @@ mod tests {
             org(1),
             generation,
             expires_at,
+            FIXTURE_CERT_GEN,
             b"owner-descriptor".to_vec(),
         )
     }
@@ -271,6 +305,7 @@ mod tests {
             org(2),
             generation,
             expires_at,
+            FIXTURE_CERT_GEN,
             b"grant-descriptor".to_vec(),
         )
     }
@@ -297,6 +332,7 @@ mod tests {
             org(1),
             generation,
             expires_at,
+            FIXTURE_CERT_GEN,
             b"owner-descriptor".to_vec(),
         )
     }
@@ -392,6 +428,7 @@ mod tests {
             org(1),
             1,
             1000,
+            FIXTURE_CERT_GEN,
             b"x".to_vec(),
         );
         assert_eq!(store.ingest(public, 0), ScopedStoreOutcome::RejectedPublic);
@@ -409,23 +446,23 @@ mod tests {
         assert_eq!(store.len(), 3);
 
         // The grant-X query sees only grant-X providers — not owner, not grant-Y.
-        let x = store.find_capabilities_for_grant(&grant_x, 0, |_| true);
+        let x = store.find_capabilities_for_grant(&grant_x, 0, &no_floors(), |_| true);
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].provider(), &provider(4));
 
         // The grant-Y query sees only grant-Y.
-        let y = store.find_capabilities_for_grant(&grant_y, 0, |_| true);
+        let y = store.find_capabilities_for_grant(&grant_y, 0, &no_floors(), |_| true);
         assert_eq!(y.len(), 1);
         assert_eq!(y[0].provider(), &provider(5));
 
         // The owner query sees only the owner entry — no grants.
-        let owner = store.find_owner_private_capabilities(0, |_| true);
+        let owner = store.find_owner_private_capabilities(0, &no_floors(), |_| true);
         assert_eq!(owner.len(), 1);
         assert_eq!(owner[0].provider(), &provider(3));
 
         // A grant query for an unknown grant sees nothing.
         assert!(store
-            .find_capabilities_for_grant(&[0xCC; 32], 0, |_| true)
+            .find_capabilities_for_grant(&[0xCC; 32], 0, &no_floors(), |_| true)
             .is_empty());
     }
 
@@ -436,7 +473,8 @@ mod tests {
         store.ingest(grant_cap(grant, 4, 1, 1000), 0);
         store.ingest(grant_cap(grant, 5, 1, 1000), 0);
         // Predicate selecting only provider(5).
-        let hits = store.find_capabilities_for_grant(&grant, 0, |c| c.provider() == &provider(5));
+        let hits = store
+            .find_capabilities_for_grant(&grant, 0, &no_floors(), |c| c.provider() == &provider(5));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].provider(), &provider(5));
     }
@@ -448,7 +486,9 @@ mod tests {
         store.ingest(grant_cap(grant, 4, 1, 1000), 0);
         store.ingest(grant_cap(grant, 5, 1, 1000), 0);
         assert_eq!(
-            store.find_capabilities_for_grant(&grant, 0, |_| true).len(),
+            store
+                .find_capabilities_for_grant(&grant, 0, &no_floors(), |_| true)
+                .len(),
             2
         );
     }
@@ -462,11 +502,11 @@ mod tests {
         assert_eq!(store.sweep_expired(2000), 1);
         assert_eq!(store.len(), 1);
         assert!(store
-            .find_owner_private_capabilities(2000, |_| true)
+            .find_owner_private_capabilities(2000, &no_floors(), |_| true)
             .is_empty());
         assert_eq!(
             store
-                .find_capabilities_for_grant(&[0xAA; 32], 2000, |_| true)
+                .find_capabilities_for_grant(&[0xAA; 32], 2000, &no_floors(), |_| true)
                 .len(),
             1
         );
@@ -480,14 +520,14 @@ mod tests {
         store.ingest(grant_cap(grant, 4, 1, 1000), 0); // expires 1000
         assert_eq!(
             store
-                .find_capabilities_for_grant(&grant, 500, |_| true)
+                .find_capabilities_for_grant(&grant, 500, &no_floors(), |_| true)
                 .len(),
             1,
             "visible before expiry"
         );
         assert!(
             store
-                .find_capabilities_for_grant(&grant, 2000, |_| true)
+                .find_capabilities_for_grant(&grant, 2000, &no_floors(), |_| true)
                 .is_empty(),
             "excluded past expiry even with no sweep",
         );
@@ -509,7 +549,7 @@ mod tests {
         // tombstone; the watermark (max expiry seen = 5000) is retained.
         store.sweep_expired(3000);
         assert!(store
-            .find_capabilities_for_grant(&grant, 3000, |_| true)
+            .find_capabilities_for_grant(&grant, 3000, &no_floors(), |_| true)
             .is_empty());
         // Replay the OLDER generation 1 (still unexpired at 3000): refused.
         assert_eq!(
@@ -517,7 +557,84 @@ mod tests {
             ScopedStoreOutcome::Stale
         );
         assert!(store
-            .find_capabilities_for_grant(&grant, 3000, |_| true)
+            .find_capabilities_for_grant(&grant, 3000, &no_floors(), |_| true)
             .is_empty());
+    }
+
+    /// A revocation state that floors `(org_kp's org, member)` at `floor`, built
+    /// through a real signed bundle so `floor_for` keys it exactly the way the
+    /// ingest path does. Used by the currentness witness.
+    fn floor_state(org_kp: &OrgKeypair, member: &EntityId, floor: u32) -> OrgRevocationState {
+        let mut floors_map = BTreeMap::new();
+        floors_map.insert(member.clone(), floor);
+        let bundle = OrgRevocationBundle::try_issue(org_kp, &floors_map).expect("issue bundle");
+        let mut state = OrgRevocationState::empty();
+        state.merge_bundle(&bundle);
+        state
+    }
+
+    /// OA3-5 (Kyra closure) — query-time revocation CURRENTNESS: a record
+    /// admitted against a membership generation becomes non-queryable the instant
+    /// the provider's revocation floor rises above that generation, with no
+    /// re-announce and no sweep. A floor at exactly the admitted generation still
+    /// returns the record (the ingest gate is `cert.generation < floor`, so
+    /// equality is admissible); one generation higher retracts it. The entry
+    /// stays physically stored — retraction is a read-time filter, not eviction.
+    #[test]
+    fn a_raised_provider_floor_retracts_a_stored_record_at_query_time() {
+        // The floor is keyed by the ISSUING org's derived id, so the stored
+        // record must carry that same org (not the synthetic `org(n)` fixtures).
+        let org_kp = OrgKeypair::from_bytes([7u8; 32]);
+        let org_id = org_kp.org_id();
+        let member = EntityId::from_bytes([9u8; 32]);
+
+        let mut store = ScopedDiscoveryStore::new();
+        store.ingest(
+            VerifiedScopedCapability::for_test(
+                CapabilityAudienceScope::Owner {
+                    org_id,
+                    audience_handle: [0x11; 32],
+                },
+                member.clone(),
+                org_id,
+                1,
+                10_000,
+                FIXTURE_CERT_GEN,
+                b"owner-descriptor".to_vec(),
+            ),
+            0,
+        );
+
+        // Visible under the empty floor view it was admitted against.
+        assert_eq!(
+            store
+                .find_owner_private_capabilities(0, &no_floors(), |_| true)
+                .len(),
+            1
+        );
+
+        // A floor at EXACTLY the admitted generation is still current.
+        let floor_at = floor_state(&org_kp, &member, FIXTURE_CERT_GEN);
+        assert_eq!(
+            store
+                .find_owner_private_capabilities(0, &floor_at, |_| true)
+                .len(),
+            1,
+            "a floor equal to the admitted generation keeps the record"
+        );
+
+        // Raise the floor ABOVE the admitted generation: the record disappears
+        // immediately from the owner-scoped query.
+        let floor_above = floor_state(&org_kp, &member, FIXTURE_CERT_GEN + 1);
+        assert!(
+            store
+                .find_owner_private_capabilities(0, &floor_above, |_| true)
+                .is_empty(),
+            "a floor above the admitted generation retracts the record at query time"
+        );
+
+        // Retraction is a read-time filter, not an eviction: the entry is still
+        // physically present (a fresh higher-generation cert could revive it).
+        assert_eq!(store.len(), 1);
     }
 }

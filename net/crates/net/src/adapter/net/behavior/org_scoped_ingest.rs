@@ -140,6 +140,13 @@ pub struct VerifiedScopedCapability {
     owner_org: OrgId,
     generation: u64,
     expires_at: u64,
+    /// The inline `owner_cert` membership generation this record was admitted
+    /// against (§3.3). Retained so a query can enforce CURRENTNESS: if the
+    /// revocation floor for `(owner_org, provider)` later rises above this
+    /// generation, the record must become non-queryable even before the next
+    /// sweep — mirroring the ingest-time `cert.generation < floor` gate at read
+    /// time (Kyra OA3-5 closure).
+    provider_cert_generation: u32,
     descriptor: Vec<u8>,
 }
 
@@ -164,6 +171,11 @@ impl VerifiedScopedCapability {
     pub fn expires_at(&self) -> u64 {
         self.expires_at
     }
+    /// The inline membership-cert generation this record was admitted against —
+    /// used for query-time revocation currentness (§3.3, Kyra OA3-5 closure).
+    pub fn provider_cert_generation(&self) -> u32 {
+        self.provider_cert_generation
+    }
     /// The decrypted capability descriptor plaintext (opaque here; parsed by the
     /// fold layer).
     pub fn descriptor(&self) -> &[u8] {
@@ -181,6 +193,7 @@ impl VerifiedScopedCapability {
         owner_org: OrgId,
         generation: u64,
         expires_at: u64,
+        provider_cert_generation: u32,
         descriptor: Vec<u8>,
     ) -> Self {
         Self {
@@ -189,6 +202,7 @@ impl VerifiedScopedCapability {
             owner_org,
             generation,
             expires_at,
+            provider_cert_generation,
             descriptor,
         }
     }
@@ -202,6 +216,7 @@ impl std::fmt::Debug for VerifiedScopedCapability {
             .field("owner_org", &self.owner_org)
             .field("generation", &self.generation)
             .field("expires_at", &self.expires_at)
+            .field("provider_cert_generation", &self.provider_cert_generation)
             .field("descriptor_len", &self.descriptor.len())
             .finish()
     }
@@ -336,6 +351,7 @@ fn verify_owner_ingest(
         owner_org,
         generation: envelope.generation(),
         expires_at: envelope.expires_at(),
+        provider_cert_generation: envelope.owner_cert().generation,
         descriptor,
     })
 }
@@ -412,6 +428,7 @@ fn verify_granted_ingest(
         owner_org: *envelope.owner_org(),
         generation: envelope.generation(),
         expires_at: envelope.expires_at(),
+        provider_cert_generation: envelope.owner_cert().generation,
         descriptor,
     })
 }
