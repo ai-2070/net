@@ -6785,7 +6785,9 @@ mod roster_fallback_tests {
             Err(RpcError::Codec { .. })
         ));
         assert!(matches!(
-            server.call_client_stream(TARGET, "svc", intent_opts()).await,
+            server
+                .call_client_stream(TARGET, "svc", intent_opts())
+                .await,
             Err(RpcError::Codec { .. })
         ));
         assert!(matches!(
