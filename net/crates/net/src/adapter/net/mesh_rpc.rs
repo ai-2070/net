@@ -50,10 +50,13 @@ use crate::adapter::net::cortex::{
 };
 use crate::error::AdapterError;
 
+use super::behavior::org::{current_timestamp, OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
 use super::behavior::org_admission_replay::AdmissionReplayGuard;
+use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
 use super::mesh::{MeshNode, PeerPublishOutcome};
-use super::org_admission_gate::{OrgProviderPolicy, RegisteredRpcService};
+use super::org_admission_gate::{org_request_digest, OrgProviderPolicy, RegisteredRpcService};
 
 // ============================================================================
 // Public types.
@@ -188,6 +191,12 @@ pub struct CallOptions {
     /// it and the call short-circuits to [`RpcError::Cancelled`]
     /// without ever publishing the REQUEST.
     pub cancel_token: Option<u64>,
+    /// E2.1: when set, the unary [`MeshNode::call`] mints an org-admission proof
+    /// over the finalized request and appends the `net-org-admission` header, so
+    /// a PROTECTED provider's admission gate can verify the call. `None` (the
+    /// default) → an ordinary public call. Protected admission is unary-only
+    /// (E1.8), so this is ignored by the streaming / duplex call shapes.
+    pub org_proof_intent: Option<OrgProofIntent>,
 }
 
 impl Default for CallOptions {
@@ -202,7 +211,56 @@ impl Default for CallOptions {
             request_window_initial: None,
             request_headers: Vec::new(),
             cancel_token: None,
+            org_proof_intent: None,
         }
+    }
+}
+
+/// Caller credentials for minting an org-admission proof inside the unary
+/// [`MeshNode::call`] (E2.1) — the minimal honest caller seam, not the full
+/// grant-management CLI (OA2-F). Set it on [`CallOptions::org_proof_intent`] to
+/// call a PROTECTED service: `call` mints the `call_id`, finalizes the request,
+/// computes the shared
+/// [`org_request_digest`](crate::adapter::net::org_admission_gate::org_request_digest),
+/// signs an [`OrgCallProof`] binding THIS call, and appends the
+/// `net-org-admission` header. Protected admission is unary-only (E1.8).
+#[derive(Clone)]
+pub struct OrgProofIntent {
+    /// The caller's signing keypair (actor S). `Arc`-held so `CallOptions`
+    /// stays `Clone` without cloning key material.
+    pub caller: Arc<crate::adapter::net::identity::EntityKeypair>,
+    /// The caller's org membership certificate.
+    pub membership: OrgMembershipCert,
+    /// The dispatcher grant empowering the caller to act for its org over the
+    /// invoked capability.
+    pub dispatcher: OrgDispatcherGrant,
+    /// The cross-org capability grant (for [`OrgAdmission::CrossOrgGranted`]);
+    /// `None` for [`OrgAdmission::OwnerDelegated`].
+    pub capability_grant: Option<OrgCapabilityGrant>,
+    /// The org the caller acts for (A).
+    pub acting_org: OrgId,
+    /// The provider's owner org (B) the proof is addressed to.
+    pub provider_owner_org: OrgId,
+    /// The exact provider (P) this call targets.
+    pub provider: crate::adapter::net::identity::EntityId,
+    /// The invoked capability (`nrpc:<service>`).
+    pub capability: CapabilityAuthorityId,
+    /// Proof lifetime in seconds from `call` time.
+    pub proof_ttl_secs: u64,
+}
+
+impl std::fmt::Debug for OrgProofIntent {
+    /// Redacts the keypair + credentials — an intent must never print key or
+    /// certificate material into a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrgProofIntent")
+            .field("acting_org", &self.acting_org)
+            .field("provider_owner_org", &self.provider_owner_org)
+            .field("provider", &self.provider)
+            .field("capability", &self.capability)
+            .field("proof_ttl_secs", &self.proof_ttl_secs)
+            .field("credentials", &"<redacted>")
+            .finish()
     }
 }
 
@@ -4581,13 +4639,21 @@ impl MeshNode {
         // `.iter().cloned()` which deep-cloned each
         // `(String, Vec<u8>)` pair into a fresh entry.
         headers.append(&mut opts.request_headers);
-        let req = RpcRequestPayload {
+        let mut req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
             body: payload.clone(),
         };
+        // E2.1: for a protected call, mint the admission proof over the
+        // FINALIZED request (the digest strips the header, so caller + provider
+        // agree) and append the `net-org-admission` header. Unary only — the
+        // protected admission gate serves unary (E1.8).
+        if let Some(intent) = opts.org_proof_intent.as_ref() {
+            let header = sign_admission_proof(intent, call_id, &req)?;
+            req.headers.push(header);
+        }
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
@@ -5018,6 +5084,43 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// broader stack won't be functional anyway; the pool cursor is
 /// left exhausted so the next mint retries the refill. `0` is
 /// reserved as a sentinel and never returned.
+/// Mint the `net-org-admission` proof header for a protected unary call (E2.1):
+/// sign an [`OrgCallProof`] binding THIS `call_id` and the finalized `req` (via
+/// the shared [`org_request_digest`], which strips any admission header, so the
+/// caller signing and the provider verifying derive the SAME digest) under the
+/// caller's [`OrgProofIntent`]. Returns the single header the caller appends.
+fn sign_admission_proof(
+    intent: &OrgProofIntent,
+    call_id: u64,
+    req: &RpcRequestPayload,
+) -> Result<(String, Vec<u8>), RpcError> {
+    let digest = org_request_digest(req).map_err(|e| RpcError::Codec {
+        direction: CodecDirection::Encode,
+        message: format!("org admission: request digest failed: {e}"),
+    })?;
+    let expiry = current_timestamp()
+        .saturating_add(intent.proof_ttl_secs)
+        .saturating_mul(1_000_000_000);
+    let proof = OrgCallProof::sign_for_call(
+        &intent.caller,
+        intent.membership.clone(),
+        intent.dispatcher.clone(),
+        intent.capability_grant.clone(),
+        intent.acting_org,
+        intent.provider_owner_org,
+        intent.provider.clone(),
+        call_id,
+        intent.capability,
+        expiry,
+        digest,
+    );
+    let bytes = proof.encode().map_err(|e| RpcError::Codec {
+        direction: CodecDirection::Encode,
+        message: format!("org admission: proof encode failed: {e}"),
+    })?;
+    Ok((ORG_ADMISSION_HEADER.to_string(), bytes))
+}
+
 fn mint_random_call_id() -> u64 {
     thread_local! {
         // (pool, cursor). Cursor starts exhausted so the first
@@ -6663,6 +6766,127 @@ mod roster_fallback_tests {
             1,
             "the tampered-binding call was denied (handler never ran for it)",
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E2.1 witness 26: the CALLER-side proof builder — `sign_admission_proof`,
+    /// the exact minting the unary `call` performs from an `OrgProofIntent` —
+    /// produces a proof the LIVE provider gate ADMITS. Proves caller and
+    /// provider derive the same request digest (E1.7) and the
+    /// `OrgProofIntent → OrgCallProof` mapping is correct end-to-end.
+    #[tokio::test]
+    async fn caller_proof_intent_produces_an_admissible_proof() {
+        use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+        use crate::adapter::net::behavior::org_admission::{Admitted, OrgAdmission};
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+
+        type Seen = std::sync::Arc<Mutex<Option<Admitted>>>;
+        struct SpyHandler(Seen);
+        #[async_trait::async_trait]
+        impl RpcHandler for SpyHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.0.lock() = Some(ctx.org_admission.clone().expect("admitted call"));
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-caller-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let seen: Seen = std::sync::Arc::new(Mutex::new(None));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(SpyHandler(seen.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0x95;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        // The production caller intent — exactly what a caller sets on
+        // `CallOptions::org_proof_intent`.
+        let intent = OrgProofIntent {
+            caller: std::sync::Arc::new(caller_kp),
+            membership,
+            dispatcher,
+            capability_grant: None,
+            acting_org: org_b.org_id(),
+            provider_owner_org: org_b.org_id(),
+            provider: node_entity.clone(),
+            capability: cap,
+            proof_ttl_secs: 30,
+        };
+
+        let call_id = 11u64;
+        let mut req = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        // The exact header `call` would mint + append.
+        req.headers
+            .push(sign_admission_proof(&intent, call_id, &req).expect("sign proof"));
+
+        let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut frame, 0);
+        frame.extend_from_slice(&req.encode());
+        assert!(server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        ));
+
+        assert!(
+            wait_until_at_least(|| seen.lock().is_some() as u64, 1).await,
+            "the caller-built proof must be admitted by the live gate",
+        );
+        let admitted = seen.lock().clone().expect("admitted");
+        assert_eq!(admitted.caller, caller_entity);
+        assert_eq!(admitted.provider, node_entity);
+        assert_eq!(admitted.capability, cap);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
