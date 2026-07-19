@@ -2946,9 +2946,19 @@ mod tests {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
-        // Replace the sidecar: unlink its directory entry (the original
-        // inode persists under `live`'s open fd + advisory lock) and let
-        // the next open create a FRESH inode under the same name.
+        // Pin the original sidecar inode across the replace. The store's
+        // interprocess lock is transient (acquired per transaction, then
+        // dropped — `StoreCore` holds no sidecar fd), so nothing keeps the
+        // original inode allocated on its own. On an inode-recycling
+        // filesystem (tmpfs, as under Kyra's Linux `/tmp`) an unlinked inode
+        // with no open fd is reused immediately, so the recreation below
+        // would collide back onto the SAME `(dev, inode)` and there would be
+        // no replacement to detect. An explicit held fd guarantees the
+        // recreated sidecar gets a DISTINCT inode on every filesystem.
+        let pin = std::fs::File::open(&lock_path).expect("pin the original sidecar inode");
+        // Replace the sidecar: unlink its directory entry (the original inode
+        // persists under `pin`) and let the next open create a FRESH inode
+        // under the same name.
         std::fs::remove_file(&lock_path).expect("unlink the old sidecar");
         let err = OrgRevocationStore::open_existing(&path)
             .expect_err("a recreated sidecar under a live core must be refused");
@@ -2956,6 +2966,7 @@ mod tests {
             matches!(err, OrgRevocationError::BackingIdentityConflict { .. }),
             "got: {err}",
         );
+        drop(pin);
         drop(live);
     }
 
@@ -3253,12 +3264,21 @@ mod tests {
         let store = OrgRevocationStore::init(&path).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
 
-        // Replace the `.lock` sidecar under the LIVE store: unlink it (the
-        // old inode persists via the store's open fd + advisory lock); the
-        // next lock open recreates it with a fresh inode.
+        // Replace the `.lock` sidecar under the LIVE store. The store's
+        // interprocess lock is transient (per transaction — `StoreCore`
+        // holds no sidecar fd), so the original inode is NOT kept allocated
+        // on its own. Pin it with an explicit fd so the recreation is
+        // guaranteed a DISTINCT inode even on an inode-recycling filesystem
+        // (tmpfs, as under Kyra's Linux `/tmp`, reuses an unlinked inode with
+        // no open fd immediately — which would collide the recreated sidecar
+        // back onto the original identity, leaving nothing to detect).
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        std::fs::remove_file(PathBuf::from(lock_path)).expect("unlink sidecar");
+        let lock_path = PathBuf::from(lock_path);
+        let pin = std::fs::File::open(&lock_path).expect("pin the original sidecar inode");
+        // Unlink the entry (the old inode persists via `pin`); the next lock
+        // open recreates it with a fresh inode.
+        std::fs::remove_file(&lock_path).expect("unlink sidecar");
 
         let err = store
             .apply_bundle(&bundle_with_floor(9))
@@ -3270,6 +3290,7 @@ mod tests {
         // The live view never advanced past 5.
         assert_eq!(store.floor_for(&org().org_id(), &member()), 5);
 
+        drop(pin);
         // Nor did the disk: a fresh handle (after the live core drops so
         // its stale path binding is released) reads 5, never 9.
         drop(store);
