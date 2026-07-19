@@ -1004,6 +1004,93 @@ async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// OA3-5a: a live inbound owner-scoped announcement is opened under this node's
+/// OWN owner audience, verified (provider membership + floors + freshness), and
+/// landed in the private-discovery store — queryable without ever touching the
+/// plaintext fold. A wrong-audience or expired envelope is refused, never stored.
+#[tokio::test]
+async fn an_inbound_owner_scoped_announcement_is_verified_and_stored() {
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use net::adapter::net::behavior::org_authority::NodeAuthority;
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+    let node = build_node_with(EntityKeypair::from_bytes([0x60u8; 32])).await;
+    let node_entity = node.entity_id().clone();
+    let org = OrgKeypair::from_bytes([0x88u8; 32]);
+    let node_cert =
+        OrgMembershipCert::try_issue(&org, node_entity.clone(), 1, 3600).expect("node cert");
+    let dir = std::env::temp_dir().join(format!("net-oa35-ingest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority =
+        Arc::new(NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt"));
+    // The node's OWN owner audience — a same-org provider seals to it.
+    let handle = authority.audience.audience_handle;
+    let key = *authority.audience.discovery_key();
+    node.install_node_authority(authority).expect("install");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let descriptor = CapabilitySet::new()
+        .add_tag("nrpc:peer-secret")
+        .to_bytes_compact();
+
+    // A same-org PROVIDER's owner-scoped envelope, sealed to `disc_key`.
+    let make_envelope = |seed: u8, disc_key: [u8; 32], expires_at: u64| -> (EntityId, Vec<u8>) {
+        let provider_kp = EntityKeypair::from_bytes([seed; 32]);
+        let provider_entity = provider_kp.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(&org, provider_entity.clone(), 1, 3600)
+            .expect("provider cert");
+        let env = ScopedCapabilityAnnouncement::build_owner(
+            &provider_kp,
+            org.org_id(),
+            cert,
+            handle,
+            &disc_key,
+            1,
+            expires_at,
+            &descriptor,
+        )
+        .expect("build owner envelope");
+        (provider_entity, env.to_bytes())
+    };
+
+    // Good: sealed to the node's real audience key, in-window → verified + stored.
+    let (good_provider, good_bytes) = make_envelope(0x61, key, now + 3600);
+    node.ingest_scoped_announcement_for_test(&good_bytes);
+    assert!(
+        node.scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &good_provider),
+        "the verified owner-scoped provider is exposed in the private-discovery store",
+    );
+
+    // Wrong audience: same handle, DIFFERENT discovery key → AEAD open fails.
+    let (bad_provider, bad_bytes) = make_envelope(0x62, [0x99u8; 32], now + 3600);
+    node.ingest_scoped_announcement_for_test(&bad_bytes);
+    assert!(
+        !node
+            .scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &bad_provider),
+        "a wrong-audience envelope is refused and never stored",
+    );
+
+    // Expired: the freshness gate refuses it at ingest.
+    let (exp_provider, exp_bytes) = make_envelope(0x63, key, now.saturating_sub(10));
+    node.ingest_scoped_announcement_for_test(&exp_bytes);
+    assert!(
+        !node
+            .scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|p| p == &exp_provider),
+        "an expired envelope is refused at ingest",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
 /// emission derived from the STALE visibility snapshot. The send-time generation
 /// check — shared by every self-emission path via `announcement_bytes_for_send`

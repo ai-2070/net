@@ -1028,6 +1028,15 @@ struct DispatchCtx {
     /// against implicit floor 0. Same `ArcSwapOption` install
     /// surface as `migration_handler`.
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// OA3-5: the installed node authority — its owner audience credential
+    /// (discovery_key + handle) opens inbound owner-scoped announcement
+    /// envelopes. Absent ⇒ this node cannot ingest scoped discovery and drops
+    /// every `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` packet.
+    node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA3-5: the private-discovery store verified scoped announcements land in.
+    /// See the matching field doc on `MeshNode`.
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
@@ -4478,6 +4487,15 @@ pub struct MeshNode {
     /// `node_authority_dir` config at construction); replacement by
     /// a DIFFERENT owner org is refused — one node, one owner.
     node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA3-5: the node's private-discovery store — verified owner/grant-scoped
+    /// capabilities opened from inbound `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`
+    /// envelopes. Structurally disjoint from the plaintext capability fold; only
+    /// a node holding the matching audience key can populate it (an INVOKE-only /
+    /// un-adopted node drops every scoped envelope). `parking_lot` mutex — ingest
+    /// and sweep are short synchronous critical sections on the inbound dispatch
+    /// path, with no await held.
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -5787,6 +5805,9 @@ impl MeshNode {
             migration_handler: Arc::new(ArcSwapOption::empty()),
             org_revocation: Arc::new(ArcSwapOption::empty()),
             node_authority: Arc::new(ArcSwapOption::empty()),
+            scoped_discovery: Arc::new(parking_lot::Mutex::new(
+                super::behavior::org_scoped_store::ScopedDiscoveryStore::new(),
+            )),
             #[cfg(feature = "cortex")]
             rpc_admission_replay: Arc::new(
                 super::behavior::org_admission_replay::AdmissionReplayGuard::with_defaults(),
@@ -7839,6 +7860,34 @@ impl MeshNode {
             .unwrap_or_default()
     }
 
+    /// Test seam (OA3-5): drive the exact inbound owner-scoped ingest path with a
+    /// raw envelope, without a live two-node transport. Verifies against this
+    /// node's installed authority + live revocation floors and stores on success
+    /// — identical to the `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` dispatch arm.
+    #[doc(hidden)]
+    pub fn ingest_scoped_announcement_for_test(&self, envelope: &[u8]) {
+        Self::ingest_scoped_announcement(
+            &self.node_authority,
+            &self.org_revocation,
+            &self.scoped_discovery,
+            envelope,
+            0,
+        );
+    }
+
+    /// Test seam (OA3-5): the provider entity ids of the owner-scoped
+    /// capabilities the private-discovery store exposes at `now_secs`
+    /// (expiry-safe — tombstoned/expired entries excluded).
+    #[doc(hidden)]
+    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+        self.scoped_discovery
+            .lock()
+            .find_owner_private_capabilities(now_secs, |_| true)
+            .into_iter()
+            .map(|c| c.provider().clone())
+            .collect()
+    }
+
     /// Test seam (OA3 closure witness): advance the visibility generation as a
     /// concurrent registration would, so a send fired after a visibility change
     /// can be observed rejecting the now-stale emission (the send path skips it
@@ -9253,6 +9302,8 @@ impl MeshNode {
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             org_revocation: self.org_revocation.clone(),
+            node_authority: self.node_authority.clone(),
+            scoped_discovery: self.scoped_discovery.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
@@ -10673,6 +10724,28 @@ impl MeshNode {
             // the membership branch above.
             for payload in events {
                 Self::handle_capability_announcement(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // OA3-5: owner/grant-scoped ENCRYPTED capability announcements. Each
+        // event is one `ScopedCapabilityAnnouncement` envelope; only a node
+        // holding the matching audience key opens + verifies it (an INVOKE-only /
+        // un-adopted node ingests nothing). Session-authenticated transport like
+        // the CAP-ANN arm above; the envelope additionally carries its own
+        // provider signature + AEAD, so a forwarded or forged frame this node's
+        // audience cannot open is silently discarded. Dark by default: an unknown
+        // id degrades the same way at the catch-all guard below.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_SCOPED_CAPABILITY_ANN {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::ingest_scoped_announcement(
+                    &ctx.node_authority,
+                    &ctx.org_revocation,
+                    &ctx.scoped_discovery,
+                    &payload,
+                    from_node,
+                );
             }
             return;
         }
@@ -16258,6 +16331,83 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             );
+        }
+    }
+
+    /// OA3-5: open, verify, and store ONE inbound owner-scoped announcement
+    /// envelope. Shared by the [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] dispatch arm
+    /// (parts from [`DispatchCtx`]) and the test seam
+    /// (`ingest_scoped_announcement_for_test`) so both exercise the identical
+    /// verify+store path.
+    ///
+    /// A node WITHOUT an installed authority holds no owner audience key and
+    /// drops every envelope (INVOKE-only / un-adopted nodes ingest nothing). The
+    /// envelope is opened against this node's OWN owner audience and checked
+    /// against the LIVE revocation floors (`verify_scoped_ingest`): a
+    /// wrong-audience, expired, floored-provider, or forged envelope is refused
+    /// and never stored. Only the owner audience is attempted here;
+    /// granted-audience ingest is OA3-4b2.
+    fn ingest_scoped_announcement(
+        node_authority: &Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+        org_revocation: &Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
+        >,
+        payload: &[u8],
+        from_node: u64,
+    ) {
+        use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+        use super::behavior::org_scoped_ingest::{
+            verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
+        };
+
+        // No installed authority ⇒ no owner audience key ⇒ cannot open. Drop with
+        // zero further work (an unknown-subprotocol frame degrades the same way).
+        let Some(authority) = node_authority.load_full() else {
+            return;
+        };
+        // `from_bytes` is verified-by-construction: structural + bounds + the
+        // provider's outer signature. A decode/verify failure drops silently.
+        let Ok(envelope) = ScopedCapabilityAnnouncement::from_bytes(payload) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                len = payload.len(),
+                "scoped-ann: envelope decode/verify failed"
+            );
+            return;
+        };
+        let owner_org = authority.owner_org();
+        let audience = AudienceAuthority::owner(owner_org, &authority.audience);
+        // Verify against the node's LIVE revocation floors, so a provider whose
+        // cert generation the org has since floored is refused at ingest. Hold
+        // the snapshot `Arc` and borrow through it; an un-adopted node with no
+        // revocation store floor-checks against an implicit empty floor set.
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = org_revocation.load_full().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        let ctx = ScopedIngestContext {
+            local_owner_org: owner_org,
+            floors,
+            now_secs: super::behavior::org::current_timestamp(),
+            skew_secs: authority.config.verification_skew_secs,
+        };
+        match verify_scoped_ingest(&envelope, &audience, &ctx) {
+            Ok(verified) => {
+                let outcome = scoped_discovery.lock().ingest(verified);
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    ?outcome,
+                    "scoped-ann: owner-audience capability ingested"
+                );
+            }
+            Err(e) => {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    error = %e,
+                    "scoped-ann: verify refused"
+                );
+            }
         }
     }
 
