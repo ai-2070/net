@@ -693,3 +693,108 @@ async fn live_two_node_protected_call_service_bypasses_legacy_gate() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// OA3-4b1 confidentiality-exit witnesses (Kyra OA3 closure)
+// ============================================================================
+
+/// A trivial handler for the emission witnesses — never actually invoked.
+struct TrivialHandler;
+
+#[async_trait::async_trait]
+impl RpcHandler for TrivialHandler {
+    async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: Bytes::from_static(b"ok"),
+        })
+    }
+}
+
+/// OA3 closure (Kyra #3): registration visibility is AUTHORITATIVE over caller
+/// baseline residue. An owner-scoped service's `nrpc:` tag left in the caller
+/// baseline must NOT leak into the plaintext announcement, while an unrelated tag
+/// survives — proving the subtraction runs on the public builder.
+#[tokio::test]
+async fn owner_scoped_residue_is_stripped_from_the_plaintext_announcement() {
+    let server = build_node_with(EntityKeypair::from_bytes([0x51u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "residue-strip");
+
+    // Register "secret" OWNER-SCOPED (requires the installed authority). Hold the
+    // handle so the registration is not torn down by Drop.
+    let _secret = server
+        .serve_rpc_owner_scoped("secret", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("owner-scoped serve");
+
+    // Announce a baseline that (as a caller might) pre-tags the owner-scoped
+    // service AND carries an unrelated tag.
+    let baseline = CapabilitySet::new()
+        .add_tag("nrpc:secret")
+        .add_tag("region:eu-west");
+    server
+        .announce_capabilities(baseline)
+        .await
+        .expect("announce");
+
+    // The stable plaintext announcement excludes nrpc:secret but keeps the
+    // unrelated tag. (The explicit announce and serve's spawned re-announce both
+    // re-derive from user_caps + the registry, converging to the same projection.)
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server
+                .local_announcement_for_test()
+                .map(|a| {
+                    !a.capabilities.has_tag("nrpc:secret")
+                        && a.capabilities.has_tag("region:eu-west")
+                })
+                .unwrap_or(false)
+        })
+        .await,
+        "owner-scoped baseline residue stripped from plaintext; unrelated tag kept",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
+/// emission derived from the STALE visibility snapshot. The send-time generation
+/// check — shared by every self-emission path via `announcement_bytes_for_send`
+/// (immediate / deferred flush / late-join push) — refuses it; the visibility
+/// bump already woke a re-announce that will publish a coherent emission.
+#[tokio::test]
+async fn a_send_after_a_visibility_change_refuses_the_stale_emission() {
+    let server = build_node_with(EntityKeypair::from_bytes([0x52u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "vis-race");
+
+    let _svc = server
+        .serve_rpc("svc", Arc::new(TrivialHandler))
+        .expect("public serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+    // An emission is published at the current visibility generation.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_bytes_for_send_for_test().is_some()
+        })
+        .await,
+        "an emission is published",
+    );
+
+    // Simulate a concurrent visibility change AFTER publication (a Public ->
+    // OwnerScoped re-registration advances the registry generation). The cached
+    // emission is now stale.
+    server.test_advance_visibility_generation();
+
+    // Every plaintext send funnels through `announcement_bytes_for_send`, which
+    // now REFUSES the stale emission — so no immediate / deferred / late-join send
+    // ships a tag a visibility change may have made private.
+    assert!(
+        server.announcement_bytes_for_send_for_test().is_none(),
+        "a send after a visibility change must not ship the stale emission",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

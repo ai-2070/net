@@ -2714,20 +2714,47 @@ impl LocalServiceRegistry {
         registration_id: u64,
         visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
     ) -> bool {
-        let newly_present = self
-            .map
-            .insert(
-                service,
-                LocalServiceEntry {
-                    registration_id,
-                    visibility,
-                },
-            )
-            .is_none();
-        if newly_present {
+        let previous = self.map.insert(
+            service,
+            LocalServiceEntry {
+                registration_id,
+                visibility,
+            },
+        );
+        let newly_present = previous.is_none();
+        // Wake the announcer whenever the PUBLIC PROJECTION changes: a name newly
+        // present, OR the SAME name changing visibility (Public <-> OwnerScoped).
+        // The stale-handle replacement protocol permits a same-name upsert under a
+        // new registration id with a DIFFERENT visibility — and that flips whether
+        // `nrpc:<svc>` belongs in the plaintext broadcast, so a silent re-token
+        // here could strand a stale plaintext tag (Kyra OA3 closure). Same-name /
+        // same-visibility re-tokening stays silent (not a capability change).
+        let projection_changed = newly_present
+            || previous
+                .map(|p| p.visibility != visibility)
+                .unwrap_or(false);
+        if projection_changed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
         newly_present
+    }
+
+    /// The current change generation — bumped whenever the public projection
+    /// changes (see [`Self::insert`] / [`Self::remove_if`]). Threaded into the
+    /// published [`LocalCapabilityEmission`] so the send path can reject an
+    /// emission derived from a STALE visibility snapshot before it ships a tag a
+    /// concurrent visibility change has since made private (Kyra OA3 closure).
+    pub(super) fn generation(&self) -> u64 {
+        *self.change_signal.borrow()
+    }
+
+    /// Test seam: advance the change generation exactly as a concurrent
+    /// visibility change would, WITHOUT registering a service — so a send-path
+    /// staleness witness can observe the published emission being rejected. Only
+    /// reachable through [`MeshNode::test_advance_visibility_generation`].
+    #[doc(hidden)]
+    pub(super) fn bump_for_test(&self) {
+        self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Remove `service` ONLY when the stored registration id matches
@@ -2799,6 +2826,12 @@ struct LocalCapabilityEmission {
     // is removed.
     #[allow(dead_code)]
     scoped: Vec<Vec<u8>>,
+    /// The local-service-registry generation this emission's public/scoped
+    /// projection was derived from. The send path rejects the emission if the
+    /// current generation has advanced — a concurrent visibility change may have
+    /// made a still-plaintext tag private (Kyra OA3 closure). `0` when there is no
+    /// registry (non-`cortex`), where no owner-scoped service can exist.
+    visibility_generation: u64,
 }
 
 #[cfg(all(test, feature = "cortex"))]
@@ -2889,6 +2922,36 @@ mod local_service_registry_tests {
 
         assert!(reg.remove_if("svc", 2));
         assert_ne!(gen(&rx), g1, "name leaving the set bumps");
+    }
+
+    /// OA3 closure (Kyra #1): a same-name visibility CHANGE (Public → OwnerScoped)
+    /// must wake the announcer, or a stale plaintext `nrpc:` tag could linger in
+    /// the cached announcement. Same-name / same-visibility re-tokening stays
+    /// silent. Also exposes the generation the send-path staleness check reads.
+    #[test]
+    fn same_name_visibility_change_bumps_the_signal() {
+        let (reg, rx) = registry();
+        let gen = |rx: &tokio::sync::watch::Receiver<u64>| *rx.borrow();
+
+        let g0 = gen(&rx);
+        assert!(reg.insert("svc".to_string(), 1, CapabilityVisibility::Public));
+        let g1 = gen(&rx);
+        assert_ne!(g1, g0, "a newly-present name bumps");
+        assert_eq!(
+            reg.generation(),
+            g1,
+            "generation() tracks the change signal"
+        );
+
+        // Same name, SAME visibility, new registration id → silent re-token.
+        assert!(!reg.insert("svc".to_string(), 2, CapabilityVisibility::Public));
+        assert_eq!(gen(&rx), g1, "same-visibility re-token is silent");
+
+        // Same name, DIFFERENT visibility (Public → OwnerScoped) → MUST bump, so
+        // the announcer re-projects and drops the now-private plaintext tag.
+        assert!(!reg.insert("svc".to_string(), 3, CapabilityVisibility::OwnerScoped));
+        assert_ne!(gen(&rx), g1, "a visibility change bumps the signal");
+        assert_eq!(reg.generation(), gen(&rx));
     }
 
     /// OA3-4b1 confidentiality projection: `public_snapshot` (→ the plaintext
@@ -7531,6 +7594,16 @@ impl MeshNode {
     ) -> Option<Vec<u8>> {
         for _ in 0..16 {
             let cached = self.local_emission.load_full()?;
+            // Reject an emission derived from a STALE visibility snapshot: if a
+            // concurrent registration advanced the projection generation since this
+            // emission was built, its plaintext tag set may no longer be correct
+            // (an owner-scoped service could have replaced a public one). Skip the
+            // send — the visibility bump already woke a re-announce that publishes a
+            // fresh, coherent emission (Kyra OA3 closure).
+            #[cfg(feature = "cortex")]
+            if cached.visibility_generation != self.rpc_local_services.generation() {
+                return None;
+            }
             // Capture the stamp AND PIN the authority/store Arcs it
             // fingerprints (Kyra Gate-1 audit — ABA). `snapshot` is
             // held across the derive + serialize + recheck below, so
@@ -7580,6 +7653,16 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn announcement_bytes_for_send_for_test(&self) -> Option<Vec<u8>> {
         self.announcement_bytes_for_send()
+    }
+
+    /// Test seam (OA3 closure witness): advance the visibility generation as a
+    /// concurrent registration would, so a send fired after a visibility change
+    /// can be observed rejecting the now-stale emission (the send path skips it
+    /// rather than ship a tag a visibility change may have made private).
+    #[cfg(feature = "cortex")]
+    #[doc(hidden)]
+    pub fn test_advance_visibility_generation(&self) {
+        self.rpc_local_services.bump_for_test();
     }
 
     /// Deterministic-witness seam (AV-11): run the send seqlock while
@@ -7674,6 +7757,9 @@ impl MeshNode {
             .store(Some(Arc::new(LocalCapabilityEmission {
                 public: ann,
                 scoped: Vec::new(),
+                // A cert rebuild does NOT change visibility — preserve the
+                // generation so the send-time freshness check still holds.
+                visibility_generation: cached.visibility_generation,
             })));
         tracing::info!(
             version,
@@ -18367,21 +18453,37 @@ impl MeshNode {
             // Gated on `cortex` because `rpc_local_services` only
             // exists when the cortex layer (which provides serve_rpc)
             // is compiled in.
+            // Capture the visibility generation BEFORE deriving the projection and
+            // thread it into the published emission: if a concurrent registration
+            // advances it, the send path rejects the (now stale) emission rather
+            // than ship a tag that became private, and the same bump woke the RT-3
+            // re-announce that republishes at the new generation (Kyra OA3
+            // closure).
+            #[cfg(feature = "cortex")]
+            let visibility_generation = self.rpc_local_services.generation();
+            #[cfg(not(feature = "cortex"))]
+            let visibility_generation = 0u64;
+
             // OA3-4b1 confidentiality projection: ONLY `Public` services
             // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
             // Owner-scoped services are emitted solely as an encrypted
             // owner-audience announcement and must never appear in the clear.
+            // Registration visibility is AUTHORITATIVE over baseline residue: a
+            // caller that pre-tagged (or reused an old baseline containing) an
+            // owner-scoped `nrpc:<svc>` would otherwise leak it — strip those exact
+            // tags from the plaintext set too (Kyra OA3 closure).
             #[cfg(feature = "cortex")]
             let caps = if self.rpc_local_services.is_empty() {
                 caps
             } else {
                 let mut merged = caps;
                 for svc in self.rpc_local_services.public_snapshot() {
-                    let tag = format!("nrpc:{}", svc.as_str());
-                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via
-                    // builder so the parsed-tag form lands and dedupes
-                    // against existing entries.
-                    merged = merged.add_tag(tag);
+                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via builder so
+                    // the parsed-tag form lands and dedupes against existing tags.
+                    merged = merged.add_tag(format!("nrpc:{}", svc.as_str()));
+                }
+                for svc in self.rpc_local_services.owner_scoped_snapshot() {
+                    merged = merged.remove_tag(&format!("nrpc:{}", svc.as_str()));
                 }
                 merged
             };
@@ -18650,6 +18752,7 @@ impl MeshNode {
                 .store(Some(Arc::new(LocalCapabilityEmission {
                     public: broadcast_ann,
                     scoped: Vec::new(),
+                    visibility_generation,
                 })));
 
             // Origin-side rate limit: within-window calls update the

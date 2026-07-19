@@ -652,8 +652,10 @@ handle) plus, newly explicit:
     substrate; audience authority is explicitly Owner or Granted
     with mutually invisible fold scopes; owner-audience envelopes
     use the zero grant_id sentinel in AD; per-grant audiences make
-    rotation surgical; `OwnerScoped` plaintext is labeled fanout
-    control, not confidentiality.
+    rotation surgical; both non-Public visibilities (`OwnerScoped`
+    and `GrantedAudience`) are ENCRYPTED-only — never plaintext
+    (Kyra OA3 ruling; a tag shipped in the clear but hidden from
+    unscoped queries is access-control theater, not confidentiality).
 11. Audit identity is the full four-party attribution.
 12. Wire evolution honest; unit-explicit timestamps; dual size
     bounds with typed errors, never silent trimming; constants

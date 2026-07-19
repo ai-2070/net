@@ -981,6 +981,18 @@ impl CapabilitySet {
         self
     }
 
+    /// Remove a tag by its user-string form (the inverse of [`Self::add_tag`]).
+    /// Used so registration visibility can be authoritative over caller baseline
+    /// residue: an owner-scoped `nrpc:` tag a caller left in the user baseline is
+    /// stripped before the plaintext announcement is built, so it never leaks
+    /// (Kyra OA3 closure). A tag that does not parse, or is absent, is a no-op.
+    pub fn remove_tag(mut self, tag: &str) -> Self {
+        if let Ok(t) = Tag::parse_user(tag) {
+            self.tags.remove(&t);
+        }
+        self
+    }
+
     /// Advertise this node as **relay-capable** — willing to serve as
     /// a NAT-traversal rendezvous coordinator (and, by the same tag,
     /// a data-plane forwarder). Peers that want to hole-punch prefer a
