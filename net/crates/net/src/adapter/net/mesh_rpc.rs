@@ -6809,8 +6809,8 @@ mod roster_fallback_tests {
         let intent_for = |service: &str| -> OrgProofIntent {
             let caller_entity = caller_kp.entity_id().clone();
             let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
-            let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
-                .expect("cert");
+            let membership =
+                OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600).expect("cert");
             let dispatcher = OrgDispatcherGrant::try_issue(
                 &org_b,
                 caller_entity,
@@ -7120,7 +7120,11 @@ mod roster_fallback_tests {
                 .await,
             Err(RpcError::Codec { .. })
         ));
-        assert_eq!(pending.pending_count(), 0, "no pending leak on unpinned target");
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "no pending leak on unpinned target"
+        );
 
         // Target pinned to a DIFFERENT entity → mismatch, local error, no leak.
         server.test_pin_peer_entity(TARGET, other);
@@ -7130,7 +7134,11 @@ mod roster_fallback_tests {
                 .await,
             Err(RpcError::Codec { .. })
         ));
-        assert_eq!(pending.pending_count(), 0, "no pending leak on provider mismatch");
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "no pending leak on provider mismatch"
+        );
     }
 
     /// E1.1: `serve_rpc_protected` refuses up front — a `PublicAuthenticated`
