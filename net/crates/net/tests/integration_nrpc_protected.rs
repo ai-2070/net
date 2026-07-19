@@ -757,6 +757,89 @@ async fn owner_scoped_residue_is_stripped_from_the_plaintext_announcement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// OA3-4b1 Commit B2: an owner-scoped service is delivered ONLY inside the
+/// encrypted owner-audience envelope on `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`. The
+/// plaintext announcement never carries its `nrpc:` tag; the envelope every send
+/// path ships decrypts under the node's OWN owner audience to a descriptor that
+/// names exactly the owner-scoped service and no public one.
+#[tokio::test]
+async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
+    use net::adapter::net::behavior::org_revocation::OrgRevocationState;
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use net::adapter::net::behavior::org_scoped_ingest::{
+        verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
+    };
+
+    let server = build_node_with(EntityKeypair::from_bytes([0x53u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "scoped-delivery");
+    // The owner envelope embeds the owner cert, so emission must be ENABLED for
+    // any scoped envelope to ship (the same switch the public cert rides).
+    server
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+
+    // One owner-scoped (confidential) service and one public service.
+    let _secret = server
+        .serve_rpc_owner_scoped("secret", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("owner-scoped serve");
+    let _public = server
+        .serve_rpc("open", Arc::new(TrivialHandler))
+        .expect("public serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Converge: the emission every send path reads carries exactly one scoped
+    // envelope, and the plaintext keeps the public tag while excluding the
+    // owner-scoped one.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_scoped_for_send_for_test().len() == 1
+                && server
+                    .local_announcement_for_test()
+                    .map(|a| {
+                        a.capabilities.has_tag("nrpc:open")
+                            && !a.capabilities.has_tag("nrpc:secret")
+                    })
+                    .unwrap_or(false)
+        })
+        .await,
+        "one scoped envelope emitted; plaintext keeps nrpc:open, drops nrpc:secret",
+    );
+
+    // Decrypt the shipped envelope under the node's OWN owner audience and
+    // confirm the sealed descriptor names exactly the owner-scoped service.
+    let scoped = server.announcement_scoped_for_send_for_test();
+    let envelope =
+        ScopedCapabilityAnnouncement::from_bytes(&scoped[0]).expect("decode scoped envelope");
+    let authority = server.node_authority().expect("authority installed");
+    let audience = AudienceAuthority::owner(authority.owner_org(), &authority.audience);
+    let floors = OrgRevocationState::empty();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let ctx = ScopedIngestContext {
+        local_owner_org: authority.owner_org(),
+        floors: &floors,
+        now_secs,
+        skew_secs: 5,
+    };
+    let verified = verify_scoped_ingest(&envelope, &audience, &ctx).expect("owner ingest opens");
+    let descriptor = CapabilitySet::from_bytes(verified.descriptor()).expect("descriptor caps");
+    assert!(
+        descriptor.has_tag("nrpc:secret"),
+        "the encrypted descriptor names the owner-scoped service",
+    );
+    assert!(
+        !descriptor.has_tag("nrpc:open"),
+        "the encrypted descriptor carries only owner-scoped services, never public ones",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
 /// emission derived from the STALE visibility snapshot. The send-time generation
 /// check — shared by every self-emission path via `announcement_bytes_for_send`

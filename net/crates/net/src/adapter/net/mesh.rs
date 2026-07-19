@@ -7479,6 +7479,63 @@ impl MeshNode {
         Ok(())
     }
 
+    /// Seal this node's owner-scoped services into encrypted owner-audience
+    /// announcement envelope(s) for `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` (OA3-4b1
+    /// Commit B2). The descriptor is a [`CapabilitySet`] of the owner-scoped
+    /// `nrpc:<svc>` tags — the private services this envelope confidentially
+    /// advertises to the node's OWN owner audience; a single envelope carries all
+    /// of them (granted-audience fanout is a later slice).
+    ///
+    /// Empty when emission is dark — no installed authority, or the owner cert is
+    /// no longer valid (floored / expired). The envelope embeds that cert and
+    /// rides its validity exactly like the public announcement, so a floored or
+    /// expired provider never ships a scoped envelope with a stale cert (Kyra
+    /// OA3 — scoped rides public-cert validity). A seal/sign failure logs and
+    /// drops the envelope (fail-safe) without blocking the plaintext announcement.
+    #[cfg(feature = "cortex")]
+    fn owner_scoped_envelopes(
+        &self,
+        owner_scoped: &[String],
+        generation: u64,
+        ttl: Duration,
+    ) -> Vec<Vec<u8>> {
+        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+        let now_secs = super::behavior::org::current_timestamp();
+        // Gate on the SAME temporal cert validity the public announcement uses:
+        // no valid emission cert ⇒ no envelope.
+        let Some(owner_cert) = self.owner_cert_for_emission_at(now_secs) else {
+            return Vec::new();
+        };
+        let Some(authority) = self.node_authority.load_full() else {
+            return Vec::new();
+        };
+        let mut descriptor_caps = CapabilitySet::new();
+        for svc in owner_scoped {
+            descriptor_caps = descriptor_caps.add_tag(format!("nrpc:{}", svc.as_str()));
+        }
+        let descriptor = descriptor_caps.to_bytes_compact();
+        let expires_at = now_secs.saturating_add(ttl.as_secs());
+        match ScopedCapabilityAnnouncement::build_owner(
+            &self.identity,
+            authority.owner_org(),
+            owner_cert,
+            authority.audience.audience_handle,
+            authority.audience.discovery_key(),
+            generation,
+            expires_at,
+            &descriptor,
+        ) {
+            Ok(envelope) => vec![envelope.to_bytes()],
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "owner-scoped announcement seal failed; envelope dropped this round"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// The certificate self-announcements attach right now: the
     /// installed authority's owner cert iff emission is enabled.
     fn owner_cert_for_emission(&self) -> Option<super::behavior::org::OrgMembershipCert> {
@@ -7691,6 +7748,19 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn announcement_bytes_for_send_for_test(&self) -> Option<Vec<u8>> {
         self.announcement_bytes_for_send().map(|e| e.public)
+    }
+
+    /// Deterministic-witness seam: the owner-scoped encrypted envelopes a send
+    /// would ship on `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` right now, taken from
+    /// the SAME validated emission load as
+    /// [`Self::announcement_bytes_for_send_for_test`] (so a test observes the
+    /// public and scoped forms of one coherent generation). Empty when nothing
+    /// has been announced or no owner-scoped service is emitting. Test-only.
+    #[doc(hidden)]
+    pub fn announcement_scoped_for_send_for_test(&self) -> Vec<Vec<u8>> {
+        self.announcement_bytes_for_send()
+            .map(|e| e.scoped)
+            .unwrap_or_default()
     }
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a
@@ -18713,13 +18783,13 @@ impl MeshNode {
             // NEVER stored in `local_announcement` or sent. When no owner-scoped
             // service is registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
-            let self_ann = {
+            let (self_ann, scoped_envelopes) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
                 if owner_scoped.is_empty() {
-                    broadcast_ann.clone()
+                    (broadcast_ann.clone(), Vec::new())
                 } else {
                     let mut self_caps = caps;
-                    for svc in owner_scoped {
+                    for svc in &owner_scoped {
                         self_caps = self_caps.add_tag(format!("nrpc:{}", svc.as_str()));
                     }
                     let mut a = CapabilityAnnouncement::new(
@@ -18737,11 +18807,18 @@ impl MeshNode {
                     if sign {
                         a.sign(&self.identity);
                     }
-                    a
+                    // OA3-4b1 Commit B2: seal the owner-scoped services into an
+                    // encrypted owner-audience envelope carried on
+                    // SUBPROTOCOL_SCOPED_CAPABILITY_ANN — never in the plaintext
+                    // `broadcast_ann`. Empty when emission is dark (no valid cert).
+                    let scoped = self.owner_scoped_envelopes(&owner_scoped, version, ttl);
+                    (a, scoped)
                 }
             };
             #[cfg(not(feature = "cortex"))]
             let self_ann = broadcast_ann.clone();
+            #[cfg(not(feature = "cortex"))]
+            let scoped_envelopes: Vec<Vec<u8>> = Vec::new();
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -18786,12 +18863,14 @@ impl MeshNode {
             // owner cert against live state via the [`SendStamp`] seqlock, so no
             // build-time stamp is stored (review-11 P1).
             // Publish public + scoped as ONE unit (Kyra OA3 torn-snapshot
-            // invariant). `scoped` is empty until Commit B populates the owner
-            // envelope; the review-11 P1 send-time seqlock re-validates `public`.
+            // invariant): the plaintext `broadcast_ann` and the owner-scoped
+            // envelopes sealed above go out under one visibility generation. The
+            // review-11 P1 send-time seqlock re-validates `public` and clears
+            // `scoped` if the owner cert it embeds goes stale before a send.
             self.local_emission
                 .store(Some(Arc::new(LocalCapabilityEmission {
                     public: broadcast_ann,
-                    scoped: Vec::new(),
+                    scoped: scoped_envelopes,
                     visibility_generation,
                 })));
 
