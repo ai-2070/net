@@ -459,6 +459,89 @@ fn grant_capability_force_with_discover_is_refused() {
         .code(2);
 }
 
+// --force is refused for grant-capability even without --discover (it used to
+// force-replace a single output). Publication is no-clobber; a forced replace is
+// not crash-atomic (Kyra OA2-F).
+#[test]
+fn grant_capability_force_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(dir.path().join("g.json"))
+        .arg("--force")
+        .assert()
+        .code(2);
+}
+
+// P1 regression: a forced `--out` aimed at a CASE-VARIANT of the org key
+// (`ORG.TOML` vs `org.toml`) must never destroy the root. `--force` is refused
+// before any filesystem work, so the root survives on EVERY platform — not just
+// case-sensitive ones (Kyra OA2-F closure-2).
+#[test]
+fn grant_dispatcher_force_refusal_preserves_a_case_variant_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let case_alias = dir.path().join("ORG.TOML");
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-dispatcher", "--org-key"])
+        .arg(&key)
+        .args(["--dispatcher", DISPATCHER_HEX])
+        .arg("--any-capability")
+        .args(["--out"])
+        .arg(&case_alias)
+        .arg("--force")
+        .assert()
+        .code(2);
+
+    // The org root key is intact — never replaced by grant JSON.
+    assert!(
+        std::fs::read_to_string(&key).unwrap().contains("seed_hex"),
+        "the org root key was not clobbered through a forced case-variant alias",
+    );
+}
+
+// On a case-insensitive filesystem `--out ORG.TOML` collides with the existing
+// `org.toml` root key even without --force: the case-sensitive alias guard does
+// not catch it, but the no-clobber hard-link publish refuses the collision, so
+// the root survives and no stage temp is left behind (Kyra OA2-F closure-2).
+#[cfg(windows)]
+#[test]
+fn grant_dispatcher_case_variant_no_clobber_preserves_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let case_alias = dir.path().join("ORG.TOML");
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-dispatcher", "--org-key"])
+        .arg(&key)
+        .args(["--dispatcher", DISPATCHER_HEX])
+        .arg("--any-capability")
+        .args(["--out"])
+        .arg(&case_alias)
+        .assert()
+        .code(2);
+
+    assert!(
+        std::fs::read_to_string(&key).unwrap().contains("seed_hex"),
+        "the case-variant no-clobber collision preserved the org root key",
+    );
+    assert!(
+        !has_stage_temp(dir.path()),
+        "no .stage. temp remains after the refused case-variant collision",
+    );
+}
+
 #[test]
 fn grant_capability_pair_rollback_leaves_no_grant_when_secret_publish_fails() {
     let dir = tempfile::tempdir().unwrap();

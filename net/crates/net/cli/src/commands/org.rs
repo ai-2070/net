@@ -183,7 +183,10 @@ pub struct GrantDispatcherArgs {
     #[arg(long)]
     pub out: PathBuf,
 
-    /// Overwrite an existing file. Refuses by default.
+    /// Refused: grant artifacts are published no-clobber. A forced replace is
+    /// not crash-atomic and, on a case-insensitive filesystem, an aliased
+    /// `--out` (e.g. `ORG.TOML` vs `org.toml`) could destroy the org key. Write
+    /// to a fresh path, or remove the old file explicitly.
     #[arg(long)]
     pub force: bool,
 
@@ -247,7 +250,10 @@ pub struct GrantCapabilityArgs {
     #[arg(long = "audience-out", value_name = "PATH")]
     pub audience_out: Option<PathBuf>,
 
-    /// Overwrite existing output files. Refuses by default.
+    /// Refused: grant artifacts are published no-clobber (the grant +
+    /// audience-secret pair is not crash-atomic, and a forced replace could
+    /// destroy a case-variant alias of the org key). Write to fresh output
+    /// paths, or remove the old files explicitly.
     #[arg(long)]
     pub force: bool,
 
@@ -295,19 +301,20 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
         created_at: now_iso8601(),
         note: args.note.clone(),
     };
-    let mut toml_text = toml::to_string_pretty(&file)
-        .map_err(|e| generic(format!("failed to serialize org key TOML: {e}")))?;
+    let toml_text = ScrubbedString::new(
+        toml::to_string_pretty(&file)
+            .map_err(|e| generic(format!("failed to serialize org key TOML: {e}")))?,
+    );
 
-    // Same atomic, mode-restricted publish as operator identities —
-    // the org root seed must never be world-readable, even
-    // transiently.
+    // Same atomic, mode-restricted publish as operator identities — the org root
+    // seed must never be world-readable, even transiently. `toml_text` carries
+    // the serialized seed and scrubs on EVERY exit via its Drop guard — including
+    // a failed atomic write or permission-enforcement step, not only the success
+    // tail (Kyra OA2-F). `file` scrubs its own `seed_hex` on Drop.
     let pid = std::process::id();
     let tmp = path.with_extension(format!("tmp.{pid}"));
     write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
     enforce_strict_permissions(&path).await?;
-    // Scrub the serialized seed buffer once published (Kyra OA2-F P1); `file`
-    // scrubs its own `seed_hex` on `Drop`.
-    zeroize_string(&mut toml_text);
 
     // Public summary only — never the seed.
     let summary = OrgKeySummary {
@@ -416,6 +423,7 @@ async fn run_grant_dispatcher(
     args: GrantDispatcherArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
+    refuse_force(args.force)?;
     let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
     let dispatcher = parse_entity_hex(&args.dispatcher)?;
 
@@ -441,15 +449,16 @@ async fn run_grant_dispatcher(
     let grant = OrgDispatcherGrant::try_issue(&keypair, dispatcher.clone(), scope, args.ttl_secs)
         .map_err(|e| invalid_args(format!("grant-dispatcher: {e}")))?;
 
-    // No-clobber atomic publish — never overwrite the org key, never follow /
-    // truncate a leaf symlink (Kyra OA2-F); `--force` replaces symlink-safe.
+    // Staged no-clobber publish — never overwrite the org key, never follow /
+    // truncate a leaf symlink (Kyra OA2-F). `--force` is refused (see
+    // `refuse_force`): a remove-then-link replace is not crash-atomic.
     refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", &args.out)])?;
     let json = serialize_json(&OrgDispatcherGrantFile {
         version: ORG_FILE_VERSION,
         grant: grant.clone(),
     })?;
     let tmp = stage_beside(&args.out, &json, false).await?;
-    publish_staged(&tmp, &args.out, args.force).await?;
+    publish_staged(&tmp, &args.out).await?;
 
     let summary = GrantDispatcherOutput {
         path: args.out.display().to_string(),
@@ -472,6 +481,7 @@ async fn run_grant_capability(
     args: GrantCapabilityArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
+    refuse_force(args.force)?;
     let issuer = load_org_key(&args.org_key, args.insecure_permissions).await?;
     let grantee_org = parse_org_hex(&args.grantee_org)?;
     let capability = CapabilityAuthorityId::for_tag(&args.capability);
@@ -520,16 +530,6 @@ async fn run_grant_capability(
     }
     refuse_aliased_paths(&alias_paths)?;
 
-    // The grant + audience-secret PAIR is published atomically no-clobber, so
-    // `--force` (replace) is incompatible with `--discover` — write to fresh
-    // output paths instead (Kyra OA2-F).
-    if args.discover && args.force {
-        return Err(invalid_args(
-            "--force cannot be combined with --discover: the grant + audience-secret pair is \
-             published atomically no-clobber; write to fresh output paths instead",
-        ));
-    }
-
     // Target: exactly one of --target-node / --target-any-owned-by.
     let (target_scope, target_label) = match (&args.target_node, &args.target_any_owned_by) {
         (Some(entity_hex), None) => {
@@ -564,13 +564,14 @@ async fn run_grant_capability(
     )
     .map_err(|e| invalid_args(format!("grant-capability: {e}")))?;
 
-    // Publish TRANSACTIONALLY (Kyra OA2-F): stage both artifacts in their
-    // destination dirs, then publish each no-clobber; if the second publish
-    // fails, roll back the first so a partial run never leaves a grant without
-    // its secret (or the reverse). Temps are cleaned up synchronously on any
-    // failure. Single-file grants honor --force (symlink-safe replace); the
-    // --discover pair does not (rejected above). The raw discovery key lives
-    // ONLY in the audience file — never in the grant, never on the wire.
+    // Publish as STAGED NO-CLOBBER with error rollback (Kyra OA2-F): stage both
+    // artifacts in their destination dirs, then publish each no-clobber; if the
+    // second publish fails, roll back the first so a partial run never leaves a
+    // grant without its secret (or the reverse). This is NOT crash-atomic across
+    // the two files (a crash between them can leave one), so `--force` is refused
+    // (`refuse_force`) and operators write to fresh paths. Temps are cleaned up
+    // synchronously on failure. The raw discovery key lives ONLY in the in-memory
+    // scrub guard and the audience file — never in the grant, never on the wire.
     let grant_json = serialize_json(&OrgCapabilityGrantFile {
         version: ORG_FILE_VERSION,
         grant: grant.clone(),
@@ -581,25 +582,41 @@ async fn run_grant_capability(
                 .audience_out
                 .as_ref()
                 .expect("--discover requires --audience-out (validated above)");
-            let mut secret_bytes = secret.encode_config();
+            // The guard scrubs this in-memory copy of the raw key on EVERY exit —
+            // including the `?` on grant staging below (Kyra OA2-F). Scrub the
+            // source array too so the `encode_config()` temporary isn't left in
+            // freed stack memory.
+            let mut raw = secret.encode_config();
+            let secret_bytes = ScrubbedBytes::new(raw.to_vec());
+            zeroize_slice(&mut raw);
             let grant_tmp = stage_beside(&args.out, &grant_json, false).await?;
-            let secret_tmp = match stage_beside(audience_out, &secret_bytes, true).await {
+            let secret_tmp = match stage_beside(audience_out, secret_bytes.as_slice(), true).await {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tokio::fs::remove_file(&grant_tmp).await;
-                    zeroize_slice(&mut secret_bytes);
+                    remove_file_or_warn(&grant_tmp, "staging temp").await;
                     return Err(e);
                 }
             };
-            zeroize_slice(&mut secret_bytes);
-            // Grant first (no-clobber; --discover forbids --force).
-            if let Err(e) = publish_staged(&grant_tmp, &args.out, false).await {
-                let _ = tokio::fs::remove_file(&secret_tmp).await;
+            // The secret is persisted to its staged file now; drop the in-memory
+            // copy (scrubs).
+            drop(secret_bytes);
+            // Grant first (no-clobber).
+            if let Err(e) = publish_staged(&grant_tmp, &args.out).await {
+                remove_file_or_warn(
+                    &secret_tmp,
+                    "staging temp (holds a copy of the audience secret)",
+                )
+                .await;
                 return Err(e);
             }
-            // Then the secret; roll back the grant if it fails.
-            if let Err(e) = publish_staged(&secret_tmp, audience_out, false).await {
-                let _ = tokio::fs::remove_file(&args.out).await;
+            // Then the secret; roll back the grant if it fails so we never leave
+            // a grant without its matching secret.
+            if let Err(e) = publish_staged(&secret_tmp, audience_out).await {
+                remove_file_or_warn(
+                    &args.out,
+                    "grant (rollback: its audience secret failed to publish)",
+                )
+                .await;
                 return Err(e);
             }
             warn_secret_permissions(audience_out, args.insecure_permissions);
@@ -607,7 +624,7 @@ async fn run_grant_capability(
         }
         None => {
             let tmp = stage_beside(&args.out, &grant_json, false).await?;
-            publish_staged(&tmp, &args.out, args.force).await?;
+            publish_staged(&tmp, &args.out).await?;
             None
         }
     };
@@ -760,6 +777,65 @@ fn zeroize_string(s: &mut String) {
     zeroize_slice(bytes);
 }
 
+/// RAII volatile-scrub for a byte buffer holding secret material: zeroes on drop
+/// so EVERY exit path (early return, `?`, panic/unwind) scrubs — not only a
+/// success tail reached after all fallible operations (Kyra OA2-F). Non-secret
+/// payloads may use it too; the extra memset is harmless and keeps staging
+/// uniform.
+struct ScrubbedBytes(Vec<u8>);
+
+impl ScrubbedBytes {
+    fn new(bytes: Vec<u8>) -> Self {
+        ScrubbedBytes(bytes)
+    }
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ScrubbedBytes {
+    fn drop(&mut self) {
+        zeroize_slice(&mut self.0);
+    }
+}
+
+/// RAII volatile-scrub for a `String` holding secret material (e.g. the
+/// serialized org root seed): scrubs on EVERY exit, including error returns from
+/// the atomic write or the permission-enforcement step, not only the success
+/// tail (Kyra OA2-F).
+struct ScrubbedString(String);
+
+impl ScrubbedString {
+    fn new(s: String) -> Self {
+        ScrubbedString(s)
+    }
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl Drop for ScrubbedString {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.0);
+    }
+}
+
+/// Grant artifacts are published NO-CLOBBER: `--force` is refused for the grant
+/// verbs because a remove-then-link replace is not crash-atomic (a crash between
+/// the two loses the old artifact) and, on a case-insensitive filesystem, an
+/// aliased `--out` (e.g. `ORG.TOML` vs `org.toml`) could destroy the org key.
+/// Write to a fresh path, or remove the old artifact explicitly (Kyra OA2-F).
+fn refuse_force(force: bool) -> Result<(), CliError> {
+    if force {
+        return Err(invalid_args(
+            "--force is refused for grant commands: publication is no-clobber (a forced replace \
+             is not crash-atomic and, on a case-insensitive filesystem, an aliased output could \
+             destroy the org key). Write to a fresh path, or remove the old artifact explicitly.",
+        ));
+    }
+    Ok(())
+}
+
 /// Load + parse an org key file, honoring the ssh-style permission
 /// gate (the seed is root-of-trust material for the whole org).
 async fn load_org_key(path: &Path, insecure_permissions: bool) -> Result<OrgKeypair, CliError> {
@@ -792,40 +868,37 @@ fn load_org_key_from_text(text: &str, path: &Path) -> Result<OrgKeypair, CliErro
             path.display()
         ))
     })?;
-    // Decode into a scrubbed buffer; on error, report the category, never the
-    // offending value.
-    let mut seed_bytes = hex::decode(parsed.seed_hex.as_bytes()).map_err(|_| {
+    // Decode into an RAII-scrubbed buffer so the seed clears on EVERY return
+    // (hex error, length error, mismatch, success, or unwind) — not only a
+    // manually placed cleanup statement at the tail (Kyra OA2-F). On error report
+    // the category, never the offending value.
+    let seed_bytes = ScrubbedBytes::new(hex::decode(parsed.seed_hex.as_bytes()).map_err(|_| {
         invalid_args(format!(
             "org key file {} seed_hex is not valid hex (kind: bad_seed_encoding)",
             path.display()
         ))
-    })?;
-    let result = (|| {
-        if seed_bytes.len() != 32 {
-            return Err(invalid_args(format!(
-                "org key file {} seed must be 32 bytes (64 hex chars), got {} (kind: \
-                 bad_seed_length)",
-                path.display(),
-                seed_bytes.len()
-            )));
-        }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_bytes);
-        let keypair = OrgKeypair::from_bytes(seed);
-        zeroize_slice(&mut seed);
-        // Consistency check: a hand-edited org_id_hex that disagrees with the
-        // seed would otherwise sign as one org while claiming another.
-        let derived = hex::encode(keypair.org_id().as_bytes());
-        if !parsed.org_id_hex.eq_ignore_ascii_case(&derived) {
-            return Err(invalid_args(format!(
-                "org key file {}: org_id_hex does not match the key derived from seed_hex",
-                path.display()
-            )));
-        }
-        Ok(keypair)
-    })();
-    zeroize_slice(&mut seed_bytes);
-    result
+    })?);
+    if seed_bytes.as_slice().len() != 32 {
+        return Err(invalid_args(format!(
+            "org key file {} seed must be 32 bytes (64 hex chars), got {} (kind: bad_seed_length)",
+            path.display(),
+            seed_bytes.as_slice().len()
+        )));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(seed_bytes.as_slice());
+    let keypair = OrgKeypair::from_bytes(seed);
+    zeroize_slice(&mut seed);
+    // Consistency check: a hand-edited org_id_hex that disagrees with the seed
+    // would otherwise sign as one org while claiming another.
+    let derived = hex::encode(keypair.org_id().as_bytes());
+    if !parsed.org_id_hex.eq_ignore_ascii_case(&derived) {
+        return Err(invalid_args(format!(
+            "org key file {}: org_id_hex does not match the key derived from seed_hex",
+            path.display()
+        )));
+    }
+    Ok(keypair)
 }
 
 /// Parse a 32-byte org id from hex (optional `0x` prefix).
@@ -842,13 +915,12 @@ fn parse_org_hex(s: &str) -> Result<OrgId, CliError> {
     Ok(OrgId::from_bytes(arr))
 }
 
-/// Atomically publish a SECRET file at mode 0600 (same discipline as
-/// the org root key and the OA-1 `owner-audience.key`) — the raw
-/// audience key must never be world-readable, even transiently.
 /// Lexically normalize a path (absolute, `.`-collapsed) for alias comparison —
 /// enough to catch a path passed as two outputs or aliased onto the input,
 /// within the trustworthy-parent boundary (no fs access, so `..` / symlinks are
-/// not resolved).
+/// not resolved). This is a best-effort UX guard, case-sensitive; the actual
+/// safety comes from no-clobber publication plus the `--force` refusal, not from
+/// this comparison (Kyra OA2-F).
 fn normalize_for_alias(p: &Path) -> PathBuf {
     std::path::absolute(p)
         .unwrap_or_else(|_| p.to_path_buf())
@@ -910,7 +982,10 @@ async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<P
         .unwrap_or("artifact");
     let tmp = final_path.with_file_name(format!(".{file_name}.stage.{}", stage_nonce()));
     let tmp_owned = tmp.clone();
-    let bytes_owned = bytes.to_vec();
+    // Wrap the copied payload so it scrubs on EVERY exit of the blocking task
+    // (open/write/sync failure, success, or unwind) — not only a success tail
+    // reached after all fallible steps (Kyra OA2-F).
+    let payload = ScrubbedBytes::new(bytes.to_vec());
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -919,15 +994,30 @@ async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<P
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(if secret { 0o600 } else { 0o644 });
         }
+        #[cfg(not(unix))]
+        {
+            // On Windows the temp inherits the parent directory's NTFS DACL; the
+            // 0600 request has no std analog (warned about at publish time).
+            let _ = secret;
+        }
+        // `create_new`: on open failure we created nothing (never remove a file
+        // we don't own — the AlreadyExists case is someone else's file). Once
+        // open succeeds we own the temp, so remove it SYNCHRONOUSLY on any
+        // subsequent write/sync failure — a partial (possibly secret) temp is
+        // never left behind (Kyra OA2-F).
         let mut f = opts.open(&tmp_owned)?;
-        std::io::Write::write_all(&mut f, &bytes_owned)?;
-        f.sync_all()?;
-        // Scrub the staged copy of a secret payload once fsynced.
-        let mut bytes_owned = bytes_owned;
-        if secret {
-            zeroize_slice(&mut bytes_owned);
+        let written = (|| -> std::io::Result<()> {
+            std::io::Write::write_all(&mut f, payload.as_slice())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp_owned);
+            return Err(e);
         }
         Ok(())
+        // `payload` drops here (and on every early return above), scrubbing the
+        // copied bytes.
     })
     .await
     .map_err(|e| generic(format!("stage-write task panicked: {e}")))?
@@ -937,32 +1027,25 @@ async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<P
 
 /// Publish a staged temp onto `final_path` with NO-CLOBBER semantics: hard-link
 /// (fails if `final_path` exists — never follows/truncates a leaf), then unlink
-/// the temp and `fsync` the parent dir. With `force`, first remove any existing
-/// leaf (symlink-safe: `remove_file` does not follow the link) before linking.
-/// On any failure the temp is cleaned up SYNCHRONOUSLY (no detached task that
-/// may not run before process exit — Kyra OA2-F).
-async fn publish_staged(tmp: &Path, final_path: &Path, force: bool) -> Result<(), CliError> {
-    if force {
-        if let Err(e) = tokio::fs::remove_file(final_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                let _ = tokio::fs::remove_file(tmp).await;
-                return Err(generic(format!(
-                    "failed to replace {}: {e}",
-                    final_path.display()
-                )));
-            }
-        }
-    }
+/// the temp and `fsync` the parent dir. There is NO forced-replace path: a
+/// remove-then-link is not crash-atomic (a crash between the two loses the old
+/// artifact), so `--force` is refused upstream (`refuse_force`). On a hard-link
+/// failure the temp is cleaned up SYNCHRONOUSLY, and a failure to remove the
+/// temp after a SUCCESSFUL publish is surfaced LOUDLY (a lingering `*.stage.*`
+/// may be an extra name for a secret payload) — never silently ignored (Kyra
+/// OA2-F).
+async fn publish_staged(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
     let tmp_owned = tmp.to_path_buf();
     let final_owned = final_path.to_path_buf();
     let link = tokio::task::spawn_blocking(move || std::fs::hard_link(&tmp_owned, &final_owned))
         .await
         .map_err(|e| generic(format!("publish task panicked: {e}")))?;
     if let Err(e) = link {
-        let _ = tokio::fs::remove_file(tmp).await;
+        remove_file_or_warn(tmp, "staging temp").await;
         return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
             invalid_args(format!(
-                "file already exists at {}; pass --force to overwrite",
+                "file already exists at {}; grant artifacts are no-clobber — write to a fresh \
+                 path or remove the old artifact explicitly",
                 final_path.display()
             ))
         } else {
@@ -970,9 +1053,26 @@ async fn publish_staged(tmp: &Path, final_path: &Path, force: bool) -> Result<()
         });
     }
     // The final path is now an independent name for the inode; drop the temp.
-    let _ = tokio::fs::remove_file(tmp).await;
+    // A removal failure here is surfaced loudly (never ignored) — a lingering
+    // secret stage temp is an extra owner-only name for that secret.
+    remove_file_or_warn(tmp, "staging temp").await;
     sync_parent_dir(final_path).await;
     Ok(())
+}
+
+/// Remove a transient artifact, warning LOUDLY with the exact path if removal
+/// fails (best-effort by nature — the publish already succeeded or is being
+/// rolled back — but never silent). A lingering `*.stage.*` for a secret payload
+/// is an extra owner-only name for that secret (Kyra OA2-F).
+async fn remove_file_or_warn(path: &Path, what: &str) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "warning: failed to remove {what} {}: {e}; remove it manually.",
+            path.display()
+        ),
+    }
 }
 
 /// On Windows the CLI has no clean 0600 analog from `std::fs`, so a secret file
