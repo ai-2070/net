@@ -36,10 +36,13 @@ use crate::adapter::net::identity::EntityId;
 
 /// The fold partition a verified capability belongs to (§3.3). Owner, Grant, and
 /// Public entries are mutually invisible and invisible to unscoped queries
-/// (enforced by the fold in OA3-4). A scoped ingest only ever yields `Owner` or
-/// `Grant`; `Public` is the partition the existing plaintext CAP-ANN path maps
-/// to, included here so the fold has one exhaustive scope type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (enforced by the separate scoped store in OA3-4). A scoped ingest only ever
+/// yields `Owner` or `Grant`; `Public` is the partition the existing plaintext
+/// CAP-ANN path maps to, included here so the scope type is exhaustive.
+///
+/// `Ord` is derived so the scope can key the scoped store's `BTreeMap`; the
+/// order carries no semantics beyond deterministic iteration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CapabilityAudienceScope {
     /// The plaintext, globally-discoverable partition (existing CAP-ANN).
     Public,
@@ -165,6 +168,29 @@ impl VerifiedScopedCapability {
     /// fold layer).
     pub fn descriptor(&self) -> &[u8] {
         &self.descriptor
+    }
+
+    /// Test-only constructor for a capability of an arbitrary scope, bypassing
+    /// the envelope/verify pipeline — used by the scoped-store unit tests (and to
+    /// witness the store's `Public`-rejection guard, which the real verify path
+    /// can never produce).
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        scope: CapabilityAudienceScope,
+        provider: EntityId,
+        owner_org: OrgId,
+        generation: u64,
+        expires_at: u64,
+        descriptor: Vec<u8>,
+    ) -> Self {
+        Self {
+            scope,
+            provider,
+            owner_org,
+            generation,
+            expires_at,
+            descriptor,
+        }
     }
 }
 
