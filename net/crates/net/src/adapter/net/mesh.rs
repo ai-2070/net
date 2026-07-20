@@ -4503,6 +4503,32 @@ pub struct MeshNode {
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
+    /// OA3-4b2: the PROVIDER grant-audience registry — grants this node's own org
+    /// issued that apply to THIS provider, each paired with its out-of-band
+    /// secret. Lock-free `ArcSwap` so routine grant churn never rotates the
+    /// authority pointer or the owner-scoped emission; the granted-emission
+    /// projection reads it and the send seqlock pointer-compares the exact
+    /// snapshot it sealed under. Mutated only through
+    /// [`Self::install_provider_grant_audience`] /
+    /// [`Self::remove_provider_grant_audience`], serialized by
+    /// `provider_grant_mu`.
+    provider_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+    /// OA3-4b2: the CONSUMER grant-audience registry — grants whose `grantee_org`
+    /// is this node's own org. The inbound nonzero-grant ingest selector looks a
+    /// record up by `grant_id` (confirming the envelope's audience handle) to
+    /// build the granted authority a cross-org envelope verifies against. Role-
+    /// separated from the provider registry: one registry's mutation can never
+    /// invalidate the other. Serialized by `consumer_grant_mu`.
+    consumer_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
+    /// Serializes provider grant-audience install/remove so two concurrent
+    /// mutations cannot both load the same snapshot and lose one. Reads stay
+    /// lock-free off the `ArcSwap` above.
+    provider_grant_mu: parking_lot::Mutex<()>,
+    /// Serializes consumer grant-audience install/remove (see
+    /// `provider_grant_mu`).
+    consumer_grant_mu: parking_lot::Mutex<()>,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -5818,6 +5844,14 @@ impl MeshNode {
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
             ),
+            provider_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
+                super::behavior::org_grant_registry::ProviderGrantSnapshot::empty(),
+            )),
+            consumer_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
+                super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+            )),
+            provider_grant_mu: parking_lot::Mutex::new(()),
+            consumer_grant_mu: parking_lot::Mutex::new(()),
             #[cfg(feature = "cortex")]
             rpc_admission_replay: Arc::new(
                 super::behavior::org_admission_replay::AdmissionReplayGuard::with_defaults(),
@@ -7521,6 +7555,144 @@ impl MeshNode {
     /// OA-1: the installed node authority, if any.
     pub fn node_authority(&self) -> Option<Arc<super::behavior::org_authority::NodeAuthority>> {
         self.node_authority.load_full()
+    }
+
+    /// OA3-4b2: install a PROVIDER grant-audience record — a grant this node's own
+    /// org issued that applies to THIS provider, plus its out-of-band secret. The
+    /// record must satisfy every install invariant (grant verifies, is currently
+    /// valid, carries DISCOVER + a discovery binding, the secret is the grant's
+    /// out-of-band key, `issuer_org == this node's owner org`, and the grant's
+    /// target scope covers this exact provider); otherwise it is refused
+    /// fail-closed. A byte-identical re-install is idempotent; a DIFFERENT
+    /// grant/secret under the same `grant_id` is a
+    /// [`GrantAudienceInstallError::Conflict`] (replacement is an explicit
+    /// remove-then-install). At capacity a new record is refused rather than
+    /// evicting an active one. REQUIRES an installed node authority.
+    ///
+    /// [`GrantAudienceInstallError::Conflict`]: super::behavior::org_grant_registry::GrantAudienceInstallError::Conflict
+    pub fn install_provider_grant_audience(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::GrantAudienceInstalled,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_provider_record, GrantAudienceInstallError, GrantAudienceInstalled,
+        };
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(GrantAudienceInstallError::NoAuthority)?;
+        let now_secs = super::behavior::org::current_timestamp();
+        let record = validate_provider_record(
+            grant,
+            secret,
+            &authority.owner_org(),
+            self.identity.entity_id(),
+            now_secs,
+            authority.config.verification_skew_secs,
+        )?;
+        // Serialize the read-validate-store so two concurrent installs cannot both
+        // load the same snapshot and lose one. Reads elsewhere stay lock-free.
+        let _guard = self.provider_grant_mu.lock();
+        let current = self.provider_grant_audiences.load_full();
+        match current.with_record(Arc::new(record), now_secs)? {
+            Some(next) => {
+                self.provider_grant_audiences.store(Arc::new(next));
+                Ok(GrantAudienceInstalled::Installed)
+            }
+            // Idempotent: an identical record was already present — do NOT rotate
+            // the pointer (a churned snapshot would invalidate cached emissions).
+            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+        }
+    }
+
+    /// OA3-4b2: remove a PROVIDER grant-audience record by `grant_id`. Returns
+    /// `true` iff a record was removed. The removed record's `Arc` stays alive
+    /// while any in-flight snapshot or emission still holds it; its secret key is
+    /// zeroized when the last holder releases it (see
+    /// [`OrgAudienceSecret`](super::behavior::org_grant::OrgAudienceSecret)).
+    pub fn remove_provider_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
+        let _guard = self.provider_grant_mu.lock();
+        let current = self.provider_grant_audiences.load_full();
+        match current.without(grant_id) {
+            Some(next) => {
+                self.provider_grant_audiences.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// OA3-4b2: install a CONSUMER grant-audience record — a grant whose
+    /// `grantee_org` is this node's own org, plus its out-of-band secret. Same
+    /// invariants as the provider install except the role check is
+    /// `grantee_org == this node's owner org` (the grant names A, this node); no
+    /// target-scope check (the target is the remote provider). Idempotent /
+    /// conflict / capacity semantics match the provider install. REQUIRES an
+    /// installed node authority.
+    pub fn install_consumer_grant_audience(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::GrantAudienceInstalled,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_consumer_record, GrantAudienceInstallError, GrantAudienceInstalled,
+        };
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(GrantAudienceInstallError::NoAuthority)?;
+        let now_secs = super::behavior::org::current_timestamp();
+        let record = validate_consumer_record(
+            grant,
+            secret,
+            &authority.owner_org(),
+            now_secs,
+            authority.config.verification_skew_secs,
+        )?;
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.with_record(Arc::new(record), now_secs)? {
+            Some(next) => {
+                self.consumer_grant_audiences.store(Arc::new(next));
+                Ok(GrantAudienceInstalled::Installed)
+            }
+            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+        }
+    }
+
+    /// OA3-4b2: remove a CONSUMER grant-audience record by `grant_id`. Returns
+    /// `true` iff a record was removed. Once removed, no inbound envelope for the
+    /// grant can be opened, and any already-stored record for it becomes
+    /// non-queryable (OA3-4b2 slice 4 query-time consumer currentness).
+    pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.without(grant_id) {
+            Some(next) => {
+                self.consumer_grant_audiences.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test seam (OA3-4b2): the number of active PROVIDER grant-audience records.
+    #[doc(hidden)]
+    pub fn provider_grant_audiences_len_for_test(&self) -> usize {
+        self.provider_grant_audiences.load().len()
+    }
+
+    /// Test seam (OA3-4b2): the number of active CONSUMER grant-audience records.
+    #[doc(hidden)]
+    pub fn consumer_grant_audiences_len_for_test(&self) -> usize {
+        self.consumer_grant_audiences.load().len()
     }
 
     /// OA-1: enable or disable attaching the INSTALLED authority's

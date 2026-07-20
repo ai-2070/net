@@ -29,7 +29,11 @@ use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_grant::{
-    CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+    CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
+    OrgDispatcherGrant,
+};
+use net::adapter::net::behavior::org_grant_registry::{
+    GrantAudienceInstallError, GrantAudienceInstalled,
 };
 use net::adapter::net::behavior::CapabilityAnnouncement;
 use net::adapter::net::cortex::{
@@ -1410,6 +1414,132 @@ async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
             .is_none(),
         "a visibility change during serialization must refuse the stale bytes",
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 1 — the LIVE `MeshNode` grant-audience install/remove surface.
+/// A node owned by org B installs a provider record (a grant IT issued over one
+/// of its own providers) and a consumer record (a grant naming org B as
+/// grantee), exercising the authority-gated APIs, idempotency, removal, and the
+/// no-authority refusal. Pure store wiring — no emission/ingest yet.
+#[tokio::test]
+async fn grant_audience_registries_install_and_remove_on_a_live_node() {
+    // A node with no authority cannot hold grant audiences.
+    let bare = build_node_with(EntityKeypair::from_bytes([0x60u8; 32])).await;
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]); // install_authority's org
+    let org_a = OrgKeypair::from_bytes([0x6Au8; 32]); // a foreign org
+    let (provider_grant, provider_secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:reconcile"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(bare.entity_id().clone()),
+        3600,
+    )
+    .expect("issue provider grant");
+    let provider_secret = provider_secret.expect("DISCOVER mints a secret");
+    assert_eq!(
+        bare.install_provider_grant_audience(provider_grant.clone(), provider_secret)
+            .unwrap_err(),
+        GrantAudienceInstallError::NoAuthority,
+        "a node without authority refuses a grant-audience install",
+    );
+
+    // Adopt org B on the node (owner org = org B's id).
+    let server = build_node_with(EntityKeypair::from_bytes([0x61u8; 32])).await;
+    let node_entity = server.entity_id().clone();
+    let node_cert =
+        OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+    let dir = std::env::temp_dir().join(format!("net-oa34b2-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority =
+        NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+    server
+        .install_node_authority(Arc::new(authority))
+        .expect("install authority");
+
+    // --- Provider record: a grant org B issued over THIS provider node. ---
+    let (p_grant, p_secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:reconcile"),
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::ExactNode(node_entity.clone()),
+        3600,
+    )
+    .expect("issue provider grant");
+    let p_secret = p_secret.expect("secret");
+    let p_grant_id = p_grant.grant_id;
+    // A byte-identical copy of the secret for the idempotent re-install (re-
+    // issuing would mint a fresh random id): round-trip the explicit config codec.
+    let p_secret_copy = net::adapter::net::behavior::org_grant::OrgAudienceSecret::decode_config(
+        &p_secret.encode_config(),
+    )
+    .expect("copy secret");
+
+    assert_eq!(
+        server
+            .install_provider_grant_audience(p_grant.clone(), p_secret)
+            .expect("install provider grant"),
+        GrantAudienceInstalled::Installed,
+    );
+    assert_eq!(server.provider_grant_audiences_len_for_test(), 1);
+    // A byte-identical re-install is an idempotent no-op.
+    assert_eq!(
+        server
+            .install_provider_grant_audience(p_grant.clone(), p_secret_copy)
+            .expect("idempotent re-install"),
+        GrantAudienceInstalled::AlreadyPresent,
+    );
+    assert_eq!(server.provider_grant_audiences_len_for_test(), 1);
+    // A grant this node's org did NOT issue is refused (wrong provider issuer).
+    let (foreign_grant, foreign_secret) = OrgCapabilityGrant::try_issue(
+        &org_a,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:reconcile"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::AnyNodeOwnedBy(org_a.org_id()),
+        3600,
+    )
+    .expect("issue foreign grant");
+    assert_eq!(
+        server
+            .install_provider_grant_audience(foreign_grant, foreign_secret.expect("secret"))
+            .unwrap_err(),
+        GrantAudienceInstallError::WrongProviderIssuer,
+    );
+
+    // --- Consumer record: a grant naming org B (this node's org) as grantee. ---
+    let (c_grant, c_secret) = OrgCapabilityGrant::try_issue(
+        &org_a,
+        org_b.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:remote-svc"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::AnyNodeOwnedBy(org_a.org_id()),
+        3600,
+    )
+    .expect("issue consumer grant");
+    let c_grant_id = c_grant.grant_id;
+    assert_eq!(
+        server
+            .install_consumer_grant_audience(c_grant, c_secret.expect("secret"))
+            .expect("install consumer grant"),
+        GrantAudienceInstalled::Installed,
+    );
+    assert_eq!(server.consumer_grant_audiences_len_for_test(), 1);
+    // The consumer install did NOT touch the provider registry (role separation).
+    assert_eq!(server.provider_grant_audiences_len_for_test(), 1);
+
+    // --- Removal is by grant id and role-scoped. ---
+    assert!(server.remove_provider_grant_audience(&p_grant_id));
+    assert_eq!(server.provider_grant_audiences_len_for_test(), 0);
+    // Removing again is a no-op.
+    assert!(!server.remove_provider_grant_audience(&p_grant_id));
+    // The consumer record is untouched by the provider removal.
+    assert_eq!(server.consumer_grant_audiences_len_for_test(), 1);
+    assert!(server.remove_consumer_grant_audience(&c_grant_id));
+    assert_eq!(server.consumer_grant_audiences_len_for_test(), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
