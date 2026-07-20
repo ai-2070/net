@@ -1087,6 +1087,34 @@ async fn admit_and_dispatch_protected(
         skew_secs: facts.skew_secs,
     };
     let captured_stamp = facts.stamp;
+
+    // Review-7 RED negative-control seam — registration-local, #[cfg(test)] ONLY,
+    // compiled out of production. If this registration was built with the disabled
+    // mode (unreachable from any production constructor), bypass ONLY the
+    // org-admission engine and dispatch the handler. Every provider/transport
+    // precondition above is still enforced: the bridge origin bind, the
+    // authenticated-caller resolution, the local-capability possession check, the
+    // provider self-verification, and the request decode/digest. Removing ONLY
+    // organization admission lets an unauthorized protected call run — the proof
+    // that `verify_org_admission` is load-bearing, independent of any legacy
+    // `may_execute` verdict. The synthetic attribution below is deliberately not a
+    // verified `Admitted`; the point is that execution proceeds WITHOUT one.
+    #[cfg(test)]
+    if reg.red_witness_admission_disabled() {
+        cache_authenticated_response_destination(mesh, cache, inbound);
+        let admitted = crate::adapter::net::behavior::org_admission::Admitted {
+            caller: caller.clone(),
+            acting_org: facts.provider_owner_org,
+            provider_org: facts.provider_owner_org,
+            provider: facts.provider.clone(),
+            capability: invoked_capability,
+        };
+        if let Err(e) = fold.lock().apply_inbound_admitted(inbound, admitted) {
+            tracing::warn!(error = %e, "rpc serve_rpc_protected: fold apply error");
+        }
+        return;
+    }
+
     let outcome = crate::adapter::net::behavior::org_admission::verify_org_admission(
         &ctx,
         &admission_headers,
@@ -3003,6 +3031,37 @@ impl MeshNode {
         )
     }
 
+    /// Test-only (review-7 RED negative control): register a protected service
+    /// whose dispatch bypasses ONLY `verify_org_admission`. NOT a production API —
+    /// compiled out without `cfg(test)`. Requires an installed authority and an
+    /// org-protected mode, exactly like [`Self::serve_rpc_protected`]; the sole
+    /// difference is the disabled admission flag on the captured registration.
+    #[cfg(test)]
+    pub(crate) fn serve_rpc_protected_red_witness_disabled<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        admission: OrgAdmission,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(ServeError::InvalidProtectedRegistration(
+                "admission mode must be org-protected".to_string(),
+            ));
+        }
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::ProtectedRedWitnessDisabled {
+                admission,
+                provider_policy,
+            },
+        )
+    }
+
     /// Register an OWNER-SCOPED unary RPC handler (OA3-4b1): an internal private
     /// capability of this node's OWN org. Its `nrpc:<service>` tag is NEVER
     /// broadcast in the clear — the capability is emitted only as an encrypted
@@ -3280,6 +3339,27 @@ impl MeshNode {
             UnaryAdmission::Granted { provider_policy } => {
                 RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
             }
+            // Test-only (review-7 RED): a protected registration marked to bypass
+            // ONLY the org-admission engine. Same shape validation as a normal
+            // protected registration; the disabled flag is the sole difference.
+            #[cfg(test)]
+            UnaryAdmission::ProtectedRedWitnessDisabled {
+                admission,
+                provider_policy,
+            } => match RegisteredRpcService::protected(
+                registration_id,
+                Arc::from(service),
+                admission,
+                provider_policy,
+            ) {
+                Ok(reg) => reg.with_red_witness_disabled(),
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
         });
         // E1.5 (Kyra #47 B2): the NODE-owned admission replay guard, shared
         // across every protected registration on this node — so `(caller,
@@ -5586,6 +5666,14 @@ enum UnaryAdmission {
     /// [`OrgAdmission::CrossOrgGranted`] invocation authority, and an explicit
     /// provider policy.
     Granted { provider_policy: OrgProviderPolicy },
+    /// Test-only (review-7 RED negative control): a protected registration whose
+    /// dispatch bypasses ONLY `verify_org_admission`. Not reachable from any
+    /// production serve wrapper; compiled out entirely without `cfg(test)`.
+    #[cfg(test)]
+    ProtectedRedWitnessDisabled {
+        admission: OrgAdmission,
+        provider_policy: OrgProviderPolicy,
+    },
 }
 
 impl UnaryAdmission {
@@ -5598,6 +5686,8 @@ impl UnaryAdmission {
             Self::Public | Self::Protected { .. } => CapabilityVisibility::Public,
             Self::OwnerScoped { .. } => CapabilityVisibility::OwnerScoped,
             Self::Granted { .. } => CapabilityVisibility::GrantedAudience,
+            #[cfg(test)]
+            Self::ProtectedRedWitnessDisabled { .. } => CapabilityVisibility::Public,
         }
     }
 }
@@ -8771,6 +8861,228 @@ mod roster_fallback_tests {
              (handler dark) and the replay of the first genuine call was refused",
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OA-4 slice 5 (review-7 RED) — `OrgAdmission` is load-bearing, independent
+    /// of any legacy `may_execute` verdict. On a provider whose target-wide
+    /// allow-list aggregation makes `may_execute(P, C, S)` FALSE while
+    /// `has_local_capability(P, C)` is TRUE:
+    ///   * positive control — a VALID org proof for C is admitted through the
+    ///     protected path (the legacy gate cannot block it);
+    ///   * negative control — an unauthorized (no-proof) request is denied and the
+    ///     handler stays dark;
+    ///   * RED — re-registering C with the `#[cfg(test)]`-only disabled mode (which
+    ///     bypasses ONLY `verify_org_admission`, after every provider/transport
+    ///     precheck) makes the SAME unauthorized request run the handler.
+    ///
+    /// The RED succeeding proves the org-admission engine is the load-bearing
+    /// authority: removing it alone — nothing else — admits an unauthorized call.
+    /// The disabled registration does not outlive this test.
+    #[tokio::test]
+    async fn seam_red_org_admission_is_load_bearing() {
+        use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use crate::adapter::net::behavior::fold::capability_bridge::{
+            has_local_capability, may_execute,
+        };
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]); // provider owner
+        let org_a = OrgKeypair::from_bytes([0x7au8; 32]); // caller org
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa4-seamred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        const CALLER_NODE: u64 = 0xC1;
+        let caller_kp = EntityKeypair::from_bytes([0x4bu8; 32]);
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let future = (current_timestamp() + 20) * 1_000_000_000;
+
+        // A valid CROSS-ORG proof for C: caller S ∈ org A holds a B→A INVOKE grant
+        // covering exactly this provider.
+        let membership = OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600)
+            .expect("membership");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_a,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher");
+        let grant = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        let valid_proof = |call_id: u64| {
+            OrgCallProof::sign_for_call(
+                &caller_kp,
+                membership.clone(),
+                dispatcher.clone(),
+                Some(grant.clone()),
+                org_a.org_id(),
+                org_b.org_id(),
+                node_entity.clone(),
+                call_id,
+                cap,
+                future,
+                digest,
+            )
+            .encode()
+            .expect("encode proof")
+        };
+        let make_event = |ch: u64, headers: Vec<Vec<u8>>, call_id: u64| {
+            let mut payload = base.clone();
+            payload.headers = headers
+                .into_iter()
+                .map(|h| (ORG_ADMISSION_HEADER.to_string(), h))
+                .collect();
+            let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut frame, 0);
+            frame.extend_from_slice(&payload.encode());
+            RpcInboundEvent {
+                channel_hash: ch,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        };
+        // The review-7 provider state: a self-announcement giving P a target-wide
+        // restrictive allow-list (an unrelated capability D excluding S), so the
+        // legacy gate would deny S — yet C is present locally.
+        let restrict = |version: u64| {
+            let mut ann = CapabilityAnnouncement::new(
+                server.node_id(),
+                node_entity.clone(),
+                version,
+                CapabilitySet::new().add_tag("nrpc:svc").add_tag("nrpc:d"),
+            );
+            ann.allowed_nodes = vec![0xDEAD];
+            server.test_inject_capability_announcement(ann);
+            assert!(
+                has_local_capability(server.capability_fold(), server.node_id(), "nrpc:svc"),
+                "the provider holds C locally",
+            );
+            assert!(
+                !may_execute(
+                    server.capability_fold(),
+                    server.node_id(),
+                    "nrpc:svc",
+                    CALLER_NODE
+                ),
+                "may_execute(P, C, S) is false via target-wide allow-list aggregation",
+            );
+        };
+
+        // ---- Phase A: admission ENFORCED. ----
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve_enforced = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::CrossOrgGranted,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve enforced");
+        let ch = serve_enforced.channel_hash;
+        restrict(100);
+
+        // Positive control: a valid proof is admitted despite may_execute == false.
+        server.deliver_rpc_inbound_for_test(ch, make_event(ch, vec![valid_proof(700)], 700));
+        // Negative control: an unauthorized (no-proof) request is denied.
+        server.deliver_rpc_inbound_for_test(ch, make_event(ch, vec![], 701));
+        // A second valid call closes the FIFO barrier.
+        server.deliver_rpc_inbound_for_test(ch, make_event(ch, vec![valid_proof(702)], 702));
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 2).await,
+            "both valid proofs are admitted through the protected path",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            2,
+            "the two valid proofs admitted (legacy gate cannot block C); the no-proof \
+             request was denied under enforced admission",
+        );
+
+        // ---- Phase B: RED — admission DISABLED for an equivalent C. ----
+        drop(serve_enforced);
+        let serve_disabled = server
+            .serve_rpc_protected_red_witness_disabled(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::CrossOrgGranted,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve red-witness-disabled");
+        let ch2 = serve_disabled.channel_hash;
+        restrict(200); // re-establish the review-7 condition after the re-register
+
+        // The SAME unauthorized (no-proof) request now RUNS the handler — proving
+        // that removing ONLY verify_org_admission is what admitted it.
+        server.deliver_rpc_inbound_for_test(ch2, make_event(ch2, vec![], 703));
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 3).await,
+            "RED: with org admission disabled, the unauthorized protected call ran the handler",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            3,
+            "disabling ONLY verify_org_admission let the unauthorized protected call execute — \
+             OrgAdmission is load-bearing, independent of the legacy may_execute verdict",
+        );
+
+        drop(serve_disabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

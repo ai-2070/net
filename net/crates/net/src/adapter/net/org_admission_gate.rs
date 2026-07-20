@@ -313,6 +313,12 @@ pub struct RegisteredRpcService {
     visibility: CapabilityVisibility,
     admission: OrgAdmission,
     provider_policy: OrgProviderPolicy,
+    /// Test-only (review-7 RED negative control): when set, the protected
+    /// dispatch bypasses ONLY `verify_org_admission` for this registration. Never
+    /// selectable from a production constructor; compiled out entirely without
+    /// `cfg(test)`, so a shipping build cannot carry the bypass.
+    #[cfg(test)]
+    red_witness_disabled: bool,
 }
 
 /// An invalid [`RegisteredRpcService`] construction (Kyra E1 audit).
@@ -339,6 +345,8 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::Public,
             admission: OrgAdmission::PublicAuthenticated,
             provider_policy: Arc::new(|_| true),
+            #[cfg(test)]
+            red_witness_disabled: false,
         }
     }
 
@@ -362,6 +370,8 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::Public,
             admission,
             provider_policy,
+            #[cfg(test)]
+            red_witness_disabled: false,
         })
     }
 
@@ -382,6 +392,8 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::OwnerScoped,
             admission: OrgAdmission::OwnerDelegated,
             provider_policy,
+            #[cfg(test)]
+            red_witness_disabled: false,
         }
     }
 
@@ -404,7 +416,26 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::GrantedAudience,
             admission: OrgAdmission::CrossOrgGranted,
             provider_policy,
+            #[cfg(test)]
+            red_witness_disabled: false,
         }
+    }
+
+    /// Test-only (review-7 RED negative control): `true` iff this registration
+    /// was marked to bypass ONLY `verify_org_admission`. Compiled out of
+    /// production — a shipping build has no way to observe or set the flag.
+    #[cfg(test)]
+    pub(crate) fn red_witness_admission_disabled(&self) -> bool {
+        self.red_witness_disabled
+    }
+
+    /// Test-only (review-7 RED negative control): mark this registration so the
+    /// protected dispatch bypasses ONLY the org-admission engine. Reachable only
+    /// from the `#[cfg(test)]` serve seam, never a production constructor.
+    #[cfg(test)]
+    pub(crate) fn with_red_witness_disabled(mut self) -> Self {
+        self.red_witness_disabled = true;
+        self
     }
 
     /// The generation token (E0.1) this registration owns.
