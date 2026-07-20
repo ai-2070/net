@@ -2325,3 +2325,146 @@ async fn grant_audience_registries_install_and_remove_on_a_live_node() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// OA-4 slice 1 — live cross-org CrossOrgGranted invocation (Tier 1)
+//
+// The first end-to-end CrossOrgGranted INVOKE over the real transport: caller S
+// (org A) holds a B→A capability grant carrying INVOKE for the provider P₂'s
+// capability; P₂ (org B) serves the protected service under `CrossOrgGranted`.
+// This is the invocation analog of the OwnerDelegated `live_two_node_owner_
+// delegated_admit`, and the harness slice 4's DISCOVER|INVOKE row reuses.
+// ============================================================================
+
+/// A cross-org INVOKE intent: caller `caller_kp` is a member of grantee org `A`
+/// and holds a B→A capability grant (issued by provider-owner org `B`) carrying
+/// INVOKE for `nrpc:<service>`, whose `target_scope` covers provider `P₂`.
+///
+/// A pure-INVOKE grant carries NO audience material by construction — the
+/// returned secret is `None` (the structural rule, asserted here), so this
+/// invocation path never touches discovery.
+fn cross_org_invoke_intent(
+    caller_kp: EntityKeypair,
+    org_a: &OrgKeypair,
+    org_b: &OrgKeypair,
+    provider: EntityId,
+    service: &str,
+    target_scope: GrantTargetScope,
+) -> OrgProofIntent {
+    let caller_entity = caller_kp.entity_id().clone();
+    let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
+    // Membership + dispatcher grant come from the caller's OWN org A (the acting
+    // org named by the membership); the capability grant comes from org B.
+    let membership =
+        OrgMembershipCert::try_issue(org_a, caller_entity.clone(), 1, 3600).expect("membership");
+    let dispatcher =
+        OrgDispatcherGrant::try_issue(org_a, caller_entity, DispatcherScope::Exact(cap), 3600)
+            .expect("dispatcher");
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        org_b,
+        org_a.org_id(),
+        cap,
+        GrantRights::INVOKE,
+        target_scope,
+        3600,
+    )
+    .expect("issue cross-org INVOKE grant");
+    assert!(
+        secret.is_none(),
+        "an INVOKE-only grant carries no audience material by construction",
+    );
+    OrgProofIntent {
+        caller: Arc::new(caller_kp),
+        membership,
+        dispatcher,
+        capability_grant: Some(grant),
+        acting_org: org_a.org_id(),
+        provider_owner_org: org_b.org_id(),
+        provider,
+        capability: cap,
+        proof_ttl_secs: 30,
+    }
+}
+
+/// LIVE cross-org admit over the real transport: caller S ∈ org A invokes a
+/// protected `CrossOrgGranted` service on provider P₂ ∈ org B under a B→A INVOKE
+/// grant. The provider gate verifies the proof, the handler runs exactly once
+/// with the exact FIVE-field attribution (caller S, acting org A, provider org
+/// B, provider P₂, capability C), the raw proof header is stripped before the
+/// handler view, and the reply returns to S.
+#[tokio::test]
+async fn live_two_node_cross_org_granted_admit() {
+    const CALLER_SEED: [u8; 32] = [0x1au8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+
+    // Provider P₂ is owned by org B; the caller acts for a DISTINCT org A.
+    let (org_b, dir) = install_authority(&server, "xorg-admit");
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    assert_ne!(org_a.org_id(), org_b.org_id(), "A and B are distinct orgs");
+    let provider = server.entity_id().clone();
+    let caller_entity = caller.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw = Arc::new(AtomicBool::new(false));
+    let attribution_ok = Arc::new(AtomicBool::new(false));
+    let stripped = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(AdmitHandler {
+                calls: calls.clone(),
+                saw_admission: saw.clone(),
+                attribution_ok: attribution_ok.clone(),
+                proof_stripped: stripped.clone(),
+                expected_caller: caller_entity,
+                // Cross-org: the caller acts for org A; P₂ is owned by org B.
+                expected_acting_org: org_a.org_id(),
+                expected_provider_org: org_b.org_id(),
+                expected_provider: provider.clone(),
+                expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected cross-org");
+
+    // The grant covers exactly P₂ (ExactNode). Same caller seed ⇒ the
+    // authenticated session peer matches the proof subject.
+    let intent = cross_org_invoke_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_a,
+        &org_b,
+        provider.clone(),
+        "svc",
+        GrantTargetScope::ExactNode(provider),
+    );
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let reply = caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect("admitted cross-org call returns Ok");
+
+    assert_eq!(reply.body.as_ref(), b"pong", "the reply returns to S");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "handler observed org_admission attribution (Some)",
+    );
+    assert!(
+        attribution_ok.load(Ordering::SeqCst),
+        "all five attribution fields (caller S, acting org A, provider org B, provider P₂, \
+         capability nrpc:svc) match — no caller-claimed field is used as attribution",
+    );
+    assert!(
+        stripped.load(Ordering::SeqCst),
+        "the raw net-org-admission proof header was stripped from the handler view",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
