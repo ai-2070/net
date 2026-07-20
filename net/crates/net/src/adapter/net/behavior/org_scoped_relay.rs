@@ -105,17 +105,86 @@ pub struct RelayDedupKey {
 ///   attacker-controlled `expires_at`;
 /// * when full, an unseen identity is refused FAIL-CLOSED — an active seen-key is
 ///   never evicted merely to admit another, or a re-flooded duplicate for the
-///   evicted key would restart the flood loop.
+///   evicted key would restart the flood loop;
+/// * occupancy is accounted PER INGRESS PEER and capped, so no single peer can
+///   consume the whole gate and turn that fail-closed refusal into a mesh-wide
+///   outage (§7 — see [`Self::MAX_ENTRIES_PER_PEER`]).
 #[derive(Default)]
 pub struct ScopedAnnRelayGate {
-    /// `outer identity -> local retention deadline (unix secs)`.
-    seen: Mutex<BTreeMap<RelayDedupKey, u64>>,
+    inner: Mutex<RelayGateInner>,
+}
+
+/// One remembered relay identity.
+#[derive(Debug)]
+struct SeenEntry {
+    /// Local retention deadline (unix secs).
+    deadline: u64,
+    /// The authenticated ingress peer whose frame first admitted this identity.
+    /// Held so the sweep can return the slot to that peer's budget.
+    admitted_by: u64,
+}
+
+#[derive(Default)]
+struct RelayGateInner {
+    /// GLOBAL dedup — one identity is relayed at most once per node no matter
+    /// how many peers deliver it. Keyed on the outer identity ALONE, never on
+    /// `(peer, identity)`: keying per peer would admit the same envelope once
+    /// per ingress adjacency and reopen the flood amplification this gate
+    /// exists to close.
+    seen: BTreeMap<RelayDedupKey, SeenEntry>,
+    /// Live occupancy per ingress peer, derived from `seen` and kept in step
+    /// with it by every mutation. A peer with no live entries is removed, so
+    /// this never grows past the number of peers actually holding slots.
+    per_peer: BTreeMap<u64, usize>,
+}
+
+impl RelayGateInner {
+    /// Drop horizon-passed entries, returning each slot to its admitting peer's
+    /// budget. A horizon-passed key is fully forgotten and admissible again.
+    fn sweep(&mut self, now_secs: u64) {
+        let per_peer = &mut self.per_peer;
+        self.seen.retain(|_, entry| {
+            if now_secs < entry.deadline {
+                return true;
+            }
+            if let Some(count) = per_peer.get_mut(&entry.admitted_by) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    per_peer.remove(&entry.admitted_by);
+                }
+            }
+            false
+        });
+    }
 }
 
 impl ScopedAnnRelayGate {
     /// Hard bound on tracked identities. A distinct-identity flood is refused
     /// fail-closed at the cap rather than growing without bound.
     const MAX_ENTRIES: usize = 8192;
+    /// Hard bound on how many live entries ONE ingress peer may hold (§7).
+    ///
+    /// Without this, the fail-closed rule above is a denial-of-service
+    /// primitive rather than a protection. The gate is keyed on the envelope's
+    /// SELF-DECLARED provider identity: `ScopedCapabilityAnnouncement::from_bytes`
+    /// verifies the outer signature against whatever provider key the sender
+    /// chose, `OrgMembershipCert::from_bytes` does not verify at all, and a
+    /// frame at `hop_count > 0` skips the direct-origin bind. So relay
+    /// identities are free to mint — one session-authenticated peer could
+    /// generate `MAX_ENTRIES` fresh keypairs, fill the gate for
+    /// `RETENTION_SECS`, and every subsequent LEGITIMATE envelope would hit the
+    /// capacity refusal. Because `decide_scoped_relay` returning `None`
+    /// suppresses the local ingest as well as the forward, that is a total
+    /// scoped-discovery blackout — and since the fill-phase envelopes are
+    /// themselves forwarded, one ~3.6 MB burst propagates it across the
+    /// connected mesh.
+    ///
+    /// Capping per-peer occupancy at an eighth of the gate bounds one peer's
+    /// share and leaves the rest available to everyone else. Colluding peers
+    /// can still combine, but each must hold an authenticated session — a far
+    /// higher bar than minting keypairs, and one the transport already
+    /// accounts for.
+    const MAX_ENTRIES_PER_PEER: usize = Self::MAX_ENTRIES / 8;
     /// How long a seen identity is remembered, as a LOCAL cap (not the
     /// envelope's `expires_at`). Long enough to absorb a flood's settling +
     /// ordinary re-announce cadence; short enough that the bounded map drains.
@@ -126,25 +195,39 @@ impl ScopedAnnRelayGate {
         Self::default()
     }
 
-    /// Admit `key` for forwarding + local open iff it is FRESH (unseen within
-    /// the retention horizon) and the gate has room; record it when admitted.
-    /// Returns `false` for a duplicate (drop before any AEAD / forward work) or
-    /// when the gate is full (fail-closed refusal — see the type docs).
-    pub fn admit(&self, key: RelayDedupKey, now_secs: u64) -> bool {
-        let mut seen = self.seen.lock();
-        // Expire on the LOCAL horizon before deciding — a horizon-passed key is
-        // fully forgotten and its identity is admissible again.
-        seen.retain(|_, deadline| now_secs < *deadline);
-        if seen.contains_key(&key) {
+    /// Admit `key`, delivered by authenticated ingress peer `from_node`, for
+    /// forwarding + local open iff it is FRESH (unseen within the retention
+    /// horizon) and both the per-peer and global budgets have room; record it
+    /// when admitted.
+    ///
+    /// Returns `false` for a duplicate (drop before any AEAD / forward work),
+    /// when `from_node` is over its own budget, or when the gate is globally
+    /// full — the last two are fail-closed refusals, see the type docs.
+    pub fn admit(&self, from_node: u64, key: RelayDedupKey, now_secs: u64) -> bool {
+        let mut inner = self.inner.lock();
+        inner.sweep(now_secs);
+        if inner.seen.contains_key(&key) {
             return false; // duplicate — already relayed this outer identity
         }
-        if seen.len() >= Self::MAX_ENTRIES {
+        // Per-peer budget FIRST, so a flooding peer exhausts its own share
+        // before it can apply any pressure to the global cap.
+        if inner.per_peer.get(&from_node).copied().unwrap_or(0) >= Self::MAX_ENTRIES_PER_PEER {
+            return false;
+        }
+        if inner.seen.len() >= Self::MAX_ENTRIES {
             // FAIL-CLOSED at capacity: never evict an active seen-key to make
             // room, or a re-flooded duplicate for that key would be admitted
             // again and reflood. The horizon sweep above is the only reclaim.
             return false;
         }
-        seen.insert(key, now_secs.saturating_add(Self::RETENTION_SECS));
+        inner.seen.insert(
+            key,
+            SeenEntry {
+                deadline: now_secs.saturating_add(Self::RETENTION_SECS),
+                admitted_by: from_node,
+            },
+        );
+        *inner.per_peer.entry(from_node).or_insert(0) += 1;
         true
     }
 
@@ -152,7 +235,7 @@ impl ScopedAnnRelayGate {
     /// module unit tests and the live relay witness's `_for_test` seam to
     /// confirm a relay ADMITTED (and thus forwarded) an envelope it can't store.
     pub(crate) fn len(&self) -> usize {
-        self.seen.lock().len()
+        self.inner.lock().seen.len()
     }
 }
 
@@ -216,7 +299,7 @@ pub fn decide_scoped_relay(
         audience_handle: *envelope.audience_handle(),
         generation: envelope.generation(),
     };
-    if !gate.admit(key, now_secs) {
+    if !gate.admit(from_node, key, now_secs) {
         return None;
     }
     // Forward while below the hop cap; only the outer hop prefix is rewritten —
@@ -273,56 +356,160 @@ mod tests {
         assert!(ScopedCapabilityRelayFrame::decode(&framed).is_none());
     }
 
+    /// An arbitrary authenticated ingress peer for the gate unit tests.
+    const PEER: u64 = 0xA1;
+
     #[test]
     fn gate_admits_a_fresh_identity_once() {
         let gate = ScopedAnnRelayGate::new();
-        assert!(gate.admit(key_n(1, 7), 1_000), "first sighting admits");
         assert!(
-            !gate.admit(key_n(1, 7), 1_000),
+            gate.admit(PEER, key_n(1, 7), 1_000),
+            "first sighting admits"
+        );
+        assert!(
+            !gate.admit(PEER, key_n(1, 7), 1_000),
             "the identical identity is a duplicate"
         );
         // A different generation for the same provider is a distinct identity.
-        assert!(gate.admit(key_n(1, 8), 1_000), "newer generation is fresh");
+        assert!(
+            gate.admit(PEER, key_n(1, 8), 1_000),
+            "newer generation is fresh"
+        );
         // A different provider is distinct too.
         assert!(
-            gate.admit(key_n(2, 7), 1_000),
+            gate.admit(PEER, key_n(2, 7), 1_000),
             "different provider is fresh"
         );
+    }
+
+    /// Dedup is GLOBAL, not per ingress peer: the same envelope arriving from a
+    /// second adjacency is still a duplicate. Keying the gate on
+    /// `(peer, identity)` would have been the easy way to bound per-peer
+    /// occupancy, and it would have reopened exactly the flood amplification
+    /// this gate exists to close — one relay per adjacency.
+    #[test]
+    fn dedup_is_global_across_ingress_peers() {
+        let gate = ScopedAnnRelayGate::new();
+        assert!(gate.admit(PEER, key_n(1, 7), 1_000));
+        assert!(
+            !gate.admit(PEER + 1, key_n(1, 7), 1_000),
+            "a second peer delivering the SAME identity is still a duplicate"
+        );
+        assert_eq!(gate.len(), 1);
     }
 
     #[test]
     fn gate_expires_on_the_local_horizon() {
         let gate = ScopedAnnRelayGate::new();
-        assert!(gate.admit(key_n(1, 7), 1_000));
+        assert!(gate.admit(PEER, key_n(1, 7), 1_000));
         // Still within the retention horizon: a duplicate is dropped.
-        assert!(!gate.admit(key_n(1, 7), 1_000 + ScopedAnnRelayGate::RETENTION_SECS - 1));
+        assert!(!gate.admit(
+            PEER,
+            key_n(1, 7),
+            1_000 + ScopedAnnRelayGate::RETENTION_SECS - 1
+        ));
         // Past the horizon: the identity is fully forgotten and admissible again.
-        assert!(gate.admit(key_n(1, 7), 1_000 + ScopedAnnRelayGate::RETENTION_SECS));
+        assert!(gate.admit(
+            PEER,
+            key_n(1, 7),
+            1_000 + ScopedAnnRelayGate::RETENTION_SECS
+        ));
     }
 
     #[test]
     fn gate_is_bounded_fail_closed_and_never_evicts_active() {
         let gate = ScopedAnnRelayGate::new();
-        for index in 0..ScopedAnnRelayGate::MAX_ENTRIES as u64 {
-            assert!(gate.admit(key_n(index, 1), 1_000));
+        // Fill to the GLOBAL cap. Spread across enough peers that no single one
+        // hits its own budget first — the per-peer rule is exercised separately
+        // below; this test is about the global bound.
+        let per_peer = ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER;
+        for index in 0..ScopedAnnRelayGate::MAX_ENTRIES {
+            let peer = (index / per_peer) as u64;
+            assert!(gate.admit(peer, key_n(index as u64, 1), 1_000));
         }
         assert_eq!(gate.len(), ScopedAnnRelayGate::MAX_ENTRIES);
         // A brand-new identity at capacity is refused fail-closed — nothing is
-        // evicted (every entry is in-horizon).
+        // evicted (every entry is in-horizon). Delivered by a FRESH peer, so
+        // the refusal is the global cap and not a per-peer budget.
         assert!(
-            !gate.admit(key_n(u64::MAX, 1), 1_000),
+            !gate.admit(u64::MAX, key_n(u64::MAX, 1), 1_000),
             "an unseen identity is refused when full"
         );
         assert_eq!(gate.len(), ScopedAnnRelayGate::MAX_ENTRIES);
         // A duplicate of a still-active key stays a duplicate (it was NOT
         // evicted to admit the flood above).
-        assert!(!gate.admit(key_n(0, 1), 1_000));
+        assert!(!gate.admit(0, key_n(0, 1), 1_000));
         // Once the horizon passes, the whole set is reclaimed and new identities
         // are admissible again.
         assert!(gate.admit(
+            u64::MAX,
             key_n(u64::MAX, 1),
             1_000 + ScopedAnnRelayGate::RETENTION_SECS
         ));
+    }
+
+    /// §7 — one peer must not be able to blackhole scoped discovery.
+    ///
+    /// The gate is keyed on the envelope's SELF-DECLARED provider identity:
+    /// `from_bytes` verifies the outer signature against whatever key the
+    /// sender chose, `OrgMembershipCert::from_bytes` does not verify at all,
+    /// and `hop_count > 0` skips the direct-origin bind. Relay identities are
+    /// therefore free to mint. Combined with the fail-closed capacity rule,
+    /// one session-authenticated peer could fill all 8192 slots for the full
+    /// 600 s retention — and because `decide_scoped_relay` returning `None`
+    /// suppresses the local ingest as well as the forward, that is a total
+    /// scoped-discovery blackout, propagated mesh-wide by the fill-phase
+    /// envelopes' own forwarding.
+    ///
+    /// Red-witness: deleting the per-peer budget check lets the flooder fill
+    /// the gate and the honest peer's admit returns false.
+    #[test]
+    fn one_peer_cannot_starve_another_out_of_the_gate() {
+        let gate = ScopedAnnRelayGate::new();
+        const FLOODER: u64 = 0xBAD;
+        const HONEST: u64 = 0x600D;
+
+        // The flooder mints distinct identities as fast as it likes.
+        let mut admitted = 0usize;
+        for index in 0..ScopedAnnRelayGate::MAX_ENTRIES as u64 {
+            if gate.admit(FLOODER, key_n(index, 1), 1_000) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted,
+            ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER,
+            "a single peer is capped at its own budget",
+        );
+        assert!(
+            gate.len() < ScopedAnnRelayGate::MAX_ENTRIES,
+            "the flooder must not have consumed the whole gate",
+        );
+
+        // An honest peer's legitimate announcement still gets through.
+        assert!(
+            gate.admit(HONEST, key_n(u64::MAX, 1), 1_000),
+            "an honest peer must still be admitted after a flood",
+        );
+    }
+
+    /// The per-peer budget is RECLAIMED as entries age out — it is a live
+    /// occupancy cap, not a lifetime quota. Without the sweep's bookkeeping a
+    /// peer would be permanently throttled after one busy window.
+    #[test]
+    fn per_peer_budget_is_returned_when_entries_expire() {
+        let gate = ScopedAnnRelayGate::new();
+        const PEER_A: u64 = 7;
+        for index in 0..ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER as u64 {
+            assert!(gate.admit(PEER_A, key_n(index, 1), 1_000));
+        }
+        // At budget: refused.
+        assert!(!gate.admit(PEER_A, key_n(u64::MAX, 1), 1_000));
+
+        // Past the horizon the slots return and the peer is admissible again.
+        let later = 1_000 + ScopedAnnRelayGate::RETENTION_SECS;
+        assert!(gate.admit(PEER_A, key_n(u64::MAX, 1), later));
+        assert_eq!(gate.len(), 1, "the expired window was fully reclaimed");
     }
 
     // ---------------- decide_scoped_relay ----------------
