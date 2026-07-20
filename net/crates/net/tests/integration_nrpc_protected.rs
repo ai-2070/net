@@ -3025,3 +3025,404 @@ async fn live_two_node_owner_delegated_floor_survives_restart_denies() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// OA-4 slice 4 — GrantedAudience composition matrix (Tier 1)
+//
+// Private discovery (OA3-4b2) composed with cross-org invocation (OA-4). A
+// consumer resolves the provider from an encrypted grant envelope, then the SAME
+// grant's INVOKE right admits the call — while DISCOVER-only, wrong-dispatcher,
+// and provider-policy-veto all resolve but fail invocation. Rows already
+// witnessed by OA3-4b2 (no-credential, copied-credential, wrong provider
+// owner/target, wrong handle/capability, stale registration, plaintext absence,
+// observer opacity, AD-transplant, post-rotation) are referenced, not repeated.
+// ============================================================================
+
+/// An org-B provider serving one granted-audience `svc` with `handler` and an
+/// admit-all policy, authority installed. Returns the node, its serve handle
+/// (kept alive by the caller), provider entity, and scratch dir.
+async fn granted_service_provider<H: RpcHandler>(
+    seed: u8,
+    svc: &str,
+    handler: Arc<H>,
+) -> (Arc<MeshNode>, ServeHandle, EntityId, std::path::PathBuf) {
+    let p = build_node_with(EntityKeypair::from_bytes([seed; 32])).await;
+    let entity = p.entity_id().clone();
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let cert = OrgMembershipCert::try_issue(&org_b, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-oa4-granted-{svc}-{seed}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    p.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    let handle = p
+        .serve_rpc_granted(svc, handler, Arc::new(|_| true))
+        .expect("granted serve");
+    (p, handle, entity, dir)
+}
+
+/// OA-4 slice 4 — the centerpiece: a consumer holding a DISCOVER|INVOKE grant
+/// privately RESOLVES the exact provider from an encrypted announcement AND
+/// INVOKES that exact provider under the SAME grant. (Plaintext absence and
+/// observer opacity are referenced to the OA3-4b2 witnesses.)
+#[tokio::test]
+async fn live_granted_audience_discovers_then_invokes() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let now = unix_now();
+    let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+        0x61,
+        "svc",
+        Arc::new(DarkHandler {
+            calls: calls.clone(),
+        }),
+    )
+    .await;
+    let (a, a_dir) = adopted_node(0x62, &org_a, "gdisc").await;
+    bring_up(&a, &p2).await;
+
+    // DISCOVER|INVOKE grant B→A for exactly P₂.
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        cap,
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::ExactNode(p_entity.clone()),
+        3600,
+    )
+    .expect("grant");
+    let secret = secret.expect("a DISCOVER grant mints an audience secret");
+    let grant_id = grant.grant_id;
+
+    // Private discovery: A ingests the encrypted announcement and resolves P₂.
+    a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install consumer grant");
+    let p_kp = EntityKeypair::from_bytes([0x61u8; 32]);
+    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
+    a.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        a.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "A privately resolves exactly P₂ under the DISCOVER right",
+    );
+
+    // Invocation: A invokes the exact P₂ under the same grant's INVOKE right.
+    let intent = cross_org_intent_with_grant(
+        EntityKeypair::from_bytes([0x62u8; 32]),
+        &org_a,
+        p_entity.clone(),
+        org_b.org_id(),
+        "svc",
+        grant.clone(),
+    );
+    a.call(
+        p2.node_id(),
+        "svc",
+        Bytes::from_static(b"ping"),
+        CallOptions {
+            org_proof_intent: Some(intent),
+            deadline: Some(Instant::now() + Duration::from_secs(5)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the granted invocation admits");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the exact P₂ handler ran once under the same grant",
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&a_dir);
+}
+
+/// OA-4 slice 4 — DISCOVER-only resolves but cannot invoke (decrypt-without-
+/// invoke). The consumer opens the envelope and resolves P₂, but the grant
+/// carries no INVOKE right, so the invocation is denied `InsufficientRights`
+/// (0x0009, handler dark). Discovery authority never confers invocation.
+#[tokio::test]
+async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let now = unix_now();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+        0x63,
+        "svc",
+        Arc::new(DarkHandler {
+            calls: calls.clone(),
+        }),
+    )
+    .await;
+    let (a, a_dir) = adopted_node(0x64, &org_a, "gdonly").await;
+    bring_up(&a, &p2).await;
+
+    // A DISCOVER-only grant (no INVOKE) mints an audience secret.
+    let (grant, secret) = cross_org_grant(&org_b, &org_a, &p_entity, "svc");
+    let grant_id = grant.grant_id;
+    a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install consumer grant");
+    let p_kp = EntityKeypair::from_bytes([0x63u8; 32]);
+    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
+    a.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        a.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "A resolves P₂ under the DISCOVER right",
+    );
+
+    // The very same grant cannot invoke: it holds no INVOKE right.
+    let intent = cross_org_intent_with_grant(
+        EntityKeypair::from_bytes([0x64u8; 32]),
+        &org_a,
+        p_entity.clone(),
+        org_b.org_id(),
+        "svc",
+        grant.clone(),
+    );
+    let err = a
+        .call(
+            p2.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a DISCOVER-only grant cannot invoke");
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark — discovery did not confer invocation",
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&a_dir);
+}
+
+/// OA-4 slice 4 — a wrong dispatcher resolves but the invocation is denied. The
+/// consumer resolves P₂ under a DISCOVER|INVOKE grant, but presents a dispatcher
+/// grant scoped to a DIFFERENT capability → `DispatcherGrantScope` (post-
+/// discovery invocation denial; discovery and invocation authority stay
+/// separate).
+#[tokio::test]
+async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let now = unix_now();
+    let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (p2, _serve, p_entity, p_dir) = granted_service_provider(
+        0x65,
+        "svc",
+        Arc::new(DarkHandler {
+            calls: calls.clone(),
+        }),
+    )
+    .await;
+    let (a, a_dir) = adopted_node(0x66, &org_a, "gwrongdisp").await;
+    bring_up(&a, &p2).await;
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        cap,
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::ExactNode(p_entity.clone()),
+        3600,
+    )
+    .expect("grant");
+    let secret = secret.expect("secret");
+    let grant_id = grant.grant_id;
+    a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install consumer grant");
+    let p_kp = EntityKeypair::from_bytes([0x65u8; 32]);
+    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
+    a.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        a.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "A resolves P₂",
+    );
+
+    // Invoke with a dispatcher grant scoped to a DIFFERENT capability.
+    let a_entity = a.entity_id().clone();
+    let intent = OrgProofIntent {
+        caller: Arc::new(EntityKeypair::from_bytes([0x66u8; 32])),
+        membership: OrgMembershipCert::try_issue(&org_a, a_entity.clone(), 1, 3600)
+            .expect("membership"),
+        dispatcher: OrgDispatcherGrant::try_issue(
+            &org_a,
+            a_entity,
+            DispatcherScope::Exact(CapabilityAuthorityId::for_tag("nrpc:elsewhere")),
+            3600,
+        )
+        .expect("dispatcher"),
+        capability_grant: Some(grant.clone()),
+        acting_org: org_a.org_id(),
+        provider_owner_org: org_b.org_id(),
+        provider: p_entity.clone(),
+        capability: cap,
+        proof_ttl_secs: 30,
+    };
+    let err = a
+        .call(
+            p2.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a dispatcher scoped elsewhere cannot invoke");
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler stayed dark");
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&a_dir);
+}
+
+/// OA-4 slice 4 — provider policy is final on the granted/cross-org path too. A
+/// consumer with a valid DISCOVER|INVOKE grant resolves P₂, but the provider's
+/// policy vetoes the call → denied (0x0009, handler dark), even though every
+/// credential is valid.
+#[tokio::test]
+async fn live_granted_audience_provider_policy_final() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let now = unix_now();
+    let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+
+    // Provider serves the granted service with a VETO policy.
+    let p2 = build_node_with(EntityKeypair::from_bytes([0x67u8; 32])).await;
+    let p_entity = p2.entity_id().clone();
+    let node_cert =
+        OrgMembershipCert::try_issue(&org_b, p_entity.clone(), 1, 3600).expect("node cert");
+    let p_dir = std::env::temp_dir().join(format!("net-oa4-granted-veto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let authority =
+        NodeAuthority::adopt(&p_dir, node_cert, &p_entity, 0, None).expect("adopt authority");
+    p2.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = p2
+        .serve_rpc_granted(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            Arc::new(|_| false),
+        )
+        .expect("granted serve with veto policy");
+
+    let (a, a_dir) = adopted_node(0x68, &org_a, "gveto").await;
+    bring_up(&a, &p2).await;
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        cap,
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        GrantTargetScope::ExactNode(p_entity.clone()),
+        3600,
+    )
+    .expect("grant");
+    let secret = secret.expect("secret");
+    let grant_id = grant.grant_id;
+    a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install consumer grant");
+    let p_kp = EntityKeypair::from_bytes([0x67u8; 32]);
+    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
+    a.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        a.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "A resolves P₂",
+    );
+
+    let intent = cross_org_intent_with_grant(
+        EntityKeypair::from_bytes([0x68u8; 32]),
+        &org_a,
+        p_entity.clone(),
+        org_b.org_id(),
+        "svc",
+        grant.clone(),
+    );
+    let err = a
+        .call(
+            p2.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the provider policy vetoes the call");
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark under the policy veto",
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&a_dir);
+}
+
+/// OA-4 slice 4 — INVOKE-only grants hold no audience material BY CONSTRUCTION.
+/// Issuance yields no discovery binding and no secret, so there is nothing to
+/// install as an audience, no envelope to emit, and no private resolution. The
+/// registry refusal of a fabricated install is pinned by
+/// `org_grant_registry::invoke_only_grant_is_refused` (Tier 3).
+#[test]
+fn invoke_only_grant_carries_no_discovery_material() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let provider = EntityKeypair::from_bytes([0x69u8; 32]).entity_id().clone();
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:svc"),
+        GrantRights::INVOKE,
+        GrantTargetScope::ExactNode(provider),
+        3600,
+    )
+    .expect("issue INVOKE-only grant");
+    assert!(
+        secret.is_none(),
+        "an INVOKE-only grant mints no audience secret",
+    );
+    assert!(
+        !grant.permits_discover(),
+        "an INVOKE-only grant confers no discovery right",
+    );
+    assert!(grant.permits_invoke(), "it does carry INVOKE");
+}
