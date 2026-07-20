@@ -2215,6 +2215,86 @@ async fn a_visibility_change_during_serialization_refuses_the_stale_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Kyra OA3 review, Finding 2 witness — a REAL registry transition (not a
+/// synthetic counter bump) landing inside the send seqlock must refuse the
+/// already-serialized stale bytes.
+///
+/// `a_visibility_change_during_serialization_refuses_the_stale_bytes` above
+/// drives the same window with `test_advance_visibility_generation`, which
+/// cannot exercise the ordering that matters: the epoch bump and the projection
+/// mutation are one call. Here the probe retires a live PUBLIC registration and
+/// re-registers the same name OWNER-SCOPED through the production
+/// `ServeHandle::drop` + `serve_rpc_owner_scoped` paths, so the epoch bump and
+/// the map mutation are the real, separately-observable events. If the epoch
+/// were bumped AFTER the mutation became visible, this send could observe
+/// "map says private, epoch still old" and release plaintext naming `nrpc:svc`.
+#[tokio::test]
+async fn a_real_registry_transition_during_serialization_refuses_the_stale_bytes() {
+    let server = build_node_with(EntityKeypair::from_bytes([0x54u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "vis-real-transition");
+
+    let public_handle = server
+        .serve_rpc("svc", Arc::new(TrivialHandler))
+        .expect("public serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.announcement_bytes_for_send_for_test().is_some()
+        })
+        .await,
+        "an emission is published",
+    );
+    // Precondition: the published plaintext really does carry the public tag, so
+    // a stale release below would be a genuine disclosure.
+    let published = server
+        .announcement_bytes_for_send_for_test()
+        .expect("published emission");
+    let decoded = CapabilityAnnouncement::from_bytes(&published).expect("decode");
+    assert!(
+        decoded
+            .capabilities
+            .tags
+            .iter()
+            .any(|t| t.to_string() == "nrpc:svc"),
+        "the published plaintext must carry nrpc:svc before the transition",
+    );
+
+    // One-shot probe fired inside the seqlock, after serialize and before the
+    // final stability recheck.
+    let slot = Arc::new(parking_lot::Mutex::new(Some(public_handle)));
+    let installed: Arc<parking_lot::Mutex<Option<net::adapter::net::mesh_rpc::ServeHandle>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let server_probe = server.clone();
+    let slot_probe = Arc::clone(&slot);
+    let installed_probe = Arc::clone(&installed);
+    let probe = move || {
+        if let Some(handle) = slot_probe.lock().take() {
+            // Real retirement through the production Drop path.
+            drop(handle);
+            // Real re-registration of the SAME name at a private visibility.
+            let replacement = server_probe
+                .serve_rpc_owner_scoped("svc", Arc::new(TrivialHandler), Arc::new(|_| true))
+                .expect("owner-scoped re-serve");
+            *installed_probe.lock() = Some(replacement);
+        }
+    };
+    assert!(
+        server
+            .announcement_bytes_for_send_probed_for_test(&probe)
+            .is_none(),
+        "a real Public -> OwnerScoped transition during serialization must refuse          the stale plaintext bytes",
+    );
+    assert!(
+        installed.lock().is_some(),
+        "the probe must actually have performed the transition",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// OA3-4b2 slice 1 — the LIVE `MeshNode` grant-audience install/remove surface.
 /// A node owned by org B installs a provider record (a grant IT issued over one
 /// of its own providers) and a consumer record (a grant naming org B as

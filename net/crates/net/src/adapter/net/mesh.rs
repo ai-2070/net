@@ -2612,7 +2612,56 @@ struct AnnounceGate {
     /// cannot later consume a DIFFERENT deferral's claim and fire
     /// inside a fresh window (RT-1 review Finding 12).
     deferral_generation: u64,
+    /// Monotonic id of the most recent BROADCAST-window claim (Kyra OA3 review,
+    /// Finding 4). A claimant that later discovers its send was refused may only
+    /// roll `last_broadcast_at` back if no one has claimed since — and `Instant`
+    /// equality cannot decide that: two claims can read the SAME `Instant::now()`
+    /// at platform clock resolution (coarse on Windows), so a timestamp match is
+    /// not proof of ownership. Comparing this counter makes "still ours"
+    /// structural rather than clock-resolution-dependent.
+    broadcast_claim_generation: u64,
+    /// The exposure-revocation epoch of the emission most recently BROADCAST
+    /// (Kyra OA3 review, Finding 3). While the live epoch runs ahead of this, a
+    /// revocation has been made locally but not yet superseded on the wire —
+    /// peers are still holding bytes that name a capability to an audience no
+    /// longer entitled to it. An announce in that state is SECURITY-PRIORITY and
+    /// bypasses the rate limit outright: coalescing it into a trailing-edge flush
+    /// leaves the stale exposure standing for the whole window, and on a
+    /// bare-`start` node (no flush task) it would stand until the keep-alive.
+    last_broadcast_exposure_generation: u64,
 }
+
+/// How one pass of [`MeshNode::announce_attempt`] should treat the origin-side
+/// rate limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnnounceMode {
+    /// Ordinary announce: honors the rate limit (coalesce / defer).
+    Routine,
+    /// A corrective re-announce driven by a sender whose own send was refused on
+    /// security grounds (Kyra OA3 review, Finding 3). It MUST bypass coalescing:
+    /// the point is to supersede a revoked exposure now, not at the end of the
+    /// window, and on a bare-`start` node no deferred flush exists at all.
+    SecurityCorrective,
+}
+
+/// What one pass of [`MeshNode::announce_attempt`] actually did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnnounceOutcome {
+    /// The emission was handed to the transport for every connected peer.
+    Sent,
+    /// Rate-limit coalesced or deferred — a pending flush owns the send.
+    Coalesced,
+    /// The send-time seqlock REFUSED the emission (exposure revoked, authority
+    /// rotated, grant snapshot swapped, or stamp churn). Nothing shipped and the
+    /// broadcast claim has been released; the caller owes a corrective pass.
+    RefusedBySecurity,
+}
+
+/// How many corrective passes a security-refused send may drive before giving
+/// up and logging. Each pass rebuilds from the CURRENT baseline, so the state
+/// that caused the refusal is already reflected; more than a couple of rounds
+/// means something is churning pathologically.
+const SECURITY_CORRECTIVE_ATTEMPTS: u8 = 3;
 
 /// A stable snapshot of the AUTHORITATIVE inputs to owner-cert
 /// emission (review-11 P1). Captured directly from live state —
@@ -2709,12 +2758,11 @@ pub(super) struct LocalServiceRegistry {
     /// `service name → { owning registration id, visibility }`.
     map: dashmap::DashMap<String, LocalServiceEntry>,
     change_signal: Arc<tokio::sync::watch::Sender<u64>>,
-    /// Counts only the transitions that can make an ALREADY-BUILT plaintext
-    /// emission leak: a name that was `Public` ceasing to be public (a
-    /// Public → private same-name upsert, or the retirement of a `Public`
-    /// service). Read by the send-path staleness check — see
-    /// [`Self::privatization_generation`].
-    privatization_signal: std::sync::atomic::AtomicU64,
+    /// Counts only the transitions that REVOKE an exposure an already-built
+    /// emission may still be carrying — see [`Self::revokes_exposure`] and
+    /// [`Self::exposure_revocation_generation`]. Covers the encrypted scoped
+    /// envelopes as well as the plaintext set: an emission holds both.
+    exposure_revocation_signal: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "cortex")]
@@ -2723,75 +2771,107 @@ impl LocalServiceRegistry {
         Self {
             map: dashmap::DashMap::new(),
             change_signal,
-            privatization_signal: std::sync::atomic::AtomicU64::new(0),
+            exposure_revocation_signal: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Bump the privatization counter (see the field doc).
-    fn mark_privatized(&self) {
-        self.privatization_signal
+    /// Bump the exposure-revocation counter (see the field doc).
+    fn mark_exposure_revoked(&self) {
+        self.exposure_revocation_signal
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Does moving `service` from `previous` to `next` visibility REVOKE an
+    /// exposure that an emission built under `previous` may still be carrying?
+    ///
+    /// An emission holds a plaintext set AND encrypted owner/granted envelopes,
+    /// so the question is not "did it leave the public set" but "is any audience
+    /// that the cached bytes still address no longer entitled to this name":
+    ///
+    /// - `Public -> OwnerScoped` / `Public -> GrantedAudience` — the cached
+    ///   PLAINTEXT still names it.
+    /// - `OwnerScoped -> GrantedAudience` — the cached OWNER envelope still names
+    ///   it, but the owner audience is no longer the intended audience.
+    /// - `GrantedAudience -> OwnerScoped` — mirror: the cached GRANTED envelopes
+    ///   still name it to the former grantees.
+    ///
+    /// Widenings are safe and must NOT bump: `OwnerScoped -> Public` and
+    /// `GrantedAudience -> Public` leave cached private bytes revealing strictly
+    /// less than the new public state. A same-visibility re-token changes no
+    /// audience. A newly-present name cannot be carried by an emission built
+    /// before it existed, at any visibility.
+    ///
+    /// Grant-set churn WITHIN `GrantedAudience` is a different axis and stays
+    /// covered by the emission's `provider_grant_snapshot` pointer check.
+    fn revokes_exposure(
+        previous: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+        next: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+    ) -> bool {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        previous != next && !matches!(next, CapabilityVisibility::Public)
     }
 
     /// Install `service` owned by `registration_id` with `visibility`. Upserts: a
     /// replacement (new id for the same name, after the incumbent's dispatcher
     /// slot was freed) installs its own token over any lingering stale entry.
-    /// Bumps the local-caps generation only when the NAME is newly present — the
-    /// announced capability set is keyed by name, so re-tokening an existing name
-    /// is not a capability change and must not wake the announcer.
+    /// Wakes the announcer only when the NAME is newly present or its visibility
+    /// changed — the announced capability set is keyed by name, so re-tokening an
+    /// existing name is not a capability change.
+    ///
+    /// **Ordering (Kyra OA3 review, Finding 2).** The exposure-revocation epoch
+    /// MUST linearize BEFORE the projection mutation becomes externally visible,
+    /// so it is bumped under the SAME shard lock that installs the entry, ahead
+    /// of the install. Bumping after the insert leaves a window where the map
+    /// already reads private but the epoch still reads old — a concurrent sender
+    /// passes its staleness check and ships bytes naming a name that just became
+    /// private. The inverse skew (new epoch, old entry) is fail-safe: a sender
+    /// refuses an emission that is still technically valid, and the next build
+    /// blocks on this same shard lock and therefore observes the new entry.
+    ///
+    /// The announcer wake fires AFTER the lock is released — never under it —
+    /// giving the required `epoch -> mutation -> wake` order. Waking before the
+    /// epoch bump would let the announcer publish a fresh-but-immediately-stale
+    /// emission and then get no second wake.
     pub(super) fn insert(
         &self,
         service: String,
         registration_id: u64,
         visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
     ) -> bool {
-        let previous = self.map.insert(
-            service,
-            LocalServiceEntry {
-                registration_id,
-                visibility,
-            },
-        );
-        let newly_present = previous.is_none();
-        // Wake the announcer whenever the PUBLIC PROJECTION changes: a name newly
-        // present, OR the SAME name changing visibility (Public <-> OwnerScoped).
-        // The stale-handle replacement protocol permits a same-name upsert under a
-        // new registration id with a DIFFERENT visibility — and that flips whether
-        // `nrpc:<svc>` belongs in the plaintext broadcast, so a silent re-token
-        // here could strand a stale plaintext tag (Kyra OA3 closure). Same-name /
-        // same-visibility re-tokening stays silent (not a capability change).
-        let projection_changed = newly_present
-            || previous
-                .map(|p| p.visibility != visibility)
-                .unwrap_or(false);
+        use dashmap::mapref::entry::Entry;
+        let installed = LocalServiceEntry {
+            registration_id,
+            visibility,
+        };
+        let (newly_present, projection_changed) = match self.map.entry(service) {
+            Entry::Occupied(mut occupied) => {
+                let previous = *occupied.get();
+                if Self::revokes_exposure(previous.visibility, visibility) {
+                    self.mark_exposure_revoked();
+                }
+                occupied.insert(installed);
+                (false, previous.visibility != visibility)
+            }
+            Entry::Vacant(vacant) => {
+                // A newly-present name revokes no exposure at any visibility: an
+                // emission built before this insert carries no tag for it.
+                vacant.insert(installed);
+                (true, true)
+            }
+        };
+        // Shard lock released above; wake last.
         if projection_changed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
-        }
-        // A registration only invalidates an in-flight plaintext emission when it
-        // takes a name that WAS public out of the public projection. A newly
-        // present name — public or private — cannot: an emission built before this
-        // insert carries no tag for it either way. Keeping the two signals apart
-        // matters because `serve_rpc` / `serve_tool` register several services in a
-        // row, and folding those benign bumps into the send-path check would strand
-        // every announce that raced them (see `privatization_generation`).
-        let privatized = previous
-            .map(|p| {
-                use crate::adapter::net::org_admission_gate::CapabilityVisibility;
-                matches!(p.visibility, CapabilityVisibility::Public)
-                    && !matches!(visibility, CapabilityVisibility::Public)
-            })
-            .unwrap_or(false);
-        if privatized {
-            self.mark_privatized();
         }
         newly_present
     }
 
-    /// The current PRIVATIZATION generation — bumped only when a name that was
-    /// `Public` stops being public (see [`Self::insert`] / [`Self::remove_if`]).
-    /// Threaded into the published [`LocalCapabilityEmission`] so the send path
-    /// can reject an emission whose plaintext tag set a concurrent visibility
-    /// change has since made wrong (Kyra OA3 closure).
+    /// The current EXPOSURE-REVOCATION generation — bumped only by transitions
+    /// that withdraw a name from an audience an already-built emission may still
+    /// be addressing (see [`Self::revokes_exposure`], [`Self::insert`], and
+    /// [`Self::remove_if`]). Threaded into the published
+    /// [`LocalCapabilityEmission`] so the send path can refuse bytes — plaintext
+    /// OR scoped envelope — whose audience is no longer entitled to them.
     ///
     /// Deliberately NOT the announcer's change signal. That signal also fires for
     /// a benign new registration, and `serve_rpc` / `serve_tool` register several
@@ -2799,42 +2879,48 @@ impl LocalServiceRegistry {
     /// mid-registration unsendable, and because the skipped send had already
     /// claimed the rate-limit window, the replacement announce was coalesced away
     /// and the node never published at all.
-    pub(super) fn privatization_generation(&self) -> u64 {
-        self.privatization_signal
+    pub(super) fn exposure_revocation_generation(&self) -> u64 {
+        self.exposure_revocation_signal
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Test seam: advance both generations exactly as a concurrent Public →
-    /// OwnerScoped transition would, WITHOUT registering a service — so a
+    /// Test seam: advance both generations exactly as a concurrent
+    /// exposure-revoking transition would, WITHOUT registering a service — so a
     /// send-path staleness witness can observe the published emission being
     /// rejected. Only reachable through
     /// [`MeshNode::test_advance_visibility_generation`].
     #[doc(hidden)]
     pub(super) fn bump_for_test(&self) {
+        self.mark_exposure_revoked();
         self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
-        self.mark_privatized();
     }
 
     /// Remove `service` ONLY when the stored registration id matches
     /// `registration_id`. A stale handle carrying a superseded id is
-    /// a no-op — the replacement's tag survives. Bumps only when a
-    /// removal actually happened.
+    /// a no-op — the replacement's tag survives.
+    ///
+    /// Retiring a service at ANY visibility revokes the intent to expose it, so
+    /// an emission still advertising it — in plaintext or inside a scoped
+    /// envelope — is stale to whichever audience it addresses. The epoch is
+    /// therefore bumped inside the predicate, under the shard lock and BEFORE
+    /// the removal becomes visible, for the same linearization reason as
+    /// [`Self::insert`]. A stale-token no-op bumps nothing.
     pub(super) fn remove_if(&self, service: &str, registration_id: u64) -> bool {
         let removed = self
             .map
-            .remove_if(service, |_, entry| entry.registration_id == registration_id)
-            .map(|(_, entry)| entry);
-        if let Some(entry) = removed {
+            .remove_if(service, |_, entry| {
+                if entry.registration_id != registration_id {
+                    return false;
+                }
+                self.mark_exposure_revoked();
+                true
+            })
+            .is_some();
+        // Shard lock released above; wake last.
+        if removed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
-            // Retiring a `Public` service leaves an already-built emission
-            // advertising an `nrpc:` tag this node no longer serves — the same
-            // stale-plaintext hazard a Public → private upsert creates.
-            use crate::adapter::net::org_admission_gate::CapabilityVisibility;
-            if matches!(entry.visibility, CapabilityVisibility::Public) {
-                self.mark_privatized();
-            }
         }
-        removed.is_some()
+        removed
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -2933,7 +3019,7 @@ struct LocalCapabilityEmission {
     /// does NOT advance it, so registering a service never strands an in-flight
     /// announce. `0` when there is no registry (non-`cortex`), where no
     /// owner-scoped service can exist.
-    privatization_generation: u64,
+    exposure_revocation_generation: u64,
 }
 
 /// One coherent send-time serialization of the published
@@ -2946,6 +3032,11 @@ struct LocalCapabilityEmission {
 struct SendEmission {
     public: Vec<u8>,
     scoped: Vec<Vec<u8>>,
+    /// The exposure-revocation epoch of the emission these bytes came from.
+    /// Recorded on the gate once they actually ship, so the "a revocation is
+    /// pending on the wire" test stays exact even if a concurrent announce
+    /// republished between this attempt's build and its send.
+    exposure_generation: u64,
 }
 
 #[cfg(all(test, feature = "cortex"))]
@@ -3062,58 +3153,98 @@ mod local_service_registry_tests {
         assert_ne!(gen(&rx), g1, "a visibility change bumps the signal");
     }
 
-    /// The send-path staleness counter is NARROWER than the announcer's change
-    /// signal: it must fire only when a name that WAS public leaves the public
-    /// projection. A benign new registration — the shape `serve_tool` produces
-    /// several of in a row — must NOT advance it, or an announce built mid-
-    /// registration becomes unsendable and (having already claimed the rate-limit
-    /// window) is never replaced.
+    /// Kyra OA3 review, Finding 1 — the send-path staleness counter must fire on
+    /// EXPOSURE REVOCATION, which is broader than "left the public set" and
+    /// narrower than the announcer's change signal.
+    ///
+    /// An emission carries plaintext AND encrypted owner/granted envelopes, so a
+    /// private-to-private move revokes an exposure too: after
+    /// `OwnerScoped -> GrantedAudience` the cached OWNER envelope still names the
+    /// service to an audience that is no longer the intended one, and the mirror
+    /// transition still names it to former grantees. A widening to `Public`
+    /// revokes nothing — cached private bytes reveal strictly less than the new
+    /// public state. A newly-present name at ANY visibility cannot be carried by
+    /// an emission built before it existed, so it must not strand that emission.
     #[test]
-    fn privatization_generation_ignores_benign_registrations() {
+    fn exposure_revocation_generation_transition_matrix() {
+        use CapabilityVisibility::{GrantedAudience as G, OwnerScoped as O, Public as P};
+
+        // (label, seeded prior visibility, next visibility, must advance)
+        let cases: &[(
+            &str,
+            Option<CapabilityVisibility>,
+            CapabilityVisibility,
+            bool,
+        )] = &[
+            ("absent -> Public", None, P, false),
+            ("absent -> OwnerScoped", None, O, false),
+            ("absent -> GrantedAudience", None, G, false),
+            ("Public -> Public (re-token)", Some(P), P, false),
+            ("OwnerScoped -> OwnerScoped (re-token)", Some(O), O, false),
+            ("Granted -> Granted (re-token)", Some(G), G, false),
+            ("OwnerScoped -> Public (widening)", Some(O), P, false),
+            ("Granted -> Public (widening)", Some(G), P, false),
+            ("Public -> OwnerScoped", Some(P), O, true),
+            ("Public -> GrantedAudience", Some(P), G, true),
+            ("OwnerScoped -> GrantedAudience", Some(O), G, true),
+            ("GrantedAudience -> OwnerScoped", Some(G), O, true),
+        ];
+
+        for (label, seed, next, must_advance) in cases {
+            let (reg, _rx) = registry();
+            if let Some(seed) = seed {
+                reg.insert("svc".to_string(), 1, *seed);
+            }
+            let before = reg.exposure_revocation_generation();
+            reg.insert("svc".to_string(), 2, *next);
+            let after = reg.exposure_revocation_generation();
+            if *must_advance {
+                assert_ne!(
+                    after, before,
+                    "{label} revokes an exposure and MUST advance the epoch",
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "{label} revokes nothing and must NOT advance the epoch                      (advancing strands in-flight emissions)",
+                );
+            }
+        }
+    }
+
+    /// Retirement withdraws the intent to expose at EVERY visibility: a cached
+    /// emission still advertising the name is stale to whichever audience it
+    /// addresses — plaintext readers, the owner audience, or former grantees.
+    /// A stale-token retirement removes nothing and so revokes nothing.
+    #[test]
+    fn retirement_revokes_exposure_at_every_visibility() {
+        for (label, visibility) in [
+            ("Public", CapabilityVisibility::Public),
+            ("OwnerScoped", CapabilityVisibility::OwnerScoped),
+            ("GrantedAudience", CapabilityVisibility::GrantedAudience),
+        ] {
+            let (reg, _rx) = registry();
+            reg.insert("svc".to_string(), 1, visibility);
+            let before = reg.exposure_revocation_generation();
+            assert!(reg.remove_if("svc", 1), "{label}: live retirement removes");
+            assert_ne!(
+                reg.exposure_revocation_generation(),
+                before,
+                "{label}: retiring a registered service must advance the epoch",
+            );
+        }
+
+        // A superseded handle retiring by its OWN (stale) id removes nothing, so
+        // the replacement's exposure is untouched and the epoch must not move.
         let (reg, _rx) = registry();
-
-        let g0 = reg.privatization_generation();
-        assert!(reg.insert("a".to_string(), 1, CapabilityVisibility::Public));
-        assert!(reg.insert("b".to_string(), 2, CapabilityVisibility::Public));
-        assert!(reg.insert("c".to_string(), 3, CapabilityVisibility::OwnerScoped));
+        reg.insert("svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("svc".to_string(), 2, CapabilityVisibility::Public);
+        let before = reg.exposure_revocation_generation();
+        assert!(!reg.remove_if("svc", 1), "stale-id retirement is a no-op");
         assert_eq!(
-            reg.privatization_generation(),
-            g0,
-            "new registrations cannot make an already-built emission leak",
-        );
-
-        // Same-name, same-visibility re-token: still nothing left the public set.
-        assert!(!reg.insert("a".to_string(), 4, CapabilityVisibility::Public));
-        assert_eq!(reg.privatization_generation(), g0, "re-token is not a leak");
-
-        // Public → OwnerScoped: the plaintext tag must stop shipping.
-        assert!(!reg.insert("a".to_string(), 5, CapabilityVisibility::OwnerScoped));
-        let g1 = reg.privatization_generation();
-        assert_ne!(g1, g0, "a public name going private bumps");
-
-        // Private → Public is a widening, not a leak.
-        assert!(!reg.insert("c".to_string(), 6, CapabilityVisibility::Public));
-        assert_eq!(
-            reg.privatization_generation(),
-            g1,
-            "widening a private name to public is not a privatization",
-        );
-
-        // Retiring a Public service also strands a plaintext tag.
-        assert!(reg.remove_if("b", 2));
-        assert_ne!(
-            reg.privatization_generation(),
-            g1,
-            "retiring a public service bumps",
-        );
-
-        // Retiring a non-public service does not.
-        let g2 = reg.privatization_generation();
-        assert!(reg.remove_if("a", 5));
-        assert_eq!(
-            reg.privatization_generation(),
-            g2,
-            "retiring an owner-scoped service strands no plaintext tag",
+            reg.exposure_revocation_generation(),
+            before,
+            "a no-op retirement revokes no exposure",
         );
     }
 
@@ -6075,6 +6206,8 @@ impl MeshNode {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
                 deferral_generation: 0,
+                broadcast_claim_generation: 0,
+                last_broadcast_exposure_generation: 0,
             })),
             local_emission: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
@@ -8226,7 +8359,8 @@ impl MeshNode {
             // window it claimed so that re-announce isn't coalesced away (Kyra OA3
             // closure).
             #[cfg(feature = "cortex")]
-            if cached.privatization_generation != self.rpc_local_services.privatization_generation()
+            if cached.exposure_revocation_generation
+                != self.rpc_local_services.exposure_revocation_generation()
             {
                 return None;
             }
@@ -8255,8 +8389,8 @@ impl MeshNode {
                 // early check at the top of the loop is only a cheap fast-path; THIS
                 // is the correctness boundary.
                 #[cfg(feature = "cortex")]
-                let visibility_stable = cached.privatization_generation
-                    == self.rpc_local_services.privatization_generation();
+                let visibility_stable = cached.exposure_revocation_generation
+                    == self.rpc_local_services.exposure_revocation_generation();
                 #[cfg(not(feature = "cortex"))]
                 let visibility_stable = true;
                 // Kyra OA3-4b1 B2 rotation safety: the owner-scoped envelopes in
@@ -8306,6 +8440,7 @@ impl MeshNode {
                     return Some(SendEmission {
                         public: bytes,
                         scoped: cached.scoped.clone(),
+                        exposure_generation: cached.exposure_revocation_generation,
                     });
                 }
                 // A visibility change, an authority rotation, or a grant mutation is
@@ -8327,6 +8462,73 @@ impl MeshNode {
              retry budget; the next send will reconcile"
         );
         None
+    }
+
+    /// Deterministic-witness seam (Kyra OA3 review, Finding 3): run a normal
+    /// announce with `probe` fired inside the send seqlock. A witness advances
+    /// the exposure epoch there — exactly what a concurrent revocation does —
+    /// forcing THIS attempt to be refused on security grounds, then observes
+    /// that the refusing sender itself drives a corrective send. Make the probe
+    /// one-shot or the corrective passes are refused too.
+    #[doc(hidden)]
+    pub async fn announce_with_send_probe_for_test(
+        &self,
+        caps: CapabilitySet,
+        probe: &(dyn Fn() + Sync),
+    ) -> Result<(), AdapterError> {
+        self.announce_from_baseline_probed(Some(caps), Duration::from_secs(300), true, Some(probe))
+            .await
+    }
+
+    /// Deterministic-witness seam (Kyra OA3 review, Finding 4): claim the
+    /// broadcast window AT AN EXPLICIT INSTANT, returning
+    /// `(claim_id, previous_timestamp)`. Taking `now` explicitly lets a witness
+    /// give two claimants the SAME `Instant` — the case a timestamp-equality
+    /// ownership test gets wrong and a monotonic token gets right.
+    #[doc(hidden)]
+    pub fn test_claim_broadcast_window_at(
+        &self,
+        now: std::time::Instant,
+    ) -> (u64, Option<std::time::Instant>) {
+        let mut gate = self.announce_gate.lock();
+        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
+        (
+            gate.broadcast_claim_generation,
+            gate.last_broadcast_at.replace(now),
+        )
+    }
+
+    /// Deterministic-witness seam: the release half of
+    /// [`Self::test_claim_broadcast_window_at`], applying the same still-ours
+    /// rule the refused-send path uses.
+    #[doc(hidden)]
+    pub fn test_release_broadcast_claim(
+        &self,
+        claim_id: u64,
+        previous: Option<std::time::Instant>,
+    ) {
+        // Delegates to the PRODUCTION rule — a mirrored copy here would let the
+        // witness keep passing while the real release path regressed.
+        self.release_broadcast_claim(claim_id, previous);
+    }
+
+    /// Release a broadcast-window claim, but ONLY if it is still ours. Ownership
+    /// is decided by the monotonic claim token, never by comparing the stored
+    /// `Instant` to the one we wrote: two claimants can read the same
+    /// `Instant::now()` at platform clock resolution, and a timestamp match would
+    /// then let a stale claimant reopen a window a newer claimant owns (Kyra OA3
+    /// review, Finding 4).
+    fn release_broadcast_claim(&self, claim_id: u64, previous: Option<std::time::Instant>) {
+        let mut gate = self.announce_gate.lock();
+        if gate.broadcast_claim_generation == claim_id {
+            gate.last_broadcast_at = previous;
+        }
+    }
+
+    /// Deterministic-witness seam: the current broadcast-window timestamp.
+    #[doc(hidden)]
+    pub fn test_broadcast_window_at(&self) -> Option<std::time::Instant> {
+        self.announce_gate.lock().last_broadcast_at
     }
 
     /// Deterministic-witness seam for the send-time serialization
@@ -8595,7 +8797,7 @@ impl MeshNode {
                 provider_grant_snapshot: None,
                 // A cert rebuild does NOT change visibility — preserve the
                 // generation so the send-time freshness check still holds.
-                privatization_generation: cached.privatization_generation,
+                exposure_revocation_generation: cached.exposure_revocation_generation,
             })));
         tracing::info!(
             version,
@@ -19555,6 +19757,56 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
+        // Kyra OA3 review, Finding 3: a send refused on security grounds must not
+        // rely on the wake that its own invalidation fired. That wake may ALREADY
+        // have run — observed this sender's in-window claim, deferred or (on a
+        // bare-`start` node, which has no flush task) returned outright — and no
+        // second wake is coming. Restoring the timestamp reopens the window for a
+        // wake that has been consumed. So the refusing sender drives the
+        // corrective pass itself, from a fresh baseline, bypassing coalescing.
+        self.announce_from_baseline_probed(new_baseline, ttl, sign, None)
+            .await
+    }
+
+    /// [`Self::announce_from_baseline`] with an optional probe fired inside the
+    /// send seqlock (see [`Self::announcement_bytes_for_send_probed`]). A witness
+    /// injects an exposure revocation there to force a security refusal and then
+    /// observes the corrective pass actually superseding it. `None` in production.
+    async fn announce_from_baseline_probed(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), AdapterError> {
+        let mut baseline = new_baseline;
+        let mut mode = AnnounceMode::Routine;
+        for _ in 0..=SECURITY_CORRECTIVE_ATTEMPTS {
+            match self
+                .announce_attempt(baseline.take(), ttl, sign, mode, probe)
+                .await?
+            {
+                AnnounceOutcome::Sent | AnnounceOutcome::Coalesced => return Ok(()),
+                AnnounceOutcome::RefusedBySecurity => mode = AnnounceMode::SecurityCorrective,
+            }
+        }
+        tracing::warn!(
+            "capability: security-corrective re-announce exhausted its attempt              budget; peers may hold a superseded projection until the next              announce or the keep-alive"
+        );
+        Ok(())
+    }
+
+    /// ONE pass of the announce path: build + publish the emission, then either
+    /// broadcast it, coalesce it, or refuse it. See [`Self::announce_from_baseline`]
+    /// for the corrective loop wrapped around this.
+    async fn announce_attempt(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        mode: AnnounceMode,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<AnnounceOutcome, AdapterError> {
         // `Some(())` = broadcast after releasing the lock (bytes are
         // serialized at send time through the epoch-checked path);
         // `None` = the announce was rate-limit-deferred or coalesced.
@@ -19582,16 +19834,17 @@ impl MeshNode {
             // Gated on `cortex` because `rpc_local_services` only
             // exists when the cortex layer (which provides serve_rpc)
             // is compiled in.
-            // Capture the privatization generation BEFORE deriving the projection
-            // and thread it into the published emission: if a concurrent visibility
-            // change advances it, the send path rejects the (now stale) emission
-            // rather than ship a tag that became private, and the same bump woke the
-            // RT-3 re-announce that republishes at the new generation (Kyra OA3
-            // closure).
+            // Capture the exposure-revocation generation BEFORE deriving the
+            // projection and thread it into the published emission: if a concurrent
+            // visibility change advances it, the send path refuses the (now stale)
+            // emission rather than ship bytes to an audience no longer entitled to
+            // them, and the refusing sender itself drives a corrective re-announce
+            // at the new generation (Kyra OA3 closure, Findings 1-3).
             #[cfg(feature = "cortex")]
-            let privatization_generation = self.rpc_local_services.privatization_generation();
+            let exposure_revocation_generation =
+                self.rpc_local_services.exposure_revocation_generation();
             #[cfg(not(feature = "cortex"))]
-            let privatization_generation = 0u64;
+            let exposure_revocation_generation = 0u64;
 
             // OA3-4b1 confidentiality projection: ONLY `Public` services
             // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
@@ -19966,7 +20219,7 @@ impl MeshNode {
                     scoped: scoped_envelopes,
                     scoped_authority,
                     provider_grant_snapshot,
-                    privatization_generation,
+                    exposure_revocation_generation,
                 })));
 
             // Origin-side rate limit: within-window calls update the
@@ -19986,13 +20239,30 @@ impl MeshNode {
                 let elapsed = gate
                     .last_broadcast_at
                     .map(|t| now.saturating_duration_since(t));
-                match elapsed {
+                // Two reasons to bypass coalescing (Finding 3):
+                //
+                //  * this is a corrective pass driven by a sender whose own send
+                //    was refused — the ordinary wake/defer machinery already
+                //    failed to carry the supersession; or
+                //  * a local exposure revocation has not yet been superseded on
+                //    the wire, so peers are still holding bytes naming a
+                //    capability to an audience that lost entitlement to it.
+                //
+                // In both cases a trailing-edge flush is too late (and on a
+                // bare-`start` node the deferral arm is a silent drop), so the
+                // send must go now.
+                let revocation_pending_on_the_wire =
+                    exposure_revocation_generation > gate.last_broadcast_exposure_generation;
+                let security_priority = matches!(mode, AnnounceMode::SecurityCorrective)
+                    || revocation_pending_on_the_wire;
+                let in_window = if security_priority { None } else { elapsed };
+                match in_window {
                     Some(e) if e < min_interval => {
                         // In-window with a flush already pending: that
                         // flush will pick up the `local_announcement`
                         // we just stored. Nothing to schedule.
                         if gate.deferred_scheduled {
-                            return Ok(());
+                            return Ok(AnnounceOutcome::Coalesced);
                         }
                         // Bare-start node (no `start_arc`): there is no
                         // owned `Arc` for a flush task to hold — same
@@ -20005,7 +20275,7 @@ impl MeshNode {
                                 "capability: in-window announce not deferred \
                              (node not started via start_arc)"
                             );
-                            return Ok(());
+                            return Ok(AnnounceOutcome::Coalesced);
                         }
                         gate.deferred_scheduled = true;
                         // New deferral claim → new generation. The
@@ -20020,11 +20290,16 @@ impl MeshNode {
                         None
                     }
                     _ => {
-                        // Claim the window, but carry out what it held: if the send
-                        // below is skipped nothing actually shipped, and the claim
-                        // must be released rather than coalesce away the very
-                        // re-announce that skip is relying on.
-                        Some((now, gate.last_broadcast_at.replace(now)))
+                        // Claim the window under a fresh ownership token, carrying
+                        // out what it held: if the send below is refused nothing
+                        // actually shipped, and the claim must be released rather
+                        // than coalesce away the corrective re-announce.
+                        gate.broadcast_claim_generation =
+                            gate.broadcast_claim_generation.wrapping_add(1);
+                        Some((
+                            gate.broadcast_claim_generation,
+                            gate.last_broadcast_at.replace(now),
+                        ))
                     }
                 }
             }
@@ -20037,28 +20312,34 @@ impl MeshNode {
         // (review-9 addendum): a self-floor raised between the
         // build above and this send must not ship the certified
         // form.
-        let Some((now_claimed, previous_broadcast_at)) = to_broadcast else {
-            return Ok(());
+        let Some((claim_id, previous_broadcast_at)) = to_broadcast else {
+            return Ok(AnnounceOutcome::Coalesced);
         };
-        let Some(emission) = self.announcement_bytes_for_send() else {
-            // The send-time seqlock refused this emission (a visibility change, an
-            // authority rotation, or a grant mutation landed after the build).
-            // NOTHING shipped, so the rate-limit window we claimed above must be
-            // released: the transition that refused the send also woke a
-            // re-announce, and leaving a phantom claim in place would coalesce that
-            // re-announce into a deferral — or, on a node without a flush task
-            // (`start` rather than `start_arc`), drop it outright, leaving peers on
-            // the superseded announcement until the keep-alive. Only roll back our
-            // OWN claim; a concurrent announce that has since claimed the window
-            // keeps it.
-            let mut gate = self.announce_gate.lock();
-            if gate.last_broadcast_at == Some(now_claimed) {
-                gate.last_broadcast_at = previous_broadcast_at;
-            }
-            return Ok(());
+        let Some(emission) = self.announcement_bytes_for_send_probed(
+            probe.map(|p| p as &dyn Fn()),
+            super::behavior::org::current_timestamp(),
+        ) else {
+            // The send-time seqlock refused this emission (exposure revoked,
+            // authority rotated, grant snapshot swapped, or stamp churn). NOTHING
+            // shipped, so release the window we claimed — a phantom claim would
+            // coalesce away the corrective pass. Roll back only if the claim is
+            // STILL OURS, decided by the monotonic claim token rather than by
+            // `Instant` equality, which two claimants can share at platform clock
+            // resolution (Finding 4).
+            self.release_broadcast_claim(claim_id, previous_broadcast_at);
+            return Ok(AnnounceOutcome::RefusedBySecurity);
         };
+        let shipped_generation = emission.exposure_generation;
         self.broadcast_emission(&emission).await;
-        Ok(())
+        // The wire now reflects every revocation up to `shipped_generation`, so
+        // ordinary rate limiting resumes until the next one.
+        {
+            let mut gate = self.announce_gate.lock();
+            gate.last_broadcast_exposure_generation = gate
+                .last_broadcast_exposure_generation
+                .max(shipped_generation);
+        }
+        Ok(AnnounceOutcome::Sent)
     }
 
     /// Send one coherent local emission to `addr`: the plaintext public CAP-ANN
