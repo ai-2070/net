@@ -59,7 +59,7 @@ use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome};
 use super::org_call::{OrgCallProof, MAX_ORG_CALL_PROOF_BYTES};
 use super::org_grant::CapabilityAuthorityId;
 use super::org_revocation::OrgRevocationState;
-use crate::adapter::net::identity::EntityId;
+use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
 /// The admission mode a provider registered for one capability
 /// (Locked #6; the model's `OrgAdmission`). Bound at registration
@@ -136,9 +136,16 @@ pub enum AdmissionDenied {
     /// The membership certificate failed signature/structure/window
     /// verification.
     MembershipInvalid,
-    /// A revocation floor for `(acting org, caller)` has risen to
-    /// or above the membership certificate's generation — the cert
-    /// is dead.
+    /// A revocation floor for `(acting org, caller)` has risen ABOVE
+    /// the membership certificate's generation — the cert is dead.
+    ///
+    /// The boundary is `generation < floor`, so a cert issued AT the
+    /// floor is still alive; the floor names the lowest generation that
+    /// remains valid, not the first one revoked. (An earlier revision of
+    /// this doc said "to or above", which would have led an operator to
+    /// issue a floor EQUAL to the generation they meant to retire and
+    /// get no error — the credential stays live. `org.rs` and
+    /// `org_authority.rs` state the rule correctly; §D3.)
     MembershipRevoked,
     /// The capability grant failed signature/structure/window
     /// verification.
@@ -513,14 +520,53 @@ pub fn verify_org_admission(
     //     distinguishes replay from call-id collision.
     //
     //     Retention derives from the SAME `clock` sample (Kyra E1
-    //     audit): the wall deadline is the proof's expiry PLUS the
-    //     accepted skew (a proof admitted within skew is still live,
-    //     so it must be retained that far), translated onto the
-    //     sample's monotonic instant. Using `clock.monotonic` as
-    //     `now` keeps insertion and expiry on one monotonic timeline —
-    //     a wall-clock jump cannot evict a just-admitted proof.
+    //     audit): the wall deadline is the proof's expiry PLUS a skew
+    //     allowance (a proof admitted within skew is still live, so it
+    //     must be retained that far), translated onto the sample's
+    //     monotonic instant. Using `clock.monotonic` as `now` keeps
+    //     insertion and expiry on one monotonic timeline — a wall-clock
+    //     jump cannot evict a just-admitted proof.
+    //
+    //     §5 — that allowance is the HARD CEILING, not `ctx.skew_secs`.
+    //     Retention must dominate every acceptance window the freshness
+    //     check could ever apply, and freshness re-reads the LIVE skew
+    //     on every call (`facts.skew_secs`, resolved from the installed
+    //     authority in `verify_provider_authority`). Retaining to
+    //     `expiry + ctx.skew_secs` ties the two to the same mutable
+    //     value read at different TIMES, which is not the same thing as
+    //     tying them together:
+    //
+    //       P runs at skew 0 (the serde default). Caller S issues a
+    //       protected call at T, proof expiry T+30; the guard entry is
+    //       retained to monotonic M+30. S keeps the frame and re-sends
+    //       it periodically — all denied ProofExpired. An operator then
+    //       runs `net node adopt --skew-secs 300` after a clock-drift
+    //       incident and calls install_node_authority: a supported
+    //       same-org renewal, runtime-installable, no restart, guard not
+    //       cleared. S's next resend at T+200 finds an EXPIRED guard
+    //       entry (so `admit` takes the reusable-key branch and returns
+    //       Admitted), passes freshness (T+200 < T+30+300), passes the
+    //       TTL ceiling, and passes every credential check — the grants
+    //       run days-to-weeks and nothing else changed. The handler runs
+    //       a SECOND time on one signed proof. The fold's duplicate
+    //       -REQUEST guard covers only in-flight calls, so the first
+    //       call having COMPLETED is the enabling condition.
+    //
+    //     The same shape has a second, non-attacker-controlled trigger:
+    //     retention is anchored on `Instant` while freshness reads wall
+    //     time, so a backward wall step (NTP correcting a fast clock)
+    //     makes monotonic elapse more than wall and expires the entry
+    //     while the proof is still fresh. `admission_clock` closes the
+    //     INTRA-admission case; this closes the inter-admission one.
+    //
+    //     `MAX_TOKEN_CLOCK_SKEW_SECS` is the ceiling `check_expiry_at`
+    //     enforces on `skew_secs` (org_call.rs), so no future skew can
+    //     produce an acceptance window wider than this retention. The
+    //     cost is bounded: entries live at most 5 minutes past expiry
+    //     rather than `ctx.skew_secs`, and the per-caller ceiling
+    //     already bounds how many a caller can hold.
     let binding_digest: [u8; 32] = blake3::hash(&proof.call_binding_sig).into();
-    let skew_ns = ctx.skew_secs.saturating_mul(1_000_000_000);
+    let skew_ns = MAX_TOKEN_CLOCK_SKEW_SECS.saturating_mul(1_000_000_000);
     let retain_until_wall_ns = proof.proof_expires_at_unix_ns.saturating_add(skew_ns);
     let expires_at = clock.monotonic_deadline_for(retain_until_wall_ns);
     match replay.admit(
@@ -598,6 +644,12 @@ mod tests {
     /// Build a valid cross-org proof (caller ∈ A, dispatcher A→caller,
     /// capability grant B→A INVOKE covering the exact provider).
     fn cross_org_proof() -> OrgCallProof {
+        cross_org_proof_for_call(CALL_ID)
+    }
+
+    /// [`cross_org_proof`] bound to an explicit `call_id`, so a test can put
+    /// two independent calls on one replay guard.
+    fn cross_org_proof_for_call(call_id: u64) -> OrgCallProof {
         let caller = caller();
         let membership =
             OrgMembershipCert::try_issue(&org_a(), caller.entity_id().clone(), 1, 3600)
@@ -627,7 +679,7 @@ mod tests {
             org_a().org_id(),
             org_b().org_id(),
             provider(),
-            CALL_ID,
+            call_id,
             cap(),
             expiry,
             REQ,
@@ -1082,14 +1134,17 @@ mod tests {
         );
         assert_eq!(stale_guard.len(), 0, "an expired proof consumes no slot");
 
-        // A sample 10 s before expiry admits; retention = the sample's
-        // monotonic + 10 s (skew 0).
+        // A sample 10 s before expiry admits. Retention runs to the
+        // proof's expiry PLUS the hard skew ceiling — NOT plus this
+        // context's `skew_secs` (§5) — so on the sample's monotonic
+        // timeline the horizon is `base + 10s + MAX_TOKEN_CLOCK_SKEW_SECS`.
         let replay = AdmissionReplayGuard::with_defaults();
         let fresh = ClockSample {
             wall_ns: expiry_ns - 10_000_000_000,
             monotonic: base,
         };
         assert!(verify_org_admission(&ctx, &[&bytes], &replay, fresh, || true, |_| true).is_ok());
+        let horizon = Duration::from_secs(10 + MAX_TOKEN_CLOCK_SKEW_SECS);
 
         // Same proof, monotonic still INSIDE retention → Replay.
         let inside = ClockSample {
@@ -1101,13 +1156,105 @@ mod tests {
             Err(AdmissionDenied::Replay),
         );
 
-        // Monotonic PAST retention (on the sample's timeline) → the
-        // slot reopened, so the same still-fresh proof admits again.
-        let past = ClockSample {
+        // Still inside at the point the PRE-§5 horizon would have ended
+        // (`base + 10s`, i.e. expiry + this context's skew of 0). This is
+        // the exact instant the old retention reopened the slot.
+        let old_horizon = ClockSample {
             wall_ns: expiry_ns - 10_000_000_000,
             monotonic: base + Duration::from_secs(11),
         };
+        assert_eq!(
+            verify_org_admission(&ctx, &[&bytes], &replay, old_horizon, || true, |_| true),
+            Err(AdmissionDenied::Replay),
+            "retention must outlast expiry + ctx.skew_secs (§5)",
+        );
+
+        // Monotonic PAST the real retention horizon → the slot reopened,
+        // so the same still-fresh proof admits again.
+        let past = ClockSample {
+            wall_ns: expiry_ns - 10_000_000_000,
+            monotonic: base + horizon + Duration::from_secs(1),
+        };
         assert!(verify_org_admission(&ctx, &[&bytes], &replay, past, || true, |_| true).is_ok());
+    }
+
+    /// §5 — widening `verification_skew_secs` at runtime must not re-admit a
+    /// proof that was already used.
+    ///
+    /// Retention used to be `expiry + ctx.skew_secs` while freshness re-reads
+    /// the LIVE skew on every call, so the two were the same mutable value
+    /// read at different times. Between an admission at skew 0 and a later
+    /// one at skew 300 there was a window where the guard entry had lapsed
+    /// but the proof was still accepted as fresh — and `admit`'s
+    /// expired-key branch returns `Admitted`, so the handler ran a second
+    /// time on one signed proof.
+    ///
+    /// The trigger is a supported operator action, not an attack: `net node
+    /// adopt --skew-secs 300` after a clock-drift incident, then
+    /// `install_node_authority` — a runtime same-org renewal that does not
+    /// clear the guard.
+    ///
+    /// Red-witness: restoring `ctx.skew_secs` in the retention computation
+    /// makes the final assertion admit instead of denying Replay.
+    #[test]
+    fn widening_skew_does_not_reopen_an_already_used_proof() {
+        let floors = empty_floors();
+        let proof = cross_org_proof();
+        let bytes = proof.encode().expect("encode");
+        let expiry_ns = proof.proof_expires_at_unix_ns;
+        let base = ClockSample::now().monotonic;
+        let replay = AdmissionReplayGuard::with_defaults();
+
+        // 1. Admit under the DEFAULT skew of 0, 10 s before expiry.
+        let narrow = cross_org_ctx(&floors);
+        assert_eq!(
+            narrow.skew_secs, 0,
+            "fixture must start at the serde default"
+        );
+        let admit_at = ClockSample {
+            wall_ns: expiry_ns - 10_000_000_000,
+            monotonic: base,
+        };
+        assert!(
+            verify_org_admission(&narrow, &[&bytes], &replay, admit_at, || true, |_| true).is_ok(),
+            "first use admits",
+        );
+
+        // 2. The operator widens skew to the ceiling and reinstalls the
+        //    authority. The guard is NOT cleared by that path.
+        let mut wide = cross_org_ctx(&floors);
+        wide.skew_secs = MAX_TOKEN_CLOCK_SKEW_SECS;
+
+        // 3. Replay the SAME frame 200 s later. Under the widened skew the
+        //    proof is still "fresh" (200 < 30 + 300), and it clears the TTL
+        //    ceiling — so nothing else in the admission order stops it. Only
+        //    the replay guard can, and only if its retention outlasted the
+        //    old, narrower skew.
+        let resend = ClockSample {
+            wall_ns: expiry_ns + 200_000_000_000,
+            monotonic: base + Duration::from_secs(210),
+        };
+        assert_eq!(
+            verify_org_admission(&wide, &[&bytes], &replay, resend, || true, |_| true),
+            Err(AdmissionDenied::Replay),
+            "a used proof must stay denied across a runtime skew widening",
+        );
+
+        // Positive control: the freshness/TTL checks really did pass under
+        // the widened skew, so the denial above is the REPLAY GUARD's doing
+        // and not an incidental ProofExpired. A distinct call_id on the same
+        // timeline admits.
+        let mut other = cross_org_ctx(&floors);
+        other.skew_secs = MAX_TOKEN_CLOCK_SKEW_SECS;
+        other.call_id = CALL_ID ^ 0xFFFF;
+        let fresh_proof = cross_org_proof_for_call(other.call_id);
+        let fresh_bytes = fresh_proof.encode().expect("encode");
+        assert!(
+            verify_org_admission(&other, &[&fresh_bytes], &replay, resend, || true, |_| true)
+                .is_ok(),
+            "an unused proof at the same instant admits — so §5's denial is \
+             the replay guard, not expiry",
+        );
     }
 
     /// E1.4 §9.5 — a security-view change detected AFTER binding
