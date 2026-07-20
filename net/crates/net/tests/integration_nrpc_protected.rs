@@ -1528,10 +1528,10 @@ async fn a_consumer_credential_replacement_racing_the_granted_insert_is_refused(
     )
     .expect("issue unrelated");
     let unrelated_secret = unrelated_secret.expect("secret");
-    let pending = std::sync::Mutex::new(Some((unrelated, unrelated_secret)));
+    let pending = parking_lot::Mutex::new(Some((unrelated, unrelated_secret)));
     let c_probe = c.clone();
     let probe = move || {
-        if let Some((g, s)) = pending.lock().expect("probe lock").take() {
+        if let Some((g, s)) = pending.lock().take() {
             c_probe
                 .install_consumer_grant_audience(g, s)
                 .expect("probe install");
