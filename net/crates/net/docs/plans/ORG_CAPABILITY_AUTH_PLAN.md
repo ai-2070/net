@@ -1,6 +1,6 @@
 # Organization Capability Auth Plan (OA)
 
-**Version:** v1.3 — applies review-7: the legacy-gate integration
+**Version:** v1.4 — applies review-7: the legacy-gate integration
 correction for OA-2 (`may_execute` aggregates allow-lists
 TARGET-WIDE across all of a node's entries, so an empty allow-list
 on the protected service is not a dependable pass-through —
@@ -9,7 +9,12 @@ narrow `has_local_capability` check, §2.4a), the stronger seam
 witness matrix (§OA-4), and three OA-3 carry-forwards: the zero
 grant_id is reserved (grant issuance/decode rejects it), envelope
 dedup identity includes `grant_id`, and secret-bearing runtime
-types are structurally non-serializable.
+types are structurally non-serializable. v1.4 (2026-07-20)
+reconciles §OA-4 to the composed-witness ruling: three evidence
+tiers (live transport / provider bridge / referenced pure-authority
+tests), a registration-local `#[cfg(test)]`-only RED seam,
+`RpcContext::org_admission` as the audit witness, and the
+INVOKE-only / wrong-dispatcher corrections.
 **Status (2026-07-19, branch `org-capability-auth`):**
 
 - **OA-1** — IMPLEMENTED and iterated through reviews 8–11 plus the
@@ -37,7 +42,13 @@ types are structurally non-serializable.
   mismatch → local reject; `tests/org_admission_wire.rs`) — is landed. See
   `docs/plans/OA2E_INTEGRATION_DESIGN.md` for the E0/E1/E2 decomposition and the
   live-gate ledger.
-- **OA-3 / OA-4** — held behind their staged reviews (next in sequence).
+- **OA-3** — grant-scoped private discovery is IMPLEMENTED and
+  **CLOSED** (Kyra, 2026-07-20, exit gate signed off at `347860feb`;
+  see `docs/plans/OA3_EXIT_GATE.md`). Owner-audience dual-publish is
+  explicitly deferred operational tooling.
+- **OA-4** — end-to-end composition witnesses, IN PROGRESS
+  (scope+methodology reconciled below; six bounded witnessed slices,
+  then STOP).
 
 `may_execute` (`capability_bridge.rs`) is byte-for-byte unchanged across
 the whole OA-2 series; every fix is red-witnessed.
@@ -559,13 +570,25 @@ envelopes (per-grant key independence witnessed). Stop. Review.
 Nodes: dispatcher **S** ∈ A; providers **P₁** ∈ A, **P₂** ∈ B;
 unrelated **X**; org **C** as wrong-grantee foil.
 
+OA-4 is the final **composition-proof** phase, not protocol
+development: no authority semantics, wire objects, stores, or SDK
+surfaces change. It proves that caller-proof construction, request
+encoding, authenticated transport identity, provider registration,
+capability possession, provider authority, admission, replay
+ownership, handler context, and response behavior **compose**
+correctly. The one production-file touch is the `#[cfg(test)]`
+registration-local RED seam (slice 5 below).
+
+### Requirement blocks (full logical matrices — REQUIRED)
+
 **Internal (P₁, `OwnerDelegated`)** — as v1.1: valid dispatcher
 grant accepted; membership-only denied; copied proof denied; wrong
 target/capability/body/expiry/replay denied; floored-after-reload
 denied; public capabilities unchanged; `may_execute` pinned
 unchanged. Plus the restart witness chain from OA-1 run end-to-end
 (floor 5 → old bundle 3 → restart → S with generation 4 cert still
-denied).
+denied) **through the live admission gate**, not merely the
+`may_execute` projection level.
 
 **Cross-org invocation (P₂, `CrossOrgGranted`)** — as v1.1: the
 full accept + eleven-denial matrix; `AnyNodeOwnedBy(B)` reuse
@@ -573,16 +596,29 @@ accepted against a second B-owned node, denied against a non-B
 node; four-party audit attribution asserted.
 
 **Private discovery (`GrantedAudience` on P₂)** — as v1.1
-(Kyra's matrix verbatim: absent from global CAP-ANN; no grant ⇒ no
-enumeration; DISCOVER-only resolves but cannot invoke; INVOKE-only
-cannot ingest; DISCOVER|INVOKE resolves and calls exact P₂; copied
-grant by C, wrong dispatcher, wrong provider owner, wrong
-handle/capability, stale registration, decrypt-without-invoke all
-denied/ignored; provider policy final) plus observer-recovers-
-nothing, AD-transplant, and post-rotation decryption failure.
+(Kyra's matrix): absent from global CAP-ANN; no grant ⇒ no
+enumeration; DISCOVER-only resolves but cannot invoke;
+DISCOVER|INVOKE resolves and calls exact P₂; copied grant by C,
+wrong provider owner, wrong handle/capability, stale registration,
+decrypt-without-invoke all denied/ignored; provider policy final;
+observer-recovers-nothing, AD-transplant, post-rotation decryption
+failure. Two rows carry **corrected semantics**:
 
-**Seam red witnesses (review-7 matrix — robust to target-wide
-allow-list aggregation):**
+- **INVOKE-only holds no audience material** — witnessed by
+  *composition*, NOT a synthetic `GrantMissingDiscover` ingest
+  result (which would witness an impossible state). Canonical
+  INVOKE-only issuance yields `discovery == None` and no audience
+  secret; therefore provider/consumer audience install is refused,
+  no confidential envelope is emitted, and no private resolution
+  occurs. Structural/registry witnesses pin the exact reason.
+- **Wrong dispatcher** is an *invocation* denial after discovery,
+  not a decryption failure: the capability resolves, the caller
+  presents a proof outside its dispatcher-grant scope →
+  `DispatcherGrantScope` → handler stays dark. Discovery authority
+  and invocation authority remain visibly separate.
+
+**Seam red (review-7 — robust to target-wide allow-list
+aggregation):**
 
 ```
 P registers protected capability C:
@@ -594,24 +630,146 @@ may_execute(P, C, S) may be false (target-wide aggregation pulls
     in D's restrictions) — witnessed, not assumed either way
 has_local_capability(P, C) is true
 valid org proof for C → ACCEPTED through the OrgAdmission path
-    (D's restrictions cannot block C)
-invalid org proof for C → denied
-missing local C tag + otherwise-valid proof → denied as
-    unregistered
+invalid org proof for C → denied; handler stays dark
+missing local C tag + otherwise-valid proof → denied unregistered
 public capability D → still governed by unchanged may_execute
-    behavior
-
 private service C absent from plaintext broadcast bytes
 
-RED: disable verify_org_admission in the protected-service branch
-    (test rig only)
-→ unauthorized C invocation SUCCEEDS
-    — proving OrgAdmission is load-bearing, independent of any
-      legacy-gate verdict
+RED: disable ONLY verify_org_admission at its call site
+    (registration-local #[cfg(test)] mode) → unauthorized C
+    invocation SUCCEEDS — proving OrgAdmission is load-bearing,
+    independent of any legacy-gate verdict.
 ```
 
-Then STOP. No further org work without a named consumer or
-measured failure.
+### Evidence tiers (Kyra ruling, 2026-07-20)
+
+Full logical matrices are required; **not** every row is a real
+network test. Each witness-map row declares its tier.
+
+- **Tier 1 — real two-node transport** (`MeshNode::call`). Required
+  where transport identity, provider selection, registration state,
+  restart publication, or handler execution is materially part of
+  the invariant: cross-org accept + exact four-party handler
+  attribution; ≥1 cryptographically-valid-but-unauthorized
+  cross-org denial; replay denial through the live provider path;
+  `AnyNodeOwnedBy(B)` reuse-accept (second B node) + non-B deny;
+  owner membership-only denial; public-caps-unchanged after
+  protected registration; the restart/floor chain through the live
+  gate; DISCOVER|INVOKE resolves-and-invokes exact P₂; DISCOVER-only
+  resolves-but-invocation-denied; provider policy final.
+- **Tier 2 — real provider bridge, synthetic inbound frames**
+  (`deliver_rpc_inbound_for_test` → `admit_and_dispatch_protected`
+  → `verify_org_admission` → fold/handler | denial). For adversarial
+  states the honest caller API cannot naturally produce: copied
+  proof, wrong target/capability/body-digest, explicit expiry,
+  malformed/multiple headers, missing-local-tag, controlled replay
+  IDs, other proof surgery. The bridge keeps a pinned authenticated
+  peer, packet/payload origin agreement, real protected
+  registration, real provider authority, real local capability state
+  (unless the row intentionally removes it), the real replay guard,
+  and the real handler/fold path.
+- **Tier 3 — existing pure authority tests**. Referenced (not
+  replaced) for the exact `AdmissionDenied` variant, boundary
+  arithmetic, cryptographic field isolation, and predicates already
+  proven independently.
+
+Live/bridge tests prove handler darkness and coarse wire denial;
+pure tests pin the exact typed reason.
+
+### RED disable seam — contract
+
+A registration-local, `#[cfg(test)]`-only admission mode on the
+captured `RegisteredRpcService`:
+
+```
+#[cfg(test)] admission mode: Enforced | DisabledForRedWitness
+```
+
+- stored only on the captured registration; immutable after
+  registration where practical; default always `Enforced`;
+- production registration constructors CANNOT select the disabled
+  mode; no process-global/static flag; no environment variable; no
+  shared toggle that can contaminate parallel tests; no public API;
+  **no cargo feature**; compiled out entirely without `cfg(test)`;
+- the disabled branch occurs AFTER the bridge origin check, direct
+  authenticated-caller resolution, local-capability possession,
+  provider self-verification, and request decode/digest — replacing
+  ONLY the `verify_org_admission` call with test-only dispatch.
+
+The RED is a **lib** test (Rust integration tests compile the
+library without `cfg(test)`, so the seam must not be reachable from
+there), using `deliver_rpc_inbound_for_test` + a real protected
+dispatcher + the real provider fold/handler: register C enforced;
+establish C present locally and absent from plaintext; make
+`may_execute(C, S)` false through unrelated-D aggregation; a valid
+proof for C succeeds; an invalid/missing proof is denied and the
+handler stays dark; re-register an equivalent C with
+`DisabledForRedWitness`; the same unauthorized request now runs the
+handler (the RED handler need not receive an `Admitted` — the point
+is that removing only organization admission permits execution
+without authenticated organization attribution). The bypassed
+registration must not outlive the local test.
+
+### Audit attribution
+
+`RpcContext::org_admission` is the authoritative audit witness — no
+new audit sink is invented. In the live handler assert all five
+`Admitted` fields (`caller == S`, `acting_org == A`,
+`provider_org == B`, `provider == P₂`, `capability == C`), that
+`org_admission` is `Some`, that the handler's ordinary caller origin
+corresponds to authenticated S, that the raw proof header was
+stripped before the handler ran, that the response returns to S, and
+that no caller-claimed field is used as attribution.
+
+### Slices (six bounded commits)
+
+1. **Live cross-org harness** — `cross_org_invoke_intent`; P₂ ∈ B,
+   S ∈ A; real `MeshNode::call`; accept; exact five-field
+   `Admitted`; proof header stripped; response returns to S.
+2. **Cross-org denial + target matrix** — one table-driven harness:
+   the eleven-denial matrix (live where naturally expressible,
+   provider-bridge where adversarial frame construction is required,
+   pure tests referenced for exact variants); add `GranteeMismatch`
+   and the missing-local-tag denial; `AnyNodeOwnedBy(B)` second-B
+   accept + non-B deny.
+3. **OwnerDelegated composition + restart** — membership-only
+   denial; the copied/wrong-target/capability/body/expiry/replay
+   matrix at ≥ provider-bridge level; a representative live denial
+   and replay; public-caps-unchanged; floor/reload denial; the full
+   restart chain through live admission.
+4. **GrantedAudience composition** — one coherent multi-node matrix
+   (no-credential → no resolution; DISCOVER-only resolves-not-
+   invokes; INVOKE-only → no material/install/envelope/resolution;
+   DISCOVER|INVOKE resolves-and-calls exact P₂; copied credential by
+   C; wrong dispatcher; wrong provider owner/target; wrong
+   handle/capability; stale registration; decrypt-without-invoke;
+   provider policy final; plaintext-absence + observer-opacity
+   referenced to OA-3 unless the topology makes them nearly free to
+   assert).
+5. **Seam-red witness** — the registration-local `#[cfg(test)]`
+   disable mode + the full C+D aggregation matrix (positive,
+   negative, RED). The only production-file touch; the diff must
+   prove every bypass symbol is under `cfg(test)`.
+6. **Witness map + final gate** — `OA4_EXIT_GATE.md` (requirement →
+   composed witness → typed unit witness); plan reconciliation; the
+   final serial exit battery; a frozen `may_execute` body
+   comparison; a source scan proving no disable seam exists outside
+   `cfg(test)`; hard STOP.
+
+### Gate cadence
+
+Per slice: new focused tests + the relevant existing integration
+target + clippy for the touched target + fmt + diff check + worktree
+check — NOT the full 5,000-test battery each time. After Slice 5
+(the only security-sensitive source touch) run the relevant full
+lib/integration gates. After Slice 6 run the complete serial exit
+battery once (clippy `--lib --features cortex -D warnings`;
+`--no-default-features`; fmt; full lib cortex;
+`integration_nrpc_protected`; `org_ownership`; `org_admission_wire`;
+diff check; `may_execute` body unchanged).
+
+Then STOP. No further organization work until there is a named
+consumer or a measured failure.
 
 ---
 
