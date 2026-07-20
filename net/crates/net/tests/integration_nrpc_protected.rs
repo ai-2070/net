@@ -85,6 +85,36 @@ async fn handshake_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     b.start();
 }
 
+/// Like [`build_node_with`] but with a short `min_announce_interval`, so a
+/// re-announce inside a tight test loop actually broadcasts instead of being
+/// coalesced away under the default 10 s rate limit (the multi-hop relay
+/// witness needs P to re-ship promptly after its emission converges).
+async fn build_node_fast_announce(keypair: EntityKeypair) -> Arc<MeshNode> {
+    let mut cfg = test_config();
+    cfg.min_announce_interval = Duration::from_millis(50);
+    Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
+}
+
+/// Establish a direct session `initiator → responder` WITHOUT starting either
+/// node's dispatch loop — used to wire a multi-hop topology (P—R—C) before
+/// bringing all nodes up together, so no node accepts while already running.
+async fn connect_no_start(initiator: &Arc<MeshNode>, responder: &Arc<MeshNode>) {
+    let r_id = responder.node_id();
+    let r_pub = *responder.public_key();
+    let r_addr = responder.local_addr();
+    let i_id = initiator.node_id();
+    let responder_c = responder.clone();
+    let accept = tokio::spawn(async move { responder_c.accept(i_id).await });
+    initiator
+        .connect(r_addr, &r_pub, r_id)
+        .await
+        .expect("connect failed");
+    accept
+        .await
+        .expect("accept task panicked")
+        .expect("accept failed");
+}
+
 async fn wait_until<F: Fn() -> bool>(limit: Duration, cond: F) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -1193,6 +1223,113 @@ async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-5 §3.2 (Kyra APPROVED design) — opaque multi-hop propagation, LIVE:
+/// provider P emits an owner-scoped service; relay R (no org authority, no shared
+/// audience) forwards the OPAQUE envelope but can neither decrypt nor store it;
+/// consumer C — which shares P's owner audience and has NO direct session with P
+/// — receives the forwarded frame, opens it, and resolves P in its
+/// private-discovery store. Because P and C are never directly connected, C's
+/// knowledge of P can only have arrived through R's relay.
+#[tokio::test]
+async fn an_owner_scoped_announcement_floods_opaquely_through_a_relay_to_the_audience() {
+    use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use net::adapter::net::behavior::org_authority::{NodeAuthority, OwnerAudienceCredential};
+
+    let p = build_node_fast_announce(EntityKeypair::from_bytes([0x80u8; 32])).await;
+    let r = build_node_fast_announce(EntityKeypair::from_bytes([0x81u8; 32])).await;
+    let c = build_node_fast_announce(EntityKeypair::from_bytes([0x82u8; 32])).await;
+    let p_entity = p.entity_id().clone();
+    let c_entity = c.entity_id().clone();
+
+    let org = OrgKeypair::from_bytes([0x8Au8; 32]);
+    let base = std::env::temp_dir().join(format!("net-oa35-relay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+
+    // --- P: provider with an owner-scoped service ---
+    let p_cert = OrgMembershipCert::try_issue(&org, p_entity.clone(), 1, 3600).expect("P cert");
+    let p_authority = Arc::new(
+        NodeAuthority::adopt(&base.join("p"), p_cert, &p_entity, 0, None).expect("adopt P"),
+    );
+    // Capture P's owner audience BEFORE install (install consumes the Arc); C
+    // shares this exact credential, modelling the org distributing ONE owner
+    // audience to its member nodes.
+    let shared_audience = p_authority.audience.encode_config();
+    p.install_node_authority(p_authority)
+        .expect("install P authority");
+    p.set_owner_cert_emission(true).expect("enable P emission");
+    let _svc = p
+        .serve_rpc_owner_scoped("secret", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("P owner-scoped serve");
+
+    // --- C: consumer in the SAME org, sharing P's owner audience ---
+    let c_cert = OrgMembershipCert::try_issue(&org, c_entity.clone(), 1, 3600).expect("C cert");
+    let mut c_authority =
+        NodeAuthority::adopt(&base.join("c"), c_cert, &c_entity, 0, None).expect("adopt C");
+    c_authority.audience =
+        OwnerAudienceCredential::decode_config(&shared_audience).expect("decode shared audience");
+    c.install_node_authority(Arc::new(c_authority))
+        .expect("install C authority");
+
+    // --- R: pure relay, NO authority (cannot open or store scoped anns) ---
+
+    // Topology: P—R and R—C, but NEVER P—C. Establish both sessions before
+    // starting any dispatch loop, then bring all three up together.
+    connect_no_start(&p, &r).await;
+    connect_no_start(&r, &c).await;
+    p.start();
+    r.start();
+    c.start();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+
+    // P's cached emission carries exactly one scoped envelope before we rely on
+    // the flood shipping it.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            p.announcement_scoped_for_send_for_test().len() == 1
+        })
+        .await,
+        "P emits exactly one owner-scoped envelope",
+    );
+
+    // Drive the flood: P announces (ships the 0x0C04 hop-0 frame to R); R
+    // forwards the opaque frame to C; C opens + stores. Re-announce across the
+    // wait so a coalesced/rate-limited send still lands within the window.
+    let mut c_resolved_p = false;
+    for _ in 0..40 {
+        p.announce_capabilities(CapabilitySet::new()).await.ok();
+        if c.scoped_owner_providers_for_test(now)
+            .iter()
+            .any(|prov| prov == &p_entity)
+        {
+            c_resolved_p = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        c_resolved_p,
+        "C resolves P through the relay despite having no direct session with P",
+    );
+
+    // The relay ADMITTED the envelope through its dedup gate — proof it received
+    // and forwarded it — yet, lacking any authority or audience, opened and
+    // stored NOTHING.
+    assert!(
+        r.scoped_relay_gate_len_for_test() >= 1,
+        "the relay admitted and forwarded the opaque envelope",
+    );
+    assert!(
+        r.scoped_owner_providers_for_test(now).is_empty(),
+        "the authority-less relay forwards but never decrypts or stores the envelope",
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an

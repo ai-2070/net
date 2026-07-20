@@ -1037,6 +1037,9 @@ struct DispatchCtx {
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+    /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
+    /// propagation. See the matching field doc on `MeshNode`.
+    scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
@@ -4496,6 +4499,10 @@ pub struct MeshNode {
     /// path, with no await held.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+    /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
+    /// propagation. Shared across the inbound dispatch so a flooded envelope is
+    /// forwarded at most once per node; never decrypts or stores anything.
+    scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -5808,6 +5815,9 @@ impl MeshNode {
             scoped_discovery: Arc::new(parking_lot::Mutex::new(
                 super::behavior::org_scoped_store::ScopedDiscoveryStore::new(),
             )),
+            scoped_relay_gate: Arc::new(
+                super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
+            ),
             #[cfg(feature = "cortex")]
             rpc_admission_replay: Arc::new(
                 super::behavior::org_admission_replay::AdmissionReplayGuard::with_defaults(),
@@ -7866,11 +7876,16 @@ impl MeshNode {
     /// — identical to the `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` dispatch arm.
     #[doc(hidden)]
     pub fn ingest_scoped_announcement_for_test(&self, envelope: &[u8]) {
+        let Ok(decoded) =
+            super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::from_bytes(envelope)
+        else {
+            return;
+        };
         Self::ingest_scoped_announcement(
             &self.node_authority,
             &self.org_revocation,
             &self.scoped_discovery,
-            envelope,
+            &decoded,
             0,
             None,
         );
@@ -7888,11 +7903,16 @@ impl MeshNode {
         envelope: &[u8],
         probe: &(dyn Fn() + Sync),
     ) {
+        let Ok(decoded) =
+            super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::from_bytes(envelope)
+        else {
+            return;
+        };
         Self::ingest_scoped_announcement(
             &self.node_authority,
             &self.org_revocation,
             &self.scoped_discovery,
-            envelope,
+            &decoded,
             0,
             Some(probe),
         );
@@ -7903,6 +7923,15 @@ impl MeshNode {
     /// (expiry-safe — tombstoned/expired entries excluded; currentness-safe —
     /// entries whose provider floor has since risen are excluded against the
     /// node's LIVE revocation snapshot, exactly as a real query would).
+    /// Test seam (OA3-5 §3.2): how many outer identities the relay dedup gate is
+    /// currently tracking. A relay that FORWARDED an envelope has admitted it
+    /// here even though (lacking the audience) it stored nothing in the scoped
+    /// discovery store.
+    #[doc(hidden)]
+    pub fn scoped_relay_gate_len_for_test(&self) -> usize {
+        self.scoped_relay_gate.len()
+    }
+
     #[doc(hidden)]
     pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
         use super::behavior::org_revocation::OrgRevocationState;
@@ -9337,6 +9366,7 @@ impl MeshNode {
             org_revocation: self.org_revocation.clone(),
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
+            scoped_relay_gate: self.scoped_relay_gate.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
@@ -10771,12 +10801,33 @@ impl MeshNode {
         // id degrades the same way at the catch-all guard below.
         if parsed.header.subprotocol_id == SUBPROTOCOL_SCOPED_CAPABILITY_ANN {
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            let now_secs = super::behavior::org::current_timestamp();
             for payload in events {
+                // Decode the relay frame, outer-verify, bind the direct origin,
+                // check expiry, and dedup — a pure decision, no I/O (OA3-5 §3.2).
+                let Some(admit) = super::behavior::org_scoped_relay::decide_scoped_relay(
+                    &payload,
+                    from_node,
+                    &ctx.scoped_relay_gate,
+                    now_secs,
+                ) else {
+                    continue;
+                };
+                // Forward the OPAQUE frame to peers-except-ingress while below the
+                // hop cap — an authority-less relay forwards even though it can
+                // never open or store the envelope.
+                if let Some(frame) = admit.forward {
+                    Self::forward_scoped_announcement(frame, from_node, ctx);
+                }
+                // Independently attempt the LOCAL audience open/store. A node with
+                // no matching audience (a pure relay, or a wrong-audience
+                // envelope) simply stores nothing; the forward above already
+                // shipped regardless of the local outcome.
                 Self::ingest_scoped_announcement(
                     &ctx.node_authority,
                     &ctx.org_revocation,
                     &ctx.scoped_discovery,
-                    &payload,
+                    &admit.envelope,
                     from_node,
                     None,
                 );
@@ -16387,29 +16438,21 @@ impl MeshNode {
         scoped_discovery: &Arc<
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
         >,
-        payload: &[u8],
+        envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
     ) {
         use super::behavior::org_revocation::OrgRevocationState;
-        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
         use super::behavior::org_scoped_ingest::{
             verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
         };
 
-        // No installed authority ⇒ no owner audience key ⇒ cannot open. Drop with
-        // zero further work (an unknown-subprotocol frame degrades the same way).
+        // The caller has already decoded the frame and outer-verified this
+        // envelope (structural + bounds + the provider's outer signature, via
+        // `from_bytes`). This is the LOCAL open/store half only: no installed
+        // authority ⇒ no owner audience key ⇒ cannot open, drop (an INVOKE-only /
+        // un-adopted relay forwards but never stores).
         let Some(authority) = node_authority.load_full() else {
-            return;
-        };
-        // `from_bytes` is verified-by-construction: structural + bounds + the
-        // provider's outer signature. A decode/verify failure drops silently.
-        let Ok(envelope) = ScopedCapabilityAnnouncement::from_bytes(payload) else {
-            tracing::trace!(
-                from_node = format!("{:#x}", from_node),
-                len = payload.len(),
-                "scoped-ann: envelope decode/verify failed"
-            );
             return;
         };
         let owner_org = authority.owner_org();
@@ -16455,7 +16498,7 @@ impl MeshNode {
             now_secs,
             skew_secs: authority.config.verification_skew_secs,
         };
-        match verify_scoped_ingest(&envelope, &audience, &ctx) {
+        match verify_scoped_ingest(envelope, &audience, &ctx) {
             Ok(verified) => {
                 // A test probe fires in the exact verify→recheck window a
                 // concurrent floor publish / store swap / authority rotation would
@@ -16899,6 +16942,51 @@ impl MeshNode {
     /// encryption and network send. Mirrors the pingwave forwarding
     /// loop at the top of `dispatch_packet` — same split-horizon
     /// rule, same best-effort send semantics.
+    /// Forward an OPAQUE scoped-announcement relay frame (hop already
+    /// incremented by [`decide_scoped_relay`](super::behavior::org_scoped_relay::decide_scoped_relay))
+    /// to every live peer EXCEPT the ingress `from_node` — the OA3-5 §3.2 opaque
+    /// flood. Mirrors [`Self::forward_capability_announcement`] but on
+    /// [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] and with NO split-horizon: the
+    /// bounded relay dedup gate (not route-based suppression) terminates loops,
+    /// and a relay generally has no route to the provider anyway. The frame bytes
+    /// ship verbatim — a relay never opens, stores, or re-signs them.
+    fn forward_scoped_announcement(frame: Vec<u8>, from_node: u64, ctx: &DispatchCtx) {
+        let peers = ctx.peers.clone();
+        let socket = ctx.socket.clone();
+        let partition_filter = ctx.partition_filter.clone();
+
+        tokio::spawn(async move {
+            for entry in peers.iter() {
+                let peer = entry.value();
+                if peer.node_id == from_node {
+                    continue; // never send back to the ingress peer
+                }
+                if partition_filter.contains(&peer.addr) {
+                    continue;
+                }
+                let session = &peer.session;
+                let stream_id = SUBPROTOCOL_SCOPED_CAPABILITY_ANN as u64;
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session.get_or_create_stream(stream_id);
+                    stream.next_tx_seq()
+                };
+                let events = vec![Bytes::copy_from_slice(&frame)];
+                let packet = builder.build_subprotocol(
+                    stream_id,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+                );
+                let _ = socket.send_to(&packet, peer.addr).await;
+                drop(builder);
+                session.touch();
+            }
+        });
+    }
+
     fn forward_capability_announcement(
         payload: Vec<u8>,
         origin_node_id: u64,
@@ -19333,8 +19421,13 @@ impl MeshNode {
             tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
         }
         for envelope in &emission.scoped {
+            // OA3-5 §3.2: wrap the canonical envelope in the outer relay frame at
+            // hop 0 (the origin). Relays rewrite only the hop prefix; the signed
+            // envelope bytes travel verbatim.
+            let frame =
+                super::behavior::org_scoped_relay::ScopedCapabilityRelayFrame::encode(0, envelope);
             if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, envelope)
+                .send_subprotocol(addr, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, &frame)
                 .await
             {
                 tracing::trace!(
