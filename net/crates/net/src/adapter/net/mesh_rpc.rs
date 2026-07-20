@@ -8881,9 +8881,14 @@ mod roster_fallback_tests {
     /// The disabled registration does not outlive this test.
     #[tokio::test]
     async fn seam_red_org_admission_is_load_bearing() {
-        use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use crate::adapter::net::behavior::fold::capability::{
+            CapabilityFold, CapabilityMembership,
+        };
         use crate::adapter::net::behavior::fold::capability_bridge::{
             has_local_capability, may_execute,
+        };
+        use crate::adapter::net::behavior::fold::{
+            EnvelopeMeta, FoldKind, NodeState, SignedAnnouncement,
         };
         use crate::adapter::net::behavior::org::{
             current_timestamp, OrgKeypair, OrgMembershipCert,
@@ -8998,32 +9003,15 @@ mod roster_fallback_tests {
                 payload: Bytes::from(frame),
             }
         };
-        // The review-7 provider state: a self-announcement giving P a target-wide
-        // restrictive allow-list (an unrelated capability D excluding S), so the
-        // legacy gate would deny S — yet C is present locally.
-        let restrict = |version: u64| {
-            let mut ann = CapabilityAnnouncement::new(
-                server.node_id(),
-                node_entity.clone(),
-                version,
-                CapabilitySet::new().add_tag("nrpc:svc").add_tag("nrpc:d"),
-            );
-            ann.allowed_nodes = vec![0xDEAD];
-            server.test_inject_capability_announcement(ann);
-            assert!(
-                has_local_capability(server.capability_fold(), server.node_id(), "nrpc:svc"),
-                "the provider holds C locally",
-            );
-            assert!(
-                !may_execute(
-                    server.capability_fold(),
-                    server.node_id(),
-                    "nrpc:svc",
-                    CALLER_NODE
-                ),
-                "may_execute(P, C, S) is false via target-wide allow-list aggregation",
-            );
-        };
+        // An unrelated PUBLIC service D — a real service governed by `may_execute`
+        // (Slice-6 exit-map accounting). Its ServeHandle is kept alive so its
+        // registration persists across C's teardown/re-registration.
+        let _serve_d = server
+            .serve_rpc(
+                "d",
+                std::sync::Arc::new(Counter(std::sync::Arc::new(AtomicUsize::new(0)))),
+            )
+            .expect("serve public D");
 
         // ---- Phase A: admission ENFORCED. ----
         let admits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -9036,7 +9024,80 @@ mod roster_fallback_tests {
             )
             .expect("serve enforced");
         let ch = serve_enforced.channel_hash;
-        restrict(100);
+
+        // C's OWN entry is unrestricted: with only the class-0 self entries (C and
+        // the public D, both empty allow-lists) the legacy gate PERMITS S.
+        assert!(
+            may_execute(
+                server.capability_fold(),
+                server.node_id(),
+                "nrpc:svc",
+                CALLER_NODE
+            ),
+            "before the unrelated restricted D entry, C's own class-0 entry permits S \
+             (empty allow-lists)",
+        );
+
+        // Add a SEPARATE restrictive native-class (0xD00D) entry for the same
+        // provider, carrying ONLY `nrpc:d` with a non-S allow-list. A distinct
+        // class key keeps it OUT of C's class-0 self entry (so C stays unrestricted)
+        // and lets it survive C's re-registration.
+        let d_kp = EntityKeypair::generate();
+        let d_entry = SignedAnnouncement::sign(
+            &d_kp,
+            CapabilityFold::KIND_ID,
+            0xD00D,
+            server.node_id(),
+            1,
+            EnvelopeMeta::default(),
+            CapabilityMembership {
+                class_hash: 0xD00D,
+                tags: vec!["nrpc:d".to_string()],
+                hardware: None,
+                state: NodeState::Idle,
+                region: None,
+                price_quote: None,
+                reflex_addr: None,
+                allowed_nodes: vec![0xDEAD],
+                allowed_subnets: vec![],
+                allowed_groups: vec![],
+                metadata: std::collections::BTreeMap::new(),
+                owner: None,
+            },
+        )
+        .expect("sign restrictive D");
+        server
+            .capability_fold()
+            .apply(d_entry)
+            .expect("apply restrictive D entry");
+
+        // Now the review-7 condition holds via UNRELATED-D target-wide aggregation:
+        // C is present locally and its OWN entry is unrestricted, yet may_execute(C,
+        // S) is false purely because D's separate restrictive entry contaminates the
+        // aggregation — and D's own gate denies S.
+        assert!(
+            has_local_capability(server.capability_fold(), server.node_id(), "nrpc:svc"),
+            "the provider holds C locally",
+        );
+        assert!(
+            !may_execute(
+                server.capability_fold(),
+                server.node_id(),
+                "nrpc:svc",
+                CALLER_NODE
+            ),
+            "may_execute(P, C, S) is now false ONLY via the unrelated D entry's \
+             target-wide aggregation — C's own entry is still unrestricted",
+        );
+        assert!(
+            !may_execute(
+                server.capability_fold(),
+                server.node_id(),
+                "nrpc:d",
+                CALLER_NODE
+            ),
+            "the unrelated D is itself governed by may_execute (S excluded)",
+        );
 
         // Positive control: a valid proof is admitted despite may_execute == false.
         server.deliver_rpc_inbound_for_test(ch, make_event(ch, vec![valid_proof(700)], 700));
@@ -9066,7 +9127,21 @@ mod roster_fallback_tests {
             )
             .expect("serve red-witness-disabled");
         let ch2 = serve_disabled.channel_hash;
-        restrict(200); // re-establish the review-7 condition after the re-register
+        // The native D entry survived the re-registration (distinct class key), so
+        // the review-7 condition still holds — no re-injection needed.
+        assert!(
+            has_local_capability(server.capability_fold(), server.node_id(), "nrpc:svc"),
+            "C is present locally after the re-registration",
+        );
+        assert!(
+            !may_execute(
+                server.capability_fold(),
+                server.node_id(),
+                "nrpc:svc",
+                CALLER_NODE
+            ),
+            "may_execute(P, C, S) stays false via the surviving unrelated D entry",
+        );
 
         // The SAME unauthorized (no-proof) request now RUNS the handler — proving
         // that removing ONLY verify_org_admission is what admitted it.
