@@ -50,7 +50,7 @@ const GRANT_TTL_SECS_DEFAULT: u64 = 7 * 24 * 60 * 60;
 pub enum OrgCommand {
     /// Generate a fresh org root keypair (offline key material).
     Keygen(KeygenArgs),
-    /// Issue a membership certificate: "node <member> belongs to
+    /// Issue a membership certificate: "node `<member>` belongs to
     /// this org". Certificates prove belonging only — never
     /// invocation authority.
     IssueCert(IssueCertArgs),
@@ -59,14 +59,14 @@ pub enum OrgCommand {
     /// revoked. Nodes merge bundles monotonically — a lower floor
     /// never rolls back a higher one, including across restart.
     IssueFloors(IssueFloorsArgs),
-    /// Issue a dispatcher grant: "entity <dispatcher> may act FOR
+    /// Issue a dispatcher grant: "entity `<dispatcher>` may act FOR
     /// this org" over a capability (or any). A -> S, org-root-signed;
     /// the caller carries it inside the org-admission proof. Holding
     /// one is never invocation authority — the provider still
     /// verifies the full per-call proof.
     GrantDispatcher(GrantDispatcherArgs),
-    /// Issue a capability grant: "org <grantee> holds <rights> on
-    /// <capability> over <target>", signed by THIS (provider) org.
+    /// Issue a capability grant: "org `<grantee>` holds `<rights>` on
+    /// `<capability>` over `<target>`", signed by THIS (provider) org.
     /// B -> A cross-org access. With --discover a fresh audience
     /// secret is minted and written owner-only (0600 on Unix; parent
     /// DACL on Windows); only its commitment rides in the signed
