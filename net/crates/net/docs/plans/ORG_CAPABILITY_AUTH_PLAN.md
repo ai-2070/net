@@ -488,15 +488,58 @@ Both scopes are mutually invisible and invisible to unscoped
 queries. Query surface: `find_capabilities_for_grant(grant_id,
 predicate)` and `find_owner_private_capabilities(predicate)`.
 
-### 3.4 Rotation — as v1.1, plus owner-audience procedure (Q4)
+### 3.4 Rotation — hard cutover (OA3-6 reconciliation)
 
-Granted: per-grant expiry → new grant mints fresh handle+key; a
-former grantee keeps cached knowledge (stated) but cannot decrypt
-new envelopes, invoke after expiry, or bypass admission. Owner:
-config-management rotation of `owner-audience.key` — install new
-credential → providers briefly dual-publish old+new envelopes →
-consumers accept both → retire old after announcement TTL. An
-operational tooling concern, not a mesh key-epoch protocol.
+Rotation is a **node-local hard cutover**, not an instantaneous global
+revocation and not (in v1) a dual-publish transition. It cannot erase
+knowledge or cryptographically revoke retained key material — a holder of
+an old key keeps whatever it already decrypted or captured.
+
+**Granted audience** (per-grant): a grant `G1` expires (or is retired from
+provider emission) → a successor `G2` is newly issued with a **fresh
+`grant_id`, handle, and key** → former `G1` holders retain their old
+knowledge and `K1`, but `K1` cannot decrypt any `G2` envelope (per-grant
+key independence, witnessed) and the expired `G1` fails grant admission. A
+former grantee may still decrypt ciphertext historically sealed under `K1`;
+what it cannot do is decrypt the successor audience or use the expired grant
+for accepted discovery/invocation.
+
+**Owner audience**: the owner-audience credential is rotated as config
+management (`install_node_authority` with a same-org authority carrying a
+fresh `owner-audience.key`). The procedure:
+
+```text
+pre-stage K2 out of band on every participating node
+  → coordinated activation of K2 (install the new authority per node)
+  → each provider rebuilds and emits ONLY under K2
+  → each activated consumer refuses K1 ciphertext
+```
+
+This is a per-node hard cutover:
+
+- after provider P activates K2, P's cached K1 emission is send-refused
+  immediately (the send-seqlock pointer-compares the sealing authority);
+- after consumer C activates K2, C cannot open K1 envelopes;
+- a lagging consumer that still holds K1 can still decrypt previously
+  captured, still-unexpired K1 ciphertext — rotation does not revoke
+  retained key material;
+- single-slot activation (one owner credential per node) necessarily
+  creates a **bounded availability gap** during fleet rollout;
+- operators pre-stage K2 and coordinate activation tightly.
+
+Two modes:
+
+```text
+planned rotation:   pre-stage + coordinated hard cutover; brief
+                    availability gap accepted.
+emergency/compromise rotation: immediate hard cutover; NEVER dual-publish
+                    the compromised old key.
+```
+
+Future optional graceful rotation may temporarily dual-publish old and new
+owner audiences. It is **not** part of the v1 mesh protocol or the OA-3 exit
+gate, and must be an explicit planned-rotation mode, never the emergency
+compromise path.
 
 ### 3.5 OA-3 exit gate
 
