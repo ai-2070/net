@@ -286,6 +286,7 @@ mod tests {
             generation,
             expires_at,
             FIXTURE_CERT_GEN,
+            None,
             b"owner-descriptor".to_vec(),
         )
     }
@@ -306,6 +307,7 @@ mod tests {
             generation,
             expires_at,
             FIXTURE_CERT_GEN,
+            Some([0x5A; 64]),
             b"grant-descriptor".to_vec(),
         )
     }
@@ -333,6 +335,7 @@ mod tests {
             generation,
             expires_at,
             FIXTURE_CERT_GEN,
+            None,
             b"owner-descriptor".to_vec(),
         )
     }
@@ -429,6 +432,7 @@ mod tests {
             1,
             1000,
             FIXTURE_CERT_GEN,
+            None,
             b"x".to_vec(),
         );
         assert_eq!(store.ingest(public, 0), ScopedStoreOutcome::RejectedPublic);
@@ -600,6 +604,7 @@ mod tests {
                 1,
                 10_000,
                 FIXTURE_CERT_GEN,
+                None,
                 b"owner-descriptor".to_vec(),
             ),
             0,

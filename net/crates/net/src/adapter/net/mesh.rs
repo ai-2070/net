@@ -7917,6 +7917,21 @@ impl MeshNode {
         let mut envelopes = Vec::new();
         for record in provider_grants.records() {
             let grant = record.grant();
+            // Emission is a LATER authority decision than installation (Kyra
+            // OA3-4b2 closure): re-check the full validity window, issuer
+            // applicability, and target coverage against THIS emission's clock +
+            // authority before building. An inactive record (not-yet-valid,
+            // expired, or inapplicable under a since-changed authority) is omitted
+            // for this round; the snapshot stays installed for when it applies.
+            if !super::behavior::org_grant_registry::grant_active_for_emission(
+                grant,
+                self.identity.entity_id(),
+                &authority.owner_org(),
+                now_secs,
+                authority.config.verification_skew_secs,
+            ) {
+                continue;
+            }
             // The descriptor names every locally-registered granted tag matching
             // THIS grant's capability (ordinarily exactly one).
             let mut descriptor_caps = CapabilitySet::new();
@@ -8320,12 +8335,17 @@ impl MeshNode {
 
     /// Test seam (OA3-4b2): the provider entity ids of the GRANTED-audience
     /// capabilities discovered under `grant_id`, at `now_secs`. Applies QUERY-TIME
-    /// CONSUMER CURRENTNESS: a granted record is visible only while this node still
-    /// holds the consumer grant it was discovered under — removing the credential
-    /// retracts every record for that grant IMMEDIATELY, with no re-announce and no
-    /// sweep (the record stays physically stored; retraction is a read-time
-    /// filter, mirroring the floor-currentness filter for owner records). Also
-    /// expiry- and floor-currentness-safe, exactly as a real query would be.
+    /// CONSUMER CURRENTNESS bound to the EXACT installed grant authority (Kyra
+    /// OA3-4b2 closure): a granted record is visible only while this node still
+    /// holds a consumer grant whose `grant_id`, audience handle, AND verified
+    /// signature match the record's. Because the registry supports explicit
+    /// remove-then-install replacement, a DIFFERENT canonical grant reusing the
+    /// same `grant_id` (different signature/authority) must NOT re-expose the old
+    /// record — its stored signature won't match. Removing the credential retracts
+    /// every record for that grant IMMEDIATELY, with no re-announce and no sweep
+    /// (the record stays physically stored; retraction is a read-time filter,
+    /// mirroring the floor-currentness filter for owner records). Also expiry- and
+    /// floor-currentness-safe, exactly as a real query would be.
     #[doc(hidden)]
     pub fn scoped_granted_providers_for_test(
         &self,
@@ -8333,18 +8353,31 @@ impl MeshNode {
         now_secs: u64,
     ) -> Vec<EntityId> {
         use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Query-time consumer currentness: no installed consumer grant for this id
         // ⇒ nothing is discoverable under it, even if a record is still stored.
-        if self.consumer_grant_audiences.load().get(grant_id).is_none() {
+        let consumer = self.consumer_grant_audiences.load();
+        let Some(record) = consumer.get(grant_id) else {
             return Vec::new();
-        }
+        };
+        // Pin the EXACT installed grant authority — signature binds the whole
+        // canonical grant; the handle is defense in depth.
+        let current_signature = record.grant().signature;
+        let current_handle = *record.audience_handle();
         let store = self.org_revocation.load_full();
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         self.scoped_discovery
             .lock()
-            .find_capabilities_for_grant(grant_id, now_secs, floors, |_| true)
+            .find_capabilities_for_grant(grant_id, now_secs, floors, |c| {
+                c.grant_signature() == Some(&current_signature)
+                    && matches!(
+                        c.scope(),
+                        CapabilityAudienceScope::Grant { audience_handle, .. }
+                            if audience_handle == &current_handle
+                    )
+            })
             .into_iter()
             .map(|c| c.provider().clone())
             .collect()
@@ -28150,5 +28183,157 @@ mod stream_ack_batching_tests {
         // small | big-alone | small — three chunks, none empty.
         assert_eq!(ranges.len(), 3);
         assert!(ranges.iter().all(|r| !r.is_empty()));
+    }
+}
+
+/// OA3-4b2 (Kyra closure): query-time consumer currentness must bind to the EXACT
+/// installed grant authority, not merely `grant_id` presence — the registry
+/// supports explicit remove-then-install replacement, so a DISTINCT canonical
+/// grant reusing the same `grant_id` must not re-expose a record admitted under
+/// the previous grant.
+#[cfg(test)]
+mod oa34b2_query_currentness_tests {
+    use super::*;
+    use crate::adapter::net::behavior::org::{current_timestamp, OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::behavior::org_grant::{
+        CapabilityAuthorityId, GrantRights, GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant,
+    };
+    use crate::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use std::net::SocketAddr;
+
+    /// A byte-identical copy of a secret (install consumes the original), scrubbing
+    /// the temporary key-bearing buffer after decode (OA2-F hygiene bar).
+    fn copy_secret(s: &OrgAudienceSecret) -> OrgAudienceSecret {
+        let mut buf = s.encode_config();
+        let copy = OrgAudienceSecret::decode_config(&buf).expect("copy secret");
+        for b in buf.iter_mut() {
+            // SAFETY: `b` is a valid mutable reference into the owned array.
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        copy
+    }
+
+    async fn adopted_consumer(org: &OrgKeypair, tag: &str) -> (Arc<MeshNode>, std::path::PathBuf) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let cfg = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+        let entity = node.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        let dir = std::env::temp_dir().join(format!("net-oa34b2-qc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+        node.install_node_authority(Arc::new(authority))
+            .expect("install authority");
+        (node, dir)
+    }
+
+    /// A granted envelope from provider `p` (org B) under `grant`/`secret`, naming
+    /// `svc` (the descriptor must name exactly the grant's capability).
+    fn granted_envelope(
+        p: &EntityKeypair,
+        org_b: &OrgKeypair,
+        grant: &OrgCapabilityGrant,
+        secret: &OrgAudienceSecret,
+        svc: &str,
+        expires_at: u64,
+    ) -> Vec<u8> {
+        let cert =
+            OrgMembershipCert::try_issue(org_b, p.entity_id().clone(), 1, 3600).expect("P cert");
+        let descriptor = CapabilitySet::new()
+            .add_tag(format!("nrpc:{svc}"))
+            .to_bytes_compact();
+        ScopedCapabilityAnnouncement::build_granted(
+            p,
+            org_b.org_id(),
+            cert,
+            grant.grant_id,
+            secret.audience_handle,
+            secret.discovery_key(),
+            1,
+            expires_at,
+            &descriptor,
+        )
+        .expect("build granted")
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_distinct_grant_reusing_the_grant_id_does_not_re_expose_the_old_record() {
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB0u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        // G1: a canonical B→A DISCOVER grant over P (random grant_id).
+        let (g1, s1) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue g1");
+        let s1 = s1.expect("secret");
+        let grant_id = g1.grant_id;
+
+        // G2: a DISTINCT canonical grant REUSING G1's grant_id — different
+        // capability + a fresh audience binding + nonce → a different signature.
+        let (s2, b2) = OrgAudienceSecret::mint(grant_id);
+        let g2 = OrgCapabilityGrant::issue_at(
+            &org_b,
+            grant_id,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-b"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            Some(b2),
+            n.saturating_sub(60),
+            n + 3600,
+            0xABCD,
+        );
+        assert_eq!(g1.grant_id, g2.grant_id, "same grant id");
+        assert_ne!(g1.signature, g2.signature, "distinct signed authority");
+
+        let (c, dir) = adopted_consumer(&org_a, "reexpose").await;
+        c.install_consumer_grant_audience(g1.clone(), copy_secret(&s1))
+            .expect("install g1");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(
+            &p, &org_b, &g1, &s1, "svc-a", exp,
+        ));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the G1 record resolves under G1",
+        );
+
+        // Replace G1 with the DISTINCT G2 (same grant_id): the old G1 record must
+        // NOT re-appear — its stored grant signature does not match G2's.
+        assert!(c.remove_consumer_grant_audience(&grant_id));
+        c.install_consumer_grant_audience(g2.clone(), copy_secret(&s2))
+            .expect("install g2");
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "a distinct-authority grant reusing the grant_id does not re-expose the old record",
+        );
+
+        // Ingesting a G2 announcement stores + resolves under the NEW authority.
+        c.ingest_scoped_announcement_for_test(&granted_envelope(
+            &p, &org_b, &g2, &s2, "svc-b", exp,
+        ));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity],
+            "only the G2 record is visible under the replacement authority",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

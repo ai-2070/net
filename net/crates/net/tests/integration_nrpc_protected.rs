@@ -967,7 +967,16 @@ fn unix_now() -> u64 {
 /// A byte-identical copy of a secret (install consumes the original; the witness
 /// keeps a copy to open the sealed envelope).
 fn copy_secret(secret: &OrgAudienceSecret) -> OrgAudienceSecret {
-    OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret")
+    // Round-trip through the explicit config codec, then SCRUB the temporary
+    // key-bearing buffer (volatile write, RAII-equivalent) so the copy leaves no
+    // lingering key material on the test stack (OA2-F hygiene bar).
+    let mut buf = secret.encode_config();
+    let copy = OrgAudienceSecret::decode_config(&buf).expect("copy secret");
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid mutable reference into the owned array.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    copy
 }
 
 /// An org-B provider node serving one granted-audience service `svc`, authority
@@ -2248,11 +2257,8 @@ async fn grant_audience_registries_install_and_remove_on_a_live_node() {
     let p_secret = p_secret.expect("secret");
     let p_grant_id = p_grant.grant_id;
     // A byte-identical copy of the secret for the idempotent re-install (re-
-    // issuing would mint a fresh random id): round-trip the explicit config codec.
-    let p_secret_copy = net::adapter::net::behavior::org_grant::OrgAudienceSecret::decode_config(
-        &p_secret.encode_config(),
-    )
-    .expect("copy secret");
+    // issuing would mint a fresh random id) — scrubs its temporary key buffer.
+    let p_secret_copy = copy_secret(&p_secret);
 
     assert_eq!(
         server

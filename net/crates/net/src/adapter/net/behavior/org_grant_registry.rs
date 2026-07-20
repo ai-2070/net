@@ -306,6 +306,30 @@ pub(crate) fn validate_provider_record(
     Ok(record)
 }
 
+/// Whether an installed provider grant is currently ELIGIBLE to seal a granted
+/// envelope (Kyra OA3-4b2 closure). Installation validated the grant once, but
+/// emission is a later authority decision under a potentially newer same-org
+/// authority configuration and a non-monotonic wall clock, so re-check the full
+/// validity window (not just `not_after`), the issuer applicability, and target
+/// coverage before building an envelope. No repeated signature verification cost
+/// beyond `verify()` inside `is_valid_at_with_skew` — the immutable stored bytes
+/// were already signature-verified at installation. An inactive record is simply
+/// omitted for this emission; the snapshot stays installed for when it becomes
+/// active.
+pub(crate) fn grant_active_for_emission(
+    grant: &OrgCapabilityGrant,
+    provider_entity: &EntityId,
+    provider_owner_org: &OrgId,
+    now_secs: u64,
+    skew_secs: u64,
+) -> bool {
+    grant.is_valid_at_with_skew(now_secs, skew_secs).is_ok()
+        && &grant.issuer_org == provider_owner_org
+        && grant
+            .target_scope
+            .covers(provider_entity, Some(provider_owner_org))
+}
+
 /// Validate a CONSUMER-side record (Kyra OA3-4b2 slice 2): the common invariants
 /// plus `grantee_org == consumer_owner_org` (the grant names A, this node).
 pub(crate) fn validate_consumer_record(
@@ -491,6 +515,80 @@ mod tests {
         let record = validate_consumer_record(g, s, &org_a().org_id(), now, SKEW)
             .expect("consumer record valid");
         assert_eq!(record.grant().issuer_org, org_b().org_id());
+    }
+
+    /// Kyra OA3-4b2 closure: emission re-checks the FULL grant validity — a record
+    /// installed valid may be inactive at a later emission (future not_before,
+    /// lapsed not_after, or inapplicable under a since-changed authority), and is
+    /// then omitted for that round. Drives the pure `grant_active_for_emission`
+    /// gate `granted_envelopes` uses.
+    #[test]
+    fn grant_active_for_emission_rechecks_window_issuer_and_target() {
+        let issuer = org_b();
+        let owner = issuer.org_id();
+        let provider = provider_entity();
+        let exact = GrantTargetScope::ExactNode(provider.clone());
+        // Build an INVOKE grant (no discovery binding needed) with an explicit
+        // window — `grant_active_for_emission` checks window + issuer + target,
+        // never DISCOVER (that is an install-time invariant).
+        let mk = |not_before: u64, not_after: u64, target: GrantTargetScope| {
+            OrgCapabilityGrant::issue_at(
+                &issuer,
+                [1u8; 32],
+                org_a().org_id(),
+                cap(),
+                GrantRights::INVOKE,
+                target,
+                None,
+                not_before,
+                not_after,
+                7,
+            )
+        };
+        let now = 10_000u64;
+        let skew = 0u64;
+
+        // Inside the validity window → active (an envelope would be built).
+        assert!(grant_active_for_emission(
+            &mk(now - 100, now + 100, exact.clone()),
+            &provider,
+            &owner,
+            now,
+            skew
+        ));
+        // Evaluated BEFORE not_before → inactive (no envelope).
+        assert!(!grant_active_for_emission(
+            &mk(now + 50, now + 100, exact.clone()),
+            &provider,
+            &owner,
+            now,
+            skew
+        ));
+        // Evaluated AT/AFTER not_after → inactive (no envelope).
+        assert!(!grant_active_for_emission(
+            &mk(now - 100, now, exact.clone()),
+            &provider,
+            &owner,
+            now,
+            skew
+        ));
+        // Issuer org that is not this provider's owner → inactive.
+        assert!(!grant_active_for_emission(
+            &mk(now - 100, now + 100, exact.clone()),
+            &provider,
+            &org_a().org_id(),
+            now,
+            skew
+        ));
+        // Target scope that does not cover this provider → inactive.
+        let other = EntityKeypair::from_bytes([0x44u8; 32]).entity_id().clone();
+        assert!(!grant_active_for_emission(
+            &mk(now - 100, now + 100, GrantTargetScope::ExactNode(other)),
+            &provider,
+            &owner,
+            now,
+            skew
+        ));
     }
 
     #[test]

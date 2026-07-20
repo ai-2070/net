@@ -27,9 +27,10 @@
 //! installed secret's commitment matches the signed grant, the envelope is
 //! unexpired, and finally the AEAD opens under the matching audience key.
 
+use super::capability::CapabilitySet;
 use super::org::OrgId;
 use super::org_authority::OwnerAudienceCredential;
-use super::org_grant::{OrgAudienceSecret, OrgCapabilityGrant};
+use super::org_grant::{CapabilityAuthorityId, OrgAudienceSecret, OrgCapabilityGrant};
 use super::org_revocation::OrgRevocationState;
 use super::org_scoped_ann::ScopedCapabilityAnnouncement;
 use crate::adapter::net::identity::EntityId;
@@ -147,6 +148,15 @@ pub struct VerifiedScopedCapability {
     /// sweep — mirroring the ingest-time `cert.generation < floor` gate at read
     /// time (Kyra OA3-5 closure).
     provider_cert_generation: u32,
+    /// For a GRANTED record, the verified signature of the exact grant that
+    /// admitted it (`None` for owner records). Public and already verified; it
+    /// binds the whole canonical grant (capability, issuer, grantee, target,
+    /// rights, audience binding, validity, nonce). A query enforces EXACT
+    /// grant-authority currentness against this: a `remove`-then-`install` of a
+    /// DIFFERENT grant sharing the same `grant_id`/handle must not re-expose the
+    /// old record — its stored signature won't match the newly-installed grant
+    /// (Kyra OA3-4b2 closure). No secret copy is needed.
+    grant_signature: Option<[u8; 64]>,
     descriptor: Vec<u8>,
 }
 
@@ -176,6 +186,12 @@ impl VerifiedScopedCapability {
     pub fn provider_cert_generation(&self) -> u32 {
         self.provider_cert_generation
     }
+    /// The verified grant signature that admitted a GRANTED record (`None` for
+    /// owner records) — used for exact grant-authority query currentness (Kyra
+    /// OA3-4b2 closure).
+    pub fn grant_signature(&self) -> Option<&[u8; 64]> {
+        self.grant_signature.as_ref()
+    }
     /// The decrypted capability descriptor plaintext (opaque here; parsed by the
     /// fold layer).
     pub fn descriptor(&self) -> &[u8] {
@@ -187,6 +203,7 @@ impl VerifiedScopedCapability {
     /// witness the store's `Public`-rejection guard, which the real verify path
     /// can never produce).
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test(
         scope: CapabilityAudienceScope,
         provider: EntityId,
@@ -194,6 +211,7 @@ impl VerifiedScopedCapability {
         generation: u64,
         expires_at: u64,
         provider_cert_generation: u32,
+        grant_signature: Option<[u8; 64]>,
         descriptor: Vec<u8>,
     ) -> Self {
         Self {
@@ -203,6 +221,7 @@ impl VerifiedScopedCapability {
             generation,
             expires_at,
             provider_cert_generation,
+            grant_signature,
             descriptor,
         }
     }
@@ -217,6 +236,7 @@ impl std::fmt::Debug for VerifiedScopedCapability {
             .field("generation", &self.generation)
             .field("expires_at", &self.expires_at)
             .field("provider_cert_generation", &self.provider_cert_generation)
+            .field("has_grant_signature", &self.grant_signature.is_some())
             .field("descriptor_len", &self.descriptor.len())
             .finish()
     }
@@ -261,6 +281,15 @@ pub enum ScopedIngestError {
     /// The AEAD open failed (wrong key / tampered ciphertext). A single opaque
     /// reason — never a per-field oracle.
     DecryptFailed,
+    /// The decrypted descriptor is not in the canonical current granted shape:
+    /// not exactly one capability tag, carries metadata, or is not canonically
+    /// compact-encoded. A provider must not smuggle arbitrary discovery state
+    /// under a grant's audience authority (Kyra OA3-4b2 closure).
+    DescriptorInvalid,
+    /// The decrypted descriptor names a capability OTHER than the one the grant
+    /// authorizes — a provider holding a valid C1 grant/secret tried to advertise
+    /// a C2 capability under C1's discovery authority (Kyra OA3-4b2 closure).
+    DescriptorOutsideGrant,
 }
 
 impl std::fmt::Display for ScopedIngestError {
@@ -280,6 +309,12 @@ impl std::fmt::Display for ScopedIngestError {
             ScopedIngestError::SecretMismatch => "installed secret does not match the grant",
             ScopedIngestError::TargetNotCovered => "provider outside the grant target scope",
             ScopedIngestError::DecryptFailed => "scoped announcement AEAD open failed",
+            ScopedIngestError::DescriptorInvalid => {
+                "granted descriptor is not the canonical single-capability shape"
+            }
+            ScopedIngestError::DescriptorOutsideGrant => {
+                "granted descriptor names a capability the grant does not authorize"
+            }
         };
         f.write_str(s)
     }
@@ -352,6 +387,8 @@ fn verify_owner_ingest(
         generation: envelope.generation(),
         expires_at: envelope.expires_at(),
         provider_cert_generation: envelope.owner_cert().generation,
+        // Owner records carry no grant authority.
+        grant_signature: None,
         descriptor,
     })
 }
@@ -419,6 +456,10 @@ fn verify_granted_ingest(
     let descriptor = envelope
         .open_with(secret.discovery_key())
         .map_err(|_| ScopedIngestError::DecryptFailed)?;
+    // The descriptor must name EXACTLY the capability the grant authorizes — a
+    // valid-key holder must not advertise an unrelated capability under this
+    // grant's confidential-discovery authority (Kyra OA3-4b2 closure).
+    descriptor_binds_grant_capability(&descriptor, &grant.capability)?;
     Ok(VerifiedScopedCapability {
         scope: CapabilityAudienceScope::Grant {
             grant_id: grant.grant_id,
@@ -429,8 +470,42 @@ fn verify_granted_ingest(
         generation: envelope.generation(),
         expires_at: envelope.expires_at(),
         provider_cert_generation: envelope.owner_cert().generation,
+        grant_signature: Some(grant.signature),
         descriptor,
     })
+}
+
+/// The granted-descriptor authority bind (Kyra OA3-4b2 closure): a granted
+/// envelope may confidentially advertise ONLY the exact capability its grant
+/// authorizes. For the current nRPC-only granted slice the descriptor's canonical
+/// current shape is a single capability tag with no metadata; anything else is a
+/// [`ScopedIngestError::DescriptorInvalid`] (rather than accepting arbitrary
+/// global `CapabilitySet` state), and a tag naming a different capability than the
+/// grant is a [`ScopedIngestError::DescriptorOutsideGrant`]. Canonicity is
+/// enforced by requiring the descriptor to equal its own re-encoding, so a
+/// non-canonical framing cannot slip a second logical form past the shape check.
+fn descriptor_binds_grant_capability(
+    descriptor: &[u8],
+    capability: &CapabilityAuthorityId,
+) -> Result<(), ScopedIngestError> {
+    let caps = CapabilitySet::from_bytes(descriptor).ok_or(ScopedIngestError::DescriptorInvalid)?;
+    // Exactly one tag, no metadata.
+    let mut tags = caps.tags.iter();
+    let (Some(tag), None) = (tags.next(), tags.next()) else {
+        return Err(ScopedIngestError::DescriptorInvalid);
+    };
+    if !caps.metadata.is_empty() {
+        return Err(ScopedIngestError::DescriptorInvalid);
+    }
+    // Canonical compact encoding: the descriptor must be its own re-encoding.
+    if caps.to_bytes_compact() != descriptor {
+        return Err(ScopedIngestError::DescriptorInvalid);
+    }
+    // The single tag must name exactly the grant's authorized capability.
+    if &CapabilityAuthorityId::for_tag(&tag.to_string()) != capability {
+        return Err(ScopedIngestError::DescriptorOutsideGrant);
+    }
+    Ok(())
 }
 
 /// The inline `owner_cert` must vouch for the publishing provider P under
@@ -694,7 +769,10 @@ mod tests {
             now + 3600,
             0x1234,
         );
-        let descriptor = b"granted-capability-descriptor".to_vec();
+        // The descriptor is the canonical single-capability shape naming exactly
+        // the grant's capability (Kyra OA3-4b2 closure): the granted-ingest path
+        // now binds the descriptor to `grant.capability`.
+        let descriptor = CapabilitySet::new().add_tag("nrpc:svc").to_bytes_compact();
         let envelope = ScopedCapabilityAnnouncement::build_granted(
             &provider,
             issuer.org_id(), // owner_org = issuer B
@@ -757,6 +835,85 @@ mod tests {
         );
         assert_eq!(verified.owner_org(), &f.issuer.org_id());
         assert_eq!(verified.descriptor(), f.descriptor.as_slice());
+        // The verified record retains the exact grant signature (Kyra OA3-4b2
+        // closure) for exact-authority query currentness.
+        assert_eq!(verified.grant_signature(), Some(&f.grant.signature));
+    }
+
+    /// Kyra OA3-4b2 closure: the granted descriptor is bound to the grant's
+    /// capability. A valid-key holder may advertise ONLY the exact capability the
+    /// grant authorizes, in the canonical single-tag shape.
+    #[test]
+    fn granted_ingest_binds_descriptor_to_the_grant_capability() {
+        let p = provider_kp();
+        let f = granted_fixture(exact_target(&p));
+        let floors = OrgRevocationState::empty();
+        let authority = AudienceAuthority::granted(&f.grant, &f.secret);
+        let ctx = granted_ctx(f.a_org, f.now + 5, &floors);
+
+        // Build a granted envelope over the fixture's grant/secret with a chosen
+        // descriptor — only the descriptor varies.
+        let build = |descriptor: &[u8]| {
+            let cert = OrgMembershipCert::issue_at(
+                &f.issuer,
+                p.entity_id().clone(),
+                5,
+                f.now.saturating_sub(3600),
+                f.now + 3600,
+                0x1234,
+            );
+            ScopedCapabilityAnnouncement::build_granted(
+                &p,
+                f.issuer.org_id(),
+                cert,
+                f.grant.grant_id,
+                f.secret.audience_handle,
+                f.secret.discovery_key(),
+                4,
+                f.now + 3600,
+                descriptor,
+            )
+            .expect("build")
+        };
+
+        // C1 (the grant's capability) → accepted.
+        let c1 = CapabilitySet::new().add_tag("nrpc:svc").to_bytes_compact();
+        assert!(verify_scoped_ingest(&build(&c1), &authority, &ctx).is_ok());
+
+        // C2 (a different capability) → refused, outside the grant.
+        let c2 = CapabilitySet::new()
+            .add_tag("nrpc:other")
+            .to_bytes_compact();
+        assert_eq!(
+            verify_scoped_ingest(&build(&c2), &authority, &ctx).unwrap_err(),
+            ScopedIngestError::DescriptorOutsideGrant
+        );
+
+        // C1 + C2 (two tags — not the canonical single-capability shape) → refused.
+        let c1c2 = CapabilitySet::new()
+            .add_tag("nrpc:svc")
+            .add_tag("nrpc:other")
+            .to_bytes_compact();
+        assert_eq!(
+            verify_scoped_ingest(&build(&c1c2), &authority, &ctx).unwrap_err(),
+            ScopedIngestError::DescriptorInvalid
+        );
+
+        // A descriptor carrying metadata is not the canonical shape → refused.
+        let with_meta = CapabilitySet::new()
+            .add_tag("nrpc:svc")
+            .with_metadata("k".to_string(), "v".to_string())
+            .to_bytes_compact();
+        assert_eq!(
+            verify_scoped_ingest(&build(&with_meta), &authority, &ctx).unwrap_err(),
+            ScopedIngestError::DescriptorInvalid
+        );
+
+        // Malformed (not a canonical CapabilitySet) → refused.
+        assert_eq!(
+            verify_scoped_ingest(&build(&[0xFFu8; 7]), &authority, &ctx).unwrap_err(),
+            ScopedIngestError::DescriptorInvalid
+        );
     }
 
     #[test]
