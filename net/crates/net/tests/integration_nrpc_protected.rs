@@ -2351,15 +2351,9 @@ fn cross_org_invoke_intent(
     service: &str,
     target_scope: GrantTargetScope,
 ) -> OrgProofIntent {
-    let caller_entity = caller_kp.entity_id().clone();
     let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
     // Membership + dispatcher grant come from the caller's OWN org A (the acting
     // org named by the membership); the capability grant comes from org B.
-    let membership =
-        OrgMembershipCert::try_issue(org_a, caller_entity.clone(), 1, 3600).expect("membership");
-    let dispatcher =
-        OrgDispatcherGrant::try_issue(org_a, caller_entity, DispatcherScope::Exact(cap), 3600)
-            .expect("dispatcher");
     let (grant, secret) = OrgCapabilityGrant::try_issue(
         org_b,
         org_a.org_id(),
@@ -2373,13 +2367,35 @@ fn cross_org_invoke_intent(
         secret.is_none(),
         "an INVOKE-only grant carries no audience material by construction",
     );
+    cross_org_intent_with_grant(caller_kp, org_a, provider, org_b.org_id(), service, grant)
+}
+
+/// Build a cross-org intent that REUSES a given capability `grant`, targeting
+/// `provider` whose owner org is `provider_owner_org`. Membership + dispatcher
+/// grant come from the caller's OWN org A. Lets one grant drive several
+/// providers (e.g. an `AnyNodeOwnedBy` grant reused across B-owned nodes).
+fn cross_org_intent_with_grant(
+    caller_kp: EntityKeypair,
+    org_a: &OrgKeypair,
+    provider: EntityId,
+    provider_owner_org: OrgId,
+    service: &str,
+    grant: OrgCapabilityGrant,
+) -> OrgProofIntent {
+    let caller_entity = caller_kp.entity_id().clone();
+    let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
+    let membership =
+        OrgMembershipCert::try_issue(org_a, caller_entity.clone(), 1, 3600).expect("membership");
+    let dispatcher =
+        OrgDispatcherGrant::try_issue(org_a, caller_entity, DispatcherScope::Exact(cap), 3600)
+            .expect("dispatcher");
     OrgProofIntent {
         caller: Arc::new(caller_kp),
         membership,
         dispatcher,
         capability_grant: Some(grant),
         acting_org: org_a.org_id(),
-        provider_owner_org: org_b.org_id(),
+        provider_owner_org,
         provider,
         capability: cap,
         proof_ttl_secs: 30,
@@ -2467,4 +2483,238 @@ async fn live_two_node_cross_org_granted_admit() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA-4 slice 2 (Tier 1, corrupted-provider-state) — missing-local-tag. A
+/// protected `CrossOrgGranted` service stays registered, but the provider's own
+/// capability tag is superseded out of the fold by an empty higher-version
+/// self-announcement. An OTHERWISE-VALID cross-org proof is denied at the
+/// possession precheck (`has_local_capability`, NOT `may_execute`) BEFORE the
+/// admission engine runs: the handler stays dark and S receives 0x0009. `call`
+/// blocks on the denial response, so the witness is race-free.
+#[tokio::test]
+async fn live_two_node_protected_missing_local_capability_denies() {
+    const CALLER_SEED: [u8; 32] = [0x1du8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (org_b, dir) = install_authority(&server, "notag");
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // Supersede the provider self-fold with an empty higher-version announcement:
+    // the protected registration remains, but the provider no longer carries the
+    // local capability tag.
+    server.test_inject_capability_announcement(CapabilityAnnouncement::new(
+        server.node_id(),
+        server.entity_id().clone(),
+        100,
+        CapabilitySet::new(),
+    ));
+
+    let intent = cross_org_invoke_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_a,
+        &org_b,
+        provider.clone(),
+        "svc",
+        GrantTargetScope::ExactNode(provider),
+    );
+    let err = caller
+        .call(
+            server.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a valid proof to a provider missing its local tag must be denied");
+    match err {
+        RpcError::ServerError { status, .. } => {
+            assert_eq!(
+                status, 0x0009,
+                "AdmissionDenied (0x0009), never a timeout masquerade",
+            );
+        }
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark — the possession precheck denied before admission",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA-4 slice 2 (Tier 1) — `AnyNodeOwnedBy(B)` reuse and boundary. A single B→A
+/// INVOKE grant scoped `AnyNodeOwnedBy(B)` admits at TWO distinct B-owned
+/// providers (reuse across discovered nodes), and is denied (0x0009) at a non-B
+/// provider — a cryptographically valid proof the non-B owner never issued
+/// (`ForeignIssuer`), which doubles as the Tier-1 valid-but-unauthorized cross-
+/// org denial. The grant is INVOKE-only, so no audience secret is minted.
+#[tokio::test]
+async fn live_cross_org_any_node_owned_by_reuse_and_deny() {
+    const CALLER_SEED: [u8; 32] = [0x1eu8; 32];
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7au8; 32]);
+    let org_c = OrgKeypair::from_bytes([0x33u8; 32]);
+
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    let (p2, dir2) = adopted_node(0x51, &org_b, "anyb-p2").await;
+    let (p2b, dir2b) = adopted_node(0x52, &org_b, "anyb-p2b").await;
+    let (pc, dirc) = adopted_node(0x53, &org_c, "anyb-pc").await;
+    bring_up(&caller, &p2).await;
+    bring_up(&caller, &p2b).await;
+    bring_up(&caller, &pc).await;
+
+    // One reusable INVOKE grant scoped to ANY B-owned node.
+    let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        cap,
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(org_b.org_id()),
+        3600,
+    )
+    .expect("issue AnyNodeOwnedBy grant");
+    assert!(secret.is_none(), "INVOKE-only mints no audience material");
+
+    let p2_calls = Arc::new(AtomicUsize::new(0));
+    let _s2 = p2
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: p2_calls.clone(),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("serve p2");
+    let p2b_calls = Arc::new(AtomicUsize::new(0));
+    let _s2b = p2b
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: p2b_calls.clone(),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("serve p2b");
+    let pc_calls = Arc::new(AtomicUsize::new(0));
+    let _sc = pc
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: pc_calls.clone(),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("serve pc");
+
+    let opts = || CallOptions {
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+
+    // Reuse: the SAME grant admits at both B-owned providers.
+    caller
+        .call(
+            p2.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(cross_org_intent_with_grant(
+                    EntityKeypair::from_bytes(CALLER_SEED),
+                    &org_a,
+                    p2.entity_id().clone(),
+                    org_b.org_id(),
+                    "svc",
+                    grant.clone(),
+                )),
+                ..opts()
+            },
+        )
+        .await
+        .expect("admit at the first B-owned node");
+    caller
+        .call(
+            p2b.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(cross_org_intent_with_grant(
+                    EntityKeypair::from_bytes(CALLER_SEED),
+                    &org_a,
+                    p2b.entity_id().clone(),
+                    org_b.org_id(),
+                    "svc",
+                    grant.clone(),
+                )),
+                ..opts()
+            },
+        )
+        .await
+        .expect("admit at the second B-owned node (grant reuse)");
+    assert_eq!(p2_calls.load(Ordering::SeqCst), 1, "P₂ handler ran once");
+    assert_eq!(
+        p2b_calls.load(Ordering::SeqCst),
+        1,
+        "the second B-owned node's handler ran once — one grant, reused",
+    );
+
+    // Boundary: the B-issued grant has no authority at a non-B provider.
+    let err = caller
+        .call(
+            pc.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(cross_org_intent_with_grant(
+                    EntityKeypair::from_bytes(CALLER_SEED),
+                    &org_a,
+                    pc.entity_id().clone(),
+                    org_c.org_id(),
+                    "svc",
+                    grant.clone(),
+                )),
+                ..opts()
+            },
+        )
+        .await
+        .expect_err("a B-issued grant must be denied at a non-B provider");
+    match err {
+        RpcError::ServerError { status, .. } => {
+            assert_eq!(status, 0x0009, "AdmissionDenied at the non-B provider");
+        }
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        pc_calls.load(Ordering::SeqCst),
+        0,
+        "the non-B provider's handler stayed dark",
+    );
+
+    for d in [dir2, dir2b, dirc] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

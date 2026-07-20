@@ -7976,6 +7976,427 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// OA-4 slice 2 (Tier 2) — the cross-org `CrossOrgGranted` DENIAL matrix,
+    /// table-driven through the REAL provider bridge (`deliver_rpc_inbound_for_test`
+    /// → `admit_and_dispatch_protected` → `verify_org_admission` + the real replay
+    /// guard). Each adversarial frame is DENIED — the handler stays dark — while
+    /// genuine calls admit and a replay of an admitted call is refused. The exact
+    /// typed `AdmissionDenied` reason for each row is pinned by the pure
+    /// `org_admission.rs` unit matrix (Tier 3); here we prove COMPOSITION: through
+    /// real dispatch, an unauthorized proof never reaches the handler.
+    ///
+    /// Covers the eleven-denial matrix incl. the OA-4 addition `GranteeMismatch`
+    /// (missing-local-tag is a corrupted-provider-state row, witnessed separately
+    /// in `protected_cross_org_missing_local_capability_denies`): wrong grantee
+    /// org, foreign issuer, insufficient rights (DISCOVER-only), missing
+    /// capability grant, wrong target, wrong capability, wrong body/digest,
+    /// expired proof, copied proof (TOFU member binding), missing header, multiple
+    /// headers, and replay.
+    ///
+    /// Barrier discipline: `deliver_rpc_inbound_for_test` is a single-consumer
+    /// FIFO, so after every denial frame we deliver two genuine calls (and re-send
+    /// the first); `admits == 2` at the end proves every prior adversarial frame
+    /// was processed-and-denied and the replay of the first genuine call was
+    /// refused — no denial merely raced ahead of a slow admit.
+    #[tokio::test]
+    async fn cross_org_admission_denial_matrix() {
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                assert!(
+                    ctx.org_admission.is_some(),
+                    "only admitted calls may reach the handler",
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]); // provider owner
+        let org_a = OrgKeypair::from_bytes([0x7au8; 32]); // caller org
+        let org_c = OrgKeypair::from_bytes([0x33u8; 32]); // foil org
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa4-xorg-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::CrossOrgGranted,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0xA1;
+        let caller_kp = EntityKeypair::from_bytes([0x1bu8; 32]);
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let future = (current_timestamp() + 20) * 1_000_000_000;
+
+        // Honest baseline credentials for caller S ∈ org A, and a valid B→A INVOKE
+        // grant covering exactly P₂.
+        let membership_a = OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600)
+            .expect("membership");
+        let dispatcher_a = OrgDispatcherGrant::try_issue(
+            &org_a,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher");
+        let good_grant = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+
+        // A frame from S's pinned session carrying `headers`, `body`, `call_id`.
+        let make_event = |headers: Vec<Vec<u8>>, call_id: u64, body: &'static [u8]| {
+            let mut payload = base.clone();
+            payload.body = Bytes::from_static(body);
+            payload.headers = headers
+                .into_iter()
+                .map(|h| (ORG_ADMISSION_HEADER.to_string(), h))
+                .collect();
+            let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut frame, 0);
+            frame.extend_from_slice(&payload.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        };
+        // Encode a proof header for caller `kp` over the given credentials. The
+        // acting org is always A (bound = dispatcher's org), the provider org B.
+        let sign = |kp: &EntityKeypair,
+                    membership: OrgMembershipCert,
+                    dispatcher: OrgDispatcherGrant,
+                    grant: Option<OrgCapabilityGrant>,
+                    call_id: u64,
+                    expiry: u64,
+                    dgst: [u8; 32]|
+         -> Vec<u8> {
+            OrgCallProof::sign_for_call(
+                kp,
+                membership,
+                dispatcher,
+                grant,
+                org_a.org_id(),
+                org_b.org_id(),
+                node_entity.clone(),
+                call_id,
+                cap,
+                expiry,
+                dgst,
+            )
+            .encode()
+            .expect("encode proof")
+        };
+        let good = |call_id: u64| {
+            sign(
+                &caller_kp,
+                membership_a.clone(),
+                dispatcher_a.clone(),
+                Some(good_grant.clone()),
+                call_id,
+                future,
+                digest,
+            )
+        };
+
+        // ---- The adversarial rows — every one must be DENIED (handler dark). ----
+
+        // 1. Wrong grantee org: grant issued B→C, but the caller is an A member.
+        let wrong_grantee = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_c.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(wrong_grantee),
+                    101,
+                    future,
+                    digest,
+                )],
+                101,
+                b"ping",
+            ),
+        );
+
+        // 2. Foreign issuer: grant issued by org C, not the provider's owner B.
+        let foreign_issuer = OrgCapabilityGrant::try_issue(
+            &org_c,
+            org_a.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(foreign_issuer),
+                    102,
+                    future,
+                    digest,
+                )],
+                102,
+                b"ping",
+            ),
+        );
+
+        // 3. Insufficient rights: a DISCOVER-only grant carries no INVOKE.
+        let discover_only = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(discover_only),
+                    103,
+                    future,
+                    digest,
+                )],
+                103,
+                b"ping",
+            ),
+        );
+
+        // 4. Missing capability grant: a CrossOrgGranted call with no grant.
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    None,
+                    104,
+                    future,
+                    digest,
+                )],
+                104,
+                b"ping",
+            ),
+        );
+
+        // 5. Wrong target: the grant names a different provider entity.
+        let other_entity = EntityKeypair::from_bytes([0xeeu8; 32]).entity_id().clone();
+        let wrong_target = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(other_entity),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(wrong_target),
+                    105,
+                    future,
+                    digest,
+                )],
+                105,
+                b"ping",
+            ),
+        );
+
+        // 6. Wrong capability: the grant authorizes a DIFFERENT capability.
+        let wrong_cap = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:other"),
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(wrong_cap),
+                    106,
+                    future,
+                    digest,
+                )],
+                106,
+                b"ping",
+            ),
+        );
+
+        // 7. Wrong body: a proof signed over the "ping" digest, delivered on a
+        //    "pong" body → the request digest binding fails.
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![good(107)], 107, b"pong"));
+
+        // 8. Expired proof: an expiry 100 s in the past.
+        let past = current_timestamp().saturating_sub(100) * 1_000_000_000;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a.clone(),
+                    dispatcher_a.clone(),
+                    Some(good_grant.clone()),
+                    108,
+                    past,
+                    digest,
+                )],
+                108,
+                b"ping",
+            ),
+        );
+
+        // 9. Copied proof: a valid proof for a DIFFERENT caller X, delivered on
+        //    S's authenticated session → TOFU member binding fails.
+        let x_kp = EntityKeypair::from_bytes([0x2cu8; 32]);
+        let x_entity = x_kp.entity_id().clone();
+        let membership_x =
+            OrgMembershipCert::try_issue(&org_a, x_entity.clone(), 1, 3600).expect("x membership");
+        let dispatcher_x =
+            OrgDispatcherGrant::try_issue(&org_a, x_entity, DispatcherScope::Exact(cap), 3600)
+                .expect("x dispatcher");
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &x_kp,
+                    membership_x,
+                    dispatcher_x,
+                    Some(good_grant.clone()),
+                    109,
+                    future,
+                    digest,
+                )],
+                109,
+                b"ping",
+            ),
+        );
+
+        // 10. Missing header: no admission header at all.
+        server.deliver_rpc_inbound_for_test(channel_hash, make_event(vec![], 110, b"ping"));
+
+        // 11. Multiple headers: two admission headers on one request.
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(vec![good(111), good(111)], 111, b"ping"),
+        );
+
+        // ---- Genuine calls + replay: the FIFO barrier. ----
+        let v1 = good(200);
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![v1.clone()], 200, b"ping"));
+        // Replay: the identical admitted frame again → refused (no second admit).
+        server.deliver_rpc_inbound_for_test(channel_hash, make_event(vec![v1], 200, b"ping"));
+        // A second genuine call closes the barrier.
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![good(201)], 201, b"ping"));
+
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 2).await,
+            "the two genuine cross-org calls must be admitted",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            2,
+            "exactly the two genuine calls admitted — every adversarial frame was denied \
+             (handler dark) and the replay of the first genuine call was refused",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Kyra #47 B1: the gate binds the AUTHENTICATED session entity's origin to
     /// the wire-claimed origin. A pinned peer with a VALID proof for itself, but
     /// stamping a DIFFERENT origin (packet == payload == victim) into the frame,
