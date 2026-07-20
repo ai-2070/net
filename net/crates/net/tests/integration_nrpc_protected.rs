@@ -1282,6 +1282,259 @@ async fn removing_a_provider_grant_refuses_the_cached_granted_envelope() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// OA3-4b2 slice 4 — consumer nonzero-grant ingest selector witnesses.
+// ---------------------------------------------------------------------------
+
+/// Adopt `org` on a fresh node, returning the node + scratch dir.
+async fn adopted_node(
+    seed: u8,
+    org: &OrgKeypair,
+    tag: &str,
+) -> (Arc<MeshNode>, std::path::PathBuf) {
+    let n = build_node_with(EntityKeypair::from_bytes([seed; 32])).await;
+    let entity = n.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!("net-oa34b2-cons-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    n.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    (n, dir)
+}
+
+/// Build a granted-audience envelope from provider P (org B) sealed under
+/// `grant`/`secret`, naming `svc`. Expires 600 s from `now`.
+fn granted_envelope_bytes(
+    provider_kp: &EntityKeypair,
+    org_b: &OrgKeypair,
+    grant: &OrgCapabilityGrant,
+    secret: &OrgAudienceSecret,
+    svc: &str,
+    now: u64,
+) -> Vec<u8> {
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    let cert = OrgMembershipCert::try_issue(org_b, provider_kp.entity_id().clone(), 1, 3600)
+        .expect("cert");
+    let descriptor = CapabilitySet::new()
+        .add_tag(format!("nrpc:{svc}"))
+        .to_bytes_compact();
+    ScopedCapabilityAnnouncement::build_granted(
+        provider_kp,
+        org_b.org_id(),
+        cert,
+        grant.grant_id,
+        secret.audience_handle,
+        secret.discovery_key(),
+        1,
+        now + 600,
+        &descriptor,
+    )
+    .expect("build granted envelope")
+    .to_bytes()
+}
+
+/// A canonical B→A DISCOVER grant over provider `p`, plus its secret.
+fn cross_org_grant(
+    org_b: &OrgKeypair,
+    org_a: &OrgKeypair,
+    p: &EntityId,
+    svc: &str,
+) -> (OrgCapabilityGrant, OrgAudienceSecret) {
+    let (g, s) = OrgCapabilityGrant::try_issue(
+        org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag(&format!("nrpc:{svc}")),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(p.clone()),
+        3600,
+    )
+    .expect("issue cross-org grant");
+    (g, s.expect("secret"))
+}
+
+/// OA3-4b2 slice 4 — a consumer A holding the canonical B→A pair opens and
+/// resolves provider P from an inbound GRANTED envelope; a node WITHOUT the pair
+/// stores nothing.
+#[tokio::test]
+async fn an_inbound_granted_announcement_is_verified_and_stored() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let provider = EntityKeypair::from_bytes([0x90u8; 32]);
+    let p_entity = provider.entity_id().clone();
+    let now = unix_now();
+
+    let (grant, secret) = cross_org_grant(&org_b, &org_a, &p_entity, "cross");
+    let grant_id = grant.grant_id;
+    let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
+
+    // Consumer C: org A, with the B→A pair installed → opens + resolves P.
+    let (c, c_dir) = adopted_node(0x91, &org_a, "resolve").await;
+    c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install consumer grant");
+    c.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        c.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "the grantee opens and resolves P under the grant",
+    );
+
+    // Node D: org A but NO consumer grant → stores nothing. Prove non-storage by
+    // installing the grant AFTER the ingest: the record never landed, so the
+    // query stays empty.
+    let (d, d_dir) = adopted_node(0x92, &org_a, "nostore").await;
+    d.ingest_scoped_announcement_for_test(&env);
+    d.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install after the drop");
+    assert!(
+        d.scoped_granted_providers_for_test(&grant_id, now)
+            .is_empty(),
+        "a node without the pair at ingest time stored nothing",
+    );
+
+    let _ = std::fs::remove_dir_all(&c_dir);
+    let _ = std::fs::remove_dir_all(&d_dir);
+}
+
+/// OA3-4b2 slice 4 — the selector is an EXACT lookup by grant id: an envelope for
+/// grant G is dropped by a node that holds only a DIFFERENT grant G2 (no scan
+/// across secrets), and stores nothing even after G is later installed.
+#[tokio::test]
+async fn the_ingest_selector_drops_a_grant_id_it_does_not_hold() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let provider = EntityKeypair::from_bytes([0x93u8; 32]);
+    let p_entity = provider.entity_id().clone();
+    let now = unix_now();
+
+    let (g1, s1) = cross_org_grant(&org_b, &org_a, &p_entity, "cross");
+    let (g2, s2) = cross_org_grant(&org_b, &org_a, &p_entity, "other");
+    let env1 = granted_envelope_bytes(&provider, &org_b, &g1, &s1, "cross", now);
+
+    // C holds only G2, then receives an envelope for G1 → dropped.
+    let (c, dir) = adopted_node(0x94, &org_a, "wrongid").await;
+    c.install_consumer_grant_audience(g2, s2)
+        .expect("install g2");
+    c.ingest_scoped_announcement_for_test(&env1);
+    // Install G1 afterward: if the earlier ingest had stored the record it would
+    // now be queryable — it is not, proving the mismatched id was dropped.
+    c.install_consumer_grant_audience(g1.clone(), copy_secret(&s1))
+        .expect("install g1");
+    assert!(
+        c.scoped_granted_providers_for_test(&g1.grant_id, now)
+            .is_empty(),
+        "an envelope whose grant id the node did not hold was dropped, not stored",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 4 — removing the consumer credential retracts the stored granted
+/// record IMMEDIATELY at query time (no re-announce, no sweep); the record stays
+/// physically stored, so re-installing the credential makes it queryable again.
+#[tokio::test]
+async fn removing_the_consumer_credential_hides_the_stored_granted_record() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let provider = EntityKeypair::from_bytes([0x95u8; 32]);
+    let p_entity = provider.entity_id().clone();
+    let now = unix_now();
+
+    let (grant, secret) = cross_org_grant(&org_b, &org_a, &p_entity, "cross");
+    let grant_id = grant.grant_id;
+    let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
+
+    let (c, dir) = adopted_node(0x96, &org_a, "hide").await;
+    c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install");
+    c.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        c.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity.clone()],
+        "resolves before removal",
+    );
+
+    // Remove the credential → the record is hidden immediately (read-time filter).
+    assert!(c.remove_consumer_grant_audience(&grant_id));
+    assert!(
+        c.scoped_granted_providers_for_test(&grant_id, now)
+            .is_empty(),
+        "removing the consumer credential retracts the record at query time",
+    );
+
+    // Re-installing the SAME credential re-exposes the still-stored record — proof
+    // the retraction was a read-time filter, not an eviction.
+    c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("re-install");
+    assert_eq!(
+        c.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity],
+        "the record was hidden, not evicted — re-installing re-exposes it",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 4 — a consumer credential replacement racing the verify→insert
+/// window refuses the stale result: a probe swaps the consumer snapshot pointer
+/// (installs an unrelated grant) between verify and the pre-insert recheck, so the
+/// raced insert is refused. A clean re-ingest against the settled snapshot lands.
+#[tokio::test]
+async fn a_consumer_credential_replacement_racing_the_granted_insert_is_refused() {
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let provider = EntityKeypair::from_bytes([0x97u8; 32]);
+    let p_entity = provider.entity_id().clone();
+    let now = unix_now();
+
+    let (grant, secret) = cross_org_grant(&org_b, &org_a, &p_entity, "cross");
+    let grant_id = grant.grant_id;
+    let env = granted_envelope_bytes(&provider, &org_b, &grant, &secret, "cross", now);
+
+    let (c, dir) = adopted_node(0x98, &org_a, "race").await;
+    c.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install target grant");
+
+    // The probe installs an UNRELATED consumer grant, swapping the registry
+    // snapshot pointer while the target-grant ingest is mid-flight.
+    let (unrelated, unrelated_secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:unrelated"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::AnyNodeOwnedBy(org_b.org_id()),
+        3600,
+    )
+    .expect("issue unrelated");
+    let unrelated_secret = unrelated_secret.expect("secret");
+    let pending = std::sync::Mutex::new(Some((unrelated, unrelated_secret)));
+    let c_probe = c.clone();
+    let probe = move || {
+        if let Some((g, s)) = pending.lock().expect("probe lock").take() {
+            c_probe
+                .install_consumer_grant_audience(g, s)
+                .expect("probe install");
+        }
+    };
+    c.ingest_scoped_announcement_probed_for_test(&env, &probe);
+    assert!(
+        c.scoped_granted_providers_for_test(&grant_id, now)
+            .is_empty(),
+        "the raced insert is refused when the consumer snapshot moved during verify",
+    );
+
+    // The target grant is still installed; a clean re-ingest against the settled
+    // snapshot now lands.
+    c.ingest_scoped_announcement_for_test(&env);
+    assert_eq!(
+        c.scoped_granted_providers_for_test(&grant_id, now),
+        vec![p_entity],
+        "a clean re-ingest against the settled snapshot resolves P",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// OA3-4b1 B2 audience-rotation safety (Kyra): a same-org authority replacement
 /// rotates the owner audience key while keeping the membership cert equal. The
 /// public-cert and visibility checks therefore see no change — only the recorded

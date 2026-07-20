@@ -1040,6 +1040,11 @@ struct DispatchCtx {
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
+    /// OA3-4b2: the consumer grant-audience registry — the inbound nonzero-grant
+    /// ingest selector looks a record up here by `grant_id`. See the matching
+    /// field doc on `MeshNode`.
+    consumer_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
@@ -8245,6 +8250,7 @@ impl MeshNode {
         Self::ingest_scoped_announcement(
             &self.node_authority,
             &self.org_revocation,
+            &self.consumer_grant_audiences,
             &self.scoped_discovery,
             &decoded,
             0,
@@ -8272,6 +8278,7 @@ impl MeshNode {
         Self::ingest_scoped_announcement(
             &self.node_authority,
             &self.org_revocation,
+            &self.consumer_grant_audiences,
             &self.scoped_discovery,
             &decoded,
             0,
@@ -8306,6 +8313,38 @@ impl MeshNode {
         self.scoped_discovery
             .lock()
             .find_owner_private_capabilities(now_secs, floors, |_| true)
+            .into_iter()
+            .map(|c| c.provider().clone())
+            .collect()
+    }
+
+    /// Test seam (OA3-4b2): the provider entity ids of the GRANTED-audience
+    /// capabilities discovered under `grant_id`, at `now_secs`. Applies QUERY-TIME
+    /// CONSUMER CURRENTNESS: a granted record is visible only while this node still
+    /// holds the consumer grant it was discovered under — removing the credential
+    /// retracts every record for that grant IMMEDIATELY, with no re-announce and no
+    /// sweep (the record stays physically stored; retraction is a read-time
+    /// filter, mirroring the floor-currentness filter for owner records). Also
+    /// expiry- and floor-currentness-safe, exactly as a real query would be.
+    #[doc(hidden)]
+    pub fn scoped_granted_providers_for_test(
+        &self,
+        grant_id: &[u8; 32],
+        now_secs: u64,
+    ) -> Vec<EntityId> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        // Query-time consumer currentness: no installed consumer grant for this id
+        // ⇒ nothing is discoverable under it, even if a record is still stored.
+        if self.consumer_grant_audiences.load().get(grant_id).is_none() {
+            return Vec::new();
+        }
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        self.scoped_discovery
+            .lock()
+            .find_capabilities_for_grant(grant_id, now_secs, floors, |_| true)
             .into_iter()
             .map(|c| c.provider().clone())
             .collect()
@@ -9731,6 +9770,7 @@ impl MeshNode {
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
+            consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
@@ -11190,6 +11230,7 @@ impl MeshNode {
                 Self::ingest_scoped_announcement(
                     &ctx.node_authority,
                     &ctx.org_revocation,
+                    &ctx.consumer_grant_audiences,
                     &ctx.scoped_discovery,
                     &admit.envelope,
                     from_node,
@@ -16789,16 +16830,22 @@ impl MeshNode {
     /// (`ingest_scoped_announcement_for_test`) so both exercise the identical
     /// verify+store path.
     ///
-    /// A node WITHOUT an installed authority holds no owner audience key and
-    /// drops every envelope (INVOKE-only / un-adopted nodes ingest nothing). The
-    /// envelope is opened against this node's OWN owner audience and checked
-    /// against the LIVE revocation floors (`verify_scoped_ingest`): a
-    /// wrong-audience, expired, floored-provider, or forged envelope is refused
-    /// and never stored. Only the owner audience is attempted here;
-    /// granted-audience ingest is OA3-4b2.
+    /// A node WITHOUT an installed authority holds neither an owner audience key
+    /// nor a grantee identity and drops every envelope (INVOKE-only / un-adopted
+    /// relays ingest nothing). The audience is selected by the envelope's grant
+    /// id: the reserved ZERO sentinel opens against this node's OWN owner audience
+    /// (OA3-4b1); a NONZERO grant id selects an installed CONSUMER grant/secret by
+    /// an EXACT bounded lookup — `consumer_grant_audiences.get(grant_id)` plus an
+    /// audience-handle match, never a scan across secrets (OA3-4b2). In both cases
+    /// `verify_scoped_ingest` re-checks everything against the LIVE revocation
+    /// floors; a wrong-audience, expired, floored-provider, wrong-grantee, or
+    /// forged envelope is refused and never stored.
     fn ingest_scoped_announcement(
         node_authority: &Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
         org_revocation: &Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+        consumer_grant_audiences: &Arc<
+            arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+        >,
         scoped_discovery: &Arc<
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
         >,
@@ -16814,13 +16861,12 @@ impl MeshNode {
         // The caller has already decoded the frame and outer-verified this
         // envelope (structural + bounds + the provider's outer signature, via
         // `from_bytes`). This is the LOCAL open/store half only: no installed
-        // authority ⇒ no owner audience key ⇒ cannot open, drop (an INVOKE-only /
-        // un-adopted relay forwards but never stores).
+        // authority ⇒ no owner audience key AND no grantee identity ⇒ cannot open,
+        // drop (an INVOKE-only / un-adopted relay forwards but never stores).
         let Some(authority) = node_authority.load_full() else {
             return;
         };
         let owner_org = authority.owner_org();
-        let audience = AudienceAuthority::owner(owner_org, &authority.audience);
         let store = org_revocation.load_full();
         // Fail-closed on a POISONED (durability-uncertain) revocation view: while
         // a floor raise's durability is unproven, the private-discovery plane must
@@ -16862,6 +16908,48 @@ impl MeshNode {
             now_secs,
             skew_secs: authority.config.verification_skew_secs,
         };
+        // OA3-4b2 audience selection: owner (zero sentinel) opens against this
+        // node's OWN owner audience; a nonzero grant id selects an installed
+        // CONSUMER credential by an EXACT bounded lookup. PIN the consumer snapshot
+        // Arc for a granted ingest (held alive across verify→insert, ABA-safe) so a
+        // removed/replaced credential racing the verify refuses the stale result
+        // (mirrors the OA3-5 3a authority/store race closure).
+        let consumer = if envelope.is_owner_audience() {
+            None
+        } else {
+            Some(consumer_grant_audiences.load_full())
+        };
+        let (audience, consumer_ptr) = match &consumer {
+            None => (
+                AudienceAuthority::owner(owner_org, &authority.audience),
+                0usize,
+            ),
+            Some(snapshot) => {
+                let ptr = Arc::as_ptr(snapshot) as *const () as usize;
+                // Exact lookup by grant id, then confirm the envelope's audience
+                // handle matches the record — never a scan across secrets. No
+                // installed consumer grant for this id ⇒ drop (this node is not a
+                // grantee for it, e.g. a relay or a wrong-grantee node).
+                let Some(record) = snapshot.get(envelope.grant_id()) else {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: no installed consumer grant for this grant id; drop"
+                    );
+                    return;
+                };
+                if record.audience_handle() != envelope.audience_handle() {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: consumer grant audience-handle mismatch; drop"
+                    );
+                    return;
+                }
+                (
+                    AudienceAuthority::granted(record.grant(), record.secret()),
+                    ptr,
+                )
+            }
+        };
         match verify_scoped_ingest(envelope, &audience, &ctx) {
             Ok(verified) => {
                 // A test probe fires in the exact verify→recheck window a
@@ -16897,7 +16985,20 @@ impl MeshNode {
                 let store_stable = store_ptr_now == store_ptr
                     && generation_now == pinned_generation
                     && !poisoned_now;
-                if !authority_stable || !store_stable {
+                // OA3-4b2: for a granted ingest, the CONSUMER snapshot must also be
+                // unchanged. A credential removal or replacement (remove-then-
+                // install, or an unrelated install) swaps the registry pointer, so
+                // a result verified under a since-mutated consumer credential is
+                // refused before it can land — mirroring the store/authority race
+                // above. Owner ingest (`consumer` is `None`) is unaffected.
+                let consumer_stable = match &consumer {
+                    None => true,
+                    Some(_) => {
+                        Arc::as_ptr(&consumer_grant_audiences.load_full()) as *const () as usize
+                            == consumer_ptr
+                    }
+                };
+                if !authority_stable || !store_stable || !consumer_stable {
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         "scoped-ann: security view moved during verify; ingest refused \
@@ -16909,7 +17010,7 @@ impl MeshNode {
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
-                    "scoped-ann: owner-audience capability ingested"
+                    "scoped-ann: scoped capability ingested"
                 );
             }
             Err(e) => {
