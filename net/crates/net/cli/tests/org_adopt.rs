@@ -342,3 +342,229 @@ fn issue_cert_rejects_overlong_ttl_and_bad_member() {
         .assert()
         .code(2);
 }
+
+// =========================================================================
+// §2 — `--force` must never destroy the org root key.
+//
+// `run_issue_cert` / `run_issue_floors` used to call `refuse_existing`
+// (which returns Ok on the first line when `--force` is set) and then
+// `tokio::fs::write`, which truncates in place and writes THROUGH a leaf
+// symlink. Pointing `--out` at `--org-key` with `--force` therefore replaced
+// the org root seed with cert JSON: no node can be re-certified, no
+// revocation floor can ever be issued again, and every outstanding
+// membership cert stays valid until natural expiry with no way to revoke it.
+//
+// Each test below asserts the org key SURVIVED BYTE-FOR-BYTE, not merely
+// that the command exited non-zero — an exit-code-only assertion passes for
+// any of several unrelated reasons (clap's usage code is 2, and so is
+// `ExitCodeKind::InvalidArgs`).
+// =========================================================================
+
+/// The org key file's exact bytes, for before/after comparison.
+fn read_key_bytes(key: &Path) -> Vec<u8> {
+    std::fs::read(key).expect("org key readable")
+}
+
+#[test]
+fn issue_cert_force_refuses_to_alias_the_org_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let before = read_key_bytes(&key);
+
+    let assert = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&key)
+        .args(["--member", MEMBER_HEX])
+        .args(["--out"])
+        .arg(&key) // <-- the org key itself
+        .arg("--force")
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("--org-key") && stderr.contains("--out"),
+        "the refusal must name the two aliased flags so the operator can fix \
+         the invocation; got: {stderr}",
+    );
+    assert_eq!(
+        read_key_bytes(&key),
+        before,
+        "the org root key must be byte-for-byte intact after a refused --force",
+    );
+}
+
+#[test]
+fn issue_floors_force_refuses_to_alias_the_org_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let before = read_key_bytes(&key);
+
+    let assert = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-floors", "--org-key"])
+        .arg(&key)
+        .args(["--floor", &format!("{MEMBER_HEX}=3")])
+        .args(["--out"])
+        .arg(&key)
+        .arg("--force")
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("--org-key") && stderr.contains("--out"),
+        "the refusal must name the two aliased flags; got: {stderr}",
+    );
+    assert_eq!(
+        read_key_bytes(&key),
+        before,
+        "the org root key must be byte-for-byte intact after a refused --force",
+    );
+}
+
+/// The lexical alias guard only compares the two paths it was given. It
+/// cannot see that a THIRD path holds key material — a backup copy of the org
+/// key, a second checkout, a key restored beside the artifact it signs. With
+/// `--force` that destination would be replaced.
+///
+/// `refuse_replacing_org_key` is the backstop: it refuses on the
+/// destination's CONTENT, so the spelling is irrelevant. Exercised here with
+/// a copy at a lexically unrelated path — which the alias guard provably
+/// cannot catch, so a pass witnesses the content check specifically.
+#[test]
+fn issue_cert_force_refuses_a_destination_holding_key_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+
+    // A backup copy at an unrelated path — `refuse_aliased_paths` compares
+    // `--org-key` against `--out` lexically and sees two different files.
+    let backup = dir.path().join("org-key-backup.toml");
+    std::fs::copy(&key, &backup).unwrap();
+    let before = read_key_bytes(&backup);
+
+    let assert = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&key)
+        .args(["--member", MEMBER_HEX])
+        .args(["--out"])
+        .arg(&backup)
+        .arg("--force")
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("org root key material"),
+        "the content backstop (not the lexical guard) must be what refuses \
+         this destination; got: {stderr}",
+    );
+    assert!(
+        !stderr.contains("seed_hex"),
+        "the refusal must not echo the key file's contents: {stderr}",
+    );
+    assert_eq!(
+        read_key_bytes(&backup),
+        before,
+        "key material at the destination must be byte-for-byte intact",
+    );
+}
+
+/// Positive control: `--force` still does its job. Certificates are renewable
+/// by design (~annual), so refusing `--force` outright the way the grant verbs
+/// do would break a real workflow — the fix makes the replace SAFE (staged +
+/// atomic rename), not unavailable.
+#[test]
+fn issue_cert_force_still_renews_an_existing_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let cert = issue_cert(dir.path(), &key, MEMBER_HEX, 0, "node.cert.json");
+    let first = std::fs::read(&cert).unwrap();
+
+    // Re-issue at a higher generation over the same path.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&key)
+        .args(["--member", MEMBER_HEX])
+        .args(["--generation", "7"])
+        .args(["--out"])
+        .arg(&cert)
+        .arg("--force")
+        .assert()
+        .code(0);
+
+    let second = std::fs::read(&cert).unwrap();
+    assert_ne!(first, second, "--force must actually replace the artifact");
+
+    // The published artifact must be COMPLETE, not a torn/interleaved write —
+    // the whole point of staging plus an atomic rename. It parses as the
+    // versioned envelope, and the cert body carries the new generation: the
+    // canonical cert encoding is fixed-offset with `generation` as a
+    // little-endian u32, so generation 7 appears as `07000000` in the hex
+    // body (a gen-0 cert has `00000000` there).
+    let text = String::from_utf8_lossy(&second).to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("published cert is valid JSON");
+    assert_eq!(parsed["version"], 1, "versioned envelope preserved");
+    let body = parsed["cert"].as_str().expect("cert body is a hex string");
+    assert!(
+        body.contains("07000000"),
+        "the replacement must carry the newly issued generation (LE u32 in the \
+         canonical cert encoding); body: {body}",
+    );
+    // No staging temp left behind.
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".stage."))
+        .collect();
+    assert!(strays.is_empty(), "staging temps left behind: {strays:?}");
+}
+
+/// Without `--force`, publication is no-clobber and must not write THROUGH a
+/// leaf symlink onto the org key. `tokio::fs::write` followed symlinks; the
+/// staged hard-link publish does not.
+#[cfg(unix)]
+#[test]
+fn issue_cert_never_writes_through_a_symlink_onto_the_org_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let before = read_key_bytes(&key);
+
+    let link = dir.path().join("cert.json");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+
+    // No --force: no-clobber refuses outright.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&key)
+        .args(["--member", MEMBER_HEX])
+        .args(["--out"])
+        .arg(&link)
+        .assert()
+        .code(2);
+    assert_eq!(read_key_bytes(&key), before, "org key intact (no --force)");
+
+    // With --force: the content backstop refuses, because the symlink
+    // resolves to the org key.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&key)
+        .args(["--member", MEMBER_HEX])
+        .args(["--out"])
+        .arg(&link)
+        .arg("--force")
+        .assert()
+        .code(2);
+    assert_eq!(
+        read_key_bytes(&key),
+        before,
+        "org key intact (with --force)"
+    );
+}

@@ -340,15 +340,18 @@ async fn run_issue_cert(args: IssueCertArgs, output: Option<OutputFormat>) -> Re
         OrgMembershipCert::try_issue(&keypair, member.clone(), args.generation, args.ttl_secs)
             .map_err(|e| invalid_args(format!("issue-cert: {e}")))?;
 
+    // The org root key must never be a publication target — with `--force` the
+    // old `refuse_existing` + `tokio::fs::write` pair would truncate it in
+    // place, destroying the only key that can issue certs or revocation floors
+    // for this org, with every outstanding cert left valid until natural expiry
+    // (§2). The alias guard runs REGARDLESS of `--force`.
+    refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", &args.out)])?;
     refuse_existing(&args.out, args.force).await?;
-    write_json_envelope(
-        &args.out,
-        &OrgCertFile {
-            version: ORG_FILE_VERSION,
-            cert: cert.clone(),
-        },
-    )
-    .await?;
+    let json = serialize_json(&OrgCertFile {
+        version: ORG_FILE_VERSION,
+        cert: cert.clone(),
+    })?;
+    publish_json_artifact(&args.out, &json, args.force).await?;
 
     let summary = IssueCertOutput {
         path: args.out.display().to_string(),
@@ -394,15 +397,15 @@ async fn run_issue_floors(
     let bundle = OrgRevocationBundle::try_issue(&keypair, &floors)
         .map_err(|e| invalid_args(format!("issue-floors: {e}")))?;
 
+    // Same boundary as issue-cert: `--out` must never alias `--org-key`, with
+    // or without `--force` (§2).
+    refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", &args.out)])?;
     refuse_existing(&args.out, args.force).await?;
-    write_json_envelope(
-        &args.out,
-        &OrgFloorsFile {
-            version: ORG_FILE_VERSION,
-            bundle: bundle.clone(),
-        },
-    )
-    .await?;
+    let json = serialize_json(&OrgFloorsFile {
+        version: ORG_FILE_VERSION,
+        bundle: bundle.clone(),
+    })?;
+    publish_json_artifact(&args.out, &json, args.force).await?;
 
     let summary = IssueFloorsOutput {
         path: args.out.display().to_string(),
@@ -1044,8 +1047,8 @@ async fn publish_staged(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
         remove_file_or_warn(tmp, "staging temp").await;
         return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
             invalid_args(format!(
-                "file already exists at {}; grant artifacts are no-clobber — write to a fresh \
-                 path or remove the old artifact explicitly",
+                "file already exists at {}; publication is no-clobber — write to a fresh path \
+                 or remove the old artifact explicitly",
                 final_path.display()
             ))
         } else {
@@ -1118,6 +1121,9 @@ async fn sync_parent_dir(path: &Path) {
     }
 }
 
+/// Pre-check for a nicer error than the race-free `create_new`/`hard_link`
+/// enforcement in [`stage_beside`] / [`publish_staged`] produces. This is UX,
+/// NOT the safety boundary — the publish path fails closed on its own.
 async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
     if force {
         return Ok(());
@@ -1128,30 +1134,124 @@ async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
             path.display()
         ))),
         Ok(false) => Ok(()),
-        Err(e) => Err(generic(format!(
-            "failed to stat {}: {e}; pass --force to override",
-            path.display()
-        ))),
+        // Deliberately NO `--force` advice here. `--force` does not "override"
+        // a stat failure — it skips the existence check entirely and publishes
+        // over whatever is at the path. Steering the operator toward it on the
+        // one path where we cannot see what we are about to replace is exactly
+        // backwards (§17).
+        Err(e) => Err(generic(format!("failed to stat {}: {e}", path.display()))),
     }
 }
 
-async fn write_json_envelope<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                generic(format!(
-                    "failed to create parent directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
+/// Publish a non-secret JSON artifact (a membership certificate, a revocation
+/// bundle) at `final_path`.
+///
+/// Both branches stage beside the destination first, so the destination is
+/// never truncated in place and a leaf symlink is never followed or written
+/// through. They differ only in replace policy:
+///
+/// - **without `--force`**: hard-link, which fails closed if anything already
+///   exists at `final_path`;
+/// - **with `--force`**: `rename`, which replaces the destination ATOMICALLY.
+///   Unlike the remove-then-link that makes a forced replace unsafe for the
+///   grant/secret pair, a rename cannot lose the old artifact on a crash — the
+///   destination always names either the old inode or the new one, never
+///   nothing.
+///
+/// Certificates and revocation bundles are renewable by design (≈annual cert
+/// renewal, floor bumps), so `--force` stays available here rather than being
+/// refused outright as it is for grants ([`refuse_force`]). What it must never
+/// do is what `tokio::fs::write` did before this: truncate an arbitrary
+/// `--out` in place, following a symlink, with no alias check against
+/// `--org-key` (§2).
+async fn publish_json_artifact(
+    final_path: &Path,
+    json: &[u8],
+    force: bool,
+) -> Result<(), CliError> {
+    if force {
+        // Only the forced path needs this: without `--force` the no-clobber
+        // hard-link already refuses anything that exists at the destination,
+        // whatever it contains.
+        refuse_replacing_org_key(final_path).await?;
     }
-    let json = serde_json::to_vec_pretty(value)
-        .map_err(|e| generic(format!("failed to serialize {}: {e}", path.display())))?;
-    tokio::fs::write(path, json)
-        .await
-        .map_err(|e| generic(format!("failed to write {}: {e}", path.display())))
+    let tmp = stage_beside(final_path, json, false).await?;
+    if force {
+        publish_staged_replace(&tmp, final_path).await
+    } else {
+        publish_staged(&tmp, final_path).await
+    }
 }
+
+/// Refuse to publish over a file whose CONTENT is org root key material.
+///
+/// [`refuse_aliased_paths`] catches the common spelling, but it is a lexical,
+/// case-sensitive comparison that resolves neither `..` nor symlinks — so on a
+/// case-insensitive filesystem `--out ORG.TOML` against `--org-key org.toml`
+/// slips past it. Without `--force` that is harmless (publication is
+/// no-clobber, so the hard-link fails `AlreadyExists`). With `--force` the
+/// replace would succeed and the org root would be unrecoverable.
+///
+/// Rather than reach for a platform file-identity API (`st_dev`/`st_ino` vs
+/// `GetFileInformationByHandle`), this refuses on what actually matters: if the
+/// destination parses as an org key file, it is not a publication target
+/// however the path was spelled. One check covers case variants, symlinks,
+/// hard links, and `..` traversal alike.
+async fn refuse_replacing_org_key(path: &Path) -> Result<(), CliError> {
+    // Absent, binary, or unreadable — nothing we can identify as key material,
+    // and any real failure surfaces from the publish itself.
+    let Ok(mut text) = tokio::fs::read_to_string(path).await else {
+        return Ok(());
+    };
+    // The text may BE the seed; scrub it before returning on EITHER branch.
+    // NEVER interpolate the parse error — its `Display` embeds the offending
+    // source line, which for this file is `seed_hex` (the same reasoning as
+    // `load_org_key_from_text`).
+    let looks_like_org_key = toml::from_str::<toml::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("seed_hex").cloned())
+        .is_some();
+    zeroize_string(&mut text);
+    if looks_like_org_key {
+        return Err(invalid_args(format!(
+            "refusing to overwrite {}: it contains org root key material. --out must not name \
+             the org key, however the path is spelled (case variant, symlink, or relative path).",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Atomic REPLACE publish for renewable artifacts: `rename` the staged temp
+/// onto `final_path`. Crash-atomic (the destination names the old or the new
+/// inode, never nothing) and it replaces a leaf symlink rather than writing
+/// through it. The rename consumes the temp, so there is no post-publish
+/// cleanup to leak.
+async fn publish_staged_replace(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
+    let tmp_owned = tmp.to_path_buf();
+    let final_owned = final_path.to_path_buf();
+    let renamed = tokio::task::spawn_blocking(move || std::fs::rename(&tmp_owned, &final_owned))
+        .await
+        .map_err(|e| generic(format!("publish task panicked: {e}")))?;
+    if let Err(e) = renamed {
+        remove_file_or_warn(tmp, "staging temp").await;
+        return Err(generic(format!(
+            "failed to publish {}: {e}",
+            final_path.display()
+        )));
+    }
+    sync_parent_dir(final_path).await;
+    Ok(())
+}
+
+// `write_json_envelope` (a `tokio::fs::write` wrapper) was deliberately
+// REMOVED rather than left unused. It truncated its target in place and wrote
+// THROUGH a leaf symlink, and it was the mechanism by which
+// `issue-cert --force` / `issue-floors --force` could destroy the org root key
+// (§2). Every artifact publish now goes through `stage_beside` +
+// `publish_staged` (no-clobber) or `publish_staged_replace` (atomic replace),
+// both of which stage beside the destination first. Do not reintroduce a
+// direct-write helper here.
 
 fn default_org_key_path(org_id_hex: &str) -> PathBuf {
     let short = &org_id_hex[..org_id_hex.len().min(16)];
