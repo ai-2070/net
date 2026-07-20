@@ -1,7 +1,7 @@
 //! OA3-5 §3.2 — opaque scoped-announcement propagation: the outer relay frame
 //! and the bounded relay dedup gate.
 //!
-//! A [`ScopedCapabilityAnnouncement`](super::org_scoped_ann::ScopedCapabilityAnnouncement)
+//! A [`ScopedCapabilityAnnouncement`]
 //! is flooded across the mesh so a consumer that shares the audience can
 //! discover a provider it has no direct session with, WITHOUT any relay ever
 //! learning the plaintext. The envelope itself stays byte-for-byte the signed

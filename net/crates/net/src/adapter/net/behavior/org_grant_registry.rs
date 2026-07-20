@@ -3,7 +3,7 @@
 //! holds for grant-scoped private discovery.
 //!
 //! Two role-separated registries, each an immutable snapshot behind its own
-//! `ArcSwap` on [`MeshNode`](crate::adapter::net::mesh):
+//! `ArcSwap` on [`MeshNode`](crate::adapter::net::MeshNode):
 //!
 //! - **Provider** ([`ProviderGrantSnapshot`]) — grants this node's OWN org issued
 //!   that apply to THIS provider. The bounded granted-emission projection
@@ -35,7 +35,8 @@
 //! last holder releases it, [`OrgAudienceSecret`]'s `Drop` zeroizes the discovery
 //! key (witnessed in `org_grant`'s review-7 gate). No filesystem loading, no org
 //! root, and NO dynamic issuance live here — the SDK/operator layer loads the
-//! canonical OA2-F artifacts and installs them through the [`MeshNode`] APIs.
+//! canonical OA2-F artifacts and installs them through the
+//! [`MeshNode`](crate::adapter::net::MeshNode) APIs.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

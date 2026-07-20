@@ -41,7 +41,7 @@ pub enum ScopedStoreOutcome {
     /// capabilities live in the plaintext fold. The OA3-3 verify path never
     /// produces a `Public` scope, so this is a defensive guard.
     RejectedPublic,
-    /// The store is at [`ScopedDiscoveryStore::MAX_ENTRIES`] and a NEW
+    /// The store is at `ScopedDiscoveryStore::MAX_ENTRIES` and a NEW
     /// `(scope, provider)` key could not be admitted without evicting an
     /// unexpired high-water mark — refused FAIL-CLOSED (Kyra OA3-5). Rollback
     /// protection is never surrendered to admit a new provider; updates to
@@ -94,7 +94,7 @@ impl ScopedDiscoveryStore {
     /// `(scope, provider)`; the newest generation wins, and an older-or-equal
     /// generation is [`ScopedStoreOutcome::Stale`] and ignored. A `Public` scope
     /// is refused ([`ScopedStoreOutcome::RejectedPublic`]); a NEW key that would
-    /// exceed [`Self::MAX_ENTRIES`] with no forgettable slot to reclaim is refused
+    /// exceed `Self::MAX_ENTRIES` with no forgettable slot to reclaim is refused
     /// [`ScopedStoreOutcome::AtCapacity`]. `now_secs` drives the fail-closed
     /// horizon sweep.
     pub fn ingest(
