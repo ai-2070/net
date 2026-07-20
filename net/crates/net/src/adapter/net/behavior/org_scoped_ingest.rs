@@ -541,6 +541,7 @@ mod tests {
         current_timestamp, OrgKeypair, OrgMembershipCert, OrgRevocationBundle,
     };
     use super::super::org_grant::{CapabilityAuthorityId, GrantRights, GrantTargetScope};
+    use super::super::org_scoped_ann::ScopedAnnouncementError;
     use super::*;
     use crate::adapter::net::identity::EntityKeypair;
     use std::collections::BTreeMap;
@@ -1028,6 +1029,126 @@ mod tests {
         assert_eq!(
             verify_scoped_ingest(&f.envelope, &authority, &ctx).unwrap_err(),
             ScopedIngestError::Expired
+        );
+    }
+
+    /// OA3-6 exit gate (§3.5 "expired-grant holder cannot decrypt a NEW audience's
+    /// envelopes — per-grant key independence"): a rotation replaces an EXPIRED
+    /// grant G1 (key K1) with a freshly-issued successor G2 (key K2) over the same
+    /// capability/provider. A former grantee holding only K1 cannot decrypt G2's
+    /// envelope AT THE AEAD BOUNDARY, and the expired G1 grant is no longer
+    /// admissible for discovery. Deterministic windows (no sleep) via `issue_at`.
+    #[test]
+    fn an_expired_grants_key_cannot_decrypt_a_freshly_issued_successors_envelope() {
+        let now = current_timestamp();
+        let provider = provider_kp();
+        let issuer = OrgKeypair::from_bytes([1u8; 32]); // B
+        let a_org = OrgKeypair::from_bytes([9u8; 32]).org_id(); // grantee A
+        let capability = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let target = GrantTargetScope::ExactNode(provider.entity_id().clone());
+        // A single provider cert valid across `now`.
+        let cert = OrgMembershipCert::issue_at(
+            &issuer,
+            provider.entity_id().clone(),
+            5,
+            now.saturating_sub(3600),
+            now + 3600,
+            0x1234,
+        );
+        // The descriptor names exactly the granted capability (closure-1 bind).
+        let descriptor = CapabilitySet::new().add_tag("nrpc:svc").to_bytes_compact();
+
+        // G1 — expired an hour ago (fresh audience material via mint).
+        let (secret1, binding1) = OrgAudienceSecret::mint([0x11u8; 32]);
+        let g1 = OrgCapabilityGrant::issue_at(
+            &issuer,
+            [0x11u8; 32],
+            a_org,
+            capability,
+            GrantRights::DISCOVER,
+            target.clone(),
+            Some(binding1),
+            now.saturating_sub(7200),
+            now.saturating_sub(3600),
+            0xA1,
+        );
+        // G2 — the currently-valid successor with FRESH audience material.
+        let (secret2, binding2) = OrgAudienceSecret::mint([0x22u8; 32]);
+        let g2 = OrgCapabilityGrant::issue_at(
+            &issuer,
+            [0x22u8; 32],
+            a_org,
+            capability,
+            GrantRights::DISCOVER,
+            target.clone(),
+            Some(binding2),
+            now.saturating_sub(3600),
+            now + 3600,
+            0xA2,
+        );
+
+        // Distinct grant id, handle, and key — the successor is an independent
+        // revocation + audience boundary.
+        assert_ne!(g1.grant_id, g2.grant_id);
+        assert_ne!(secret1.audience_handle, secret2.audience_handle);
+        assert_ne!(secret1.discovery_key(), secret2.discovery_key());
+
+        // G2's envelope (its own expiry unexpired so only the GRANT window matters
+        // for the G1 refusal below).
+        let g2_env = ScopedCapabilityAnnouncement::build_granted(
+            &provider,
+            issuer.org_id(),
+            cert.clone(),
+            g2.grant_id,
+            secret2.audience_handle,
+            secret2.discovery_key(),
+            4,
+            now + 3600,
+            &descriptor,
+        )
+        .expect("build G2 envelope");
+
+        // AEAD-boundary independence: G2 opens under K2 but NOT under K1 — call
+        // `open_with` DIRECTLY so the failure is the AEAD open, not an earlier
+        // handle/grant-id mismatch in the ingest pipeline (Kyra's precise witness).
+        assert_eq!(
+            g2_env
+                .open_with(secret2.discovery_key())
+                .expect("K2 opens G2"),
+            descriptor
+        );
+        assert_eq!(
+            g2_env.open_with(secret1.discovery_key()).unwrap_err(),
+            ScopedAnnouncementError::SealOpenFailed,
+            "the former grant's key cannot decrypt the successor's envelope",
+        );
+
+        // G2 verifies + ingests successfully under G2 + K2.
+        let floors = OrgRevocationState::empty();
+        let g2_authority = AudienceAuthority::granted(&g2, &secret2);
+        let ctx = granted_ctx(a_org, now, &floors);
+        assert!(verify_scoped_ingest(&g2_env, &g2_authority, &ctx).is_ok());
+
+        // The EXPIRED G1 grant is no longer admissible for discovery. Its own
+        // envelope's expiry is far future, so the refusal comes from the GRANT
+        // validity check (which runs before envelope-expiry) — GrantInvalid, not
+        // Expired. Pin the actual variant, not the one the prose might suggest.
+        let g1_env = ScopedCapabilityAnnouncement::build_granted(
+            &provider,
+            issuer.org_id(),
+            cert,
+            g1.grant_id,
+            secret1.audience_handle,
+            secret1.discovery_key(),
+            4,
+            now + 3600,
+            &descriptor,
+        )
+        .expect("build G1 envelope");
+        let g1_authority = AudienceAuthority::granted(&g1, &secret1);
+        assert_eq!(
+            verify_scoped_ingest(&g1_env, &g1_authority, &ctx).unwrap_err(),
+            ScopedIngestError::GrantInvalid,
         );
     }
 }

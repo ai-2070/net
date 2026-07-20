@@ -442,12 +442,15 @@ impl ScopedCapabilityAnnouncement {
         )
     }
 
-    /// Deterministic build hook for golden vectors: seal with a caller-supplied
-    /// nonce instead of a fresh random one. Test-only — real publication always
+    /// Common deterministic-nonce build hook for golden vectors: seal with a
+    /// caller-supplied nonce (instead of a fresh random one) and sign. Shared by
+    /// [`Self::build_owner_with_nonce`] and [`Self::build_granted_with_nonce`] so
+    /// the two deterministic builders differ ONLY in their `grant_id` sentinel
+    /// policy, never in sealing/signing logic. Test-only — real publication always
     /// uses a fresh random nonce via [`Self::build_owner`] / [`Self::build_granted`].
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_granted_with_nonce(
+    fn build_with_nonce(
         provider_keypair: &EntityKeypair,
         owner_org: OrgId,
         owner_cert: OrgMembershipCert,
@@ -459,9 +462,6 @@ impl ScopedCapabilityAnnouncement {
         nonce: [u8; SCOPED_ANN_NONCE_SIZE],
         descriptor: &[u8],
     ) -> Result<Self, ScopedAnnouncementError> {
-        if grant_id == OWNER_AUDIENCE_GRANT_SENTINEL {
-            return Err(ScopedAnnouncementError::ReservedGrantId);
-        }
         let provider = provider_keypair.entity_id().clone();
         let aad = scoped_ann_associated_data(
             &provider,
@@ -483,6 +483,68 @@ impl ScopedCapabilityAnnouncement {
             expires_at,
             nonce,
             ciphertext,
+        )
+    }
+
+    /// Deterministic OWNER-audience build hook (golden vectors): `grant_id` is
+    /// fixed to the reserved zero sentinel, mirroring [`Self::build_owner`].
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_owner_with_nonce(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        audience_handle: [u8; 32],
+        owner_discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        nonce: [u8; SCOPED_ANN_NONCE_SIZE],
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        Self::build_with_nonce(
+            provider_keypair,
+            owner_org,
+            owner_cert,
+            OWNER_AUDIENCE_GRANT_SENTINEL,
+            audience_handle,
+            owner_discovery_key,
+            generation,
+            expires_at,
+            nonce,
+            descriptor,
+        )
+    }
+
+    /// Deterministic GRANTED-audience build hook (golden vectors): rejects the
+    /// reserved zero `grant_id`, mirroring [`Self::build_granted`].
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_granted_with_nonce(
+        provider_keypair: &EntityKeypair,
+        owner_org: OrgId,
+        owner_cert: OrgMembershipCert,
+        grant_id: [u8; 32],
+        audience_handle: [u8; 32],
+        discovery_key: &[u8; 32],
+        generation: u64,
+        expires_at: u64,
+        nonce: [u8; SCOPED_ANN_NONCE_SIZE],
+        descriptor: &[u8],
+    ) -> Result<Self, ScopedAnnouncementError> {
+        if grant_id == OWNER_AUDIENCE_GRANT_SENTINEL {
+            return Err(ScopedAnnouncementError::ReservedGrantId);
+        }
+        Self::build_with_nonce(
+            provider_keypair,
+            owner_org,
+            owner_cert,
+            grant_id,
+            audience_handle,
+            discovery_key,
+            generation,
+            expires_at,
+            nonce,
+            descriptor,
         )
     }
 
@@ -1137,4 +1199,51 @@ mod tests {
     // construction moves these bytes — the whole encoded envelope, including the
     // deterministic ed25519 outer signature, is locked here.
     const GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c04010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020700000000000000d2040000000000000303030303030303030303030303030303030303030303032100a7eee1241f24f2fa061e532b393aaf8aa5b73a76eef9afcd640df692b04e159d8740e97ea293f952f8fae84542d911648555f96846ad269115031cd46c1537ee36f78ca97f55f4d1e855708ace5e9453a9570228523ec61fa12cc50fdb8db3b409";
+
+    /// OA3-6 exit gate (§3.5 "golden vectors incl. the zero-sentinel owner AD"):
+    /// a frozen OWNER-audience envelope. `grant_id` is the all-zero sentinel,
+    /// bound into the AEAD associated data; the whole encoded envelope — framing,
+    /// zero-sentinel grant id, ciphertext, and deterministic ed25519 outer
+    /// signature — is byte-locked here.
+    #[test]
+    fn owner_golden_vector_pins_the_zero_sentinel_envelope() {
+        let pk = provider_keypair();
+        let org = owner_keypair();
+        let cert = deterministic_cert(&org, pk.entity_id());
+        let owner_key = [7u8; 32];
+        let env = ScopedCapabilityAnnouncement::build_owner_with_nonce(
+            &pk,
+            org.org_id(),
+            cert,
+            HANDLE,
+            &owner_key,
+            1,
+            99,
+            NONCE,
+            b"owner-golden-descriptor",
+        )
+        .expect("build owner");
+        let encoded = hex::encode(env.to_bytes());
+        assert_eq!(encoded, OWNER_GOLDEN_ENVELOPE_HEX, "OWNER_GOLDEN={encoded}");
+
+        // The pinned bytes decode + outer-verify, are the owner audience, carry
+        // the all-zero grant sentinel, and open under the owner key.
+        let bytes = hex::decode(OWNER_GOLDEN_ENVELOPE_HEX).expect("golden hex");
+        let decoded =
+            ScopedCapabilityAnnouncement::from_bytes(&bytes).expect("decode + verify owner golden");
+        assert!(decoded.is_owner_audience());
+        assert_eq!(decoded.grant_id(), &OWNER_AUDIENCE_GRANT_SENTINEL);
+        // The grant-id field is all-zero in the ENCODED bytes too (offset after
+        // version + provider + owner_org + owner_cert + audience_handle).
+        let grant_id_off = 1 + 32 + 32 + OrgMembershipCert::WIRE_SIZE + 32;
+        assert_eq!(&bytes[grant_id_off..grant_id_off + 32], &[0u8; 32]);
+        assert_eq!(
+            decoded.open_with(&owner_key).expect("open"),
+            b"owner-golden-descriptor"
+        );
+    }
+
+    /// Frozen by the deterministic owner build above — the OWNER counterpart to
+    /// [`GOLDEN_ENVELOPE_HEX`], pinning the zero-sentinel AD encoding end to end.
+    const OWNER_GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c0401010101010101010101010101010101010101010101010101010101010101010000000000000000000000000000000000000000000000000000000000000000010000000000000063000000000000000303030303030303030303030303030303030303030303032700eb71257e070ca19f1b7426956ab5ab3a49e81917777a448abfafb33a633f75f842f096421b62dddda47b880244aa5f99f5a4d94fbdb94b57ee7d37e026077bf6872b2a4b7ccba39d3c5f7e3dfbd79a2f819650beea2e210eb81732d189814d902bcf29005bbf00";
 }
