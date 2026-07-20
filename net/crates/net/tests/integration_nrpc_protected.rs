@@ -1997,6 +1997,121 @@ async fn an_owner_scoped_announcement_floods_opaquely_through_a_relay_to_the_aud
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// OA3-4b2 slice 5 — a GRANTED (cross-org B→A) capability floods opaquely through
+/// a relay to the grantee, LIVE. Provider P (org B) emits a granted-private
+/// service under a B→A grant; relay R (no authority, no grant) forwards the
+/// opaque envelope but can neither decrypt nor store it; consumer A (org B's
+/// GRANTEE, holding the B→A consumer credential) — with NO direct session to P —
+/// receives the forwarded frame, opens it under the grant, and resolves P. Since
+/// P and A are different orgs AND never directly connected, A's knowledge of P can
+/// only have arrived through R. Plaintext projections stay clean throughout.
+#[tokio::test]
+async fn a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee() {
+    let p = build_node_fast_announce(EntityKeypair::from_bytes([0x83u8; 32])).await;
+    let r = build_node_fast_announce(EntityKeypair::from_bytes([0x84u8; 32])).await;
+    let a = build_node_fast_announce(EntityKeypair::from_bytes([0x85u8; 32])).await;
+    let p_entity = p.entity_id().clone();
+
+    let org_b = OrgKeypair::from_bytes([0x8Bu8; 32]); // provider org
+    let org_a = OrgKeypair::from_bytes([0x8Au8; 32]); // grantee org (distinct)
+    let base = std::env::temp_dir().join(format!("net-oa34b2-relay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+
+    // The single B→A grant: P holds it as a PROVIDER record (to emit), A holds it
+    // as a CONSUMER record (to open) — same grant_id, same audience key.
+    let (grant, secret) = cross_org_grant(&org_b, &org_a, &p_entity, "cross");
+    let grant_id = grant.grant_id;
+
+    // --- P: org-B provider with a granted-private service + provider grant ---
+    let p_cert = OrgMembershipCert::try_issue(&org_b, p_entity.clone(), 1, 3600).expect("P cert");
+    let p_authority = Arc::new(
+        NodeAuthority::adopt(&base.join("p"), p_cert, &p_entity, 0, None).expect("adopt P"),
+    );
+    p.install_node_authority(p_authority)
+        .expect("install P authority");
+    p.set_owner_cert_emission(true).expect("enable P emission");
+    let _svc = p
+        .serve_rpc_granted("cross", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("P granted serve");
+    p.install_provider_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install P provider grant");
+
+    // --- A: org-A grantee holding the B→A consumer credential ---
+    let a_entity = a.entity_id().clone();
+    let a_cert = OrgMembershipCert::try_issue(&org_a, a_entity.clone(), 1, 3600).expect("A cert");
+    let a_authority = Arc::new(
+        NodeAuthority::adopt(&base.join("a"), a_cert, &a_entity, 0, None).expect("adopt A"),
+    );
+    a.install_node_authority(a_authority)
+        .expect("install A authority");
+    a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install A consumer grant");
+
+    // --- R: pure relay, NO authority (cannot open or store scoped anns) ---
+
+    // Topology: P—R and R—A, but NEVER P—A. Establish both sessions before
+    // starting any dispatch loop, then bring all three up together.
+    connect_no_start(&p, &r).await;
+    connect_no_start(&r, &a).await;
+    p.start();
+    r.start();
+    a.start();
+
+    let now = unix_now();
+
+    // P's cached emission carries exactly one granted envelope before the flood.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            p.announcement_scoped_for_send_for_test().len() == 1
+        })
+        .await,
+        "P emits exactly one granted envelope",
+    );
+
+    // Drive the flood: P announces (ships the 0x0C04 hop-0 frame to R); R forwards
+    // the opaque frame to A; A opens + resolves P under the grant.
+    let mut a_resolved_p = false;
+    for _ in 0..40 {
+        p.announce_capabilities(CapabilitySet::new()).await.ok();
+        if a.scoped_granted_providers_for_test(&grant_id, now)
+            .iter()
+            .any(|prov| prov == &p_entity)
+        {
+            a_resolved_p = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        a_resolved_p,
+        "the grantee A resolves P through the relay despite different orgs and no direct session",
+    );
+
+    // The relay ADMITTED the envelope through its dedup gate — proof it received
+    // and forwarded it — yet, lacking any authority or grant, opened and stored
+    // NOTHING. R is the non-grantee observer: it cannot resolve the capability.
+    assert!(
+        r.scoped_relay_gate_len_for_test() >= 1,
+        "the relay admitted and forwarded the opaque envelope",
+    );
+    assert!(
+        r.scoped_owner_providers_for_test(now).is_empty()
+            && r.scoped_granted_providers_for_test(&grant_id, now)
+                .is_empty(),
+        "the authority-less non-grantee relay forwards but never decrypts or stores",
+    );
+
+    // Plaintext stays clean: P never advertises the granted tag in the clear.
+    assert!(
+        p.local_announcement_for_test()
+            .map(|ann| !ann.capabilities.has_tag("nrpc:cross"))
+            .unwrap_or(false),
+        "the granted tag never appears in P's plaintext announcement",
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// OA3 closure (Kyra #2): a send fired AFTER a visibility change must not ship an
 /// emission derived from the STALE visibility snapshot. The send-time generation
 /// check — shared by every self-emission path via `announcement_bytes_for_send`
