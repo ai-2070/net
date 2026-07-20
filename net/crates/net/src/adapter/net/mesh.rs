@@ -2709,6 +2709,12 @@ pub(super) struct LocalServiceRegistry {
     /// `service name → { owning registration id, visibility }`.
     map: dashmap::DashMap<String, LocalServiceEntry>,
     change_signal: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Counts only the transitions that can make an ALREADY-BUILT plaintext
+    /// emission leak: a name that was `Public` ceasing to be public (a
+    /// Public → private same-name upsert, or the retirement of a `Public`
+    /// service). Read by the send-path staleness check — see
+    /// [`Self::privatization_generation`].
+    privatization_signal: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "cortex")]
@@ -2717,7 +2723,14 @@ impl LocalServiceRegistry {
         Self {
             map: dashmap::DashMap::new(),
             change_signal,
+            privatization_signal: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Bump the privatization counter (see the field doc).
+    fn mark_privatized(&self) {
+        self.privatization_signal
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Install `service` owned by `registration_id` with `visibility`. Upserts: a
@@ -2754,25 +2767,52 @@ impl LocalServiceRegistry {
         if projection_changed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
+        // A registration only invalidates an in-flight plaintext emission when it
+        // takes a name that WAS public out of the public projection. A newly
+        // present name — public or private — cannot: an emission built before this
+        // insert carries no tag for it either way. Keeping the two signals apart
+        // matters because `serve_rpc` / `serve_tool` register several services in a
+        // row, and folding those benign bumps into the send-path check would strand
+        // every announce that raced them (see `privatization_generation`).
+        let privatized = previous
+            .map(|p| {
+                use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+                matches!(p.visibility, CapabilityVisibility::Public)
+                    && !matches!(visibility, CapabilityVisibility::Public)
+            })
+            .unwrap_or(false);
+        if privatized {
+            self.mark_privatized();
+        }
         newly_present
     }
 
-    /// The current change generation — bumped whenever the public projection
-    /// changes (see [`Self::insert`] / [`Self::remove_if`]). Threaded into the
-    /// published [`LocalCapabilityEmission`] so the send path can reject an
-    /// emission derived from a STALE visibility snapshot before it ships a tag a
-    /// concurrent visibility change has since made private (Kyra OA3 closure).
-    pub(super) fn generation(&self) -> u64 {
-        *self.change_signal.borrow()
+    /// The current PRIVATIZATION generation — bumped only when a name that was
+    /// `Public` stops being public (see [`Self::insert`] / [`Self::remove_if`]).
+    /// Threaded into the published [`LocalCapabilityEmission`] so the send path
+    /// can reject an emission whose plaintext tag set a concurrent visibility
+    /// change has since made wrong (Kyra OA3 closure).
+    ///
+    /// Deliberately NOT the announcer's change signal. That signal also fires for
+    /// a benign new registration, and `serve_rpc` / `serve_tool` register several
+    /// services back to back: keying the send check on it made an announce built
+    /// mid-registration unsendable, and because the skipped send had already
+    /// claimed the rate-limit window, the replacement announce was coalesced away
+    /// and the node never published at all.
+    pub(super) fn privatization_generation(&self) -> u64 {
+        self.privatization_signal
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Test seam: advance the change generation exactly as a concurrent
-    /// visibility change would, WITHOUT registering a service — so a send-path
-    /// staleness witness can observe the published emission being rejected. Only
-    /// reachable through [`MeshNode::test_advance_visibility_generation`].
+    /// Test seam: advance both generations exactly as a concurrent Public →
+    /// OwnerScoped transition would, WITHOUT registering a service — so a
+    /// send-path staleness witness can observe the published emission being
+    /// rejected. Only reachable through
+    /// [`MeshNode::test_advance_visibility_generation`].
     #[doc(hidden)]
     pub(super) fn bump_for_test(&self) {
         self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
+        self.mark_privatized();
     }
 
     /// Remove `service` ONLY when the stored registration id matches
@@ -2783,11 +2823,18 @@ impl LocalServiceRegistry {
         let removed = self
             .map
             .remove_if(service, |_, entry| entry.registration_id == registration_id)
-            .is_some();
-        if removed {
+            .map(|(_, entry)| entry);
+        if let Some(entry) = removed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
+            // Retiring a `Public` service leaves an already-built emission
+            // advertising an `nrpc:` tag this node no longer serves — the same
+            // stale-plaintext hazard a Public → private upsert creates.
+            use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+            if matches!(entry.visibility, CapabilityVisibility::Public) {
+                self.mark_privatized();
+            }
         }
-        removed
+        removed.is_some()
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -2879,12 +2926,14 @@ struct LocalCapabilityEmission {
     /// allocation.
     provider_grant_snapshot:
         Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
-    /// The local-service-registry generation this emission's public/scoped
-    /// projection was derived from. The send path rejects the emission if the
-    /// current generation has advanced — a concurrent visibility change may have
-    /// made a still-plaintext tag private (Kyra OA3 closure). `0` when there is no
-    /// registry (non-`cortex`), where no owner-scoped service can exist.
-    visibility_generation: u64,
+    /// The local-service-registry PRIVATIZATION generation this emission's
+    /// public/scoped projection was derived from. The send path rejects the
+    /// emission if it has advanced — a concurrent visibility change made a
+    /// still-plaintext tag private (Kyra OA3 closure). A benign new registration
+    /// does NOT advance it, so registering a service never strands an in-flight
+    /// announce. `0` when there is no registry (non-`cortex`), where no
+    /// owner-scoped service can exist.
+    privatization_generation: u64,
 }
 
 /// One coherent send-time serialization of the published
@@ -2992,7 +3041,7 @@ mod local_service_registry_tests {
     /// OA3 closure (Kyra #1): a same-name visibility CHANGE (Public → OwnerScoped)
     /// must wake the announcer, or a stale plaintext `nrpc:` tag could linger in
     /// the cached announcement. Same-name / same-visibility re-tokening stays
-    /// silent. Also exposes the generation the send-path staleness check reads.
+    /// silent.
     #[test]
     fn same_name_visibility_change_bumps_the_signal() {
         let (reg, rx) = registry();
@@ -3002,11 +3051,6 @@ mod local_service_registry_tests {
         assert!(reg.insert("svc".to_string(), 1, CapabilityVisibility::Public));
         let g1 = gen(&rx);
         assert_ne!(g1, g0, "a newly-present name bumps");
-        assert_eq!(
-            reg.generation(),
-            g1,
-            "generation() tracks the change signal"
-        );
 
         // Same name, SAME visibility, new registration id → silent re-token.
         assert!(!reg.insert("svc".to_string(), 2, CapabilityVisibility::Public));
@@ -3016,7 +3060,61 @@ mod local_service_registry_tests {
         // the announcer re-projects and drops the now-private plaintext tag.
         assert!(!reg.insert("svc".to_string(), 3, CapabilityVisibility::OwnerScoped));
         assert_ne!(gen(&rx), g1, "a visibility change bumps the signal");
-        assert_eq!(reg.generation(), gen(&rx));
+    }
+
+    /// The send-path staleness counter is NARROWER than the announcer's change
+    /// signal: it must fire only when a name that WAS public leaves the public
+    /// projection. A benign new registration — the shape `serve_tool` produces
+    /// several of in a row — must NOT advance it, or an announce built mid-
+    /// registration becomes unsendable and (having already claimed the rate-limit
+    /// window) is never replaced.
+    #[test]
+    fn privatization_generation_ignores_benign_registrations() {
+        let (reg, _rx) = registry();
+
+        let g0 = reg.privatization_generation();
+        assert!(reg.insert("a".to_string(), 1, CapabilityVisibility::Public));
+        assert!(reg.insert("b".to_string(), 2, CapabilityVisibility::Public));
+        assert!(reg.insert("c".to_string(), 3, CapabilityVisibility::OwnerScoped));
+        assert_eq!(
+            reg.privatization_generation(),
+            g0,
+            "new registrations cannot make an already-built emission leak",
+        );
+
+        // Same-name, same-visibility re-token: still nothing left the public set.
+        assert!(!reg.insert("a".to_string(), 4, CapabilityVisibility::Public));
+        assert_eq!(reg.privatization_generation(), g0, "re-token is not a leak");
+
+        // Public → OwnerScoped: the plaintext tag must stop shipping.
+        assert!(!reg.insert("a".to_string(), 5, CapabilityVisibility::OwnerScoped));
+        let g1 = reg.privatization_generation();
+        assert_ne!(g1, g0, "a public name going private bumps");
+
+        // Private → Public is a widening, not a leak.
+        assert!(!reg.insert("c".to_string(), 6, CapabilityVisibility::Public));
+        assert_eq!(
+            reg.privatization_generation(),
+            g1,
+            "widening a private name to public is not a privatization",
+        );
+
+        // Retiring a Public service also strands a plaintext tag.
+        assert!(reg.remove_if("b", 2));
+        assert_ne!(
+            reg.privatization_generation(),
+            g1,
+            "retiring a public service bumps",
+        );
+
+        // Retiring a non-public service does not.
+        let g2 = reg.privatization_generation();
+        assert!(reg.remove_if("a", 5));
+        assert_eq!(
+            reg.privatization_generation(),
+            g2,
+            "retiring an owner-scoped service strands no plaintext tag",
+        );
     }
 
     /// OA3-4b1 confidentiality projection: `public_snapshot` (→ the plaintext
@@ -8120,13 +8218,16 @@ impl MeshNode {
         for _ in 0..16 {
             let cached = self.local_emission.load_full()?;
             // Reject an emission derived from a STALE visibility snapshot: if a
-            // concurrent registration advanced the projection generation since this
-            // emission was built, its plaintext tag set may no longer be correct
-            // (an owner-scoped service could have replaced a public one). Skip the
-            // send — the visibility bump already woke a re-announce that publishes a
-            // fresh, coherent emission (Kyra OA3 closure).
+            // concurrent registration took a name OUT of the public projection
+            // since this emission was built, its plaintext tag set is no longer
+            // correct (an owner-scoped service could have replaced a public one).
+            // Skip the send — the same transition woke a re-announce that publishes
+            // a fresh, coherent emission, and the caller releases the rate-limit
+            // window it claimed so that re-announce isn't coalesced away (Kyra OA3
+            // closure).
             #[cfg(feature = "cortex")]
-            if cached.visibility_generation != self.rpc_local_services.generation() {
+            if cached.privatization_generation != self.rpc_local_services.privatization_generation()
+            {
                 return None;
             }
             // Capture the stamp AND PIN the authority/store Arcs it
@@ -8154,8 +8255,8 @@ impl MeshNode {
                 // early check at the top of the loop is only a cheap fast-path; THIS
                 // is the correctness boundary.
                 #[cfg(feature = "cortex")]
-                let visibility_stable =
-                    cached.visibility_generation == self.rpc_local_services.generation();
+                let visibility_stable = cached.privatization_generation
+                    == self.rpc_local_services.privatization_generation();
                 #[cfg(not(feature = "cortex"))]
                 let visibility_stable = true;
                 // Kyra OA3-4b1 B2 rotation safety: the owner-scoped envelopes in
@@ -8494,7 +8595,7 @@ impl MeshNode {
                 provider_grant_snapshot: None,
                 // A cert rebuild does NOT change visibility — preserve the
                 // generation so the send-time freshness check still holds.
-                visibility_generation: cached.visibility_generation,
+                privatization_generation: cached.privatization_generation,
             })));
         tracing::info!(
             version,
@@ -19481,16 +19582,16 @@ impl MeshNode {
             // Gated on `cortex` because `rpc_local_services` only
             // exists when the cortex layer (which provides serve_rpc)
             // is compiled in.
-            // Capture the visibility generation BEFORE deriving the projection and
-            // thread it into the published emission: if a concurrent registration
-            // advances it, the send path rejects the (now stale) emission rather
-            // than ship a tag that became private, and the same bump woke the RT-3
-            // re-announce that republishes at the new generation (Kyra OA3
+            // Capture the privatization generation BEFORE deriving the projection
+            // and thread it into the published emission: if a concurrent visibility
+            // change advances it, the send path rejects the (now stale) emission
+            // rather than ship a tag that became private, and the same bump woke the
+            // RT-3 re-announce that republishes at the new generation (Kyra OA3
             // closure).
             #[cfg(feature = "cortex")]
-            let visibility_generation = self.rpc_local_services.generation();
+            let privatization_generation = self.rpc_local_services.privatization_generation();
             #[cfg(not(feature = "cortex"))]
-            let visibility_generation = 0u64;
+            let privatization_generation = 0u64;
 
             // OA3-4b1 confidentiality projection: ONLY `Public` services
             // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
@@ -19865,7 +19966,7 @@ impl MeshNode {
                     scoped: scoped_envelopes,
                     scoped_authority,
                     provider_grant_snapshot,
-                    visibility_generation,
+                    privatization_generation,
                 })));
 
             // Origin-side rate limit: within-window calls update the
@@ -19880,7 +19981,7 @@ impl MeshNode {
             // send of the newest version.
             let now = std::time::Instant::now();
             let min_interval = self.config.min_announce_interval;
-            let defer_for = {
+            {
                 let mut gate = self.announce_gate.lock();
                 let elapsed = gate
                     .last_broadcast_at
@@ -19912,19 +20013,20 @@ impl MeshNode {
                         // a task orphaned by a rate-limit-floor reset
                         // can't fire against this claim (Finding 12).
                         gate.deferral_generation = gate.deferral_generation.wrapping_add(1);
-                        Some((min_interval - e, gate.deferral_generation))
-                    }
-                    _ => {
-                        gate.last_broadcast_at = Some(now);
+                        let (delay, generation) = (min_interval - e, gate.deferral_generation);
+                        // Never spawn under the gate lock (unchanged ordering).
+                        drop(gate);
+                        self.spawn_deferred_announce(delay, generation);
                         None
                     }
+                    _ => {
+                        // Claim the window, but carry out what it held: if the send
+                        // below is skipped nothing actually shipped, and the claim
+                        // must be released rather than coalesce away the very
+                        // re-announce that skip is relying on.
+                        Some((now, gate.last_broadcast_at.replace(now)))
+                    }
                 }
-            };
-            if let Some((delay, generation)) = defer_for {
-                self.spawn_deferred_announce(delay, generation);
-                None
-            } else {
-                Some(())
             }
         };
         // `announce_mu` is released here — the peer broadcast is
@@ -19935,10 +20037,24 @@ impl MeshNode {
         // (review-9 addendum): a self-floor raised between the
         // build above and this send must not ship the certified
         // form.
-        if to_broadcast.is_none() {
+        let Some((now_claimed, previous_broadcast_at)) = to_broadcast else {
             return Ok(());
-        }
+        };
         let Some(emission) = self.announcement_bytes_for_send() else {
+            // The send-time seqlock refused this emission (a visibility change, an
+            // authority rotation, or a grant mutation landed after the build).
+            // NOTHING shipped, so the rate-limit window we claimed above must be
+            // released: the transition that refused the send also woke a
+            // re-announce, and leaving a phantom claim in place would coalesce that
+            // re-announce into a deferral — or, on a node without a flush task
+            // (`start` rather than `start_arc`), drop it outright, leaving peers on
+            // the superseded announcement until the keep-alive. Only roll back our
+            // OWN claim; a concurrent announce that has since claimed the window
+            // keeps it.
+            let mut gate = self.announce_gate.lock();
+            if gate.last_broadcast_at == Some(now_claimed) {
+                gate.last_broadcast_at = previous_broadcast_at;
+            }
             return Ok(());
         };
         self.broadcast_emission(&emission).await;
