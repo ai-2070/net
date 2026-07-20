@@ -2614,11 +2614,26 @@ fn build_request_grant_emitter(
 /// peer can at most misdirect responses for THEIR own request — they
 /// already could.
 ///
-/// **Bounded** ([`BoundedLru`]): the bridge inserts *before* the
-/// capability gate, so an unbounded map would let one authed peer spray
-/// distinct `(origin, call_id)` keys and amplify server memory. The LRU
-/// caps the footprint; eviction costs only a response-path cache miss
-/// (roster fallback), never correctness.
+/// **Bounded** ([`BoundedLru`]): the LRU caps the footprint under a
+/// crafted-origin flood.
+///
+/// The insert is on the ACCEPT path only — `cache_authenticated_response_destination`
+/// runs after the gate on both the public bridge
+/// ([`MeshNode::bridge_preflight`]) and the protected one
+/// ([`MeshNode::admit_and_dispatch_protected`]) — so a rejected caller
+/// never occupies a slot. (This ordering was inverted relative to an
+/// earlier revision of this comment, which described the insert as
+/// preceding the gate.)
+///
+/// **What an eviction costs depends on the registration mode.** For a
+/// legacy public service it is a response-path cache miss that falls back
+/// to the roster — availability-neutral. For an org-protected service it
+/// is a DROPPED response and a caller timeout, because those registrations
+/// are [`ResponseRouteFallback::DirectOnly`] and must never roster-fan an
+/// org-confidential body onto a permissive reply channel (see
+/// [`UnaryAdmission::response_route_fallback`]). Eviction is therefore
+/// never a *confidentiality* event in either mode, but it is not free for
+/// protected services — size this cap against their concurrency.
 type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64, u64), u64>>;
 
 /// Capacity bound for the per-`serve_rpc` caller-keyed caches
@@ -2646,9 +2661,13 @@ const RPC_CALLER_CACHE_CAP_NZ: std::num::NonZeroUsize =
 /// most-recently-used) in a `parking_lot::Mutex`. The per-response lock
 /// is uncontended in the common case — one fold drives a given service
 /// — and is far cheaper than the `format!` + `ChannelName` allocation /
-/// roster fan-out the caches exist to avoid. Eviction is always safe: a
-/// miss just recomputes the value (channel name) or falls back to the
-/// roster lookup.
+/// roster fan-out the caches exist to avoid.
+///
+/// Eviction is always *safe*, but not always free: for the reply-channel
+/// cache a miss just recomputes the channel name, and for the
+/// [`RpcOriginNodeCache`] a miss costs a roster fallback on public
+/// services and a dropped response on protected ones. See that type's
+/// docs.
 struct BoundedLru<K, V>(Mutex<lru::LruCache<K, V>>);
 
 impl<K: std::hash::Hash + Eq, V: Clone> BoundedLru<K, V> {
@@ -3133,6 +3152,11 @@ impl MeshNode {
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
         let channel_hash = request_channel.hash();
 
+        // Captured before `mode` is consumed below. An org-protected
+        // registration NEVER roster-fans its responses — see
+        // [`UnaryAdmission::response_route_fallback`].
+        let response_fallback = mode.response_route_fallback();
+
         // Bridge: a tokio mpsc the inbound dispatcher pushes into.
         // The bridge task drains it and runs each event through
         // the fold. Bounded so a runaway publisher can't OOM the
@@ -3466,7 +3490,7 @@ impl MeshNode {
                     job.reply_channel_hash,
                     job.reply_stream_id,
                     job.payload,
-                    ResponseRouteFallback::RosterOnStaleDirect,
+                    response_fallback,
                 )
                 .await
                 {
@@ -5690,6 +5714,47 @@ impl UnaryAdmission {
             Self::ProtectedRedWitnessDisabled { .. } => CapabilityVisibility::Public,
         }
     }
+
+    /// The response-routing policy this registration mode carries.
+    ///
+    /// A legacy public service keeps the AV-5 roster fallback: an honest
+    /// caller that reconnected under a new `NodeId` (its cached direct route
+    /// went stale) is still reachable through its signed subscriber roster
+    /// subscription, so a pre-send miss fans out rather than dropping.
+    ///
+    /// Every org-protected mode is [`ResponseRouteFallback::DirectOnly`]. The
+    /// roster leg buys them nothing — admission already required a pinned
+    /// direct session ([`resolve_direct_caller`] refuses a caller it cannot
+    /// bind to the AEAD-authenticated peer), so a protected response always
+    /// has an authenticated unicast target or no legitimate destination at
+    /// all. And it costs them the confidentiality guarantee the mode exists
+    /// to provide: `<service>.replies.<caller_origin>` is auto-registered as
+    /// a DEFAULT-PERMISSIVE prefix by the SDK
+    /// (`sdk::mesh_rpc::auto_register_rpc_channels`), and `authorize_subscribe`
+    /// does not bind a subscriber to the origin named in the channel, so ANY
+    /// peer may hold a live subscription to another caller's reply channel.
+    /// Roster-fanning a `CrossOrgGranted` response onto that channel
+    /// discloses an org-confidential body to every such subscriber.
+    ///
+    /// The two reachable triggers are both ordinary operation, not attack
+    /// preconditions: eviction from the `RPC_CALLER_CACHE_CAP`-bounded route
+    /// cache under concurrency, and `PeerPublishOutcome::NoSession` when the
+    /// caller's session dropped between admission and send. Dropping the
+    /// frame in both cases is correct — the caller times out, which is the
+    /// same outcome it already gets from a full response drainer channel.
+    fn response_route_fallback(&self) -> ResponseRouteFallback {
+        match self {
+            Self::Public => ResponseRouteFallback::RosterOnStaleDirect,
+            Self::Protected { .. } | Self::OwnerScoped { .. } | Self::Granted { .. } => {
+                ResponseRouteFallback::DirectOnly
+            }
+            // The RED negative control must route exactly like the protected
+            // registration it is the control FOR, or the witness would differ
+            // from production on the response leg as well as the gate.
+            #[cfg(test)]
+            Self::ProtectedRedWitnessDisabled { .. } => ResponseRouteFallback::DirectOnly,
+        }
+    }
 }
 
 // ============================================================================
@@ -7536,6 +7601,98 @@ mod roster_fallback_tests {
             server.serve_rpc("p", std::sync::Arc::new(H)).is_ok(),
             "no dangling protected registration blocks the slot",
         );
+    }
+
+    /// §1 regression: EVERY org-protected registration mode routes its
+    /// responses [`ResponseRouteFallback::DirectOnly`]; only the legacy public
+    /// mode keeps the AV-5 roster fallback.
+    ///
+    /// This is the exact mutation that reintroduces the defect: the unary
+    /// response drainer previously passed a hardcoded
+    /// `ResponseRouteFallback::RosterOnStaleDirect` for every mode, so a
+    /// route-cache eviction (past `RPC_CALLER_CACHE_CAP` concurrent calls) or a
+    /// `NoSession` at send time fanned an org-confidential `CrossOrgGranted`
+    /// response onto `<service>.replies.<caller_origin>` — a channel the SDK
+    /// auto-registers default-permissive and that `authorize_subscribe` lets
+    /// ANY peer subscribe to.
+    ///
+    /// Asserted against the mode enum rather than through a live two-node call
+    /// deliberately: the leak triggers only on a cache MISS, and a passing
+    /// end-to-end call always populates the cache on the accept path — so an
+    /// integration test over the happy path exercises the direct leg and
+    /// witnesses nothing, passing identically with the defect present.
+    ///
+    /// The full property is witnessed in two halves, and this is the first:
+    ///
+    /// 1. **mode → policy** (here): every protected mode resolves to
+    ///    `DirectOnly`.
+    /// 2. **policy → behavior**:
+    ///    [`direct_only_frame_drops_while_normal_response_rosters_when_peer_gone`]
+    ///    proves the divergence on identical input over a gone peer —
+    ///    `DirectOnly` drops, `RosterOnStaleDirect` reaches the roster.
+    ///
+    /// The remaining link — the response drainer passing *this* function's
+    /// result rather than a literal — is held by construction rather than by
+    /// test: `serve_rpc_unary_impl` derives `response_fallback` once from
+    /// `mode` before consuming it, and the drainer has no other
+    /// `ResponseRouteFallback` in scope. Re-introducing the defect requires
+    /// deliberately replacing that variable with a literal.
+    #[test]
+    fn protected_registrations_never_roster_fan_responses() {
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        let policy: OrgProviderPolicy = std::sync::Arc::new(|_| true);
+
+        // Legacy public keeps the roster fallback (AV-5): an honest caller that
+        // reconnected under a new NodeId is still reachable via its signed
+        // roster subscription, and a public response body is not confidential.
+        assert_eq!(
+            UnaryAdmission::Public.response_route_fallback(),
+            ResponseRouteFallback::RosterOnStaleDirect,
+            "public services keep the AV-5 roster fallback",
+        );
+
+        // Every protected mode is direct-only.
+        for (label, mode) in [
+            (
+                "Protected/OwnerDelegated",
+                UnaryAdmission::Protected {
+                    admission: OrgAdmission::OwnerDelegated,
+                    provider_policy: policy.clone(),
+                },
+            ),
+            (
+                "Protected/CrossOrgGranted",
+                UnaryAdmission::Protected {
+                    admission: OrgAdmission::CrossOrgGranted,
+                    provider_policy: policy.clone(),
+                },
+            ),
+            (
+                "OwnerScoped",
+                UnaryAdmission::OwnerScoped {
+                    provider_policy: policy.clone(),
+                },
+            ),
+            (
+                "Granted",
+                UnaryAdmission::Granted {
+                    provider_policy: policy.clone(),
+                },
+            ),
+            (
+                "ProtectedRedWitnessDisabled",
+                UnaryAdmission::ProtectedRedWitnessDisabled {
+                    admission: OrgAdmission::OwnerDelegated,
+                    provider_policy: policy.clone(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                mode.response_route_fallback(),
+                ResponseRouteFallback::DirectOnly,
+                "{label} must never roster-fan an org-confidential response",
+            );
+        }
     }
 
     /// E1 witness 10/11 (owner-delegated), end-to-end through the LIVE gate:
