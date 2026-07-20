@@ -46,9 +46,13 @@ INVOKE-only / wrong-dispatcher corrections.
   **CLOSED** (Kyra, 2026-07-20, exit gate signed off at `347860feb`;
   see `docs/plans/OA3_EXIT_GATE.md`). Owner-audience dual-publish is
   explicitly deferred operational tooling.
-- **OA-4** — end-to-end composition witnesses, IN PROGRESS
-  (scope+methodology reconciled below; six bounded witnessed slices,
-  then STOP).
+- **OA-4** — end-to-end composition witnesses, **CLOSED** (six
+  bounded witnessed slices, all signed off; see
+  `docs/plans/OA4_EXIT_GATE.md` for the requirement → tier → exact-
+  test map). The one production touch is a `#[cfg(test)]`-only RED
+  seam that compiles out of every non-test build; `may_execute` is
+  byte-for-byte unchanged. No further organization work without a
+  named consumer or a measured failure.
 
 `may_execute` (`capability_bridge.rs`) is byte-for-byte unchanged across
 the whole OA-2 series; every fix is red-witnessed.
