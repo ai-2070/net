@@ -2848,19 +2848,32 @@ struct LocalCapabilityEmission {
     public: CapabilityAnnouncement,
     // Cloned into the send-time [`SendEmission`] by the combined send helper
     // ([`MeshNode::send_emission_to`]) and shipped on
-    // `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`, one packet per envelope. Built empty
-    // until OA3-4b1 Commit B2 populates the owner envelope; a cert-invalidating
-    // send-time rebuild clears it (see [`MeshNode::rebuild_cached_announcement`]).
+    // `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`, one packet per envelope. Holds the
+    // owner-audience envelope (OA3-4b1) followed by the granted-audience envelopes
+    // (OA3-4b2), one per active provider grant. A cert-invalidating send-time
+    // rebuild clears it (see [`MeshNode::rebuild_cached_announcement`]).
     scoped: Vec<Vec<u8>>,
-    /// The exact `Arc<NodeAuthority>` whose owner audience sealed `scoped` (Kyra
-    /// OA3-4b1 B2 rotation safety). `Some` only when `scoped` is nonempty. The
-    /// send path pointer-compares it against the currently-installed authority
-    /// and refuses the send if they differ: a same-org authority replacement
-    /// rotates the audience key while keeping the public cert equal, so neither
-    /// the cert rebuild nor the visibility check would otherwise catch it.
-    /// Holding the original Arc makes the comparison ABA-safe — a replacement is
-    /// necessarily a distinct allocation.
+    /// The exact `Arc<NodeAuthority>` whose owner audience sealed the OWNER
+    /// envelopes in `scoped` (Kyra OA3-4b1 B2 rotation safety). `Some` only when an
+    /// owner envelope is present. The send path pointer-compares it against the
+    /// currently-installed authority and refuses the send if they differ: a
+    /// same-org authority replacement rotates the audience key while keeping the
+    /// public cert equal, so neither the cert rebuild nor the visibility check
+    /// would otherwise catch it. Holding the original Arc makes the comparison
+    /// ABA-safe — a replacement is necessarily a distinct allocation.
     scoped_authority: Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+    /// The exact `Arc<ProviderGrantSnapshot>` whose grants sealed the GRANTED
+    /// envelopes in `scoped` (OA3-4b2 emission coherence, mirroring
+    /// `scoped_authority` for owner). `Some` only when a granted envelope is
+    /// present. The send path pointer-compares it against the currently-installed
+    /// provider registry: a grant install/remove/replace swaps the snapshot
+    /// pointer, so a cached granted envelope sealed under a since-mutated grant
+    /// can never ship — the mutation wakes a current-baseline rebuild that
+    /// republishes public + owner + granted coherently. ABA-safe: the emission
+    /// holds the original snapshot Arc alive, so a mutation is a distinct
+    /// allocation.
+    provider_grant_snapshot:
+        Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
     /// The local-service-registry generation this emission's public/scoped
     /// projection was derived from. The send path rejects the emission if the
     /// current generation has advanced — a concurrent visibility change may have
@@ -7569,6 +7582,40 @@ impl MeshNode {
         self.node_authority.load_full()
     }
 
+    /// Best-effort wake of a current-baseline re-announce (OA3-4b2): a provider
+    /// grant mutation changes the granted-envelope projection, so republish a
+    /// fresh, coherent emission (public + owner + granted). Rebuilds from the
+    /// CURRENT live baseline (`None`), never a captured one — a captured baseline
+    /// would reintroduce the RT-3 stale-baseline race (Kyra OA3-4b1 B2). Only a
+    /// node started via `start_arc` (populated `self_weak`) inside a runtime can
+    /// spawn; a bare node reconciles on its next explicit announce, and until the
+    /// rebuild lands the send-path pointer check keeps the stale granted envelopes
+    /// off the wire.
+    fn wake_baseline_reannounce(&self) {
+        if let Some(weak) = self.self_weak.get().cloned() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let shutdown = self.shutdown.clone();
+                handle.spawn(async move {
+                    let Some(node) = weak.upgrade() else {
+                        return;
+                    };
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Err(e) = node
+                        .announce_from_baseline(None, Duration::from_secs(300), true)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "grant-audience mutation: post-mutation re-announce failed"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
     /// OA3-4b2: install a PROVIDER grant-audience record — a grant this node's own
     /// org issued that applies to THIS provider, plus its out-of-band secret. The
     /// record must satisfy every install invariant (grant verifies, is currently
@@ -7608,17 +7655,26 @@ impl MeshNode {
         )?;
         // Serialize the read-validate-store so two concurrent installs cannot both
         // load the same snapshot and lose one. Reads elsewhere stay lock-free.
-        let _guard = self.provider_grant_mu.lock();
-        let current = self.provider_grant_audiences.load_full();
-        match current.with_record(Arc::new(record), now_secs)? {
-            Some(next) => {
-                self.provider_grant_audiences.store(Arc::new(next));
-                Ok(GrantAudienceInstalled::Installed)
+        let outcome = {
+            let _guard = self.provider_grant_mu.lock();
+            let current = self.provider_grant_audiences.load_full();
+            match current.with_record(Arc::new(record), now_secs)? {
+                Some(next) => {
+                    self.provider_grant_audiences.store(Arc::new(next));
+                    GrantAudienceInstalled::Installed
+                }
+                // Idempotent: an identical record was already present — do NOT
+                // rotate the pointer (a churned snapshot would invalidate cached
+                // emissions).
+                None => GrantAudienceInstalled::AlreadyPresent,
             }
-            // Idempotent: an identical record was already present — do NOT rotate
-            // the pointer (a churned snapshot would invalidate cached emissions).
-            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+        };
+        // Only a real install changes the granted-envelope projection; an
+        // idempotent no-op must not churn the emission.
+        if matches!(outcome, GrantAudienceInstalled::Installed) {
+            self.wake_baseline_reannounce();
         }
+        Ok(outcome)
     }
 
     /// OA3-4b2: remove a PROVIDER grant-audience record by `grant_id`. Returns
@@ -7627,15 +7683,24 @@ impl MeshNode {
     /// zeroized when the last holder releases it (see
     /// [`OrgAudienceSecret`](super::behavior::org_grant::OrgAudienceSecret)).
     pub fn remove_provider_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
-        let _guard = self.provider_grant_mu.lock();
-        let current = self.provider_grant_audiences.load_full();
-        match current.without(grant_id) {
-            Some(next) => {
-                self.provider_grant_audiences.store(Arc::new(next));
-                true
+        let removed = {
+            let _guard = self.provider_grant_mu.lock();
+            let current = self.provider_grant_audiences.load_full();
+            match current.without(grant_id) {
+                Some(next) => {
+                    self.provider_grant_audiences.store(Arc::new(next));
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        // A removal changes the granted-envelope projection: wake a rebuild so the
+        // cached (now-stale) granted envelope is republished without it. Until the
+        // rebuild lands, the send-path pointer check already refuses the stale one.
+        if removed {
+            self.wake_baseline_reannounce();
         }
+        removed
     }
 
     /// OA3-4b2: install a CONSUMER grant-audience record — a grant whose
@@ -7792,6 +7857,102 @@ impl MeshNode {
                 Vec::new()
             }
         }
+    }
+
+    /// OA3-4b2: the bounded GRANTED-audience envelopes for one emission. For each
+    /// ACTIVE provider grant record, select the locally-registered
+    /// `GrantedAudience` service tags whose capability id equals the grant's
+    /// capability; if that set is nonempty, build EXACTLY ONE `build_granted`
+    /// envelope sealed under that grant's key. Overlapping grants (two valid
+    /// grants for the same capability) yield TWO independently-decryptable
+    /// envelopes — never coalesced by capability, grantee org, or handle: each
+    /// grant/key pair is its own revocation + expiry boundary. The whole fanout
+    /// is bounded by [`MAX_PROVIDER_GRANT_AUDIENCES`](super::behavior::org_grant_registry::MAX_PROVIDER_GRANT_AUDIENCES)
+    /// (the registry cap), so an emission ships at most one granted envelope per
+    /// active record.
+    ///
+    /// `expires_at = min(now + ttl, grant.not_after, owner_cert.not_after)` — a
+    /// descriptor never outlives its grant or the provider's membership; a
+    /// born-expired record (grant or cert already lapsed) is skipped rather than
+    /// shipped. The grant's stored bytes were signature-verified at install and
+    /// are immutable, so this hot path re-checks only the (cheap) time bound via
+    /// the expiry min — never the ed25519 signature. `authority` + `owner_cert`
+    /// are the SAME pinned pair the public/owner envelopes use; the caller retains
+    /// the exact `Arc<ProviderGrantSnapshot>` so the send path refuses if a grant
+    /// mutation swaps it. A per-envelope seal/sign failure logs and drops that
+    /// envelope (fail-safe), never blocking the others or the plaintext announce.
+    #[cfg(feature = "cortex")]
+    #[allow(clippy::too_many_arguments)]
+    fn granted_envelopes(
+        &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        owner_cert: &super::behavior::org::OrgMembershipCert,
+        provider_grants: &super::behavior::org_grant_registry::ProviderGrantSnapshot,
+        granted_services: &[String],
+        generation: u64,
+        now_secs: u64,
+        ttl: Duration,
+    ) -> Vec<Vec<u8>> {
+        use super::behavior::org_grant::CapabilityAuthorityId;
+        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+        // Precompute each granted service's capability id ONCE (blake3 per tag),
+        // then match records against it — O(services + services*records) rather
+        // than a hash per (service, record) pair.
+        let tagged: Vec<(String, CapabilityAuthorityId)> = granted_services
+            .iter()
+            .map(|svc| {
+                let tag = format!("nrpc:{}", svc.as_str());
+                let id = CapabilityAuthorityId::for_tag(&tag);
+                (tag, id)
+            })
+            .collect();
+
+        let base_expiry = now_secs.saturating_add(ttl.as_secs());
+        let mut envelopes = Vec::new();
+        for record in provider_grants.records() {
+            let grant = record.grant();
+            // The descriptor names every locally-registered granted tag matching
+            // THIS grant's capability (ordinarily exactly one).
+            let mut descriptor_caps = CapabilitySet::new();
+            let mut matched = false;
+            for (tag, id) in &tagged {
+                if id == &grant.capability {
+                    descriptor_caps = descriptor_caps.add_tag(tag.clone());
+                    matched = true;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            // expires_at bounded by the grant and the provider's membership; a
+            // record whose grant or cert has already lapsed is born-expired — skip.
+            let expires_at = base_expiry.min(grant.not_after).min(owner_cert.not_after);
+            if expires_at <= now_secs {
+                continue;
+            }
+            let descriptor = descriptor_caps.to_bytes_compact();
+            match ScopedCapabilityAnnouncement::build_granted(
+                &self.identity,
+                authority.owner_org(),
+                owner_cert.clone(),
+                grant.grant_id,
+                *record.audience_handle(),
+                record.secret().discovery_key(),
+                generation,
+                expires_at,
+                &descriptor,
+            ) {
+                Ok(envelope) => envelopes.push(envelope.to_bytes()),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "granted-audience announcement seal failed; envelope dropped this round"
+                    );
+                }
+            }
+        }
+        envelopes
     }
 
     /// The certificate self-announcements attach right now: the
@@ -7995,26 +8156,42 @@ impl MeshNode {
                         .unwrap_or(false),
                     None => true,
                 };
+                // OA3-4b2 emission coherence: the granted envelopes in
+                // `cached.scoped` were sealed under a specific provider grant
+                // snapshot, recorded as `provider_grant_snapshot`. A grant
+                // install/remove/replace swaps the registry pointer, so a cached
+                // granted ciphertext sealed under a since-mutated grant must not
+                // ship. Same ABA-safe pointer comparison as the owner authority —
+                // `cached` holds the original snapshot Arc alive.
+                let provider_grants_stable = match &cached.provider_grant_snapshot {
+                    Some(built) => Arc::ptr_eq(&self.provider_grant_audiences.load_full(), built),
+                    None => true,
+                };
                 // Emit only if nothing moved during the derive + serialize — the
-                // security stamp, the visibility generation, AND the sealing
-                // authority all still hold. The pinned `snapshot` Arcs are still
-                // alive for this comparison, so a swapped-away authority/store
-                // cannot reuse the captured addresses.
-                if self.security_stamp() == stamp && visibility_stable && authority_stable {
-                    // Pair the serialized public bytes with the owner-scoped
-                    // envelopes from the SAME validated `cached` load — one
-                    // coherent generation, never a torn public/scoped snapshot
-                    // (Kyra OA3). A cert-invalidating rebuild has already cleared
-                    // `scoped`, so an envelope embedding a stale cert cannot ship.
+                // security stamp, the visibility generation, the sealing authority,
+                // AND the sealing provider snapshot all still hold. The pinned
+                // `snapshot` Arcs are still alive for this comparison, so a
+                // swapped-away authority/store cannot reuse the captured addresses.
+                if self.security_stamp() == stamp
+                    && visibility_stable
+                    && authority_stable
+                    && provider_grants_stable
+                {
+                    // Pair the serialized public bytes with the owner + granted
+                    // envelopes from the SAME validated `cached` load — one coherent
+                    // generation, never a torn public/scoped snapshot (Kyra OA3). A
+                    // cert-invalidating rebuild has already cleared `scoped`, so an
+                    // envelope embedding a stale cert cannot ship.
                     return Some(SendEmission {
                         public: bytes,
                         scoped: cached.scoped.clone(),
                     });
                 }
-                // A visibility change or an authority rotation is terminal for this
-                // send — each already woke a re-announce that will publish a
-                // coherent emission; do not retry against state that just changed.
-                if !visibility_stable || !authority_stable {
+                // A visibility change, an authority rotation, or a grant mutation is
+                // terminal for this send — each already woke a re-announce that will
+                // publish a coherent emission; do not retry against state that just
+                // changed.
+                if !visibility_stable || !authority_stable || !provider_grants_stable {
                     return None;
                 }
                 continue;
@@ -8240,6 +8417,9 @@ impl MeshNode {
                 scoped: Vec::new(),
                 // Scoped cleared ⇒ no sealing authority to track (Kyra B2).
                 scoped_authority: None,
+                // Scoped cleared ⇒ no sealing provider snapshot to track either
+                // (the granted envelopes embed the same cert, OA3-4b2).
+                provider_grant_snapshot: None,
                 // A cert rebuild does NOT change visibility — preserve the
                 // generation so the send-time freshness check still holds.
                 visibility_generation: cached.visibility_generation,
@@ -19411,11 +19591,11 @@ impl MeshNode {
             // stored in `local_announcement` or sent. When no private service is
             // registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
-            let (self_ann, scoped_envelopes, scoped_authority) = {
+            let (self_ann, scoped_envelopes, scoped_authority, provider_grant_snapshot) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
                 let granted = self.rpc_local_services.granted_snapshot();
                 if owner_scoped.is_empty() && granted.is_empty() {
-                    (broadcast_ann.clone(), Vec::new(), None)
+                    (broadcast_ann.clone(), Vec::new(), None, None)
                 } else {
                     let mut self_caps = caps;
                     for svc in owner_scoped.iter().chain(granted.iter()) {
@@ -19436,18 +19616,24 @@ impl MeshNode {
                     if sign {
                         a.sign(&self.identity);
                     }
-                    // OA3-4b1 Commit B2: seal the owner-scoped services into an
-                    // encrypted owner-audience envelope carried on
+                    // Seal the private services into encrypted envelopes carried on
                     // SUBPROTOCOL_SCOPED_CAPABILITY_ANN — never in the plaintext
-                    // `broadcast_ann`. Sealed under the SAME pinned authority
-                    // whose cert `a`/`broadcast_ann` embed; a nonempty result
-                    // retains that exact Arc so the send path refuses a later
-                    // same-org rotation (Kyra OA3-4b1 B2). Only when an owner-
-                    // scoped service is registered — a granted-only node emits no
-                    // owner envelope here (granted envelopes are OA3-4b2 slice 3).
-                    match (emission_authority.as_ref(), owner_cert.as_ref()) {
-                        (Some(authority), Some(cert)) if !owner_scoped.is_empty() => {
-                            let scoped = self.owner_scoped_envelopes(
+                    // `broadcast_ann`. Owner-scoped (OA3-4b1) and granted-audience
+                    // (OA3-4b2) envelopes ride the SAME pinned cert `a`/
+                    // `broadcast_ann` embed; each family retains the exact Arc it
+                    // sealed under (owner audience / provider grant snapshot) so the
+                    // send path refuses if that Arc is later replaced.
+                    let mut scoped_envelopes: Vec<Vec<u8>> = Vec::new();
+                    let mut scoped_authority = None;
+                    let mut provider_grant_snapshot = None;
+                    if let (Some(authority), Some(cert)) =
+                        (emission_authority.as_ref(), owner_cert.as_ref())
+                    {
+                        // OA3-4b1: ONE owner-audience envelope for all owner-scoped
+                        // services (only when one is registered — a granted-only
+                        // node emits no owner envelope).
+                        if !owner_scoped.is_empty() {
+                            let owner_env = self.owner_scoped_envelopes(
                                 authority,
                                 cert.clone(),
                                 &owner_scoped,
@@ -19455,23 +19641,42 @@ impl MeshNode {
                                 now_secs,
                                 ttl,
                             );
-                            if scoped.is_empty() {
-                                (a, Vec::new(), None)
-                            } else {
-                                (a, scoped, Some(Arc::clone(authority)))
+                            if !owner_env.is_empty() {
+                                scoped_envelopes.extend(owner_env);
+                                scoped_authority = Some(Arc::clone(authority));
                             }
                         }
-                        _ => (a, Vec::new(), None),
+                        // OA3-4b2: one granted-audience envelope per active provider
+                        // grant matching a locally-registered granted service.
+                        // Retain the exact snapshot Arc so a grant mutation (which
+                        // swaps the pointer) refuses the cached ciphertext.
+                        if !granted.is_empty() {
+                            let snapshot = self.provider_grant_audiences.load_full();
+                            let granted_env = self.granted_envelopes(
+                                authority, cert, &snapshot, &granted, version, now_secs, ttl,
+                            );
+                            if !granted_env.is_empty() {
+                                scoped_envelopes.extend(granted_env);
+                                provider_grant_snapshot = Some(snapshot);
+                            }
+                        }
                     }
+                    (
+                        a,
+                        scoped_envelopes,
+                        scoped_authority,
+                        provider_grant_snapshot,
+                    )
                 }
             };
             #[cfg(not(feature = "cortex"))]
             let self_ann = broadcast_ann.clone();
             #[cfg(not(feature = "cortex"))]
-            let (scoped_envelopes, scoped_authority): (
+            let (scoped_envelopes, scoped_authority, provider_grant_snapshot): (
                 Vec<Vec<u8>>,
                 Option<Arc<super::behavior::org_authority::NodeAuthority>>,
-            ) = (Vec::new(), None);
+                Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+            ) = (Vec::new(), None, None);
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -19525,6 +19730,7 @@ impl MeshNode {
                     public: broadcast_ann,
                     scoped: scoped_envelopes,
                     scoped_authority,
+                    provider_grant_snapshot,
                     visibility_generation,
                 })));
 

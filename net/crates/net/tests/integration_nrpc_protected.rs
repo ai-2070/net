@@ -28,6 +28,7 @@ use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
+use net::adapter::net::behavior::org_grant::OrgAudienceSecret;
 use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
     OrgDispatcherGrant,
@@ -40,7 +41,7 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeError};
+use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeError, ServeHandle};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -947,6 +948,335 @@ async fn serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant() 
     assert!(
         has_local_capability(server.capability_fold(), server.node_id(), "nrpc:cross"),
         "the granted service is locally dispatchable despite being undiscoverable",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// OA3-4b2 slice 3 — granted-audience emission helpers + witnesses.
+// ---------------------------------------------------------------------------
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// A byte-identical copy of a secret (install consumes the original; the witness
+/// keeps a copy to open the sealed envelope).
+fn copy_secret(secret: &OrgAudienceSecret) -> OrgAudienceSecret {
+    OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret")
+}
+
+/// An org-B provider node serving one granted-audience service `svc`, authority
+/// installed and emission enabled. Returns the node, its serve handle (kept alive
+/// by the caller), scratch dir, entity, and org B.
+async fn granted_provider(
+    seed: u8,
+    tag: &str,
+    svc: &str,
+) -> (
+    Arc<MeshNode>,
+    ServeHandle,
+    std::path::PathBuf,
+    EntityId,
+    OrgKeypair,
+) {
+    let p = build_node_with(EntityKeypair::from_bytes([seed; 32])).await;
+    let entity = p.entity_id().clone();
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let cert = OrgMembershipCert::try_issue(&org_b, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!("net-oa34b2-emit-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    p.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    p.set_owner_cert_emission(true).expect("enable emission");
+    let handle = p
+        .serve_rpc_granted(svc, Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("granted serve");
+    (p, handle, dir, entity, org_b)
+}
+
+/// Open a granted-audience envelope as grantee `grantee_org` would, returning the
+/// sealed descriptor capabilities on success (or `None` if it does not open).
+fn open_granted_envelope(
+    scoped_bytes: &[u8],
+    grant: &OrgCapabilityGrant,
+    secret: &OrgAudienceSecret,
+    grantee_org: OrgId,
+    now_secs: u64,
+) -> Option<CapabilitySet> {
+    use net::adapter::net::behavior::org_revocation::OrgRevocationState;
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use net::adapter::net::behavior::org_scoped_ingest::{
+        verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
+    };
+    let env = ScopedCapabilityAnnouncement::from_bytes(scoped_bytes).ok()?;
+    let authority = AudienceAuthority::granted(grant, secret);
+    let floors = OrgRevocationState::empty();
+    let ctx = ScopedIngestContext {
+        local_owner_org: grantee_org,
+        floors: &floors,
+        now_secs,
+        skew_secs: 5,
+    };
+    let verified = verify_scoped_ingest(&env, &authority, &ctx).ok()?;
+    CapabilitySet::from_bytes(verified.descriptor())
+}
+
+/// Wait until P's cached emission carries exactly `n` scoped envelopes,
+/// re-announcing across the wait so a coalesced send still converges.
+async fn converge_scoped_count(p: &Arc<MeshNode>, n: usize) -> bool {
+    for _ in 0..40 {
+        p.announce_capabilities(CapabilitySet::new()).await.ok();
+        if p.announcement_scoped_for_send_for_test().len() == n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    p.announcement_scoped_for_send_for_test().len() == n
+}
+
+/// OA3-4b2 slice 3 — a granted service ships ONLY inside an encrypted grant
+/// envelope. With one matching provider grant installed, P emits exactly one
+/// granted envelope; its tag never rides the plaintext broadcast; the grantee A
+/// opens it under the grant secret and the sealed descriptor names exactly the
+/// granted service.
+#[tokio::test]
+async fn a_granted_service_ships_only_inside_an_encrypted_grant_envelope() {
+    let (p, _h, dir, entity, org_b) = granted_provider(0x70, "one", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:cross"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(entity.clone()),
+        3600,
+    )
+    .expect("issue grant");
+    let secret = secret.expect("secret");
+    let opener = copy_secret(&secret);
+    assert_eq!(
+        p.install_provider_grant_audience(grant.clone(), secret)
+            .expect("install"),
+        GrantAudienceInstalled::Installed
+    );
+
+    // Converge: exactly one scoped envelope (the granted one — no owner service).
+    assert!(
+        converge_scoped_count(&p, 1).await,
+        "P emits exactly one granted envelope",
+    );
+    // Plaintext never carries the granted tag.
+    assert!(
+        p.local_announcement_for_test()
+            .map(|a| !a.capabilities.has_tag("nrpc:cross"))
+            .unwrap_or(false),
+        "the granted tag never appears in the plaintext announcement",
+    );
+
+    // The grantee A opens it; the descriptor names exactly the granted service.
+    let scoped = p.announcement_scoped_for_send_for_test();
+    let descriptor = open_granted_envelope(&scoped[0], &grant, &opener, org_a.org_id(), unix_now())
+        .expect("grantee opens the granted envelope");
+    assert!(descriptor.has_tag("nrpc:cross"));
+    assert!(!descriptor.has_tag("nrpc:open"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 3 — two overlapping grants (same capability) emit TWO
+/// independently-decryptable envelopes, never coalesced. Each grant's key opens
+/// ONLY its own envelope: K1 cannot open K2's, and vice versa.
+#[tokio::test]
+async fn overlapping_grants_emit_two_independently_decryptable_envelopes() {
+    let (p, _h, dir, entity, org_b) = granted_provider(0x71, "two", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let cap = CapabilityAuthorityId::for_tag("nrpc:cross");
+
+    let issue = || {
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            cap,
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(entity.clone()),
+            3600,
+        )
+        .expect("issue");
+        (g, s.expect("secret"))
+    };
+    let (g1, s1) = issue();
+    let (g2, s2) = issue();
+    assert_ne!(g1.grant_id, g2.grant_id, "distinct grant ids");
+    let (o1, o2) = (copy_secret(&s1), copy_secret(&s2));
+    p.install_provider_grant_audience(g1.clone(), s1)
+        .expect("install g1");
+    p.install_provider_grant_audience(g2.clone(), s2)
+        .expect("install g2");
+
+    // Two overlapping grants → two envelopes, never coalesced.
+    assert!(
+        converge_scoped_count(&p, 2).await,
+        "two overlapping grants emit two envelopes",
+    );
+    let scoped = p.announcement_scoped_for_send_for_test();
+    let now = unix_now();
+
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    let envs: Vec<ScopedCapabilityAnnouncement> = scoped
+        .iter()
+        .map(|b| ScopedCapabilityAnnouncement::from_bytes(b).expect("decode"))
+        .collect();
+    // Locate each grant's envelope by its grant id.
+    let e1 = envs
+        .iter()
+        .find(|e| e.grant_id() == &g1.grant_id)
+        .expect("g1 envelope present");
+    let e2 = envs
+        .iter()
+        .find(|e| e.grant_id() == &g2.grant_id)
+        .expect("g2 envelope present");
+
+    // Full-path ingest: each grantee opens ONLY its own grant's envelope.
+    assert!(open_granted_envelope(&e1.to_bytes(), &g1, &o1, org_a.org_id(), now).is_some());
+    assert!(open_granted_envelope(&e2.to_bytes(), &g2, &o2, org_a.org_id(), now).is_some());
+
+    // AEAD key independence: K1 cannot decrypt K2's ciphertext, and vice versa —
+    // each grant/key pair is its own boundary, never coalesced under one key.
+    assert!(e1.open_with(o1.discovery_key()).is_ok(), "K1 opens E1",);
+    assert!(
+        e1.open_with(o2.discovery_key()).is_err(),
+        "K2 cannot open E1",
+    );
+    assert!(e2.open_with(o2.discovery_key()).is_ok(), "K2 opens E2",);
+    assert!(
+        e2.open_with(o1.discovery_key()).is_err(),
+        "K1 cannot open E2",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 3 — a provider grant for a capability with NO locally-registered
+/// granted service emits no envelope (fanout is per matching capability, not per
+/// installed grant).
+#[tokio::test]
+async fn an_unrelated_capability_grant_emits_no_granted_envelope() {
+    let (p, _h, dir, entity, org_b) = granted_provider(0x72, "none", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    // A valid grant that covers this provider but names a DIFFERENT capability.
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:unrelated"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(entity.clone()),
+        3600,
+    )
+    .expect("issue");
+    p.install_provider_grant_audience(grant, secret.expect("secret"))
+        .expect("install");
+
+    // Nothing matches the local `nrpc:cross` service → no envelope at all.
+    assert!(
+        converge_scoped_count(&p, 0).await,
+        "an unrelated-capability grant emits no granted envelope",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 3 — a granted envelope's expiry never outlives its grant:
+/// `expires_at = min(now + announce_ttl, grant.not_after, cert.not_after)`. A
+/// grant with a short TTL clamps the envelope below the (300 s) announce TTL and
+/// the (3600 s) cert.
+#[tokio::test]
+async fn a_granted_envelope_never_outlives_its_grant() {
+    let (p, _h, dir, entity, org_b) = granted_provider(0x73, "ttl", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:cross"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(entity.clone()),
+        120, // far shorter than the 300 s announce TTL and 3600 s cert
+    )
+    .expect("issue");
+    p.install_provider_grant_audience(grant.clone(), secret.expect("secret"))
+        .expect("install");
+    assert!(converge_scoped_count(&p, 1).await, "one granted envelope");
+
+    let scoped = p.announcement_scoped_for_send_for_test();
+    let env =
+        net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::from_bytes(
+            &scoped[0],
+        )
+        .expect("decode");
+    assert!(
+        env.expires_at() <= grant.not_after,
+        "envelope expiry {} must not outlive the grant not_after {}",
+        env.expires_at(),
+        grant.not_after,
+    );
+    // The grant TTL (120 s) is the binding constraint, well below now + 300 s.
+    assert!(
+        env.expires_at() <= unix_now() + 200,
+        "the short grant TTL clamped the envelope expiry below the announce TTL",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 3 — removing a provider grant swaps the registry snapshot
+/// pointer, so the cached granted envelope can no longer ship: the send seqlock's
+/// pointer-eq check refuses it BEFORE any rebuild lands (the mutation woke a
+/// rebuild on a started node; here the unstarted node has no `self_weak`, so the
+/// refusal is observed deterministically). A fresh announce then republishes with
+/// the grant gone — zero envelopes.
+#[tokio::test]
+async fn removing_a_provider_grant_refuses_the_cached_granted_envelope() {
+    let (p, _h, dir, entity, org_b) = granted_provider(0x74, "remove", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:cross"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(entity.clone()),
+        3600,
+    )
+    .expect("issue");
+    let grant_id = grant.grant_id;
+    p.install_provider_grant_audience(grant, secret.expect("secret"))
+        .expect("install");
+    assert!(converge_scoped_count(&p, 1).await, "one granted envelope");
+
+    // Remove the grant (unstarted node → no auto re-announce). The cached
+    // emission still holds the granted envelope sealed under the OLD snapshot,
+    // but the send path pointer-eq check now refuses it: the send returns None.
+    assert!(p.remove_provider_grant_audience(&grant_id));
+    assert!(
+        p.announcement_scoped_for_send_for_test().is_empty(),
+        "the cached granted envelope is refused after the grant is removed",
+    );
+
+    // A fresh announce rebuilds against the empty registry — zero envelopes.
+    p.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert!(
+        p.announcement_scoped_for_send_for_test().is_empty(),
+        "the rebuilt emission carries no granted envelope",
     );
 
     let _ = std::fs::remove_dir_all(&dir);
