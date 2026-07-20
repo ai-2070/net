@@ -91,6 +91,57 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Every OTHER test surface in this workflow is auto-discovered
+      # (`cargo test -p <crate>` / bare `pytest` / `go test ./...`), so a
+      # new test file there is picked up for free. This job is the sole
+      # exception: it pins `--test <name>` explicitly, per feature group,
+      # to keep the crate from recompiling once per test binary. The cost
+      # of that is a silent failure mode — a new `tests/*.rs` runs in NO
+      # job until someone remembers to edit this file, and nothing
+      # complains. `unit-tests` is `--lib` (never touches `tests/`) and
+      # the Coverage workflow, which does auto-discover, only fires on
+      # master + PRs and is pinned informational — so on a feature branch
+      # an unpinned test is gated by nothing at all.
+      #
+      # This guard closes that. Any new `tests/*.rs` must either appear in
+      # a `--test` flag below or be added to UNPINNED_OK with a reason.
+      - name: Guard — every tests/*.rs is pinned to a step
+        run: |
+          # Tests that intentionally run nowhere in THIS workflow.
+          UNPINNED_OK="
+          integration_redis      # required-features=[redis]; needs a service container
+          integration_jetstream  # required-features=[jetstream]; needs a service container
+          natsim                 # runs in natsim.yml (privileged netns harness, --ignored)
+          "
+          # Scrape the real pins only: drop YAML comment lines and this
+          # step's own `echo` prose, both of which mention the flag by name
+          # and would otherwise be scraped as bogus test targets.
+          sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
+            | grep -v 'echo ' \
+            | grep -oE -- '--test [a-z0-9_]+' \
+            | sed 's/--test //' | sort -u > /tmp/pinned.txt
+          printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
+          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present.txt
+          missing=$(comm -23 /tmp/present.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
+          if [ -n "$missing" ]; then
+            echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
+            printf '  %s\n' $missing
+            echo ""
+            echo "Add each to the matching feature group below (check the file's"
+            echo "#![cfg(...)] gate — a test listed under a feature set that does not"
+            echo "satisfy it compiles to a silent 0-test binary), or to UNPINNED_OK."
+            exit 1
+          fi
+          # The reverse drift: a --test flag naming a file that no longer exists
+          # fails the run with a confusing cargo error, so name it here instead.
+          stale=$(comm -13 /tmp/present.txt /tmp/pinned.txt)
+          if [ -n "$stale" ]; then
+            echo "::error::CI pins --test target(s) with no matching tests/*.rs:"
+            printf '  %s\n' $stale
+            exit 1
+          fi
+          echo "OK: $(wc -l < /tmp/present.txt) test files, all accounted for."
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -233,6 +284,7 @@ jobs:
           --test integration_nrpc_cross_lang
           --test integration_nrpc_cross_lang_streaming
           --test integration_tool_announce
+          --test capability_exposure_revocation
           --test nrpc_inbound_dispatcher
           --test nrpc_call_hijack
           --test nrpc_registration_order
