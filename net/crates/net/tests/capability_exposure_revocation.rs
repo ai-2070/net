@@ -274,3 +274,165 @@ async fn a_refused_sender_cannot_roll_back_over_a_newer_claim() {
         "the live claimant's release restores what it displaced",
     );
 }
+
+/// Kyra OA3 review (deferred-flush claim ownership) — the trailing-edge flush is
+/// a broadcast-window CLAIMANT and must advance the ownership token like any
+/// other. It previously wrote `last_broadcast_at` directly, which left it
+/// invisible to the release rule: an immediate sender that claimed first and was
+/// refused later still matched its own token and rolled its predecessor back
+/// over the flush's newer window, silently reopening it.
+///
+/// Drives the REAL `flush_deferred_announce` rather than a mirror of its claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_flush_claim_cannot_be_rolled_back_by_an_earlier_sender() {
+    let node = build_node().await;
+    node.start();
+    let _handle = node
+        .serve_rpc("flush-svc", Arc::new(TrivialHandler))
+        .expect("serve");
+    node.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Immediate sender A claims the window.
+    let t_a = std::time::Instant::now();
+    let (claim_a, previous_a) = node.test_claim_broadcast_window_at(t_a);
+
+    // The deferred flush (B) fires and claims through the shared helper.
+    let generation = node.test_arm_deferred_flush();
+    node.test_flush_deferred_announce(generation, None).await;
+    let owned_by_flush = node.test_broadcast_window_at();
+    assert!(
+        owned_by_flush.is_some() && owned_by_flush != Some(t_a),
+        "the deferred flush must have taken the window",
+    );
+
+    // A's send is refused and it releases. The flush owns the slot now, so A's
+    // release must be inert — it holds a superseded token.
+    node.test_release_broadcast_claim(claim_a, previous_a);
+    assert_eq!(
+        node.test_broadcast_window_at(),
+        owned_by_flush,
+        "an earlier immediate claimant must not roll back over the deferred \
+         flush's newer claim",
+    );
+}
+
+/// Kyra OA3 review (reflex-reset claim invalidation) — a rate-limit-floor reset
+/// invalidates outstanding ownership. Without advancing the token, a sender that
+/// claimed before the reset and is refused after it would still compare equal
+/// and restore its predecessor timestamp, silently re-arming the rate limit the
+/// reset had just cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reflex_reset_invalidates_outstanding_broadcast_claims() {
+    let node = build_node().await;
+
+    // Seed a prior broadcast, then A claims.
+    let t0 = std::time::Instant::now();
+    node.test_claim_broadcast_window_at(t0);
+    let t_a = std::time::Instant::now();
+    let (claim_a, previous_a) = node.test_claim_broadcast_window_at(t_a);
+    assert_eq!(previous_a, Some(t0));
+
+    // The reset clears the floor so the next announce broadcasts unconditionally.
+    node.test_invalidate_broadcast_window();
+    assert_eq!(
+        node.test_broadcast_window_at(),
+        None,
+        "the reset must clear the rate-limit floor",
+    );
+
+    // A is refused and releases. It must NOT undo the reset by restoring t0.
+    node.test_release_broadcast_claim(claim_a, previous_a);
+    assert_eq!(
+        node.test_broadcast_window_at(),
+        None,
+        "a claim outstanding across a reset must not restore over it — doing so \
+         re-arms the rate limit the reset deliberately cleared",
+    );
+}
+
+/// Kyra OA3 review (deferred security correction) — when the DEFERRED flush's
+/// own send is refused by the seqlock it must release its claim and drive the
+/// same bounded corrective pass the immediate path does.
+///
+/// Previously it just returned: window consumed, nothing sent, no correction,
+/// on-wire exposure generation untouched. An exposure revocation would usually
+/// wake a security-priority immediate announce, but an authority or
+/// provider-grant invalidation moves no exposure epoch, so nothing was
+/// guaranteed to carry the supersession on this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_security_refused_deferred_flush_drives_a_corrective_send() {
+    let server = build_node().await;
+    let client = build_node().await;
+
+    let server_id = server.node_id();
+    let client_id = client.node_id();
+    let server_pub = *server.public_key();
+    let server_addr = server.local_addr();
+    let server_clone = server.clone();
+    let accept = tokio::spawn(async move { server_clone.accept(client_id).await });
+    client
+        .connect(server_addr, &server_pub, server_id)
+        .await
+        .expect("connect");
+    accept.await.expect("accept task").expect("accept");
+    server.start();
+    client.start();
+
+    let _handle = server
+        .serve_rpc("deferred-svc", Arc::new(TrivialHandler))
+        .expect("serve");
+    // Publish an emission for the flush to find, without letting it reach the
+    // client yet: the tag must arrive via the CORRECTIVE pass below, not this.
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("seed announce");
+
+    let served = CapabilityFilter::new().require_tag("nrpc:deferred-svc");
+    assert!(
+        wait_until(
+            || client.find_nodes_by_filter(&served).contains(&server_id),
+            Duration::from_secs(10),
+        )
+        .await,
+        "precondition: the seed announce reaches the client",
+    );
+
+    // Now force the DEFERRED flush's send to be refused, one-shot.
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_probe = server.clone();
+    let fired_probe = Arc::clone(&fired);
+    let probe = move || {
+        if !fired_probe.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            server_probe.test_advance_visibility_generation();
+        }
+    };
+
+    let generation = server.test_arm_deferred_flush();
+    server
+        .test_flush_deferred_announce(generation, Some(&probe))
+        .await;
+
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "the probe must actually have fired inside the flush's send seqlock",
+    );
+    // The corrective pass must have published a SUPERSEDING announcement. The
+    // emission the flush refused is gone; only a fresh one can be on the wire,
+    // and the node must be able to serialize one right now.
+    assert!(
+        wait_until(
+            || server.announcement_bytes_for_send_for_test().is_some(),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the refused deferred flush must have driven a corrective pass that \
+         republished a coherent emission",
+    );
+    assert!(
+        client.find_nodes_by_filter(&served).contains(&server_id),
+        "the client's view must remain coherent across the refused flush",
+    );
+}

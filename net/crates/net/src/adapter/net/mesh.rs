@@ -8490,12 +8490,9 @@ impl MeshNode {
         &self,
         now: std::time::Instant,
     ) -> (u64, Option<std::time::Instant>) {
-        let mut gate = self.announce_gate.lock();
-        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
-        (
-            gate.broadcast_claim_generation,
-            gate.last_broadcast_at.replace(now),
-        )
+        // Delegates to the production claim helper — see
+        // `test_release_broadcast_claim` for why these seams must not mirror.
+        self.claim_broadcast_window(now)
     }
 
     /// Deterministic-witness seam: the release half of
@@ -8512,6 +8509,59 @@ impl MeshNode {
         self.release_broadcast_claim(claim_id, previous);
     }
 
+    /// Claim the broadcast window under an ALREADY-HELD gate lock, returning
+    /// `(claim_id, displaced timestamp)`.
+    ///
+    /// Every path that takes ownership of the window goes through here or its
+    /// locking wrapper — the immediate announce, the deferred trailing-edge
+    /// flush, and the witness seam. A path that wrote `last_broadcast_at`
+    /// WITHOUT advancing the token would be invisible to
+    /// [`Self::release_broadcast_claim`]: an older refused sender would still
+    /// compare equal and roll its predecessor back over the newer window (Kyra
+    /// OA3 review — deferred-flush claim ownership).
+    fn claim_broadcast_window_locked(
+        gate: &mut AnnounceGate,
+        now: std::time::Instant,
+    ) -> (u64, Option<std::time::Instant>) {
+        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
+        (
+            gate.broadcast_claim_generation,
+            gate.last_broadcast_at.replace(now),
+        )
+    }
+
+    /// [`Self::claim_broadcast_window_locked`], taking the gate lock.
+    fn claim_broadcast_window(&self, now: std::time::Instant) -> (u64, Option<std::time::Instant>) {
+        let mut gate = self.announce_gate.lock();
+        Self::claim_broadcast_window_locked(&mut gate, now)
+    }
+
+    /// Reset the rate-limit floor so the next announce broadcasts
+    /// unconditionally, cancelling any pending trailing-edge flush.
+    ///
+    /// Advancing the claim token is load-bearing, not bookkeeping: a reset
+    /// INVALIDATES outstanding ownership. Without the bump, a sender that
+    /// claimed before the reset and is refused after it would still hold a
+    /// matching token and restore its predecessor timestamp over the reset —
+    /// silently re-arming the rate limit the reset just cleared.
+    fn invalidate_broadcast_window(&self) {
+        let mut gate = self.announce_gate.lock();
+        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
+        gate.last_broadcast_at = None;
+        gate.deferred_scheduled = false;
+    }
+
+    /// Record that the wire now reflects every exposure revocation up to
+    /// `shipped`, so ordinary rate limiting resumes until the next one. Shared
+    /// by the immediate and deferred send paths — a path that broadcasts
+    /// without recording would leave every later announce permanently
+    /// security-priority.
+    fn record_broadcast_exposure_generation(&self, shipped: u64) {
+        let mut gate = self.announce_gate.lock();
+        gate.last_broadcast_exposure_generation =
+            gate.last_broadcast_exposure_generation.max(shipped);
+    }
+
     /// Release a broadcast-window claim, but ONLY if it is still ours. Ownership
     /// is decided by the monotonic claim token, never by comparing the stored
     /// `Instant` to the one we wrote: two claimants can read the same
@@ -8523,6 +8573,39 @@ impl MeshNode {
         if gate.broadcast_claim_generation == claim_id {
             gate.last_broadcast_at = previous;
         }
+    }
+
+    /// Deterministic-witness seam: arm a deferred trailing-edge flush slot and
+    /// return its deferral generation, so a witness can drive the REAL
+    /// [`Self::flush_deferred_announce`] without waiting on a timer.
+    #[doc(hidden)]
+    pub fn test_arm_deferred_flush(&self) -> u64 {
+        let mut gate = self.announce_gate.lock();
+        gate.deferred_scheduled = true;
+        gate.deferral_generation = gate.deferral_generation.wrapping_add(1);
+        gate.deferral_generation
+    }
+
+    /// Deterministic-witness seam: run the REAL deferred flush, optionally with
+    /// a probe fired inside its send seqlock. Delegates to the production path —
+    /// the witness must exercise the flush's own claim/refusal handling, not a
+    /// copy of it.
+    #[doc(hidden)]
+    pub async fn test_flush_deferred_announce(
+        &self,
+        generation: u64,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) {
+        self.flush_deferred_announce_probed(generation, probe).await
+    }
+
+    /// Deterministic-witness seam: the rate-limit-floor reset the reflex-override
+    /// paths perform. Delegates to the production
+    /// [`Self::invalidate_broadcast_window`] so the witness covers the real rule
+    /// (and stays reachable without the `nat-traversal` feature).
+    #[doc(hidden)]
+    pub fn test_invalidate_broadcast_window(&self) {
+        self.invalidate_broadcast_window();
     }
 
     /// Deterministic-witness seam: the current broadcast-window timestamp.
@@ -19779,8 +19862,26 @@ impl MeshNode {
         sign: bool,
         probe: Option<&(dyn Fn() + Sync)>,
     ) -> Result<(), AdapterError> {
+        self.announce_loop(new_baseline, ttl, sign, AnnounceMode::Routine, probe)
+            .await
+    }
+
+    /// The corrective loop shared by every announce entry point. `start_mode`
+    /// is `Routine` for an ordinary announce and `SecurityCorrective` for a
+    /// caller that has ALREADY had a send refused — the deferred flush, whose
+    /// own send the seqlock rejected, enters here so it drives exactly the same
+    /// bounded correction the immediate path does (Kyra OA3 review — deferred
+    /// security correction).
+    async fn announce_loop(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        start_mode: AnnounceMode,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), AdapterError> {
         let mut baseline = new_baseline;
-        let mut mode = AnnounceMode::Routine;
+        let mut mode = start_mode;
         for _ in 0..=SECURITY_CORRECTIVE_ATTEMPTS {
             match self
                 .announce_attempt(baseline.take(), ttl, sign, mode, probe)
@@ -20294,12 +20395,7 @@ impl MeshNode {
                         // out what it held: if the send below is refused nothing
                         // actually shipped, and the claim must be released rather
                         // than coalesce away the corrective re-announce.
-                        gate.broadcast_claim_generation =
-                            gate.broadcast_claim_generation.wrapping_add(1);
-                        Some((
-                            gate.broadcast_claim_generation,
-                            gate.last_broadcast_at.replace(now),
-                        ))
+                        Some(Self::claim_broadcast_window_locked(&mut gate, now))
                     }
                 }
             }
@@ -20331,14 +20427,7 @@ impl MeshNode {
         };
         let shipped_generation = emission.exposure_generation;
         self.broadcast_emission(&emission).await;
-        // The wire now reflects every revocation up to `shipped_generation`, so
-        // ordinary rate limiting resumes until the next one.
-        {
-            let mut gate = self.announce_gate.lock();
-            gate.last_broadcast_exposure_generation = gate
-                .last_broadcast_exposure_generation
-                .max(shipped_generation);
-        }
+        self.record_broadcast_exposure_generation(shipped_generation);
         Ok(AnnounceOutcome::Sent)
     }
 
@@ -20432,23 +20521,69 @@ impl MeshNode {
     /// (Finding 12); the reset's documented follow-up announce
     /// supersedes the flush.
     async fn flush_deferred_announce(&self, generation: u64) {
-        {
+        self.flush_deferred_announce_probed(generation, None).await
+    }
+
+    /// [`Self::flush_deferred_announce`] with an optional send-seqlock probe, so
+    /// a witness can force this path's send to be refused and observe that it
+    /// releases its own claim and drives a corrective pass. `None` in production.
+    async fn flush_deferred_announce_probed(
+        &self,
+        generation: u64,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) {
+        // Claim through the SHARED helper so this path advances the ownership
+        // token like every other claimant. Writing `last_broadcast_at` directly
+        // (the pre-review shape) left the flush invisible to
+        // `release_broadcast_claim`: an immediate sender that claimed earlier and
+        // was refused later still matched its own token and rolled its
+        // predecessor back over this newer window.
+        let (claim_id, previous_broadcast_at) = {
             let mut gate = self.announce_gate.lock();
             if !gate.deferred_scheduled || gate.deferral_generation != generation {
                 return;
             }
             gate.deferred_scheduled = false;
-            gate.last_broadcast_at = Some(std::time::Instant::now());
-        }
+            Self::claim_broadcast_window_locked(&mut gate, std::time::Instant::now())
+        };
         // `local_announcement` is stored before the gate on every
         // announce path, so a scheduled flush always finds it. The
         // bytes are serialized through the epoch-checked path
         // (review-9 addendum): a self-floor raised during the
         // deferral window must not ship the certified form.
-        let Some(emission) = self.announcement_bytes_for_send() else {
+        let Some(emission) = self.announcement_bytes_for_send_probed(
+            probe.map(|p| p as &dyn Fn()),
+            super::behavior::org::current_timestamp(),
+        ) else {
+            // Refused on security grounds. Previously this path simply returned:
+            // it consumed its window, sent nothing, drove no correction, and left
+            // the on-wire exposure generation untouched. Exposure revocations
+            // usually wake a security-priority immediate announce, but an
+            // AUTHORITY or PROVIDER-GRANT invalidation moves no exposure epoch —
+            // so nothing else was guaranteed to carry the supersession, and the
+            // "a security-refused sender drives its own correction" contract was
+            // false for this path.
+            self.release_broadcast_claim(claim_id, previous_broadcast_at);
+            if let Err(e) = self
+                .announce_loop(
+                    None,
+                    Duration::from_secs(300),
+                    true,
+                    AnnounceMode::SecurityCorrective,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "capability: deferred flush refused on security grounds and its                      corrective re-announce failed",
+                );
+            }
             return;
         };
+        let shipped_generation = emission.exposure_generation;
         self.broadcast_emission(&emission).await;
+        self.record_broadcast_exposure_generation(shipped_generation);
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
@@ -23917,11 +24052,7 @@ impl MeshNode {
         // fire too would put a second broadcast inside the fresh
         // window. The parked flush task no-ops when it finds the
         // slot cleared.
-        {
-            let mut gate = self.announce_gate.lock();
-            gate.last_broadcast_at = None;
-            gate.deferred_scheduled = false;
-        }
+        self.invalidate_broadcast_window();
     }
 
     /// Drop a previously-installed runtime reflex override. The
@@ -23970,11 +24101,7 @@ impl MeshNode {
         // previous send, and a pending trailing-edge flush is
         // canceled for the same reason. See that method's
         // comment for details (cubic P2 + RT-1 follow-up).
-        {
-            let mut gate = self.announce_gate.lock();
-            gate.last_broadcast_at = None;
-            gate.deferred_scheduled = false;
-        }
+        self.invalidate_broadcast_window();
     }
 
     /// Reflex-diff re-classification trigger
