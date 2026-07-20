@@ -1312,7 +1312,7 @@ fn create_missing_components_owner_only(dir: &Path, sid: &[u32]) -> std::io::Res
 /// types (0 = ACCESS_ALLOWED, 1 = ACCESS_DENIED); for any other ACE type it is a
 /// sentinel so a validator treats it conservatively.
 #[cfg(windows)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AceInfo {
     sid: String,
     mask: u32,
@@ -1331,10 +1331,20 @@ struct AceInfo {
 #[cfg(windows)]
 #[derive(Debug)]
 struct DaclView {
-    /// Owner SID string — inspected by the witnesses (owner-is-trusted); the
-    /// production validator reasons about the DACL, not the owner (a foreign
-    /// owner cannot itself grant access — the DACL governs that).
-    #[allow(dead_code)]
+    /// Owner SID string — a PRODUCTION criterion, checked by
+    /// [`validate_existing_dir_dacl`].
+    ///
+    /// An earlier revision carried this `#[allow(dead_code)]` with the note
+    /// "a foreign owner cannot itself grant access — the DACL governs that."
+    /// That is false on Windows: an object's owner is implicitly granted
+    /// `READ_CONTROL` and `WRITE_DAC` on every access check unless an
+    /// `OWNER RIGHTS` (`S-1-3-4`) ACE is present in the DACL, and nothing
+    /// here requires one. A foreign owner can therefore re-open the boundary
+    /// at will AFTER validation passes — set a DACL that names only the
+    /// victim, let adoption provision `owner-audience.key` into the
+    /// directory, then rewrite the DACL and read the raw owner discovery key.
+    /// Ownership is a write-capable path that never appears as an ACE, so the
+    /// ACE walk below cannot see it (§3).
     owner_sid: String,
     /// `SE_DACL_PROTECTED` — asserted on a FRESHLY created dir by the witnesses;
     /// NOT a production criterion for a pre-existing dir, which may legitimately
@@ -1344,6 +1354,14 @@ struct DaclView {
     null_dacl: bool,
     aces: Vec<AceInfo>,
 }
+
+/// Placeholder SID recorded for an ACE whose type does not carry its SID at
+/// the fixed byte-8 offset the simple ALLOWED/DENIED types use (object and
+/// callback ACEs). It is deliberately not a parseable SID string, so it can
+/// never compare equal to a trusted principal — a write-capable ACE bearing
+/// it therefore fails closed in [`validate_existing_dir_dacl`] (§4).
+#[cfg(windows)]
+const NON_SIMPLE_ACE_SID: &str = "<non-simple-ace>";
 
 /// The access-mask bits that make an ACE write-capable (able to mutate the
 /// object, its contents, or its ACL/owner). Any allowed ACE carrying one of
@@ -1461,12 +1479,15 @@ fn read_object_security(path: &Path) -> std::io::Result<DaclView> {
             // Mask sits at byte 4 for every ACE_HEADER-prefixed ACE.
             let mask = (base.add(4) as *const u32).read_unaligned();
             // The SID begins at byte 8 for the SIMPLE ACE types only; other
-            // (e.g. object) ACEs place it elsewhere, so record a sentinel and
-            // let the validator treat a write-capable one conservatively.
+            // (e.g. object / callback) ACEs place it elsewhere, so record the
+            // sentinel and let the validator treat a write-capable one
+            // conservatively. `validate_existing_dir_dacl` honors that: it
+            // skips only DENY types, so a sentinel-SID grant reaches the
+            // trusted-principal check and — never matching one — refuses.
             let sid = if ace_type == 0 || ace_type == 1 {
                 sid_to_string(base.add(8).cast())?
             } else {
-                String::from("<non-simple-ace>")
+                String::from(NON_SIMPLE_ACE_SID)
             };
             aces.push(AceInfo {
                 sid,
@@ -1695,6 +1716,29 @@ fn validate_existing_dir_dacl(dir: &Path) -> Result<(), OrgAuthorityError> {
         path: dir.display().to_string(),
         reason: format!("read authority directory security descriptor: {e}"),
     })?;
+    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("resolve current user SID: {e}"),
+    })?;
+    validate_dacl_view(&view, &user_sid, dir)
+}
+
+/// The PURE half of [`validate_existing_dir_dacl`]: given an already-read
+/// security descriptor and the current user's SID, decide whether the object
+/// is owner-only.
+///
+/// Split out so the two fail-closed rules below are unit-testable against
+/// synthetic descriptors. The foreign-OWNER rule in particular cannot be
+/// witnessed end-to-end without a second user account and elevation, which no
+/// CI runner (and no developer workstation, by default) provides — so without
+/// this seam it would ship with no test at all, which is how it came to be
+/// `#[allow(dead_code)]` in the first place.
+#[cfg(windows)]
+fn validate_dacl_view(
+    view: &DaclView,
+    user_sid: &str,
+    dir: &Path,
+) -> Result<(), OrgAuthorityError> {
     if view.null_dacl {
         return Err(OrgAuthorityError::InsecureAuthorityDir {
             path: dir.display().to_string(),
@@ -1702,27 +1746,79 @@ fn validate_existing_dir_dacl(dir: &Path) -> Result<(), OrgAuthorityError> {
                 .to_string(),
         });
     }
-    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
-        path: dir.display().to_string(),
-        reason: format!("resolve current user SID: {e}"),
-    })?;
     const LOCAL_SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let trusted = |sid: &str| sid == user_sid || sid == LOCAL_SYSTEM || sid == ADMINISTRATORS;
+
+    // §3 — OWNERSHIP FIRST. The owner holds implicit `WRITE_DAC` (and
+    // `READ_CONTROL`) regardless of what the DACL says, absent an
+    // `OWNER RIGHTS` ACE that nothing here requires. A foreign owner can
+    // therefore rewrite the ACL after this validation returns, so no ACE
+    // walk can substitute for this check. The Unix path already enforces the
+    // equivalent — `authority_dir_policy_violation` refuses `owner_uid != euid`
+    // before looking at mode bits.
+    if !trusted(&view.owner_sid) {
+        return Err(OrgAuthorityError::InsecureAuthorityDir {
+            path: dir.display().to_string(),
+            reason: format!(
+                "authority directory is owned by untrusted principal {} — the owner holds \
+                 implicit WRITE_DAC and can re-grant itself access at any time, so a \
+                 restrictive DACL is not sufficient. Only the current user, SYSTEM, and \
+                 Administrators are trusted owners",
+                view.owner_sid
+            ),
+        });
+    }
+
     for ace in &view.aces {
-        // Only ALLOWED ACEs (type 0) grant access; a DENY cannot broaden it.
-        if ace.ace_type != 0 {
+        // §4 — fail CLOSED on any ACE we could not fully parse.
+        //
+        // Type 0 (`ACCESS_ALLOWED_ACE`) is not the only access-GRANTING type:
+        // `ACCESS_ALLOWED_OBJECT_ACE` (5), `ACCESS_ALLOWED_CALLBACK_ACE` (9),
+        // and `ACCESS_ALLOWED_CALLBACK_OBJECT_ACE` (11) all grant, and their
+        // SID does not sit at the fixed byte-8 offset the simple types use —
+        // so `read_object_security` records the `NON_SIMPLE_ACE_SID` sentinel
+        // for them rather than a real SID.
+        //
+        // An earlier revision skipped every `ace_type != 0`, which silently
+        // dropped exactly those grants: a conditional ACE (SDDL `XA`) granting
+        // Everyone full control under a tautological condition would pass
+        // validation while Windows' own access check honored it. That also
+        // contradicted `read_object_security`'s stated intent, which is to
+        // record the sentinel and "let the validator treat a write-capable one
+        // conservatively".
+        //
+        // So: skip only the DENY types (a deny can never broaden access), and
+        // treat everything else as a grant. An unparsed SID can never match a
+        // trusted principal, so a write-capable one refuses on the check below.
+        const ACCESS_DENIED: u8 = 1;
+        const ACCESS_DENIED_OBJECT: u8 = 6;
+        const ACCESS_DENIED_CALLBACK: u8 = 10;
+        const ACCESS_DENIED_CALLBACK_OBJECT: u8 = 12;
+        if matches!(
+            ace.ace_type,
+            ACCESS_DENIED
+                | ACCESS_DENIED_OBJECT
+                | ACCESS_DENIED_CALLBACK
+                | ACCESS_DENIED_CALLBACK_OBJECT
+        ) {
             continue;
         }
+        // Audit / alarm ACE types (2, 3, 7, 8, 13, 14, 15, 17…) live in the
+        // SACL, not the DACL, so they should not appear here at all. If one
+        // does, it is not something we understand — the write-capability check
+        // below still applies, which is the conservative outcome.
         if ace.mask & WRITE_MASK == 0 {
             continue; // a read-only grant to anyone is tolerated
         }
-        if ace.sid != user_sid && ace.sid != LOCAL_SYSTEM && ace.sid != ADMINISTRATORS {
+        if !trusted(&ace.sid) {
             return Err(OrgAuthorityError::InsecureAuthorityDir {
                 path: dir.display().to_string(),
                 reason: format!(
                     "authority directory grants write access to untrusted principal {} \
-                     (mask {:#010x}) — only the owner, SYSTEM, and Administrators are trusted",
-                    ace.sid, ace.mask
+                     (ace type {}, mask {:#010x}) — only the owner, SYSTEM, and \
+                     Administrators are trusted",
+                    ace.sid, ace.ace_type, ace.mask
                 ),
             });
         }
@@ -2639,6 +2735,299 @@ mod tests {
             matches!(&adopt_err, OrgAuthorityError::InsecureAuthorityDir { .. }),
             "got: {adopt_err}",
         );
+    }
+
+    /// Test-only: apply an SDDL DACL string to `path` through the Win32
+    /// security APIs (`ConvertStringSecurityDescriptorToSecurityDescriptorW`
+    /// + `SetFileSecurityW`).
+    ///
+    /// Needed because the ACE shapes these witnesses must produce — object and
+    /// callback (conditional) ACEs — have no `icacls` syntax, and PowerShell's
+    /// `Set-Acl` lives in a module that is not autoloadable in every
+    /// environment. Going straight to the API also matches the rule the
+    /// production reader follows: binary security APIs, never localizable
+    /// text.
+    #[cfg(windows)]
+    #[allow(clippy::multiple_unsafe_ops_per_block)]
+    fn apply_sddl(path: &Path, sddl: &str) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        type Pv = *mut std::ffi::c_void;
+        extern "system" {
+            fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl: *const u16,
+                revision: u32,
+                sd: *mut Pv,
+                size: *mut u32,
+            ) -> i32;
+            fn SetFileSecurityW(name: *const u16, info: u32, sd: Pv) -> i32;
+            fn LocalFree(mem: Pv) -> Pv;
+        }
+        const SDDL_REVISION_1: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide_path.push(0);
+        let mut wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl).encode_wide().collect();
+        wide_sddl.push(0);
+
+        // SAFETY: both buffers are valid NUL-terminated UTF-16. The convert
+        // call allocates a self-relative descriptor with LocalAlloc, which we
+        // free with LocalFree on every path. `sd` is only dereferenced by
+        // SetFileSecurityW between those two points, and both return values
+        // are checked.
+        unsafe {
+            let mut sd: Pv = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let ok = SetFileSecurityW(
+                wide_path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd,
+            );
+            LocalFree(sd);
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// §3 (Windows): a directory owned by an untrusted principal must fail
+    /// closed even when its DACL names ONLY the current user.
+    ///
+    /// On Windows an object's owner is implicitly granted `READ_CONTROL` and
+    /// `WRITE_DAC` on every access check unless an `OWNER RIGHTS` (`S-1-3-4`)
+    /// ACE is present, and nothing here requires one. So a foreign owner can
+    /// hand us a directory whose ACL looks perfect, wait for `adopt` to
+    /// provision `owner-audience.key` into it, then rewrite the ACL and read
+    /// the raw owner discovery key — which decrypts every `OwnerScoped`
+    /// announcement for the org.
+    ///
+    /// The realistic setup is `C:\ProgramData`, which by default grants
+    /// `BUILTIN\Users` create-folder and `CREATOR OWNER` full control on
+    /// subfolders: any low-privileged user can pre-create the directory and
+    /// is then its owner.
+    ///
+    /// Driven through [`validate_dacl_view`] with a synthetic descriptor,
+    /// because producing a genuinely foreign-owned directory needs a second
+    /// account and elevation that CI does not have. The ACE list here is
+    /// deliberately CLEAN — the only thing wrong is the owner — so a pass
+    /// cannot be attributed to the ACE walk.
+    ///
+    /// Red-witness: deleting the owner check makes this validate.
+    #[cfg(windows)]
+    #[test]
+    fn a_foreign_owned_dir_fails_closed_despite_a_clean_dacl() {
+        const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+        let user = current_process_sid_string().expect("user sid");
+        // A well-known SID that is never the current user, SYSTEM, or
+        // Administrators: "Guests" (S-1-5-32-546).
+        let foreign = "S-1-5-32-546";
+        assert_ne!(user, foreign, "fixture SID must not be the test principal");
+
+        let clean_ace = AceInfo {
+            sid: user.clone(),
+            mask: FILE_ALL_ACCESS,
+            ace_type: 0,
+            flags: 0x03, // OI|CI
+        };
+        let dir = Path::new("C:\\ProgramData\\net-authority");
+
+        // Same DACL, trusted owner -> accepted. Establishes that the ACE list
+        // below is not itself the reason for the refusal.
+        let owned_by_us = DaclView {
+            owner_sid: user.clone(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![clean_ace.clone()],
+        };
+        validate_dacl_view(&owned_by_us, &user, dir)
+            .expect("an owner-only dir owned by the current user validates");
+
+        // Only the owner differs.
+        let owned_by_foreign = DaclView {
+            owner_sid: foreign.to_string(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![clean_ace],
+        };
+        let err = validate_dacl_view(&owned_by_foreign, &user, dir)
+            .expect_err("a foreign-owned authority directory must be refused");
+        match &err {
+            OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
+                reason.contains("owned by untrusted principal") && reason.contains(foreign),
+                "the refusal must name ownership as the cause and identify the owner; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+    }
+
+    /// §4 companion, driven purely: a write-capable ACE bearing the
+    /// [`NON_SIMPLE_ACE_SID`] sentinel refuses regardless of its exact type
+    /// code, and a read-only one is still tolerated. Covers the object /
+    /// callback ACE type codes (5, 9, 11) individually — the live
+    /// conditional-ACE witness can only exercise whichever one PowerShell
+    /// happens to emit.
+    #[cfg(windows)]
+    #[test]
+    fn every_non_simple_grant_type_fails_closed_when_write_capable() {
+        let user = current_process_sid_string().expect("user sid");
+        let dir = Path::new("C:\\ProgramData\\net-authority");
+        let view_with = |ace_type: u8, mask: u32| DaclView {
+            owner_sid: user.clone(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![
+                AceInfo {
+                    sid: user.clone(),
+                    mask: 0x001F_01FF,
+                    ace_type: 0,
+                    flags: 0x03,
+                },
+                AceInfo {
+                    sid: NON_SIMPLE_ACE_SID.to_string(),
+                    mask,
+                    ace_type,
+                    flags: 0x03,
+                },
+            ],
+        };
+
+        // ACCESS_ALLOWED_OBJECT (5), _CALLBACK (9), _CALLBACK_OBJECT (11).
+        for ace_type in [5u8, 9, 11] {
+            let err = validate_dacl_view(&view_with(ace_type, WRITE_MASK), &user, dir)
+                .expect_err("a write-capable unparsed ACE must be refused");
+            assert!(
+                matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+                "ace_type {ace_type}: got {err}",
+            );
+        }
+
+        // Read-only (FILE_READ_DATA) carries no WRITE_MASK bit, so it stays
+        // tolerated — the rule is "write-capable and unidentifiable", not
+        // "unidentifiable".
+        validate_dacl_view(&view_with(9, 0x0000_0001), &user, dir)
+            .expect("a read-only non-simple ACE is tolerated");
+
+        // And the DENY forms are skipped rather than treated as grants.
+        for ace_type in [1u8, 6, 10, 12] {
+            validate_dacl_view(&view_with(ace_type, WRITE_MASK), &user, dir)
+                .unwrap_or_else(|e| panic!("deny ace_type {ace_type} must not refuse: {e}"));
+        }
+    }
+
+    /// §4 (Windows): a write-capable ACE whose type is NOT one of the simple
+    /// ALLOWED/DENIED forms must fail closed.
+    ///
+    /// `read_object_security` cannot locate the SID of an object / callback
+    /// ACE (it does not sit at the fixed byte-8 offset), so it records the
+    /// [`NON_SIMPLE_ACE_SID`] sentinel. The validator previously skipped every
+    /// `ace_type != 0`, which dropped those grants entirely — while Windows'
+    /// own access check honored them.
+    ///
+    /// A conditional ACE (SDDL `XA`, type 9 = `ACCESS_ALLOWED_CALLBACK_ACE`)
+    /// granting Everyone full control under a tautological condition is the
+    /// convenient shape: true for every token, so it is a real world-writable
+    /// grant. The prior witness used `icacls /grant`, which emits a type-0 ACE
+    /// and therefore passed while this variant slipped through.
+    ///
+    /// Red-witness: restoring `if ace.ace_type != 0 { continue; }` makes this
+    /// directory validate, and the `expect_err` fails.
+    #[cfg(windows)]
+    #[test]
+    fn a_non_simple_write_capable_ace_fails_closed() {
+        let scratch = Scratch::new();
+        let dir = scratch.dir().join("conditional-ace");
+        std::fs::create_dir(&dir).expect("mkdir");
+
+        // D:P = protected DACL, no inheritance. XA = callback (conditional)
+        // allow ACE. OICI = object+container inheritable. FA = full access.
+        // WD = Everyone. The condition `Member_of{SID(WD)}` holds for every
+        // token, so this grants Everyone full control in practice.
+        //
+        // Applied through the Win32 SDDL API rather than `icacls` (which has
+        // no conditional-ACE syntax) or PowerShell `Set-Acl` (whose Security
+        // module is not autoloadable in every environment, including some CI
+        // images) — and consistent with this module's rule of using the binary
+        // security APIs over localizable tooling.
+        apply_sddl(&dir, "D:P(XA;OICI;FA;;;WD;(Member_of{SID(WD)}))")
+            .expect("applying the conditional ACE must succeed");
+
+        // Precondition: the ACE really is a non-simple type carrying the
+        // sentinel and a write-capable mask. Without this the test could pass
+        // for the wrong reason (e.g. Set-Acl silently emitting a type-0 ACE).
+        let view = read_object_security(&dir).expect("read sd");
+        let sentinel_write = view
+            .aces
+            .iter()
+            .find(|a| a.sid == NON_SIMPLE_ACE_SID && a.mask & WRITE_MASK != 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a write-capable non-simple ACE; got {:?}",
+                    view.aces
+                )
+            });
+        assert_ne!(
+            sentinel_write.ace_type, 0,
+            "the ACE under test must not be a simple ALLOWED ace",
+        );
+
+        let err = validate_existing_dir_dacl(&dir)
+            .expect_err("a write-capable non-simple ACE must be refused");
+        assert!(
+            matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {err}",
+        );
+
+        // And through the full ceremony, not only the validator.
+        let kp = node_identity();
+        let adopt_err = NodeAuthority::adopt(&dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("adopt into a conditionally-world-writable dir must be refused");
+        assert!(
+            matches!(&adopt_err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {adopt_err}",
+        );
+    }
+
+    /// §4 companion: a DENY ACE — simple or not — must NOT be treated as a
+    /// grant. Skipping only the deny types (rather than everything that is not
+    /// type 0) is what makes the fail-closed rule above safe; without this
+    /// witness the fix could over-refuse an ordinary hardened directory.
+    #[cfg(windows)]
+    #[test]
+    fn a_deny_ace_does_not_make_an_owner_only_dir_invalid() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let dir = scratch.dir().join("with-deny");
+        NodeAuthority::adopt(&dir, cert_for(&kp, 1), kp.entity_id(), 0, None).expect("adopt");
+        validate_existing_dir_dacl(&dir).expect("baseline owner-only dir validates");
+
+        // Add an explicit DENY for Everyone. It cannot broaden access, so the
+        // directory stays valid.
+        let status = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/deny")
+            .arg("*S-1-1-0:(OI)(CI)W")
+            .status()
+            .expect("run icacls /deny");
+        assert!(status.success(), "icacls deny must succeed");
+
+        let view = read_object_security(&dir).expect("read sd");
+        assert!(
+            view.aces.iter().any(|a| a.ace_type == 1),
+            "precondition: a simple DENY ace must be present; got {:?}",
+            view.aces,
+        );
+        validate_existing_dir_dacl(&dir)
+            .expect("a DENY ace must not invalidate an owner-only directory");
     }
 
     /// Gate-1 (Windows, item 9): when protected creation cannot complete (an
