@@ -99,8 +99,15 @@ impl RpcHandler for CountingHandler {
 /// ‖ RpcRequestPayload{service, ..}` — the exact shape a sender
 /// emits, but with `route` and `service` chosen independently so a
 /// test can name a service that differs from the routed channel.
-fn request_frame(route: u64, service: &str, body: &[u8]) -> Bytes {
-    let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0xCAFE, 1, 0);
+///
+/// `origin` MUST be the publishing node's real origin hash: the Gate-3
+/// binding in `bridge_origin_check` drops any frame whose payload
+/// (`EventMeta`) origin differs from its authenticated packet origin,
+/// BEFORE the service-equality gate this test is exercising. A synthetic
+/// value here would make every assertion below pass vacuously — including
+/// the positive controls, which is exactly how this fixture broke.
+fn request_frame(origin: u64, route: u64, service: &str, body: &[u8]) -> Bytes {
+    let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, origin, 1, 0);
     let req = RpcRequestPayload {
         service: service.to_string(),
         deadline_ns: 0,
@@ -205,7 +212,7 @@ async fn admin_route_with_echo_payload_never_runs_admin_handler() {
     deliver(
         &f.a,
         &f.admin_requests,
-        request_frame(admin_route, "echo", b"payload claims echo"),
+        request_frame(f.a.origin_hash(), admin_route, "echo", b"payload claims echo"),
     )
     .await;
     assert_eq!(
@@ -223,7 +230,7 @@ async fn admin_route_with_echo_payload_never_runs_admin_handler() {
     deliver(
         &f.a,
         &f.admin_requests,
-        request_frame(admin_route, "admin", b"payload claims admin"),
+        request_frame(f.a.origin_hash(), admin_route, "admin", b"payload claims admin"),
     )
     .await;
     assert_eq!(
@@ -244,7 +251,7 @@ async fn echo_route_with_admin_payload_never_runs_echo_handler() {
     deliver(
         &f.a,
         &f.echo_requests,
-        request_frame(echo_route, "admin", b"payload claims admin"),
+        request_frame(f.a.origin_hash(), echo_route, "admin", b"payload claims admin"),
     )
     .await;
     assert_eq!(
@@ -261,7 +268,7 @@ async fn echo_route_with_admin_payload_never_runs_echo_handler() {
     deliver(
         &f.a,
         &f.echo_requests,
-        request_frame(echo_route, "echo", b"payload claims echo"),
+        request_frame(f.a.origin_hash(), echo_route, "echo", b"payload claims echo"),
     )
     .await;
     assert_eq!(
