@@ -3046,7 +3046,9 @@ async fn granted_service_provider<H: RpcHandler>(
     svc: &str,
     handler: Arc<H>,
 ) -> (Arc<MeshNode>, ServeHandle, EntityId, std::path::PathBuf) {
-    let p = build_node_with(EntityKeypair::from_bytes([seed; 32])).await;
+    // Fast announce so the granted emission ships promptly over 0x0C04, and
+    // emission enabled so the provider actually projects scoped envelopes.
+    let p = build_node_fast_announce(EntityKeypair::from_bytes([seed; 32])).await;
     let entity = p.entity_id().clone();
     let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
     let cert = OrgMembershipCert::try_issue(&org_b, entity.clone(), 1, 3600).expect("cert");
@@ -3058,10 +3060,38 @@ async fn granted_service_provider<H: RpcHandler>(
     let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
     p.install_node_authority(Arc::new(authority))
         .expect("install authority");
+    p.set_owner_cert_emission(true).expect("enable emission");
     let handle = p
         .serve_rpc_granted(svc, handler, Arc::new(|_| true))
         .expect("granted serve");
     (p, handle, entity, dir)
+}
+
+/// Drive the LIVE direct provider→consumer 0x0C04 scoped send until `consumer`
+/// resolves exactly `provider` for `grant_id`, re-announcing the provider across
+/// the wait so a coalesced send still converges. This is the real discovery path
+/// — provider emission → 0x0C04 → consumer verify/open/store — not a hand-built
+/// injected envelope.
+async fn converge_granted_resolution(
+    provider: &Arc<MeshNode>,
+    consumer: &Arc<MeshNode>,
+    grant_id: &[u8; 32],
+    provider_entity: &EntityId,
+    now: u64,
+) -> bool {
+    for _ in 0..100 {
+        provider
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .ok();
+        if consumer.scoped_granted_providers_for_test(grant_id, now)
+            == vec![provider_entity.clone()]
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// OA-4 slice 4 — the centerpiece: a consumer holding a DISCOVER|INVOKE grant
@@ -3100,16 +3130,17 @@ async fn live_granted_audience_discovers_then_invokes() {
     let secret = secret.expect("a DISCOVER grant mints an audience secret");
     let grant_id = grant.grant_id;
 
-    // Private discovery: A ingests the encrypted announcement and resolves P₂.
+    // Live private discovery over 0x0C04: the consumer installs FIRST (so P₂'s
+    // first emitted envelope is immediately decryptable), then the provider
+    // installs the SAME grant; A receives, opens, and resolves P₂ through the
+    // real scoped-receive path — no hand-built envelope.
     a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install consumer grant");
-    let p_kp = EntityKeypair::from_bytes([0x61u8; 32]);
-    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
-    a.ingest_scoped_announcement_for_test(&env);
-    assert_eq!(
-        a.scoped_granted_providers_for_test(&grant_id, now),
-        vec![p_entity.clone()],
-        "A privately resolves exactly P₂ under the DISCOVER right",
+    p2.install_provider_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install provider grant");
+    assert!(
+        converge_granted_resolution(&p2, &a, &grant_id, &p_entity, now).await,
+        "A privately resolves exactly P₂ over the live 0x0C04 scoped send",
     );
 
     // Invocation: A invokes the exact P₂ under the same grant's INVOKE right.
@@ -3170,13 +3201,11 @@ async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
     let grant_id = grant.grant_id;
     a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install consumer grant");
-    let p_kp = EntityKeypair::from_bytes([0x63u8; 32]);
-    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
-    a.ingest_scoped_announcement_for_test(&env);
-    assert_eq!(
-        a.scoped_granted_providers_for_test(&grant_id, now),
-        vec![p_entity.clone()],
-        "A resolves P₂ under the DISCOVER right",
+    p2.install_provider_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install provider grant");
+    assert!(
+        converge_granted_resolution(&p2, &a, &grant_id, &p_entity, now).await,
+        "A resolves P₂ under the DISCOVER right over the live 0x0C04 scoped send",
     );
 
     // The very same grant cannot invoke: it holds no INVOKE right.
@@ -3252,13 +3281,11 @@ async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied()
     let grant_id = grant.grant_id;
     a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install consumer grant");
-    let p_kp = EntityKeypair::from_bytes([0x65u8; 32]);
-    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
-    a.ingest_scoped_announcement_for_test(&env);
-    assert_eq!(
-        a.scoped_granted_providers_for_test(&grant_id, now),
-        vec![p_entity.clone()],
-        "A resolves P₂",
+    p2.install_provider_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install provider grant");
+    assert!(
+        converge_granted_resolution(&p2, &a, &grant_id, &p_entity, now).await,
+        "A resolves P₂ over the live 0x0C04 scoped send",
     );
 
     // Invoke with a dispatcher grant scoped to a DIFFERENT capability.
@@ -3316,7 +3343,7 @@ async fn live_granted_audience_provider_policy_final() {
     let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
 
     // Provider serves the granted service with a VETO policy.
-    let p2 = build_node_with(EntityKeypair::from_bytes([0x67u8; 32])).await;
+    let p2 = build_node_fast_announce(EntityKeypair::from_bytes([0x67u8; 32])).await;
     let p_entity = p2.entity_id().clone();
     let node_cert =
         OrgMembershipCert::try_issue(&org_b, p_entity.clone(), 1, 3600).expect("node cert");
@@ -3326,6 +3353,7 @@ async fn live_granted_audience_provider_policy_final() {
         NodeAuthority::adopt(&p_dir, node_cert, &p_entity, 0, None).expect("adopt authority");
     p2.install_node_authority(Arc::new(authority))
         .expect("install authority");
+    p2.set_owner_cert_emission(true).expect("enable emission");
     let calls = Arc::new(AtomicUsize::new(0));
     let _serve = p2
         .serve_rpc_granted(
@@ -3353,13 +3381,11 @@ async fn live_granted_audience_provider_policy_final() {
     let grant_id = grant.grant_id;
     a.install_consumer_grant_audience(grant.clone(), copy_secret(&secret))
         .expect("install consumer grant");
-    let p_kp = EntityKeypair::from_bytes([0x67u8; 32]);
-    let env = granted_envelope_bytes(&p_kp, &org_b, &grant, &secret, "svc", now);
-    a.ingest_scoped_announcement_for_test(&env);
-    assert_eq!(
-        a.scoped_granted_providers_for_test(&grant_id, now),
-        vec![p_entity.clone()],
-        "A resolves P₂",
+    p2.install_provider_grant_audience(grant.clone(), copy_secret(&secret))
+        .expect("install provider grant");
+    assert!(
+        converge_granted_resolution(&p2, &a, &grant_id, &p_entity, now).await,
+        "A resolves P₂ over the live 0x0C04 scoped send",
     );
 
     let intent = cross_org_intent_with_grant(
