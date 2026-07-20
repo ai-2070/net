@@ -34,6 +34,7 @@ use net::adapter::net::cortex::{
     RequestStream, RpcClientStreamingHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
     RpcStreamingContext,
 };
+use net::adapter::net::behavior::CapabilitySet;
 use net::adapter::net::mesh_rpc::{CallOptions, CodecDirection, RpcError};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -76,6 +77,42 @@ async fn handshake_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
         .expect("accept failed");
     a.start();
     b.start();
+
+    // Exchange SIGNED capability announcements so each side TOFU-pins the
+    // other's entity id (`peer_entity_id`). A Noise session authenticates the
+    // transport, but the origin_hash <-> node_id binding is only learned from a
+    // signed announcement — and the Gate-3 upload-grant classifier
+    // (`classify_request_grant_route`) reads exactly that pin: an unpinned
+    // caller classifies as `RelayedOrUntrusted`, so a flow-controlled REQUEST is
+    // dropped before the fold and the caller just hangs until its deadline.
+    // Production peers always announce; this harness did not, which made every
+    // `request_window_initial` call unservable.
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("a announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("b announce");
+    assert!(
+        wait_until(
+            || a.peer_entity_id(b_id).is_some() && b.peer_entity_id(a_id).is_some(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "both peers must TOFU-pin each other before a flow-controlled call",
+    );
+}
+
+/// Poll `cond` until true or `timeout` elapses.
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 // ============================================================================
