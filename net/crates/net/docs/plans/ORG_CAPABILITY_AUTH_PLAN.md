@@ -637,13 +637,18 @@ valid org proof for C → ACCEPTED through the OrgAdmission path
 invalid org proof for C → denied; handler stays dark
 missing local C tag + otherwise-valid proof → denied unregistered
 public capability D → still governed by unchanged may_execute
-private service C absent from plaintext broadcast bytes
 
 RED: disable ONLY verify_org_admission at its call site
     (registration-local #[cfg(test)] mode) → unauthorized C
     invocation SUCCEEDS — proving OrgAdmission is load-bearing,
     independent of any legacy-gate verdict.
 ```
+
+C uses `serve_rpc_protected`, which intentionally has PUBLIC
+discovery — visibility is NOT part of the RED invariant (it is about
+invocation authority alone). Plaintext-private capability exclusion
+is witnessed separately by `serve_rpc_granted` / closed OA3 / OA-4
+Block 3, not here; the RED adds no granted/private variant.
 
 ### Evidence tiers (Kyra ruling, 2026-07-20)
 
@@ -655,8 +660,8 @@ network test. Each witness-map row declares its tier.
   restart publication, or handler execution is materially part of
   the invariant: cross-org accept + exact four-party handler
   attribution; ≥1 cryptographically-valid-but-unauthorized
-  cross-org denial; replay denial through the live provider path;
-  `AnyNodeOwnedBy(B)` reuse-accept (second B node) + non-B deny;
+  cross-org denial; `AnyNodeOwnedBy(B)` reuse-accept (second B node)
+  + non-B deny;
   owner membership-only denial; public-caps-unchanged after
   protected registration; the restart/floor chain through the live
   gate; DISCOVER|INVOKE resolves-and-invokes exact P₂; DISCOVER-only
@@ -704,9 +709,12 @@ The RED is a **lib** test (Rust integration tests compile the
 library without `cfg(test)`, so the seam must not be reachable from
 there), using `deliver_rpc_inbound_for_test` + a real protected
 dispatcher + the real provider fold/handler: register C enforced;
-establish C present locally and absent from plaintext; make
-`may_execute(C, S)` false through unrelated-D aggregation; a valid
-proof for C succeeds; an invalid/missing proof is denied and the
+establish C present locally (visibility is NOT part of the RED
+invariant — C uses `serve_rpc_protected`, which has public
+discovery); make `may_execute(C, S)` false through a SEPARATE
+unrelated D fold entry's target-wide aggregation (C's own entry
+stays unrestricted); a valid proof for C succeeds; an invalid/
+missing proof is denied and the
 handler stays dark; re-register an equivalent C with
 `DisabledForRedWitness`; the same unauthorized request now runs the
 handler (the RED handler need not receive an `Admitted` — the point

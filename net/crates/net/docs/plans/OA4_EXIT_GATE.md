@@ -16,6 +16,10 @@ Each requirement below is mapped to its witnesses, tagged by evidence tier:
   adversarial states the honest caller API cannot produce.
 - **T3 — pure authority / engine / crypto unit** (referenced, not repeated): pins
   the exact typed reason, boundary arithmetic, or predicate.
+- **Prior OA3** — a witness closed in an earlier OA phase (OA3-4b2 / OA3),
+  referenced not repeated: a component, live, ingest, registry, or relay witness
+  in the already-signed-off suite. NOT a pure unit (that is T3), and NOT part of
+  this phase's live matrix.
 
 Live/bridge tests prove handler darkness and coarse wire denial; T3 pins the
 exact reason.
@@ -50,7 +54,8 @@ exact reason.
 | Expired proof DENIED (`ProofExpired`) | **T2** matrix (row 6) · **T3** `org_admission::expired_proof_is_refused` |
 | Unexpected capability grant DENIED (`UnexpectedCapabilityGrant`) | **T2** matrix (row 7) |
 | Grantee mismatch DENIED (`GranteeMismatch`, acting ≠ owner) | **T2** matrix (row 8) |
-| Missing / multiple headers DENIED | **T2** matrix (rows 9–10) |
+| Missing header DENIED | **T2** matrix (row 9) |
+| Multiple headers DENIED | **T2** matrix (row 10) |
 | Replay refused (real replay guard) | **T2** matrix (replay control) · **T3** `org_admission::replay_then_collision_are_distinguished` |
 | Floored-after-reload DENIED at the live gate (`MembershipRevoked`) | **T1** `live_two_node_owner_delegated_floor_survives_restart_denies` · **T3** `org_admission::revocation_floor_kills_the_membership` |
 | Public capabilities unchanged | **T1** `live_two_node_public_capability_unchanged_beside_protected`, `live_two_node_public_handler_never_sees_proof_header` |
@@ -79,10 +84,17 @@ exact reason.
 | 7 | Wrong body/digest (`BindingInvalid`) | **T2** matrix (row 7) · **T3** `binding_rejects_a_transplanted_call` |
 | 8 | Expired proof (`ProofExpired`) | **T2** matrix (row 8) · **T3** `expired_proof_is_refused` |
 | 9 | Copied proof (`MemberBindingMismatch`) | **T2** matrix (row 9) · **T3** `tofu_member_binding_rejects_a_relayed_proof` |
-| 10 | Missing / multiple headers | **T2** matrix (rows 10–11) |
-| 11 | Missing local tag / unregistered | **T1** `live_two_node_protected_missing_local_capability_denies` — OA-4 addition |
-| — | Replay refused (real replay guard) | **T2** matrix (replay control) · **T3** `replay_then_collision_are_distinguished` |
-| — | Floored membership (`MembershipRevoked`) | **T3** `revocation_floor_kills_the_membership` — the membership-floor check runs AFTER mode validation and is shared by both modes; its live floor-persistence composition is the Block-1 restart witness. **Not** claimed live-witnessed for cross-org. |
+| 10 | Missing header | **T2** matrix (row 10) |
+| 11 | Multiple headers | **T2** matrix (row 11) |
+
+Separate from the eleven-row bridge matrix (per the tier ruling — these are NOT
+among the eleven adversarial rows):
+
+| Requirement | Tier → witness |
+|---|---|
+| Missing local tag / unregistered (OA-4 addition) | **T1** `live_two_node_protected_missing_local_capability_denies` |
+| Replay refused (real replay guard) | **T2** `cross_org_admission_denial_matrix` (replay control: an admitted V1 re-sent identically → refused) · **T3** `replay_then_collision_are_distinguished` |
+| Floored membership (`MembershipRevoked`) | **T3** `revocation_floor_kills_the_membership` — the membership-floor check runs AFTER mode validation and is shared by both modes; its live floor-persistence composition is the Block-1 restart witness. **Not** claimed live-witnessed for cross-org. |
 
 | `AnyNodeOwnedBy(B)` requirement | Tier → witness |
 |---|---|
@@ -108,15 +120,15 @@ referenced to the closed OA3-4b2 / OA3 witnesses.
 | DISCOVER-only resolves but cannot invoke (decrypt-without-invoke) | **T1** `live_granted_audience_discover_only_resolves_but_cannot_invoke` (`InsufficientRights`) |
 | Wrong dispatcher — resolves but invocation denied | **T1** `live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied` (`DispatcherGrantScope`, post-discovery) |
 | Provider policy final | **T1** `live_granted_audience_provider_policy_final` · `live_two_node_policy_veto_denies` |
-| INVOKE-only holds no audience material | **T1** `invoke_only_grant_carries_no_discovery_material` (composition: no secret, no discovery right) · **T3** `org_grant_registry::invoke_only_grant_is_refused`, `org_grant::capability_grant_invoke_only_roundtrip` |
-| Private service absent from plaintext CAP-ANN | **T3** `a_granted_service_ships_only_inside_an_encrypted_grant_envelope`, `serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant` |
-| No grant ⇒ no enumeration | **T3** `an_inbound_granted_announcement_is_verified_and_stored` |
-| Copied credential by wrong grantee | **T3** `granted_ingest_rejects_wrong_grantee` |
-| Wrong handle / capability | **T3** `granted_ingest_binds_descriptor_to_the_grant_capability`, `owner_ingest_rejects_wrong_owner_and_wrong_handle` |
-| Stale registration | **T3** `removing_a_provider_grant_refuses_the_cached_granted_envelope` |
-| Observer recovers nothing | **T3** `a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee` |
-| AD-transplant fails | **T3** `org_scoped_ann::open_with_transplanted_aad_fails` |
-| Post-rotation decryption failure | **T3** `a_same_org_audience_rotation_refuses_the_stale_scoped_envelope`, `org_scoped_ingest::an_expired_grants_key_cannot_decrypt_a_freshly_issued_successors_envelope` |
+| INVOKE-only holds no audience material | **T3 / composed structural** `invoke_only_grant_carries_no_discovery_material` (a `#[test]` asserting only issuance shape: `secret == None`, `!permits_discover`, `permits_invoke`), `org_grant_registry::invoke_only_grant_is_refused`, `org_grant::capability_grant_invoke_only_roundtrip`. Its location in the integration file does not make it live transport. |
+| Private service absent from plaintext CAP-ANN | **Prior OA3 component** `a_granted_service_ships_only_inside_an_encrypted_grant_envelope`, `serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant` |
+| No grant ⇒ no enumeration | **Prior OA3 ingest/component** `an_inbound_granted_announcement_is_verified_and_stored` |
+| Copied credential by wrong grantee | **T3 pure unit** `granted_ingest_rejects_wrong_grantee` |
+| Wrong handle / capability | **T3 pure unit** `granted_ingest_binds_descriptor_to_the_grant_capability`, `owner_ingest_rejects_wrong_owner_and_wrong_handle` |
+| Stale registration | **Prior OA3 registry/component** `removing_a_provider_grant_refuses_the_cached_granted_envelope` |
+| Observer recovers nothing | **Prior OA3 live relay** `a_granted_capability_floods_opaquely_through_a_relay_to_the_grantee` |
+| AD-transplant fails | **T3 pure unit** `org_scoped_ann::open_with_transplanted_aad_fails` |
+| Post-rotation decryption failure | **Prior OA3 component** `a_same_org_audience_rotation_refuses_the_stale_scoped_envelope` · **T3 AEAD/ingest** `org_scoped_ingest::an_expired_grants_key_cannot_decrypt_a_freshly_issued_successors_envelope` |
 
 ---
 
