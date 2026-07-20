@@ -211,11 +211,107 @@ fn random_scoped_ann_nonce() -> [u8; SCOPED_ANN_NONCE_SIZE] {
     nonce
 }
 
+/// Bucket size the descriptor plaintext is padded up to INSIDE the AEAD (§6).
+///
+/// Without padding, `ciphertext_len == plaintext_len + 16`, and `ciphertext_len`
+/// rides the wire in CLEARTEXT at a fixed offset — readable by every relay,
+/// none of which need be in the audience. That was tolerable when the plaintext
+/// was an arbitrary descriptor blob ("size — nothing matchable", plan §3.2),
+/// but OA3-4b2 canonicalized the GRANTED plaintext to exactly one `nrpc:<svc>`
+/// tag, which collapses the plaintext space to a bijection with the tag string.
+/// A relay could then invert `ciphertext_len` to `len(service_name)` EXACTLY,
+/// for a provider and owner org that are themselves cleartext — a strong filter
+/// against any candidate name list. For the owner envelope (one envelope
+/// carrying every owner-scoped tag) the same channel reveals how many private
+/// services exist and the exact length of each newly registered one, live,
+/// across successive generations.
+///
+/// Padding to a bucket reduces that to a coarse bucket index. 256 bytes is
+/// chosen so a realistic single-service granted descriptor and a small owner
+/// descriptor land in the SAME first bucket, and the cost is free against the
+/// packet budget: `MAX_SCOPED_ANN_CIPHERTEXT_BYTES` is const-asserted well
+/// above it.
+pub const SCOPED_ANN_PAD_BUCKET_BYTES: usize = 256;
+
+/// Bytes the length prefix occupies inside the padded plaintext.
+const SCOPED_ANN_PAD_LEN_PREFIX: usize = 2;
+
+const _: () = assert!(
+    SCOPED_ANN_PAD_BUCKET_BYTES <= MAX_SCOPED_ANN_CIPHERTEXT_BYTES,
+    "one pad bucket must fit inside the plaintext budget"
+);
+
+/// Wrap `plaintext` as `[u16 LE len][plaintext][zero padding]`, padded up to the
+/// next whole multiple of [`SCOPED_ANN_PAD_BUCKET_BYTES`].
+///
+/// The length prefix is INSIDE the AEAD, so it is neither readable nor
+/// malleable by a relay — unlike the envelope's cleartext `ciphertext_len`,
+/// which after this reveals only the bucket count.
+fn pad_descriptor(plaintext: &[u8]) -> Result<Vec<u8>, ScopedAnnouncementError> {
+    let framed = SCOPED_ANN_PAD_LEN_PREFIX + plaintext.len();
+    // Round UP to a whole number of buckets (a plaintext that exactly fills a
+    // bucket still gets a full one, so `framed` never aliases the boundary).
+    let buckets = framed.div_ceil(SCOPED_ANN_PAD_BUCKET_BYTES);
+    let padded_len = buckets * SCOPED_ANN_PAD_BUCKET_BYTES;
+    if padded_len > MAX_SCOPED_ANN_CIPHERTEXT_BYTES {
+        return Err(ScopedAnnouncementError::DescriptorTooLarge {
+            encoded: padded_len,
+            maximum: MAX_SCOPED_ANN_CIPHERTEXT_BYTES,
+        });
+    }
+    // A descriptor that does not fit the u16 prefix cannot be represented; the
+    // bound above is far below u16::MAX, so this is unreachable in practice.
+    let len_u16 = u16::try_from(plaintext.len()).map_err(|_| {
+        ScopedAnnouncementError::DescriptorTooLarge {
+            encoded: plaintext.len(),
+            maximum: usize::from(u16::MAX),
+        }
+    })?;
+    let mut padded = vec![0u8; padded_len];
+    padded[..SCOPED_ANN_PAD_LEN_PREFIX].copy_from_slice(&len_u16.to_le_bytes());
+    padded[SCOPED_ANN_PAD_LEN_PREFIX..framed].copy_from_slice(plaintext);
+    Ok(padded)
+}
+
+/// Inverse of [`pad_descriptor`]. Runs only on AEAD-authenticated bytes, so the
+/// checks here are structural rather than adversarial — but they stay STRICT
+/// (exact bucket multiple, in-range length, all-zero tail) so a padding-shaped
+/// covert channel cannot be smuggled past a holder of the discovery key.
+fn unpad_descriptor(padded: &[u8]) -> Result<Vec<u8>, ScopedAnnouncementError> {
+    if padded.len() < SCOPED_ANN_PAD_BUCKET_BYTES || padded.len() % SCOPED_ANN_PAD_BUCKET_BYTES != 0
+    {
+        return Err(ScopedAnnouncementError::InvalidFormat);
+    }
+    let mut len_bytes = [0u8; SCOPED_ANN_PAD_LEN_PREFIX];
+    len_bytes.copy_from_slice(&padded[..SCOPED_ANN_PAD_LEN_PREFIX]);
+    let len = usize::from(u16::from_le_bytes(len_bytes));
+    let end = SCOPED_ANN_PAD_LEN_PREFIX
+        .checked_add(len)
+        .ok_or(ScopedAnnouncementError::InvalidFormat)?;
+    if end > padded.len() {
+        return Err(ScopedAnnouncementError::InvalidFormat);
+    }
+    // The declared length must be consistent with the bucket count it was
+    // sealed under — otherwise a sender could inflate the envelope while
+    // claiming a short descriptor, reintroducing a (coarser) length channel.
+    if end.div_ceil(SCOPED_ANN_PAD_BUCKET_BYTES) * SCOPED_ANN_PAD_BUCKET_BYTES != padded.len() {
+        return Err(ScopedAnnouncementError::InvalidFormat);
+    }
+    if padded[end..].iter().any(|b| *b != 0) {
+        return Err(ScopedAnnouncementError::InvalidFormat);
+    }
+    Ok(padded[SCOPED_ANN_PAD_LEN_PREFIX..end].to_vec())
+}
+
 /// Seal a descriptor `plaintext` under the audience `discovery_key` with a fresh
 /// random nonce and the given associated data. Returns `(nonce, ciphertext)`
-/// where `ciphertext` includes the 16-byte AEAD tag. Rejects a plaintext larger
-/// than [`MAX_SCOPED_ANN_CIPHERTEXT_BYTES`] with
-/// [`ScopedAnnouncementError::DescriptorTooLarge`].
+/// where `ciphertext` includes the 16-byte AEAD tag.
+///
+/// The plaintext is length-prefixed and PADDED to a whole multiple of
+/// [`SCOPED_ANN_PAD_BUCKET_BYTES`] before sealing (§6), so the envelope's
+/// cleartext `ciphertext_len` discloses only a bucket count. Rejects a
+/// descriptor whose PADDED form exceeds [`MAX_SCOPED_ANN_CIPHERTEXT_BYTES`]
+/// with [`ScopedAnnouncementError::DescriptorTooLarge`].
 pub fn seal_descriptor(
     discovery_key: &[u8; 32],
     aad: &[u8],
@@ -236,17 +332,14 @@ pub fn seal_descriptor_with_nonce(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ScopedAnnouncementError> {
-    if plaintext.len() > MAX_SCOPED_ANN_CIPHERTEXT_BYTES {
-        return Err(ScopedAnnouncementError::DescriptorTooLarge {
-            encoded: plaintext.len(),
-            maximum: MAX_SCOPED_ANN_CIPHERTEXT_BYTES,
-        });
-    }
+    // Pad FIRST — the bound applies to what actually goes under the AEAD, and
+    // therefore to what `ciphertext_len` will report on the wire.
+    let padded = pad_descriptor(plaintext)?;
     let aead = XChaCha20Poly1305::new(discovery_key.into());
     aead.encrypt(
         nonce.into(),
         Payload {
-            msg: plaintext,
+            msg: padded.as_slice(),
             aad,
         },
     )
@@ -278,14 +371,16 @@ pub fn open_descriptor(
         });
     }
     let aead = XChaCha20Poly1305::new(discovery_key.into());
-    aead.decrypt(
-        nonce.into(),
-        Payload {
-            msg: ciphertext,
-            aad,
-        },
-    )
-    .map_err(|_| ScopedAnnouncementError::SealOpenFailed)
+    let padded = aead
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| ScopedAnnouncementError::SealOpenFailed)?;
+    unpad_descriptor(&padded)
 }
 
 /// Wire-format version byte at the head of a serialized
@@ -871,7 +966,11 @@ mod tests {
         let aad = scoped_ann_associated_data(&provider(), &owner_org(), &HANDLE, &GRANT, 5, 9);
         let plaintext = b"capability-descriptor-fragment";
         let ciphertext = seal_descriptor_with_nonce(&KEY, &NONCE, &aad, plaintext).expect("seal");
-        assert_eq!(ciphertext.len(), plaintext.len() + SCOPED_ANN_AEAD_TAG_SIZE);
+        // §6: the ciphertext tracks the PADDED bucket, not the descriptor.
+        assert_eq!(
+            ciphertext.len(),
+            SCOPED_ANN_PAD_BUCKET_BYTES + SCOPED_ANN_AEAD_TAG_SIZE
+        );
         assert_ne!(
             &ciphertext[..plaintext.len()],
             &plaintext[..],
@@ -879,6 +978,115 @@ mod tests {
         );
         let opened = open_descriptor(&KEY, &NONCE, &aad, &ciphertext).expect("open");
         assert_eq!(opened, plaintext);
+    }
+
+    /// §6 — the wire's cleartext `ciphertext_len` must not disclose the
+    /// descriptor's length.
+    ///
+    /// Before padding, `ciphertext_len == plaintext_len + 16`. Because
+    /// OA3-4b2 canonicalized the granted plaintext to exactly one
+    /// `nrpc:<svc>` tag, that made the field a bijection with the service
+    /// name's length — invertible by any relay, none of which need be in the
+    /// audience, against a provider and owner org that are themselves
+    /// cleartext.
+    ///
+    /// Red-witness: dropping `pad_descriptor` from `seal_descriptor_with_nonce`
+    /// makes the first assertion fail immediately.
+    #[test]
+    fn ciphertext_length_does_not_leak_the_descriptor_length() {
+        let aad = scoped_ann_associated_data(&provider(), &owner_org(), &HANDLE, &GRANT, 5, 9);
+
+        // Descriptors of very different lengths — the shape a service-name
+        // dictionary attack would try to distinguish.
+        let lens: Vec<usize> = (0..SCOPED_ANN_PAD_BUCKET_BYTES - SCOPED_ANN_PAD_LEN_PREFIX)
+            .step_by(17)
+            .collect();
+        let sizes: std::collections::BTreeSet<usize> = lens
+            .iter()
+            .map(|n| {
+                let pt = vec![b'x'; *n];
+                seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &pt)
+                    .expect("seal")
+                    .len()
+            })
+            .collect();
+        assert_eq!(
+            sizes.len(),
+            1,
+            "every descriptor in one bucket must produce ONE ciphertext size; got {sizes:?}",
+        );
+
+        // Round-trip fidelity is preserved across the whole range, including
+        // the empty descriptor and the exact bucket boundary.
+        for n in lens
+            .iter()
+            .copied()
+            .chain([0, SCOPED_ANN_PAD_BUCKET_BYTES - SCOPED_ANN_PAD_LEN_PREFIX])
+        {
+            let pt = vec![b'x'; n];
+            let ct = seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &pt).expect("seal");
+            assert_eq!(
+                open_descriptor(&KEY, &NONCE, &aad, &ct).expect("open"),
+                pt,
+                "round trip at descriptor length {n}",
+            );
+        }
+
+        // Crossing the bucket boundary costs exactly one more bucket — the
+        // residual channel is a bucket COUNT, which is the intended tradeoff
+        // and is asserted here so a future bucket-size change is deliberate.
+        let just_over = vec![b'x'; SCOPED_ANN_PAD_BUCKET_BYTES - SCOPED_ANN_PAD_LEN_PREFIX + 1];
+        let ct = seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &just_over).expect("seal");
+        assert_eq!(
+            ct.len(),
+            2 * SCOPED_ANN_PAD_BUCKET_BYTES + SCOPED_ANN_AEAD_TAG_SIZE
+        );
+        assert_eq!(
+            open_descriptor(&KEY, &NONCE, &aad, &ct).expect("open"),
+            just_over
+        );
+    }
+
+    /// §6 — the padding is structurally strict, so a holder of the discovery
+    /// key cannot smuggle data in the tail. The AEAD already authenticates
+    /// these bytes, so this is defense against a MALICIOUS SENDER inside the
+    /// audience, not against a relay.
+    #[test]
+    fn unpad_rejects_malformed_padding() {
+        // Not a whole bucket.
+        assert_eq!(
+            unpad_descriptor(&[0u8; 3]),
+            Err(ScopedAnnouncementError::InvalidFormat)
+        );
+        // Declared length runs past the buffer.
+        let mut over = vec![0u8; SCOPED_ANN_PAD_BUCKET_BYTES];
+        over[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            unpad_descriptor(&over),
+            Err(ScopedAnnouncementError::InvalidFormat)
+        );
+        // Non-zero byte in the padding tail (the covert channel).
+        let mut dirty = pad_descriptor(b"abc").expect("pad");
+        let last = dirty.len() - 1;
+        dirty[last] = 0xAA;
+        assert_eq!(
+            unpad_descriptor(&dirty),
+            Err(ScopedAnnouncementError::InvalidFormat)
+        );
+        // An over-inflated envelope claiming a short descriptor — would
+        // reintroduce a coarse length channel under sender control.
+        let mut inflated = vec![0u8; 2 * SCOPED_ANN_PAD_BUCKET_BYTES];
+        inflated[..2].copy_from_slice(&3u16.to_le_bytes());
+        inflated[2..5].copy_from_slice(b"abc");
+        assert_eq!(
+            unpad_descriptor(&inflated),
+            Err(ScopedAnnouncementError::InvalidFormat)
+        );
+        // The well-formed case still round-trips.
+        assert_eq!(
+            unpad_descriptor(&pad_descriptor(b"abc").unwrap()).unwrap(),
+            b"abc"
+        );
     }
 
     #[test]
@@ -916,17 +1124,31 @@ mod tests {
     #[test]
     fn seal_rejects_oversized_descriptor() {
         let aad = scoped_ann_associated_data(&provider(), &owner_org(), &HANDLE, &GRANT, 5, 9);
-        let oversized = vec![0u8; MAX_SCOPED_ANN_CIPHERTEXT_BYTES + 1];
+
+        // §6: the cap applies to the PADDED plaintext — that is what goes
+        // under the AEAD and therefore what the packet budget must hold. The
+        // largest admissible descriptor is the biggest one whose framed form
+        // still rounds down to a whole number of buckets inside the cap.
+        let max_buckets = MAX_SCOPED_ANN_CIPHERTEXT_BYTES / SCOPED_ANN_PAD_BUCKET_BYTES;
+        let largest_padded = max_buckets * SCOPED_ANN_PAD_BUCKET_BYTES;
+        let at_cap = vec![0u8; largest_padded - SCOPED_ANN_PAD_LEN_PREFIX];
+        let sealed = seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &at_cap).expect("at cap seals");
+        assert_eq!(sealed.len(), largest_padded + SCOPED_ANN_AEAD_TAG_SIZE);
+        assert_eq!(
+            open_descriptor(&KEY, &NONCE, &aad, &sealed).expect("open"),
+            at_cap
+        );
+
+        // One byte more spills into a bucket the budget cannot hold, and the
+        // error reports the PADDED size that did not fit.
+        let oversized = vec![0u8; largest_padded - SCOPED_ANN_PAD_LEN_PREFIX + 1];
         assert_eq!(
             seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &oversized),
             Err(ScopedAnnouncementError::DescriptorTooLarge {
-                encoded: MAX_SCOPED_ANN_CIPHERTEXT_BYTES + 1,
+                encoded: largest_padded + SCOPED_ANN_PAD_BUCKET_BYTES,
                 maximum: MAX_SCOPED_ANN_CIPHERTEXT_BYTES,
             })
         );
-        // Exactly at the cap seals fine.
-        let at_cap = vec![0u8; MAX_SCOPED_ANN_CIPHERTEXT_BYTES];
-        assert!(seal_descriptor_with_nonce(&KEY, &NONCE, &aad, &at_cap).is_ok());
     }
 
     #[test]
@@ -1198,7 +1420,7 @@ mod tests {
     // change to the wire layout, a field width, the signing domain, or the AEAD
     // construction moves these bytes — the whole encoded envelope, including the
     // deterministic ed25519 outer signature, is locked here.
-    const GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c04010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020700000000000000d2040000000000000303030303030303030303030303030303030303030303032100a7eee1241f24f2fa061e532b393aaf8aa5b73a76eef9afcd640df692b04e159d8740e97ea293f952f8fae84542d911648555f96846ad269115031cd46c1537ee36f78ca97f55f4d1e855708ace5e9453a9570228523ec61fa12cc50fdb8db3b409";
+    const GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c04010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020700000000000000d2040000000000000303030303030303030303030303030303030303030303031001d181ea2f162ebaf04e09552a3338b295a3dbf3682fc27cab38ac9c6bb0ab3daadca9a7638e3bac69a4280471ced18c8521b0e230e3ff23cc5de6976b2fa88b37d60f9e5270b432011c0f6ed96670e44e67045d19d28a294f1bbb54e2ba8e9be78d38c6b035781fafa020a5a3869e5f7b042506a46cea75239a1008568d1b1021fa6caee3e2d001afda54fe72f92ecdbbad4492d181dfc19215a295d356868f7949970a2c4f07f6b51db06bc74c7b8571e75fdace096d8551f0553a517eff2aee2285fea4f52ec265fdb02a1d95e385e3bd330549619b5fc39ecbca0ded33fd34d9acc10b2775646519783af64c0e98c2732bd89f747473c6abd74f1c88e55ad49d43b0fb207102a607ec7f4f33510e4bb35c53935fef08d76a36d0f4cfb43fe4f03e51c2f175cde7bf5fedd2b56bf573614fcc22a55504577efd2ad78ce2ba8a0a584f5835477c70cea1534298f1790e";
 
     /// OA3-6 exit gate (§3.5 "golden vectors incl. the zero-sentinel owner AD"):
     /// a frozen OWNER-audience envelope. `grant_id` is the all-zero sentinel,
@@ -1245,5 +1467,5 @@ mod tests {
 
     /// Frozen by the deterministic owner build above — the OWNER counterpart to
     /// [`GOLDEN_ENVELOPE_HEX`], pinning the zero-sentinel AD encoding end to end.
-    const OWNER_GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c0401010101010101010101010101010101010101010101010101010101010101010000000000000000000000000000000000000000000000000000000000000000010000000000000063000000000000000303030303030303030303030303030303030303030303032700eb71257e070ca19f1b7426956ab5ab3a49e81917777a448abfafb33a633f75f842f096421b62dddda47b880244aa5f99f5a4d94fbdb94b57ee7d37e026077bf6872b2a4b7ccba39d3c5f7e3dfbd79a2f819650beea2e210eb81732d189814d902bcf29005bbf00";
+    const OWNER_GOLDEN_ENVELOPE_HEX: &str = "0166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473ae80300000000000040420f000000000003000000cdab000000000000e86638ebfcdd62b5b94bcf3b15f78be4f33ee0a4f7cbd5713a06a88fd5df42d129c550d2076eefff949ac948407db797229f3ee0c2e116d6049eb7ea13629c04010101010101010101010101010101010101010101010101010101010101010100000000000000000000000000000000000000000000000000000000000000000100000000000000630000000000000003030303030303030303030303030303030303030303030310019306246c1b44b4dd107f2f9f22bfe32d4fe913156a65427ad85f3c0d202421bacc0c81c5185c658dbcddbd71096436223f6add9836ebeca1a463d86d2c8e01404ecb3563995505f7becc74fbd78cde577eeac9bdecce298f17095cef15ed16ba3bbd0924e45f1c744eb66783c473315e6975a1e3d46a5e2cf51708c2937768e516e46671d6b6f334cc1cccc3c7700ad72244fca0abc096710c17ff4e7adc0f0ebdc09fca643d2894533c613cce4aee4ef4272ccde2b2a9770f8ff76bd5593525f954586fbc22763f68d30e2fc65bec3361d8c0052227fc48d9d259396d0441a0e72fd846bd9fdde850c1b6daeae18e4b106f6d5cc7876b2274d7c0e292e39bbdaa72b0fd550b7b95bf2949a6c391a40f71434e541d5e2ac486a75d4542515cfbbc92fc4f49b45f9e957ae92c7a5a91961ee346ef5c9ba2253652c0838da5260b2a1be07489fb64122c4f0318a4bdb90c";
 }
