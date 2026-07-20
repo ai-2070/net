@@ -23,13 +23,19 @@ private-discovery error. Rotation/expiry act on some and not others.
   and the exact audience selection. An *expired* grant is refused
   (`GrantInvalid`) even though its key could still decrypt its own old ciphertext.
 - **Cached knowledge** — what a node already learned and stored. Rotation/expiry
-  do not erase already-stored records; query-time currentness (revocation floor
-  and consumer-credential presence) hides them at read time, and sweeps reclaim
-  them, but the crypto cannot un-teach a peer.
-- **Invocation authority** — the `OrgAdmission` gate (`may_execute` + a valid
-  per-call org proof). Discovery and knowledge NEVER confer invocation: an
-  audience credential grants knowledge only. Invocation is out of this gate
-  (OA-2 admission / OA-4 end-to-end).
+  do not erase already-stored records; query-time currentness (the revocation
+  floor, and — for granted records — the exact installed consumer grant authority
+  `grant_id + audience handle + verified grant signature`) hides them at read
+  time, and sweeps reclaim them, but the crypto cannot un-teach a peer.
+- **Invocation authority** — a SEPARATE authorization path, never implied by
+  discovery. Public nRPC remains governed by the legacy `may_execute` path.
+  Organization-protected nRPC is governed by the distinct `OrgAdmission` path
+  using a valid request-bound organization proof, local capability possession,
+  and provider policy. These are NOT conjunctive: a valid protected call can be
+  accepted even when target-wide legacy allow-list aggregation makes
+  `may_execute` false — `may_execute` is not an authority requirement for
+  protected organization calls. Discovery or possession of an audience credential
+  never confers invocation authority (OA-2 admission / OA-4 end-to-end).
 
 ## §3.5 criteria → witnesses
 
