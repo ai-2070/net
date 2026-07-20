@@ -40,7 +40,7 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError};
+use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeError};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -869,6 +869,84 @@ async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
     assert!(
         !descriptor.has_tag("nrpc:open"),
         "the encrypted descriptor carries only owner-scoped services, never public ones",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA3-4b2 slice 2 — the granted-audience registration seam. `serve_rpc_granted`
+/// requires an installed authority; the registered granted service is
+/// DISPATCHABLE (present in the self-fold, so `has_local_capability` admits it —
+/// the CrossOrgGranted invoke gate would pass this possession check) yet its tag
+/// never rides the plaintext broadcast and — with NO provider grant installed —
+/// it emits no discovery envelope. That is register-before-grant fail-closed:
+/// dispatchable but undiscoverable. `serve_rpc_protected(CrossOrgGranted)` is
+/// UNCHANGED — its tag still rides plaintext (public discovery).
+#[tokio::test]
+async fn serve_rpc_granted_is_dispatchable_but_undiscoverable_without_a_grant() {
+    use net::adapter::net::behavior::fold::capability_bridge::has_local_capability;
+
+    // No authority → refused (same gate as serve_rpc_owner_scoped).
+    let bare = build_node_with(EntityKeypair::from_bytes([0x62u8; 32])).await;
+    assert!(
+        matches!(
+            bare.serve_rpc_granted("cross", Arc::new(TrivialHandler), Arc::new(|_| true)),
+            Err(ServeError::ProtectedAuthorityRequired(_))
+        ),
+        "a granted registration without authority is refused",
+    );
+
+    let server = build_node_with(EntityKeypair::from_bytes([0x63u8; 32])).await;
+    let (_org_b, dir) = install_authority(&server, "granted-seam");
+    server
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+
+    // A granted (confidential cross-org) service, a protected-CrossOrgGranted
+    // service (public discovery — unchanged behavior), and a public service.
+    let _granted = server
+        .serve_rpc_granted("cross", Arc::new(TrivialHandler), Arc::new(|_| true))
+        .expect("granted serve");
+    let _protected = server
+        .serve_rpc_protected(
+            "prot",
+            Arc::new(TrivialHandler),
+            OrgAdmission::CrossOrgGranted,
+            Arc::new(|_| true),
+        )
+        .expect("protected serve");
+    let _public = server
+        .serve_rpc("open", Arc::new(TrivialHandler))
+        .expect("public serve");
+    server
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Converge: plaintext keeps the public + protected tags, drops the granted
+    // one; with no provider grant installed, no discovery envelope ships.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server
+                .local_announcement_for_test()
+                .map(|a| {
+                    a.capabilities.has_tag("nrpc:open")
+                        && a.capabilities.has_tag("nrpc:prot")
+                        && !a.capabilities.has_tag("nrpc:cross")
+                })
+                .unwrap_or(false)
+                && server.announcement_scoped_for_send_for_test().is_empty()
+        })
+        .await,
+        "plaintext keeps public+protected, drops granted; no envelope without a grant",
+    );
+
+    // Dispatchable: the granted service IS in the self-fold, so
+    // has_local_capability admits it (the provider-possession check the
+    // CrossOrgGranted callee gate runs before admission).
+    assert!(
+        has_local_capability(server.capability_fold(), server.node_id(), "nrpc:cross"),
+        "the granted service is locally dispatchable despite being undiscoverable",
     );
 
     let _ = std::fs::remove_dir_all(&dir);

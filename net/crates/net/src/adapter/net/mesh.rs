@@ -2812,6 +2812,18 @@ impl LocalServiceRegistry {
             .collect()
     }
 
+    /// Names of `GrantedAudience` services — emitted only inside encrypted
+    /// grant-audience announcements (one envelope per active provider grant),
+    /// never plaintext (OA3-4b2).
+    pub(super) fn granted_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::GrantedAudience))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     /// ALL registered service names regardless of visibility — for the LOCAL
     /// self-fold, so `has_local_capability` admits every locally registered
     /// service (§2.4a). This set NEVER reaches the wire.
@@ -19184,7 +19196,17 @@ impl MeshNode {
                     // the parsed-tag form lands and dedupes against existing tags.
                     merged = merged.add_tag(format!("nrpc:{}", svc.as_str()));
                 }
-                for svc in self.rpc_local_services.owner_scoped_snapshot() {
+                // Registration visibility is AUTHORITATIVE over baseline residue: a
+                // caller that pre-tagged (or reused an old baseline containing) a
+                // private `nrpc:<svc>` would otherwise leak it. Strip every
+                // owner-scoped AND granted tag from the plaintext set (OA3-4b1 /
+                // OA3-4b2 confidentiality).
+                for svc in self
+                    .rpc_local_services
+                    .owner_scoped_snapshot()
+                    .into_iter()
+                    .chain(self.rpc_local_services.granted_snapshot())
+                {
                     merged = merged.remove_tag(&format!("nrpc:{}", svc.as_str()));
                 }
                 merged
@@ -19381,19 +19403,22 @@ impl MeshNode {
                 broadcast_ann.sign(&self.identity);
             }
 
-            // The SELF-FOLD announcement — the PUBLIC set plus owner-scoped
-            // `nrpc:` tags. LOCAL ONLY: it feeds the self-fold so
-            // `has_local_capability` admits owner-scoped services (§2.4a), and is
-            // NEVER stored in `local_announcement` or sent. When no owner-scoped
-            // service is registered it is identical to the broadcast form.
+            // The SELF-FOLD announcement — the PUBLIC set plus owner-scoped AND
+            // granted `nrpc:` tags. LOCAL ONLY: it feeds the self-fold so
+            // `has_local_capability` admits every locally-registered private
+            // service (§2.4a) — a granted service must be dispatchable even before
+            // a matching grant is installed (OA3-4b2 register-before-grant). NEVER
+            // stored in `local_announcement` or sent. When no private service is
+            // registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
             let (self_ann, scoped_envelopes, scoped_authority) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
-                if owner_scoped.is_empty() {
+                let granted = self.rpc_local_services.granted_snapshot();
+                if owner_scoped.is_empty() && granted.is_empty() {
                     (broadcast_ann.clone(), Vec::new(), None)
                 } else {
                     let mut self_caps = caps;
-                    for svc in &owner_scoped {
+                    for svc in owner_scoped.iter().chain(granted.iter()) {
                         self_caps = self_caps.add_tag(format!("nrpc:{}", svc.as_str()));
                     }
                     let mut a = CapabilityAnnouncement::new(
@@ -19417,9 +19442,11 @@ impl MeshNode {
                     // `broadcast_ann`. Sealed under the SAME pinned authority
                     // whose cert `a`/`broadcast_ann` embed; a nonempty result
                     // retains that exact Arc so the send path refuses a later
-                    // same-org rotation (Kyra OA3-4b1 B2).
+                    // same-org rotation (Kyra OA3-4b1 B2). Only when an owner-
+                    // scoped service is registered — a granted-only node emits no
+                    // owner envelope here (granted envelopes are OA3-4b2 slice 3).
                     match (emission_authority.as_ref(), owner_cert.as_ref()) {
-                        (Some(authority), Some(cert)) => {
+                        (Some(authority), Some(cert)) if !owner_scoped.is_empty() => {
                             let scoped = self.owner_scoped_envelopes(
                                 authority,
                                 cert.clone(),

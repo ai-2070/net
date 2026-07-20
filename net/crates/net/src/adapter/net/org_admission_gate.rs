@@ -281,9 +281,13 @@ pub enum CapabilityVisibility {
     /// in the clear (OA3-4b1).
     OwnerScoped,
     /// A cross-org private capability. Emitted ONLY as an encrypted
-    /// `ScopedCapabilityAnnouncement` under a grant audience — never plaintext.
-    /// Emission needs the provider-side grant/secret store and is deferred to
-    /// OA3-4b2; a registration that requests it is refused until then.
+    /// `ScopedCapabilityAnnouncement` under a grant audience — never plaintext —
+    /// one envelope per active provider grant record (OA3-4b2). Invocation still
+    /// requires [`OrgAdmission::CrossOrgGranted`] admission; the capability enters
+    /// the local self-fold for `has_local_capability` but never the wire in the
+    /// clear. A granted service registered BEFORE a matching grant is installed is
+    /// locally dispatchable but undiscoverable (fail-closed) until installing the
+    /// grant wakes a coherent reannouncement.
     GrantedAudience,
 }
 
@@ -381,6 +385,28 @@ impl RegisteredRpcService {
         }
     }
 
+    /// A GRANTED-AUDIENCE registration (OA3-4b2): a cross-org private capability.
+    /// `GrantedAudience` visibility (emitted only as an encrypted grant-audience
+    /// announcement, never plaintext), [`OrgAdmission::CrossOrgGranted`] invocation
+    /// authority (identical invoke gate to a protected cross-org service — the two
+    /// differ ONLY in discovery visibility), and an EXPLICIT `provider_policy`. The
+    /// service enters the local self-fold so `has_local_capability` admits it, but
+    /// its tag never rides a plaintext broadcast; it becomes discoverable only once
+    /// a matching provider grant is installed.
+    pub fn granted(
+        registration_id: u64,
+        service: Arc<str>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Self {
+        Self {
+            registration_id,
+            service,
+            visibility: CapabilityVisibility::GrantedAudience,
+            admission: OrgAdmission::CrossOrgGranted,
+            provider_policy,
+        }
+    }
+
     /// The generation token (E0.1) this registration owns.
     pub fn registration_id(&self) -> u64 {
         self.registration_id
@@ -392,7 +418,8 @@ impl RegisteredRpcService {
     }
 
     /// The announcement visibility — `Public` for legacy/protected services,
-    /// `OwnerScoped` for an owner-scoped registration (OA3-4b1).
+    /// `OwnerScoped` for an owner-scoped registration (OA3-4b1), `GrantedAudience`
+    /// for a granted-audience registration (OA3-4b2).
     pub fn visibility(&self) -> CapabilityVisibility {
         self.visibility
     }
@@ -663,6 +690,18 @@ mod tests {
             .err(),
             Some(RegisteredServiceError::PublicAdmissionNotProtected),
         );
+
+        // owner_scoped() (OA3-4b1): OwnerScoped visibility + OwnerDelegated.
+        let own = RegisteredRpcService::owner_scoped(11, svc.clone(), Arc::new(|_| true));
+        assert_eq!(own.visibility(), CapabilityVisibility::OwnerScoped);
+        assert_eq!(own.admission(), OrgAdmission::OwnerDelegated);
+
+        // granted() (OA3-4b2): GrantedAudience visibility + CrossOrgGranted. The
+        // invoke gate matches a CrossOrgGranted protected service; only the
+        // discovery VISIBILITY differs (private grant-audience vs public).
+        let granted = RegisteredRpcService::granted(13, svc.clone(), Arc::new(|_| true));
+        assert_eq!(granted.visibility(), CapabilityVisibility::GrantedAudience);
+        assert_eq!(granted.admission(), OrgAdmission::CrossOrgGranted);
     }
 
     /// The admission stamp is "current" only against an identical,

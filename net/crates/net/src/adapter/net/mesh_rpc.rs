@@ -3029,6 +3029,37 @@ impl MeshNode {
         )
     }
 
+    /// Register a GRANTED-AUDIENCE unary RPC handler (OA3-4b2): a cross-org private
+    /// capability. Its `nrpc:<service>` tag is NEVER broadcast in the clear — the
+    /// capability is emitted only as an encrypted grant-audience
+    /// `ScopedCapabilityAnnouncement`, one envelope per active provider grant
+    /// record — but it enters the local self-fold so
+    /// [`OrgAdmission::CrossOrgGranted`] admission can dispatch it. The invoke gate
+    /// is identical to [`Self::serve_rpc_protected`] with `CrossOrgGranted`; the two
+    /// differ ONLY in discovery visibility (protected = public discovery, granted =
+    /// grant-audience-private discovery). REQUIRES an installed node authority.
+    /// Registering BEFORE a matching grant is installed is fail-closed: the service
+    /// is dispatchable but undiscoverable until a provider grant is installed (which
+    /// wakes a coherent reannouncement). Unary only (E1.8).
+    pub fn serve_rpc_granted<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        // Granted registration requires an installed authority — both to bind this
+        // node's owner org (the grant issuer) and because the granted emission
+        // consumes the provider grant/secret store, which is meaningless without one.
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::Granted { provider_policy },
+        )
+    }
+
     /// Shared unary serve implementation for the public [`Self::serve_rpc`] and
     /// protected [`Self::serve_rpc_protected`] wrappers. The bridge branches on
     /// the captured [`RegisteredRpcService`]'s admission mode: public runs the
@@ -3243,6 +3274,12 @@ impl MeshNode {
                 Arc::from(service),
                 provider_policy,
             ),
+            // OA3-4b2: granted-audience — cross-org private capability.
+            // `GrantedAudience` visibility (encrypted-only emission) +
+            // `CrossOrgGranted` invocation authority.
+            UnaryAdmission::Granted { provider_policy } => {
+                RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
+            }
         });
         // E1.5 (Kyra #47 B2): the NODE-owned admission replay guard, shared
         // across every protected registration on this node — so `(caller,
@@ -5544,16 +5581,23 @@ enum UnaryAdmission {
     /// [`OrgAdmission::OwnerDelegated`] invocation authority, and an explicit
     /// provider policy.
     OwnerScoped { provider_policy: OrgProviderPolicy },
+    /// OA3-4b2 granted-audience: `GrantedAudience` visibility (emitted only as an
+    /// encrypted grant-audience announcement, never plaintext),
+    /// [`OrgAdmission::CrossOrgGranted`] invocation authority, and an explicit
+    /// provider policy.
+    Granted { provider_policy: OrgProviderPolicy },
 }
 
 impl UnaryAdmission {
     /// The announcement visibility this registration mode carries — the
     /// discriminator the local-service registry stores so emission can exclude
-    /// owner-scoped `nrpc:` tags from the plaintext broadcast (OA3-4b1).
+    /// owner-scoped / granted `nrpc:` tags from the plaintext broadcast
+    /// (OA3-4b1 / OA3-4b2).
     fn visibility(&self) -> CapabilityVisibility {
         match self {
             Self::Public | Self::Protected { .. } => CapabilityVisibility::Public,
             Self::OwnerScoped { .. } => CapabilityVisibility::OwnerScoped,
+            Self::Granted { .. } => CapabilityVisibility::GrantedAudience,
         }
     }
 }
