@@ -212,7 +212,12 @@ async fn admin_route_with_echo_payload_never_runs_admin_handler() {
     deliver(
         &f.a,
         &f.admin_requests,
-        request_frame(f.a.origin_hash(), admin_route, "echo", b"payload claims echo"),
+        request_frame(
+            f.a.origin_hash(),
+            admin_route,
+            "echo",
+            b"payload claims echo",
+        ),
     )
     .await;
     assert_eq!(
@@ -230,7 +235,12 @@ async fn admin_route_with_echo_payload_never_runs_admin_handler() {
     deliver(
         &f.a,
         &f.admin_requests,
-        request_frame(f.a.origin_hash(), admin_route, "admin", b"payload claims admin"),
+        request_frame(
+            f.a.origin_hash(),
+            admin_route,
+            "admin",
+            b"payload claims admin",
+        ),
     )
     .await;
     assert_eq!(
@@ -251,7 +261,12 @@ async fn echo_route_with_admin_payload_never_runs_echo_handler() {
     deliver(
         &f.a,
         &f.echo_requests,
-        request_frame(f.a.origin_hash(), echo_route, "admin", b"payload claims admin"),
+        request_frame(
+            f.a.origin_hash(),
+            echo_route,
+            "admin",
+            b"payload claims admin",
+        ),
     )
     .await;
     assert_eq!(
@@ -268,7 +283,12 @@ async fn echo_route_with_admin_payload_never_runs_echo_handler() {
     deliver(
         &f.a,
         &f.echo_requests,
-        request_frame(f.a.origin_hash(), echo_route, "echo", b"payload claims echo"),
+        request_frame(
+            f.a.origin_hash(),
+            echo_route,
+            "echo",
+            b"payload claims echo",
+        ),
     )
     .await;
     assert_eq!(

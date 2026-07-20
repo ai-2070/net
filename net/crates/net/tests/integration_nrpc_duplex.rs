@@ -16,6 +16,8 @@
 //! 4. `into_split` lets sink + stream live in independent tokio
 //!    tasks; CANCEL only fires when BOTH halves drop.
 //! 5. CANCEL from either side closes both halves cleanly.
+//! 6. Upload flow control end to end — a send blocked on credit is
+//!    unblocked by a server-emitted REQUEST_GRANT.
 
 #![cfg(all(feature = "net", feature = "cortex"))]
 
@@ -26,6 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use net::adapter::net::behavior::CapabilitySet;
 use net::adapter::net::cortex::{
     RequestStream, RpcDuplexHandler, RpcHandlerError, RpcResponseSink, RpcStreamingContext,
 };
@@ -71,6 +74,40 @@ async fn handshake_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
         .expect("accept failed");
     a.start();
     b.start();
+
+    // Exchange SIGNED capability announcements so each side TOFU-pins the
+    // other's entity id. The Gate-3 upload-grant classifier
+    // (`classify_request_grant_route`) reads that pin: an unpinned caller
+    // classifies as `RelayedOrUntrusted`, and the duplex serve bridge — one of
+    // the two flow-controlled bridges — then drops the REQUEST before the fold.
+    // Only the windowed test below depends on this, but establishing it here
+    // keeps every duplex fixture on the same production-shaped footing.
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("a announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("b announce");
+    assert!(
+        wait_until(
+            || a.peer_entity_id(b_id).is_some() && b.peer_entity_id(a_id).is_some(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "both peers must TOFU-pin each other before a flow-controlled call",
+    );
+}
+
+/// Poll `cond` until true or `timeout` elapses.
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 // ============================================================================
@@ -140,6 +177,32 @@ impl RpcDuplexHandler for ServerTerminatesFirstHandler {
         responses.send(Bytes::from_static(b"only"));
         // Return immediately — fold emits terminal End; further
         // caller sends arrive at a closed-down call.
+        Ok(())
+    }
+}
+
+/// Pre-sleeps before touching the request stream, so no
+/// REQUEST_GRANT can fire while the caller is exhausting its initial
+/// upload window. Then drains, counting every chunk, and emits one
+/// summary response on EOS.
+struct SlowDrainDuplexHandler {
+    pre_sleep_ms: u64,
+    consumed: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for SlowDrainDuplexHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        mut requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        tokio::time::sleep(Duration::from_millis(self.pre_sleep_ms)).await;
+        while requests.next().await.is_some() {
+            self.consumed.fetch_add(1, Ordering::SeqCst);
+        }
+        responses.send(format!("total:{}", self.consumed.load(Ordering::SeqCst)).into_bytes());
         Ok(())
     }
 }
@@ -481,4 +544,86 @@ async fn call_duplex_rejects_zero_request_window() {
         }
         other => panic!("expected RpcError::Codec(Encode), got {other:?}"),
     }
+}
+
+/// 6/6 — Upload flow control END TO END: a send blocked on credit is
+/// UNBLOCKED by a REQUEST_GRANT.
+///
+/// This is the shape the grant path had no integration coverage for at
+/// all. `call_duplex_rejects_zero_request_window` only exercises the
+/// client-side `Some(0)` guard, which returns before any wire traffic —
+/// so until now no test drove a windowed duplex upload over a real
+/// transport, and the server-side grant emitter's effect on a caller's
+/// semaphore was asserted only in unit-level witnesses.
+///
+/// The caller opens a window of 2 and the handler pre-sleeps 500 ms, so
+/// the first two sends consume both initial credits and the third MUST
+/// block — no grant can have fired yet. The third send's future is then
+/// PINNED and re-polled rather than dropped: first proving it is still
+/// pending during the pre-sleep, then proving that same future completes
+/// once the handler drains and grants flow back. Dropping it (the older
+/// pattern) proves only that credit is enforced, never that it is
+/// replenished — a server that emitted no grants at all would pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplex_window_grant_unblocks_blocked_send() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_duplex(
+            "slow",
+            Arc::new(SlowDrainDuplexHandler {
+                pre_sleep_ms: 500,
+                consumed: consumed.clone(),
+            }),
+        )
+        .expect("serve_rpc_duplex");
+
+    let opts = CallOptions {
+        request_window_initial: Some(2),
+        ..CallOptions::default()
+    };
+    let mut call = caller
+        .call_duplex(server.node_id(), "slow", opts)
+        .await
+        .expect("call_duplex");
+    assert!(call.flow_controlled(), "window opt-in must be honored");
+
+    // Both initial credits — immediate.
+    call.send(Bytes::from_static(b"a")).await.expect("send a");
+    call.send(Bytes::from_static(b"b")).await.expect("send b");
+
+    {
+        let third = call.send(Bytes::from_static(b"c"));
+        tokio::pin!(third);
+        // Still pre-sleeping: no chunk consumed, so no grant emitted.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut third)
+                .await
+                .is_err(),
+            "third send must block on credit while the server is still pre-sleeping",
+        );
+        // Same future: the pre-sleep ends, the handler drains, REQUEST_GRANTs
+        // reach the caller's semaphore, and the blocked send completes.
+        tokio::time::timeout(Duration::from_secs(5), &mut third)
+            .await
+            .expect("a REQUEST_GRANT must unblock the blocked send once the server drains")
+            .expect("send c");
+    }
+
+    call.finish_sending().await.expect("finish_sending");
+
+    let mut collected: Vec<String> = Vec::new();
+    while let Some(item) = call.next().await {
+        let chunk = item.expect("chunk must be Ok");
+        collected.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+    assert_eq!(
+        consumed.load(Ordering::SeqCst),
+        3,
+        "handler must observe all three uploaded chunks",
+    );
+    assert_eq!(collected, vec!["total:3".to_string()]);
 }
