@@ -8397,6 +8397,383 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// OA-4 slice 3 (Tier 2) — the OwnerDelegated DENIAL matrix, table-driven
+    /// through the real provider bridge (mirrors the cross-org harness for the
+    /// same-org mode). Each adversarial frame is DENIED (handler dark); the exact
+    /// typed reason is pinned by the pure `org_admission.rs` unit matrix (Tier 3).
+    /// Rows: membership-only (dispatcher grant scoped to another capability),
+    /// copied proof (TOFU member binding), wrong callee, wrong capability, wrong
+    /// body/digest, expired proof, an UNEXPECTED capability grant (OwnerDelegated
+    /// forbids one), grantee mismatch (acting org ≠ the provider's owner), missing
+    /// header, multiple headers. A FIFO barrier of two genuine calls (the first
+    /// re-sent) gives `admits == 2` — every denial and the replay were refused.
+    #[tokio::test]
+    async fn owner_delegated_admission_denial_matrix() {
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(std::sync::Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for Counter {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                assert!(
+                    ctx.org_admission.is_some(),
+                    "only admitted calls may reach the handler",
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]); // provider owner == caller org
+        let org_a = OrgKeypair::from_bytes([0x7au8; 32]); // a FOREIGN org, for grantee mismatch
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa4-owner-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let admits = std::sync::Arc::new(AtomicUsize::new(0));
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(Counter(admits.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0xB1;
+        let caller_kp = EntityKeypair::from_bytes([0x3bu8; 32]);
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let future = (current_timestamp() + 20) * 1_000_000_000;
+
+        // Honest OwnerDelegated baseline: caller S is a member of the provider's
+        // OWN owner org B, with a dispatcher grant covering nrpc:svc and no
+        // capability grant.
+        let membership_b = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("membership");
+        let dispatcher_b = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher");
+
+        let make_event = |headers: Vec<Vec<u8>>, call_id: u64, body: &'static [u8]| {
+            let mut payload = base.clone();
+            payload.body = Bytes::from_static(body);
+            payload.headers = headers
+                .into_iter()
+                .map(|h| (ORG_ADMISSION_HEADER.to_string(), h))
+                .collect();
+            let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+                .to_bytes()
+                .to_vec();
+            encode_rpc_route(&mut frame, 0);
+            frame.extend_from_slice(&payload.encode());
+            RpcInboundEvent {
+                channel_hash,
+                origin_hash: caller_origin,
+                from_node: CALLER_NODE,
+                payload: Bytes::from(frame),
+            }
+        };
+        // sign_for_call with explicit fields — full proof surgery.
+        #[allow(clippy::too_many_arguments)]
+        let sign = |kp: &EntityKeypair,
+                    membership: OrgMembershipCert,
+                    dispatcher: OrgDispatcherGrant,
+                    grant: Option<OrgCapabilityGrant>,
+                    acting_org: crate::adapter::net::behavior::org::OrgId,
+                    callee: crate::adapter::net::identity::EntityId,
+                    capability: CapabilityAuthorityId,
+                    call_id: u64,
+                    expiry: u64,
+                    dgst: [u8; 32]|
+         -> Vec<u8> {
+            OrgCallProof::sign_for_call(
+                kp,
+                membership,
+                dispatcher,
+                grant,
+                acting_org,
+                org_b.org_id(),
+                callee,
+                call_id,
+                capability,
+                expiry,
+                dgst,
+            )
+            .encode()
+            .expect("encode proof")
+        };
+        let good = |call_id: u64| {
+            sign(
+                &caller_kp,
+                membership_b.clone(),
+                dispatcher_b.clone(),
+                None,
+                org_b.org_id(),
+                node_entity.clone(),
+                cap,
+                call_id,
+                future,
+                digest,
+            )
+        };
+
+        // 1. Membership-only: the dispatcher grant covers a DIFFERENT capability,
+        //    so it does not empower this call → DispatcherGrantScope.
+        let dispatcher_other = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(CapabilityAuthorityId::for_tag("nrpc:other")),
+            3600,
+        )
+        .expect("dispatcher");
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_b.clone(),
+                    dispatcher_other,
+                    None,
+                    org_b.org_id(),
+                    node_entity.clone(),
+                    cap,
+                    401,
+                    future,
+                    digest,
+                )],
+                401,
+                b"ping",
+            ),
+        );
+
+        // 2. Copied proof: a valid proof for a DIFFERENT caller X on S's session.
+        let x_kp = EntityKeypair::from_bytes([0x3cu8; 32]);
+        let x_entity = x_kp.entity_id().clone();
+        let membership_x =
+            OrgMembershipCert::try_issue(&org_b, x_entity.clone(), 1, 3600).expect("x membership");
+        let dispatcher_x =
+            OrgDispatcherGrant::try_issue(&org_b, x_entity, DispatcherScope::Exact(cap), 3600)
+                .expect("x dispatcher");
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &x_kp,
+                    membership_x,
+                    dispatcher_x,
+                    None,
+                    org_b.org_id(),
+                    node_entity.clone(),
+                    cap,
+                    402,
+                    future,
+                    digest,
+                )],
+                402,
+                b"ping",
+            ),
+        );
+
+        // 3. Wrong callee: the binding names a different provider entity.
+        let other_entity = EntityKeypair::from_bytes([0xefu8; 32]).entity_id().clone();
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_b.clone(),
+                    dispatcher_b.clone(),
+                    None,
+                    org_b.org_id(),
+                    other_entity,
+                    cap,
+                    403,
+                    future,
+                    digest,
+                )],
+                403,
+                b"ping",
+            ),
+        );
+
+        // 4. Wrong capability: the binding is minted for a different capability.
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_b.clone(),
+                    dispatcher_b.clone(),
+                    None,
+                    org_b.org_id(),
+                    node_entity.clone(),
+                    CapabilityAuthorityId::for_tag("nrpc:other"),
+                    404,
+                    future,
+                    digest,
+                )],
+                404,
+                b"ping",
+            ),
+        );
+
+        // 5. Wrong body: signed over the "ping" digest, delivered on "pong".
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![good(405)], 405, b"pong"));
+
+        // 6. Expired proof.
+        let past = current_timestamp().saturating_sub(100) * 1_000_000_000;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_b.clone(),
+                    dispatcher_b.clone(),
+                    None,
+                    org_b.org_id(),
+                    node_entity.clone(),
+                    cap,
+                    406,
+                    past,
+                    digest,
+                )],
+                406,
+                b"ping",
+            ),
+        );
+
+        // 7. Unexpected capability grant: OwnerDelegated forbids carrying one.
+        let stray_grant = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_b.org_id(),
+            cap,
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(node_entity.clone()),
+            3600,
+        )
+        .expect("grant")
+        .0;
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_b.clone(),
+                    dispatcher_b.clone(),
+                    Some(stray_grant),
+                    org_b.org_id(),
+                    node_entity.clone(),
+                    cap,
+                    407,
+                    future,
+                    digest,
+                )],
+                407,
+                b"ping",
+            ),
+        );
+
+        // 8. Grantee mismatch: the caller acts for a FOREIGN org A, not the
+        //    provider's owner B → OwnerDelegated denies.
+        let membership_a = OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600)
+            .expect("a membership");
+        let dispatcher_a = OrgDispatcherGrant::try_issue(
+            &org_a,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("a dispatcher");
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(
+                vec![sign(
+                    &caller_kp,
+                    membership_a,
+                    dispatcher_a,
+                    None,
+                    org_a.org_id(),
+                    node_entity.clone(),
+                    cap,
+                    408,
+                    future,
+                    digest,
+                )],
+                408,
+                b"ping",
+            ),
+        );
+
+        // 9. Missing header. 10. Multiple headers.
+        server.deliver_rpc_inbound_for_test(channel_hash, make_event(vec![], 409, b"ping"));
+        server.deliver_rpc_inbound_for_test(
+            channel_hash,
+            make_event(vec![good(410), good(410)], 410, b"ping"),
+        );
+
+        // Genuine + replay barrier.
+        let v1 = good(500);
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![v1.clone()], 500, b"ping"));
+        server.deliver_rpc_inbound_for_test(channel_hash, make_event(vec![v1], 500, b"ping"));
+        server
+            .deliver_rpc_inbound_for_test(channel_hash, make_event(vec![good(501)], 501, b"ping"));
+
+        assert!(
+            wait_until_at_least(|| admits.load(Ordering::SeqCst) as u64, 2).await,
+            "the two genuine owner-delegated calls must be admitted",
+        );
+        assert_eq!(
+            admits.load(Ordering::SeqCst),
+            2,
+            "exactly the two genuine calls admitted — every adversarial frame was denied \
+             (handler dark) and the replay of the first genuine call was refused",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Kyra #47 B1: the gate binds the AUTHENTICATED session entity's origin to
     /// the wire-claimed origin. A pinned peer with a VALID proof for itself, but
     /// stamping a DIFFERENT origin (packet == payload == victim) into the frame,

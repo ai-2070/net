@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use net::adapter::net::behavior::capability::CapabilitySet;
-use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert};
+use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_grant::OrgAudienceSecret;
@@ -201,10 +201,22 @@ fn owner_delegated_intent(
     provider: EntityId,
     service: &str,
 ) -> OrgProofIntent {
+    owner_delegated_intent_gen(caller_kp, org_b, provider, service, 1)
+}
+
+/// Like [`owner_delegated_intent`] but with an explicit membership `generation`
+/// — used to drive the revocation floor (a below-floor cert is denied).
+fn owner_delegated_intent_gen(
+    caller_kp: EntityKeypair,
+    org_b: &OrgKeypair,
+    provider: EntityId,
+    service: &str,
+    generation: u32,
+) -> OrgProofIntent {
     let caller_entity = caller_kp.entity_id().clone();
     let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
-    let membership =
-        OrgMembershipCert::try_issue(org_b, caller_entity.clone(), 1, 3600).expect("membership");
+    let membership = OrgMembershipCert::try_issue(org_b, caller_entity.clone(), generation, 3600)
+        .expect("membership");
     let dispatcher =
         OrgDispatcherGrant::try_issue(org_b, caller_entity, DispatcherScope::Exact(cap), 3600)
             .expect("dispatcher");
@@ -2717,4 +2729,299 @@ async fn live_cross_org_any_node_owned_by_reuse_and_deny() {
     for d in [dir2, dir2b, dirc] {
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// OA-4 slice 3 (Tier 1) — the representative live OwnerDelegated denial:
+/// membership-only. The caller holds a valid membership AND a dispatcher grant,
+/// but the dispatcher grant is scoped to a DIFFERENT capability, so it does not
+/// empower this call → `DispatcherGrantScope`. The handler stays dark; S sees
+/// 0x0009. (Membership alone never confers invocation authority.)
+#[tokio::test]
+async fn live_two_node_owner_delegated_membership_only_denied() {
+    const CALLER_SEED: [u8; 32] = [0x2du8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (org_b, dir) = install_authority(&server, "memonly");
+    let provider = server.entity_id().clone();
+    let caller_entity = caller.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // Valid membership + dispatcher grant, but the dispatcher covers a DIFFERENT
+    // capability, so it does not empower nrpc:svc.
+    let membership =
+        OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600).expect("membership");
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &org_b,
+        caller_entity,
+        DispatcherScope::Exact(CapabilityAuthorityId::for_tag("nrpc:elsewhere")),
+        3600,
+    )
+    .expect("dispatcher");
+    let intent = OrgProofIntent {
+        caller: Arc::new(EntityKeypair::from_bytes(CALLER_SEED)),
+        membership,
+        dispatcher,
+        capability_grant: None,
+        acting_org: org_b.org_id(),
+        provider_owner_org: org_b.org_id(),
+        provider,
+        capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+        proof_ttl_secs: 30,
+    };
+    let err = caller
+        .call(
+            server.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a membership-only proof must be denied");
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler stayed dark");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA-4 slice 3 (Tier 1) — registering a PROTECTED capability leaves PUBLIC
+/// capabilities unchanged. The provider serves a public service AND a protected
+/// one on the same node; a public call carrying NO proof still succeeds normally
+/// (the legacy `may_execute` path, public handler never sees a proof header),
+/// while the protected service still denies an unproven call. Registering the
+/// protected capability did not alter the public one's behavior.
+#[tokio::test]
+async fn live_two_node_public_capability_unchanged_beside_protected() {
+    const CALLER_SEED: [u8; 32] = [0x2eu8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let (_org_b, dir) = install_authority(&server, "pubunchanged");
+
+    let pub_calls = Arc::new(AtomicUsize::new(0));
+    let saw_proof = Arc::new(AtomicBool::new(false));
+    let _pub = server
+        .serve_rpc(
+            "pub",
+            Arc::new(HeaderSpyHandler {
+                calls: pub_calls.clone(),
+                saw_proof: saw_proof.clone(),
+            }),
+        )
+        .expect("serve public");
+    let prot_calls = Arc::new(AtomicUsize::new(0));
+    let _prot = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: prot_calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // The public call, with NO proof, succeeds — unchanged by the protected reg.
+    let reply = caller
+        .call(
+            server.node_id(),
+            "pub",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the public call succeeds without a proof");
+    assert_eq!(reply.body.as_ref(), b"pong");
+    assert_eq!(
+        pub_calls.load(Ordering::SeqCst),
+        1,
+        "public handler ran once"
+    );
+    assert!(
+        !saw_proof.load(Ordering::SeqCst),
+        "the public handler saw no org-admission proof header",
+    );
+
+    // The protected service still requires a proof: an unproven call is denied.
+    let err = caller
+        .call(
+            server.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the protected service still requires a proof");
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        prot_calls.load(Ordering::SeqCst),
+        0,
+        "the protected handler stayed dark",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OA-4 slice 3 (Tier 1) — the OA-1 restart chain through the LIVE admission
+/// gate. A revocation floor of 5 is raised for the caller and persisted; the
+/// WHOLE node authority is reopened FROM DISK (the restart), and a lower
+/// (generation 3) bundle is a no-op. A below-floor (generation 4) membership
+/// cert is then denied `MembershipRevoked` at the live gate (0x0009, handler
+/// dark), while an at-floor (generation 5) cert admits — proving persisted floor
+/// state reaches the real provider admission path, not just the `may_execute`
+/// projection.
+#[tokio::test]
+async fn live_two_node_owner_delegated_floor_survives_restart_denies() {
+    const CALLER_SEED: [u8; 32] = [0x2fu8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+    let node_entity = server.entity_id().clone();
+    let caller_entity = caller.entity_id().clone();
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+
+    // Adopt the provider authority; raise a floor of 5 for the caller, persisted.
+    let node_cert =
+        OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+    let dir = std::env::temp_dir().join(format!("net-oa4-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority =
+        NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(caller_entity.clone(), 5u32);
+    authority
+        .revocation
+        .apply_bundle(&OrgRevocationBundle::try_issue(&org_b, &floors).expect("bundle 5"))
+        .expect("apply floor 5");
+    server
+        .install_node_authority(Arc::new(authority))
+        .expect("install authority");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // RESTART: reopen the entire authority from disk — the floor must survive.
+    // A lower (generation 3) bundle must be a no-op.
+    let reopened = NodeAuthority::open(&dir, &node_entity).expect("reopen authority");
+    assert_eq!(
+        reopened
+            .revocation
+            .floor_for(&org_b.org_id(), &caller_entity),
+        5,
+        "floor 5 survives the restart",
+    );
+    let mut lower = std::collections::BTreeMap::new();
+    lower.insert(caller_entity.clone(), 3u32);
+    reopened
+        .revocation
+        .apply_bundle(&OrgRevocationBundle::try_issue(&org_b, &lower).expect("bundle 3"))
+        .expect("lower bundle is a no-op");
+    assert_eq!(
+        reopened
+            .revocation
+            .floor_for(&org_b.org_id(), &caller_entity),
+        5,
+        "floor stays 5 after a lower bundle",
+    );
+    server
+        .install_node_authority(Arc::new(reopened))
+        .expect("install reopened authority");
+
+    // Below the floor (generation 4): denied at the live gate.
+    let intent4 = owner_delegated_intent_gen(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        node_entity.clone(),
+        "svc",
+        4,
+    );
+    let err = caller
+        .call(
+            server.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent4),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a below-floor cert must be denied after the restart");
+    match err {
+        RpcError::ServerError { status, .. } => {
+            assert_eq!(status, 0x0009, "MembershipRevoked at the live gate");
+        }
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark for the below-floor call",
+    );
+
+    // At the floor (generation 5): admitted — proving the floor is exactly 5.
+    let intent5 = owner_delegated_intent_gen(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        node_entity.clone(),
+        "svc",
+        5,
+    );
+    caller
+        .call(
+            server.node_id(),
+            "svc",
+            Bytes::from_static(b"ping"),
+            CallOptions {
+                org_proof_intent: Some(intent5),
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an at-floor cert admits");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the at-floor call reached the handler",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
