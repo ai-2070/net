@@ -432,8 +432,10 @@ fn verify_owner_ingest(
     // The inline cert must vouch for THIS provider under THIS org, and be
     // currently valid + at/above the revocation floor.
     verify_provider_membership(envelope, &owner_org, ctx)?;
-    // Envelope freshness.
-    if is_expired(envelope, ctx) {
+    // Envelope freshness, under the CLAMPED expiry: an owner-scoped record may
+    // never outlive the membership certificate that vouched for its provider.
+    let expires_at = effective_expires_at(envelope, &[envelope.owner_cert().not_after]);
+    if is_expired_at(expires_at, ctx) {
         return Err(ScopedIngestError::Expired);
     }
     // The AEAD open under the owner key both reveals the descriptor AND
@@ -449,7 +451,7 @@ fn verify_owner_ingest(
         provider: envelope.provider().clone(),
         owner_org,
         generation: envelope.generation(),
-        expires_at: envelope.expires_at(),
+        expires_at,
         provider_cert_generation: envelope.owner_cert().generation,
         // Owner records carry no grant authority.
         grant_signature: None,
@@ -512,8 +514,15 @@ fn verify_granted_ingest(
     // P's inline cert must vouch for P under the issuer org B, valid + above the
     // floor.
     verify_provider_membership(envelope, &grant.issuer_org, ctx)?;
-    // Envelope freshness.
-    if is_expired(envelope, ctx) {
+    // Envelope freshness, under the CLAMPED expiry: a granted record may
+    // outlive neither the provider's membership certificate NOR the grant that
+    // authorized the discovery. Without the grant bound, a grantor org could
+    // mint providers whose records survive the grant itself.
+    let expires_at = effective_expires_at(
+        envelope,
+        &[envelope.owner_cert().not_after, grant.not_after],
+    );
+    if is_expired_at(expires_at, ctx) {
         return Err(ScopedIngestError::Expired);
     }
     // The AEAD open under the grant's secret key reveals the descriptor.
@@ -532,7 +541,7 @@ fn verify_granted_ingest(
         provider: envelope.provider().clone(),
         owner_org: *envelope.owner_org(),
         generation: envelope.generation(),
-        expires_at: envelope.expires_at(),
+        expires_at,
         provider_cert_generation: envelope.owner_cert().generation,
         grant_signature: Some(grant.signature),
         descriptor,
@@ -593,10 +602,37 @@ fn verify_provider_membership(
     Ok(())
 }
 
-/// An envelope is expired once the clock passes its `expires_at`, with the same
-/// skew tolerance applied to certificate/grant windows.
-fn is_expired(envelope: &ScopedCapabilityAnnouncement, ctx: &ScopedIngestContext<'_>) -> bool {
-    ctx.now_secs >= envelope.expires_at().saturating_add(ctx.skew_secs)
+/// The expiry this record is actually admitted under: the envelope's own
+/// `expires_at` CLAMPED to every credential that authorized it.
+///
+/// `expires_at` is attacker-chosen — it is a plaintext field the publisher
+/// picks. The publisher is expected to bound it (`mesh.rs`:
+/// `base_expiry.min(grant.not_after).min(owner_cert.not_after)`), but a rule
+/// enforced only on the honest sender is not a rule. An insider, or any
+/// provider under a malicious grantor org, could publish `expires_at =
+/// u64::MAX` and the record stayed discoverable forever:
+///
+///  * expiry is not a revocation floor, so a lapsing certificate raises
+///    nothing and retracts nothing;
+///  * `saturating_add(skew)` keeps `u64::MAX` permanently unexpired;
+///  * no sweep, relay check, or query surface re-derived the bound.
+///
+/// Clamping here makes the stored `expires_at` the true composite bound, which
+/// is why no separate window needs to be carried on the record: the credential
+/// lifetimes are immutable signed statements, so `min()` of them at ingest is
+/// exactly what a query-time re-check would recompute. The existing
+/// expiry-safe queries and tombstone horizon then enforce it for free.
+fn effective_expires_at(envelope: &ScopedCapabilityAnnouncement, bounds: &[u64]) -> u64 {
+    bounds.iter().copied().fold(envelope.expires_at(), u64::min)
+}
+
+/// An envelope is expired once the clock passes `expires_at`, with the same
+/// skew tolerance applied to certificate/grant windows. Takes the EFFECTIVE
+/// expiry (see [`effective_expires_at`]) rather than reading the envelope's
+/// claim directly, so a clamped-to-the-past record is refused as born-expired
+/// instead of being stored under a lifetime nothing authorized.
+fn is_expired_at(effective_expires_at: u64, ctx: &ScopedIngestContext<'_>) -> bool {
+    ctx.now_secs >= effective_expires_at.saturating_add(ctx.skew_secs)
 }
 
 #[cfg(test)]
@@ -686,6 +722,167 @@ mod tests {
         );
         assert_eq!(verified.provider(), f.provider.entity_id());
         assert_eq!(verified.descriptor(), f.descriptor.as_slice());
+    }
+
+    /// §3 — the publisher's `expires_at` is a CEILING request, not a grant of
+    /// lifetime. An owner record may never outlive the membership certificate
+    /// that vouched for its provider.
+    ///
+    /// Before the clamp, `expires_at` was stored verbatim, so an insider could
+    /// publish `u64::MAX` and stay discoverable forever: expiry is not a
+    /// revocation floor (a lapsing certificate raises nothing),
+    /// `saturating_add(skew)` keeps `u64::MAX` unexpired, and no query surface
+    /// re-derived the bound. The rule was enforced on the honest SENDER
+    /// (`mesh.rs` clamps at emission) and nowhere on the untrusted receiver.
+    #[test]
+    fn owner_ingest_clamps_expiry_to_the_provider_certificate() {
+        let provider = provider_kp();
+        let org = OrgKeypair::from_bytes([1u8; 32]);
+        let credential = OwnerAudienceCredential::generate(org.org_id());
+        // Certificate lapses at 12_000 — well before the envelope's claim.
+        let cert_not_after = 12_000;
+        let cert = OrgMembershipCert::issue_at(
+            &org,
+            provider.entity_id().clone(),
+            5,
+            0,
+            cert_not_after,
+            0x1234,
+        );
+        let descriptor = b"owner-capability-descriptor".to_vec();
+        let envelope = ScopedCapabilityAnnouncement::build_owner(
+            &provider,
+            org.org_id(),
+            cert,
+            credential.audience_handle,
+            credential.discovery_key(),
+            3,
+            u64::MAX, // the attacker's claim: never expire
+            &descriptor,
+        )
+        .expect("build owner envelope");
+
+        let floors = OrgRevocationState::empty();
+        let authority = AudienceAuthority::owner(org.org_id(), &credential);
+        let ctx = owner_ctx(org.org_id(), &floors);
+        let verified = verify_scoped_ingest(&envelope, &authority, &ctx).expect("owner ingest");
+
+        assert_eq!(
+            verified.expires_at(),
+            cert_not_after,
+            "the record must be admitted under the CERTIFICATE's lifetime, not \
+             the publisher's claim",
+        );
+        assert_ne!(
+            verified.expires_at(),
+            u64::MAX,
+            "storing the claim verbatim makes the record permanently \
+             discoverable after the certificate lapses",
+        );
+    }
+
+    /// The same rule for a granted record, which has TWO ceilings: the
+    /// provider's certificate and the grant that authorized the discovery.
+    /// Without the grant bound, a grantor org could mint providers whose
+    /// records outlive the grant itself.
+    #[test]
+    fn granted_ingest_clamps_expiry_to_the_grant() {
+        let now = current_timestamp();
+        let provider = provider_kp();
+        let issuer = OrgKeypair::from_bytes([1u8; 32]); // B
+        let a_org = OrgKeypair::from_bytes([9u8; 32]).org_id(); // A
+        let (grant, secret) = OrgCapabilityGrant::try_issue(
+            &issuer,
+            a_org,
+            CapabilityAuthorityId::for_tag("nrpc:svc"),
+            GrantRights::INVOKE.union(GrantRights::DISCOVER),
+            exact_target(&provider),
+            3600,
+        )
+        .expect("issue grant");
+        let secret = secret.expect("discover mints a secret");
+        // Certificate deliberately OUTLIVES the grant, so the grant is the
+        // binding ceiling and the assertion cannot pass by accident on the
+        // certificate bound alone.
+        let cert = OrgMembershipCert::issue_at(
+            &issuer,
+            provider.entity_id().clone(),
+            5,
+            now.saturating_sub(3600),
+            now + 100_000,
+            0x1234,
+        );
+        let descriptor = CapabilitySet::new().add_tag("nrpc:svc").to_bytes_compact();
+        let envelope = ScopedCapabilityAnnouncement::build_granted(
+            &provider,
+            issuer.org_id(),
+            cert.clone(),
+            grant.grant_id,
+            secret.audience_handle,
+            secret.discovery_key(),
+            4,
+            u64::MAX, // the attacker's claim
+            &descriptor,
+        )
+        .expect("build granted envelope");
+
+        let floors = OrgRevocationState::empty();
+        let authority = AudienceAuthority::granted(&grant, &secret);
+        let ctx = granted_ctx(a_org, now, &floors);
+        let verified = verify_scoped_ingest(&envelope, &authority, &ctx).expect("granted ingest");
+
+        assert_eq!(
+            verified.expires_at(),
+            grant.not_after,
+            "a granted record must be bounded by the GRANT, which here expires \
+             before the provider certificate",
+        );
+        assert!(
+            grant.not_after < cert.not_after,
+            "precondition: the grant must be the shorter ceiling, else this \
+             test would pass on the certificate bound alone",
+        );
+    }
+
+    /// A record whose clamp puts it in the PAST is born-expired and refused,
+    /// rather than stored under a lifetime nothing authorized.
+    #[test]
+    fn a_record_clamped_into_the_past_is_refused_as_expired() {
+        let provider = provider_kp();
+        let org = OrgKeypair::from_bytes([1u8; 32]);
+        let credential = OwnerAudienceCredential::generate(org.org_id());
+        // Certificate already lapsed relative to NOW (10_000) + SKEW.
+        let cert = OrgMembershipCert::issue_at(
+            &org,
+            provider.entity_id().clone(),
+            5,
+            0,
+            NOW - (SKEW * 2),
+            0x1234,
+        );
+        let descriptor = b"owner-capability-descriptor".to_vec();
+        let envelope = ScopedCapabilityAnnouncement::build_owner(
+            &provider,
+            org.org_id(),
+            cert,
+            credential.audience_handle,
+            credential.discovery_key(),
+            3,
+            u64::MAX,
+            &descriptor,
+        )
+        .expect("build owner envelope");
+
+        let floors = OrgRevocationState::empty();
+        let authority = AudienceAuthority::owner(org.org_id(), &credential);
+        let ctx = owner_ctx(org.org_id(), &floors);
+        // NB: the lapsed certificate is ALSO caught by the membership window
+        // check, so this asserts only that the composition refuses — it does
+        // not claim the clamp is the sole reason.
+        assert!(
+            verify_scoped_ingest(&envelope, &authority, &ctx).is_err(),
+            "a record with no live credential behind it must not be stored",
+        );
     }
 
     /// §9 — a node its OWN org has revoked stops ingesting scoped

@@ -90,6 +90,33 @@ impl ScopedDiscoveryStore {
     /// capacity-gated.
     const MAX_ENTRIES: usize = 8192;
 
+    /// Per-scope cap: no single audience may occupy more than this many of the
+    /// [`Self::MAX_ENTRIES`] slots.
+    ///
+    /// The global cap alone is a bound that is correct in isolation and does
+    /// not COMPOSE. Owner-scoped discovery and every installed grant share one
+    /// budget, so a single grantor org — which owns its org key and can mint
+    /// provider certificates for free — could publish 8192 valid envelopes
+    /// under one DISCOVER grant and permanently occupy the whole store,
+    /// including the slots this node needs for its OWN owner-scoped
+    /// capabilities.
+    ///
+    /// That was reachable specifically because the fail-closed cardinality fix
+    /// (which is correct, and stays) removed eviction: the earlier
+    /// evict-to-low-water version self-healed, whereas fail-closed plus an
+    /// attacker-chosen retention horizon does not. Clamping `expires_at` at
+    /// ingest bounds the horizon; this bounds the blast radius per audience,
+    /// so exhausting one scope cannot deny any other.
+    ///
+    /// Sized so the owner partition plus a full complement of installed grants
+    /// each get a meaningful share rather than racing for one pool.
+    const MAX_ENTRIES_PER_SCOPE: usize = 1024;
+
+    /// Live + tombstoned entries currently held for `scope`.
+    fn entries_in_scope(&self, scope: &CapabilityAudienceScope) -> usize {
+        self.entries.keys().filter(|(s, _)| s == scope).count()
+    }
+
     /// Ingest a verified scoped capability. At most one entry is kept per
     /// `(scope, provider)`; the newest generation wins, and an older-or-equal
     /// generation is [`ScopedStoreOutcome::Stale`] and ignored. A `Public` scope
@@ -134,6 +161,17 @@ impl ScopedDiscoveryStore {
                 if self.entries.len() >= Self::MAX_ENTRIES {
                     self.sweep_expired(now_secs);
                     if self.entries.len() >= Self::MAX_ENTRIES {
+                        return ScopedStoreOutcome::AtCapacity;
+                    }
+                }
+                // Per-scope share, checked AFTER the global sweep so a
+                // reclaimable slot in this scope is counted. Same fail-closed
+                // discipline: refuse the new key rather than evict a live one,
+                // so one audience filling its share can never roll back
+                // another audience's freshness — or its own.
+                if self.entries_in_scope(capability.scope()) >= Self::MAX_ENTRIES_PER_SCOPE {
+                    self.sweep_expired(now_secs);
+                    if self.entries_in_scope(capability.scope()) >= Self::MAX_ENTRIES_PER_SCOPE {
                         return ScopedStoreOutcome::AtCapacity;
                     }
                 }
@@ -340,6 +378,26 @@ mod tests {
         )
     }
 
+    /// Build a capability in an ARBITRARY scope, so a test can exercise the
+    /// per-scope share (§4) rather than only the owner partition.
+    fn scoped_cap_in(
+        scope: CapabilityAudienceScope,
+        provider_index: u64,
+        generation: u64,
+        expires_at: u64,
+    ) -> VerifiedScopedCapability {
+        VerifiedScopedCapability::for_test(
+            scope,
+            provider_n(provider_index),
+            org(1),
+            generation,
+            expires_at,
+            FIXTURE_CERT_GEN,
+            Some([0x5Au8; 64]),
+            b"granted-descriptor".to_vec(),
+        )
+    }
+
     /// OA3-5b (Kyra closure): a distinct-provider flood is bounded at
     /// MAX_ENTRIES and refused FAIL-CLOSED (`AtCapacity`) — never by evicting a
     /// known provider's unexpired high-water mark. Updates to known keys are
@@ -347,26 +405,84 @@ mod tests {
     #[test]
     fn ingest_bounds_cardinality_fail_closed_under_a_distinct_provider_flood() {
         let mut store = ScopedDiscoveryStore::new();
-        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES as u64 {
+        // A single-audience flood is now bounded by the PER-SCOPE share, which
+        // binds before the global cap (§4).
+        let cap = ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE;
+        for index in 0..cap as u64 {
             assert_eq!(
                 store.ingest(owner_cap_n(index, 1, 10_000), 1),
                 ScopedStoreOutcome::Inserted
             );
         }
-        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        assert_eq!(store.len(), cap);
         // A further DISTINCT provider is refused; nothing is evicted (every entry
         // is in-horizon at now=1, so the fail-closed sweep frees no slot).
         assert_eq!(
             store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
             ScopedStoreOutcome::AtCapacity
         );
-        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        assert_eq!(store.len(), cap);
         // An UPDATE to an already-known key is never capacity-gated.
         assert_eq!(
             store.ingest(owner_cap_n(0, 2, 10_000), 1),
             ScopedStoreOutcome::Updated
         );
-        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        assert_eq!(store.len(), cap);
+    }
+
+    /// §4 — exhausting ONE audience must not deny any other.
+    ///
+    /// `MAX_ENTRIES` alone is a bound that is correct in isolation and does not
+    /// compose: owner discovery and every installed grant shared one 8192-slot
+    /// pool, so a single grantor org — which owns its org key and mints
+    /// provider certificates for free — could fill the whole store under one
+    /// DISCOVER grant and lock this node out of its OWN owner-scoped
+    /// capabilities.
+    ///
+    /// That became reachable when eviction was (correctly) removed for the
+    /// rollback-preservation fix: the earlier evict-to-low-water version
+    /// self-healed, fail-closed does not.
+    #[test]
+    fn one_exhausted_scope_never_denies_another() {
+        let mut store = ScopedDiscoveryStore::new();
+        let hostile = CapabilityAudienceScope::Grant {
+            grant_id: [0x7Au8; 32],
+            audience_handle: [0x7Bu8; 32],
+        };
+
+        // A hostile grantor fills its entire share.
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
+            assert_eq!(
+                store.ingest(scoped_cap_in(hostile.clone(), index, 1, 10_000), 1),
+                ScopedStoreOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            store.ingest(scoped_cap_in(hostile.clone(), u64::MAX, 1, 10_000), 1),
+            ScopedStoreOutcome::AtCapacity,
+            "the hostile scope must be capped at its own share",
+        );
+
+        // The owner partition is untouched and still admits.
+        assert_eq!(
+            store.ingest(owner_cap_n(0, 1, 10_000), 1),
+            ScopedStoreOutcome::Inserted,
+            "a flooded grant scope must not deny owner-scoped discovery",
+        );
+        // As does an unrelated grant.
+        let other = CapabilityAudienceScope::Grant {
+            grant_id: [0x0Cu8; 32],
+            audience_handle: [0x0Du8; 32],
+        };
+        assert_eq!(
+            store.ingest(scoped_cap_in(other, 0, 1, 10_000), 1),
+            ScopedStoreOutcome::Inserted,
+            "a flooded grant scope must not deny an unrelated grant",
+        );
+
+        // And the global cap is nowhere near reached — proving the per-scope
+        // share, not the global bound, is what stopped the flood.
+        assert!(store.len() < ScopedDiscoveryStore::MAX_ENTRIES);
     }
 
     /// OA3-5b (Kyra closure): capacity pressure never rolls a known provider's
@@ -380,11 +496,13 @@ mod tests {
             store.ingest(owner_cap_n(0, 2, 10_000), 1),
             ScopedStoreOutcome::Inserted
         );
-        // Fill the rest of the store to capacity with distinct providers.
-        for index in 1..ScopedDiscoveryStore::MAX_ENTRIES as u64 {
+        // Fill this scope's share with distinct providers. The per-scope cap
+        // (§4) binds before the global one for a single-audience flood, which
+        // is the pressure this test is about.
+        for index in 1..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
             store.ingest(owner_cap_n(index, 1, 10_000), 1);
         }
-        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES);
+        assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE);
         // A brand-new provider is refused rather than evicting P's high-water.
         assert_eq!(
             store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
