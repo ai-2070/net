@@ -1160,6 +1160,103 @@ fn validate_unix_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
     Ok(())
 }
 
+/// §12 — the Windows counterpart of [`validate_unix_ancestor_chain`].
+///
+/// The Unix walk refuses an authority directory whose ANCESTORS are writable
+/// by another account, on the stated grounds that "another account with write
+/// access to that ancestor could rename the owned authority directory's entry
+/// and plant a replacement". Windows had no counterpart at all: for a
+/// PRE-EXISTING directory only the leaf's owner and DACL were validated, so
+/// the module doc's claim to protect a custom nested path held on one platform
+/// only.
+///
+/// Two of the three attacks that gap allowed are now closed elsewhere, and
+/// saying which matters, because it bounds what this walk is actually for:
+///
+///   * SUBSTITUTION (plant a replacement directory) already failed closed —
+///     an attacker-created directory is owned by the attacker and
+///     `validate_dacl_view`'s owner rule refuses it, and a junction is refused
+///     because Rust's `FileType::is_dir()` is false for a name-surrogate
+///     reparse point.
+///   * ACE PROPAGATION from an ancestor is closed by the §20-residual
+///     inheritance severing in `validate_existing_dir_dacl`.
+///   * DELETION is what remains, and it is why this exists: a parent-owner can
+///     remove `owner-membership.json` and downgrade the node to "no owner
+///     installed". §2's audience-org binding now stops that becoming a
+///     cross-org key inheritance, but the downgrade itself is still a
+///     denial-of-service an ancestor's owner should not be able to cause.
+///
+/// Ownership is the criterion, not the DACL: on Windows an object's owner
+/// holds implicit `WRITE_DAC` regardless of what the ACL says, so a foreign
+/// owner anywhere on the chain can re-grant itself write access at will —
+/// exactly the reasoning `validate_dacl_view` already applies to the leaf.
+#[cfg(windows)]
+fn validate_windows_ancestor_chain(dir: &Path) -> Result<(), OrgAuthorityError> {
+    let io = |e: std::io::Error| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("authority directory ancestor: {e}"),
+    };
+    // `dir` may not exist yet (create path): find the deepest EXISTING
+    // ancestor, then canonicalize so symlinked components resolve to the real
+    // chain that will actually be traversed.
+    let mut cursor = dir;
+    let existing = loop {
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if parent.exists() {
+                    break parent;
+                }
+                cursor = parent;
+            }
+            _ => return Ok(()),
+        }
+    };
+    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
+        path: dir.display().to_string(),
+        reason: format!("resolve current user SID: {e}"),
+    })?;
+    const LOCAL_SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const TRUSTED_INSTALLER: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    let trusted = |sid: &str| {
+        sid == user_sid || sid == LOCAL_SYSTEM || sid == ADMINISTRATORS || sid == TRUSTED_INSTALLER
+    };
+
+    let real = std::fs::canonicalize(existing).map_err(io)?;
+    for ancestor in real.ancestors() {
+        // A drive root (`\\?\C:\`) has no meaningful owner to check and is
+        // administered by the system; stop rather than refuse every path on
+        // the volume.
+        if ancestor.parent().is_none() {
+            break;
+        }
+        let view = match read_object_security(ancestor) {
+            Ok(view) => view,
+            // An ancestor we cannot READ the descriptor of is not evidence of
+            // compromise — it is commonly a permissions boundary above the
+            // user's profile. Fail OPEN here deliberately: the leaf checks are
+            // what carry the security property, and refusing every node whose
+            // `C:\Users` is opaque would make the product unusable for a
+            // hardening that is defense in depth.
+            Err(_) => continue,
+        };
+        if !trusted(&view.owner_sid) {
+            return Err(OrgAuthorityError::InsecureAuthorityDir {
+                path: dir.display().to_string(),
+                reason: format!(
+                    "ancestor {} is owned by untrusted principal {} — that owner holds \
+                     implicit WRITE_DAC over the component and can remove or replace the \
+                     authority directory's entry through it, whatever the authority \
+                     directory's own ACL says",
+                    ancestor.display(),
+                    view.owner_sid
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 /// The current process user's SID, copied into an aligned owned buffer derived
 /// from the process access token — NOT from `USERNAME` (spoofable). Returned as
 /// `Vec<u32>` so `as_ptr()` is 4-byte aligned: a `SID`'s trailing
@@ -1874,7 +1971,15 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                 // older or aborted run must NOT be adopted merely because it
                 // exists — that was the operator-asserted downgrade Kyra flagged.
                 #[cfg(windows)]
-                validate_existing_dir_dacl(dir)?;
+                {
+                    // §12 — the ancestor chain first, mirroring the Unix
+                    // ordering: a component another account owns can have the
+                    // authority directory's entry removed through it whatever
+                    // the leaf's own ACL says, so validating the leaf first
+                    // would be checking the wrong thing in the wrong order.
+                    validate_windows_ancestor_chain(dir)?;
+                    validate_existing_dir_dacl(dir)?;
+                }
                 #[cfg(not(windows))]
                 tracing::debug!(
                     path = %dir.display(),
@@ -1890,8 +1995,15 @@ fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
                 // behind, so a retry cannot adopt an insecure residue.
                 #[cfg(windows)]
                 {
+                    // §12 — validate the existing part of the chain BEFORE
+                    // creating into it, then RE-validate the completed chain,
+                    // exactly as the Unix path does. The second pass closes the
+                    // race where another account creates an intermediate
+                    // between the pre-check and the create.
+                    validate_windows_ancestor_chain(dir)?;
                     let sid = process_user_sid().map_err(io)?;
                     create_missing_components_owner_only(dir, &sid).map_err(io)?;
+                    validate_windows_ancestor_chain(dir)?;
                 }
                 #[cfg(not(windows))]
                 {
@@ -3308,6 +3420,81 @@ mod tests {
         }
     }
 
+    /// §12 — the Windows ancestor walk runs, accepts a normal chain, and
+    /// refuses a foreign-owned component.
+    ///
+    /// The refusal half cannot be produced end-to-end without a second user
+    /// account, so it is driven through the same pure-view seam the §3 owner
+    /// rule uses. The ACCEPT half is live: every test in this file adopts under
+    /// `%TEMP%`, whose chain is `C:\Users\<me>\AppData\Local\Temp` — a real,
+    /// multi-component, user-and-system-owned path. If the walk were too
+    /// strict (or the trusted set too narrow), all 30+ of them would fail
+    /// rather than this one, which is a stronger signal than any single
+    /// assertion here.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_chain_accepts_a_normal_path() {
+        let scratch = Scratch::new();
+        let nested = scratch.dir().join("a").join("b");
+
+        // A chain rooted in the user's own profile validates, including the
+        // not-yet-created components.
+        validate_windows_ancestor_chain(&nested)
+            .expect("a user-owned ancestor chain must validate");
+
+        // And once created, it still validates — the post-creation re-check in
+        // `ensure_secure_authority_dir` depends on this.
+        std::fs::create_dir_all(&nested).expect("create nested");
+        validate_windows_ancestor_chain(&nested).expect("the completed chain must validate too");
+    }
+
+    /// The refusal half of §12, driven purely: a foreign-owned ancestor is
+    /// rejected because that owner holds implicit WRITE_DAC over the component
+    /// and can remove the authority directory's entry through it — whatever
+    /// the authority directory's own ACL says.
+    ///
+    /// This mirrors `validate_dacl_view`'s §3 rule one level up, and the
+    /// two views below differ ONLY in the owner, so the refusal is
+    /// attributable to ownership alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_foreign_owned_ancestor_is_refused() {
+        let user = current_process_sid_string().expect("user sid");
+        let foreign = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let dir = Path::new("C:\\ProgramData\\net-authority");
+        let ace = AceInfo {
+            sid: user.clone(),
+            mask: 0x001F_01FF,
+            ace_type: 0,
+            flags: 0x03,
+        };
+
+        // Owner trusted -> the ACE list is not itself a cause for refusal.
+        let ours = DaclView {
+            owner_sid: user.clone(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![ace.clone()],
+        };
+        validate_dacl_view(&ours, &user, dir).expect("a user-owned component validates");
+
+        // Only the owner differs.
+        let theirs = DaclView {
+            owner_sid: foreign.to_string(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![ace],
+        };
+        let err = validate_dacl_view(&theirs, &user, dir)
+            .expect_err("a foreign-owned component must be refused");
+        match &err {
+            OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
+                reason.contains("WRITE_DAC") && reason.contains(foreign),
+                "the refusal must explain WHY ownership is the criterion; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+    }
     /// §20 residual, LIVE on NTFS: adopting into a pre-existing directory that
     /// inherits from its parent SEVERS that inheritance, so an ancestor cannot
     /// later propagate access onto the authority files.
