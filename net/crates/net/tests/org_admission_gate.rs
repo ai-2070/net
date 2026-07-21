@@ -224,12 +224,28 @@ async fn provider_with_expired_cert_cannot_admit() {
     // Valid immediately after install.
     assert!(verify_provider_authority(&node, &ClockSample::now()).is_ok());
 
-    // Let the window close (> 2s so the second-granularity not_after
-    // is definitely reached).
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
-
+    // §T9 — advance the CLOCK SAMPLE rather than sleeping.
+    //
+    // This slept 2500 ms against a 2 s certificate: a 500 ms margin on a
+    // second-granularity `not_after`, under a suite that runs tests in
+    // parallel on an oversubscribed CI CPU. That is a flake waiting for a
+    // loaded runner, and a flake in a security suite is worse than a gap —
+    // `.config/nextest.toml` gives these binaries `retries = 0` precisely so
+    // an intermittent signal is not retried into green, so this would fail the
+    // job outright.
+    //
+    // `verify_provider_authority` reads the SUPPLIED sample (pinned by
+    // `provider_self_verify_reads_the_supplied_clock_sample` below), so a
+    // sample past `not_after` is exactly equivalent and deterministic. It also
+    // removes 2.5 s of wall time from every run.
+    let expired_sample = ClockSample {
+        wall_ns: ClockSample::now()
+            .wall_ns
+            .saturating_add(10 * 1_000_000_000),
+        monotonic: std::time::Instant::now(),
+    };
     assert_eq!(
-        verify_provider_authority(&node, &ClockSample::now()).map(|_| ()),
+        verify_provider_authority(&node, &expired_sample).map(|_| ()),
         Err(AdmissionDenied::ProviderAuthorityUnavailable),
         "an expired owner cert cannot admit",
     );

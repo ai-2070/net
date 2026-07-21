@@ -861,6 +861,26 @@ async fn owner_scoped_residue_is_stripped_from_the_plaintext_announcement() {
         "owner-scoped baseline residue stripped from plaintext; unrelated tag kept",
     );
 
+    // §T8 — `wait_until` returns on the FIRST instant the condition holds, and
+    // there are two independent re-announce paths (the explicit announce and
+    // serve's spawned one). If one of them regressed to republish
+    // `nrpc:secret`, this could catch the other's good state and pass while
+    // the leak landed a moment later. Re-assert after a settling window so the
+    // property is STABLE rather than merely reached.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let settled = server
+        .local_announcement_for_test()
+        .expect("an announcement is published by now");
+    assert!(
+        !settled.capabilities.has_tag("nrpc:secret"),
+        "the owner-scoped tag reappeared in plaintext after convergence — a \
+         second re-announce path is republishing the baseline residue",
+    );
+    assert!(
+        settled.capabilities.has_tag("region:eu-west"),
+        "the unrelated baseline tag must survive the strip",
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1253,6 +1273,42 @@ async fn overlapping_grants_emit_two_independently_decryptable_envelopes() {
 async fn an_unrelated_capability_grant_emits_no_granted_envelope() {
     let (p, _h, dir, entity, org_b) = granted_provider(0x72, "none", "cross").await;
     let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    // §T6 — establish the MATCHING case first, so the zero below is a
+    // transition rather than the initial state.
+    //
+    // `converge_scoped_count(p, 0)` polls for "count == 0", and 0 is exactly
+    // what the provider starts with: on iteration 1 it returns true whether or
+    // not any rebuild has happened. For `n > 0` the helper is self-validating
+    // (it must observe the positive state), but the n == 0 form proved nothing
+    // on its own. Driving 1 → 0 makes the emission machinery demonstrably live
+    // before the negative is asserted.
+    let (matching, matching_secret) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:cross"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(entity.clone()),
+        3600,
+    )
+    .expect("issue matching");
+    let matching_id = matching.grant_id;
+    p.install_provider_grant_audience(matching, matching_secret.expect("secret"))
+        .expect("install matching");
+    assert!(
+        converge_scoped_count(&p, 1).await,
+        "precondition: a grant that DOES name the local service emits one \
+         envelope — without this, the zero asserted below is indistinguishable \
+         from a provider that never emitted anything",
+    );
+    assert!(
+        p.remove_provider_grant_audience(&matching_id),
+        "the matching grant must actually be removed",
+    );
+    assert!(
+        converge_scoped_count(&p, 0).await,
+        "removing the matching grant retracts its envelope",
+    );
 
     // A valid grant that covers this provider but names a DIFFERENT capability.
     let (grant, secret) = OrgCapabilityGrant::try_issue(
@@ -2650,6 +2706,17 @@ async fn live_two_node_cross_org_granted_admit() {
 /// admission engine runs: the handler stays dark and S receives 0x0009. `call`
 /// blocks on the denial response, so the witness is race-free.
 #[tokio::test]
+// §T4 SCOPE — this proves the call is DENIED (0x0009) with the handler dark.
+// It does NOT prove WHICH check denied it. The wire status is coarse by
+// design, so "denied at the possession precheck, before the admission engine"
+// is not observable from here; a regression that moved the check after
+// credential verification, or one where the injected empty announcement broke
+// something else that denies first, would still pass.
+//
+// The ordering itself is pinned in-crate, where it is reachable: the
+// provider-bridge denial matrices in `mesh_rpc.rs` drive
+// `admit_and_dispatch_protected` directly and distinguish the reasons. Do not
+// strengthen the assertion here — the coarse byte is the security property.
 async fn live_two_node_protected_missing_local_capability_denies() {
     const CALLER_SEED: [u8; 32] = [0x1du8; 32];
     let server = build_node_with(EntityKeypair::generate()).await;
@@ -3001,6 +3068,13 @@ async fn live_two_node_public_capability_unchanged_beside_protected() {
     );
     assert!(
         !saw_proof.load(Ordering::SeqCst),
+        // §T7 — this call attaches no `org_proof_intent`, so no header is ever
+        // minted: the assertion restates its own precondition and would pass
+        // with the public-bridge stripper deleted outright. Kept as a
+        // regression tripwire for the SHAPE of this test, not as evidence of
+        // stripping — that is
+        // `live_two_node_public_handler_never_sees_proof_header`, which
+        // actually attaches a proof and is falsifiable.
         "the public handler saw no org-admission proof header",
     );
 

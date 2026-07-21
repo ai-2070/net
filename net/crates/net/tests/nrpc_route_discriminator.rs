@@ -271,6 +271,30 @@ async fn route_absent_from_bucket_is_dropped() {
         c.fired2.lock().is_empty(),
         "ch2 must not fire for a foreign route"
     );
+
+    // §T5 — IN-TEST positive control, on THIS fixture.
+    //
+    // Everything above is "nothing fired", which a broken fixture satisfies
+    // perfectly: if the subscription, publish roster or session had silently
+    // regressed, the frame would never arrive and this test would pass while
+    // proving nothing about the route discriminator. The positive control
+    // elsewhere in the file runs against a DIFFERENT `Collision::new()`
+    // instance, so it cannot vouch for this one.
+    //
+    // A known-good frame on the same fixture, after the negative, establishes
+    // that delivery works here and that the drop above was a DECISION.
+    c.deliver(rpc_frame(DISPATCH_RPC_REQUEST, c.ch1.hash(), b"body"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !c.fired1.lock().is_empty(),
+        "the fixture must deliver a well-routed frame — without this the \
+         assertions above pass on a dead fixture",
+    );
+    assert!(
+        c.fired2.lock().is_empty(),
+        "and still only to the addressed dispatcher",
+    );
 }
 
 /// Witness 7: an nRPC-typed frame too short to carry the route
@@ -289,5 +313,23 @@ async fn malformed_route_is_dropped() {
     assert!(
         c.fired1.lock().is_empty() && c.fired2.lock().is_empty(),
         "a route-less RPC frame must be dropped, not delivered",
+    );
+
+    // §T5 — same in-test positive control as the sibling negative: prove this
+    // fixture delivers, so "nothing fired" is a decision rather than a dead
+    // harness.
+    //
+    // NB the name overstates slightly and is worth knowing: a 24-byte frame
+    // could be rejected by any length check on the way in, not necessarily by
+    // the route discriminator itself. What is pinned is that a frame too short
+    // to CARRY a route is never delivered under a truncated read — which is
+    // the property that matters — not the identity of the check that drops it.
+    c.deliver(rpc_frame(DISPATCH_RPC_REQUEST, c.ch2.hash(), b"body"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !c.fired2.lock().is_empty(),
+        "the fixture must deliver a well-routed frame — without this the \
+         assertion above passes on a dead fixture",
     );
 }
