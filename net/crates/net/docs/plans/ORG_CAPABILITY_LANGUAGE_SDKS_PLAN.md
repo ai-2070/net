@@ -15,15 +15,25 @@ a discovery key in garbage-collected memory.
 
 ## Status
 
-**v0.2 — applies Kyra's review (2026-07-21).** Product surface and binding
-doctrine **SIGNED OFF**; five narrow corrections applied — (1) R2 is a NEW
+**v0.3 (2026-07-21).** Product and binding architecture **SIGNED OFF**;
+**Workstream R is AUTHORIZED**. Individual language workstreams still activate
+only on a named consumer for that language.
+
+v0.2 applied Kyra's five architecture findings — (1) R2 is a NEW
 security-sensitive loader, not reuse of an existing helper (§D2a); (2)
 canonical `OrgCaller` is marshaled, never reshaped for the C ABI (§R4); (3) the
 C ABI takes a typed arc and exact ownership, and drops the dishonest
 "idempotent" free (§D7); (4) an unclassifiable error becomes `org:unknown`,
 never a counterfeit admission denial (§D5a); (5) rollout follows named
-consumers rather than hardcoding C+G first (§Rollout). Plus the Node
-acceptance witness now asserts the *blocking* behavior it documents.
+consumers (§Rollout).
+
+v0.3 closes three internal inconsistencies in that revision: the R2 bullet
+still carried the superseded "reuse the CLI's 0600 gate" wording; the
+`Box<OrgAudienceSecret>` claim was withdrawn because it does not compose with
+the by-value credential pipeline and only postpones the move (§D2a); and Go's
+promised `Call(ctx, …)` had no deadline or cancel token in the C ABI to make it
+real, so `net_org_call` now carries both (§D6a). G3 also pins the `MeshRpc`
+close/finalizer ordering explicitly.
 
 **Design only. Not started.** Activation gates on Workstream R (§R), which is
 Rust-side work that must land before any binding can compile against the
@@ -220,8 +230,9 @@ returns the secret to its caller**.
 **Consequence, stated plainly:** a language SDK cannot construct credentials
 entirely in memory. That is deliberate. An application that wants to fetch
 credentials from a secret manager writes them to a 0600 file (or a tmpfs path)
-first — the same thing the CLI does, and the same trust boundary
-`ensure_secure_authority_dir` already polices.
+first — the same thing the CLI does. `ensure_secure_authority_dir` is the
+**model** for that trust boundary, not a loader that already covers arbitrary
+grant-secret paths; §D2a builds the grant-side equivalent.
 
 ### D2a. The grant-side secret loader is NEW code, not reuse
 
@@ -240,16 +251,17 @@ gate." That was wrong, and the substrate says so explicitly.
 So R2 builds a narrow canonical loader mirroring `read_audience_checked`
 (`org_authority.rs:2269`), which is the only correct model in the tree:
 
-1. open **without following** symlinks / reparse points
+1. validate the **trusted ancestor chain** — *before* opening, matching the
+   authority loader's ordering;
+2. open **without following** symlinks / reparse points
    (`org_revocation::open_regular_nofollow`);
-2. verify the already-open object is a **regular file**;
-3. validate ownership and permissions **on the opened descriptor** — Unix uses
+3. verify the already-open object is a **regular file**;
+4. validate ownership and permissions **on the opened descriptor** — Unix uses
    `file.metadata()`, never `metadata(path)` followed by `open(path)`;
-4. on Windows validate the **file's own protected DACL**, not merely its
+5. on Windows validate the **file's own protected DACL**, not merely its
    containing directory — the §11 correction `read_audience_checked` already
    carries, which exists precisely because org-wide key distribution means the
    file may arrive from a share or a restore tool with its own explicit ACE;
-5. validate the trusted ancestor chain;
 6. read exactly `OrgAudienceSecret::ENCODED_SIZE` into a **scrub-on-drop**
    buffer (the CLI's `ScrubbedBytes` shape), never `std::fs::read`, whose
    `Vec` leaves the key in freed heap reachable from a core dump or swap;
@@ -258,13 +270,39 @@ So R2 builds a narrow canonical loader mirroring `read_audience_checked`
 9. scrub the input buffer on **every** path, success and failure alike, and
    never let key bytes reach a log, an error `Display`, or a `Debug`.
 
-**A residual to not multiply.** `decode_config`'s §27/§29 note records that
-both codecs move key material *by value*, and a Rust move is a memcpy that does
-not run `Drop` on the source — so each construction hop strands an unscrubbed
-copy in a dead stack frame. A loader adds hops. The loader should therefore
-return `Box<OrgAudienceSecret>` (the fix that note names) rather than widening
-the residual it inherits, and R2's review should check that it did not add a
-by-value hop.
+Steps 1 and 2–5 close different windows: ancestor validation first establishes
+that the path is in a trusted location, and validating the *already-open*
+object then closes the file-level TOCTOU a path-based check would leave.
+
+**The pre-existing by-value residual is accepted, not multiplied.**
+`decode_config`'s §27/§29 note records that both codecs move key material *by
+value*, and a Rust move is a memcpy that does not run `Drop` on the source — so
+each construction hop strands an unscrubbed copy in a dead stack frame.
+
+An earlier draft said the loader should return `Box<OrgAudienceSecret>` to
+close this. **It does not, and that claim is withdrawn.** The implemented
+pipeline is by-value end to end —
+`OrgCredentials { audience_secrets: Vec<OrgAudienceSecret> }` → `into_parts` →
+`Vec<(OrgCapabilityGrant, OrgAudienceSecret)>` → `OrgAudienceLeases::acquire` →
+grant-registry install. A boxed return merely postpones the move to
+`let secret: OrgAudienceSecret = *boxed;`. Preserving the box end to end would
+mean changing `OrgCredentials`, `into_parts`, audience pairing, lease
+acquisition, and probably registry installation — a secret-ownership refactor
+far wider than a language-binding plan has earned.
+
+The bounded contract instead:
+
+> The loader reads into scrub-on-drop input storage and hands the decoded
+> `OrgAudienceSecret` directly into the existing credential pipeline. It must
+> not introduce **additional** intermediate copies.
+>
+> The pre-existing §27/§29 by-value construction residual remains explicitly
+> accepted, and is not multiplied into language memory. Closing it end to end
+> requires a separate ownership refactor through `OrgCredentials` and the
+> audience registry; OSDK-L does not attempt it.
+
+R2's review checks that the loader added no new by-value hop — not that it
+eliminated the inherited ones.
 
 This is still narrow work, but it is **new security-sensitive code with its own
 review**, not plumbing. It is the single highest-risk item in this plan.
@@ -429,8 +467,37 @@ exactly what X3's drift guards exist to make loud. A binding that never emits
 |---|---|---|
 | TS | `async call(...): Promise<Resp>` (plain `#[napi] pub async fn`) | sync, returns a handle |
 | Python | `OrgClient.call` (GIL released via `py.detach`) **and** `AsyncOrgClient.call` via `pyo3-async-runtimes`, with `async_bridge` cancel guards | sync, returns a handle; handler may be sync or a coroutine |
-| Go | `Call(ctx, service, req)` — ctx only on the unary call, matching `MeshRpc.Call` | `ServeOrg(...)`, no ctx |
-| C | blocking | dispatcher + reserved id |
+| Go | `Call(ctx, service, req)` — ctx only on the unary call, matching `MeshRpc.Call`, with **real** deadline + cancellation semantics (§D6a) | `ServeOrg(...)`, no ctx |
+| C | blocking, with explicit `deadline_ms` + `cancel_token` | dispatcher + reserved id |
+
+### D6a. Go's `ctx` must be real, or must not exist
+
+`MeshRpc.Call(ctx, ...)` has genuine semantics today: the context deadline
+becomes `deadline_ms` across C, and cancellation mints a token that reaches
+Rust's `CancelRegistry`, drops the future, and puts a CANCEL frame on the wire.
+
+An earlier draft promised `OrgClient.Call(ctx, ...)` over a C function that
+carried **neither** a deadline nor a cancel token. That wrapper could only
+abandon its own wait while the blocking cgo call continued underneath — the
+worst possible outcome, because the caller would believe a call was cancelled
+while it was still executing, and an org call's execution is *authorized side
+effect*, not a read.
+
+Resolved by mirroring the existing cancellable C doctrine: `net_org_call` takes
+`deadline_ms` and `cancel_token`, `net_org_reserve_cancel_token` mints the
+token before the call, and `net_org_cancel_call` drops that one future. Go then
+wires `ctx` exactly as `mesh_rpc.go` does — `contextDeadlineMs(ctx)` plus an
+`installCancelWatcher` goroutine.
+
+**Cancellation drops one future and never retries.** That is not a new rule; it
+is the facade's existing no-resend contract reaching the C ABI: a signed proof
+is bound to one `call_id`, and any second attempt must be a fresh call minted
+by the application.
+
+The rejected alternative is recorded because it remains available if the
+cancellation plumbing proves disproportionate: **drop `context.Context` from Go
+v1 entirely** and document that the Rust facade owns a fixed timeout. What the
+plan will not do is expose a `ctx` that only cosmetically cancels the Go wait.
 
 ### D7. The C ABI, and Go over it
 
@@ -479,10 +546,24 @@ void net_org_client_free(NetOrgClient** client);
 void net_org_credentials_free(NetOrgCredentials** credentials);
 void net_org_serve_handle_free(NetOrgServeHandle** handle);
 
+/* Deadline and cancellation are execution control, NOT an options object —
+ * they select no provider, no grant, and no authority. Without them a Go
+ * `Call(ctx, ...)` could only cancel its own wait while the request continued,
+ * leaving execution ambiguous; see §D6a. `deadline_ms == 0` means the facade's
+ * default. `cancel_token == 0` means uncancellable. */
 int net_org_call(NetOrgClient* client,
                  const char* service_ptr, size_t service_len,
                  const uint8_t* req_ptr, size_t req_len,
+                 uint64_t deadline_ms, uint64_t cancel_token,
                  uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+
+/* Reserve BEFORE the call so a cancel arriving first cannot race registration
+ * — the doctrine net_rpc_reserve_cancel_token already establishes. */
+uint64_t net_org_reserve_cancel_token(void);
+
+/* Drops the ONE in-flight call future. It never launches a second attempt:
+ * a signed proof is never resent (the facade's no-retry rule). */
+int net_org_cancel_call(NetOrgClient* client, uint64_t cancel_token);
 
 typedef int (*NetOrgHandlerFn)(
     uint64_t handler_id, const net_org_caller_t* caller,
@@ -559,10 +640,15 @@ A language column is "done" when every row is `✅`. Cross-referenced from
 - **R1 — raw-byte duals.** `OrgClient::call_bytes`, `Mesh::serve_org_bytes`
   (§D1). The typed verbs are rewritten on top; a witness asserts the typed path
   is exactly bytes + JSON.
-- **R2 — credential loading.** `OrgCredentials::from_parts(membership_bytes,
-  dispatcher_bytes, grant_bytes, audience_secret_paths)`, reusing the CLI's
-  0600 permission gate. Secrets are read, held, and zeroized entirely inside
-  Rust; no accessor returns one.
+- **R2 — credential loading.** Add
+  `OrgCredentials::from_parts(membership_bytes, dispatcher_bytes, grant_bytes,
+  audience_secret_paths)` using the **new opened-object loader specified by
+  §D2a**. The loader validates the trusted ancestor chain, opens without
+  following symlinks / reparse points, validates the already-open regular file
+  (descriptor metadata on Unix; the file's own protected DACL on Windows),
+  reads into scrub-on-drop storage, rejects trailing bytes, and never returns
+  secret material. Secrets are read, held, and zeroized entirely inside Rust;
+  no accessor returns one.
 - **R3 — the `org:` error vocabulary.** One function
   `OrgSdkError::to_wire_kind() -> (&'static str, String)`; the four domains and
   every kind string frozen here and nowhere else.
@@ -641,8 +727,24 @@ create/serve/call/free.
   `go-tests` CI build (the job enumerates every cdylib by name).
 - **G2** `go/org.go`: `OrgCredentialsConfig` struct + `NewOrgCredentials`.
 - **G3** `NewOrgClient(node, creds)` → `*OrgClient` with `Close()` +
-  `SetFinalizer`, `withHandle` guard shape.
-- **G4** `Call(ctx, service, req)`; typed free functions `OrgCall[Req,Resp]`.
+  `SetFinalizer`. The double-pointer C API removes the *double-free* class, but
+  it does not by itself serialize a finalizer against an explicit `Close()`, so
+  G3 copies the current `MeshRpc` shape exactly:
+
+  ```
+  closed.Swap(true)              // exactly one winner
+  → exclusive handle mutex
+  → runtime.SetFinalizer(client, nil)
+  → C.net_org_client_free(&handle)
+  → handle = nil
+  ```
+
+  Every call holds the **read** lock across the whole cgo invocation
+  (`withHandle` + `runtime.KeepAlive`), and the finalizer calls `Close()`
+  rather than freeing independently.
+- **G4** `Call(ctx, service, req)` with real deadline + cancellation per §D6a
+  (`contextDeadlineMs` + `installCancelWatcher`); typed free functions
+  `OrgCall[Req,Resp]`.
 - **G5** `ServeOrg[Req,Resp]` free function + the Variant-A trampoline.
 - **G6** `OrgError{Kind, Message}` + sentinels + `orgErrorFromCode`.
 - **G7** mirror the contract file into `bindings/go/net/org.go`.
