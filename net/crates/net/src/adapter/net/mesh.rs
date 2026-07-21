@@ -1168,6 +1168,17 @@ struct DispatchCtx {
     /// fleet root.
     #[cfg(feature = "redex")]
     sensing_local_entity_root: sensing::AudienceScopeCommitment,
+    /// §10: the local RPC service registry, so the sensing candidate
+    /// snapshot can refuse to DECLARE a capability this node serves
+    /// under a private visibility.
+    ///
+    /// The self-fold entry deliberately carries every registered service
+    /// regardless of visibility (`has_local_capability` needs that), and
+    /// the sensing audience gate keys on OWNER ROOT rather than grant
+    /// scope — so without this a same-root peer holding no grant could
+    /// confirm a grant-private service exists by probing for it.
+    #[cfg(feature = "redex")]
+    rpc_local_services: Arc<LocalServiceRegistry>,
     /// SI-3: the origin-emission scheduler slot. See the matching
     /// field on `MeshNode`; the dispatch arm feeds it when a
     /// `ProviderRegistration` targets this node.
@@ -2962,6 +2973,23 @@ impl LocalServiceRegistry {
             .collect()
     }
 
+    /// Whether `service` is registered under a PRIVATE visibility
+    /// (owner-scoped or granted-audience).
+    ///
+    /// A direct lookup rather than `owner_scoped_snapshot() ∪ granted_snapshot()`
+    /// because the sensing plane asks this once per inbound interest frame, and
+    /// building two `Vec<String>`s per probe would hand a peer a cheap
+    /// allocation amplifier.
+    pub(super) fn is_private(&self, service: &str) -> bool {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map.get(service).is_some_and(|e| {
+            matches!(
+                e.value().visibility,
+                CapabilityVisibility::OwnerScoped | CapabilityVisibility::GrantedAudience
+            )
+        })
+    }
+
     /// ALL registered service names regardless of visibility — for the LOCAL
     /// self-fold, so `has_local_capability` admits every locally registered
     /// service (§2.4a). This set NEVER reaches the wire.
@@ -3265,6 +3293,50 @@ mod local_service_registry_tests {
         let mut all = reg.all_snapshot();
         all.sort();
         assert_eq!(all, vec!["own-svc".to_string(), "pub-svc".to_string()]);
+    }
+
+    /// §10 — the predicate the sensing plane consults before DECLARING a
+    /// capability.
+    ///
+    /// The self-fold deliberately carries private services so
+    /// `has_local_capability` admits them (§2.4a), and that entry never reaches
+    /// the wire — but the sensing plane reads the same fold and gates on OWNER
+    /// ROOT, not grant scope. A same-root peer holding no grant could therefore
+    /// probe for a granted service and get a branch registration it would not
+    /// otherwise receive, confirming the service exists.
+    ///
+    /// Both private visibilities must answer `true`; a public service and an
+    /// unregistered name must answer `false`, or the sensing plane would stop
+    /// declaring capabilities it legitimately serves.
+    #[test]
+    fn is_private_covers_both_private_visibilities_and_nothing_else() {
+        let (reg, _rx) = registry();
+        reg.insert("pub-svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("own-svc".to_string(), 2, CapabilityVisibility::OwnerScoped);
+        reg.insert(
+            "granted-svc".to_string(),
+            3,
+            CapabilityVisibility::GrantedAudience,
+        );
+
+        assert!(
+            reg.is_private("own-svc"),
+            "an owner-scoped service must not be declared to the sensing plane",
+        );
+        assert!(
+            reg.is_private("granted-svc"),
+            "a granted-audience service must not be declared to the sensing \
+             plane — grant scope must not collapse to owner scope for existence",
+        );
+        assert!(
+            !reg.is_private("pub-svc"),
+            "a PUBLIC service must still be declared, or sensing stops working \
+             for the services it is meant to serve",
+        );
+        assert!(
+            !reg.is_private("never-registered"),
+            "an unregistered name is not private — it is simply absent",
+        );
     }
 }
 
@@ -4493,8 +4565,12 @@ fn sensing_candidate_snapshot_from_parts(
     local_entity_root: sensing::AudienceScopeCommitment,
     local_owner_root: &sensing::AudienceScopeCommitment,
     capability_id: &sensing::CapabilityId,
+    // `is_locally_private`: whether `capability_id` names a service this node
+    // serves under a PRIVATE visibility (owner-scoped or granted-audience).
+    // See the §10 note at the filter below.
+    is_locally_private: impl Fn(&sensing::CapabilityId) -> bool,
 ) -> Vec<sensing::CandidateProvider> {
-    let declarers = sensing::extract_declarers(capability_fold, capability_id, |node_id| {
+    let mut declarers = sensing::extract_declarers(capability_fold, capability_id, |node_id| {
         if node_id == local_node_id {
             Some(local_entity_root)
         } else {
@@ -4503,6 +4579,27 @@ fn sensing_candidate_snapshot_from_parts(
                 .map(|entry| sensing::AudienceScopeCommitment::owner_root(entry.value()))
         }
     });
+    // §10 — never DECLARE a locally private capability to the sensing plane.
+    //
+    // `index_self_with_local_services` deliberately puts every registered
+    // service into the SELF-fold entry regardless of visibility, so
+    // `has_local_capability` admits owner-scoped and granted services (§2.4a).
+    // That entry never reaches the wire — but the sensing plane reads the same
+    // fold, and its audience gate keys on OWNER ROOT, not on grant scope.
+    //
+    // So a peer in this node's own owner root, holding NO grant, could send a
+    // `SensingInterestFrame` naming `nrpc:<granted-service>`, match this node's
+    // self-entry, and receive a branch registration / warm-start it would not
+    // otherwise get — behaviourally confirming that the private service exists.
+    // Grant-scoped visibility was flattened to owner-scoped for EXISTENCE.
+    //
+    // The tag string itself never ships (no sensing frame carries a tag field,
+    // and `CandidateProvider` is not `Serialize`), so this is an oracle rather
+    // than a disclosure — but it is new on this branch, and the fix is simply
+    // to answer as a node that does not declare the capability at all.
+    if is_locally_private(capability_id) {
+        declarers.retain(|d| d.node_id != local_node_id);
+    }
     sensing::build_candidate_snapshot(
         &declarers,
         local_owner_root,
@@ -7271,7 +7368,21 @@ impl MeshNode {
             sensing::AudienceScopeCommitment::owner_root(self.identity.entity_id()),
             &self.sensing_local_root,
             capability_id,
+            |cap| self.capability_is_locally_private(cap),
         )
+    }
+
+    /// §10 — does `capability_id` name a service THIS node serves under a
+    /// private visibility?
+    ///
+    /// Only `nrpc:` tags can correspond to a registered service, so anything
+    /// else is public by construction and answers `false` without a map probe.
+    #[cfg(feature = "redex")]
+    fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
+        capability_id
+            .as_str()
+            .strip_prefix("nrpc:")
+            .is_some_and(|svc| self.rpc_local_services.is_private(svc))
     }
 
     /// Test-only helper — TOFU-pin `entity_id` for `node_id` exactly
@@ -10307,6 +10418,8 @@ impl MeshNode {
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
             ),
+            #[cfg(feature = "redex")]
+            rpc_local_services: self.rpc_local_services.clone(),
             sensing_emitter: self.sensing_emitter.clone(),
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
             signing_identity: self.identity.clone(),
@@ -15714,6 +15827,11 @@ impl MeshNode {
                         ctx.sensing_local_entity_root,
                         &ctx.sensing_local_root,
                         capability_id,
+                        |cap| {
+                            cap.as_str()
+                                .strip_prefix("nrpc:")
+                                .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
+                        },
                     );
                     let mut slot = ctx.sensing_leader.lock();
                     let Some(leader) = slot.as_mut() else {
@@ -17117,6 +17235,11 @@ impl MeshNode {
             ctx.sensing_local_entity_root,
             &ctx.sensing_local_root,
             capability_id,
+            |cap| {
+                cap.as_str()
+                    .strip_prefix("nrpc:")
+                    .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
+            },
         );
         let reconciliation = {
             let mut slot = ctx.sensing_leader.lock();
