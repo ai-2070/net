@@ -1,21 +1,22 @@
 # Org Capability SDK Plan (OSDK)
 
-**Version:** v0.3 — applies Kyra's v0.2 verdict (2026-07-21): public
-facade **APPROVED**; six narrow authority/lifecycle corrections
-applied — (1) common discovery is private-only (no public plaintext
-plane, no provenance ranking, no ownership accessor); (2) `OrgCaller`
-is an exact projection of canonical `Admitted` — the `grant_id`
-field and the `Admitted` extension are deleted; (3) consumer-audience
-installs use an internal reference-counted lease, not
-node-lifetime persistence; (4) the facade requires a configured
-durable mesh identity (`Mesh::identity()`) — no keypair accessor is
-added; (5) the facade error is `OrgSdkError` — the canonical
-`net_sdk::org::OrgError` is not renamed or shadowed; (6) every v0.2
-open question is closed in this revision. The core-touch inventory
-reduces to one promotion plus re-exports.
+**Version:** v0.4 — applies Kyra's v0.3 final ruling (2026-07-21):
+public API, scope, private-only discovery, identity/key ownership,
+and provider behavior all **SIGNED OFF**; this revision closes the
+three narrow HOLD items — (1) `mesh.org` requires a matching
+installed `NodeAuthority` (the complete private-discovery identity
+relation); (2) the consumer-audience lease owns a specific registry
+installation via an opaque installation token (ownership-safe
+removal — never a bare grant-id remove); (3) the validity contract
+is three-stage (construction = structure/signatures; bind =
+operational installability; call = per-call temporal recheck) —
+plus the non-blocking wording correction (five top-level facade
+concepts, not a "complete list of public types").
 
 Lineage: v0.1 rejected (enterprise SDK program); v0.2 public shape
-approved with corrections; v0.3 is the corrected design of record.
+approved with corrections; v0.3 architecture signed off with three
+lifecycle holds; v0.4 closes the holds — per the ruling, no further
+architecture review is expected before authorization.
 Companion docs:
 [`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md)
 (substrate — OA-1..OA-4 CLOSED),
@@ -23,11 +24,12 @@ Companion docs:
 caller/provider seams the verbs sit on).
 
 **Status:** design of record for the facade; implementation **not
-yet authorized**. Activation requires organization-auth review
-sign-off **at an exact pinned substrate commit**, recorded here at
-authorization time once the open organization-auth Pass-2 findings
-are closed. The SDK must not begin against a moving authority
-substrate.
+yet authorized** — the v0.3 ruling holds authorization for exactly
+the lifecycle closures this revision applies. Activation requires
+organization-auth review sign-off **at an exact pinned substrate
+commit**, recorded here at authorization time once the open
+organization-auth Pass-2 findings are closed. The SDK must not begin
+against a moving authority substrate.
 
 **The measured gap (OA-4 STOP-gate answer).** The gap is NOT
 "applications need to inspect private-discovery records." The gap
@@ -67,8 +69,11 @@ The two verbs are symmetric: **`serve_org` emits privately;
 `org.call` discovers privately.** Protected-but-publicly-discoverable
 registration AND discovery both remain low-level.
 
-Public types, complete list: `OrgCredentials`, `OrgClient`,
-`OrgAccess`, `OrgCaller`, `OrgSdkError`. Everything else must earn
+The five top-level facade concepts: `OrgCredentials`, `OrgClient`,
+`OrgAccess`, `OrgCaller`, `OrgSdkError` (whose public nested domain
+enums `OrgCredentialError` and `OrgDiscoveryError` accompany it —
+"five" counts concepts, not every public Rust type). Everything
+else must earn
 its way in through a named consumer. The low-level canonical APIs
 (`OrgProofIntent`, `serve_rpc_protected` / `serve_rpc_owner_scoped` /
 `serve_rpc_granted`, `OrgProviderPolicy`, the raw envelope codecs)
@@ -106,7 +111,8 @@ references.
   `Identity::keypair() -> &Arc<EntityKeypair>`,
   `Mesh::entity_keypair()`. No new accessor is needed — the facade
   *requires* a configured identity instead of supporting ephemeral
-  ones (§1).
+  ones (§1). `MeshNode::node_authority()` likewise already exists
+  for the authority precondition (§1).
 - The provider gate already delivers verified facts: protected
   handlers receive `RpcContext.org_admission: Option<Admitted>`
   (five fields, `org_admission.rs:303`), with the raw proof header
@@ -147,40 +153,83 @@ let org = mesh.org(credentials)?;
 ```
 
 - **No keypair.** The mesh's configured durable identity signs.
-  `mesh.org(credentials)` refuses if:
-  - `mesh.identity()` is `None` →
+- **The binding contract — the complete private-discovery identity
+  relation.** `mesh.org(credentials)` refuses unless ALL of:
+  - configured durable identity: `mesh.identity()` is `Some` — else
     `OrgCredentialError::PersistentIdentityRequired`. Organization
-    membership binds to a durable cryptographic entity; a generated
-    ephemeral node identity has no place in the common
-    organizational facade (the low-level API remains for exotic
-    after-start issuance scenarios);
-  - `membership.member != mesh.entity_id()` — the TOFU member
-    binding would fail remotely anyway; fail here instead.
-- **Construction checks structural relationships and signatures;
-  calls check temporal validity.** `new` verifies: each credential's
-  signature against its org id; `membership.org_id ==
-  dispatcher.org_id` (acting-org agreement); every grant names
-  `grantee_org == membership.org_id`; no reserved zero grant id;
-  every audience secret satisfies `matches_grant(&grant)` against
-  exactly one held grant (the §2.6-witnessed commitment relation);
-  no duplicate grant ids. Windows are NOT checked here — an actor
-  may be assembled long before use; expiry is a call-time refusal.
+    membership binds to a durable cryptographic entity; ephemeral
+    node identities stay on the low-level API;
+  - installed node authority: `mesh.node_authority()` is `Some` —
+    else `OrgCredentialError::NodeAuthorityRequired`. A durable
+    identity alone is insufficient: consumer-audience installation
+    canonically requires an installed `NodeAuthority`
+    (`grant.grantee_org == authority.owner_org()`), and
+    owner-private discovery needs the authority's owner-audience
+    credential. Without this precondition a structurally valid bind
+    would search owner-private state that can never exist and
+    return a misleading `NoAuthorizedProvider`;
+  - `membership.member == mesh.entity_id()` — the TOFU member
+    binding would fail remotely anyway; fail here instead;
+  - `membership.org_id == node_authority.owner_org()` — else
+    `OrgCredentialError::NodeAuthorityOrgMismatch`.
+
+  `MeshNode::node_authority()` already exists — this precondition
+  introduces no new core accessor.
+- **Three-stage validity contract (locked, v0.4 reconciliation).**
+  The v0.2 "construction checks structure; calls check temporal
+  validity" split was incomplete: binding installs audiences, and
+  the canonical installation path already rejects `GrantNotCurrent`,
+  `MissingDiscover`, and `NoDiscoveryBinding`. The exact contract:
+  - `OrgCredentials::new` — structural relationships and signatures
+    ONLY: each credential's signature against its org id;
+    `membership.org_id == dispatcher.org_id` (acting-org agreement);
+    every grant names `grantee_org == membership.org_id`; no
+    reserved zero grant id; every audience secret satisfies
+    `matches_grant(&grant)` against exactly one held grant (the
+    §2.6-witnessed commitment relation); no duplicate grant ids. No
+    window checks — credentials may be assembled before their
+    validity window.
+  - `mesh.org` — operational binding: the identity/authority
+    relation above, plus audience-lease acquisition, which rides the
+    canonical installation path and inherits its refusals
+    (`GrantNotCurrent` / `MissingDiscover` / `NoDiscoveryBinding`) —
+    a DISCOVER grant that is not currently installable fails the
+    bind loudly. Credentials bind when operationally active.
+  - `org.call` — per-call temporal recheck of membership,
+    dispatcher, and the selected grant: a long-lived client crosses
+    expiration windows, so call-time checks remain necessary.
 - **No public `OrgActor`, no public `OrgCredentialStore`, no mutable
   install API.** The collection is closed at construction. Changing
   credentials = construct new `OrgCredentials`, bind again.
-- **Consumer-audience lifecycle: internal reference-counted lease**
-  (locked). Binding acquires a lease per (grant, secret) pair:
-  the first client using grant G →
-  `install_consumer_grant_audience(G)`; additional clients using G →
-  SDK-local reference count; a clone shares its client's lease; the
-  last independently bound client using G drops →
-  `remove_consumer_grant_audience(G)`. The lease is internal and
-  adds no public API. This keeps installed ingest authority in exact
-  correspondence with live credential possession: no ambient
-  decryption authority after credentials drop, no immortal registry
-  slots, no accumulation across credential rotation, and the
-  two-clients-one-grant case is correct by counting. Install
-  failures at bind are loud (`OrgSdkError::Credentials`).
+- **Consumer-audience lifecycle: internal reference-counted lease
+  with ownership-safe removal** (locked — the token form). Binding
+  acquires a lease per (grant, secret) pair; additional clients
+  using the same grant increment the SDK-local count; a clone
+  shares its client's lease. The lease is internal and adds no
+  public API. Ownership is structural, not by grant id:
+  - install returns `Installed(token)` — an opaque token naming the
+    exact installed record / registry generation, no secret bytes —
+    or `AlreadyPresent`;
+  - `Installed(token)` → the lease OWNS that installation.
+    `AlreadyPresent` (e.g. low-level code installed the grant
+    first) → the lease is NON-OWNING and final drop removes
+    nothing — the facade never removes authority it did not
+    install;
+  - last independently bound client drops → an owning lease calls
+    `remove_consumer_grant_audience_if_current(token)`; the core
+    compares and removes under `consumer_grant_mu`, so a low-level
+    replacement cannot race between check and removal — a stale
+    token removes nothing;
+  - the SDK-side lease mutex covers the zero-to-one install and
+    one-to-zero removal transitions, not only counter mutation, so
+    a final drop racing a new bind leaves the registration
+    installed for the new client.
+
+  This keeps installed ingest authority in exact correspondence
+  with live credential possession: no ambient decryption authority
+  after credentials drop, no immortal registry slots, no
+  accumulation across rotation. Install failures at bind are loud
+  (`OrgSdkError::Credentials`).
 - The struct derives neither `Serialize` nor `Deserialize`
   (inherited structurally from `OrgAudienceSecret`; asserted
   type-level for the container too) and its `Debug` is redacted.
@@ -293,7 +342,9 @@ and S2 witnesses the path unreachable through the real gate.
 pub enum OrgSdkError {
     Credentials(OrgCredentialError),   // mismatch, expired, missing grant,
                                        // ambiguous grant, audience mismatch,
-                                       // persistent identity required
+                                       // persistent identity required,
+                                       // node authority required / org mismatch,
+                                       // grant not installable at bind
     Discovery(OrgDiscoveryError),      // no authorized provider (with the
                                        // considered count), provider not direct
     AdmissionDenied(CoarseAdmissionReason),
@@ -415,7 +466,16 @@ Everything is SDK-crate code except:
    are consumed internally by `org.call`; nothing new is re-exported
    publicly from the SDK. Test seams become aliases or are retired —
    test-named seams must not be load-bearing production API.
-2. **Pure re-exports** in `org::types` as needed (`Admitted`,
+2. **Ownership-safe consumer-audience removal** (the v0.3 ruling's
+   one narrow additional lifecycle touch):
+   `install_consumer_grant_audience` returns
+   `Installed(token) | AlreadyPresent`, and a new
+   `remove_consumer_grant_audience_if_current(token)` compares and
+   removes under the existing `consumer_grant_mu`, so replacement
+   cannot race between check and removal. The token names an exact
+   installed record / registry generation and carries no secret
+   bytes. Pure lifecycle — no authority semantics change.
+3. **Pure re-exports** in `org::types` as needed (`Admitted`,
    `OrgAdmission`, `CoarseAdmissionReason`, `OrgProofIntent` alias).
 
 Explicitly removed from the v0.2 inventory by the verdict: the
@@ -436,22 +496,35 @@ objects, headers, and status codes, the replay guard, the RED seam,
 ## Slices (four bounded commits, stop-and-review per slice)
 
 **S0 — credentials and errors.** `OrgCredentials` + structural
-validation, mesh-identity binding, the internal audience **lease**,
-`OrgSdkError`, `org::types` re-exports. Witnesses:
+validation, the binding contract, the token **lease** (core item 2
+lands here), `OrgSdkError`, `org::types` re-exports. Witnesses:
 - structural-validation matrix (each broken relationship → its typed
   `OrgCredentialError`);
-- `PersistentIdentityRequired` on a mesh with no configured
-  identity; member-binding refusal on
+- binding-relation matrix: `PersistentIdentityRequired` (no
+  configured identity); `NodeAuthorityRequired` (no installed
+  authority); `NodeAuthorityOrgMismatch` (authority owned by a
+  different org); member-binding refusal on
   `membership.member != mesh.entity_id()`;
+- bind-time installability: a not-currently-valid DISCOVER grant →
+  loud bind failure surfacing the canonical `GrantNotCurrent`
+  refusal (validity-contract stage 2);
 - audience-mismatch refusal (reuses the §2.6 commitment relation);
 - **lease semantics**: two clients bound with one grant → exactly one
   install; a clone shares its client's lease; dropping one client
-  removes nothing; dropping the last removes the registration;
+  removes nothing; dropping the last removes an OWNED registration;
   re-binding after full drop re-installs;
+- **lease ownership safety**: a grant pre-installed by low-level
+  code → bind observes `AlreadyPresent`, the lease is non-owning,
+  final drop removes nothing; low-level replacement of an owned
+  installation → the stale token's `remove_…_if_current` removes
+  nothing;
+- **lease concurrency**: last-client drop racing a new client bind →
+  the registration remains installed for the new client (the lease
+  mutex covers the 0→1 and 1→0 transitions);
 - container non-serializability + redacted `Debug` (type-level);
 - the canonical `net_sdk::org::OrgError` still resolves to the
   issuance error (compile witness); existing flat `net_sdk::org::*`
-  paths unchanged. No core diff.
+  paths unchanged.
 
 **S1 — `org.call`.** The core query promotion (item 1), private-only
 discovery, classification, exact matching, selection, intent, coarse
@@ -522,8 +595,8 @@ or a measured failure.
 
 **Gate cadence** (mirrors OA-4): per slice — new focused tests, the
 touched integration target, clippy for touched targets, fmt, diff
-review. After S1 (the core-touching slice) the relevant full
-lib/integration gates. After S3 the full serial battery once (clippy
+review. After S0 and S1 (the core-touching slices) the relevant
+full lib/integration gates. After S3 the full serial battery once (clippy
 `--lib --features cortex -D warnings`; `--no-default-features`; fmt;
 full lib cortex; `integration_nrpc_protected`; `org_ownership`;
 `org_admission_wire`; `may_execute` body unchanged).
@@ -541,9 +614,19 @@ full lib cortex; `integration_nrpc_protected`; `org_ownership`;
   registration never fails for lack of an audience; exit witnesses
   perform the install.
 - **Grant-id extension** — deleted, with `OrgCaller.grant_id`.
-- **Consumer registration lifecycle** — the internal
-  reference-counted lease; install on first use, remove on last
-  drop; clones share their client's lease.
+- **Binding preconditions** — configured durable identity +
+  installed `NodeAuthority` + `membership.member == mesh.entity_id()`
+  + `membership.org_id == node_authority.owner_org()`: the complete
+  private-discovery identity relation (v0.3 final ruling).
+- **Consumer registration lifecycle** — the reference-counted lease
+  in the TOKEN form: install returns
+  `Installed(token) | AlreadyPresent`; only an owning lease removes,
+  via `remove_consumer_grant_audience_if_current(token)` under
+  `consumer_grant_mu`; clones share their client's lease; the lease
+  mutex covers the 0→1 / 1→0 transitions.
+- **Validity contract** — three-stage: structure/signatures at
+  construction; operational installability (incl. `GrantNotCurrent`)
+  at bind; per-call temporal recheck.
 
 ---
 
@@ -589,8 +672,8 @@ canonical APIs keep every capability available meanwhile.
    admits; local checks only ever refuse to send.
 2. The verbs are symmetric: `serve_org` emits privately, `org.call`
    discovers privately; the public plane is low-level on both sides.
-3. Structural + signature validation at construction; temporal
-   validity at call time.
+3. Three-stage validity: structure and signatures at construction;
+   operational installability at bind; per-call temporal recheck.
 4. Local predicates are the provider's own functions
    (`is_valid_at_with_skew`, `covers_capability`,
    `GrantTargetScope::covers`, `GrantRights::contains`,
@@ -600,11 +683,14 @@ canonical APIs keep every capability available meanwhile.
 6. Admission mode is inferred (plane + org relation), never
    caller-specified; access implies encrypted visibility; no
    fallback mode exists.
-7. The facade requires a configured durable mesh identity; it never
-   clones secret key material and adds no keypair accessor.
+7. The facade requires a configured durable mesh identity AND an
+   installed node authority whose owner org matches the membership —
+   the complete private-discovery identity relation; it never clones
+   secret key material and adds no keypair accessor.
 8. Installed consumer-audience state corresponds exactly to live
-   credential possession (the reference-counted lease); authority is
-   never immortal.
+   credential possession (the token lease); authority is never
+   immortal, and the facade never removes an installation it does
+   not own.
 9. Secrets stay structurally non-serializable end-to-end; the
    credential container adds no serialization and no `Debug` leak.
 10. No new wire surface; `0x0009` + the coarse byte are consumed,
@@ -617,5 +703,6 @@ canonical APIs keep every capability available meanwhile.
 13. `OrgProofIntent` and the low-level serve/discovery APIs stay
     public and unchanged as the advanced seam; everything the facade
     does is expressible through them by hand.
-14. The core-touch inventory (one query promotion + re-exports) is
-    exhaustive; anything beyond it reopens this plan's review.
+14. The core-touch inventory (one query promotion + the token
+    lease-lifecycle seam + re-exports) is exhaustive; anything
+    beyond it reopens this plan's review.
