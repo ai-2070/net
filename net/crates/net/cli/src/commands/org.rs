@@ -37,6 +37,7 @@ use crate::commands::identity::{
 };
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
+use crate::secret::{zeroize_slice, zeroize_string, ScrubbedBytes, ScrubbedString};
 
 /// Format version of the cert / floors / grant JSON envelopes.
 pub(crate) const ORG_FILE_VERSION: u32 = 1;
@@ -762,66 +763,6 @@ struct GrantCapabilityOutput {
 // =========================================================================
 // Helpers
 // =========================================================================
-
-/// Best-effort in-place scrub (volatile writes prevent optimizer elision —
-/// matching the core crate's convention, no `zeroize` dependency).
-fn zeroize_slice(buf: &mut [u8]) {
-    for byte in buf.iter_mut() {
-        // SAFETY: `byte` is a valid mutable reference for this iteration.
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-}
-
-/// Scrub a `String`'s backing bytes in place (writing `0x00` keeps the buffer
-/// valid UTF-8).
-fn zeroize_string(s: &mut String) {
-    // SAFETY: overwriting with 0 bytes preserves the UTF-8 invariant.
-    let bytes = unsafe { s.as_mut_vec() };
-    zeroize_slice(bytes);
-}
-
-/// RAII volatile-scrub for a byte buffer holding secret material: zeroes on drop
-/// so EVERY exit path (early return, `?`, panic/unwind) scrubs — not only a
-/// success tail reached after all fallible operations (Kyra OA2-F). Non-secret
-/// payloads may use it too; the extra memset is harmless and keeps staging
-/// uniform.
-struct ScrubbedBytes(Vec<u8>);
-
-impl ScrubbedBytes {
-    fn new(bytes: Vec<u8>) -> Self {
-        ScrubbedBytes(bytes)
-    }
-    fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl Drop for ScrubbedBytes {
-    fn drop(&mut self) {
-        zeroize_slice(&mut self.0);
-    }
-}
-
-/// RAII volatile-scrub for a `String` holding secret material (e.g. the
-/// serialized org root seed): scrubs on EVERY exit, including error returns from
-/// the atomic write or the permission-enforcement step, not only the success
-/// tail (Kyra OA2-F).
-struct ScrubbedString(String);
-
-impl ScrubbedString {
-    fn new(s: String) -> Self {
-        ScrubbedString(s)
-    }
-    fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl Drop for ScrubbedString {
-    fn drop(&mut self) {
-        zeroize_string(&mut self.0);
-    }
-}
 
 /// Grant artifacts are published NO-CLOBBER: `--force` is refused for the grant
 /// verbs because a remove-then-link replace is not crash-atomic (a crash between

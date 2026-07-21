@@ -29,6 +29,7 @@ mod error;
 mod output;
 mod parsers;
 mod prelude;
+mod secret;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
