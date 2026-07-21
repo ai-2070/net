@@ -1535,6 +1535,13 @@ mod mesh_bindings {
                 config = config.with_auto_direct_upgrade(true);
             }
 
+            // OSDK-L N: an explicitly supplied seed IS a configured identity.
+            // The org facade refuses to bind credentials to a generated
+            // fallback, so this provenance must be recorded here exactly as
+            // `MeshBuilder::identity` records it on the Rust side — otherwise a
+            // Node caller who supplied a seed would be refused as ephemeral.
+            config.configured_identity = options.identity_seed.is_some();
+
             let identity = match options.identity_seed {
                 Some(seed) => {
                     let bytes: &[u8] = seed.as_ref();
