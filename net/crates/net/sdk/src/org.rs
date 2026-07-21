@@ -74,6 +74,8 @@ mod tests;
 mod tests_call;
 #[cfg(all(test, feature = "cortex"))]
 mod tests_live;
+#[cfg(test)]
+mod tests_loader;
 #[cfg(all(test, feature = "cortex"))]
 mod tests_serve;
 

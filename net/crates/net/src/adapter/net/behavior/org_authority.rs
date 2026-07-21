@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 
 use super::org::{current_timestamp, OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
 use super::org_revocation::{
-    write_atomic, OrgRevocationError, OrgRevocationState, OrgRevocationStore,
-    ProvisioningExpectation,
+    open_regular_nofollow, write_atomic, OrgRevocationError, OrgRevocationState,
+    OrgRevocationStore, ProvisioningExpectation,
 };
 use crate::adapter::net::identity::EntityId;
 
@@ -2330,6 +2330,155 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
             reason: e.to_string(),
         })?;
     Ok(Some(bytes))
+}
+
+/// OSDK-L R2 — load a GRANT-side [`OrgAudienceSecret`] from an out-of-band
+/// 0600 file, validating the OPENED OBJECT rather than a pathname.
+///
+/// This is the loader `OrgAudienceSecret::decode_config`'s doc says does not
+/// exist, and says why one that "merely wrapped this call would imply a safety
+/// it does not provide". It exists now because the language SDKs need a way to
+/// supply audience material WITHOUT the raw discovery key crossing an FFI
+/// boundary into garbage-collected memory: the binding hands over a path, and
+/// the key's whole lifetime stays inside Rust.
+///
+/// Structurally mirrors [`read_audience_checked`], which is the only correct
+/// model in this tree, and adds the two things a grant-side path needs that the
+/// authority directory got from `ensure_secure_authority_dir`:
+///
+/// 1. the ancestor chain is validated FIRST, because a grant secret may live
+///    anywhere the operator put it rather than inside an already-policed
+///    authority directory — an ancestor another account can write through lets
+///    that account swap the entry before we ever open it;
+/// 2. the read is EXACT and rejects trailing bytes, so a file that is a valid
+///    secret followed by anything else is refused rather than silently
+///    accepted.
+///
+/// Then, on the already-open descriptor: regular-file check, Unix mode from
+/// `File::metadata` (never `metadata(path)` then `open(path)` — that pair is
+/// the TOCTOU), and on Windows the file's OWN protected DACL (§11), because
+/// org-wide key distribution means this file may arrive from a share or a
+/// restore tool carrying an explicit ace the containing directory says nothing
+/// about.
+///
+/// # Platform asymmetry, inherited deliberately
+///
+/// The ancestor walk is Unix-only, matching `ensure_secure_authority_dir`: on
+/// Windows a pre-existing ancestor chain is not walked, because a writable
+/// ancestor's owner could replace the entry and no child DACL can prevent it —
+/// so the check would imply a guarantee it cannot make. Windows instead leans
+/// on the file's own protected DACL (§11), which is the stronger check for the
+/// object actually read. Operators placing grant secrets outside a
+/// protected directory on Windows must manage that chain out of band, exactly
+/// as the CLI already warns for custom authority paths.
+///
+/// # Secret handling
+///
+/// The file bytes land in a [`ScrubbedBytes`] that zeroes on EVERY exit —
+/// return, `?`, or unwind — so the key never lingers in freed heap where a core
+/// dump or swap could reach it. No error returned from here embeds file
+/// content, and the error `Display` renders only the path.
+///
+/// # Residual (inherited, not multiplied)
+///
+/// `decode_config` returns `Self` by value, and a Rust move is a memcpy that
+/// does not run `Drop` on the source, so that one hop strands a copy in a dead
+/// stack frame (`org_grant.rs` §27/§29). This loader adds no further by-value
+/// hop; closing the inherited one end to end needs an ownership refactor
+/// through `OrgCredentials` and the audience registry, which OSDK-L does not
+/// attempt.
+pub fn load_grant_audience_secret(
+    path: &Path,
+) -> Result<super::org_grant::OrgAudienceSecret, OrgAuthorityError> {
+    use std::io::Read;
+
+    let encoded_size = super::org_grant::OrgAudienceSecret::ENCODED_SIZE;
+
+    // 1. Ancestor chain FIRST — establish the path is in a trusted location
+    //    before opening anything. A bare relative name has an empty parent, so
+    //    resolve against the current directory the way `normalize_authority_dir`
+    //    does, or the chain would go unchecked.
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::env::current_dir().map_err(|e| OrgAuthorityError::Io {
+                path: path.display().to_string(),
+                reason: format!("resolve audience secret parent: {e}"),
+            })?,
+        };
+        validate_unix_ancestor_chain(&parent)?;
+    }
+
+    // 2. Open without following symlinks / reparse points.
+    let mut file = open_regular_nofollow(path).map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("open audience secret: {e}"),
+    })?;
+
+    // 3-4. Validate the ALREADY-OPEN object: a regular file, owner-only.
+    let meta = file.metadata().map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("stat audience secret: {e}"),
+    })?;
+    if !meta.is_file() {
+        return Err(OrgAuthorityError::Io {
+            path: path.display().to_string(),
+            reason: "audience secret is not a regular file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(OrgAuthorityError::PermissiveAudienceFile {
+                path: path.display().to_string(),
+                mode,
+            });
+        }
+    }
+    // 5. Windows: the file's own descriptor, not merely its directory.
+    #[cfg(windows)]
+    {
+        validate_audience_file_acl(path)?;
+    }
+
+    // 6-7. Exact read into scrub-on-drop storage, then prove there is nothing
+    //      after it. Reading one extra byte is how "exactly N" is checked
+    //      without trusting the stat size, which can change under us.
+    let mut buf = ScrubbedBytes(vec![0u8; encoded_size]);
+    file.read_exact(&mut buf.0)
+        .map_err(|e| OrgAuthorityError::Io {
+            path: path.display().to_string(),
+            reason: format!("audience secret is shorter than {encoded_size} bytes: {e}"),
+        })?;
+    let mut trailing = [0u8; 1];
+    match file.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(_) => {
+            return Err(OrgAuthorityError::CorruptFile {
+                path: path.display().to_string(),
+                detail: format!("audience secret has trailing bytes after {encoded_size}"),
+            })
+        }
+        Err(e) => {
+            return Err(OrgAuthorityError::Io {
+                path: path.display().to_string(),
+                reason: format!("audience secret trailing-byte probe: {e}"),
+            })
+        }
+    }
+
+    // 8. Decode. `buf` scrubs on the way out of every branch below.
+    super::org_grant::OrgAudienceSecret::decode_config(buf.as_slice()).map_err(|_| {
+        // Deliberately does not forward the decode error's payload — nothing
+        // derived from key bytes reaches a message.
+        OrgAuthorityError::CorruptFile {
+            path: path.display().to_string(),
+            detail: "audience secret failed to decode".to_string(),
+        }
+    })
 }
 
 /// §11 — validate `owner-audience.key`'s OWN security descriptor on Windows.

@@ -158,6 +158,70 @@ impl OrgCredentials {
         })
     }
 
+    /// Assemble from canonical wire bytes and audience-secret **file paths**
+    /// (OSDK-L R2) — the constructor every language binding uses.
+    ///
+    /// # Why the asymmetry
+    ///
+    /// The three signed credentials are public objects designed to transit, so
+    /// they cross an FFI boundary as their canonical wire encodings. The
+    /// audience secret is the raw discovery key: handing it to a
+    /// garbage-collected runtime as a buffer would put it in memory that is
+    /// never zeroized, freely copied by the collector, and visible in a heap
+    /// dump — undoing at the last hop what the substrate protects everywhere
+    /// else. So a binding supplies a PATH, and the key's whole lifetime stays
+    /// in Rust: loaded by
+    /// [`load_grant_audience_secret`](net::adapter::net::behavior::org_authority::load_grant_audience_secret),
+    /// which validates the opened object, reads into scrub-on-drop storage, and
+    /// never returns the bytes to anyone.
+    ///
+    /// There is deliberately **no bytes variant of this constructor**, in Rust
+    /// or in any binding. Adding one would reopen the language-SDK plan's first
+    /// locked decision.
+    pub fn from_parts(
+        membership: &[u8],
+        dispatcher: &[u8],
+        grants: &[Vec<u8>],
+        audience_secret_paths: &[std::path::PathBuf],
+    ) -> Result<Self, OrgCredentialError> {
+        let membership = OrgMembershipCert::from_bytes(membership).map_err(|source| {
+            OrgCredentialError::SignatureInvalid {
+                credential: "membership".to_string(),
+                source,
+            }
+        })?;
+        let dispatcher = OrgDispatcherGrant::from_bytes(dispatcher).map_err(|source| {
+            OrgCredentialError::SignatureInvalid {
+                credential: "dispatcher grant".to_string(),
+                source,
+            }
+        })?;
+        let mut decoded_grants = Vec::with_capacity(grants.len());
+        for (i, raw) in grants.iter().enumerate() {
+            decoded_grants.push(OrgCapabilityGrant::from_bytes(raw).map_err(|source| {
+                OrgCredentialError::SignatureInvalid {
+                    credential: format!("capability grant #{i}"),
+                    source,
+                }
+            })?);
+        }
+
+        let mut secrets = Vec::with_capacity(audience_secret_paths.len());
+        for path in audience_secret_paths {
+            secrets.push(
+                net::adapter::net::behavior::org_authority::load_grant_audience_secret(path)
+                    .map_err(|e| OrgCredentialError::AudienceSecretFile {
+                        path: path.display().to_string(),
+                        detail: e.to_string(),
+                    })?,
+            );
+        }
+
+        // Everything after this is the same validation an in-process caller
+        // gets — the loading path adds no authority and skips no check.
+        Self::new(membership, dispatcher, decoded_grants, secrets)
+    }
+
     /// The organization this actor acts for (named by the membership; the
     /// dispatcher grant agrees, checked at construction).
     pub fn acting_org(&self) -> OrgId {

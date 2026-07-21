@@ -304,6 +304,21 @@ pub enum OrgCredentialError {
         source: GrantAudienceInstallError,
     },
 
+    /// BIND. An audience-secret file could not be loaded — it does not exist,
+    /// is not a regular file, is reachable through an ancestor another account
+    /// can write, is group/other-readable, carries an untrusted Windows ace, is
+    /// the wrong length, or failed to decode.
+    ///
+    /// The detail names the path and the refusal only; nothing derived from key
+    /// bytes reaches it.
+    #[error("audience secret file {path} was refused: {detail}")]
+    AudienceSecretFile {
+        /// The rejected path.
+        path: String,
+        /// The canonical loader's refusal, rendered.
+        detail: String,
+    },
+
     // ---- call: temporal + matching ----
     /// CALL. A credential's validity window does not contain the call clock. A
     /// long-lived client crosses expiry, so this is re-checked per call rather
@@ -394,6 +409,7 @@ impl OrgCredentialError {
             Self::DuplicateGrant { .. } => "duplicate_grant",
             Self::AudienceSecretMismatch { .. } => "audience_secret_mismatch",
             Self::AudienceInstallRefused { .. } => "audience_install_refused",
+            Self::AudienceSecretFile { .. } => "audience_secret_file",
             Self::NotCurrentlyValid { .. } => "not_currently_valid",
             Self::DispatcherScopeExcludesCapability { .. } => {
                 "dispatcher_scope_excludes_capability"
