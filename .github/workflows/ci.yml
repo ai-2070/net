@@ -267,7 +267,7 @@ jobs:
       - name: CortEX + nRPC + AI Tools
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool"
+          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test integration_cortex_adapter
           --test integration_cortex_tasks
           --test integration_cortex_memories
@@ -313,7 +313,7 @@ jobs:
       - name: Sensing
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool"
+          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test sensing_dispatch
           --test sensing_failure_plane
           --test sensing_fallback

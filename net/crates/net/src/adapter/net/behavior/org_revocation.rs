@@ -434,11 +434,22 @@ struct StoreCore {
     /// [`OrgRevocationStore::arm_publish_pause_for_test`], a
     /// `#[doc(hidden)]` seam mirroring the review-11 `*_paused_for_test`
     /// hooks); the per-publish check is an uncontended `Mutex::take`.
+    ///
+    /// §19 — gated behind `cfg(test)`/`feature = "fixtures"`. It was plain
+    /// `pub` (only `#[doc(hidden)]`), and `run_publish_pause_hook` blocks on
+    /// an mpsc `recv()` WHILE `live.write()` is held: any code linked against
+    /// this crate could arm the pause, never send the resume token, and
+    /// permanently wedge `barriered_generation()` and
+    /// `snapshot_with_generation()` — i.e. every admission decision in
+    /// `verify_provider_authority`, plus every other process blocked on the
+    /// interprocess lock. Compiled out of consumer builds entirely.
+    #[cfg(any(test, feature = "fixtures"))]
     publish_pause: parking_lot::Mutex<Option<PublishPauseHook>>,
 }
 
 /// The one-shot hook a test installs to pause [`StoreCore::publish`]
 /// between the view swap and the generation bump.
+#[cfg(any(test, feature = "fixtures"))]
 struct PublishPauseHook {
     /// Signalled once the view is swapped and the pause begins.
     swapped: std::sync::mpsc::Sender<()>,
@@ -470,6 +481,7 @@ impl StoreCore {
         // window while `live` (the write guard) is held, so a witness
         // can prove the barriered readers never observe it. A no-op
         // (one uncontended `Mutex::take`) unless a test armed the hook.
+        #[cfg(any(test, feature = "fixtures"))]
         self.run_publish_pause_hook();
         self.generation.fetch_add(1, Ordering::Release);
         raised
@@ -477,6 +489,7 @@ impl StoreCore {
 
     /// Fire the one-shot publish pause hook if a test installed one.
     /// Runs while the caller holds `live.write()`.
+    #[cfg(any(test, feature = "fixtures"))]
     fn run_publish_pause_hook(&self) {
         if let Some(hook) = self.publish_pause.lock().take() {
             let _ = hook.swapped.send(());
@@ -894,6 +907,7 @@ fn join_or_create_core(
         generation: AtomicU64::new(0),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
+        #[cfg(any(test, feature = "fixtures"))]
         publish_pause: parking_lot::Mutex::new(None),
     });
     reg.cores.insert(backing_id, Arc::downgrade(&core));
@@ -1205,6 +1219,7 @@ impl OrgRevocationStore {
     /// tests in a separate crate can reach it; never used in
     /// production paths.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn mark_poisoned_for_test(&self) {
         mark_poisoned(&self.core.backing_id, &self.core.path);
     }
@@ -1265,6 +1280,7 @@ impl OrgRevocationStore {
     /// "new view, old generation" window to prove the send-path /
     /// admission barriered reads never observe it. Not for production.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn arm_publish_pause_for_test(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -1938,10 +1954,37 @@ pub(crate) fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File>
     Ok(f)
 }
 
-/// fsync the parent directory of `path` (Unix; no-op elsewhere,
-/// where the rename primitive carries the metadata guarantee).
-/// Split out so the durability-recovery path (review-9) can prove
-/// the directory entry durable without rewriting the file.
+/// Flush the parent directory of `path`, so the RENAME that published the file
+/// is durable and not just the file's contents.
+///
+/// Split out so the durability-recovery path (review-9) can prove the
+/// directory entry durable without rewriting the file.
+///
+/// # §13 — why this is Unix-only, correctly
+///
+/// The original comment justified the non-Unix no-op with "the rename
+/// primitive carries the metadata guarantee", which is too vague to check and
+/// reads like a hand-wave. It is, however, the right ANSWER for the wrong
+/// reason, and the fix is not where it looks.
+///
+/// Windows has no directory fsync. `FlushFileBuffers` on a directory handle
+/// returns `ERROR_ACCESS_DENIED` — it is not a supported operation, whatever
+/// the symmetry with POSIX suggests. (Verified here: an implementation using
+/// `CreateFileW` + `FILE_FLAG_BACKUP_SEMANTICS` + `FlushFileBuffers` failed
+/// every store test with os error 5.)
+///
+/// The documented Win32 mechanism is on the RENAME instead:
+/// `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` "guarantees that the move is
+/// flushed to disk before the function returns". [`write_atomic_phased`] now
+/// uses it, so on Windows durability is achieved INLINE with the publish
+/// rather than in a second phase.
+///
+/// One consequence is worth stating rather than leaving to be rediscovered:
+/// `WritePhase::PostRename` remains unreachable on Windows, so the poison
+/// machinery still does not arm there. That is now correct rather than a gap —
+/// with write-through there is no "renamed, but perhaps not durable" window to
+/// be uncertain ABOUT. The rename either committed durably or returned an
+/// error, which the pre-rename phase already handles.
 fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1953,11 +1996,55 @@ fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        // Durability is carried by MOVEFILE_WRITE_THROUGH at rename time; see
+        // the §13 note above. Deliberately not an error: there is nothing left
+        // to prove at this point.
         let _ = path;
     }
     Ok(())
 }
 
+/// Atomically replace `dest` with `src`, DURABLY (§13, Windows).
+///
+/// `std::fs::rename` is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and no
+/// write-through, so the directory entry lands in the volume metadata cache
+/// and a power loss seconds after `apply_bundle` returned `Ok` could lose it —
+/// while the node had already published the raised floor and its subscribers
+/// had retracted ownership. That is precisely the rollback this module exists
+/// to prevent, and NTFS journalling does not close it: the journal guarantees
+/// metadata CONSISTENCY after a crash, not that a completed rename was flushed
+/// before the call returned.
+///
+/// `MOVEFILE_WRITE_THROUGH` is the documented fix and makes the publish
+/// durable inline.
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn rename_write_through(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    let mut from: Vec<u16> = src.as_os_str().encode_wide().collect();
+    from.push(0);
+    let mut to: Vec<u16> = dest.as_os_str().encode_wide().collect();
+    to.push(0);
+    // SAFETY: both buffers are NUL-terminated and outlive the call; the return
+    // value is checked and no pointer escapes this scope.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 /// Monotone counter qualifying temp names so two writers in one
 /// process (or a reused PID) can never collide on a temp inode.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2057,22 +2144,35 @@ pub(crate) fn write_atomic_phased(path: &Path, bytes: &[u8]) -> Result<(), Write
     // DOCUMENTED to replace an existing destination file (see the
     // std platform-specific behavior notes), so no separate
     // ReplaceFileW path is required for replacement semantics.
-    // Crash DURABILITY is a distinct boundary: the parent-dir
-    // fsync below is Unix-only, so on non-Unix platforms the
-    // durability of the new directory entry is whatever the
-    // platform's rename primitive provides — this module's
-    // fail-closed poison machinery therefore only arms on Unix,
-    // where the fsync can actually be attempted and fail.
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    // Crash DURABILITY is a distinct boundary, and `rename` alone does
+    // not carry it on ANY platform: the directory entry lives in the
+    // metadata cache until the parent directory is flushed. The
+    // parent-dir flush below is implemented on Unix (`fsync`) and on
+    // Windows (`FlushFileBuffers` on a backup-semantics directory
+    // handle), so the fail-closed poison machinery arms on both.
+    //
+    // It was Unix-only, which made `WritePhase::PostRename`
+    // unreachable on Windows and every poison/recovery path there
+    // vacuous — see `fsync_parent_dir` (§13).
+    // §13 — on Windows, publish through MOVEFILE_WRITE_THROUGH so the
+    // directory entry is durable when this returns; `std::fs::rename` omits
+    // the flag and leaves it in the volume metadata cache. On Unix the
+    // parent fsync below carries it.
+    #[cfg(windows)]
+    let renamed = rename_write_through(&tmp, path);
+    #[cfg(not(windows))]
+    let renamed = std::fs::rename(&tmp, path);
+    if let Err(e) = renamed {
         let _ = std::fs::remove_file(&tmp);
         return Err(pre(e));
     }
 
-    // POSIX: rename() updates the directory entry in memory only; a
-    // crash before the directory fsyncs can revert to the old file
+    // rename() updates the directory entry in cache only; a crash
+    // before the directory is flushed can revert to the old file
     // (BUG #93 lineage, mirrors redex/disk.rs). Required, not
     // best-effort — and a failure HERE is post-rename: the caller
-    // must treat disk state as unproven (review-8 §13).
+    // must treat disk state as unproven (review-8 §13). True on
+    // Windows as well as POSIX, which is what §13 corrected.
     if let Err(e) = fsync_parent_dir(path) {
         return Err(WritePhase::PostRename(e.to_string()));
     }
@@ -2440,6 +2540,62 @@ mod tests {
         assert_eq!(readopted.floor_for(&org().org_id(), &member()), 5);
     }
 
+    /// The sibling of the test above, for the case it does NOT cover: the file
+    /// is not merely stale, it is GONE.
+    ///
+    /// `init` used to read that as a first adopt and durably write an empty
+    /// state — un-revoking every certificate the org had retired — while
+    /// `open_existing` read the identical situation as `MissingState` and
+    /// refused. The permissive reading was on `net node adopt`, the path an
+    /// operator reaches for when something already looks wrong.
+    ///
+    /// The `.lock` sidecar outlives the state file and is the evidence that
+    /// this store was provisioned before. Note the caller still says
+    /// `MayBeFresh` here: this asserts the store defends itself even when the
+    /// caller believes a fresh adopt is plausible.
+    /// §13 — the durable publish goes through `MOVEFILE_WRITE_THROUGH` on
+    /// Windows, and it must behave exactly like the plain rename it replaces.
+    ///
+    /// A unit test cannot prove crash durability. What it CAN pin is that the
+    /// write-through path is the one actually taken, that it REPLACES an
+    /// existing destination (the flag combination is easy to get wrong —
+    /// omitting `MOVEFILE_REPLACE_EXISTING` would fail on every republish),
+    /// and that a genuine failure still surfaces as an error rather than
+    /// being swallowed.
+    ///
+    /// Recorded because the first attempt at this fix was WRONG: it used
+    /// `FlushFileBuffers` on a `FILE_FLAG_BACKUP_SEMANTICS` directory handle,
+    /// by analogy with the POSIX parent fsync. That is not a supported
+    /// operation on Windows — it returns `ERROR_ACCESS_DENIED` and failed
+    /// every store test here. There is no directory fsync; the durability
+    /// primitive is on the rename.
+    #[cfg(windows)]
+    #[test]
+    fn write_through_rename_replaces_and_reports_failure() {
+        let scratch = Scratch::new();
+        let dest = scratch.state_path();
+        let src = scratch.0.join("staged.json");
+
+        std::fs::write(&dest, b"old").expect("seed destination");
+        std::fs::write(&src, b"new").expect("seed source");
+
+        rename_write_through(&src, &dest).expect("write-through rename must succeed");
+        assert_eq!(
+            std::fs::read(&dest).expect("read dest"),
+            b"new",
+            "the rename must REPLACE an existing destination — without \
+             MOVEFILE_REPLACE_EXISTING every republish would fail",
+        );
+        assert!(!src.exists(), "the source must be consumed by the move");
+
+        // A missing source is an error, not a silent success.
+        let ghost = scratch.0.join("does-not-exist.json");
+        assert!(
+            rename_write_through(&ghost, &dest).is_err(),
+            "a failed move must surface as an error; swallowing it would make \
+             a lost publish look durable",
+        );
+    }
     /// The sibling of the test above, for the case it does NOT cover: the file
     /// is not merely stale, it is GONE.
     ///
