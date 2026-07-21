@@ -676,7 +676,7 @@ jobs:
       # crate default set (which includes `nat-traversal`) is NOT active.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,test-helpers
+        run: npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,org,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
@@ -744,7 +744,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers,dataforts
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,org,test-helpers,dataforts
 
       - name: Install npm dependencies
         run: npm i

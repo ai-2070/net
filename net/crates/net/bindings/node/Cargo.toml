@@ -180,6 +180,12 @@ payments = ["mcp", "net", "dep:net-payments"]
 # the mesh surface `from_node_arc` needs, `cortex` for the nRPC the live
 # join/renew/serve bridge rides).
 delegation = ["net", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
+
+# Organization capability auth (OSDK-L Workstream N) — `OrgCredentials`,
+# `OrgClient`, and the two verbs over `net_sdk::org`. Needs `cortex` because
+# the call/serve verbs ride the nRPC surface, and forwards the SDK's `net` +
+# `cortex` so the org facade compiles with the same shape the Rust SDK ships.
+org = ["net", "cortex", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
 # Agent-to-agent task handoff (`NODE_DELEGATION_A2A_SDK_PLAN.md` WS-3, Hermes V2
 # Phase 3): `NetMesh.serveA2a` backed by a JS async task executor +
 # submit/status/cancel by node id. Thin wrappers over `net_sdk::{a2a, mesh_a2a}`.

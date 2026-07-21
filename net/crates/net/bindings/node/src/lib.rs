@@ -42,6 +42,8 @@ mod cortex;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+#[cfg(feature = "org")]
+mod org;
 // Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
 // + the operator device-lifecycle facade. Thin wrappers over
 // `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same

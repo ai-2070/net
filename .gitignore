@@ -21,6 +21,8 @@ net/crates/net/bindings/python/.venv*/
 # drift against the Rust source on every napi-derive change.
 net/crates/net/bindings/node/errors.js
 net/crates/net/bindings/node/errors.d.ts
+net/crates/net/bindings/node/org.js
+net/crates/net/bindings/node/org.d.ts
 net/crates/net/bindings/node/mesh_rpc.js
 net/crates/net/bindings/node/mesh_rpc.d.ts
 net/crates/net/bindings/node/index.js
