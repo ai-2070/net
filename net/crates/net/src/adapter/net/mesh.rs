@@ -7930,18 +7930,18 @@ impl MeshNode {
     /// protected serve registration on this node — so `(caller, call_id)`
     /// uniqueness is enforced provider-wide, not fragmented per service.
     #[cfg(feature = "cortex")]
+    pub(crate) fn rpc_admission_replay_arc(
+        &self,
+    ) -> Arc<super::behavior::org_admission_replay::AdmissionReplayGuard> {
+        self.rpc_admission_replay.clone()
+    }
+
     /// §6 — the per-peer failed-admission throttle.
     #[cfg(feature = "cortex")]
     pub(crate) fn admission_rate_limiter(
         &self,
     ) -> &super::behavior::org_admission_replay::AdmissionFailureLimiter {
         &self.rpc_admission_rate_limit
-    }
-
-    pub(crate) fn rpc_admission_replay_arc(
-        &self,
-    ) -> Arc<super::behavior::org_admission_replay::AdmissionReplayGuard> {
-        self.rpc_admission_replay.clone()
     }
 
     /// OA-1 (review-8 §2/§3): install the node's loaded,
