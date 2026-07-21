@@ -108,6 +108,13 @@ Witness locations: `sdk/src/org/tests.rs` (S0), `tests_call.rs` (S1),
 | An undecodable body still reports a denial, never an error-about-the-error | **U** `an_undecodable_denial_body_falls_back_to_denied` |
 | An unknown reason byte is still a denial | **U** `an_unknown_reason_byte_is_still_a_denial` |
 | Other server statuses stay transport errors — the facade never manufactures a denial | **U** `other_server_errors_are_not_admission_denials` |
+| **Live**: local checks pass, the provider refuses, and the caller gets `AdmissionDenied` — not a credential or transport error | **L** `live_a_provider_side_revocation_surfaces_as_admission_denied` |
+
+The live row is the one that matters for the error hierarchy's purpose. A
+revocation floor is imported by the PROVIDER only, so the caller's pre-flight
+cannot anticipate it: the request is really sent, admission really refuses it,
+and the denial really round-trips as the coarse wire reason. The provider's
+handler stays dark.
 
 ## §3–4 `serve_org` — the provider verb
 
@@ -187,9 +194,11 @@ admission step, wire object, header, status code, or replay behavior moved.
 - `cargo clippy --features net,cortex --lib --all-targets` (sdk) — clean.
 - `cargo build --lib --no-default-features` — builds.
 - Core lib (cortex): **5088 passed**, 0 failed.
-- SDK lib: **191 passed**, 0 failed (46 org).
+- SDK lib: **192 passed**, 0 failed (47 org).
 - `integration_nrpc_protected` **40**, `org_ownership` **31**,
   `org_admission_wire` **2** — all pass unchanged.
+- All SDK integration test targets compile (verified with `-j 1`; parallel
+  builds on this machine hit a cargo metadata-stub race unrelated to the code).
 - The org suite was run six consecutive times to confirm no flakiness after the
   one load-sensitive assertion found in S2 was made deterministic.
 

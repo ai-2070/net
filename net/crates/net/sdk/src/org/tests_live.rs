@@ -438,6 +438,101 @@ async fn live_cross_org_without_a_grant_discovers_nothing() {
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// A LIVE remote denial: local checks pass, the provider refuses.
+///
+/// This is the distinction the whole error hierarchy exists for. The caller's
+/// membership is revoked at the PROVIDER (a floor the caller has no way to
+/// know about), so the facade's local pre-flight passes, the request is
+/// actually sent, and admission refuses it — surfacing as
+/// `OrgSdkError::AdmissionDenied` with the coarse wire reason rather than a
+/// credential error or a transport error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_a_provider_side_revocation_surfaces_as_admission_denied() {
+    use net::adapter::net::behavior::org::OrgRevocationBundle;
+
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("live-revoked-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("live-revoked-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    let _serve = provider
+        .serve_org(
+            "internal.reindex",
+            OrgAccess::SameOrg,
+            move |_c: OrgCaller, req: Ping| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(Pong {
+                        n: req.n,
+                        served_by: "p".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("serve_org");
+
+    // The caller's credentials are minted at generation 1 and stay locally
+    // valid for the whole test.
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let org = caller
+        .org(OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials"))
+        .expect("bind");
+    assert!(
+        converge_discovery(&provider, &org, &cap("nrpc:internal.reindex")).await,
+        "the caller resolved the provider before revocation"
+    );
+
+    // The org raises a floor to generation 2 for the caller, and ONLY the
+    // provider imports the bundle — exactly the split that makes this a remote
+    // decision the caller cannot anticipate.
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(c_identity.entity_id().clone(), 2u32);
+    let bundle = OrgRevocationBundle::try_issue(&a, &floors).expect("floors");
+    provider
+        .node()
+        .node_authority()
+        .expect("authority")
+        .revocation
+        .apply_bundle(&bundle)
+        .expect("provider imports the floor");
+
+    let err = org
+        .call::<_, Pong>("internal.reindex", &Ping { n: 1 })
+        .await
+        .expect_err("the provider refuses the revoked membership");
+    match err {
+        OrgSdkError::AdmissionDenied(reason) => {
+            // Coarse by design — a precise reason would be a credential oracle.
+            assert_eq!(
+                reason,
+                CoarseAdmissionReason::Denied,
+                "coarse denial bucket"
+            );
+        }
+        other => panic!("expected a remote admission denial, got {other:?}"),
+    }
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "the handler stayed dark — admission refused before dispatch"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 // ---------------------------------------------------------------------------
 // The design test
 // ---------------------------------------------------------------------------
