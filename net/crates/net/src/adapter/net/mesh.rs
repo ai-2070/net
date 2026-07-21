@@ -1523,6 +1523,10 @@ pub struct MeshNodeConfig {
     /// per-external-org quota, per-caller quota. See
     /// [`MeshNodeConfig::with_admission_replay_config`].
     pub admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig,
+    /// §6 — per-peer throttle on the signature work a FAILING caller can
+    /// compel. Safe defaults, not universal limits; see
+    /// [`MeshNodeConfig::with_admission_rate_limit`].
+    pub admission_rate_limit: super::behavior::org_admission_replay::AdmissionRateLimitConfig,
     /// How often this node re-announces its own capabilities to keep its
     /// entry alive. Capability entries carry a TTL (default 300 s) and the
     /// fold sweeper evicts them on expiry, so without a periodic
@@ -1860,6 +1864,8 @@ impl MeshNodeConfig {
             psk,
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
+            admission_rate_limit:
+                super::behavior::org_admission_replay::AdmissionRateLimitConfig::default(),
             num_shards: 4,
             packet_pool_size: 64,
             default_reliable: false,
@@ -1998,6 +2004,22 @@ impl MeshNodeConfig {
     /// Validated at node construction; an inconsistent envelope (a reserve at
     /// or above the total, a per-org quota that cannot fit the external pool)
     /// is refused loudly rather than clamped.
+    /// §6 — the per-peer failed-admission envelope.
+    ///
+    /// Charged on FAILURE only, so an honest caller whose admissions succeed
+    /// is unaffected however fast it calls. Raise it knowingly if clients in
+    /// your deployment legitimately fail admission in bursts.
+    pub fn with_admission_rate_limit(
+        mut self,
+        config: super::behavior::org_admission_replay::AdmissionRateLimitConfig,
+    ) -> Self {
+        self.admission_rate_limit = config;
+        self
+    }
+
+    /// Replay-guard capacity envelope (§5) — global cap, owner reserve,
+    /// per-external-org quota, per-caller quota. Safe defaults, not universal
+    /// workload limits; validated at node construction.
     pub fn with_admission_replay_config(
         mut self,
         config: super::behavior::org_admission_replay::AdmissionReplayConfig,
@@ -4947,6 +4969,9 @@ pub struct MeshNode {
     /// budget, not one-per-service.
     #[cfg(feature = "cortex")]
     rpc_admission_replay: Arc<super::behavior::org_admission_replay::AdmissionReplayGuard>,
+    /// §6 — per-peer throttle on the signature work a FAILING caller can compel.
+    #[cfg(feature = "cortex")]
+    rpc_admission_rate_limit: Arc<super::behavior::org_admission_replay::AdmissionFailureLimiter>,
     /// Review-9: serializes authority/store installation. The
     /// check-then-store sequences (dominance validation, one-owner
     /// comparison, callback wiring, reconciliation) must be one
@@ -5984,6 +6009,17 @@ impl MeshNode {
         // here so an inconsistent envelope fails at construction rather than
         // at the first protected call under load.
         let admission_replay_config = config.admission_replay;
+        // §6 — captured before `config` moves, and validated here so a
+        // degenerate envelope fails at construction rather than at the first
+        // throttled call.
+        let admission_rate_limit_config = config.admission_rate_limit;
+        if let Err(e) = admission_rate_limit_config.validate() {
+            // Loud, not clamped — mirrors `AdmissionReplayGuard::new`. A
+            // degenerate envelope (zero burst, zero refill) would throttle a
+            // peer permanently on its first failure, which is a far worse
+            // outcome than refusing to start.
+            panic!("invalid admission rate-limit config: {e}");
+        }
         let enable_sensing_failure = config.enable_sensing_coalescing;
         let sensing_overlay_recovery = sensing_overlay_changed.clone();
         let enable_sensing_recovery = config.enable_sensing_coalescing;
@@ -6317,6 +6353,18 @@ impl MeshNode {
             )),
             provider_grant_mu: parking_lot::Mutex::new(()),
             consumer_grant_mu: parking_lot::Mutex::new(()),
+            #[cfg(feature = "cortex")]
+            rpc_admission_rate_limit: Arc::new(
+                // The envelope was validated (and panicked on) above, so this
+                // cannot fail; fall back to the safe defaults rather than a
+                // second panic — `expect()` is denied in production code here.
+                super::behavior::org_admission_replay::AdmissionFailureLimiter::try_new(
+                    admission_rate_limit_config,
+                )
+                .unwrap_or_else(|_| {
+                    super::behavior::org_admission_replay::AdmissionFailureLimiter::with_defaults()
+                }),
+            ),
             #[cfg(feature = "cortex")]
             rpc_admission_replay: Arc::new(
                 super::behavior::org_admission_replay::AdmissionReplayGuard::new(
@@ -7882,6 +7930,14 @@ impl MeshNode {
     /// protected serve registration on this node — so `(caller, call_id)`
     /// uniqueness is enforced provider-wide, not fragmented per service.
     #[cfg(feature = "cortex")]
+    /// §6 — the per-peer failed-admission throttle.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn admission_rate_limiter(
+        &self,
+    ) -> &super::behavior::org_admission_replay::AdmissionFailureLimiter {
+        &self.rpc_admission_rate_limit
+    }
+
     pub(crate) fn rpc_admission_replay_arc(
         &self,
     ) -> Arc<super::behavior::org_admission_replay::AdmissionReplayGuard> {

@@ -1176,6 +1176,44 @@ async fn admit_and_dispatch_protected(
         return;
     }
 
+    // §6 — throttle BEFORE the signature work, not after.
+    //
+    // Everything below this point costs up to three `ed25519 verify_strict`
+    // operations, and reaching it requires NO org credentials: a TOFU-pinned
+    // peer self-mints an `OrgKeypair`, issues itself a valid membership cert
+    // and dispatcher grant under it, and attaches a garbage capability grant
+    // naming this provider's public owner org. Every cheap plaintext check
+    // passes. Failed admissions deliberately consume no replay slot, so the
+    // replay ceilings — including the §5 partition — never see this traffic.
+    //
+    // The budget is charged on FAILURE only (see `AdmissionFailureLimiter`), so
+    // an honest caller whose admissions succeed is entirely unaffected however
+    // fast it calls. A peer that has spent its allowance is denied here,
+    // cheaply, without the verification it was trying to compel.
+    if !mesh
+        .admission_rate_limiter()
+        .may_attempt(from_node, clock.monotonic)
+    {
+        tracing::warn!(
+            service = service,
+            from_node = format!("{:#x}", from_node),
+            "nrpc: org admission throttled — peer exhausted its failed-admission budget",
+        );
+        metrics
+            .capability_denied_total
+            .fetch_add(1, Ordering::Relaxed);
+        emit_admission_denial(
+            mesh,
+            resp_tx,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Unavailable,
+        );
+        return;
+    }
+
     let outcome = crate::adapter::net::behavior::org_admission::verify_org_admission(
         &ctx,
         &admission_headers,
@@ -1199,6 +1237,10 @@ async fn admit_and_dispatch_protected(
             }
         }
         Err(denied) => {
+            // §6 — charge the failure. A denial is what an attacker produces;
+            // a legitimate caller's admissions succeed and cost nothing.
+            mesh.admission_rate_limiter()
+                .on_failure(from_node, clock.monotonic);
             tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
             emit_admission_denial(
                 mesh,

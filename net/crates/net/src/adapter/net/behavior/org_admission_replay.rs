@@ -427,6 +427,230 @@ impl ReplayState {
     }
 }
 
+/// Burst of FAILED admissions one authenticated peer may cost before it is
+/// throttled (§6). See [`AdmissionFailureLimiter`].
+pub const DEFAULT_MAX_FAILED_ADMISSIONS_PER_PEER: u32 = 64;
+
+/// Failed-admission budget refilled per second, per peer (§6).
+pub const DEFAULT_FAILED_ADMISSION_REFILL_PER_SEC: u32 = 8;
+
+/// Maximum peers tracked at once; the oldest idle entry is reclaimed at
+/// capacity (§6). Bounded so the limiter cannot itself become the memory
+/// exhaustion it exists to prevent.
+pub const DEFAULT_MAX_RATE_LIMITED_PEERS: usize = 4_096;
+
+/// Per-peer throttle on the SIGNATURE work a failing caller can compel (§6).
+///
+/// # The asymmetry this closes
+///
+/// A peer needs only a TOFU-pinned session and NO org credentials to reach the
+/// expensive part of the gate. It self-mints an `OrgKeypair`, issues ITSELF a
+/// genuinely valid membership certificate and dispatcher grant under that key,
+/// and attaches a garbage capability grant naming the provider's (public)
+/// owner org. Every cheap plaintext check passes — none of them verifies a
+/// signature — and the gate then performs THREE `ed25519 verify_strict`
+/// operations before denying `CapabilityGrantInvalid`.
+///
+/// Nothing bounded that. Failed admissions deliberately consume no replay
+/// slot (the guard records only ADMITTED calls, so a denial cannot evict a
+/// legitimate entry), so the replay ceilings — including the §5 trust-domain
+/// partition — never see this traffic at all.
+///
+/// # Why it charges on FAILURE rather than per attempt
+///
+/// A per-attempt limiter would throttle honest callers, and picking a rate
+/// that suits every deployment is exactly the guess that makes such limits
+/// wrong. But the attacker's distinguishing property is not its RATE — it is
+/// that its admissions always FAIL. A legitimate caller's succeed.
+///
+/// So a successful admission costs nothing at all: an honest peer can drive
+/// the gate as fast as it likes and never touch this. Only failures draw on
+/// the bucket, and when it empties the peer is refused BEFORE the signature
+/// work rather than after — which is the whole point, since the work is the
+/// resource being protected.
+///
+/// A legitimately misconfigured client (expired proof, wrong capability) fails
+/// at a low rate and the refill absorbs it; a client failing faster than the
+/// refill is, by construction, either broken or hostile, and throttling it is
+/// correct in both cases.
+///
+/// # These are SAFE defaults, not universal limits
+///
+/// 64 burst with 8/s refill bounds one peer to ~1.2 ms/s of verification CPU
+/// while letting a reconnect storm through untouched. An operator running
+/// protected RPC where clients legitimately fail admission in bursts can raise
+/// the envelope knowingly via [`MeshNodeConfig`]; the point is that the
+/// failure mode is bounded and attributable, not that the numbers suit every
+/// workload.
+///
+/// [`MeshNodeConfig`]: crate::adapter::net::MeshNodeConfig
+pub struct AdmissionFailureLimiter {
+    buckets: Mutex<HashMap<u64, PeerBucket>>,
+    config: AdmissionRateLimitConfig,
+    /// Admissions refused because the peer's failure budget was exhausted.
+    throttled: AtomicU64,
+}
+
+/// Tunables for [`AdmissionFailureLimiter`] (§6).
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionRateLimitConfig {
+    /// Burst of failed admissions one peer may cost before throttling.
+    pub max_failed_per_peer: u32,
+    /// Budget refilled per second, per peer.
+    pub refill_per_sec: u32,
+    /// Maximum peers tracked simultaneously.
+    pub max_tracked_peers: usize,
+}
+
+impl Default for AdmissionRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_failed_per_peer: DEFAULT_MAX_FAILED_ADMISSIONS_PER_PEER,
+            refill_per_sec: DEFAULT_FAILED_ADMISSION_REFILL_PER_SEC,
+            max_tracked_peers: DEFAULT_MAX_RATE_LIMITED_PEERS,
+        }
+    }
+}
+
+impl AdmissionRateLimitConfig {
+    /// Reject a degenerate envelope loudly rather than clamping it.
+    pub fn validate(&self) -> Result<(), ReplayConfigError> {
+        if self.max_failed_per_peer == 0 {
+            return Err(ReplayConfigError::ZeroPerCallerCeiling);
+        }
+        if self.refill_per_sec == 0 {
+            // A zero refill makes the first burst permanent: a peer that
+            // exhausts its budget is throttled forever, so a single expired
+            // proof at startup would take a client out until restart.
+            return Err(ReplayConfigError::ZeroPerCallerCeiling);
+        }
+        if self.max_tracked_peers == 0 {
+            return Err(ReplayConfigError::ZeroGlobalCeiling);
+        }
+        Ok(())
+    }
+}
+
+struct PeerBucket {
+    /// Remaining failed-admission allowance.
+    tokens: u32,
+    /// When `tokens` was last refilled.
+    last_refill: Instant,
+    /// Last touch, for idle reclamation at capacity.
+    last_seen: Instant,
+}
+
+impl AdmissionFailureLimiter {
+    /// A limiter with the given envelope, VALIDATED.
+    pub fn try_new(config: AdmissionRateLimitConfig) -> Result<Self, ReplayConfigError> {
+        config.validate()?;
+        Ok(Self {
+            buckets: Mutex::new(HashMap::new()),
+            config,
+            throttled: AtomicU64::new(0),
+        })
+    }
+
+    /// A limiter with the default envelope (always valid).
+    pub fn with_defaults() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            config: AdmissionRateLimitConfig::default(),
+            throttled: AtomicU64::new(0),
+        }
+    }
+
+    /// May `from_node` attempt an admission right now?
+    ///
+    /// Call BEFORE the signature work. `false` means the peer has spent its
+    /// failure budget and must be denied cheaply.
+    pub fn may_attempt(&self, from_node: u64, now: Instant) -> bool {
+        let mut buckets = self.buckets.lock();
+        let cfg = self.config;
+        match buckets.get_mut(&from_node) {
+            None => true, // unseen peer: no failures charged yet
+            Some(bucket) => {
+                Self::refill(bucket, cfg, now);
+                bucket.last_seen = now;
+                if bucket.tokens > 0 {
+                    true
+                } else {
+                    self.throttled.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            }
+        }
+    }
+
+    /// Charge one failed admission to `from_node`.
+    ///
+    /// Called ONLY on a denial. A successful admission costs nothing, which is
+    /// what keeps honest traffic entirely unaffected.
+    pub fn on_failure(&self, from_node: u64, now: Instant) {
+        let mut buckets = self.buckets.lock();
+        let cfg = self.config;
+        if !buckets.contains_key(&from_node) {
+            if buckets.len() >= cfg.max_tracked_peers {
+                // Reclaim the least-recently-seen peer. Safe to evict: losing a
+                // bucket only restores that peer's full allowance, and the
+                // evicted one is by definition the least active.
+                if let Some(oldest) = buckets
+                    .iter()
+                    .min_by_key(|(_, b)| b.last_seen)
+                    .map(|(peer, _)| *peer)
+                {
+                    buckets.remove(&oldest);
+                }
+            }
+            buckets.insert(
+                from_node,
+                PeerBucket {
+                    tokens: cfg.max_failed_per_peer,
+                    last_refill: now,
+                    last_seen: now,
+                },
+            );
+        }
+        if let Some(bucket) = buckets.get_mut(&from_node) {
+            Self::refill(bucket, cfg, now);
+            bucket.tokens = bucket.tokens.saturating_sub(1);
+            bucket.last_seen = now;
+        }
+    }
+
+    fn refill(bucket: &mut PeerBucket, cfg: AdmissionRateLimitConfig, now: Instant) {
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        let secs = elapsed.as_secs();
+        if secs == 0 {
+            return;
+        }
+        let gained = secs.saturating_mul(u64::from(cfg.refill_per_sec));
+        let gained = u32::try_from(gained).unwrap_or(u32::MAX);
+        bucket.tokens = bucket
+            .tokens
+            .saturating_add(gained)
+            .min(cfg.max_failed_per_peer);
+        bucket.last_refill = now;
+    }
+
+    /// Admissions refused because the peer's failure budget was exhausted.
+    pub fn throttled_denials(&self) -> u64 {
+        self.throttled.load(Ordering::Relaxed)
+    }
+
+    /// Remaining failure allowance for `from_node` (test/metric surface).
+    pub fn tokens_for(&self, from_node: u64) -> u32 {
+        self.buckets
+            .lock()
+            .get(&from_node)
+            .map_or(self.config.max_failed_per_peer, |b| b.tokens)
+    }
+
+    /// Peers currently tracked (test/metric surface).
+    pub fn tracked_peers(&self) -> usize {
+        self.buckets.lock().len()
+    }
+}
 /// The volatile admission replay guard. One per provider node.
 pub struct AdmissionReplayGuard {
     entries: Mutex<ReplayState>,
@@ -772,6 +996,151 @@ mod tests {
         )
     }
 
+    // ==================================================================
+    // §6 — per-peer throttle on compelled signature work.
+    // ==================================================================
+
+    fn limiter() -> AdmissionFailureLimiter {
+        AdmissionFailureLimiter::try_new(AdmissionRateLimitConfig {
+            max_failed_per_peer: 4,
+            refill_per_sec: 2,
+            max_tracked_peers: 8,
+        })
+        .expect("valid envelope")
+    }
+
+    /// The property that makes this design defensible: an honest caller is
+    /// COMPLETELY unaffected, however fast it calls.
+    ///
+    /// A per-attempt limiter would throttle legitimate traffic, and picking a
+    /// rate that suits every deployment is exactly the guess that makes such
+    /// limits wrong. Charging on FAILURE instead keys on the attacker's actual
+    /// distinguishing property — its admissions fail; a real caller's succeed.
+    #[test]
+    fn a_peer_whose_admissions_succeed_is_never_throttled() {
+        let lim = limiter();
+        let now = Instant::now();
+        const PEER: u64 = 7;
+
+        // Far more attempts than the burst allowance, none of them failures.
+        for _ in 0..1_000 {
+            assert!(
+                lim.may_attempt(PEER, now),
+                "a successful caller must never be throttled — charging per \
+                 ATTEMPT would penalise exactly the traffic we want",
+            );
+        }
+        assert_eq!(lim.throttled_denials(), 0);
+        assert_eq!(
+            lim.tracked_peers(),
+            0,
+            "a peer with no failures costs nothing to track"
+        );
+    }
+
+    /// A failing peer spends its burst and is then refused BEFORE the
+    /// signature work — which is the resource being protected.
+    #[test]
+    fn a_failing_peer_exhausts_its_budget_and_is_refused() {
+        let lim = limiter();
+        let now = Instant::now();
+        const PEER: u64 = 9;
+
+        for _ in 0..4 {
+            assert!(lim.may_attempt(PEER, now));
+            lim.on_failure(PEER, now);
+        }
+        assert_eq!(lim.tokens_for(PEER), 0);
+        assert!(
+            !lim.may_attempt(PEER, now),
+            "the peer must be refused once its failure budget is spent",
+        );
+        assert_eq!(lim.throttled_denials(), 1);
+    }
+
+    /// Throttling is per PEER: one abusive session must not deny another.
+    #[test]
+    fn throttling_one_peer_leaves_others_untouched() {
+        let lim = limiter();
+        let now = Instant::now();
+        const NOISY: u64 = 1;
+        const QUIET: u64 = 2;
+
+        for _ in 0..4 {
+            lim.on_failure(NOISY, now);
+        }
+        assert!(!lim.may_attempt(NOISY, now));
+        assert!(
+            lim.may_attempt(QUIET, now),
+            "a second peer's allowance must be untouched by the first's abuse",
+        );
+    }
+
+    /// The budget refills, so a legitimately misconfigured client recovers
+    /// without operator intervention. A zero-refill envelope would make the
+    /// first burst permanent, which `validate` refuses for this reason.
+    #[test]
+    fn the_budget_refills_over_time() {
+        let lim = limiter();
+        let t0 = Instant::now();
+        const PEER: u64 = 3;
+
+        for _ in 0..4 {
+            lim.on_failure(PEER, t0);
+        }
+        assert!(!lim.may_attempt(PEER, t0));
+
+        // 2 tokens/sec: one second restores two attempts.
+        let later = t0 + Duration::from_secs(1);
+        assert!(
+            lim.may_attempt(PEER, later),
+            "a throttled peer must recover on its own — otherwise one expired \
+             proof at startup takes a client out until restart",
+        );
+        assert_eq!(lim.tokens_for(PEER), 2);
+
+        // Refill saturates at the burst ceiling rather than growing unbounded.
+        let much_later = t0 + Duration::from_secs(3_600);
+        lim.may_attempt(PEER, much_later);
+        assert_eq!(lim.tokens_for(PEER), 4);
+    }
+
+    /// The tracking map is bounded, so the limiter cannot become the memory
+    /// exhaustion it exists to prevent.
+    #[test]
+    fn tracked_peers_are_bounded() {
+        let lim = limiter();
+        let now = Instant::now();
+        for peer in 0..64u64 {
+            lim.on_failure(peer, now + Duration::from_millis(peer));
+        }
+        assert!(
+            lim.tracked_peers() <= 8,
+            "peer tracking must stay within max_tracked_peers, got {}",
+            lim.tracked_peers(),
+        );
+    }
+
+    /// A degenerate envelope is refused loudly. Zero refill in particular
+    /// would make the first burst permanent.
+    #[test]
+    fn a_degenerate_rate_limit_envelope_is_refused() {
+        assert!(AdmissionRateLimitConfig {
+            max_failed_per_peer: 0,
+            refill_per_sec: 1,
+            max_tracked_peers: 8,
+        }
+        .validate()
+        .is_err());
+        assert!(AdmissionRateLimitConfig {
+            max_failed_per_peer: 4,
+            refill_per_sec: 0,
+            max_tracked_peers: 8,
+        }
+        .validate()
+        .is_err());
+        assert!(AdmissionRateLimitConfig::default().validate().is_ok());
+    }
     // ==================================================================
     // §5 — trust-domain partitioning of the replay budget.
     //
