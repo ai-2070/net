@@ -85,13 +85,34 @@ impl OrgClient {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let intent = self.plan(service)?;
-        let provider = intent.provider.clone();
-
         let body = Codec::Json.encode(request).map_err(|e| RpcError::Codec {
             direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
             message: format!("org call encode: {e}"),
         })?;
+
+        let reply = self.call_bytes(service, Bytes::from(body)).await?;
+
+        Codec::Json.decode(&reply).map_err(|e| {
+            OrgSdkError::Rpc(RpcError::Codec {
+                direction: net::adapter::net::mesh_rpc::CodecDirection::Decode,
+                message: format!("org call decode: {e}"),
+            })
+        })
+    }
+
+    /// [`call`](Self::call) without the codec — bytes in, bytes out (OSDK-L R1).
+    ///
+    /// The typed verb IS this plus JSON, so there is one authority path and the
+    /// typed layer is provably just marshaling. Exists because language
+    /// bindings cannot cross an FFI boundary with a generic: `call<Req, Resp>`
+    /// is unwrappable by napi, PyO3, or cgo, and this is what they call.
+    ///
+    /// Every guarantee of the typed verb holds here unchanged: private-only
+    /// discovery, inferred admission mode, exact grant matching, deterministic
+    /// selection, one canonical request-bound proof, and no retry.
+    pub async fn call_bytes(&self, service: &str, request: Bytes) -> Result<Bytes, OrgSdkError> {
+        let intent = self.plan(service)?;
+        let provider = intent.provider.clone();
 
         let opts = CallOptions {
             org_proof_intent: Some(intent),
@@ -103,16 +124,11 @@ impl OrgClient {
         // pins `peer_entity_id(target) == intent.provider` before sending.
         let reply = self
             .node
-            .call(provider.node_id(), service, Bytes::from(body), opts)
+            .call(provider.node_id(), service, request, opts)
             .await
             .map_err(map_rpc_error)?;
 
-        Codec::Json.decode(&reply.body).map_err(|e| {
-            OrgSdkError::Rpc(RpcError::Codec {
-                direction: net::adapter::net::mesh_rpc::CodecDirection::Decode,
-                message: format!("org call decode: {e}"),
-            })
-        })
+        Ok(reply.body)
     }
 
     /// Everything `call` does before touching the network: capability

@@ -533,6 +533,108 @@ async fn live_a_provider_side_revocation_surfaces_as_admission_denied() {
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// R1: the typed verb IS the raw verb plus JSON.
+///
+/// Proved by crossing the seams: a TYPED `serve_org` handler answers a
+/// hand-written-JSON `call_bytes`, and a RAW `serve_org_bytes` handler answers
+/// a typed `call`. If the codec layer did anything beyond marshaling — a
+/// different framing, an extra header, a second authority step — one direction
+/// would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_raw_and_typed_seams_interoperate() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("live-r1-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("live-r1-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    // A TYPED handler…
+    let _typed = provider
+        .serve_org(
+            "typed.svc",
+            OrgAccess::SameOrg,
+            |_c: OrgCaller, req: Ping| async move {
+                Ok(Pong {
+                    n: req.n + 1,
+                    served_by: "typed".to_string(),
+                })
+            },
+        )
+        .expect("typed serve");
+
+    // …and a RAW handler that does its own JSON, asserting it sees the same
+    // verified facts the typed one does.
+    let saw_caller = Arc::new(AtomicBool::new(false));
+    let saw = saw_caller.clone();
+    let org_id = a.org_id();
+    let _raw = provider
+        .serve_org_bytes(
+            "raw.svc",
+            OrgAccess::SameOrg,
+            move |c: OrgCaller, body: bytes::Bytes| {
+                let saw = saw.clone();
+                async move {
+                    saw.store(c.acting_org == org_id && c.is_same_org(), Ordering::SeqCst);
+                    let req: Ping = serde_json::from_slice(&body).map_err(|e| {
+                        crate::org::OrgHandlerError::Application {
+                            code: 0x8000,
+                            message: format!("bad body: {e}"),
+                        }
+                    })?;
+                    let out = serde_json::to_vec(&Pong {
+                        n: req.n + 1,
+                        served_by: "raw".to_string(),
+                    })
+                    .expect("encode");
+                    Ok(bytes::Bytes::from(out))
+                }
+            },
+        )
+        .expect("raw serve");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let org = caller
+        .org(OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials"))
+        .expect("bind");
+    assert!(converge_discovery(&provider, &org, &cap("nrpc:typed.svc")).await);
+    assert!(converge_discovery(&provider, &org, &cap("nrpc:raw.svc")).await);
+
+    // Raw caller → typed handler. The bytes are exactly what the codec emits.
+    let raw_reply = org
+        .call_bytes(
+            "typed.svc",
+            bytes::Bytes::from(serde_json::to_vec(&Ping { n: 1 }).expect("encode")),
+        )
+        .await
+        .expect("call_bytes reaches the typed handler");
+    let decoded: Pong = serde_json::from_slice(&raw_reply).expect("decode");
+    assert_eq!(decoded.n, 2);
+    assert_eq!(decoded.served_by, "typed");
+
+    // Typed caller → raw handler.
+    let typed_reply: Pong = org
+        .call("raw.svc", &Ping { n: 10 })
+        .await
+        .expect("typed call reaches the raw handler");
+    assert_eq!(typed_reply.n, 11);
+    assert_eq!(typed_reply.served_by, "raw");
+    assert!(
+        saw_caller.load(Ordering::SeqCst),
+        "the raw handler receives the same verified OrgCaller as the typed one"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 // ---------------------------------------------------------------------------
 // The design test
 // ---------------------------------------------------------------------------

@@ -66,7 +66,7 @@ mod call;
 #[cfg(feature = "cortex")]
 mod serve;
 #[cfg(feature = "cortex")]
-pub use serve::{OrgAccess, OrgCaller};
+pub use serve::{OrgAccess, OrgCaller, OrgHandlerError};
 
 #[cfg(test)]
 mod tests;

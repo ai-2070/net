@@ -41,6 +41,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use net::adapter::net::behavior::org_admission::Admitted;
 use net::adapter::net::identity::EntityId;
 
@@ -115,6 +116,41 @@ impl OrgCaller {
     }
 }
 
+/// What a raw org handler may return on failure (OSDK-L R1).
+///
+/// The typed [`Mesh::serve_org`] maps a handler's `Err(String)` onto
+/// `Application { code: NRPC_TYPED_HANDLER_ERROR }` and a decode failure onto
+/// `Application { code: NRPC_TYPED_BAD_REQUEST }`. A language binding needs the
+/// same expressiveness — Node throws `nrpc:app_error:0x<code>:<body>`, Go
+/// returns `AppError(code, body)` — so the raw seam carries the code instead of
+/// flattening every failure into one status.
+///
+/// Neither variant is ever an admission denial: `0x0009` is the admission
+/// engine's word, and a handler cannot counterfeit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrgHandlerError {
+    /// An application-level rejection carrying a status the caller sees.
+    Application {
+        /// Application status code (the `0x8000..=0xFFFF` band by convention).
+        code: u16,
+        /// Diagnostic body.
+        message: String,
+    },
+    /// An internal failure — surfaced as a server error, not an app status.
+    Internal(String),
+}
+
+impl From<OrgHandlerError> for RpcHandlerError {
+    fn from(e: OrgHandlerError) -> Self {
+        match e {
+            OrgHandlerError::Application { code, message } => {
+                RpcHandlerError::Application { code, message }
+            }
+            OrgHandlerError::Internal(message) => RpcHandlerError::Internal(message),
+        }
+    }
+}
+
 impl Mesh {
     /// Serve a protected, privately-discoverable service (OSDK §4).
     ///
@@ -138,11 +174,57 @@ impl Mesh {
         F: Fn(OrgCaller, Req) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Resp, String>> + Send + 'static,
     {
-        let typed = Arc::new(OrgTypedHandler {
-            codec: Codec::Json,
+        let codec = Codec::Json;
+        let inner = Arc::new(handler);
+        // The typed verb IS the raw one plus JSON — one dispatch path, and the
+        // codec layer is provably marshaling.
+        self.serve_org_bytes(service, access, move |caller, body: Bytes| {
+            let inner = inner.clone();
+            async move {
+                let req: Req = codec
+                    .decode(&body)
+                    .map_err(|e| OrgHandlerError::Application {
+                        code: NRPC_TYPED_BAD_REQUEST,
+                        message: format!("org handler: bad request body: {e}"),
+                    })?;
+                let resp =
+                    inner(caller, req)
+                        .await
+                        .map_err(|message| OrgHandlerError::Application {
+                            code: NRPC_TYPED_HANDLER_ERROR,
+                            message,
+                        })?;
+                let out = codec.encode(&resp).map_err(|e| {
+                    OrgHandlerError::Internal(format!("org handler: response encode: {e}"))
+                })?;
+                Ok(Bytes::from(out))
+            }
+        })
+    }
+
+    /// [`serve_org`](Self::serve_org) without the codec — bytes in, bytes out
+    /// (OSDK-L R1).
+    ///
+    /// Exists for the same reason as
+    /// [`call_bytes`](crate::org::OrgClient::call_bytes): a generic closure
+    /// cannot cross an FFI boundary, so this is the seam every language binding
+    /// registers against. The handler still receives the provider-verified
+    /// [`OrgCaller`] — dropping it here would defeat the point of the verb.
+    ///
+    /// Access still implies visibility, and the trivial proof policy is still
+    /// installed; nothing about admission changes by removing the codec.
+    pub fn serve_org_bytes<F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+    {
+        let raw = Arc::new(OrgBytesHandler {
             inner: Arc::new(handler),
-            _req: std::marker::PhantomData::<Req>,
-            _resp: std::marker::PhantomData::<Resp>,
         });
         self.auto_register_rpc_channels(service);
         // The trivial proof policy: v1 decides in the handler, with the verified
@@ -150,29 +232,29 @@ impl Mesh {
         // that must refuse before the replay insert.
         let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
         match access {
-            OrgAccess::SameOrg => self.node().serve_rpc_owner_scoped(service, typed, policy),
-            OrgAccess::Granted => self.node().serve_rpc_granted(service, typed, policy),
+            OrgAccess::SameOrg => self.node().serve_rpc_owner_scoped(service, raw, policy),
+            OrgAccess::Granted => self.node().serve_rpc_granted(service, raw, policy),
         }
     }
 }
 
-/// Bridges the facade's `Fn(OrgCaller, Req) -> Future` closure to the raw
+/// Bridges the facade's `Fn(OrgCaller, Bytes) -> Future` closure to the raw
 /// `RpcHandler` trait, forwarding the verified admission facts the existing
 /// typed wrapper discards.
-struct OrgTypedHandler<Req, Resp, F> {
-    codec: Codec,
+///
+/// This is the ONLY `RpcHandler` impl in the org facade: the typed verb wraps a
+/// codec around a closure and registers through here, so there is exactly one
+/// place where admission facts are projected and one place where a handler
+/// failure is classified.
+struct OrgBytesHandler<F> {
     inner: Arc<F>,
-    _req: std::marker::PhantomData<Req>,
-    _resp: std::marker::PhantomData<Resp>,
 }
 
 #[async_trait]
-impl<Req, Resp, F, Fut> RpcHandler for OrgTypedHandler<Req, Resp, F>
+impl<F, Fut> RpcHandler for OrgBytesHandler<F>
 where
-    Req: serde::de::DeserializeOwned + Send + Sync + 'static,
-    Resp: serde::Serialize + Send + Sync + 'static,
-    F: Fn(OrgCaller, Req) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Resp, String>> + Send + 'static,
+    F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
 {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
         // The gate dispatches a protected registration ONLY after
@@ -187,32 +269,11 @@ where
         };
         let caller = OrgCaller::from(admitted);
 
-        let req: Req = match self.codec.decode(&ctx.payload.body) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(RpcHandlerError::Application {
-                    code: NRPC_TYPED_BAD_REQUEST,
-                    message: format!("org handler: bad request body: {e}"),
-                })
-            }
-        };
-
-        let resp =
-            (self.inner)(caller, req)
-                .await
-                .map_err(|message| RpcHandlerError::Application {
-                    code: NRPC_TYPED_HANDLER_ERROR,
-                    message,
-                })?;
-
-        let body = self
-            .codec
-            .encode(&resp)
-            .map_err(|e| RpcHandlerError::Internal(format!("org handler: response encode: {e}")))?;
+        let body = (self.inner)(caller, ctx.payload.body.clone()).await?;
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: body.into(),
+            body,
         })
     }
 }

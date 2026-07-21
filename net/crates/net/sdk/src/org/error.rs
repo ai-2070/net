@@ -49,6 +49,140 @@ pub enum OrgSdkError {
     Rpc(#[from] RpcError),
 }
 
+/// The wire prefix every org error kind carries (OSDK-L R3).
+///
+/// Mirrors `ERR_NRPC_PREFIX` — the house pattern for crossing an FFI boundary
+/// is a stable prefixed string that each language re-parses into its own error
+/// type, pinned by a golden fixture.
+pub const ERR_ORG_PREFIX: &str = "org:";
+
+/// The four canonical domains, plus the parser fallback.
+///
+/// The domain is the load-bearing fact: it says WHERE the refusal happened.
+/// `Credentials` and `Discovery` mean nothing was sent; `AdmissionDenied` means
+/// a provider's admission engine evaluated and refused the request; `Rpc` means
+/// transport or a non-admission server failure.
+///
+/// [`Unclassified`](Self::Unclassified) exists so a binding that meets a kind
+/// it does not know **never impersonates one of the four** — reporting
+/// `admission_denied` for an unparsed string would assert a remote evaluation
+/// that may never have happened. It is an internal compatibility failure, not
+/// an admission result, and a binding that emits it in CI has a vocabulary out
+/// of sync with this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgErrorDomain {
+    /// Local — the credential set could not authorize the call.
+    Credentials,
+    /// Local — no authorized provider could be found.
+    Discovery,
+    /// Remote — the provider's admission engine refused.
+    AdmissionDenied,
+    /// Transport, or a non-admission server error.
+    Rpc,
+    /// Parser / ABI fallback. Never produced by Rust; only by a binding whose
+    /// vocabulary disagrees with this build.
+    Unclassified,
+}
+
+impl OrgErrorDomain {
+    /// The stable wire token. Frozen — a rename is a breaking ABI change that
+    /// must fail the cross-language fixture before it reaches a release.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Credentials => "credentials",
+            Self::Discovery => "discovery",
+            Self::AdmissionDenied => "admission_denied",
+            Self::Rpc => "rpc",
+            Self::Unclassified => "unknown",
+        }
+    }
+
+    /// Parse a domain token. `None` means this build does not know it — the
+    /// caller maps that to [`Unclassified`](Self::Unclassified).
+    pub fn from_wire(token: &str) -> Option<Self> {
+        Some(match token {
+            "credentials" => Self::Credentials,
+            "discovery" => Self::Discovery,
+            "admission_denied" => Self::AdmissionDenied,
+            "rpc" => Self::Rpc,
+            "unknown" => Self::Unclassified,
+            _ => return None,
+        })
+    }
+
+    /// Whether a refusal in this domain means nothing left this process.
+    ///
+    /// The single most useful question a caller asks, and the one a
+    /// misclassification would answer wrongly.
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Credentials | Self::Discovery)
+    }
+}
+
+impl OrgSdkError {
+    /// The domain this error belongs to.
+    pub fn domain(&self) -> OrgErrorDomain {
+        match self {
+            Self::Credentials(_) => OrgErrorDomain::Credentials,
+            Self::Discovery(_) => OrgErrorDomain::Discovery,
+            Self::AdmissionDenied(_) => OrgErrorDomain::AdmissionDenied,
+            Self::Rpc(_) => OrgErrorDomain::Rpc,
+        }
+    }
+
+    /// The stable kind token within the domain.
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::Credentials(e) => e.wire_kind(),
+            Self::Discovery(e) => e.wire_kind(),
+            Self::AdmissionDenied(reason) => match reason {
+                CoarseAdmissionReason::Denied => "denied",
+                CoarseAdmissionReason::NotSupported => "not_supported",
+                CoarseAdmissionReason::Unavailable => "unavailable",
+            },
+            // The nested nRPC kind is already a frozen vocabulary; reuse it
+            // rather than minting a second name for the same condition.
+            Self::Rpc(e) => rpc_wire_kind(e),
+        }
+    }
+
+    /// The single source of the `org:` wire vocabulary (OSDK-L R3).
+    ///
+    /// Every binding parses exactly this, and
+    /// `tests/cross_lang_org/error_vectors.json` is generated from it, so a
+    /// kind rename fails five suites instead of silently diverging one.
+    ///
+    /// Shape: `org:<domain>:<kind>[: <detail>]`. The detail is human-facing
+    /// and MUST NOT be parsed for semantics — and it never carries credential
+    /// material, because the local variants render only ids and the remote one
+    /// renders only a coarse bucket.
+    pub fn to_wire(&self) -> String {
+        let (domain, kind) = (self.domain().as_wire(), self.wire_kind());
+        match self {
+            // The remote bucket is deliberately reasonless beyond the bucket:
+            // a precise reason would be a credential oracle (OA2-E2).
+            Self::AdmissionDenied(_) => format!("{ERR_ORG_PREFIX}{domain}:{kind}"),
+            other => format!("{ERR_ORG_PREFIX}{domain}:{kind}: {other}"),
+        }
+    }
+}
+
+/// The frozen nRPC kind for an `org:rpc:` error, reusing that vocabulary.
+fn rpc_wire_kind(e: &RpcError) -> &'static str {
+    match e {
+        RpcError::NoRoute { .. } => "no_route",
+        RpcError::Timeout { .. } => "timeout",
+        RpcError::ServerError { .. } => "server_error",
+        RpcError::Transport(_) => "transport",
+        RpcError::Codec { direction, .. } => match direction {
+            net::adapter::net::mesh_rpc::CodecDirection::Encode => "codec_encode",
+            net::adapter::net::mesh_rpc::CodecDirection::Decode => "codec_decode",
+        },
+        RpcError::CapabilityDenied { .. } => "capability_denied",
+        RpcError::Cancelled => "cancelled",
+    }
+}
+
 /// Local credential failures — assembly (`OrgCredentials::new`), binding
 /// (`Mesh::org`), and per-call matching. The three stages are noted per variant
 /// because which stage refused tells an operator where to look.
@@ -245,6 +379,41 @@ pub enum OrgDiscoveryError {
     },
 }
 
+impl OrgCredentialError {
+    /// The stable kind token. Frozen with the fixture (OSDK-L R3).
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::PersistentIdentityRequired => "persistent_identity_required",
+            Self::NodeAuthorityRequired => "node_authority_required",
+            Self::NodeAuthorityOrgMismatch { .. } => "node_authority_org_mismatch",
+            Self::MemberBindingMismatch { .. } => "member_binding_mismatch",
+            Self::SignatureInvalid { .. } => "signature_invalid",
+            Self::DispatcherBindingMismatch { .. } => "dispatcher_binding_mismatch",
+            Self::ActingOrgMismatch { .. } => "acting_org_mismatch",
+            Self::GrantNotForActingOrg { .. } => "grant_not_for_acting_org",
+            Self::DuplicateGrant { .. } => "duplicate_grant",
+            Self::AudienceSecretMismatch { .. } => "audience_secret_mismatch",
+            Self::AudienceInstallRefused { .. } => "audience_install_refused",
+            Self::NotCurrentlyValid { .. } => "not_currently_valid",
+            Self::DispatcherScopeExcludesCapability { .. } => {
+                "dispatcher_scope_excludes_capability"
+            }
+            Self::MissingCapabilityGrant { .. } => "missing_capability_grant",
+            Self::AmbiguousCapabilityGrant { .. } => "ambiguous_capability_grant",
+        }
+    }
+}
+
+impl OrgDiscoveryError {
+    /// The stable kind token. Frozen with the fixture (OSDK-L R3).
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::NoAuthorizedProvider { .. } => "no_authorized_provider",
+            Self::ProviderNotDirect { .. } => "provider_not_direct",
+        }
+    }
+}
+
 /// Hex-format a 32-byte id for error text (grant ids and capability authority
 /// ids are public values; this never touches secret material).
 pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
@@ -259,4 +428,134 @@ pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
 /// Hex-format a capability authority id.
 pub(crate) fn hex_capability(capability: &CapabilityAuthorityId) -> String {
     hex32(capability.as_bytes())
+}
+
+#[cfg(test)]
+mod wire_vocabulary_tests {
+    //! OSDK-L R3 — the `org:` vocabulary is the bindings' contract, so these
+    //! pin its shape, its exhaustiveness, and the one property a
+    //! misclassification would destroy.
+
+    use super::*;
+
+    #[test]
+    fn the_domain_token_round_trips_and_says_where_the_refusal_happened() {
+        for d in [
+            OrgErrorDomain::Credentials,
+            OrgErrorDomain::Discovery,
+            OrgErrorDomain::AdmissionDenied,
+            OrgErrorDomain::Rpc,
+            OrgErrorDomain::Unclassified,
+        ] {
+            assert_eq!(OrgErrorDomain::from_wire(d.as_wire()), Some(d));
+        }
+        // The load-bearing distinction: local means nothing was sent.
+        assert!(OrgErrorDomain::Credentials.is_local());
+        assert!(OrgErrorDomain::Discovery.is_local());
+        assert!(!OrgErrorDomain::AdmissionDenied.is_local());
+        assert!(!OrgErrorDomain::Rpc.is_local());
+        // Unknown must NOT claim to be local either — it claims nothing.
+        assert!(!OrgErrorDomain::Unclassified.is_local());
+    }
+
+    /// An unknown token yields `None` so a binding maps it to `Unclassified`
+    /// rather than guessing a domain.
+    #[test]
+    fn an_unknown_domain_token_is_not_silently_coerced() {
+        assert_eq!(OrgErrorDomain::from_wire("admission"), None);
+        assert_eq!(OrgErrorDomain::from_wire(""), None);
+        assert_eq!(OrgErrorDomain::from_wire("credentials "), None);
+    }
+
+    #[test]
+    fn every_error_renders_the_prefixed_three_part_shape() {
+        let e = OrgSdkError::Credentials(OrgCredentialError::NodeAuthorityRequired);
+        let wire = e.to_wire();
+        assert!(
+            wire.starts_with("org:credentials:node_authority_required"),
+            "{wire}"
+        );
+        assert_eq!(e.domain(), OrgErrorDomain::Credentials);
+
+        let e = OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            capability: "ab".repeat(32),
+            considered: 3,
+        });
+        assert!(
+            e.to_wire()
+                .starts_with("org:discovery:no_authorized_provider"),
+            "{}",
+            e.to_wire()
+        );
+    }
+
+    /// The remote bucket carries the bucket and NOTHING else — a precise
+    /// reason would be a credential oracle (OA2-E2).
+    #[test]
+    fn an_admission_denial_renders_only_its_coarse_bucket() {
+        for (reason, token) in [
+            (CoarseAdmissionReason::Denied, "denied"),
+            (CoarseAdmissionReason::NotSupported, "not_supported"),
+            (CoarseAdmissionReason::Unavailable, "unavailable"),
+        ] {
+            let wire = OrgSdkError::AdmissionDenied(reason).to_wire();
+            assert_eq!(wire, format!("org:admission_denied:{token}"));
+            // No trailing detail at all.
+            assert_eq!(wire.matches(':').count(), 2, "{wire}");
+        }
+    }
+
+    /// `org:rpc:` reuses the frozen nRPC kinds rather than minting a second
+    /// name for the same condition.
+    #[test]
+    fn the_rpc_domain_reuses_the_nrpc_kind_vocabulary() {
+        let e = OrgSdkError::Rpc(RpcError::Timeout { elapsed_ms: 5 });
+        assert!(
+            e.to_wire().starts_with("org:rpc:timeout"),
+            "{}",
+            e.to_wire()
+        );
+
+        let e = OrgSdkError::Rpc(RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Decode,
+            message: "x".into(),
+        });
+        assert!(
+            e.to_wire().starts_with("org:rpc:codec_decode"),
+            "{}",
+            e.to_wire()
+        );
+    }
+
+    /// Every credential and discovery kind is distinct — a duplicated token
+    /// would make two conditions indistinguishable to every binding at once.
+    #[test]
+    fn kind_tokens_are_unique_within_their_domain() {
+        let credential_kinds = [
+            OrgCredentialError::PersistentIdentityRequired.wire_kind(),
+            OrgCredentialError::NodeAuthorityRequired.wire_kind(),
+            OrgCredentialError::DuplicateGrant {
+                grant_id: String::new(),
+            }
+            .wire_kind(),
+            OrgCredentialError::MissingCapabilityGrant {
+                capability: String::new(),
+            }
+            .wire_kind(),
+            OrgCredentialError::AmbiguousCapabilityGrant {
+                capability: String::new(),
+                grant_ids: vec![],
+            }
+            .wire_kind(),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for k in credential_kinds {
+            assert!(seen.insert(k), "duplicate credential kind token: {k}");
+            // Tokens are snake_case ASCII so every language can match them.
+            assert!(
+                k.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "non-portable kind token: {k}"
+            );
+        }
+    }
 }
