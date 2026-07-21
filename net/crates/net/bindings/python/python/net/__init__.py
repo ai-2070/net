@@ -945,5 +945,38 @@ except ImportError:
 else:
     __all__.append("A2aServeHandle")
 
+# Organization capability auth (OSDK-L Workstream P, the `org` feature):
+# `OrgCredentials`, `OrgClient`, `serve_org`, and the `OrgError` family from
+# the native module, plus the pure-Python typed/vocabulary layer in `net.org`.
+try:
+    from ._net import (
+        OrgAdmissionDeniedError,
+        OrgClient,
+        OrgCredentials,
+        OrgCredentialsError,
+        OrgDiscoveryError,
+        OrgError,
+        OrgServeHandle,
+        OrgUnclassifiedError,
+        serve_org,
+    )
+except ImportError:
+    # `org` feature not compiled in; the symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "OrgAdmissionDeniedError",
+            "OrgClient",
+            "OrgCredentials",
+            "OrgCredentialsError",
+            "OrgDiscoveryError",
+            "OrgError",
+            "OrgServeHandle",
+            "OrgUnclassifiedError",
+            "serve_org",
+        ]
+    )
+
 
 __version__ = "0.33.0"

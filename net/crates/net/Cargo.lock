@@ -2992,6 +2992,7 @@ dependencies = [
 name = "net-python"
 version = "0.33.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "bytes",

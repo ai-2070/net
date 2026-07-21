@@ -846,7 +846,7 @@ jobs:
         # `payments-http` (the outbound HTTP-402 client, WS-P2) is an opt-in
         # NOT in the default wheel — built here so test_payment_http.py's rows
         # run (they skip cleanly if the class is absent).
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,extension-module
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python
