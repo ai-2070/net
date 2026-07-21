@@ -9073,9 +9073,44 @@ impl MeshNode {
         self.scoped_relay_gate.len()
     }
 
-    #[doc(hidden)]
-    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+    /// OSDK S1: the verified OWNER-PRIVATE providers of `capability` — the
+    /// same-org private discovery plane.
+    ///
+    /// Every candidate was admitted by `verify_scoped_ingest` (outer signature,
+    /// owner certificate proving the provider is in THIS node's org, audience
+    /// selection under the owner audience, AEAD open, descriptor validation) and
+    /// is filtered here for expiry and revocation-floor currentness. The
+    /// descriptor is decoded and must actually carry `capability`: an owner
+    /// envelope announces every owner-scoped tag the provider serves, so
+    /// possession of a matching record is not by itself a match for the tag you
+    /// asked about.
+    ///
+    /// Discovery is NOT authority: a returned provider still admits the caller
+    /// only on a valid per-call organization proof.
+    pub fn owner_private_capability_providers(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+        self.owner_private_providers_at(Some(capability), super::behavior::org::current_timestamp())
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect()
+    }
+
+    /// Shared owner-plane query. `capability == None` returns every owner-private
+    /// record (the test seam's historical semantics); `Some` filters by decoded
+    /// descriptor tag. Returns each candidate with its provider entity so both
+    /// callers can project what they need.
+    fn owner_private_providers_at(
+        &self,
+        capability: Option<&super::behavior::org_grant::CapabilityAuthorityId>,
+        now_secs: u64,
+    ) -> Vec<(
+        super::behavior::org_scoped_store::PrivateCapabilityProvider,
+        EntityId,
+    )> {
         use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
         // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
         // node with no revocation store queries against an implicit empty floor
         // set), so the currentness filter reflects real node state.
@@ -9085,9 +9120,28 @@ impl MeshNode {
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         self.scoped_discovery
             .lock()
-            .find_owner_private_capabilities(now_secs, floors, |_| true)
+            .find_owner_private_capabilities(now_secs, floors, |c| match capability {
+                None => true,
+                Some(want) => super::behavior::org_scoped_ingest::descriptor_declares_capability(
+                    c.descriptor(),
+                    want,
+                ),
+            })
             .into_iter()
-            .map(|c| c.provider().clone())
+            .map(|c| {
+                (
+                    PrivateCapabilityProvider::from_verified(c),
+                    c.provider().clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+        self.owner_private_providers_at(None, now_secs)
+            .into_iter()
+            .map(|(_, provider)| provider)
             .collect()
     }
 
@@ -9104,12 +9158,38 @@ impl MeshNode {
     /// (the record stays physically stored; retraction is a read-time filter,
     /// mirroring the floor-currentness filter for owner records). Also expiry- and
     /// floor-currentness-safe, exactly as a real query would be.
-    #[doc(hidden)]
-    pub fn scoped_granted_providers_for_test(
+    /// OSDK S1: the verified GRANTED-audience providers discoverable under
+    /// `grant_id` — the cross-org private discovery plane.
+    ///
+    /// Applies the same query-time consumer currentness as the seam below:
+    /// visible only while this node still holds a consumer grant whose grant id,
+    /// audience handle, AND verified signature match the stored record, so
+    /// removing the credential retracts every record for that grant immediately,
+    /// and a DIFFERENT grant reusing the id never re-exposes the old one.
+    ///
+    /// Ingest already bound each record's descriptor to the grant's authorized
+    /// capability, so no descriptor filtering is needed here — the grant id
+    /// determines the capability.
+    ///
+    /// Discovery is NOT authority: DISCOVER rights got you this list; invoking
+    /// still requires INVOKE and a valid per-call proof.
+    pub fn granted_capability_providers(
+        &self,
+        grant_id: &[u8; 32],
+    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
+        self.granted_providers_at(grant_id, super::behavior::org::current_timestamp())
+            .iter()
+            .map(PrivateCapabilityProvider::from_verified)
+            .collect()
+    }
+
+    /// Shared granted-plane query at an explicit clock.
+    fn granted_providers_at(
         &self,
         grant_id: &[u8; 32],
         now_secs: u64,
-    ) -> Vec<EntityId> {
+    ) -> Vec<super::behavior::org_scoped_ingest::VerifiedScopedCapability> {
         use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Query-time consumer currentness: no installed consumer grant for this id
@@ -9137,6 +9217,18 @@ impl MeshNode {
                     )
             })
             .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_granted_providers_for_test(
+        &self,
+        grant_id: &[u8; 32],
+        now_secs: u64,
+    ) -> Vec<EntityId> {
+        self.granted_providers_at(grant_id, now_secs)
+            .iter()
             .map(|c| c.provider().clone())
             .collect()
     }

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use net::adapter::net::identity::EntityKeypair;
+use net::adapter::net::MeshNode;
 
 use super::credentials::OrgCredentials;
 use super::error::{hex32, OrgCredentialError, OrgSdkError};
@@ -24,6 +25,10 @@ use crate::mesh::Mesh;
 /// withdraws another clone's ingest authority.
 #[derive(Clone)]
 pub struct OrgClient {
+    /// The node this client calls through. Used by the call verb, which rides
+    /// the nRPC surface.
+    #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+    pub(crate) node: Arc<MeshNode>,
     /// The mesh's durable identity — signs every proof this client mints.
     pub(crate) caller: Arc<EntityKeypair>,
     pub(crate) membership: OrgMembershipCert,
@@ -171,6 +176,7 @@ impl Mesh {
         })?;
 
         Ok(OrgClient {
+            node: self.node().clone(),
             caller: identity.keypair().clone(),
             membership,
             dispatcher,

@@ -24,7 +24,7 @@ use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::RpcError;
 use thiserror::Error;
 
-use super::types::{CoarseAdmissionReason, OrgId};
+use super::types::{CapabilityAuthorityId, CoarseAdmissionReason, OrgId};
 
 /// Every failure the org facade can produce.
 #[derive(Debug, Error)]
@@ -254,4 +254,9 @@ pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Hex-format a capability authority id.
+pub(crate) fn hex_capability(capability: &CapabilityAuthorityId) -> String {
+    hex32(capability.as_bytes())
 }

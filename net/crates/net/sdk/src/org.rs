@@ -59,8 +59,15 @@ pub(crate) use lease::OrgAudienceLeases;
 mod client;
 pub use client::OrgClient;
 
+/// The call verb rides the nRPC surface, so it needs `cortex`; binding
+/// (`mesh.org`) does not and stays available without it.
+#[cfg(feature = "cortex")]
+mod call;
+
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "cortex"))]
+mod tests_call;
 
 #[cfg(test)]
 mod oa2_grant_sdk_reexport {

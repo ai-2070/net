@@ -21,22 +21,22 @@ use crate::mesh::Mesh;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn org_a() -> OrgKeypair {
+pub(super) fn org_a() -> OrgKeypair {
     OrgKeypair::from_bytes([0xA1u8; 32])
 }
-fn org_b() -> OrgKeypair {
+pub(super) fn org_b() -> OrgKeypair {
     OrgKeypair::from_bytes([0xB2u8; 32])
 }
 fn org_c() -> OrgKeypair {
     OrgKeypair::from_bytes([0xC3u8; 32])
 }
 
-fn cap(tag: &str) -> CapabilityAuthorityId {
+pub(super) fn cap(tag: &str) -> CapabilityAuthorityId {
     CapabilityAuthorityId::for_tag(tag)
 }
 
 /// Membership + dispatcher for `member` acting for `org`, both wide open.
-fn belonging(
+pub(super) fn belonging(
     org: &OrgKeypair,
     member: &net::adapter::net::identity::EntityId,
 ) -> (OrgMembershipCert, OrgDispatcherGrant) {
@@ -47,7 +47,7 @@ fn belonging(
 }
 
 /// A DISCOVER|INVOKE grant from `issuer` to `grantee_org` over `capability`.
-fn discover_grant(
+pub(super) fn discover_grant(
     issuer: &OrgKeypair,
     grantee_org: OrgId,
     capability: CapabilityAuthorityId,
@@ -67,7 +67,7 @@ fn discover_grant(
 
 /// A mesh with a durable identity and (optionally) an adopted node authority
 /// owned by `owner`. Returns the mesh and the authority dir to clean up.
-async fn mesh_with_authority(
+pub(super) async fn mesh_with_authority(
     tag: &str,
     owner: Option<&OrgKeypair>,
 ) -> (Mesh, Identity, std::path::PathBuf) {
@@ -274,9 +274,7 @@ async fn bind_refuses_a_mesh_without_a_durable_identity() {
     assert!(
         matches!(
             err,
-            crate::org::OrgSdkError::Credentials(
-                OrgCredentialError::PersistentIdentityRequired
-            )
+            crate::org::OrgSdkError::Credentials(OrgCredentialError::PersistentIdentityRequired)
         ),
         "got {err:?}"
     );
