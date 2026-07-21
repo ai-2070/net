@@ -258,10 +258,22 @@ pub struct GrantCapabilityArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// Allow permissive org-key file modes on Unix, and silence the
-    /// Windows audience-secret DACL warning.
+    /// Allow permissive org-key file modes on Unix.
     #[arg(long)]
     pub insecure_permissions: bool,
+
+    /// Silence the Windows warning that the 0600 audience-secret mode is
+    /// unenforceable and the file inherits its parent's NTFS DACL.
+    ///
+    /// Deliberately SEPARATE from `--insecure-permissions` (§16). The two
+    /// gates are unrelated: one relaxes a check on an INPUT the operator
+    /// already controls (the org key's own mode), the other suppresses the
+    /// only signal that a freshly minted OUTPUT secret may be readable by
+    /// others. Sharing a flag meant an operator who added it once on Linux to
+    /// get past a 0644 key checked out of git carried it onto Windows, where
+    /// it silently suppressed the one warning that platform has.
+    #[arg(long = "accept-windows-dacl")]
+    pub accept_windows_dacl: bool,
 }
 
 pub async fn run(cmd: OrgCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
@@ -623,7 +635,7 @@ async fn run_grant_capability(
                 .await;
                 return Err(e);
             }
-            warn_secret_permissions(audience_out, args.insecure_permissions);
+            warn_secret_permissions(audience_out, args.accept_windows_dacl);
             Some(audience_out.display().to_string())
         }
         None => {
@@ -1027,19 +1039,19 @@ async fn remove_file_or_warn(path: &Path, what: &str) {
 /// ACL engine — the custom `--audience-out` parent is operator-asserted trusted
 /// (Kyra OA2-F).
 #[cfg(not(unix))]
-fn warn_secret_permissions(path: &Path, insecure_permissions: bool) {
-    if !insecure_permissions {
+fn warn_secret_permissions(path: &Path, accepted: bool) {
+    if !accepted {
         eprintln!(
             "warning: the 0600 audience-secret mode is not enforced on Windows; {} inherits its \
              parent directory's NTFS DACL. Ensure the parent is owner-only (or pass \
-             --insecure-permissions to silence).",
+             --accept-windows-dacl to silence).",
             path.display()
         );
     }
 }
 
 #[cfg(unix)]
-fn warn_secret_permissions(_path: &Path, _insecure_permissions: bool) {}
+fn warn_secret_permissions(_path: &Path, _accepted: bool) {}
 
 /// `fsync` the parent directory so a link/rename is durable (Unix; best-effort
 /// no-op where the platform doesn't support directory fsync).

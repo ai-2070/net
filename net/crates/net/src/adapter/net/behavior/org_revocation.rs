@@ -129,6 +129,24 @@ impl OrgRevocationState {
     pub fn merge_bundle(&mut self, bundle: &OrgRevocationBundle) -> usize {
         let mut raised = 0;
         for (member, floor) in bundle.floors() {
+            // §14: a floor of 0 is the IMPLICIT default — `floor_for` returns 0
+            // for an absent key — so materializing an entry for it says
+            // nothing and never expires. `or_insert(0)` used to create a key
+            // for EVERY member a bundle named, unchanged or zero alike, and
+            // `floors` is never pruned, so `revocation-state.json` accumulated
+            // semantically-null `floor: 0` rows permanently. Those rows are
+            // not merely disk noise: `install_org_revocation_store_locked`
+            // walks the whole snapshot and calls `retract_floored_ownership`
+            // per entry, and that takes an EXCLUSIVE fold write lock — so an
+            // org that has named 2,000 members over its lifetime made every
+            // subsequent authority install take 2,000 sequential exclusive
+            // acquisitions, most of which can retract nothing
+            // (`generation < 0` is unsatisfiable for u32), stalling every
+            // concurrent `may_execute` / `has_local_capability` / discovery
+            // query on the node.
+            if *floor == 0 {
+                continue;
+            }
             let entry = self
                 .floors
                 .entry((bundle.org_id, member.clone()))
@@ -2007,6 +2025,57 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// §14 — a zero floor is the implicit default, so it must not be
+    /// materialized into the persisted state.
+    ///
+    /// `floor_for` returns 0 for an absent key, so a stored `floor: 0` row
+    /// says exactly nothing — and `floors` is never pruned, so those rows
+    /// accumulate permanently. They are not just disk noise: the authority
+    /// install sweep walks the whole snapshot and calls
+    /// `retract_floored_ownership` per entry, which takes an EXCLUSIVE fold
+    /// write lock. An org that has named N members over its lifetime made
+    /// every install pay N sequential exclusive acquisitions, nearly all of
+    /// which can retract nothing (`generation < 0` is unsatisfiable for u32).
+    ///
+    /// Red-witness: restoring the unconditional `or_insert(0)` puts the
+    /// zero-floor member in the map and fails the length assertion.
+    #[test]
+    fn a_zero_floor_is_not_persisted() {
+        let org = org();
+        let zero_member = crate::adapter::net::identity::EntityKeypair::generate()
+            .entity_id()
+            .clone();
+        let real_member = crate::adapter::net::identity::EntityKeypair::generate()
+            .entity_id()
+            .clone();
+
+        let mut map = BTreeMap::new();
+        map.insert(zero_member.clone(), 0u32);
+        map.insert(real_member.clone(), 3u32);
+        let bundle = OrgRevocationBundle::try_issue(&org, &map).expect("bundle");
+
+        let mut state = OrgRevocationState::empty();
+        let raised = state.merge_bundle(&bundle);
+
+        assert_eq!(raised, 1, "only the nonzero floor counts as a raise");
+        assert_eq!(
+            state.floors.len(),
+            1,
+            "the zero floor must not materialize a row; got {:?}",
+            state.floors,
+        );
+        // Semantics are unchanged either way — that is the point.
+        assert_eq!(state.floor_for(&org.org_id(), &zero_member), 0);
+        assert_eq!(state.floor_for(&org.org_id(), &real_member), 3);
+
+        // And a later REAL floor for that member still lands.
+        let mut map = BTreeMap::new();
+        map.insert(zero_member.clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org, &map).expect("bundle");
+        assert_eq!(state.merge_bundle(&bundle), 1);
+        assert_eq!(state.floor_for(&org.org_id(), &zero_member), 5);
+    }
 
     /// §13 — the poison key memo must not cache the PRE-CREATION fallback.
     ///

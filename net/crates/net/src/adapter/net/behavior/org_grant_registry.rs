@@ -248,9 +248,37 @@ impl GrantAudienceRecords {
 /// one unique key by construction, so a same-`grant_id` install with any
 /// different bytes is a CONFLICT, never a silent replacement.
 fn records_identical(existing: &GrantAudienceRecord, incoming: &GrantAudienceRecord) -> bool {
+    // §18: the raw-key comparison is CONSTANT-TIME. Every other equality here
+    // is over public material (the signed grant, the routing handle), but
+    // `discovery_key` is the secret itself, and this is the one place in the
+    // grant family where two secrets are compared to each other. `==` on
+    // `[u8; 32]` short-circuits on the first differing byte.
+    //
+    // No attacker was constructed for this: reaching it requires the local
+    // operator/SDK install API, so a caller who can supply candidate keys and
+    // time the result already holds the install path. It is fixed because a
+    // secret-vs-secret comparison should not depend on that argument staying
+    // true — an install surface exposed over RPC later would inherit an oracle
+    // silently.
     existing.grant == incoming.grant
         && existing.secret.audience_handle == incoming.secret.audience_handle
-        && existing.secret.discovery_key() == incoming.secret.discovery_key()
+        && constant_time_eq_32(
+            existing.secret.discovery_key(),
+            incoming.secret.discovery_key(),
+        )
+}
+
+/// Branch-free, data-independent equality for a 32-byte secret.
+///
+/// Accumulates the XOR of every byte pair and compares once, so the running
+/// time is independent of WHERE the first difference falls. `black_box` on the
+/// accumulator keeps the optimizer from reintroducing an early exit.
+fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    std::hint::black_box(diff) == 0
 }
 
 /// The common, role-agnostic install invariants (Kyra OA3-4b2 slice 2): the grant

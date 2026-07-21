@@ -168,10 +168,17 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         None => None,
     };
 
-    let dir = args
-        .authority_dir
-        .clone()
-        .unwrap_or_else(default_authority_dir);
+    let dir = match args.authority_dir.clone() {
+        Some(explicit) => explicit,
+        None => default_authority_dir().ok_or_else(|| {
+            invalid_args(
+                "cannot determine the default authority directory on this platform \
+                 (no config dir); pass --authority-dir explicitly. Refusing to fall \
+                 back to the working directory — the authority dir holds the raw \
+                 owner audience key.",
+            )
+        })?,
+    };
     // The authority scaffold (`NodeAuthority::adopt`) owns creating the
     // authority directory as an owner-only (0700, atomic) local security
     // boundary and validating an existing one. We deliberately do NOT
@@ -236,11 +243,22 @@ struct AdoptOutput {
     floors_applied: Option<usize>,
 }
 
-fn default_authority_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("net-mesh")
-        .join("authority")
+/// The default authority directory, or `None` when the platform config
+/// directory cannot be resolved (§19).
+///
+/// Deliberately NOT falling back to `PathBuf::from(".")`. The authority
+/// directory holds `owner-audience.key` — the raw owner discovery key — and a
+/// CWD fallback silently relocates it to wherever the operator happened to be
+/// standing. On Unix the ancestor-trust walk would refuse a hostile CWD, but
+/// on Windows nothing would: `validate_existing_dir_dacl` checks the directory
+/// it is given, and a world-writable CWD that the operator owns passes both
+/// the owner check and the ACE walk.
+///
+/// A broken environment is rare, but the failure mode is provisioning key
+/// material somewhere unintended and unnoticed. Refusing and telling the
+/// operator to pass `--authority-dir` is strictly better than guessing.
+fn default_authority_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("net-mesh").join("authority"))
 }
 
 // Re-exported for the integration tests' path assertions.

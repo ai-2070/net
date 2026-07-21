@@ -640,7 +640,17 @@ fn grant_capability_discover_warns_about_windows_dacl() {
         "a --discover run warns about the Windows DACL by default",
     );
     assert!(
-        !run(&["--insecure-permissions"], "silent").contains("not enforced on Windows"),
-        "--insecure-permissions silences the Windows DACL warning",
+        !run(&["--accept-windows-dacl"], "silent").contains("not enforced on Windows"),
+        "--accept-windows-dacl silences the Windows DACL warning",
+    );
+    // §16: the flags are SEPARATE. `--insecure-permissions` relaxes the Unix
+    // org-key mode gate and must NOT suppress this warning — an operator who
+    // added it on Linux to get past a 0644 key checked out of git would
+    // otherwise carry it onto Windows and silence the only signal this
+    // platform has that a freshly minted discovery key landed under a
+    // permissive inherited DACL.
+    assert!(
+        run(&["--insecure-permissions"], "still-warned").contains("not enforced on Windows"),
+        "--insecure-permissions must not silence the Windows DACL warning",
     );
 }

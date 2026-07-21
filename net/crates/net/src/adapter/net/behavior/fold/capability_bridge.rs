@@ -495,6 +495,22 @@ pub fn retract_floored_ownership(
     floor: u32,
 ) -> usize {
     let node_id = member.node_id();
+    // §14: probe under a SHARED read first. `with_state_mut` takes an
+    // exclusive write lock unconditionally, before it even checks whether this
+    // node has any entries — and the install sweep calls this once per floor
+    // in the persisted state, the overwhelming majority of which retract
+    // nothing. Paying a write lock to discover "no entries for this node"
+    // serialized every concurrent `may_execute` / `has_local_capability` /
+    // discovery query behind a walk that had nothing to do.
+    //
+    // Not a TOCTOU: an entry appearing between the probe and the write can
+    // only be a NEWER announcement, which carries its own ingest-time floor
+    // check, and the post-apply `recheck_projected_owner_floor` covers the
+    // interleaving explicitly. Missing it here is the same outcome as the
+    // sweep having run a moment earlier.
+    if fold.with_state(|state| !state.by_node.contains_key(&node_id)) {
+        return 0;
+    }
     let retracted = fold.with_state_mut(|state| {
         let Some(keys) = state.by_node.get(&node_id) else {
             return 0;
@@ -514,7 +530,13 @@ pub fn retract_floored_ownership(
         retracted
     });
     if retracted > 0 {
-        fold.notify_projection_changed();
+        // §15: on the AUDIT plane, not only `tracing`. This is the one
+        // security-relevant fold transition the org feature produces, and it
+        // was the only one an installed `FoldAuditSink` never saw.
+        fold.notify_projection_retracted(
+            format!("node:{node_id:#x}"),
+            format!("ownership retracted under org {org} at floor {floor} ({retracted} entries)"),
+        );
     }
     retracted
 }
@@ -2685,6 +2707,65 @@ mod tests {
         let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
         assert_eq!(retracted, 0);
         assert_eq!(fold.change_generation(), before);
+    }
+
+    /// §15 — ownership retraction is recorded on the AUDIT plane.
+    ///
+    /// Every other fold transition (create, replace, evict, expire) emits an
+    /// `AuditEvent`. Retraction emitted none, so a deployment with an
+    /// installed `FoldAuditSink` logged capability lifecycle faithfully and
+    /// was silent on the one security-relevant transition the org feature
+    /// produces: a revocation floor rising and stripping a node's proven
+    /// ownership. The only trace was a `tracing::info!`, which is not the
+    /// audit plane and is not what a compliance consumer reads.
+    ///
+    /// Red-witness: reverting to `notify_projection_changed` records nothing
+    /// and the sink stays empty.
+    #[test]
+    fn ownership_retraction_is_recorded_on_the_audit_plane() {
+        use crate::adapter::net::behavior::fold::audit::VecFoldAuditSink;
+        use crate::adapter::net::behavior::fold::AuditKind;
+
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
+        apply_legacy_announcement(&fold, ann).expect("apply");
+        assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
+
+        // Install the sink AFTER the apply so the only event we can observe is
+        // the retraction itself.
+        let sink = std::sync::Arc::new(VecFoldAuditSink::new());
+        fold.set_audit_sink(Some(sink.clone()));
+        assert!(sink.is_empty(), "sink starts clean");
+
+        let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
+        assert_eq!(retracted, 1, "the stale projection was retracted");
+        assert_eq!(owner_org_for(&fold, node_id), None);
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1, "exactly one audit event; got {events:?}");
+        assert_eq!(
+            events[0].kind,
+            AuditKind::Custom("ownership-retracted"),
+            "the retraction is its own audit kind",
+        );
+        let detail = events[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("floor 5") && detail.contains(&org_root().org_id().to_string()),
+            "the detail must name the org and the floor for an auditor; got {detail:?}",
+        );
+
+        // A retraction that changes nothing must NOT emit — otherwise the
+        // install sweep would flood the audit plane with no-ops.
+        let before = sink.len();
+        assert_eq!(
+            retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 9),
+            0,
+        );
+        assert_eq!(sink.len(), before, "a no-op retraction emits nothing");
     }
 
     /// Review-8 §9 witness: a rising floor retracts a stale
