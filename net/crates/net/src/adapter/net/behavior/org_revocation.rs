@@ -214,6 +214,24 @@ impl OrgRevocationState {
         }
         let mut floors = BTreeMap::new();
         for entry in file.floors {
+            // §20 — the §14 zero-floor rule is enforced HERE too, not just in
+            // `merge_bundle`.
+            //
+            // A floor of 0 is the IMPLICIT default (`floor_for` returns 0 for
+            // an absent key), so a materialized zero row says nothing, never
+            // expires, and is carried forward by every subsequent write
+            // (`merged = disk.clone()`). Enforcing the invariant at only one of
+            // three entry points left the install-sweep pathology §14 describes
+            // re-openable by any state file that already contained zero rows —
+            // hand-edited, produced by a build predating §14, or grown through
+            // `publish`.
+            //
+            // Dropped rather than rejected: a zero row is semantically
+            // identical to absence, so refusing the whole file would turn a
+            // no-op into an outage.
+            if entry.floor == 0 {
+                continue;
+            }
             if floors
                 .insert((entry.org, entry.member), entry.floor)
                 .is_some()
@@ -224,9 +242,45 @@ impl OrgRevocationState {
                 });
             }
         }
+        // §21 — floors are never pruned, and CANNOT be: dropping a floor
+        // un-revokes the member it retired. So this is a soft signal, not a
+        // cap. Refusing at a limit would be worse than the cost it avoids
+        // (the node would fail to load its own revocation state), and evicting
+        // would silently re-admit revoked certificates.
+        //
+        // The cost is real but operator-driven, not attacker-driven:
+        // `apply_bundle` is reachable only from the adopt ceremony, never from
+        // the network. Every raise re-serializes the whole map to pretty JSON
+        // under the cross-process lock, and
+        // `install_org_revocation_store_locked` walks the snapshot taking one
+        // EXCLUSIVE fold write lock per entry. At a few thousand entries that
+        // is a visible stall on every authority install.
+        //
+        // Surfacing it is what an operator can act on: retire the org's
+        // certificate generation and re-issue, so historical floors become
+        // redundant and the state file can be replaced wholesale.
+        if floors.len() >= FLOOR_COUNT_ADVISORY {
+            tracing::warn!(
+                floors = floors.len(),
+                path = %path.display(),
+                "org revocation: the persisted floor set is large; every raise \
+                 re-serializes it under the interprocess lock and every authority \
+                 install takes one exclusive fold lock per entry. Consider rolling \
+                 the org certificate generation so historical floors can be retired.",
+            );
+        }
         Ok(Self { floors })
     }
 }
+
+/// Floor count at which [`OrgRevocationState::from_file_bytes`] warns (§21).
+///
+/// Deliberately an ADVISORY threshold rather than a cap. Floors are never
+/// pruned and must not be: dropping one un-revokes the member it retired, and
+/// refusing to load past a limit would take the node down rather than slow it.
+/// Sized well above any plausible steady state so it fires on genuine
+/// accumulation, not on a normally-operating org.
+const FLOOR_COUNT_ADVISORY: usize = 4_096;
 
 /// On-disk shape of `revocation-state.json`. `deny_unknown_fields`:
 /// an entry this node doesn't understand could be a floor it is
@@ -465,11 +519,42 @@ impl StoreCore {
     /// floor never lowers" structural rather than assumed.
     fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
         let mut live = self.live.write();
+        // §15 — the per-key max keeps the LIVE view safe, but silently
+        // absorbing a weaker incoming state hides the fact that DISK is now
+        // behind what this node is enforcing. `apply_bundle` then builds its
+        // merge from `disk` alone and re-persists that weaker base, so the
+        // divergence becomes permanent and only surfaces at the next restart —
+        // as a floor rollback.
+        //
+        // Nothing here can repair it (this is the in-memory publish, under the
+        // live write lock, with no file lock held), so it is SURFACED instead:
+        // an operator seeing this has a state file that needs restoring or a
+        // bundle re-applied, and would otherwise have no signal at all until
+        // the rollback landed.
+        //
+        // §20 — and the max no longer materializes a zero row for a live key
+        // that is absent from `next`: `or_insert(0)` created exactly the
+        // never-expiring, says-nothing entry §14 removed from `merge_bundle`.
+        let mut regressed = 0usize;
         for ((org, member), floor) in live.iter() {
-            let entry = next.floors.entry((*org, member.clone())).or_insert(0);
+            if *floor == 0 {
+                continue;
+            }
+            let entry = next.floors.entry((*org, member.clone())).or_insert(*floor);
             if *floor > *entry {
                 *entry = *floor;
+                regressed += 1;
             }
+        }
+        if regressed > 0 {
+            tracing::error!(
+                keys = regressed,
+                "org revocation: the persisted state is BEHIND the enforced view \
+                 for {regressed} floor(s); the live view is preserved, but disk \
+                 will re-persist the weaker base and a restart would roll those \
+                 floors back. Restore the state file or re-apply the bundles \
+                 that raised them.",
+            );
         }
         let raised: Vec<RaisedFloor> = next
             .iter()
@@ -1110,8 +1195,33 @@ impl OrgRevocationStore {
                     );
                     return Err(err);
                 }
+                // §18 — poison on a post-rename durability failure, exactly as
+                // `apply_bundle` does.
+                //
+                // `write_atomic` maps `PostRename` to `DurabilityUncertain` but
+                // omits the `mark_poisoned` call, and its docstring scopes it to
+                // "callers whose files carry no published live view". The state
+                // file is precisely the file that DOES carry one: this is the
+                // path that creates it. Without the poison a retry, or a
+                // same-process `open_existing`, sees a clean path and proceeds
+                // over a directory entry that was never proven durable.
                 let state = OrgRevocationState::empty();
-                write_atomic(&path, &state.to_file_bytes()?)?;
+                match write_atomic_phased(&path, &state.to_file_bytes()?) {
+                    Ok(()) => {}
+                    Err(WritePhase::PreRename(reason)) => {
+                        return Err(OrgRevocationError::Io {
+                            path: path.display().to_string(),
+                            reason,
+                        })
+                    }
+                    Err(WritePhase::PostRename(reason)) => {
+                        mark_poisoned(&backing_id, &path);
+                        return Err(OrgRevocationError::DurabilityUncertain {
+                            path: path.display().to_string(),
+                            reason,
+                        });
+                    }
+                }
                 state
             }
             Err(e) => {
@@ -1582,6 +1692,30 @@ pub(crate) enum WritePhase {
 /// core registry because poison must outlive every handle.
 static PATH_POISON: std::sync::OnceLock<Mutex<PoisonRegistry>> = std::sync::OnceLock::new();
 
+/// # §16/§17 — the two limits of this tombstone, stated plainly
+///
+/// **It is PROCESS-LOCAL.** `PATH_POISON` is a `OnceLock<Mutex<..>>` in
+/// process memory, so a RESTART discards every poison record. That matters
+/// because a restart is the natural operator response to a
+/// `DurabilityUncertain` error: the new process performs no recovery, reads
+/// whatever the directory entry now resolves to — possibly the pre-rename
+/// state — and publishes it as ground truth. A restart is therefore not a
+/// route to recovery; it is the one action that guarantees the uncertainty is
+/// discarded unexamined. Documented rather than fixed because a durable
+/// marker cannot be fsynced into the very directory whose fsync just failed;
+/// closing it properly needs a marker in a DIFFERENT directory, or an
+/// operator acknowledgement gate on `open_existing`.
+///
+/// **The path index can still be laundered by deleting BOTH files.**
+/// `poison_path_key` falls back to the non-canonical normalized path when
+/// `canonicalize` fails (correctly — it must not memoize a guess), but
+/// `mark_poisoned` recorded the CANONICAL key while the state file still
+/// existed. Remove the state file and its `.lock`, and a subsequent `init`
+/// computes the fallback key, misses `by_path`, gets a fresh inode so misses
+/// `by_id`, and proceeds as unpoisoned. §1's `ProvisioningExpectation` is what
+/// covers that case now — the caller knows the node was provisioned before
+/// even when this registry has forgotten.
+///
 /// Two poison indexes that must BOTH be consulted (R3-2):
 ///
 /// - `by_id` — the live `.lock` sidecar identity ([`BackingId`]), which
@@ -2206,6 +2340,61 @@ mod tests {
 
     static TEST_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+    /// §20 — the zero-floor rule is enforced at PARSE too, not only in
+    /// `merge_bundle`.
+    ///
+    /// §14 removed zero rows at the merge entry point and left two others
+    /// open: `from_file_bytes` accepted them from disk, and `publish`'s
+    /// `or_insert(0)` could materialize one. A state file that already
+    /// contained zero rows — hand-edited, or written by a build predating §14
+    /// — therefore carried them forward through `merged = disk.clone()` on
+    /// every subsequent write, re-opening the install-sweep stall §14
+    /// describes.
+    ///
+    /// Dropped rather than rejected: a zero row is semantically identical to
+    /// absence, so refusing the file would turn a no-op into an outage.
+    #[test]
+    fn parsed_state_drops_zero_floor_rows() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let org_id = org().org_id();
+        let live = member();
+        let null = EntityId::from_bytes([0xEE; 32]);
+
+        // Hand-write a state file carrying BOTH a real floor and a zero row.
+        let json = format!(
+            r#"{{"version":{ORG_REVOCATION_STATE_VERSION},"floors":[
+                {{"org":"{org_hex}","member":"{live_hex}","floor":7}},
+                {{"org":"{org_hex}","member":"{null_hex}","floor":0}}
+            ]}}"#,
+            org_hex = hex::encode(org_id.as_bytes()),
+            live_hex = hex::encode(live.as_bytes()),
+            null_hex = hex::encode(null.as_bytes()),
+        );
+        std::fs::write(&path, json).expect("write hand-made state");
+
+        let state =
+            OrgRevocationState::from_file_bytes(&std::fs::read(&path).expect("read back"), &path)
+                .expect("a zero row must not make the file unloadable");
+
+        assert_eq!(
+            state.floor_for(&org_id, &live),
+            7,
+            "the real floor survives"
+        );
+        assert_eq!(
+            state.floor_for(&org_id, &null),
+            0,
+            "a zero floor reads as the implicit default either way",
+        );
+        assert_eq!(
+            state.iter().count(),
+            1,
+            "the zero row must not be MATERIALIZED — it is what accumulates \
+             and makes every authority install take an exclusive fold lock \
+             per entry",
+        );
+    }
     /// §14 — a zero floor is the implicit default, so it must not be
     /// materialized into the persisted state.
     ///
