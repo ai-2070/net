@@ -87,7 +87,7 @@
     "object-code": "2.0.0",
     "posthog-js": "^1",
     "posthog-node": "^5",
-    "react": "19.2.7",
+    "react": "19.2.8",
     "react-day-picker": "10.0.1",
     "react-dom": "19.2.7",
     "react-fast-marquee": "1.6.5",
