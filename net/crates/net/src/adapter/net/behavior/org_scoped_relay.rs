@@ -114,6 +114,34 @@ pub struct ScopedAnnRelayGate {
     inner: Mutex<RelayGateInner>,
 }
 
+/// What the dedup gate decided about one delivered frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAdmission {
+    /// First sighting of this identity: forward it AND hand it to the local
+    /// audience open/store step.
+    Fresh,
+    /// A duplicate that arrived on a strictly SHORTER path (§8). Forward the
+    /// improved hop count so the subtree behind this node is not truncated —
+    /// but do NOT re-ingest: the store already holds this identity, and
+    /// re-running the AEAD open on a duplicate would hand an attacker free
+    /// repeated work.
+    ShorterPath,
+    /// Duplicate at an equal-or-worse hop, ingress peer over budget, or the
+    /// gate is globally full (both budget cases fail closed).
+    Drop,
+}
+
+impl RelayAdmission {
+    /// Whether this frame should be forwarded onward.
+    pub fn forwards(self) -> bool {
+        matches!(self, Self::Fresh | Self::ShorterPath)
+    }
+    /// Whether this frame should also be handed to the LOCAL open/store step.
+    pub fn ingests_locally(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+}
+
 /// One remembered relay identity.
 #[derive(Debug)]
 struct SeenEntry {
@@ -122,6 +150,13 @@ struct SeenEntry {
     /// The authenticated ingress peer whose frame first admitted this identity.
     /// Held so the sweep can return the slot to that peer's budget.
     admitted_by: u64,
+    /// The BEST (lowest) hop count seen for this identity so far (§8).
+    ///
+    /// `hop_count` is outside the provider signature, so a relay can inflate
+    /// it; remembering the minimum lets a later, honest, shorter-path copy
+    /// re-forward and repair a subtree that an inflated first sighting would
+    /// otherwise have cut off for the whole generation.
+    min_hop: u8,
 }
 
 #[derive(Default)]
@@ -203,32 +238,61 @@ impl ScopedAnnRelayGate {
     /// Returns `false` for a duplicate (drop before any AEAD / forward work),
     /// when `from_node` is over its own budget, or when the gate is globally
     /// full — the last two are fail-closed refusals, see the type docs.
-    pub fn admit(&self, from_node: u64, key: RelayDedupKey, now_secs: u64) -> bool {
+    pub fn admit(
+        &self,
+        from_node: u64,
+        key: RelayDedupKey,
+        hop_count: u8,
+        now_secs: u64,
+    ) -> RelayAdmission {
         let mut inner = self.inner.lock();
         inner.sweep(now_secs);
-        if inner.seen.contains_key(&key) {
-            return false; // duplicate — already relayed this outer identity
+        if let Some(existing) = inner.seen.get_mut(&key) {
+            // §8 — a duplicate that arrived on a STRICTLY SHORTER path must be
+            // re-forwarded, or one relay can truncate the flood for a whole
+            // generation.
+            //
+            // `hop_count` rides OUTSIDE the provider's signature by design, so
+            // a malicious relay can re-emit a legitimate envelope verbatim with
+            // `hop_count = MAX - 1`. Each victim admitted it, ingested locally,
+            // and forwarded NOTHING (it is at the hop boundary). When the
+            // honest copy arrived seconds later over a real path it was a plain
+            // duplicate and was dropped — so it was not forwarded either. One
+            // well-connected relay therefore suppressed propagation to every
+            // subtree behind its victims until the generation rolled.
+            //
+            // Remembering the best hop seen and re-forwarding on improvement
+            // costs one byte per entry and makes the attack self-correcting:
+            // the honest shorter-path copy repairs the subtree. The dedup
+            // identity is NOT re-admitted for local ingest — the store already
+            // holds it — so this cannot be used to replay AEAD work.
+            if hop_count < existing.min_hop {
+                existing.min_hop = hop_count;
+                return RelayAdmission::ShorterPath;
+            }
+            return RelayAdmission::Drop; // duplicate at an equal-or-worse hop
         }
         // Per-peer budget FIRST, so a flooding peer exhausts its own share
         // before it can apply any pressure to the global cap.
         if inner.per_peer.get(&from_node).copied().unwrap_or(0) >= Self::MAX_ENTRIES_PER_PEER {
-            return false;
+            return RelayAdmission::Drop;
         }
         if inner.seen.len() >= Self::MAX_ENTRIES {
             // FAIL-CLOSED at capacity: never evict an active seen-key to make
             // room, or a re-flooded duplicate for that key would be admitted
             // again and reflood. The horizon sweep above is the only reclaim.
-            return false;
+            return RelayAdmission::Drop;
         }
         inner.seen.insert(
             key,
             SeenEntry {
                 deadline: now_secs.saturating_add(Self::RETENTION_SECS),
                 admitted_by: from_node,
+                min_hop: hop_count,
             },
         );
         *inner.per_peer.entry(from_node).or_insert(0) += 1;
-        true
+        RelayAdmission::Fresh
     }
 
     /// Number of tracked (currently-remembered) relay identities. Used by the
@@ -236,6 +300,16 @@ impl ScopedAnnRelayGate {
     /// confirm a relay ADMITTED (and thus forwarded) an envelope it can't store.
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().seen.len()
+    }
+
+    /// Test shim preserving the pre-§8 boolean shape: admit at hop 0 and report
+    /// whether this was a FRESH sighting. Every pre-existing gate witness is
+    /// about dedup / budgets / retention rather than hop improvement, so
+    /// keeping their assertions verbatim keeps them honest about what they
+    /// test; the §8 hop behaviour has its own witnesses.
+    #[cfg(test)]
+    fn admit_fresh(&self, from_node: u64, key: RelayDedupKey, now_secs: u64) -> bool {
+        self.admit(from_node, key, 0, now_secs) == RelayAdmission::Fresh
     }
 }
 
@@ -247,6 +321,12 @@ pub struct ScopedRelayAdmit {
     /// The hop-incremented frame to forward to peers-except-ingress, or `None`
     /// at the hop boundary (the frame has reached its forwarding depth).
     pub forward: Option<Vec<u8>>,
+    /// Whether to also run the LOCAL audience open/store step.
+    ///
+    /// `false` for a §8 shorter-path re-forward: the identity is already in the
+    /// store, so re-opening the AEAD would be duplicated work an attacker could
+    /// solicit by replaying the same envelope at ever-lower hop counts.
+    pub ingest_locally: bool,
 }
 
 /// OA3-5 §3.2 relay decision — PURE, no I/O, so it is deterministically
@@ -299,7 +379,8 @@ pub fn decide_scoped_relay(
         audience_handle: *envelope.audience_handle(),
         generation: envelope.generation(),
     };
-    if !gate.admit(from_node, key, now_secs) {
+    let admission = gate.admit(from_node, key, frame.hop_count, now_secs);
+    if !admission.forwards() {
         return None;
     }
     // Forward while below the hop cap; only the outer hop prefix is rewritten —
@@ -312,12 +393,96 @@ pub fn decide_scoped_relay(
     } else {
         None
     };
-    Some(ScopedRelayAdmit { envelope, forward })
+    Some(ScopedRelayAdmit {
+        envelope,
+        forward,
+        ingest_locally: admission.ingests_locally(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // §8 — a relay must not be able to truncate the flood.
+    // ------------------------------------------------------------------
+
+    /// The attack: `hop_count` rides OUTSIDE the provider's signature, so a
+    /// malicious relay can re-emit a legitimate envelope verbatim at the hop
+    /// boundary. The victim admits it, ingests locally, and forwards NOTHING.
+    /// When the honest copy arrives over a real short path it used to be a
+    /// plain duplicate and was dropped — so it was not forwarded either, and
+    /// every subtree behind the victim went dark for the whole generation.
+    ///
+    /// The gate now remembers the best hop seen and re-admits for FORWARDING
+    /// on a strict improvement, so the honest copy repairs the subtree.
+    #[test]
+    fn a_shorter_path_duplicate_is_re_forwarded() {
+        let gate = ScopedAnnRelayGate::new();
+        const MALICIOUS: u64 = 0xBAD;
+        const HONEST: u64 = 0x600D;
+        let key = key_n(1, 7);
+
+        // Inflated first sighting: admitted, ingested, at the hop boundary.
+        assert_eq!(
+            gate.admit(MALICIOUS, key.clone(), MAX_CAPABILITY_HOPS - 1, 1_000),
+            RelayAdmission::Fresh,
+        );
+
+        // The honest, genuinely-closer copy: re-forwarded, NOT re-ingested.
+        let honest = gate.admit(HONEST, key.clone(), 0, 1_000);
+        assert_eq!(honest, RelayAdmission::ShorterPath);
+        assert!(
+            honest.forwards(),
+            "the shorter-path copy must be forwarded, or the subtree behind \
+             this node stays truncated for the whole generation",
+        );
+        assert!(
+            !honest.ingests_locally(),
+            "it must NOT be re-ingested — the store already holds this \
+             identity, and re-opening the AEAD would let a peer solicit \
+             repeated crypto work by replaying at ever-lower hops",
+        );
+
+        // Ratchet: once the best hop is 0, nothing improves on it, so an
+        // attacker cannot use this path to re-forward without bound.
+        assert_eq!(
+            gate.admit(HONEST, key.clone(), 0, 1_000),
+            RelayAdmission::Drop,
+        );
+        assert_eq!(gate.admit(MALICIOUS, key, 5, 1_000), RelayAdmission::Drop);
+    }
+
+    /// The improvement is strict, and it does not re-open the dedup gate: a
+    /// duplicate at an equal or WORSE hop is still dropped. Without this a
+    /// relay could re-forward the same identity indefinitely by replaying it.
+    #[test]
+    fn an_equal_or_worse_hop_duplicate_is_still_dropped() {
+        let gate = ScopedAnnRelayGate::new();
+        const PEER: u64 = 7;
+        let key = key_n(2, 3);
+
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 4, 1_000),
+            RelayAdmission::Fresh
+        );
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 4, 1_000),
+            RelayAdmission::Drop,
+            "equal hop is not an improvement",
+        );
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 9, 1_000),
+            RelayAdmission::Drop,
+            "a worse hop is not an improvement",
+        );
+        assert_eq!(
+            gate.admit(PEER, key, 3, 1_000),
+            RelayAdmission::ShorterPath,
+            "a strictly better hop is",
+        );
+    }
 
     fn provider_n(index: u64) -> EntityId {
         let mut bytes = [0u8; 32];
@@ -363,21 +528,21 @@ mod tests {
     fn gate_admits_a_fresh_identity_once() {
         let gate = ScopedAnnRelayGate::new();
         assert!(
-            gate.admit(PEER, key_n(1, 7), 1_000),
+            gate.admit_fresh(PEER, key_n(1, 7), 1_000),
             "first sighting admits"
         );
         assert!(
-            !gate.admit(PEER, key_n(1, 7), 1_000),
+            !gate.admit_fresh(PEER, key_n(1, 7), 1_000),
             "the identical identity is a duplicate"
         );
         // A different generation for the same provider is a distinct identity.
         assert!(
-            gate.admit(PEER, key_n(1, 8), 1_000),
+            gate.admit_fresh(PEER, key_n(1, 8), 1_000),
             "newer generation is fresh"
         );
         // A different provider is distinct too.
         assert!(
-            gate.admit(PEER, key_n(2, 7), 1_000),
+            gate.admit_fresh(PEER, key_n(2, 7), 1_000),
             "different provider is fresh"
         );
     }
@@ -390,9 +555,9 @@ mod tests {
     #[test]
     fn dedup_is_global_across_ingress_peers() {
         let gate = ScopedAnnRelayGate::new();
-        assert!(gate.admit(PEER, key_n(1, 7), 1_000));
+        assert!(gate.admit_fresh(PEER, key_n(1, 7), 1_000));
         assert!(
-            !gate.admit(PEER + 1, key_n(1, 7), 1_000),
+            !gate.admit_fresh(PEER + 1, key_n(1, 7), 1_000),
             "a second peer delivering the SAME identity is still a duplicate"
         );
         assert_eq!(gate.len(), 1);
@@ -401,15 +566,15 @@ mod tests {
     #[test]
     fn gate_expires_on_the_local_horizon() {
         let gate = ScopedAnnRelayGate::new();
-        assert!(gate.admit(PEER, key_n(1, 7), 1_000));
+        assert!(gate.admit_fresh(PEER, key_n(1, 7), 1_000));
         // Still within the retention horizon: a duplicate is dropped.
-        assert!(!gate.admit(
+        assert!(!gate.admit_fresh(
             PEER,
             key_n(1, 7),
             1_000 + ScopedAnnRelayGate::RETENTION_SECS - 1
         ));
         // Past the horizon: the identity is fully forgotten and admissible again.
-        assert!(gate.admit(
+        assert!(gate.admit_fresh(
             PEER,
             key_n(1, 7),
             1_000 + ScopedAnnRelayGate::RETENTION_SECS
@@ -425,23 +590,23 @@ mod tests {
         let per_peer = ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER;
         for index in 0..ScopedAnnRelayGate::MAX_ENTRIES {
             let peer = (index / per_peer) as u64;
-            assert!(gate.admit(peer, key_n(index as u64, 1), 1_000));
+            assert!(gate.admit_fresh(peer, key_n(index as u64, 1), 1_000));
         }
         assert_eq!(gate.len(), ScopedAnnRelayGate::MAX_ENTRIES);
         // A brand-new identity at capacity is refused fail-closed — nothing is
         // evicted (every entry is in-horizon). Delivered by a FRESH peer, so
         // the refusal is the global cap and not a per-peer budget.
         assert!(
-            !gate.admit(u64::MAX, key_n(u64::MAX, 1), 1_000),
+            !gate.admit_fresh(u64::MAX, key_n(u64::MAX, 1), 1_000),
             "an unseen identity is refused when full"
         );
         assert_eq!(gate.len(), ScopedAnnRelayGate::MAX_ENTRIES);
         // A duplicate of a still-active key stays a duplicate (it was NOT
         // evicted to admit the flood above).
-        assert!(!gate.admit(0, key_n(0, 1), 1_000));
+        assert!(!gate.admit_fresh(0, key_n(0, 1), 1_000));
         // Once the horizon passes, the whole set is reclaimed and new identities
         // are admissible again.
-        assert!(gate.admit(
+        assert!(gate.admit_fresh(
             u64::MAX,
             key_n(u64::MAX, 1),
             1_000 + ScopedAnnRelayGate::RETENTION_SECS
@@ -472,7 +637,7 @@ mod tests {
         // The flooder mints distinct identities as fast as it likes.
         let mut admitted = 0usize;
         for index in 0..ScopedAnnRelayGate::MAX_ENTRIES as u64 {
-            if gate.admit(FLOODER, key_n(index, 1), 1_000) {
+            if gate.admit_fresh(FLOODER, key_n(index, 1), 1_000) {
                 admitted += 1;
             }
         }
@@ -488,7 +653,7 @@ mod tests {
 
         // An honest peer's legitimate announcement still gets through.
         assert!(
-            gate.admit(HONEST, key_n(u64::MAX, 1), 1_000),
+            gate.admit_fresh(HONEST, key_n(u64::MAX, 1), 1_000),
             "an honest peer must still be admitted after a flood",
         );
     }
@@ -501,14 +666,14 @@ mod tests {
         let gate = ScopedAnnRelayGate::new();
         const PEER_A: u64 = 7;
         for index in 0..ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER as u64 {
-            assert!(gate.admit(PEER_A, key_n(index, 1), 1_000));
+            assert!(gate.admit_fresh(PEER_A, key_n(index, 1), 1_000));
         }
         // At budget: refused.
-        assert!(!gate.admit(PEER_A, key_n(u64::MAX, 1), 1_000));
+        assert!(!gate.admit_fresh(PEER_A, key_n(u64::MAX, 1), 1_000));
 
         // Past the horizon the slots return and the peer is admissible again.
         let later = 1_000 + ScopedAnnRelayGate::RETENTION_SECS;
-        assert!(gate.admit(PEER_A, key_n(u64::MAX, 1), later));
+        assert!(gate.admit_fresh(PEER_A, key_n(u64::MAX, 1), later));
         assert_eq!(gate.len(), 1, "the expired window was fully reclaimed");
     }
 

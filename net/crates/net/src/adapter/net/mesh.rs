@@ -9649,6 +9649,26 @@ impl MeshNode {
     /// Interval from `config.capability_gc_interval` (default 60s).
     fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
         let seen = self.seen_announcements.clone();
+        // §9 — the scoped-discovery store had NO periodic sweep. `sweep_expired`
+        // existed but its only non-test caller was the at-capacity branch of
+        // `ingest`, so on a node that was merely idle (or below capacity) it
+        // never ran at all. Three consequences, all closed by ticking it here:
+        //
+        //   * decrypted descriptors — the PLAINTEXT names of private
+        //     capabilities — were retained indefinitely past the lifetime
+        //     they were authorized for;
+        //   * the budget silently filled with dead entries, turning into the
+        //     §4 capacity wedge with no attacker involved;
+        //   * the generation high-water outlived its designed tombstone
+        //     horizon, so a provider that restarted (its `capability_version`
+        //     counter resets to 0) re-announced at generation 1 against a
+        //     consumer still holding, say, 500 — every announcement `Stale`,
+        //     the key never forgotten, that provider undiscoverable at every
+        //     prior consumer until its counter climbed past the old mark.
+        //
+        // This loop is the right home: same cadence (60 s), same purpose
+        // (bounded retention of observation state), already shutdown-aware.
+        let scoped = self.scoped_discovery.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -9666,6 +9686,14 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                        let now_secs = super::behavior::org::current_timestamp();
+                        let forgotten = scoped.lock().sweep_expired(now_secs);
+                        if forgotten > 0 {
+                            tracing::debug!(
+                                forgotten,
+                                "scoped discovery: swept fully-forgotten entries",
+                            );
+                        }
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -11698,15 +11726,22 @@ impl MeshNode {
                 // no matching audience (a pure relay, or a wrong-audience
                 // envelope) simply stores nothing; the forward above already
                 // shipped regardless of the local outcome.
-                Self::ingest_scoped_announcement(
-                    &ctx.node_authority,
-                    &ctx.org_revocation,
-                    &ctx.consumer_grant_audiences,
-                    &ctx.scoped_discovery,
-                    &admit.envelope,
-                    from_node,
-                    None,
-                );
+                //
+                // Skipped for a §8 shorter-path re-forward: that identity was
+                // already ingested on its first sighting, and re-running the
+                // AEAD open would let a peer solicit repeated crypto work by
+                // replaying one envelope at ever-lower hop counts.
+                if admit.ingest_locally {
+                    Self::ingest_scoped_announcement(
+                        &ctx.node_authority,
+                        &ctx.org_revocation,
+                        &ctx.consumer_grant_audiences,
+                        &ctx.scoped_discovery,
+                        &admit.envelope,
+                        from_node,
+                        None,
+                    );
+                }
             }
             return;
         }
