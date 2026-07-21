@@ -259,7 +259,7 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
 /// see a `#[cfg(test)]` item.
 ///
 /// The unretractable-projection hazard this used to carry is closed at the
-/// producer instead: [`verify_announced_owner_cert`] now refuses a cert whose
+/// producer instead: `verify_announced_owner_cert` now refuses a cert whose
 /// entity does not derive the announced node id (§12), so no caller of this
 /// helper can install ownership that a floor raise could never clear.
 pub fn apply_legacy_announcement(

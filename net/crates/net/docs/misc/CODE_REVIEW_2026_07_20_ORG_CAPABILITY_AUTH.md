@@ -1,7 +1,47 @@
 # CODE REVIEW 2026-07-20 — Organization Capability Auth (`org-capability-auth`)
 
-> **Status: OPEN — no findings resolved yet.** This document is the review
-> output only. Findings are ordered by severity; §1 and §2 are merge-blocking.
+> **Status: all 19 production findings + §T1-§T9 + §D1-§D4 RESOLVED on this
+> branch** (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4, `e21a9d23c`
+> §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8, `8e2b85596` §9,
+> `7b54c211d` §10+§11+§17, `b937e63e6` §12, `49ed592af` §13, `6b492b349`
+> §14-§19, `087a90d07` §T1, `353115c72` §T9, `fc94c960e` §T2-§T8).
+>
+> Every fix is RED-WITNESSED: each new test was verified to fail against the
+> original code and pass against the fix, and the witness is recorded in the
+> commit. The crate passes `cargo fmt`, both CI clippy gates (production-strict
+> and `--all-targets` with the four panic lints allowed), 5210 lib tests, and
+> every affected integration suite.
+>
+> **Three corrections to this document, found while fixing it:**
+>
+> 1. **§T1's mutation analysis was incomplete.** The caller-identity property
+>    is defended TWICE — step 5's TOFU member bind and step 7's
+>    `dispatcher_grant.dispatcher != *ctx.authenticated_caller`. Deleting
+>    either alone still denies (verified). The review's claimed mutation is
+>    dangerous precisely because it repoints `authenticated_caller`, which both
+>    checks read; a test aimed at one check would have missed it. The new test
+>    is the only one of 40 that fails under it.
+> 2. **§T1's proof-expiry gap does not exist as stated.** `proof_ttl_secs` is
+>    applied when the proof is MINTED, and `call()` mints fresh on every
+>    invocation, so no already-expired proof can be presented through the
+>    public API. Expiry is reachable only via a captured proof being replayed —
+>    the attack the binding and replay guard exist to stop — and is covered in
+>    the `org_admission` units, which take an explicit `ClockSample`. Replaced
+>    with the caller-side TTL-ceiling test, which IS reachable.
+> 3. **§12 was worse than described.** `test_inject_capability_announcement` is
+>    not merely `#[doc(hidden)] pub` in Rust — it is re-exported through the
+>    Python, Node and Go bindings as a callable method of the shipped
+>    libraries. It was therefore fixed at the producer
+>    (`verify_announced_owner_cert`) rather than by gating the seam, which
+>    would have broken real callers.
+>
+> Two findings were also fixed more narrowly than proposed, deliberately:
+> §2 keeps `--force` available (certs and floor bundles are renewable by
+> design) and makes the replace SAFE via staging + atomic rename, rather than
+> refusing it as the grant verbs do; §9 is defense-in-depth only and does NOT
+> substitute for the §3.4 key rotation, which remains unimplemented.
+
+Findings are ordered by severity; §1 and §2 were merge-blocking.
 
 Review of branch `org-capability-auth` against `master`: 217 commits, 81 files,
 +42,871/−1,082. The change lands the OA (Organization Capability Auth) subsystem

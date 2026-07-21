@@ -45,7 +45,15 @@ pub fn apply_legacy_announcement(fold: &Fold<CapabilityFold>, ann: CapabilityAnn
 }
 ```
 
-Docstring frames this as "primarily for test fixtures", but `rg apply_legacy_announcement` finds ~30 production call sites (`compute/scheduler.rs`, `compute/fork_group.rs`, `compute/replica_group.rs`, `dataforts/blob/migration.rs`, others). A failing `fold.apply` — invalid generation, signature mismatch, anything `FoldError` grows into — is now an invisible no-op.
+Docstring frames this as "primarily for test fixtures", but `rg apply_legacy_announcement` finds ~30 production call sites (`compute/scheduler.rs`, `compute/fork_group.rs`, `compute/replica_group.rs`, `dataforts/blob/migration.rs`, others).
+
+> **Stale as of 2026-07-21 (§D4).** That count is no longer accurate: every
+> in-tree caller is now a test or a bench, so `apply_legacy_announcement` is a
+> fixture helper in fact as well as in its docstring. It stays `pub` only
+> because `benches/net.rs` is a separate compilation target and cannot see a
+> `#[cfg(test)]` item. Note it passes `floors = None`, which skips the
+> revocation floor check entirely — fine for a bare-fold fixture, wrong for
+> anything else. Do not reintroduce a production caller. A failing `fold.apply` — invalid generation, signature mismatch, anything `FoldError` grows into — is now an invisible no-op.
 
 Fix options:
 - Return `Result<ApplyOutcome, FoldError>` and let callers `let _ =` explicitly where the no-op is intentional. Touches ~30 sites; not large but ripples the public bridge surface.

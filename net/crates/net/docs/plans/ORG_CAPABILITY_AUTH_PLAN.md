@@ -15,6 +15,23 @@ tiers (live transport / provider bridge / referenced pure-authority
 tests), a registration-local `#[cfg(test)]`-only RED seam,
 `RpcContext::org_admission` as the audit witness, and the
 INVOKE-only / wrong-dispatcher corrections.
+
+**Test-seam surface (§D4, 2026-07-21).** "A registration-local
+`#[cfg(test)]`-only RED seam" describes the OA-4 negative control
+specifically, and is correct about it. It should not be read as a
+statement about the branch's total test-only surface: `mesh_rpc.rs` and
+`mesh.rs` carry ~15 and ~16 `#[cfg(test)]` items respectively, several
+documented as bypasses. All compile out of a shipping build, so none is
+a shipped vulnerability — but the surface is larger than one seam, and a
+reviewer auditing "what can bypass the gate in a test build?" should
+expect to enumerate it rather than trust this sentence.
+
+One item that was NOT `#[cfg(test)]` — `MeshNode::test_inject_capability_announcement`,
+`#[doc(hidden)] pub` and re-exported through the Python / Node / Go
+bindings — is addressed at the producer instead (§12): it could install
+an ownership projection under a node id no retraction path would ever
+visit. `verify_announced_owner_cert` now refuses that binding for every
+caller.
 **Status (2026-07-19, branch `org-capability-auth`):**
 
 - **OA-1** — IMPLEMENTED and iterated through reviews 8–11 plus the
@@ -74,7 +91,24 @@ admission; provider-local policy is final; authentication is never
 replay prevention; ownership is singular; **the OrgAdmission gate —
 not a legacy allow-list — supplies the authority for protected
 services (red-witnessed, §OA-4)**; revocation monotonicity survives
-restart.
+restart — *for MEMBERSHIP floors* (see the scope note below).
+
+**Scope of "revocation" (§D1, 2026-07-21).** The only revocation
+primitive that is wired is the membership floor, and
+`OrgRevocationBundle` verifies against `bundle.org_id` — so an org can
+only revoke ITS OWN members. There is no floor, denylist, or CRL keyed
+on `OrgCapabilityGrant::grant_id`. A provider org B that issued A a
+`CrossOrgGranted` grant therefore has NO cryptographic lever to withdraw
+it: B cannot sign A's membership floors, and the grant dies only at
+`not_after` (days–weeks, §2.2). Until then any A member holding a valid
+membership cert and dispatcher grant keeps passing admission. B's only
+recourse is the provider-policy closure (step 11), which is application
+code and runs AFTER the replay insert.
+
+This is deliberate ("Grants: expiry + non-renewal; provider-local deny
+is immediate"), but the unqualified invariant above read as a stronger
+guarantee than the cross-org path provides. The mechanism to close it
+exists — `grant_id` is in the proof the policy sees — and is not built.
 
 ---
 
@@ -458,9 +492,21 @@ generation)` — the wire identity carries the actual audience scope
 even though handles are unique by rule, so a handle collision
 (accidental or malicious) cannot let one envelope suppress another
 before ingest validation; v1 floods opaque envelopes (observers learn
-existence, provider, owner, random handle, size — nothing
-matchable); selective forwarding by handle is a later fanout
-optimization.
+existence, provider, owner, random handle, and a PADDED size bucket);
+selective forwarding by handle is a later fanout optimization.
+
+**Size (§D2, corrected 2026-07-21).** This previously read "size —
+nothing matchable". That was true when the descriptor was an arbitrary
+blob, but OA3-4b2 canonicalized the granted plaintext to exactly one
+`nrpc:<svc>` tag, which collapsed the plaintext space to a bijection
+with the tag string — so `ciphertext_len`, which rides the wire in
+cleartext at a fixed offset, inverted to `len(service_name)` EXACTLY for
+a provider and owner org that are themselves cleartext. The descriptor
+is now length-prefixed and padded to a whole multiple of
+`SCOPED_ANN_PAD_BUCKET_BYTES` (256) INSIDE the AEAD, so the residual
+channel is a bucket count. The claim is only as strong as that
+padding: any future change that makes the plaintext space smaller or
+more predictable must revisit it rather than inheriting this sentence.
 
 ### 3.3 Audience authority — owner vs granted (review-6 §2 fix)
 

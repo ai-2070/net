@@ -108,7 +108,7 @@ pub struct RelayDedupKey {
 ///   evicted key would restart the flood loop;
 /// * occupancy is accounted PER INGRESS PEER and capped, so no single peer can
 ///   consume the whole gate and turn that fail-closed refusal into a mesh-wide
-///   outage (§7 — see [`Self::MAX_ENTRIES_PER_PEER`]).
+///   outage (§7 — see `MAX_ENTRIES_PER_PEER`).
 #[derive(Default)]
 pub struct ScopedAnnRelayGate {
     inner: Mutex<RelayGateInner>,
