@@ -167,13 +167,15 @@ impl Mesh {
             pairs.push((grant.clone(), secret));
         }
 
-        let leases = self.org_audience_leases.clone();
-        let grant_ids = leases.acquire(self.node(), pairs).map_err(|(id, source)| {
-            OrgCredentialError::AudienceInstallRefused {
+        // The lease registry lives on the NODE, so every `Mesh` wrapper over
+        // this node shares one refcount per grant id.
+        let grant_ids = self
+            .node()
+            .acquire_consumer_audience_leases(pairs)
+            .map_err(|(id, source)| OrgCredentialError::AudienceInstallRefused {
                 grant_id: hex32(&id),
                 source,
-            }
-        })?;
+            })?;
 
         Ok(OrgClient {
             node: self.node().clone(),
@@ -183,11 +185,7 @@ impl Mesh {
             grants,
             acting_org,
             skew_secs: authority.config.verification_skew_secs,
-            _lease: Arc::new(AudienceLeaseGuard::new(
-                self.node().clone(),
-                leases,
-                grant_ids,
-            )),
+            _lease: Arc::new(AudienceLeaseGuard::new(self.node().clone(), grant_ids)),
         })
     }
 }

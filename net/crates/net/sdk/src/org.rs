@@ -57,7 +57,6 @@ pub use error::{
     parse_org_wire, OrgCredentialError, OrgDiscoveryError, OrgErrorDomain, OrgSdkError,
     ERR_ORG_PREFIX,
 };
-pub(crate) use lease::OrgAudienceLeases;
 
 #[doc(hidden)]
 pub mod fixtures;

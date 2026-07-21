@@ -233,6 +233,94 @@ pub enum ConsumerAudienceInstall {
     AlreadyPresent,
 }
 
+/// Reference-counted consumer-audience leases for one NODE (OSDK S0, rehomed).
+///
+/// # Why this lives on the node
+///
+/// It originally sat on the SDK's `Mesh` wrapper, which was wrong in a way only
+/// a second wrapper exposes: the lease guards the NODE's consumer-audience
+/// registry, so its refcount must be keyed to the node. `Mesh::from_node_arc`
+/// is public, and the Node and Python bindings hold `Arc<MeshNode>` rather than
+/// an SDK `Mesh`, so "one `Mesh` per node" was never an invariant anyone
+/// enforced.
+///
+/// With a per-wrapper registry, two wrappers over one node each believed they
+/// were the first installer: the second's lease was marked non-owning, and the
+/// FIRST wrapper's drop then removed the audience out from under a client that
+/// was still live — silently breaking its private discovery with no error
+/// anywhere. Keyed to the node, that state is unrepresentable.
+#[derive(Default)]
+pub struct OrgAudienceLeases {
+    entries: parking_lot::Mutex<std::collections::HashMap<[u8; 32], LeaseEntry>>,
+}
+
+/// One grant id's shared installation state.
+pub(crate) struct LeaseEntry {
+    /// How many live holders reference this grant id.
+    count: usize,
+    /// `Some` iff THIS registry performed the install and may remove it.
+    /// `None` when the record was already present (installed by the low-level
+    /// operator API or another owner) — release must then remove nothing.
+    owned: Option<ConsumerAudienceLease>,
+}
+
+impl OrgAudienceLeases {
+    /// Test seam: how many grant ids are currently referenced.
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// Whether no grant id is referenced.
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Test seam: the refcount for one grant id, and whether the entry owns its
+    /// installation.
+    #[doc(hidden)]
+    pub fn entry_for_test(&self, grant_id: &[u8; 32]) -> Option<(usize, bool)> {
+        self.entries
+            .lock()
+            .get(grant_id)
+            .map(|e| (e.count, e.owned.is_some()))
+    }
+
+    pub(crate) fn lock_entries(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, std::collections::HashMap<[u8; 32], LeaseEntry>> {
+        self.entries.lock()
+    }
+}
+
+impl LeaseEntry {
+    pub(crate) fn new_owned(lease: ConsumerAudienceLease) -> Self {
+        Self {
+            count: 1,
+            owned: Some(lease),
+        }
+    }
+    pub(crate) fn new_borrowed() -> Self {
+        Self {
+            count: 1,
+            owned: None,
+        }
+    }
+    pub(crate) fn retain(&mut self) {
+        self.count += 1;
+    }
+    /// Decrement; returns the owned lease iff this was the last reference AND
+    /// this registry owns the installation.
+    pub(crate) fn release(&mut self) -> (bool, Option<ConsumerAudienceLease>) {
+        self.count = self.count.saturating_sub(1);
+        if self.count > 0 {
+            return (false, None);
+        }
+        (true, self.owned.take())
+    }
+}
+
 /// The result of a successful install (Kyra OA3-4b2 idempotency contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantAudienceInstalled {

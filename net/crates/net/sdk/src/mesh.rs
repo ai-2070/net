@@ -337,7 +337,6 @@ impl MeshBuilder {
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
             tool_watch: Arc::new(parking_lot::Mutex::new(None)),
-            org_audience_leases: Arc::new(crate::org::OrgAudienceLeases::default()),
         })
     }
 }
@@ -390,13 +389,6 @@ pub struct Mesh {
     /// [`Mesh::serve_tool_watch`].
     #[cfg(feature = "tool")]
     pub(crate) tool_watch: Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
-    /// OSDK: consumer-audience leases, shared by every [`OrgClient`] bound to
-    /// this mesh (`mesh.org(..)`). One refcount per grant id, so two clients
-    /// holding the same grant install its audience once and the first to drop
-    /// does not withdraw the second's ingest authority.
-    ///
-    /// [`OrgClient`]: crate::org::OrgClient
-    pub(crate) org_audience_leases: Arc<crate::org::OrgAudienceLeases>,
 }
 
 impl Mesh {
@@ -1149,7 +1141,6 @@ impl Mesh {
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
             tool_watch: Arc::new(parking_lot::Mutex::new(None)),
-            org_audience_leases: Arc::new(crate::org::OrgAudienceLeases::default()),
         }
     }
 

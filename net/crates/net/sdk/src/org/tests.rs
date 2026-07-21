@@ -355,7 +355,7 @@ async fn bind_accepts_the_complete_relation_and_leases_the_audience() {
     // would have nothing to ingest.
     assert_eq!(mesh.node().consumer_grant_audiences_len_for_test(), 1);
     assert_eq!(
-        mesh.org_audience_leases.entry_for_test(&grant_id),
+        mesh.node().org_audience_leases().entry_for_test(&grant_id),
         Some((1, true)),
         "one reference, owned by this registry"
     );
@@ -423,14 +423,14 @@ async fn lease_refcounts_across_clients_and_removes_only_on_the_last_drop() {
         "the second bind must NOT install a second record"
     );
     assert_eq!(
-        mesh.org_audience_leases.entry_for_test(&grant_id),
+        mesh.node().org_audience_leases().entry_for_test(&grant_id),
         Some((2, true))
     );
 
     // A CLONE shares its client's lease — it does not take a reference.
     let c1_clone = c1.clone();
     assert_eq!(
-        mesh.org_audience_leases.entry_for_test(&grant_id),
+        mesh.node().org_audience_leases().entry_for_test(&grant_id),
         Some((2, true)),
         "cloning a client shares one guard"
     );
@@ -442,7 +442,7 @@ async fn lease_refcounts_across_clients_and_removes_only_on_the_last_drop() {
         "dropping one holder must not withdraw the other's ingest authority"
     );
     assert_eq!(
-        mesh.org_audience_leases.entry_for_test(&grant_id),
+        mesh.node().org_audience_leases().entry_for_test(&grant_id),
         Some((1, true))
     );
 
@@ -452,7 +452,7 @@ async fn lease_refcounts_across_clients_and_removes_only_on_the_last_drop() {
         0,
         "the last holder's drop withdraws the audience"
     );
-    assert_eq!(mesh.org_audience_leases.len(), 0);
+    assert_eq!(mesh.node().org_audience_leases().len(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -478,7 +478,7 @@ async fn lease_never_removes_an_installation_it_did_not_perform() {
     let creds = OrgCredentials::new(cert, dg, vec![grant], vec![secret]).expect("assembles");
     let client = mesh.org(creds).expect("binds");
     assert_eq!(
-        mesh.org_audience_leases.entry_for_test(&grant_id),
+        mesh.node().org_audience_leases().entry_for_test(&grant_id),
         Some((1, false)),
         "already present → the lease is NON-OWNING"
     );
@@ -596,4 +596,67 @@ fn canonical_paths_are_unchanged_by_the_module_split() {
     let _: crate::org::OrgId = org_a().org_id();
     let _: crate::org::types::OrgId = org_a().org_id();
     let _: crate::org::types::OrgProofIntent;
+}
+
+// ---------------------------------------------------------------------------
+// 5. The lease registry's ownership scope (found while starting Workstream N)
+// ---------------------------------------------------------------------------
+
+/// Two `Mesh` wrappers over ONE node must share the audience refcount.
+///
+/// The lease guards the NODE's consumer-audience registry, so its refcount has
+/// to be keyed to the node. `Mesh::from_node_arc` is public and the Node/Python
+/// bindings hold `Arc<MeshNode>` rather than an SDK `Mesh`, so "one Mesh per
+/// node" is not an invariant anyone enforces.
+///
+/// If the registry is per-`Mesh`, the second wrapper's bind sees the record
+/// already present, marks its lease NON-OWNING, and then the first wrapper's
+/// drop removes the audience out from under a client that is still live —
+/// silently breaking its private discovery.
+#[tokio::test]
+async fn two_mesh_wrappers_over_one_node_share_the_audience_lease() {
+    let a = org_a();
+    let (mesh1, identity, dir) = mesh_with_authority("lease-scope", Some(&a)).await;
+    let node = mesh1.node().clone();
+    // A second wrapper over the SAME node — what a binding does.
+    let mesh2 = Mesh::from_node_arc(
+        node.clone(),
+        std::sync::Arc::new(net::adapter::net::ChannelConfigRegistry::new()),
+        Some(identity.clone()),
+    );
+
+    let (grant, secret) = discover_grant(&org_b(), a.org_id(), cap("nrpc:svc"), 3600);
+    let encoded = secret.encode_config();
+    let creds = |s: OrgAudienceSecret| {
+        let (cert, dg) = belonging(&a, identity.entity_id());
+        OrgCredentials::new(cert, dg, vec![grant.clone()], vec![s]).expect("assembles")
+    };
+
+    let c1 = mesh1
+        .org(creds(secret))
+        .expect("bind through the first wrapper");
+    let c2 = mesh2
+        .org(creds(
+            OrgAudienceSecret::decode_config(&encoded).expect("decode"),
+        ))
+        .expect("bind through the second wrapper");
+
+    assert_eq!(node.consumer_grant_audiences_len_for_test(), 1);
+
+    // The first client goes away; the second is STILL LIVE and still needs its
+    // audience to discover anything.
+    drop(c1);
+    assert_eq!(
+        node.consumer_grant_audiences_len_for_test(),
+        1,
+        "dropping one wrapper's client must not withdraw a live client's ingest          authority — the refcount belongs to the node, not the wrapper"
+    );
+
+    drop(c2);
+    assert_eq!(
+        node.consumer_grant_audiences_len_for_test(),
+        0,
+        "the last client's drop withdraws it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

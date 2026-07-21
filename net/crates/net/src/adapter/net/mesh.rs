@@ -4960,6 +4960,11 @@ pub struct MeshNode {
     /// Serializes consumer grant-audience install/remove (see
     /// `provider_grant_mu`).
     consumer_grant_mu: parking_lot::Mutex<()>,
+    /// Reference-counted consumer-audience leases (OSDK S0, rehomed here from
+    /// the SDK's `Mesh` wrapper). Keyed to the NODE because that is what the
+    /// consumer registry belongs to: two `Mesh` wrappers over one node share
+    /// this, so neither can withdraw an audience the other is still using.
+    org_audience_leases: Arc<super::behavior::org_grant_registry::OrgAudienceLeases>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
@@ -6361,6 +6366,9 @@ impl MeshNode {
             )),
             provider_grant_mu: parking_lot::Mutex::new(()),
             consumer_grant_mu: parking_lot::Mutex::new(()),
+            org_audience_leases: Arc::new(
+                super::behavior::org_grant_registry::OrgAudienceLeases::default(),
+            ),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
@@ -8365,6 +8373,92 @@ impl MeshNode {
                 None => false,
             },
             None => false,
+        }
+    }
+
+    /// The node's consumer-audience lease registry (OSDK S0).
+    pub fn org_audience_leases(
+        &self,
+    ) -> &Arc<super::behavior::org_grant_registry::OrgAudienceLeases> {
+        &self.org_audience_leases
+    }
+
+    /// Acquire reference-counted consumer-audience leases for `pairs`,
+    /// installing any not already leased on this NODE.
+    ///
+    /// All-or-nothing: if any install is refused, every reference taken so far
+    /// in this call is released before returning, so a failed bind leaves the
+    /// registry exactly as it found it. Returns the grant ids now referenced.
+    ///
+    /// The lock spans the "is it already leased?" read AND the install, so two
+    /// concurrent binds cannot both decide they are first; and it spans the
+    /// 1→0 removal in [`release_consumer_audience_leases`], so a final release
+    /// racing a fresh bind cannot leave the new holder without its audience.
+    pub fn acquire_consumer_audience_leases(
+        &self,
+        pairs: Vec<(
+            super::behavior::org_grant::OrgCapabilityGrant,
+            super::behavior::org_grant::OrgAudienceSecret,
+        )>,
+    ) -> Result<
+        Vec<[u8; 32]>,
+        (
+            [u8; 32],
+            super::behavior::org_grant_registry::GrantAudienceInstallError,
+        ),
+    > {
+        use super::behavior::org_grant_registry::{ConsumerAudienceInstall, LeaseEntry};
+        let mut taken: Vec<[u8; 32]> = Vec::with_capacity(pairs.len());
+        for (grant, secret) in pairs {
+            let grant_id = grant.grant_id;
+            let mut entries = self.org_audience_leases.lock_entries();
+            match entries.get_mut(&grant_id) {
+                Some(entry) => {
+                    entry.retain();
+                    // `secret` drops here (zeroized): the record it would have
+                    // installed is already live and identical by construction —
+                    // a differing secret for the same id would have been a
+                    // Conflict at the first install.
+                }
+                None => match self.install_consumer_grant_audience_leased(grant, secret) {
+                    Ok(ConsumerAudienceInstall::Installed(lease)) => {
+                        entries.insert(grant_id, LeaseEntry::new_owned(lease));
+                    }
+                    Ok(ConsumerAudienceInstall::AlreadyPresent) => {
+                        entries.insert(grant_id, LeaseEntry::new_borrowed());
+                    }
+                    Err(e) => {
+                        drop(entries);
+                        self.release_consumer_audience_leases(&taken);
+                        return Err((grant_id, e));
+                    }
+                },
+            }
+            drop(entries);
+            taken.push(grant_id);
+        }
+        Ok(taken)
+    }
+
+    /// Release one reference per id; the last reference to an OWNED
+    /// installation removes it. A non-owning entry (the record was already
+    /// present when first leased) removes nothing.
+    pub fn release_consumer_audience_leases(&self, grant_ids: &[[u8; 32]]) {
+        for grant_id in grant_ids {
+            let mut entries = self.org_audience_leases.lock_entries();
+            let Some(entry) = entries.get_mut(grant_id) else {
+                continue;
+            };
+            let (last, owned) = entry.release();
+            if !last {
+                continue;
+            }
+            entries.remove(grant_id);
+            // Still under the lock: the 1→0 transition and the registry removal
+            // are one step.
+            if let Some(lease) = owned {
+                self.remove_consumer_grant_audience_if_current(&lease);
+            }
         }
     }
 
