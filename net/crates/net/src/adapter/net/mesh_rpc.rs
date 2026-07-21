@@ -853,8 +853,9 @@ async fn emit_capability_denial(
 /// body carries ONLY the single COARSE reason byte — the detailed
 /// `AdmissionDenied` variant stays provider-side audit (a caller must not learn
 /// which check failed).
-async fn emit_admission_denial(
+fn emit_admission_denial(
     mesh: &MeshNode,
+    resp_tx: &mpsc::Sender<RpcResponseJob>,
     service: &str,
     claimed_origin: u64,
     call_id: u64,
@@ -887,20 +888,44 @@ async fn emit_admission_denial(
     let reply_channel_id = ChannelId::new(reply_channel.clone());
     let reply_channel_hash = reply_channel_id.hash();
     let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
-    // `target_hint = Some(from_node)` + `DirectOnly`: unicast to the
-    // authenticated peer and nothing else — never reflected onto a forged
-    // origin's roster (NC2 / R2-7).
-    let _ = publish_response_to_caller(
-        mesh,
-        reply_origin,
-        Some(from_node),
-        &reply_channel,
-        reply_channel_hash,
-        reply_stream_id,
-        Bytes::from(buf),
-        ResponseRouteFallback::DirectOnly,
-    )
-    .await;
+    // §7 — hand the denial to the response DRAINER instead of awaiting the
+    // publish here.
+    //
+    // Every serve bridge is a single task draining a bounded mpsc, so an
+    // awaited network write inside the loop serializes behind itself: one
+    // session-holding peer (no org credentials required — it stamps its own
+    // origin, so the origin check and caller resolution both pass) could send
+    // junk proofs and impose a full AEAD-encrypt + socket write of
+    // head-of-line blocking per packet on every legitimate protected call.
+    // `master` emitted denials through the sync `RpcResponseEmitter`; making
+    // this path `.await` was a regression, not a design change.
+    //
+    // The routing guarantees are unchanged and must stay that way:
+    // `target_hint = Some(from_node)` is set EXPLICITLY here rather than
+    // resolved from the origin-node cache — a denied call was never dispatched
+    // so it has no cache entry, and the drainer publishes protected responses
+    // with `ResponseRouteFallback::DirectOnly`, under which a `None` hint
+    // means DROP. Getting this wrong would silently swallow every denial
+    // rather than misroute one, which is why the live witnesses assert the
+    // 0x0009 actually arrives.
+    if resp_tx
+        .try_send(RpcResponseJob {
+            caller_origin: reply_origin,
+            call_id,
+            target_hint: Some(from_node),
+            reply_channel,
+            reply_channel_hash,
+            reply_stream_id,
+            payload: Bytes::from(buf),
+        })
+        .is_err()
+    {
+        tracing::debug!(
+            from_node = format!("{:#x}", from_node),
+            call_id,
+            "rpc admission: response drainer at capacity; dropping denial"
+        );
+    }
 }
 
 /// Strip a stray `net-org-admission` proof header from a PUBLIC-service inbound
@@ -973,6 +998,9 @@ async fn admit_and_dispatch_protected(
     reg: &crate::adapter::net::org_admission_gate::RegisteredRpcService,
     replay: &crate::adapter::net::behavior::org_admission_replay::AdmissionReplayGuard,
     fold: &Arc<Mutex<RpcServerFold>>,
+    // §7 — the bounded response drainer. Denials are ENQUEUED here rather than
+    // published inline, so the single bridge task never awaits a socket write.
+    resp_tx: &mpsc::Sender<RpcResponseJob>,
 ) {
     use crate::adapter::net::behavior::org_admission::{AdmissionContext, CoarseAdmissionReason};
     use crate::adapter::net::org_admission_gate as gate;
@@ -1007,13 +1035,13 @@ async fn admit_and_dispatch_protected(
         Err(_) => {
             emit_admission_denial(
                 mesh,
+                resp_tx,
                 service,
                 claimed_origin,
                 call_id,
                 from_node,
                 CoarseAdmissionReason::Denied,
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1028,13 +1056,13 @@ async fn admit_and_dispatch_protected(
     ) {
         emit_admission_denial(
             mesh,
+            resp_tx,
             service,
             claimed_origin,
             call_id,
             from_node,
             CoarseAdmissionReason::Denied,
-        )
-        .await;
+        );
         return;
     }
 
@@ -1043,25 +1071,25 @@ async fn admit_and_dispatch_protected(
     else {
         emit_admission_denial(
             mesh,
+            resp_tx,
             service,
             claimed_origin,
             call_id,
             from_node,
             CoarseAdmissionReason::Denied,
-        )
-        .await;
+        );
         return;
     };
     let Ok(request_digest) = gate::org_request_digest(&payload) else {
         emit_admission_denial(
             mesh,
+            resp_tx,
             service,
             claimed_origin,
             call_id,
             from_node,
             CoarseAdmissionReason::Denied,
-        )
-        .await;
+        );
         return;
     };
     let admission_headers: Vec<&[u8]> = payload
@@ -1082,13 +1110,13 @@ async fn admit_and_dispatch_protected(
         Err(d) => {
             emit_admission_denial(
                 mesh,
+                resp_tx,
                 service,
                 claimed_origin,
                 call_id,
                 from_node,
                 d.coarse(),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1161,13 +1189,13 @@ async fn admit_and_dispatch_protected(
             tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
             emit_admission_denial(
                 mesh,
+                resp_tx,
                 service,
                 claimed_origin,
                 call_id,
                 from_node,
                 denied.coarse(),
-            )
-            .await;
+            );
         }
     }
 }
@@ -3222,6 +3250,12 @@ impl MeshNode {
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
         let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
+        // §7 — a second handle for the protected bridge's DENIAL path, so a
+        // denial is enqueued on the same bounded drainer as any other response
+        // instead of being published inline. Mirrors `master`'s
+        // `emit_for_bridge`, which existed for exactly this reason on the
+        // capability-denial path.
+        let resp_tx_for_denials = resp_tx.clone();
         let emit: RpcResponseEmitter = Arc::new(move |from_node, caller_origin, call_id, resp| {
             let target_hint = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
             // Resolve the reply channel from cache (Arc bump on hit; one
@@ -3485,6 +3519,7 @@ impl MeshNode {
                             &reg_for_bridge,
                             &replay_for_bridge,
                             &fold,
+                            &resp_tx_for_denials,
                         )
                         .await;
                     }
