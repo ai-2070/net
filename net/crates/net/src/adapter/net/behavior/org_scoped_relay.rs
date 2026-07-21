@@ -9,6 +9,33 @@
 //! hop counter, exactly like plaintext CAP-ANN's `hop_count`) and the per-node
 //! dedup state that stops a flood from looping (Kyra OA3-5 wire ruling — do NOT
 //! add `hop_count` to the signed envelope).
+//!
+//! # §23 — "learning the plaintext" is the precise claim, and it is the only one
+//!
+//! A relay cannot open the descriptor: that needs the audience key, and the
+//! AEAD binds provider‖owner_org‖handle‖grant_id‖generation‖expires_at, so an
+//! envelope cannot be transplanted into another context either. The
+//! ciphertext is padded to 256-byte buckets, so its length discloses only a
+//! coarse bucket index rather than the capability name's length.
+//!
+//! What a relay DOES see, because routing needs it, is the envelope's
+//! cleartext framing: `provider`, `owner_org`, `grant_id`, `audience_handle`,
+//! `generation` and `expires_at`. `grant_id` and `audience_handle` are stable
+//! for a grant's lifetime, so a relay on the path can build a persistent map
+//! of WHICH providers serve WHICH cross-org grant, and the all-zero owner
+//! sentinel explicitly labels owner-scoped envelopes — letting it count an
+//! org's internal private-service announcements and watch their re-announce
+//! cadence via `generation`.
+//!
+//! That is a metadata channel, not a confidentiality break, and it is
+//! inherent: a relay that cannot read the routing fields cannot route. It is
+//! documented here because the phrase "without any relay ever learning the
+//! plaintext" is easy to read as "learning nothing", and an operator placing
+//! an untrusted relay on a private-discovery path should know what that relay
+//! can infer. (`grant_id` is arguably redundant with `audience_handle` on the
+//! wire and could be dropped to narrow this — not done, because the ingest
+//! selector keys on it and the change would be a wire break for a metadata
+//! reduction, not an exposure fix.)
 
 use std::collections::BTreeMap;
 

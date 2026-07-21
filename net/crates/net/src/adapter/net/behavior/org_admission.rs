@@ -484,6 +484,33 @@ pub fn verify_org_admission(
         .caller_membership
         .is_valid_at_with_skew(now_secs, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::MembershipInvalid)?;
+    // §14 — BOUNDARY, stated because it is invisible at this call site.
+    //
+    // `floor_for` returns 0 for an org this node holds no floors for, and
+    // `generation < 0` is unsatisfiable for a `u32`. For an OwnerDelegated
+    // call `acting_org` is this provider's own org, whose bundles it imports
+    // by definition, so the check bites. For CrossOrgGranted, `acting_org` is
+    // a FOREIGN org A — and floors arrive only via operator-distributed,
+    // A-signed bundle files that B has chosen to merge. If B never imports
+    // A's bundles (the default), this check silently evaluates to "permit"
+    // for every cross-org caller.
+    //
+    // So a compromised A member keeps invoking B's protected capability for
+    // the life of its membership certificate — up to `MAX_ORG_CERT_TTL_SECS`
+    // (2 years) — and B cannot revoke the capability grant it issued either,
+    // because floors apply to the membership cert and NOT to grants (v1, see
+    // `org_grant.rs`). The only live provider-side kill switch is the
+    // `provider_policy` closure at step 11.
+    //
+    // Deliberately not "fixed" here: making an absent foreign floor set DENY
+    // would break every cross-org deployment that has not built bundle
+    // distribution, and there is no signal at this layer to distinguish "no
+    // floors because none were ever needed" from "no floors because
+    // distribution is broken". Closing it properly needs a cross-org bundle
+    // channel plus an explicit per-issuer "floors expected" assertion — an
+    // operational surface, not a check. Until then `provider_policy` is the
+    // documented mechanism, and this is the §D1 limitation made concrete at
+    // the exact line where a reader would otherwise assume coverage.
     let floor = ctx
         .floors
         .floor_for(&acting_org, &proof.caller_membership.member);

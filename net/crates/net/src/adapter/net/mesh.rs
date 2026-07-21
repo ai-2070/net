@@ -20201,6 +20201,27 @@ impl MeshNode {
                 // private `nrpc:<svc>` would otherwise leak it. Strip every
                 // owner-scoped AND granted tag from the plaintext set (OA3-4b1 /
                 // OA3-4b2 confidentiality).
+                //
+                // §30 — DECIDED, not overlooked: this suppression is keyed on
+                // the CURRENTLY-REGISTERED private set, so it is not sticky.
+                // Drop the `ServeHandle` and the next re-announce ships an
+                // operator's own `nrpc:<svc>` baseline tag in the clear again.
+                //
+                // That asymmetry is deliberate. The tag is in the plaintext set
+                // only because the OPERATOR put it in `user_caps` — merged
+                // `nrpc:` tags are never written back into the baseline
+                // (`announce_from_baseline` snapshots the caller's set BEFORE
+                // the merge), so the only way one is present is explicit
+                // intent to advertise. A private registration temporarily
+                // overrides that intent; ending the registration restores it.
+                // Making suppression permanent would mean a process that once
+                // served `X` privately could never advertise `X` publicly
+                // again without a restart, which is a worse and far more
+                // surprising failure.
+                //
+                // What this is NOT: a leak of a service the operator never
+                // asked to advertise. Those tags come from the registry, not
+                // the baseline, and disappear with the registration.
                 for svc in self
                     .rpc_local_services
                     .owner_scoped_snapshot()

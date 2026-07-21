@@ -377,6 +377,20 @@ impl OrgAudienceSecret {
     /// Explicit config-file codec:
     /// `version ‖ grant_id ‖ handle ‖ key`, exactly
     /// [`Self::ENCODED_SIZE`] bytes.
+    ///
+    /// # §28 — CALLER OBLIGATION: scrub the returned buffer
+    ///
+    /// The returned array carries the raw 32-byte discovery key and has NO
+    /// `Drop` of its own — it is a plain `[u8; N]`. Whoever calls this must
+    /// volatile-scrub it once the bytes are written, on EVERY exit path
+    /// including error returns. `cli/src/commands/org.rs` is the reference
+    /// pattern (`zeroize_slice` on the array plus a `ScrubbedBytes` guard on
+    /// the copy handed to the writer).
+    ///
+    /// This obligation was previously stated in neither codec's docs, so the
+    /// only in-tree example an operator could copy was a test doing
+    /// `decode_config(&std::fs::read(path)?)` — which leaves the whole file,
+    /// including the key, in an un-zeroed `Vec` that drops silently.
     pub fn encode_config(&self) -> [u8; Self::ENCODED_SIZE] {
         let mut buf = [0u8; Self::ENCODED_SIZE];
         buf[0] = ORG_AUDIENCE_SECRET_VERSION;
@@ -388,6 +402,37 @@ impl OrgAudienceSecret {
 
     /// Strict inverse of [`Self::encode_config`]: exact length and
     /// known version byte, or a loud typed error.
+    ///
+    /// # §28 — CALLER OBLIGATION: scrub the input buffer
+    ///
+    /// `bytes` is caller-owned and carries the raw discovery key. Read it into
+    /// something that scrubs on drop (`ScrubbedBytes`) rather than a bare
+    /// `Vec<u8>`; a plain `std::fs::read` leaves the key in freed heap, where
+    /// it can reach a core dump, swap, or a later allocation.
+    ///
+    /// There is deliberately no in-crate loader that does this FOR you: the
+    /// owner-side equivalent (`NodeAuthority::open`) reads through
+    /// `read_audience_checked`, which additionally requires a regular file and
+    /// gates the mode on the ALREADY-OPENED descriptor, closing the TOCTOU a
+    /// path-based check leaves open. A grant-side loader would need the same
+    /// treatment, and shipping one that merely wrapped this call would imply a
+    /// safety it does not provide.
+    ///
+    /// # §27/§29 — residual, stated rather than silently accepted
+    ///
+    /// Both codecs move key material BY VALUE, and a Rust move is a memcpy
+    /// that does NOT run `Drop` on the source. So each hop —
+    /// `mint`/`decode_config` returning `Self`, `validate_common` taking it by
+    /// value, `Arc::new(record)` — strands a copy in a stack frame that is
+    /// never scrubbed; only the final `Arc` release runs the zeroizing `Drop`.
+    /// The same applies to `OwnerAudienceCredential`'s by-value returns.
+    ///
+    /// Closing it means returning `Box<Self>` so only a pointer moves. Not
+    /// done here because it is a wide API change for a residual bounded by
+    /// freed stack memory in a process that already holds the key live in an
+    /// `Arc` — but it is the fix if this ever needs closing, and the module
+    /// doc's "Arc bumps only — never secret bytes" claim is accurate for the
+    /// MAP mutation and not for these construction hops.
     #[expect(
         clippy::unwrap_used,
         reason = "length checked to be exactly ENCODED_SIZE above; fixed slices convert infallibly"
