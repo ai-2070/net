@@ -144,7 +144,7 @@ impl MeshBuilder {
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
             #[cfg(feature = "nat-traversal")]
-            auto_direct_upgrade: false,
+            auto_direct_upgrade: true,
         })
     }
 
@@ -272,7 +272,8 @@ impl MeshBuilder {
     /// deferral) so in-flight work is never dropped.
     ///
     /// **Optimization, not correctness** — traffic rides the relay
-    /// until (and unless) a direct path lands. Off by default.
+    /// until (and unless) a direct path lands. On by default; pass
+    /// `false` to pin traffic to the relay path.
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
@@ -310,9 +311,12 @@ impl MeshBuilder {
         if self.try_port_mapping {
             config = config.with_try_port_mapping(true);
         }
+        // Unconditional pass-through, not `if self.auto_direct_upgrade`:
+        // the flag now defaults on, so an opt-in-only plumbing would make
+        // `.auto_direct_upgrade(false)` a silent no-op.
         #[cfg(feature = "nat-traversal")]
-        if self.auto_direct_upgrade {
-            config = config.with_auto_direct_upgrade(true);
+        {
+            config = config.with_auto_direct_upgrade(self.auto_direct_upgrade);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;

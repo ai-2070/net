@@ -110,9 +110,11 @@ mod natsim {
         // announces once per node, but the reflex-diff trigger and late
         // joiners lean on the re-announce loop.
         cfg.min_announce_interval = Duration::from_millis(100);
-        if auto_upgrade {
-            cfg = cfg.with_auto_direct_upgrade(true);
-        }
+        // Set both ways, never `if auto_upgrade`: the flag defaults on,
+        // so leaving it unset would silently enable the upgrade in the
+        // punch / fallback / skip scenarios that deliberately omit
+        // `--auto-upgrade` and assert on un-upgraded behavior.
+        cfg = cfg.with_auto_direct_upgrade(auto_upgrade);
         cfg
     }
 

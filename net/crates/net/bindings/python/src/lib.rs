@@ -1251,8 +1251,9 @@ mod mesh_bindings {
             // opportunistically re-handshaked over a direct path
             // and migrated (guarded by the migration contract so
             // in-flight work is never dropped). Optimization,
-            // not correctness; default False. Silently ignored
-            // when built without `--features nat-traversal`.
+            // not correctness; default True — pass False to pin
+            // traffic to the relay path. Silently ignored when
+            // built without `--features nat-traversal`.
             auto_direct_upgrade: Option<bool>,
             // permissive_channels: opt out of the strict
             // `ChannelConfigRegistry` install. When True, no
@@ -1323,9 +1324,12 @@ mod mesh_bindings {
             // above — thin wheels accept the kwarg and ignore it.
             #[cfg(not(feature = "port-mapping"))]
             let _ = try_port_mapping;
+            // `if let`, not `== Some(true)`: the flag defaults on, so
+            // `auto_direct_upgrade=False` must reach the core config
+            // rather than being swallowed as "not opted in".
             #[cfg(feature = "nat-traversal")]
-            if auto_direct_upgrade == Some(true) {
-                config = config.with_auto_direct_upgrade(true);
+            if let Some(enabled) = auto_direct_upgrade {
+                config = config.with_auto_direct_upgrade(enabled);
             }
             #[cfg(not(feature = "nat-traversal"))]
             let _ = auto_direct_upgrade;

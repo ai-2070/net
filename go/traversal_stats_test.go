@@ -69,17 +69,29 @@ func TestTraversalStatsFullShapeBootsZero(t *testing.T) {
 // config into the cdylib without erroring (behavioral coverage of
 // the upgrade itself lives in the Rust integration suite — this
 // pins the binding-surface plumbing).
+// Both poles are exercised: the flag defaults on, so the explicit
+// false (kill switch) is the arm that would regress silently if the
+// binding ever collapsed back to opt-in-only plumbing.
 func TestAutoDirectUpgradeFlagAccepted(t *testing.T) {
-	aAddr, _ := allocPortPair(t)
-	m, err := NewMeshNode(MeshConfig{
-		BindAddr:          aAddr,
-		PskHex:            meshPsk,
-		AutoDirectUpgrade: true,
-	})
-	if err != nil {
-		t.Fatalf("new with AutoDirectUpgrade: %v", err)
-	}
-	if err := m.Shutdown(); err != nil {
-		t.Fatalf("shutdown: %v", err)
+	enabled, disabled := true, false
+	for name, want := range map[string]*bool{
+		"unset":    nil,
+		"enabled":  &enabled,
+		"disabled": &disabled,
+	} {
+		t.Run(name, func(t *testing.T) {
+			aAddr, _ := allocPortPair(t)
+			m, err := NewMeshNode(MeshConfig{
+				BindAddr:          aAddr,
+				PskHex:            meshPsk,
+				AutoDirectUpgrade: want,
+			})
+			if err != nil {
+				t.Fatalf("new with AutoDirectUpgrade=%v: %v", want, err)
+			}
+			if err := m.Shutdown(); err != nil {
+				t.Fatalf("shutdown: %v", err)
+			}
+		})
 	}
 }

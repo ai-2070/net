@@ -1725,10 +1725,11 @@ pub struct MeshNodeConfig {
     /// open streams / unacked in-flight data defers rather than dropping
     /// that state.
     ///
-    /// **Default `false`.** This is new session-migration behavior; the
-    /// flag exists so it can be enabled per-deployment (and by the
-    /// integration tests) and validated against the real-NAT harness
-    /// (Stage 4) before any consideration of flipping the default.
+    /// **Default `true`.** Validated against the Stage 4 real-NAT
+    /// harness (`tests/natsim`, netns + nftables masquerade), which
+    /// exercises the upgrade across genuine cone/symmetric NATs in CI.
+    /// Set to `false` to pin traffic to the relay path — the kill
+    /// switch restores pre-v0.34 behavior exactly.
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
     pub auto_direct_upgrade: bool,
@@ -1783,11 +1784,11 @@ impl MeshNodeConfig {
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
             #[cfg(feature = "nat-traversal")]
-            auto_direct_upgrade: false,
+            auto_direct_upgrade: true,
         }
     }
 
-    /// Enable the background direct-path upgrade. See
+    /// Enable or disable the background direct-path upgrade. See
     /// [`MeshNodeConfig::auto_direct_upgrade`] for semantics and the
     /// migration-safety guarantees.
     ///
