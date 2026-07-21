@@ -1,6 +1,7 @@
 # CODE REVIEW 2026-07-20 — Organization Capability Auth (`org-capability-auth`)
 
-> **Status: 20 production findings resolved; TEST closure is PARTIAL.**
+> **Status: 20 production findings resolved; §T1-§T8 and §D1-§D4 closed;
+> §T9 config landed but CI not yet observed green at HEAD.**
 >
 > Production fixes (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4,
 > `e21a9d23c` §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8,
@@ -25,19 +26,26 @@
 >   release-compiled, with `floors = None` — and `MeshNode::capability_fold()`
 >   is also `pub`.
 >
-> **TEST closure (§T1-§T9) is NOT complete.** What actually landed:
+> **TEST closure (§T1-§T9): complete except §T9's CI observation.** Two of
+> Kyra's items (§T2, §T3) resolved as CORRECTIONS rather than new tests —
+> in both cases the property was already witnessed at the layer where it is
+> reachable, and the integration test named in the review genuinely could
+> not witness it. Both are verified by mutation, and both now carry a scope
+> note pointing at the real witness, because a reader who finds a
+> multiply-guarded test and no cross-reference will reasonably conclude the
+> property is untested. What landed:
 >
 > | Item | State |
 > |---|---|
-> | §T1 | PARTIAL — the wrong-caller-identity witness is real and red-witnessed; the replay and wire-tamper witnesses were NOT added. (Proof expiry is unreachable end-to-end; see below.) |
-> | §T2 | PARTIAL — the origin-bind half is now asserted, but the companion still passes under a `(origin, call_id)` key, so the session component named by §T2 is still not witnessed. |
-> | §T3 | NOT DONE — `nrpc_response_routing.rs` is unchanged and still multiply guarded. |
-> | §T4 | PARTIAL — `org_adopt.rs` gained stderr-asserting tests; the principal wrong-reason cases at `org_grant.rs:214` and `:399` are unchanged. |
+> | §T1 | DONE — caller binding (`087a90d07`), plus replay and wire-tamper (`6d52f02e8`), each red-witnessed against the exact mutation named in the review. Proof expiry is unreachable end-to-end and is covered in the `org_admission` units; see below. |
+> | §T2 | DONE, by correction — the session component IS witnessed, by four pre-existing fold-level tests in `cortex/rpc.rs` (verified: collapsing the key's `from_node` fails all four). The integration test cannot witness it, because Gate-3 rejects a forged-origin frame before the fold sees it. A scope note records the split. |
+> | §T3 | DONE, by correction — `response_route_is_trustworthy` IS witnessed exhaustively by `origin_cache_tests::response_route_trust_requires_authenticated_direct_origin` (verified: stubbing the predicate to `true` fails it). The integration test is triple-guarded liveness and is now scoped as such. |
+> | §T4 | DONE — `org_grant.rs:214` no longer masks three cases behind `TargetOrgNotIssuer` and asserts each rule's own stderr; `:399` asserts the alias guard's message rather than a bare exit 2. Both red-witnessed. |
 > | §T5 | DONE — the restart is real and red-witnessed. |
 > | §T6 | DONE — the precondition no longer masks the assertion. |
 > | §T7 | DONE — both hangs now fail. |
-> | §T8 | PARTIAL — the `recv_timeout` shapes are fixed; the sleep-based blocking assertions, the copied-ingest seam coverage, the emission-flag setup and the PID-reuse scratch hazard are not. |
-> | §T9 | Config landed and locally verified; **CI has not been observed green at HEAD.** |
+> | §T8 | DONE — `recv_timeout` shapes, the sleep-based blocking assertions (now gated on thread entry), the copied-ingest seam (dispatch and the test seam now share one `ingest_announcement_with_owner_projection`), the emission-flag ordering, and the PID-reuse scratch hazard. Each red-witnessed. |
+> | §T9 | Config landed and locally verified; **CI has not been observed green at HEAD** — still the one open item. |
 >
 > One §T1 item is not a gap but a correction: proof EXPIRY is unreachable
 > end-to-end through the public API, because `proof_ttl_secs` is applied at
