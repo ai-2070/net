@@ -29,6 +29,15 @@ Workstream R, X1, **Node (N)**, and **Python (P)** are **IMPLEMENTED**. Go
 | **P** — Python caller + provider | done | `16ce249a3` | **built + tested: 12 pytest, stub drift clean** |
 | **C + G** — Go over a new C ABI | not started | — | consumer-gated |
 
+**A functional gap was found and closed: the bindings needed provisioning
+(§D9).** Finishing the Node/Python "residual" surfaced that the org bindings
+were **non-functional**, not merely untested — no binding could install a node
+authority, so `mesh.org(..)` could only ever fail `NodeAuthorityRequired`, and
+a granted provider had no way to install its grant audience. Closed by OSDK §7
+(`24a70e330`): `install_org_authority(dir)` and
+`install_provider_grant_audience(grant_bytes, secret_path)` in the SDK and both
+bindings, verified by a live cross-org call provisioned entirely through them.
+
 **Two substrate bugs were found and fixed by doing the binding work** — the
 reason R was sequenced first, vindicated:
 
@@ -671,6 +680,38 @@ Matching all three typed layers. `call`/`ServeOrg` marshal with the language's
 JSON, byte-identical to Rust's `Codec::Json`. The raw byte surface
 (`callBytes`) is exposed for callers who marshal themselves.
 
+### D9. Provisioning is a binding requirement, not an afterthought (OSDK §7)
+
+The verbs are not enough. For `mesh.org(..)` to succeed the node needs an
+installed authority, and for a `Granted` `serveOrg` to seal envelopes the node
+needs its provider grant audience installed. In Rust the tests reach these via
+`MeshNode::install_node_authority` / `install_provider_grant_audience` directly;
+a binding cannot, so **without an exposed provisioning path the whole org
+surface is inert in that language** — you can construct credentials and call
+`bind`, and it always fails `NodeAuthorityRequired`. This was found by finishing
+Node/Python, not predicted.
+
+Two node-based methods, one implementation each, matching the seam doctrine:
+
+- `install_org_authority(dir)` — load the directory `net node adopt` wrote,
+  self-verify it against this node's identity, install it + its revocation
+  store. This is node **startup**, sharply distinct from:
+  - **adoption** — the one-time ceremony that MINTS the files (`net node
+    adopt`), which stays CLI-only because it mints material; and
+  - **issuance** — minting certs/grants (`net org …`), also CLI-only.
+  Loading an already-adopted authority is neither; it is a node reading its own
+  provisioned identity, and every language must be able to do it.
+- `install_provider_grant_audience(grant_bytes, secret_path)` — the
+  provider-side install a granted service needs. Secret as a **path**, never
+  bytes — the §D2/§D2a asymmetry, same reason.
+
+Provisioning errors are **not** the four call-path domains: a node either starts
+correctly or it does not, so they surface as plain errors, not something a
+caller branches on per-request. No addition to the frozen `org:` vocabulary.
+
+A `SameOrg` provider needs only `install_org_authority` (it seals under the
+owner audience the authority carries); a `Granted` provider needs both.
+
 ---
 
 ## The parity matrix (the contract)
@@ -695,6 +736,8 @@ and C cells still carry their planned slice ids.
 | Coarse remote reason preserved | ✅ | ✅ | ✅ | G6 | C5 |
 | `unknown` fallback that impersonates no domain | ✅ | ✅ | ✅ | G6 | C5 |
 | Node/binding identity provenance (§D1a) | ✅ | ✅ | ✅ | **G-prov** | — |
+| `install_org_authority(dir)` — bind precondition (§D9) | ✅ | ✅ | ✅ | G-prov2 | C6 |
+| `install_provider_grant_audience(bytes, path)` (§D9) | ✅ | ✅ | ✅ | G-prov2 | C6 |
 | Async dual | ✅ | ✅ (Promise) | ✅ (GIL release) | ctx | — |
 | Error-vocabulary golden vector | ✅ | ✅ | ✅ | X1 | X1 |
 | Live cross-language call matrix | ✅ | — | — | X2 | — |
@@ -789,10 +832,20 @@ classified into the credentials domain, seeded meshes stable / ephemeral not;
 `configured_identity` for a supplied `identitySeed` (§D1a), so a seeded Node
 caller was refused as ephemeral. Fixed at the constructor.
 
-**Acceptance (still owed at the live tier):** a Node service serving a private
-cross-org capability that a Node client calls, with the handler reading
-`caller.actingOrg`, needs an adopted node authority in the JS harness. The Rust
-live suite proves the seam; the JS live variant lands with X2.
+- [x] **N6** (§D9) `installOrgAuthority` + `installProviderGrantAudience` — the
+  provisioning the surface is non-functional without. Verified: the functions
+  are in `index.d.ts`, `tsc` clean, and `org_binding.test.ts` exercises them
+  through the real napi boundary (bad dir refused, grant+path both cross).
+
+**Acceptance (live admitted call owed with X2):** a Node service serving a
+private cross-org capability that a Node client calls, with the handler reading
+`caller.actingOrg`, still needs the full issuance chain (org keys, cert, grant)
+generated in the JS harness — that is X2 territory. The exact binding-shaped
+path (`install_org_authority` + `install_provider_grant_audience` + `from_parts`
++ `call`) IS proven end-to-end at the Rust tier
+(`live_cross_org_call_through_the_provisioning_methods`), and the Node functions
+are thin marshaling over the same SDK calls, so the remaining delta is issuance
+artifacts, not the org path.
 
 The disposal contract asserts what `NetMesh.shutdown()` actually does, which is
 **reject, not hang** — it drains `Arc::try_unwrap` for ~250 ms (50 x 5 ms),
@@ -849,13 +902,17 @@ def`. Recorded, not silently dropped.
 the `OrgError` hierarchy catchable as a base, no bytes path for a secret, seeded
 meshes stable / ephemeral not); `test_stub_drift.py` clean on all org classes.
 
-**Found by building it:** the same `configured_identity` gap as Node, in the
-PyO3 `NetMesh.__new__` — the SECOND non-SDK constructor to omit it. Fixed.
+- [x] **P8** (§D9) `install_org_authority` + `install_provider_grant_audience`
+  module functions — the provisioning the surface is non-functional without.
+  Verified through the real PyO3 boundary in `test_org_binding.py`.
 
-**Acceptance (live tier owed with X2, as for Node):** the Node acceptance
-sentence in Python. The sync surface is proven at the construction/refusal tier
-a Python app can reach without operator setup; the live admitted call needs an
-adopted authority.
+**Found by building it:** the same `configured_identity` gap as Node, in the
+PyO3 `NetMesh.__new__` — the SECOND non-SDK constructor to omit it. Fixed. And
+the §D9 provisioning gap, which made the surface inert until closed.
+
+**Acceptance (live admitted call owed with X2, as for Node):** the binding-
+shaped path is proven end-to-end at the Rust tier; the Python delta is the
+issuance artifacts a live call needs, not the org path.
 
 ### Workstream C — C: the header IS the SDK
 
@@ -863,6 +920,12 @@ adopted authority.
   `ffi_guard!` + `HandleGuard` adoption, dispatcher + reserved id, ABI stamp,
   and the `-140..-144` error block mirrored into `net.go.h` **and** `go/net.h`
   (or `header_parity_test.go` fails).
+- **C6** (§D9) `net_org_install_authority(mesh_arc, dir, out_err)` and
+  `net_org_install_provider_grant_audience(mesh_arc, grant_ptr, grant_len,
+  secret_path, out_err)` — the provisioning the surface is inert without. Secret
+  is a path, never a `(ptr,len)`. Provisioning failures use `out_err` with a
+  plain message, NOT the `-140..-143` call-domain codes (`NET_ERR_ORG_*`), since
+  they are startup errors, not call results.
 
 **Acceptance:** a C program in `examples/` binds credentials, serves one
 capability and calls another, and `valgrind` reports no leak across
@@ -902,6 +965,10 @@ create/serve/call/free.
   `OrgCall[Req,Resp]`.
 - **G5** `ServeOrg[Req,Resp]` free function + the Variant-A trampoline.
 - **G6** `OrgError{Kind, Message}` + sentinels + `orgErrorFromCode`.
+- **G-prov2** (§D9) `InstallOrgAuthority(node, dir)` and
+  `InstallProviderGrantAudience(node, grantBytes, secretPath)` over C6 — the
+  provisioning without which `NewOrgClient` always fails and a granted
+  `ServeOrg` cannot seal. Do it alongside G2/G5; it is not optional.
 - **G7** mirror the contract file into `bindings/go/net/org.go`.
 
 **Acceptance:** `go test -v ./...` with `RUN_INTEGRATION_TESTS=1` runs a
@@ -1096,6 +1163,13 @@ Recorded so the Go implementer inherits the lessons rather than the surprises:
    or not at all until a user hits them. Both binding suites also caught test
    bugs of mine (`.length` arity in JS, property-vs-method in Python) — writing
    binding tests without running them produces confidently wrong tests.
+5. **The verbs are not the whole surface — provisioning (§D9) is required.**
+   `install_org_authority` and `install_provider_grant_audience` were not in the
+   original per-language slice lists, and their absence made the bindings *look*
+   complete while being unusable (`bind` always fails `NodeAuthorityRequired`).
+   Go must expose both (G-prov2 / C6), or a Go app can construct credentials and
+   never bind. This is the same lesson as #4 in a different costume: "the classes
+   exist" is not "the surface works."
 
 ---
 
