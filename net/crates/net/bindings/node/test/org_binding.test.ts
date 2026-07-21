@@ -14,7 +14,13 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { NetMesh, OrgClient, OrgCredentials } from '../index'
+import {
+  installOrgAuthority,
+  installProviderGrantAudience,
+  NetMesh,
+  OrgClient,
+  OrgCredentials,
+} from '../index'
 import { classifyOrgError, OrgCredentialsError, OrgError } from '../errors'
 
 const PSK = '42'.repeat(32)
@@ -159,6 +165,32 @@ describe('org client binding through the native boundary', () => {
       expect(err.isLocal).toBe(true)
 
       expect(typeof OrgClient.bind).toBe('function')
+    } finally {
+      await mesh.shutdown()
+    }
+  })
+})
+
+describe('org provisioning surface', () => {
+  it('exposes install functions and errors on a bad authority dir', async () => {
+    const mesh = await NetMesh.create({
+      bindAddr: nextAddr(),
+      psk: PSK,
+      identitySeed: seed(0x61),
+    })
+    try {
+      // The functions the org surface is non-functional without.
+      expect(typeof installOrgAuthority).toBe('function')
+      expect(typeof installProviderGrantAudience).toBe('function')
+
+      // A nonexistent directory is refused (the error path marshals across FFI).
+      expect(() => installOrgAuthority(mesh, '/no/such/authority/dir')).toThrow()
+
+      // A well-formed-length but unsigned grant with a bogus secret path is
+      // refused — proving grant bytes + a path both cross and the loader runs.
+      expect(() =>
+        installProviderGrantAudience(mesh, Buffer.alloc(318), '/no/such/secret'),
+      ).toThrow()
     } finally {
       await mesh.shutdown()
     }

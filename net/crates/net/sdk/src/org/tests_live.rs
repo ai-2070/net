@@ -167,6 +167,49 @@ async fn fast_mesh(
     (mesh, identity, dir)
 }
 
+/// A configured mesh whose authority is installed through the PRODUCTION path a
+/// binding takes — `NodeAuthority::adopt` writes the dir (the `net node adopt`
+/// ceremony), then `Mesh::install_org_authority(dir)` opens and installs it.
+///
+/// Distinct from `fast_mesh`, which installs the in-memory authority directly.
+/// This proves the dir-loading path (§7) actually composes into a working call.
+async fn provisioned_mesh(tag: &str, owner: &OrgKeypair) -> (Mesh, Identity, std::path::PathBuf) {
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    let node = Arc::new(node);
+    let entity = identity.entity_id().clone();
+
+    // The ADOPTION ceremony writes the authority files (operator/CLI step).
+    let cert = OrgMembershipCert::try_issue(owner, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-osdk-provision-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt writes the dir");
+
+    let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity.clone()));
+    // The STARTUP step a binding performs: load the adopted files and install.
+    mesh.install_org_authority(&dir)
+        .expect("install_org_authority loads and installs the adopted dir");
+    // Owner-cert emission needs the authority installed first.
+    mesh.node()
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+    (mesh, identity, dir)
+}
+
 /// Assertions a protected handler makes about its own admission.
 struct Facts {
     ran: Arc<AtomicUsize>,
@@ -768,6 +811,258 @@ async fn live_binding_rehearsal_from_files_through_the_raw_seams() {
     );
 
     let _ = std::fs::remove_dir_all(&secret_dir);
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// §7 provisioning — the methods that make the org surface usable from a binding
+// ---------------------------------------------------------------------------
+
+/// `install_org_authority(dir)` loads an adopted directory and satisfies the
+/// bind precondition. Before it, `mesh.org` fails `NodeAuthorityRequired`;
+/// after it, the same credentials get past that check.
+///
+/// This is THE gap that made the bindings non-functional: without an authority
+/// install path, a Node/Python `mesh.org(..)` could never succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_org_authority_unblocks_binding() {
+    let a = org_a();
+    // A configured mesh with NO authority yet.
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32]);
+    cfg.configured_identity = true;
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("node");
+    let ccfg = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(ccfg.clone());
+    let node = Arc::new(node);
+    let entity = identity.entity_id().clone();
+    let mesh = Mesh::from_node_arc(node, ccfg, Some(identity.clone()));
+
+    let creds = || {
+        let (cert, dg) = belonging(&a, &entity);
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles")
+    };
+
+    // No authority yet → refused for exactly that reason.
+    let err = mesh.org(creds()).expect_err("no authority installed");
+    assert!(
+        matches!(
+            err,
+            OrgSdkError::Credentials(crate::org::OrgCredentialError::NodeAuthorityRequired)
+        ),
+        "got {err:?}"
+    );
+
+    // Adopt a dir for THIS entity, then install through the production path.
+    let cert = OrgMembershipCert::try_issue(&a, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-osdk-install-auth-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+
+    mesh.install_org_authority(&dir).expect("install succeeds");
+    // Now the SAME credentials get past the authority check (to member binding,
+    // which passes because the membership names this entity).
+    mesh.org(creds())
+        .expect("binds after the authority is installed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `install_org_authority` refuses a directory adopted for a DIFFERENT entity —
+/// `NodeAuthority::open` self-verifies against this node's identity, so a
+/// binding cannot install someone else's authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_org_authority_refuses_a_foreign_directory() {
+    let a = org_a();
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32]);
+    cfg.configured_identity = true;
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("node");
+    let ccfg = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(ccfg.clone());
+    let node = Arc::new(node);
+    let mesh = Mesh::from_node_arc(node, ccfg, Some(identity.clone()));
+
+    // Adopt a dir for a STRANGER entity, not this node.
+    let stranger = net::adapter::net::identity::EntityKeypair::generate()
+        .entity_id()
+        .clone();
+    let cert = OrgMembershipCert::try_issue(&a, stranger.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-osdk-foreign-auth-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = NodeAuthority::adopt(&dir, cert, &stranger, 0, None).expect("adopt");
+
+    mesh.install_org_authority(&dir)
+        .expect_err("an authority adopted for another entity must be refused");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `install_provider_grant_audience(bytes, path)` — the provider-side method a
+/// granted `serve_org` needs — installs from wire bytes plus a secret file, and
+/// refuses a mismatched secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_provider_grant_audience_round_trips_from_bytes_and_a_path() {
+    use std::io::Write;
+
+    let (a, b) = (org_a(), org_b());
+    let (mesh, _identity, dir) = provisioned_mesh("provider-audience", &b).await;
+    let provider_entity = mesh.node().entity_id().clone();
+
+    // B grants A discover+invoke on this provider.
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &b,
+        a.org_id(),
+        cap("nrpc:customer.read"),
+        GrantRights::INVOKE.union(GrantRights::DISCOVER),
+        GrantTargetScope::ExactNode(provider_entity),
+        3600,
+    )
+    .expect("grant");
+    let secret = secret.expect("discover mints a secret");
+
+    let sdir = std::env::temp_dir().join(format!(
+        "net-osdk-prov-secret-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sdir);
+    std::fs::create_dir_all(&sdir).expect("mkdir");
+    let secret_path = sdir.join("g.audience");
+    {
+        let mut f = std::fs::File::create(&secret_path).expect("create");
+        f.write_all(&secret.encode_config()).expect("write");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+    }
+
+    mesh.install_provider_grant_audience(&grant.to_bytes(), &secret_path)
+        .expect("installs from bytes + a path");
+    assert_eq!(mesh.node().provider_grant_audiences_len_for_test(), 1);
+
+    // A secret for a DIFFERENT grant is refused.
+    let (_other, other_secret) = discover_grant(&b, a.org_id(), cap("nrpc:other"), 3600);
+    let other_path = sdir.join("other.audience");
+    {
+        let mut f = std::fs::File::create(&other_path).expect("create");
+        f.write_all(&other_secret.encode_config()).expect("write");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&other_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+    }
+    mesh.install_provider_grant_audience(&grant.to_bytes(), &other_path)
+        .expect_err("a secret that is not this grant's key must be refused");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole binding-shaped path, live: a provider provisioned entirely through
+/// the §7 methods (`install_org_authority` + `install_provider_grant_audience`)
+/// serves a granted capability that a caller — also provisioned via
+/// `install_org_authority`, binding a grant + secret FILE — invokes.
+///
+/// Every provisioning step here is exactly what a Node or Python app does; no
+/// direct `install_node_authority` / in-memory secret is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_cross_org_call_through_the_provisioning_methods() {
+    use std::io::Write;
+
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_id, p_dir) = provisioned_mesh("prov-provider", &b).await;
+    let (caller, c_identity, c_dir) = provisioned_mesh("prov-caller", &a).await;
+    bring_up(&caller, &provider).await;
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    let _serve = provider
+        .serve_org(
+            "customer.read",
+            OrgAccess::Granted,
+            move |_c: OrgCaller, req: Ping| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(Pong {
+                        n: req.n + 100,
+                        served_by: "prov".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("serve_org");
+
+    // Issue the grant; write BOTH sides' secrets to files (the binding shape).
+    let (grant, secret) = discover_grant(&b, a.org_id(), cap("nrpc:customer.read"), 3600);
+    let sdir = std::env::temp_dir().join(format!(
+        "net-osdk-prov-live-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sdir);
+    std::fs::create_dir_all(&sdir).expect("mkdir");
+    let write_secret = |name: &str, s: &OrgAudienceSecret| {
+        let path = sdir.join(name);
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(&s.encode_config()).expect("write");
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        path
+    };
+    let provider_secret_path = write_secret("provider.audience", &secret);
+    let caller_secret_path = write_secret("caller.audience", &secret);
+
+    // Provider provisions its grant audience from bytes + a path.
+    provider
+        .install_provider_grant_audience(&grant.to_bytes(), &provider_secret_path)
+        .expect("provider audience from the §7 method");
+
+    // Caller binds a grant + secret FILE — the whole point of the asymmetry.
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::from_parts(
+        &cert.to_bytes(),
+        &dg.to_bytes(),
+        &[grant.to_bytes()],
+        &[caller_secret_path],
+    )
+    .expect("credentials from files");
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge_discovery(&provider, &org, &cap("nrpc:customer.read")).await,
+        "resolved through a provider provisioned entirely via the §7 methods"
+    );
+
+    let pong: Pong = org
+        .call("customer.read", &Ping { n: 5 })
+        .await
+        .expect("the fully binding-shaped cross-org call is admitted");
+    assert_eq!(pong.n, 105);
+    assert_eq!(pong.served_by, "prov");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    let _ = std::fs::remove_dir_all(&sdir);
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&c_dir);
 }

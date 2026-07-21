@@ -110,3 +110,21 @@ def test_bind_and_serve_are_reachable_on_a_seeded_mesh() -> None:
             net.OrgCredentials(b"\x00" * 156, b"\x00" * 185, [], [])
     finally:
         mesh.shutdown()
+
+
+def test_provisioning_surface_exists_and_errors_on_bad_input() -> None:
+    # The functions the org surface is non-functional without.
+    assert hasattr(net, "install_org_authority")
+    assert hasattr(net, "install_provider_grant_audience")
+
+    mesh = net.NetMesh(_addr(), PSK, identity_seed=_seed(0x61))
+    try:
+        # A nonexistent directory is refused (the error path marshals across FFI).
+        with pytest.raises(Exception):
+            net.install_org_authority(mesh, "/no/such/authority/dir")
+        # Right-length but unsigned grant + a bogus secret path is refused —
+        # proving grant bytes + a path both cross and the loader runs.
+        with pytest.raises(Exception):
+            net.install_provider_grant_audience(mesh, bytes(318), "/no/such/secret")
+    finally:
+        mesh.shutdown()

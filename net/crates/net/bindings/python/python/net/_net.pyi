@@ -3555,3 +3555,15 @@ def serve_org(
     ``"same_org"`` or ``"granted"``. The handler is
     ``handler(caller: dict, request: bytes) -> bytes``."""
     ...
+
+def install_org_authority(mesh: Any, authority_dir: str) -> None:
+    """Install an adopted node authority from the directory ``net node adopt``
+    wrote. Required before ``OrgClient.bind`` or a ``"granted"`` ``serve_org``."""
+    ...
+
+def install_provider_grant_audience(
+    mesh: Any, grant: bytes, audience_secret_path: str
+) -> None:
+    """Install a provider grant audience (grant wire bytes + secret file PATH)
+    so a ``"granted"`` service can seal envelopes."""
+    ...

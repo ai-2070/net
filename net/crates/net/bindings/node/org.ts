@@ -39,11 +39,13 @@ import {
   OrgClient as NativeOrgClient,
   OrgCredentials,
   serveOrg as nativeServeOrg,
+  installOrgAuthority,
+  installProviderGrantAudience,
 } from './index'
 import type { OrgCaller, OrgRequest, OrgServeHandle } from './index'
 import { classifyOrgError } from './errors'
 
-export { OrgAccess, OrgCredentials }
+export { OrgAccess, OrgCredentials, installOrgAuthority, installProviderGrantAudience }
 export {
   classifyOrgError,
   OrgAdmissionDeniedError,

@@ -164,3 +164,45 @@ async fn run_py_org_handler(
         ))),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Provisioning — the operator/startup steps that make the surface usable
+// ---------------------------------------------------------------------------
+
+/// Install an adopted node authority from ``authority_dir`` — the directory
+/// ``net node adopt`` wrote.
+///
+/// REQUIRED before ``OrgClient.bind`` can succeed or a ``"granted"`` service
+/// can serve. This is node STARTUP (loading already-adopted files), not
+/// adoption (the ceremony that mints them — that stays in the CLI). The node's
+/// identity must be the one the membership names, so the mesh must have been
+/// created with the matching ``identity_seed``.
+#[pyfunction]
+pub fn install_org_authority(
+    mesh: &crate::mesh_bindings::NetMesh,
+    authority_dir: String,
+) -> PyResult<()> {
+    let node = mesh.node_arc_clone()?;
+    net_sdk::org::install_org_authority_node(&node, std::path::Path::new(&authority_dir))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Install a provider grant audience so a ``"granted"`` service can seal
+/// envelopes: the grant this node's org issued (wire ``bytes``) plus its
+/// out-of-band secret (a ``str`` PATH — the raw key never enters Python).
+///
+/// A ``"same_org"`` provider does NOT need this.
+#[pyfunction]
+pub fn install_provider_grant_audience(
+    mesh: &crate::mesh_bindings::NetMesh,
+    grant: &[u8],
+    audience_secret_path: String,
+) -> PyResult<()> {
+    let node = mesh.node_arc_clone()?;
+    net_sdk::org::install_provider_grant_audience_node(
+        &node,
+        grant,
+        std::path::Path::new(&audience_secret_path),
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}

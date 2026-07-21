@@ -3535,6 +3535,11 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<org::PyOrgClient>()?;
         m.add_class::<org_serve::PyOrgServeHandle>()?;
         m.add_function(wrap_pyfunction!(org_serve::serve_org, m)?)?;
+        m.add_function(wrap_pyfunction!(org_serve::install_org_authority, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            org_serve::install_provider_grant_audience,
+            m
+        )?)?;
         m.add("OrgError", m.py().get_type::<org::OrgError>())?;
         m.add(
             "OrgCredentialsError",

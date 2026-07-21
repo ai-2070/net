@@ -958,6 +958,8 @@ try:
         OrgError,
         OrgServeHandle,
         OrgUnclassifiedError,
+        install_org_authority,
+        install_provider_grant_audience,
         serve_org,
     )
 except ImportError:
@@ -974,6 +976,8 @@ else:
             "OrgError",
             "OrgServeHandle",
             "OrgUnclassifiedError",
+            "install_org_authority",
+            "install_provider_grant_audience",
             "serve_org",
         ]
     )

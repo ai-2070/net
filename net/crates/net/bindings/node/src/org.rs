@@ -217,6 +217,47 @@ fn org_error(e: net_sdk::org::OrgSdkError) -> Error {
 }
 
 // ---------------------------------------------------------------------------
+// Provisioning — the operator/startup steps that make the surface usable
+// ---------------------------------------------------------------------------
+
+/// Install an adopted node authority from `authorityDir` — the directory
+/// `net node adopt` wrote.
+///
+/// REQUIRED before `OrgClient.bind` can succeed or a `Granted` service can
+/// serve: the org facade needs an installed authority. This is node STARTUP
+/// (loading already-adopted files), not adoption (the one-time ceremony that
+/// mints them — that stays in the `net org` / `net node adopt` CLI). The node's
+/// identity must be the one the membership names, so the mesh must have been
+/// created with the matching `identitySeed`.
+#[napi]
+pub fn install_org_authority(mesh: &crate::NetMesh, authority_dir: String) -> Result<()> {
+    let node = mesh.node_arc_clone()?;
+    net_sdk::org::install_org_authority_node(&node, std::path::Path::new(&authority_dir))
+        .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+/// Install a provider grant audience so a `Granted` service can seal envelopes:
+/// the grant this node's org issued (wire bytes) plus its out-of-band secret
+/// (a PATH — the raw key never enters JS, the same asymmetry as credentials).
+///
+/// A `SameOrg` provider does NOT need this; it seals under the owner audience
+/// carried by the installed authority.
+#[napi]
+pub fn install_provider_grant_audience(
+    mesh: &crate::NetMesh,
+    grant: Buffer,
+    audience_secret_path: String,
+) -> Result<()> {
+    let node = mesh.node_arc_clone()?;
+    net_sdk::org::install_provider_grant_audience_node(
+        &node,
+        &grant,
+        std::path::Path::new(&audience_secret_path),
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // The provider verb
 // ---------------------------------------------------------------------------
 

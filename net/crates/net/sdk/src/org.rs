@@ -74,6 +74,12 @@ mod call;
 mod serve;
 #[cfg(feature = "cortex")]
 pub use serve::{serve_org_bytes_node, OrgAccess, OrgCaller, OrgHandlerError};
+#[cfg(feature = "cortex")]
+mod provision;
+#[cfg(feature = "cortex")]
+pub use provision::{
+    install_org_authority_node, install_provider_grant_audience_node, OrgProvisionError,
+};
 
 #[cfg(test)]
 mod tests;
