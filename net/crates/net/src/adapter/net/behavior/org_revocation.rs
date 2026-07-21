@@ -1497,14 +1497,68 @@ fn poison_registry() -> &'static Mutex<PoisonRegistry> {
     PATH_POISON.get_or_init(|| Mutex::new(PoisonRegistry::default()))
 }
 
+/// Memo for [`poison_path_key`]: `normalized_path -> canonical key`.
+///
+/// Bounded by the number of distinct authority paths this process has
+/// touched — the same bound `PATH_POISON` already carries — so it needs no
+/// eviction.
+static POISON_KEY_MEMO: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn poison_key_memo() -> &'static Mutex<std::collections::HashMap<PathBuf, PathBuf>> {
+    POISON_KEY_MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// The case-normalized poison-tombstone key for `normalized_path` (R3-2).
 /// `canonicalize` collapses case-aliases through the ACTUAL filesystem
 /// identity — not blind ASCII case-folding, which would over-poison two
 /// genuinely distinct files on a case-sensitive filesystem. Falls back to
 /// the normalized path when the state file does not yet exist (a fresh
 /// `init` before creation) or `canonicalize` otherwise fails.
+///
+/// MEMOIZED (§13). The state being guarded is a process-local `HashSet` /
+/// `HashMap`, but reaching it used to cost a full path resolution on EVERY
+/// call: on Linux an `lstat`/`readlink` per component, on Windows a
+/// `CreateFileW` + `GetFinalPathNameByHandleW` — a real file open. That was
+/// paid three times per protected unary RPC (`org_admission_gate`) and twice
+/// per inbound scoped-announcement envelope that clears the relay gate.
+///
+/// The sharp case was not throughput: `apply_bundle` calls `is_poisoned`
+/// while holding BOTH the interprocess `.lock` sidecar and `core.reload`. On
+/// an NFS/SMB or stalled-disk authority directory that `canonicalize` blocks
+/// for the filesystem timeout with the cross-process revocation lock held,
+/// stalling every other process's `apply_bundle` and every `StoreCore::publish`
+/// on that core — hence every `barriered_generation()` / `snapshot_with_generation()`
+/// reader in `verify_provider_authority`. The same pattern under `_pin` in
+/// `install_org_revocation_store_locked` freezes publishes on two cores at once.
+///
+/// Only SUCCESSFUL canonicalizations are memoized. Caching the fallback would
+/// pin the non-canonical path as the key forever — including after the state
+/// file is created — and a later case-alias would then miss its tombstone.
+///
+/// A memoized key can only go stale if the path is later repointed (e.g. a
+/// symlink swung elsewhere). That direction is fail-CLOSED: the tombstone
+/// keeps applying to the original identity rather than silently following the
+/// path to a new one.
 fn poison_path_key(normalized_path: &Path) -> PathBuf {
-    std::fs::canonicalize(normalized_path).unwrap_or_else(|_| normalized_path.to_path_buf())
+    if let Some(hit) = poison_key_memo().lock().get(normalized_path) {
+        return hit.clone();
+    }
+    // Resolve OUTSIDE the memo lock: this is the call that can block for a
+    // filesystem timeout, and holding the memo lock across it would just move
+    // the stall rather than remove it.
+    match std::fs::canonicalize(normalized_path) {
+        Ok(canonical) => {
+            poison_key_memo()
+                .lock()
+                .insert(normalized_path.to_path_buf(), canonical.clone());
+            canonical
+        }
+        // Not yet created (fresh `init`) or otherwise unresolvable — fall back
+        // WITHOUT memoizing, so the real canonical key is picked up once the
+        // file exists.
+        Err(_) => normalized_path.to_path_buf(),
+    }
 }
 
 /// Poison `normalized_path` under BOTH indexes (R3-2), recording `id` in the
@@ -1953,6 +2007,55 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// §13 — the poison key memo must not cache the PRE-CREATION fallback.
+    ///
+    /// `poison_path_key` falls back to the normalized path when
+    /// `canonicalize` fails, which is the normal state during a fresh `init`
+    /// before the state file exists. Memoizing that fallback would pin the
+    /// non-canonical path as the key forever, so once the file appeared a
+    /// case-alias (or any other path spelling resolving to the same file)
+    /// would look up a DIFFERENT key and miss its tombstone — silently
+    /// un-poisoning a store that must stay fail-closed.
+    ///
+    /// Red-witness: memoizing the `Err` branch makes the post-creation key
+    /// equal the pre-creation fallback, failing the final assertion on any
+    /// platform where `canonicalize` rewrites the path (it prefixes `\?\`
+    /// on Windows and resolves `..`/symlinks everywhere).
+    #[test]
+    fn poison_key_memo_does_not_cache_the_pre_creation_fallback() {
+        let scratch = Scratch::new();
+        // A spelling `canonicalize` will REWRITE: descend then come back up,
+        // which it resolves away. This makes the pre- and post-creation keys
+        // observably different on every platform.
+        let indirect = scratch.0.join("sub").join("..").join("state.json");
+        std::fs::create_dir_all(scratch.0.join("sub")).expect("mkdir");
+
+        // Before creation: canonicalize fails, so we get the fallback.
+        let before = poison_path_key(&indirect);
+        assert_eq!(
+            before,
+            indirect.to_path_buf(),
+            "a missing file falls back to the normalized path",
+        );
+
+        // Create it, then ask again. The memo must NOT have pinned the
+        // fallback — the real canonical key has to win now.
+        std::fs::write(&indirect, b"{}").expect("write state");
+        let after = poison_path_key(&indirect);
+        let expected = std::fs::canonicalize(&indirect).expect("canonicalize");
+        assert_eq!(
+            after, expected,
+            "once the file exists the canonical key must be used",
+        );
+        assert_ne!(
+            after, before,
+            "the pre-creation fallback must not have been memoized",
+        );
+
+        // And the successful resolution IS memoized — a second call agrees.
+        assert_eq!(poison_path_key(&indirect), expected, "memo is stable");
+    }
 
     /// Unique per-test scratch dir (house pattern — no tempfile dev-dep).
     struct Scratch(PathBuf);
