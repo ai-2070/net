@@ -1051,6 +1051,30 @@ jobs:
       - name: Run clippy (production code, strict)
         run: cargo clippy --all-features --lib --bins -- -D warnings
 
+      # `--all-features` above lints exactly ONE configuration, and it is not
+      # one anybody ships: it force-enables every opt-in feature, including
+      # `fixtures` (the test/bench seam). That made CI structurally blind to
+      # breakage in the configurations people actually build — `cargo build`,
+      # `--features net`, `--features cortex` — none of which enable
+      # `fixtures`.
+      #
+      # This is not hypothetical. Gating `apply_legacy_announcement` behind
+      # `#[cfg(any(test, feature = "fixtures"))]` left the two imports that
+      # type its signature dangling in every non-`fixtures` build. The
+      # `--all-features` job stayed green while `cargo clippy --lib --features
+      # cortex -- -D warnings` failed, and so did the Windows security job
+      # below (which pins `--features net`) — so the platform-specific
+      # security suites it exists to gate silently ran in NO job.
+      #
+      # `--no-default-features` and the default set are the two ends of the
+      # range; between them they catch a cfg that only compiles under a
+      # feature nobody enables by default.
+      - name: Run clippy (default features, strict)
+        run: cargo clippy --lib --bins -- -D warnings
+
+      - name: Run clippy (no default features, strict)
+        run: cargo clippy --no-default-features --lib --bins -- -D warnings
+
       # `--all-targets` adds clippy coverage for tests / benches /
       # examples. Tests are allowed to `.unwrap()` / `.expect()` freely
       # (~5000 sites across the test surface) and rarely contain
@@ -1724,18 +1748,49 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-winsec-v1-${{ hashFiles('**/Cargo.lock') }}
 
+      # nextest here for the same reasons the ubuntu jobs use it, plus two
+      # that are specific to this job (see `.config/nextest.toml`):
+      #
+      #   * `slow-timeout` / `terminate-after` turn a hung test into a NAMED
+      #     failure. Under plain `cargo test` a hang consumed this job's whole
+      #     40-minute budget with no indication of which test stalled — the
+      #     exact failure the nextest config was written to prevent, which
+      #     this job was bypassing by not using nextest.
+      #   * the `retries = 0` override applies to the security suites, so a
+      #     deliberate-race regression cannot be retried into a green run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # The lib units carry the DACL validator witnesses (org_authority) plus
       # the authority/revocation/ingest suites. `--features net` is the
       # narrowest set that compiles the org modules.
+      #
+      # Two hazards, both learned the hard way:
+      #
+      #  1. `adapter::net::behavior::org` is a PREFIX, and not every
+      #     security-relevant module lives under it. `org_admission_gate` sits
+      #     at `adapter::net::org_admission_gate` — one level up — and was
+      #     silently excluded. Both surfaces are named explicitly below.
+      #
+      #  2. `cargo test -- <filter>` exits **0** when the filter matches
+      #     NOTHING, so a module rename turned this job into a green no-op —
+      #     the identical silent-coverage failure that the "every tests/*.rs is
+      #     pinned to a step" guard in the integration job exists to prevent.
+      #     That guard was never applied to its own neighbour. `--no-tests=fail`
+      #     closes it natively: an empty filterset is an error, not a pass.
       - name: Org + authority unit tests
-        run: cargo test --features net --lib -- adapter::net::behavior::org
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
 
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact
       # aliasing the lexical guard cannot catch).
       - name: Net CLI tests
-        run: cargo test -p net-cli
+        run: cargo nextest run -p net-cli --no-tests=fail
 
       # Windows-only production paths must also LINT here: the DACL reader is
       # `#[cfg(windows)]`, so the ubuntu clippy job never sees it.

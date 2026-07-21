@@ -34,8 +34,17 @@ use super::capability::{
     resolve_candidate_keys, CapabilityFilter, CapabilityFold, CapabilityMembership,
     HardwareSummary, VerifiedOwner,
 };
+// `FoldError` and `ApplyOutcome` type only `apply_legacy_announcement`'s
+// signature, and that helper is itself `#[cfg(any(test, feature = "fixtures"))]`
+// — so without the same gate these two dangle in every build that does NOT
+// enable `fixtures`, which is every build except `--all-features`. CI's clippy
+// job passes `--all-features`, so it cannot see the breakage; keep the gates in
+// lockstep with the helper below.
+#[cfg(any(test, feature = "fixtures"))]
 use super::state::FoldError;
-use super::{ApplyOutcome, EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
+#[cfg(any(test, feature = "fixtures"))]
+use super::ApplyOutcome;
+use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
