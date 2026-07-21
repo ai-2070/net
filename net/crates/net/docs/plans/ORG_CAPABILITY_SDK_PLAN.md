@@ -23,13 +23,32 @@ Companion docs:
 [`OA2E_INTEGRATION_DESIGN.md`](OA2E_INTEGRATION_DESIGN.md) (the live
 caller/provider seams the verbs sit on).
 
-**Status:** design of record for the facade; implementation **not
-yet authorized** — the v0.3 ruling holds authorization for exactly
-the lifecycle closures this revision applies. Activation requires
-organization-auth review sign-off **at an exact pinned substrate
-commit**, recorded here at authorization time once the open
-organization-auth Pass-2 findings are closed. The SDK must not begin
-against a moving authority substrate.
+**Status: IMPLEMENTED (2026-07-21).** All four slices landed on
+branch `org-capability-auth`, each its own commit, against substrate
+base `07820a9de`:
+
+| Slice | Commit | Content |
+|---|---|---|
+| S0 | `a9ec879a4` | `OrgCredentials`, the binding relation, the token lease, `OrgSdkError` |
+| S1 | `3cf35f39f` | `org.call`, private-only discovery, the query promotion, coarse denial decode |
+| S2 | `c2a7c5c86` | `serve_org`, `OrgAccess`, the `OrgCaller` projection |
+| S3 | (this) | live composed exit, the design test, `ORG_SDK_EXIT_GATE.md` |
+
+See [`ORG_SDK_EXIT_GATE.md`](ORG_SDK_EXIT_GATE.md) for the
+requirement → witness map. `may_execute` is byte-for-byte unchanged;
+the admission engine, wire objects, headers, status codes, and replay
+guard are untouched; the core-touch inventory below is verified
+exhaustive by diff.
+
+**Note on the activation gate.** v0.4 required sign-off "at an exact
+pinned substrate commit" once the open organization-auth Pass-2
+findings closed. Implementation was authorized directly by the
+operator before that pin was recorded, so the substrate base is
+pinned retroactively above (`07820a9de`) rather than by a prior
+review. Any Pass-2 finding that lands after it should be checked
+against §Core-touch inventory — the facade adds no authority
+semantics, so the exposure is that a substrate fix could change
+behavior the witnesses currently pin.
 
 **The measured gap (OA-4 STOP-gate answer).** The gap is NOT
 "applications need to inspect private-discovery records." The gap
