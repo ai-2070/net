@@ -27,6 +27,44 @@
 > --features cortex -- -D warnings` fails at HEAD, and the branch's own new
 > `windows-security-tests` CI job fails on its clippy step and therefore never
 > runs any of the three security suites it was added to gate (§C1).
+>
+> ---
+>
+> ## Remediation status (updated as fixes land)
+>
+> | Item | Sev | State |
+> |---|---|---|
+> | §C1 / §C2 / §C3 — CI gate | Med | **FIXED** `523bb9fc4` |
+> | 2026-07-20 §2 — org root destroyable | **Crit** | **FIXED** `67bc26f4d` |
+> | §1 — floor reset on re-adopt | High | **FIXED** `59dc0bc70` |
+> | §2 — audience key inherited across orgs | High | **FIXED** `54ec6fab2` |
+> | §3 + §4 — scoped expiry / store budget | High | **FIXED** `417700942` |
+> | 2026-07-20 §20 residual + §11 — Windows DACL | High | **FIXED** `d1e0f241b` |
+> | 2026-07-20 §10 / §19 / §17 — CLI hygiene | Med/Low | **FIXED** `781d8991d` |
+> | §T1 / §T2 / §T3 — test falsifiability | — | **FIXED** `4c5c6db6e` |
+> | §12 — Windows ancestor chain | Med | **OPEN** (partially mitigated by the inheritance severing in `d1e0f241b`) |
+> | §5 / §6 / §7 — admission DoS | Med | OPEN |
+> | §8 / §9 / §24 — relay + store lifecycle | Med | OPEN |
+> | §10 — GrantedAudience existence oracle | Med | OPEN |
+> | §13 — Windows durability boundary | Med | OPEN |
+> | §14 — cross-org floors absent-means-zero | Med/Low | OPEN |
+> | §15–§34 — low cluster | Low | OPEN |
+> | §T4–§T9 — remaining test quality | — | OPEN |
+>
+> Two findings were also discovered while FIXING rather than reviewing, and are
+> recorded here because neither was reachable by reading:
+>
+> - **`NO_COLOR=1` broke every subcommand.** `#[arg(long, global = true,
+>   env = "NO_COLOR")] no_color: bool` made clap parse the variable's VALUE as a
+>   bool literal, so the near-universal spelling — and the one no-color.org
+>   specifies — exited 2 before the CLI did any work. It is why
+>   `cargo test -p net-cli` could not run on a developer machine at all. Fixed
+>   in `67bc26f4d`.
+> - **A malformed identity file printed the operator's private seed.**
+>   `load_identity_seed` interpolated the toml parse error, and
+>   `toml::de::Error`'s `Display` embeds the offending source line — which for
+>   that file is `seed_hex = "…"`. `org.rs` omits the error at both its parse
+>   sites for exactly this reason. Fixed in `781d8991d`, red-witnessed.
 
 ## Conventions
 
@@ -1284,14 +1322,25 @@ comment says it exists to prevent.
 
 ## §D1 — The 2026-07-20 production claim is an overclaim by six
 
-`docs/misc/CODE_REVIEW_2026_07_20_ORG_CAPABILITY_AUTH.md:3` still reads
+`docs/misc/CODE_REVIEW_2026_07_20_ORG_CAPABILITY_AUTH.md:3` read
 **"20 production findings resolved."** Part I finds six INCOMPLETE — §2
 (Critical), §20 (High), §5 (High), §10 (Medium), §17 (Low), §19 (Low).
 
-The header's retraction is honest in direction and correctly refuses to quietly
-fix what it got wrong; it should be extended to the production claim, and the
-test table should be refreshed (`187ef4213` closed §T2/§T4 without updating it,
-which understates — the safe direction, but stale).
+The header's existing retraction is honest in direction and correctly refuses to
+quietly fix what it got wrong; it has now been extended to the production claim.
+
+> **Correction to this document.** An earlier draft of this section also
+> asserted that the 2026-07-20 TEST table was stale — that `187ef4213` had
+> closed §T2/§T4 without updating it. **That was wrong.** The table reads DONE
+> for §T1–§T8, and the commits it cites (`6d52f02e8`, `087a90d07`, `187ef4213`)
+> all exist and carry the described work. The claim came from a remediation
+> audit that read the table at an earlier revision, and it was relayed here
+> without being checked against the file at HEAD — the same failure mode this
+> review is elsewhere criticising. It is recorded rather than deleted.
+>
+> The test-quality findings in Part IV are unaffected: they were derived by
+> reading the test code directly, not the table, and §T1/§T2/§T3 were each
+> reproduced before being fixed.
 
 Minor, in the same area: `capability_bridge.rs:370-415` — the §12 fix duplicated
 a 23-line comment block **verbatim**, back to back, before the

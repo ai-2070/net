@@ -1079,8 +1079,12 @@ async fn remove_file_or_warn(path: &Path, what: &str) {
 /// On Windows the CLI has no clean 0600 analog from `std::fs`, so a secret file
 /// inherits its parent directory's NTFS DACL. Surface the SAME loud warning the
 /// org-key read path uses so a permissive ACL is at least observable in operator
-/// logs; `--insecure-permissions` suppresses it (matching the Unix gate's escape
-/// hatch). No-op on Unix, where the file was already created mode 0600. No new
+/// logs; `--accept-windows-dacl` suppresses it. NOT `--insecure-permissions`:
+/// §16 split the two precisely because one relaxes a check on an INPUT the
+/// operator already controls, while this silences the only signal that a
+/// freshly written OUTPUT secret may be readable by others — and this doc
+/// still named the flag that split was designed to steer them away from.
+/// No-op on Unix, where the file was already created mode 0600. No new
 /// ACL engine — the custom `--audience-out` parent is operator-asserted trusted
 /// (Kyra OA2-F).
 #[cfg(not(unix))]

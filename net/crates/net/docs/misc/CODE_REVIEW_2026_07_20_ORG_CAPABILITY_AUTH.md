@@ -1,7 +1,41 @@
 # CODE REVIEW 2026-07-20 — Organization Capability Auth (`org-capability-auth`)
 
-> **Status: 20 production findings resolved; §T1-§T8 and §D1-§D4 closed;
-> §T9 config landed but CI not yet observed green at HEAD.**
+> **Status: SUPERSEDED by `CODE_REVIEW_2026_07_21_ORG_CAPABILITY_AUTH_PASS2.md`.
+> The production-closure claim below was an overclaim and is retracted — six of
+> the twenty were INCOMPLETE.**
+>
+> A second independent review (2026-07-21) audited every remediation against the
+> code at HEAD. Six production findings were still open: **§2 (Critical)**, §20
+> (High), §5 (High), §10 (Medium), §17 (Low), §19 (Low). Five of the six are the
+> same *propagation gap* this document names as its own dominant pattern — the
+> fix reached the path under review and not its siblings.
+>
+> Most consequentially, **§2 was not closed**. `refuse_replacing_org_key` was
+> wired into `publish_json_artifact`, which only `issue-cert` / `issue-floors`
+> call. The two verbs that themselves WRITE seed files kept an unguarded
+> `--force`, so `net identity generate --out "$ORG_KEY" --force` still replaced
+> the org root and exited 0 — the identical end state §2 describes, through a
+> verb the fix skipped.
+>
+> All six are now closed, each red-witnessed: `523bb9fc4` (§C1 CI gate),
+> `67bc26f4d` (§2), `59dc0bc70` (§1 new), `54ec6fab2` (§2 new), `417700942`
+> (§3+§4 new), `d1e0f241b` (§20 residual + §11), `781d8991d` (§10/§19/§17),
+> `4c5c6db6e` (§T1/§T2/§T3 test repairs).
+>
+> **The TEST table below is accurate and is NOT retracted.** An earlier draft of
+> the pass-2 audit asserted it was stale at §T2/§T4; that was checked against the
+> code and the cited commits (`6d52f02e8`, `187ef4213`) and found to be wrong.
+> The table stands as written. What pass 2 DID find in the test suite was
+> different and narrower: §T1's TTL witness was non-falsifiable for the property
+> it named, and every handler-darkness assertion read its counter at a single
+> instant, leaving "denies to the caller but still executes the handler" outside
+> the suite's reach. Both fixed in `4c5c6db6e`.
+>
+> ---
+>
+> **Original status line, retained for the record: 20 production findings
+> resolved; §T1-§T8 and §D1-§D4 closed; §T9 config landed but CI not yet
+> observed green at HEAD.**
 >
 > Production fixes (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4,
 > `e21a9d23c` §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8,

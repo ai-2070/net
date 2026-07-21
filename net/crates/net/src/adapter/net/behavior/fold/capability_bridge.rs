@@ -399,35 +399,14 @@ pub(crate) fn verify_announced_owner_cert(
     //
     // Synthetic-peer injection is unaffected: those announcements carry no
     // `owner_cert`, so they return at the `?` above and never reach this check.
-    // §12 — the entity must actually BE the announcing node.
-    //
-    // `retract_floored_ownership` locates entries to retract via
-    // `member.node_id()`, and the install sweep and post-apply recheck both
-    // search `by_node[entity.node_id()]`. That only works because production
-    // ingest guarantees `ann.entity_id.node_id() == ann.node_id` (enforced at
-    // the dispatch site). An announcement violating it lands the projection in
-    // `by_node[ann.node_id]` while every retraction path looks under
-    // `by_node[entity.node_id()]` — so NO floor raise, no store install, and no
-    // recheck can ever clear it, and `owner_org_for` keeps reporting the
-    // revoked org indefinitely.
-    //
-    // Checked HERE rather than only at the dispatch site because this function
-    // is the single producer of a `Some(VerifiedOwner)`: the `#[doc(hidden)]`
-    // `MeshNode::test_inject_capability_announcement` seam (which ships in
-    // release builds and is re-exported by the Python / Node / Go bindings as a
-    // synthetic-peer helper) and the `pub` `apply_legacy_announcement` fixture
-    // helper both reach the fold without passing the dispatch check. Enforcing
-    // the bind at the producer makes the retraction invariant hold for every
-    // path, present and future.
-    //
-    // Synthetic-peer injection is unaffected: those announcements carry no
-    // `owner_cert`, so they return at the `?` above and never reach this check.
     if ann.entity_id.node_id() != ann.node_id {
         tracing::debug!(
             node_id = format!("{:#x}", ann.node_id),
             entity_node_id = format!("{:#x}", ann.entity_id.node_id()),
             org = %cert.org_id,
-            "dropping owner cert: announcing entity does not derive the announced              node id — an ownership projection under a mismatched node id could              never be retracted (announcement kept)"
+            "dropping owner cert: announcing entity does not derive the announced node id \
+             — an ownership projection under a mismatched node id could never be \
+             retracted (announcement kept)"
         );
         return None;
     }

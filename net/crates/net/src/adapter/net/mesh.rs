@@ -19931,7 +19931,9 @@ impl MeshNode {
             }
         }
         tracing::warn!(
-            "capability: security-corrective re-announce exhausted its attempt              budget; peers may hold a superseded projection until the next              announce or the keep-alive"
+            "capability: security-corrective re-announce exhausted its attempt budget; \
+             peers may hold a superseded projection until the next announce or the \
+             keep-alive"
         );
         Ok(())
     }
