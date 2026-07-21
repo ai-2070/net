@@ -1133,7 +1133,7 @@ impl OrgRevocationStore {
     ///    authority directory (a node holding a membership certificate has
     ///    demonstrably been provisioned before);
     /// 2. the `.lock` sidecar, which is created beside the state file and
-    ///    survives its deletion. It is probed BEFORE [`lock_state_file`] can
+    ///    survives its deletion. It is probed BEFORE `lock_state_file` can
     ///    create it — the previous ordering destroyed exactly the evidence
     ///    needed here.
     ///
