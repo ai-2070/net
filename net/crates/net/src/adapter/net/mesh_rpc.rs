@@ -636,8 +636,16 @@ fn streaming_response_is_terminal(resp: &RpcResponsePayload) -> bool {
 /// inbound frame BEFORE it reaches the fold.
 enum BridgePreflight {
     /// Passed equality + the capability gate; the response route was
-    /// cached if authenticated. Hand the frame to the fold.
-    Proceed,
+    /// cached if authenticated. Hand THIS frame to the fold.
+    ///
+    /// The frame is carried by value rather than the caller reusing its own
+    /// `inbound` (§8). A public/legacy handler must never receive
+    /// org-admission credential material (E1.6), and the strip that enforces
+    /// that lives inside [`bridge_preflight`] — so a bridge physically cannot
+    /// fold an unstripped frame, because the only frame it is handed is the
+    /// stripped one. Cloning is cheap: `payload` is a refcounted `Bytes` and
+    /// the rest is three `u64`s.
+    Proceed(RpcInboundEvent),
     /// Cross-service confused deputy, malformed, or a denial with no
     /// authenticated reply identity — drop silently.
     Drop,
@@ -752,7 +760,19 @@ fn bridge_preflight(
         };
     }
     cache_authenticated_response_destination(mesh, cache, inbound);
-    BridgePreflight::Proceed
+    // E1.6 (§8): a public / legacy handler must NEVER see org-admission
+    // credential material. This used to be the unary bridge's job, applied at
+    // its single fold call site — so `serve_rpc_streaming`,
+    // `serve_rpc_client_stream` and `serve_rpc_duplex`, which call this
+    // preflight and then fold directly, never stripped at all. Doing it here,
+    // and handing the caller the stripped frame rather than letting it reuse
+    // its own, makes the omission unrepresentable.
+    //
+    // Cheap: `strip_public_admission_header` short-circuits on non-REQUEST
+    // frames and on a byte-scan miss, so only genuinely admission-bearing
+    // frames pay the decode/re-encode.
+    let frame = strip_public_admission_header(inbound).unwrap_or_else(|| inbound.clone());
+    BridgePreflight::Proceed(frame)
 }
 
 /// Emit a terminal `CapabilityDenied` for a gate-denied call, routed
@@ -3419,7 +3439,16 @@ impl MeshNode {
                             &tag,
                             &metrics_for_bridge,
                         ) {
-                            BridgePreflight::Proceed => {}
+                            BridgePreflight::Proceed(frame) => {
+                                // AV-1 item 1: drive the fold with the
+                                // AEAD-verified `from_node` so per-call state
+                                // binds to the authenticated session peer.
+                                // `frame` is the preflight's stripped frame
+                                // (E1.6 / §8) — never the raw `inbound`.
+                                if let Err(e) = fold.lock().apply_inbound(&frame) {
+                                    tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
+                                }
+                            }
                             BridgePreflight::Drop => continue,
                             BridgePreflight::Deny {
                                 claimed_origin,
@@ -3439,17 +3468,6 @@ impl MeshNode {
                                 .await;
                                 continue;
                             }
-                        }
-                        // AV-1 item 1: drive the fold with the AEAD-verified
-                        // `inbound.from_node` so per-call state binds to the
-                        // authenticated session peer. Kyra #47 mixed-version: a
-                        // public/legacy handler must never receive org-admission
-                        // credential material, so strip a stray proof header
-                        // first (cheap — only rewrites when one is present).
-                        let stripped = strip_public_admission_header(&inbound);
-                        let ev = stripped.as_ref().unwrap_or(&inbound);
-                        if let Err(e) = fold.lock().apply_inbound(ev) {
-                            tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                         }
                     }
                     OrgAdmission::OwnerDelegated | OrgAdmission::CrossOrgGranted => {
@@ -3680,7 +3698,13 @@ impl MeshNode {
                     &tag,
                     &metrics_for_bridge,
                 ) {
-                    BridgePreflight::Proceed => {}
+                    BridgePreflight::Proceed(frame) => {
+                        // AV-1 item 1: authenticated-peer-bound fold drive, on
+                        // the preflight's stripped frame (E1.6 / §8).
+                        if let Err(e) = fold.lock().apply_inbound(&frame) {
+                            tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
+                        }
+                    }
                     BridgePreflight::Drop => continue,
                     BridgePreflight::Deny {
                         claimed_origin,
@@ -3703,10 +3727,6 @@ impl MeshNode {
                         .await;
                         continue;
                     }
-                }
-                // AV-1 item 1: authenticated-peer-bound fold drive.
-                if let Err(e) = fold.lock().apply_inbound(&inbound) {
-                    tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
                 }
             }
         });
@@ -3879,7 +3899,7 @@ impl MeshNode {
                     &tag,
                     &metrics_for_bridge,
                 ) {
-                    BridgePreflight::Proceed => {
+                    BridgePreflight::Proceed(frame) => {
                         // Gate-3: a relayed/untrusted caller cannot be issued
                         // secure upload grants (no e2e recipient correlation),
                         // so reject a flow-controlled REQUEST here — BEFORE the
@@ -3893,6 +3913,12 @@ impl MeshNode {
                             &tag,
                         ) {
                             continue;
+                        }
+                        // AV-1 item 1: authenticated-peer-bound fold drive, on
+                        // the preflight's stripped frame (E1.6 / §8).
+                        if let Err(e) = fold.lock().apply_inbound(&frame) {
+                            tracing::warn!(error = %e,
+                                "rpc serve_rpc_client_stream: fold apply error");
                         }
                     }
                     BridgePreflight::Drop => continue,
@@ -3914,11 +3940,6 @@ impl MeshNode {
                         .await;
                         continue;
                     }
-                }
-                // AV-1 item 1: authenticated-peer-bound fold drive.
-                if let Err(e) = fold.lock().apply_inbound(&inbound) {
-                    tracing::warn!(error = %e,
-                        "rpc serve_rpc_client_stream: fold apply error");
                 }
             }
         });
@@ -4207,7 +4228,7 @@ impl MeshNode {
                     &tag,
                     &metrics_for_bridge,
                 ) {
-                    BridgePreflight::Proceed => {
+                    BridgePreflight::Proceed(frame) => {
                         // Gate-3: a relayed/untrusted caller cannot be issued
                         // secure upload grants (no e2e recipient correlation),
                         // so reject a flow-controlled REQUEST here — BEFORE the
@@ -4221,6 +4242,12 @@ impl MeshNode {
                             &tag,
                         ) {
                             continue;
+                        }
+                        // AV-1 item 1: authenticated-peer-bound fold drive, on
+                        // the preflight's stripped frame (E1.6 / §8).
+                        if let Err(e) = fold.lock().apply_inbound(&frame) {
+                            tracing::warn!(error = %e,
+                                "rpc serve_rpc_duplex: fold apply error");
                         }
                     }
                     BridgePreflight::Drop => continue,
@@ -4242,11 +4269,6 @@ impl MeshNode {
                         .await;
                         continue;
                     }
-                }
-                // AV-1 item 1: authenticated-peer-bound fold drive.
-                if let Err(e) = fold.lock().apply_inbound(&inbound) {
-                    tracing::warn!(error = %e,
-                        "rpc serve_rpc_duplex: fold apply error");
                 }
             }
         });
@@ -7317,6 +7339,105 @@ mod roster_fallback_tests {
             req.headers.iter().any(|(n, _)| n == "keep"),
             "an unrelated header was retained",
         );
+    }
+
+    /// §8 — the E1.6 strip is applied by the SHARED preflight, so every serve
+    /// bridge gets it.
+    ///
+    /// It used to run at the unary bridge's single fold call site. The three
+    /// streaming bridges (`serve_rpc_streaming`, `serve_rpc_client_stream`,
+    /// `serve_rpc_duplex`) call this same preflight and then
+    /// `fold.lock().apply_inbound(&inbound)` directly, so they never stripped
+    /// at all — a caller who hand-stuffed `net-org-admission` into
+    /// `CallOptions.request_headers` and issued a streaming call handed the
+    /// public handler org-admission credential material verbatim, which E1.6
+    /// states must never happen.
+    ///
+    /// Asserted on `bridge_preflight` rather than through four live bridges
+    /// because the preflight is now the ONLY source of a foldable frame:
+    /// `BridgePreflight::Proceed` carries it by value, so a bridge physically
+    /// cannot fold anything else. Covering this seam covers all four, and the
+    /// compiler enforces the rest.
+    ///
+    /// Red-witness: returning `inbound.clone()` from the preflight instead of
+    /// the strip result fails the first assertion.
+    #[tokio::test]
+    async fn bridge_preflight_strips_a_stray_proof_header_for_every_bridge() {
+        let server = build_server().await;
+        let cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
+        let metrics = server.rpc_metrics_arc().for_service("svc");
+
+        let req = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![
+                ("keep".to_string(), b"v".to_vec()),
+                (ORG_ADMISSION_HEADER.to_string(), b"proofbytes".to_vec()),
+            ],
+            body: Bytes::from_static(b"ping"),
+        };
+        let mut payload = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut payload, 0);
+        payload.extend_from_slice(&req.encode());
+        // `from_node == 0` is the loopback/local exemption, so the origin bind
+        // and the capability gate both pass — this test is about the strip.
+        let inbound = RpcInboundEvent {
+            channel_hash: 0,
+            origin_hash: 0,
+            from_node: 0,
+            payload: Bytes::from(payload),
+        };
+
+        match bridge_preflight(&server, &cache, &inbound, "svc", "nrpc:svc", &metrics) {
+            BridgePreflight::Proceed(frame) => {
+                let decoded =
+                    RpcRequestPayload::decode(frame.payload.slice(RPC_FRAME_BODY_OFFSET..))
+                        .expect("decode the frame the bridge would fold");
+                assert!(
+                    !decoded
+                        .headers
+                        .iter()
+                        .any(|(n, _)| n == ORG_ADMISSION_HEADER),
+                    "the frame handed to EVERY bridge must carry no proof header",
+                );
+                assert!(
+                    decoded.headers.iter().any(|(n, _)| n == "keep"),
+                    "an unrelated header must survive",
+                );
+                assert_eq!(decoded.body.as_ref(), b"ping", "the body is untouched");
+            }
+            _ => panic!("expected Proceed for a loopback frame on the captured service"),
+        }
+
+        // A frame with no proof header still proceeds, unmodified.
+        let clean = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![("keep".to_string(), b"v".to_vec())],
+            body: Bytes::from_static(b"ping"),
+        };
+        let mut payload = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 2, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut payload, 0);
+        payload.extend_from_slice(&clean.encode());
+        let inbound = RpcInboundEvent {
+            channel_hash: 0,
+            origin_hash: 0,
+            from_node: 0,
+            payload: Bytes::from(payload),
+        };
+        match bridge_preflight(&server, &cache, &inbound, "svc", "nrpc:svc", &metrics) {
+            BridgePreflight::Proceed(frame) => assert_eq!(
+                frame.payload, inbound.payload,
+                "a frame with no proof header is passed through byte-for-byte",
+            ),
+            _ => panic!("expected Proceed"),
+        }
     }
 
     /// Kyra #47 B3: a protected `call` finalizes ATOMICALLY and validates the
