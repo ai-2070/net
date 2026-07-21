@@ -4960,6 +4960,14 @@ pub struct MeshNode {
     /// Serializes consumer grant-audience install/remove (see
     /// `provider_grant_mu`).
     consumer_grant_mu: parking_lot::Mutex<()>,
+    /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
+    /// Each accepted install claims the next value, so a
+    /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
+    /// names ONE installation rather than a grant id that a later
+    /// remove-then-install could silently rebind. Node-local and never on the
+    /// wire; monotone for the process lifetime (wrapping would take ~5.8e11
+    /// years at one install per nanosecond).
+    consumer_grant_install_seq: std::sync::atomic::AtomicU64,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -6353,6 +6361,7 @@ impl MeshNode {
             )),
             provider_grant_mu: parking_lot::Mutex::new(()),
             consumer_grant_mu: parking_lot::Mutex::new(()),
+            consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
                 // The envelope was validated (and panicked on) above, so this
@@ -8233,7 +8242,44 @@ impl MeshNode {
         super::behavior::org_grant_registry::GrantAudienceInstallError,
     > {
         use super::behavior::org_grant_registry::{
-            validate_consumer_record, GrantAudienceInstallError, GrantAudienceInstalled,
+            ConsumerAudienceInstall, GrantAudienceInstalled,
+        };
+        // One implementation, two surface shapes: the unleased form discards the
+        // ownership proof, so a caller that does not track leases keeps the
+        // remove-by-grant-id semantics it has always had.
+        Ok(
+            match self.install_consumer_grant_audience_leased(grant, secret)? {
+                ConsumerAudienceInstall::Installed(_) => GrantAudienceInstalled::Installed,
+                ConsumerAudienceInstall::AlreadyPresent => GrantAudienceInstalled::AlreadyPresent,
+            },
+        )
+    }
+
+    /// OSDK S0: [`install_consumer_grant_audience`] returning an ownership proof.
+    ///
+    /// Identical validation, idempotency, conflict, and capacity semantics; the
+    /// difference is only what the caller learns. A fresh install returns
+    /// [`ConsumerAudienceInstall::Installed`] carrying a
+    /// [`ConsumerAudienceLease`] that names THIS installation; an idempotent
+    /// no-op returns `AlreadyPresent` and NO lease, because the record belongs to
+    /// whoever installed it first. Pair with
+    /// [`remove_consumer_grant_audience_if_current`] so a withdrawing holder can
+    /// never destroy an installation it does not own.
+    ///
+    /// [`install_consumer_grant_audience`]: Self::install_consumer_grant_audience
+    /// [`ConsumerAudienceLease`]: super::behavior::org_grant_registry::ConsumerAudienceLease
+    /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
+    pub fn install_consumer_grant_audience_leased(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::ConsumerAudienceInstall,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_consumer_record, ConsumerAudienceInstall, ConsumerAudienceLease,
+            GrantAudienceInstallError,
         };
         let authority = self
             .node_authority
@@ -8247,14 +8293,25 @@ impl MeshNode {
             now_secs,
             authority.config.verification_skew_secs,
         )?;
+        let grant_id = *record.grant_id();
+        // Claim the stamp before the store so the published record and the
+        // returned lease carry the same value; a claimed-but-unused stamp on the
+        // idempotent path is harmless (the counter is only ever compared for
+        // equality, never for density).
+        let install_seq = self
+            .consumer_grant_install_seq
+            .fetch_add(1, Ordering::Relaxed);
+        let record = record.with_install_seq(install_seq);
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
         match current.with_record(Arc::new(record), now_secs)? {
             Some(next) => {
                 self.consumer_grant_audiences.store(Arc::new(next));
-                Ok(GrantAudienceInstalled::Installed)
+                Ok(ConsumerAudienceInstall::Installed(
+                    ConsumerAudienceLease::new(grant_id, install_seq),
+                ))
             }
-            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+            None => Ok(ConsumerAudienceInstall::AlreadyPresent),
         }
     }
 
@@ -8262,6 +8319,12 @@ impl MeshNode {
     /// `true` iff a record was removed. Once removed, no inbound envelope for the
     /// grant can be opened, and any already-stored record for it becomes
     /// non-queryable (OA3-4b2 slice 4 query-time consumer currentness).
+    ///
+    /// Unconditional: it removes whatever currently occupies `grant_id`. A holder
+    /// that installed one specific record and wants to withdraw only that one
+    /// must use [`remove_consumer_grant_audience_if_current`] instead.
+    ///
+    /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
@@ -8270,6 +8333,37 @@ impl MeshNode {
                 self.consumer_grant_audiences.store(Arc::new(next));
                 true
             }
+            None => false,
+        }
+    }
+
+    /// OSDK S0: remove a CONSUMER grant-audience record ONLY if the currently
+    /// installed record is the exact one this lease owns. Returns `true` iff that
+    /// record was removed.
+    ///
+    /// The compare and the removal happen under one `consumer_grant_mu` hold, so
+    /// a concurrent remove-then-install cannot slip a different record in between
+    /// the two: a stale lease (its installation already replaced, or already
+    /// removed) removes NOTHING and reports `false`. This is what makes an SDK
+    /// credential lease safe to drop without auditing who else touched the
+    /// registry.
+    pub fn remove_consumer_grant_audience_if_current(
+        &self,
+        lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
+    ) -> bool {
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.get(lease.grant_id()) {
+            // Same grant id, different installation — the lease is stale and owns
+            // nothing here.
+            Some(record) if record.install_seq() != lease.install_seq() => false,
+            Some(_) => match current.without(lease.grant_id()) {
+                Some(next) => {
+                    self.consumer_grant_audiences.store(Arc::new(next));
+                    true
+                }
+                None => false,
+            },
             None => false,
         }
     }
