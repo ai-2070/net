@@ -1,781 +1,555 @@
 # Org Capability SDK Plan (OSDK)
 
-**Version:** v0.1 — design for review (2026-07-21). Originating
-specification: Kyra's SDK ruling (2026-07-19, "the org capability SDK
-should be a thin, role-oriented facade over the canonical OA types,
-not another authorization model"). Companion to
-[`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md) (the
-substrate — OA-1..OA-4 all CLOSED) and
+**Version:** v0.2 — applies Kyra's simplification ruling (2026-07-21):
+"the current plan is still designing an SDK system. What we need is an
+SDK **verb layer** over the authority system that already exists."
+v0.1's five-module design (admin / client / provider / discovery /
+types, wallet, policy builders, candidate ontology, options objects)
+is superseded; every removed surface is recorded in §Deferred with the
+ruling's rationale. Companion to
+[`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md)
+(the substrate — OA-1..OA-4 all CLOSED) and
 [`OA2E_INTEGRATION_DESIGN.md`](OA2E_INTEGRATION_DESIGN.md) (the live
-caller/provider seams this plan wraps).
+caller/provider seams the verbs sit on).
 
 **Status:** design only; no code authorized. Activation gate: review
-sign-off. Prerequisites (all met): OA-1..OA-4 closed
-(`OA3_EXIT_GATE.md`, `OA4_EXIT_GATE.md`), `#47` live wiring signed
-off, OA2-F grant management landed.
+sign-off. Prerequisites (all met): OA-1..OA-4 closed, `#47` live
+wiring signed off, OA2-F grant management landed.
 
-**The named consumer (OA-4 STOP-gate answer).** OA-4 ends with "no
-further organization work without a named consumer or a measured
-failure." This plan is the consumer surface, and it is justified by a
-measured gap, not speculation:
+**The measured gap (OA-4 STOP-gate answer, corrected per the
+ruling).** The gap is NOT "applications need to inspect
+private-discovery records." The gap is: **applications cannot
+privately discover and invoke a protected service.** Today the only
+readers of OA-3's verified discovery store are two `#[doc(hidden)]`
+test seams; the caller seam requires hand-assembling all nine
+`OrgProofIntent` fields; the SDK has no protected serve; and the
+coarse denial byte E2.2 put on the wire is decoded by nothing on the
+caller side. The verbs below close exactly that, and nothing else.
 
-- OA-3's verified private-discovery store has **no production
-  reader**: the only query surface is two `#[doc(hidden)]` test seams
-  (`MeshNode::scoped_owner_providers_for_test` /
-  `scoped_granted_providers_for_test`, `mesh.rs:8900/8931`). A
-  protected-and-private service cannot be privately discovered by any
-  production caller today.
-- OA-2's caller seam requires hand-assembling all nine
-  `OrgProofIntent` fields (`mesh_rpc.rs:230`) with **no local
-  validation of any kind** — wrong grant, expired window, wrong
-  target scope, mismatched org all surface only as a remote
-  `0x0009` whose coarse reason byte **no caller-side code decodes**
-  (`CoarseAdmissionReason::from_wire` is unused off the provider).
-- The SDK `Mesh` exposes **no protected serve at all**, and
-  `serve_rpc_typed` handlers structurally cannot see the admitted
-  facts (`TypedRpcHandler::call` discards `ctx`,
-  `sdk/src/mesh_rpc.rs:833`).
+---
 
-**Design principle (locked, from the ruling):** the ergonomic API
-makes the secure path short —
+## The surface
+
+The everyday surface answers three questions only:
+
+1. What credentials am I using?
+2. What protected capability am I calling?
+3. Who is allowed to call the capability I am serving?
 
 ```rust
-client.call_service("customer.read", &req, OrgCallOptions::default()).await
+// caller
+let org = mesh.org(credentials)?;
+let customer: Customer = org.call("customer.read", &request).await?;
+
+// provider — cross-org, encrypted grant-audience discovery
+mesh.serve_org("customer.read", OrgAccess::Granted,
+    |caller, request| async move { read_customer(caller, request).await })?;
+
+// provider — same-organization, encrypted owner-audience discovery
+mesh.serve_org("internal.reindex", OrgAccess::SameOrg,
+    |caller, request| async move { reindex(caller, request).await })?;
 ```
 
-— while internally preserving the full exact chain: actor identity →
-membership → dispatcher delegation → cross-org capability grant if
-required → verified private discovery → exact provider selection →
-canonical request-bound proof → live provider admission →
-provider-local policy → handler. `OrgProofIntent` remains the
-advanced low-level escape hatch, unchanged.
+That is almost the entire common SDK. Everything else must earn its
+way in through a named consumer. The low-level canonical APIs
+(`OrgProofIntent`, `serve_rpc_protected` / `serve_rpc_owner_scoped` /
+`serve_rpc_granted`, the raw envelope codecs) remain available and
+unchanged — reducing the facade does not reduce substrate power.
 
-**What the SDK is NOT:** another authorization model. It never
-admits, never weakens admission, adds no wire objects, headers,
-status codes, or authority semantics. `verify_org_admission`,
-`may_execute`, the serve gates, and every wire codec are untouched.
-Local pre-flight validation only ever *refuses to send* — it is
-structurally incapable of making a provider accept anything.
+**The design test (acceptance criterion, not aspiration).** A user
+must be able to make the secure common path work without knowing
+these names: `OrgProofIntent`, `OwnerDelegated`, `CrossOrgGranted`,
+the `OrgAudienceSecret` commitment, `ScopedCapabilityAnnouncement`,
+`VerifiedScopedCapability`, `CoarseAdmissionReason` (the *name*; the
+decoded value appears inside `OrgError`), `GrantTargetScope`. They
+may meet them when debugging or using the advanced API. S3's example
+witness enforces this: the composed example imports none of them.
 
 ---
 
-## Grounded inventory — what exists vs. what is missing
+## Grounded reality (what the verbs sit on)
 
-(As of `org-capability-auth` HEAD, 2026-07-21. Line numbers are
-snapshot references, not contracts.)
+As of `org-capability-auth` HEAD, 2026-07-21; line numbers are
+snapshot references.
 
-| Area | Exists (canonical) | Missing (this plan) |
-|---|---|---|
-| Caller proof seam | `CallOptions.org_proof_intent`; `call()` mints call_id, computes `org_request_digest`, signs via `OrgCallProof::sign_for_call`, appends exactly one `net-org-admission` header, pins provider identity (`mesh_rpc.rs:4984–5041`, `sign_admission_proof` `:5525`) | Builder/assembly, wallet, local pre-flight, mode inference, typed errors |
-| Caller validation | Provider-side only (`org_admission.rs`); caller checks capability-tag match, TTL 1..=30 s, single header | Everything else: window/rights/target/relation checks before send |
-| Denial surface | `RpcStatus::AdmissionDenied = 0x0009`, body = 1 coarse byte (`emit_admission_denial`, `mesh_rpc.rs:856`); detailed `AdmissionDenied` (30 variants) stays provider-side | Caller-side decode of the coarse byte; a typed local-vs-remote error split |
-| Provider serve | Core `MeshNode::serve_rpc_protected` / `serve_rpc_owner_scoped` / `serve_rpc_granted` (`mesh_rpc.rs:3072/3139/3170`); `RpcContext.org_admission: Option<Admitted>`; header stripped | SDK-level protected serve; typed handlers that receive `Admitted`; policy ergonomics |
-| Provider policy | `OrgProviderPolicy = Arc<dyn Fn(&OrgCallProof) -> bool>` — proof only, runs step 11, after replay insert | Request-aware policy (Q1); grant-id denylist helper (§D1 residual) |
-| Private discovery | `ScopedDiscoveryStore::find_capabilities_for_grant` / `find_owner_private_capabilities` (`org_scoped_store.rs:202/231`), expiry- and floor-safe | **Any** production/SDK query surface (today: `#[doc(hidden)]` test seams only) |
-| Public discovery | `find_nodes`/`find_best_node` over the plaintext fold; ownership projection `owner_org_for` + `verify_announced_owner_cert` (`capability_bridge.rs:476/355`) | Ownership-verified candidate model unified with the scoped plane |
-| Credentials | `OrgAudienceSecret::matches_grant` (`org_grant.rs:369`), commitment check, structurally non-serializable + zeroizing secrets | A wallet: exact matching, ambiguity-is-an-error, loud install |
-| Admin issuance | Canonical `try_issue` constructors; CLI already calls them **through `net_sdk::org` re-exports** (no parallel logic); offline; secret-hygiene hardened (`cli/src/secret.rs`, staged 0600 publish) | An `OrgAdmin` grouping as the single choke point; shared file-envelope codecs so apps can read CLI-minted files |
-| SDK module shape | Flat re-export file `sdk/src/org.rs`; `OrgProofIntent` re-exported via `net_sdk::mesh_rpc`, not `org` | The role-oriented module split below |
-
----
-
-## Module layout
-
-```
-net_sdk::org::types      canonical OA type re-exports (spine; includes
-                         OrgProofIntent, Admitted, OrgAdmission,
-                         CapabilityVisibility, CoarseAdmissionReason)
-net_sdk::org::admin      offline root operations (OrgAdmin)
-net_sdk::org::client     caller credentials + protected calls
-                         (OrgActor, OrgCredentialStore, OrgClient)
-net_sdk::org::provider   protected registration + policy
-                         (serve_org_typed, OrgServicePolicy, OrgCall)
-net_sdk::org::discovery  verified discovery + audience state
-                         (find_service, install wrappers)
-```
-
-The existing flat `net_sdk::org::*` paths remain valid (`pub use
-types::*` at the module root) — no downstream churn. `types` also
-re-exports `OrgProofIntent` (today only on `net_sdk::mesh_rpc`) so
-the whole org surface is reachable from one module.
+- `call()` already does the hard caller work: mints the call id,
+  computes the canonical digest, signs via
+  `OrgCallProof::sign_for_call`, appends exactly one
+  `net-org-admission` header, and pins
+  `peer_entity_id(target) == intent.provider`
+  (`mesh_rpc.rs:4984–5041`, `sign_admission_proof` `:5525`).
+  `org.call` supplies what is missing: credential assembly, exact
+  grant matching, mode inference, internal verified discovery,
+  provider selection, and denial decoding.
+- The provider gate already delivers verified facts: protected
+  handlers receive `RpcContext.org_admission: Option<Admitted>`
+  (five fields), with the raw proof header stripped. `serve_org`
+  supplies the typed wrapper that today discards `ctx`
+  (`TypedRpcHandler::call`, `sdk/src/mesh_rpc.rs:833`) and therefore
+  loses the facts.
+- Core serve entry points already exist per (admission × visibility)
+  pair: `serve_rpc_protected(admission)` (public discovery),
+  `serve_rpc_owner_scoped`, `serve_rpc_granted`
+  (`mesh_rpc.rs:3072/3139/3170`). `serve_org` maps onto them; it
+  invents no registration path.
+- The verified private-discovery queries exist and are expiry- and
+  floor-safe (`ScopedDiscoveryStore::find_capabilities_for_grant` /
+  `find_owner_private_capabilities`, `org_scoped_store.rs:202/231`)
+  but are reachable only through `_for_test` seams
+  (`mesh.rs:8900/8931`) — the one real core promotion this plan
+  needs.
+- Remote denial reaches the caller as
+  `ServerError { status: 0x0009, body: [coarse_byte] }`
+  (`emit_admission_denial`, `mesh_rpc.rs:856`);
+  `CoarseAdmissionReason::from_wire` is currently unused off the
+  provider. The facade finally consumes it.
 
 ---
 
-## 1. Errors — `OrgSdkError`
+## The five public concepts
 
-A caller must be able to distinguish: (a) it lacked authority
-locally; (b) no authorized provider was discoverable; (c) the
-provider's live authority state denied; (d) provider policy vetoed;
-(e) transport failed. Today (a)–(d) are one opaque
-`RpcError::ServerError`/`Codec` soup.
+### 1. `OrgCredentials`
 
 ```rust
-#[derive(Debug, thiserror::Error)]
-pub enum OrgSdkError {
-    // ---- local, before anything is sent ----
-    CredentialMismatch(CredentialMismatch),   // actor assembly (§3.1)
-    MissingCapabilityGrant { capability: CapabilityAuthorityId,
-                             provider_org: OrgId },
-    AmbiguousCapabilityGrant { capability: CapabilityAuthorityId,
-                               matches: Vec<[u8; 32]> },   // grant_ids
-    AudienceSecretMismatch { grant_id: [u8; 32] },
-    PreflightRefused(PreflightReason),        // window/scope/rights/target (§3.4)
-    StreamingUnsupported,
-    // ---- discovery / selection ----
-    NoAuthorizedProvider { capability: CapabilityAuthorityId,
-                           considered: usize },
-    ProviderNotDirect { provider: EntityId },  // E0.3: direct-session-only
-    // ---- remote ----
-    RemoteAdmissionDenied { coarse: CoarseAdmissionReason },  // 0x0009 decoded
-    RemoteError { status: u16, message: String },
-    Transport(#[from] RpcError),
-}
-```
-
-Notes:
-
-- `RemoteAdmissionDenied` is produced by decoding the existing wire
-  shape — `ServerError { status: 0x0009, body: [coarse_byte] }` —
-  with `CoarseAdmissionReason::from_wire`. **No new wire surface**;
-  the SDK finally consumes the byte E2.2 shipped. An undecodable
-  body maps to `RemoteAdmissionDenied { coarse: Denied }` (fail
-  toward the least-informative bucket, never an error-in-error).
-- The coarse 3-bucket wire enum stays coarse **by design** (denial
-  reasons must not become a credential oracle — E2.2). The SDK does
-  not attempt to reconstruct detailed reasons from timing or
-  retries, and the docs say so.
-- Local pre-flight reasons (`PreflightReason`) are detailed and
-  free: they leak nothing because they never leave the caller.
-- Exact enum shape is provisional; frozen at S0 review.
-
----
-
-## 2. `net_sdk::org::admin` — offline root operations
-
-Thin grouping over the canonical constructors the CLI already calls;
-the value is a single choke point plus app-readable credential
-files, not new logic.
-
-```rust
-pub struct OrgAdmin { root: OrgKeypair }
-
-impl OrgAdmin {
-    pub fn from_root_key(root: OrgKeypair) -> Self;
-    pub fn org_id(&self) -> OrgId;
-
-    pub fn issue_membership(&self, member: EntityId, generation: u32,
-        ttl_secs: u64) -> Result<OrgMembershipCert, OrgError>;
-    pub fn issue_floors(&self, floors: &BTreeMap<EntityId, u32>)
-        -> Result<OrgRevocationBundle, OrgError>;
-    pub fn grant_dispatcher(&self, dispatcher: EntityId,
-        scope: DispatcherScope, ttl_secs: u64)
-        -> Result<OrgDispatcherGrant, OrgError>;
-    pub fn grant_capability(&self, grantee_org: OrgId,
-        capability: CapabilityAuthorityId, rights: GrantRights,
-        target_scope: GrantTargetScope, ttl_secs: u64)
-        -> Result<(OrgCapabilityGrant, Option<OrgAudienceSecret>), OrgError>;
-}
-```
-
-Decisions:
-
-- **Pure delegation.** Each method is one call to the existing
-  `try_issue` (`org.rs:458/773`, `org_grant.rs:491/787`). All
-  issuance invariants (TTL caps, `rights ⊇ DISCOVER ⇔` fresh
-  audience material, zero-grant-id reservation) stay enforced where
-  they live today — in the constructors. `OrgAdmin` adds none and
-  removes none.
-- **Offline by construction.** The module imports no `MeshNode` /
-  `Mesh` / transport type (witnessed by a compile-time/module-dep
-  check in S1). Issuance runs on an air-gapped machine exactly as
-  the CLI does today.
-- **CLI rebased onto `OrgAdmin`.** The CLI keeps everything that is
-  genuinely CLI-shaped — argv parsing, `load_org_key`, `ScrubbedString`
-  hygiene, 0600 staged no-clobber publication, `--force` refusal —
-  and routes the issuance call itself through `OrgAdmin`. This makes
-  "CLI and SDK call the same canonical constructors" structural
-  rather than incidental.
-- **Shared file envelopes.** The versioned JSON envelope codecs the
-  CLI writes (`OrgCertFile` / `OrgFloorsFile` /
-  `OrgDispatcherGrantFile` / `OrgCapabilityGrantFile`,
-  `ORG_FILE_VERSION = 1`) move to a location both the CLI and
-  `net_sdk::org` can use (exact home decided at S1 review — Q3), so
-  an application can load a CLI-minted grant file directly into the
-  wallet. The audience-secret config codec
-  (`OrgAudienceSecret::{encode,decode}_config`) is already shared.
-- **Root-key loading stays out.** `OrgAdmin` takes an in-memory
-  `OrgKeypair`; reading seed files, permission gates, and DACL
-  warnings remain the CLI's (`load_org_key`) or the application's
-  responsibility. The SDK does not invent a second seed-file reader.
-
-Deliberately NOT in `OrgAdmin` v1: live revocation push (applying an
-`OrgRevocationBundle` to a running node exists as library machinery —
-`OrgRevocationStore::apply_bundle` +
-`MeshNode::install_org_revocation_store` — but has no driver verb;
-that is separate admin-ops tooling with its own review), key
-rotation ceremonies, and any daemon/HTTP admin endpoint.
-
----
-
-## 3. `net_sdk::org::client` — caller credentials and protected calls
-
-### 3.1 `OrgActor` — who is calling, for whom
-
-```rust
-pub struct OrgActor {
-    caller: Arc<EntityKeypair>,
+pub struct OrgCredentials {
     membership: OrgMembershipCert,
     dispatcher: OrgDispatcherGrant,
-}
-
-impl OrgActor {
-    pub fn new(caller: Arc<EntityKeypair>, membership: OrgMembershipCert,
-        dispatcher: OrgDispatcherGrant) -> Result<Self, OrgSdkError>;
-    pub fn acting_org(&self) -> OrgId;   // == membership.org_id
-}
-```
-
-`new` fails loudly (`CredentialMismatch`) when:
-
-- `membership.member != caller entity id` (the TOFU member binding
-  would fail remotely anyway — fail here instead);
-- `membership.org_id != dispatcher.org_id` (acting-org agreement,
-  mirrors admission step "acting-org mismatch");
-- either credential's signature fails `verify` against its org id,
-  or its window is already expired at construction (skew-tolerant,
-  same `is_valid_at_with_skew` predicates the provider uses).
-
-### 3.2 `OrgCredentialStore` — exact wallet, not an ambient bag
-
-```rust
-pub struct OrgCredentialStore {
-    actor: OrgActor,
-    capability_grants: Vec<OrgCapabilityGrant>,
+    grants: Vec<OrgCapabilityGrant>,
     audience_secrets: Vec<OrgAudienceSecret>,
 }
+
+let credentials = OrgCredentials::new(membership, dispatcher, grants, secrets)?;
+let org = mesh.org(credentials)?;
 ```
 
-- `install_grant(grant)` — verifies the grant signature, rejects the
-  reserved zero grant id, rejects `grantee_org != actor.acting_org()`
-  (a wallet holds only grants naming this actor's org), rejects
-  duplicates by `grant_id`.
-- `install_audience_secret(secret)` — **requires** a previously
-  installed grant with `secret.matches_grant(&grant)`
-  (`org_grant.rs:369` — grant-id match AND key-commitment match);
-  otherwise `AudienceSecretMismatch`. This reuses the §2.6-witnessed
-  commitment check; a wrong or stale secret never sits silently in
-  the wallet.
-- **Grant lookup matches the complete authority relation** — all of:
-  - `grant.grantee_org == actor.acting_org()`
-  - `grant.issuer_org == provider_owner_org`
-  - `grant.capability == capability`
-  - `grant.rights` contains the required right (INVOKE for calls,
-    DISCOVER for private discovery)
-  - `grant.target_scope.covers(provider_entity, Some(provider_owner_org))`
-    (the same `GrantTargetScope::covers`, `org_grant.rs:223`)
-  - window valid at now (skew-tolerant).
+- **No keypair.** The mesh's existing identity signs.
+  `mesh.org(credentials)` binds to the node identity and refuses if
+  `membership.member != mesh.entity_id()` — the TOFU member binding
+  would fail remotely anyway; fail here instead.
+- **Construction checks structural relationships and signatures;
+  calls check temporal validity** (ruling). `new` verifies: each
+  credential's signature against its org id;
+  `membership.org_id == dispatcher.org_id` (acting-org agreement);
+  every grant names `grantee_org == membership.org_id`; no reserved
+  zero grant id; every audience secret satisfies
+  `matches_grant(&grant)` against exactly one held grant (the
+  §2.6-witnessed commitment relation — a wrong or stale secret never
+  sits silently in the set); no duplicate grant ids. Windows are NOT
+  checked here — an actor may be assembled long before use; expiry
+  is a call-time refusal.
+- **No public `OrgActor`, no public `OrgCredentialStore`, no mutable
+  install API.** The collection is closed at construction. Changing
+  credentials = construct a new `OrgCredentials`, bind again.
+- **Binding has one internal side effect** (not a public mutable
+  API): it idempotently installs the credential's (grant, secret)
+  pairs into the node's consumer-audience ingest registry
+  (`MeshNode::install_consumer_grant_audience`) — without this the
+  scoped store never accumulates records for those grants and
+  private discovery is structurally empty. Install failures are loud
+  (`OrgError::Credentials`). Registrations persist for the node's
+  lifetime (no uninstall-on-drop in v1 — dropping a client must not
+  blind a second client bound with the same grant); pinned at S0
+  review (Q5).
+- The struct derives neither `Serialize` nor `Deserialize`
+  (inherited structurally from `OrgAudienceSecret`; asserted
+  type-level for the container too) and its `Debug` is redacted.
 
-  Zero matches → `MissingCapabilityGrant`. **Two or more matches →
-  `AmbiguousCapabilityGrant`** listing the candidate grant ids —
-  never a silent choice. (Ambiguity is possible: overlapping
-  `ExactNode` + `AnyNodeOwnedBy` grants for one capability.) An
-  explicit `OrgCallOptions::use_grant(grant_id)` override resolves
-  ambiguity deliberately.
-- The store derives `Debug` by hand (redacted), implements neither
-  `Serialize` nor `Deserialize` (type-level witness, same pattern as
-  `OrgAudienceSecret`), and drops secrets zeroized (inherited from
-  the contained types).
-
-### 3.3 `OrgClient` — the call surface
+### 2. `OrgClient` — one common method
 
 ```rust
-impl Mesh {
-    pub fn org_client(&self, actor: OrgActor) -> OrgClient;
-}
-
-impl OrgClient {
-    pub fn install_grant(&mut self, g: OrgCapabilityGrant) -> Result<(), OrgSdkError>;
-    pub fn install_audience_secret(&mut self, s: OrgAudienceSecret) -> Result<(), OrgSdkError>;
-
-    /// Exact-target protected call (provider already known).
-    pub async fn call<Req, Resp>(&self, provider: EntityId, service: &str,
-        req: &Req, opts: OrgCallOptions) -> Result<Resp, OrgSdkError>;
-
-    /// Discover → verify → select → pin → call (§5, §6).
-    pub async fn call_service<Req, Resp>(&self, service: &str,
-        req: &Req, opts: OrgCallOptions) -> Result<Resp, OrgSdkError>;
-
-    pub fn find_service(&self, service: &str) -> FindService;   // §5
-}
+let org = mesh.org(credentials)?;
+org.call("customer.read", &request).await
 ```
 
-`OrgCallOptions`: codec (reuses the typed-RPC `Codec`), timeout,
-`proof_ttl_secs` (default = the shared 30 s, clamped to
-`MAX_ORG_PROOF_TTL_SECS`), `use_grant`, provider-selection hook
-(§6). Streaming shapes are refused locally with
-`StreamingUnsupported` before core would refuse them.
+Internally, in order:
 
-### 3.4 What `call` does internally (exact-target)
+```
+derive capability            CapabilityAuthorityId::for_tag("nrpc:<svc>")
+→ verified discovery         internal; granted + owner planes via the
+                             scoped store, public plane via the fold with
+                             ingest-verified ownership (owner_org_for);
+                             a public candidate with no verified owner
+                             projection is never eligible
+→ mode classification        candidate owner org == acting org → SameOrg
+                             (no grant attached); else Granted
+→ exact credential matching  the complete authority relation: grantee
+                             org, issuer org, capability, INVOKE,
+                             target_scope.covers(provider, owner),
+                             window valid now — the provider's own
+                             predicates, never a reimplementation
+→ deterministic selection    eligible = classified + grant-matched +
+                             direct-session-reachable (E0.3); tie-break
+                             documented and stable (private provenance
+                             before public, then lowest provider id);
+                             zero eligible → typed discovery error
+→ canonical OrgProofIntent   all nine fields; placed on CallOptions
+→ exact-target protected call  core call() pins, mints, digests, signs,
+                             sends one request — unchanged
+→ coarse denial decoding     0x0009 body → CoarseAdmissionReason →
+                             OrgError::AdmissionDenied
+```
 
-1. `capability = CapabilityAuthorityId::for_tag("nrpc:<service>")` —
-   the same derivation `sign_admission_proof` re-checks.
-2. Resolve `provider_owner_org`: the ownership projection for the
-   pinned provider (public plane: `owner_org_for`; private plane: the
-   verified record's `owner_org` — §5). No projection → the call
-   cannot be classified → `PreflightRefused(UnknownProviderOwner)`
-   unless `opts` supplies the expected owner org explicitly.
-3. **Mode inference — derived, never caller-specified:**
-   - `provider_owner_org == actor.acting_org()` → owner-delegated:
-     `capability_grant = None` (attaching one is
-     `UnexpectedCapabilityGrant` remotely; the SDK never does).
-   - otherwise → cross-org: wallet lookup per §3.2 (INVOKE).
-4. **Local pre-flight (advisory, fail-fast, never authority):**
-   membership + dispatcher + grant windows at now; dispatcher scope
-   covers the capability (`covers_capability`); grant relation per
-   §3.2. Pre-flight uses **the caller's local knowledge only** — it
-   cannot see the provider's floors, replay state, or live policy,
-   and the docs say so. Its contract: every refusal is a call the
-   provider was certain to deny *for the checked reason*; it makes
-   no promise in the accept direction.
-5. Build the canonical `OrgProofIntent` (all nine fields) and place
-   it on `CallOptions.org_proof_intent`.
-6. Delegate to `MeshNode::call` — which (unchanged) pins
-   `peer_entity_id(target) == intent.provider`, mints the call id,
-   computes the canonical digest, signs, appends exactly one header,
-   sends one exact-target request.
-7. Map the result: decode `Resp` on success; `0x0009` → coarse
-   decode → `RemoteAdmissionDenied`; pin failure ("target is not the
-   pinned provider" / no direct session) → `ProviderNotDirect`;
-   everything else → `RemoteError` / `Transport`.
+Ruling-locked exclusions: **no** public exact-provider call, **no**
+provider selector, **no** `use_grant`, **no** discovery builder,
+**no** options object. Overlapping valid grants for the selected
+provider produce the typed ambiguity error — the operator removes
+the ambiguity or drops to the low-level seam.
 
-The application never signs an `OrgCallProof`, never touches the
-header, and never sees the proof bytes.
+**The SDK owns** (not the caller): proof TTL (the shared 30 s,
+`MAX_ORG_PROOF_TTL_SECS`); grant matching; provider selection;
+provider pinning; retry prohibition (a signed proof is never resent;
+the SDK performs no automatic retry of any kind — every `org.call`
+is one fresh call id and one fresh signature; idempotency across
+calls is the application's, per the volatile replay-guard contract);
+codec default (one default, both sides — Q1); timeout default
+(inherited core default). `call_with` arrives only when a real
+consumer needs one specific option.
 
-**Retry rule (locked):** the SDK never resends a signed proof. Any
-retry is a new call — new call id, new expiry, new signature —
-because the replay guard is volatile-by-contract and keyed on
-`(caller, call_id)`; cross-restart idempotency remains the
-application's. `RemoteAdmissionDenied` is never auto-retried.
-
-### 3.5 Pre-flight uses the provider's own predicates
-
-Locked: pre-flight calls the exact functions admission calls —
-`is_valid_at_with_skew`, `covers_capability`,
-`GrantTargetScope::covers`, `GrantRights::contains`,
-`matches_grant` — not a parallel reimplementation. A divergence
-class (SDK says yes, provider says no, or vice versa) can then only
-come from state the caller genuinely cannot see (floors, replay,
-policy, live authority), which is the honest boundary.
-
----
-
-## 4. `net_sdk::org::provider` — protected registration and policy
-
-### 4.1 `serve_org_typed`
+### 3. `OrgAccess`
 
 ```rust
-impl Mesh {
-    pub fn serve_org_typed<Req, Resp, F, Fut>(&self, service: &str,
-        codec: Codec, policy: OrgServicePolicy, handler: F)
-        -> Result<ServeHandle, OrgSdkError>
-    where F: Fn(OrgCall, Req) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = Result<Resp, String>> + Send;
-}
+pub enum OrgAccess { SameOrg, Granted }
+```
 
-pub struct OrgCall { /* borrowed view over RpcContext */ }
-impl OrgCall {
-    pub fn admitted(&self) -> &Admitted;      // guaranteed present (below)
-    pub fn caller(&self) -> EntityId;
-    pub fn acting_org(&self) -> OrgId;
-    pub fn provider_org(&self) -> OrgId;
-    pub fn provider(&self) -> EntityId;
-    pub fn capability(&self) -> CapabilityAuthorityId;
-    pub fn ctx(&self) -> &RpcContext;         // escape hatch (headers etc.)
+Human-facing names in the common API, mapping directly onto the
+canonical admission modes — `SameOrg → OwnerDelegated`,
+`Granted → CrossOrgGranted` — which retain their canonical names in
+`org::types`. There is no third variant: `PublicAuthenticated`
+services are not org-protected and keep `serve_rpc`.
+
+### 4. `OrgCaller`
+
+```rust
+pub struct OrgCaller {
+    entity: EntityId,
+    acting_org: OrgId,
+    provider_org: OrgId,
+    capability: CapabilityAuthorityId,
+    grant_id: Option<[u8; 32]>,   // Some ⇔ Granted admission
 }
 ```
 
-- The wrapper mirrors `TypedRpcHandler` (decode `Req` → run → encode
-  `Resp`) but **forwards the verified facts**: it reads
-  `ctx.org_admission` and hands the handler an `OrgCall`. Today's
-  typed wrapper discards `ctx` entirely — this is the ergonomic fix
-  for "authenticated, provider-verified facts" without any
-  `expect()` in application code.
-- `org_admission == None` inside a protected typed handler is an
-  invariant violation (the gate only dispatches admitted protected
-  calls). The wrapper does not panic: it refuses with an internal
-  server error and a loud log, and S3 carries a witness that the
-  path is unreachable through the real gate.
-- No mode fallback, ever: public handlers keep `serve_rpc` /
-  `serve_rpc_typed`; protected handlers use `serve_org_typed`. There
-  is deliberately no "public or protected" registration and no
-  auto-upgrade.
+A projection of canonical `Admitted` — not a new authority object.
+The handler receives `(OrgCaller, Req)` and returns
+`Result<Resp, _>`; the wrapper decodes/encodes with the default
+codec. **No `RpcContext` exposure in the common handler** —
+applications needing headers, packet metadata, or proof-level policy
+use the existing low-level protected serve API.
 
-### 4.2 `OrgServicePolicy` — explicit mode, explicit visibility
+Honest grounding note: `Admitted` today carries five fields and
+**no `grant_id`** (`org_admission.rs:303`); the grant id lives in
+the verified proof, which the gate does not forward. `OrgCaller.grant_id`
+therefore needs a small additive core extension (§Core touches, item
+2) — provider-side only, never on the wire, and independently useful:
+it completes the §D1 audit story (a handler can log/deny by the
+exact grant its caller invoked under, which §D1 names as the
+existing-but-unbuilt lever).
 
-```rust
-OrgServicePolicy::owner_delegated()        // OrgAdmission::OwnerDelegated
-OrgServicePolicy::cross_org()              // OrgAdmission::CrossOrgGranted
-    .visibility(OrgVisibility::Public)     // default
-    .visibility(OrgVisibility::Private)    // owner_delegated → OwnerScoped
-                                           // cross_org       → GrantedAudience
-    .deny_grant_ids([g1, g2])              // §4.3
-    .with_proof_policy(|proof: &OrgCallProof| ...)   // core step-11 hook
-    .with_request_policy(|call: &OrgCall, req: &Req| ...)  // §4.4 / Q1
-```
+If `org_admission` is absent inside a `serve_org` handler, that is
+an invariant violation (the gate dispatches only admitted protected
+calls): the wrapper returns an internal error loudly, never panics,
+and S2 witnesses the path unreachable through the real gate.
 
-Mapping onto the existing core entry points (no new core serve
-paths): `owner_delegated + Public` → `serve_rpc_protected(OwnerDelegated)`;
-`owner_delegated + Private` → `serve_rpc_owner_scoped`;
-`cross_org + Public` → `serve_rpc_protected(CrossOrgGranted)`;
-`cross_org + Private` → `serve_rpc_granted`. The exact
-(admission × visibility) matrix — including which combinations the
-core constructors refuse — is pinned as a table at S3 review, not
-invented here.
-
-### 4.3 `deny_grant_ids` — the §D1 provider-local lever, built
-
-`ORG_CAPABILITY_AUTH_PLAN.md` §D1 records that a provider org B has
-no cryptographic lever to withdraw an issued cross-org grant before
-`not_after`, and that the closing mechanism — "`grant_id` is in the
-proof the policy sees — exists and is not built." This is it, at the
-SDK layer, zero core change:
-
-- `deny_grant_ids` compiles into the registered step-11 proof
-  policy: a proof whose `capability_grant.grant_id` is listed →
-  `false` → `AdmissionDenied::ProviderPolicyRejected` → `0x0009`.
-- v1 is a static-at-registration set plus a shared
-  `Arc<RwLock<HashSet<[u8;32]>>>` handle the operator can mutate at
-  runtime (`OrgServicePolicy::deny_list_handle()`), so an emergency
-  deny does not require re-registration.
-- Honest limits, documented where the API is: it is provider-local
-  (per node, per registration), volatile, and runs after the replay
-  insert — exactly the §D1 caveats. It is a mitigation, not grant
-  revocation; the deferred grant-revocation store remains deferred.
-
-### 4.4 Two policy hooks, honestly separated
-
-The core policy seam is `Fn(&OrgCallProof) -> bool`, runs as
-admission step 11 (after replay insert, before the handler), and
-produces `0x0009`. Kyra's sketch wants a policy over
-`(acting_org, request)`. Two hooks, distinct semantics:
-
-- **Proof policy** (`with_proof_policy`, plus `deny_grant_ids`):
-  installed into the core seam verbatim. Sees credentials, not the
-  request. Denial is admission denial (`0x0009`, coarse `Denied`).
-- **Request policy** (`with_request_policy`): runs inside the SDK
-  handler wrapper — after admission, after decode, before the
-  application handler. Sees the `Admitted` facts and the typed
-  request. Denial maps to an application-level error response
-  (status/shape pinned at S3 review), **not** `0x0009` — because
-  `0x0009` is the admission engine's word and the SDK must not
-  counterfeit it.
-
-This keeps the closed OA-2 seam byte-untouched. Extending the core
-policy signature to see request bytes is explicitly rejected for v1
-(it would reopen a signed-off gate for ergonomics); revisit only
-with a concrete consumer need (Q1).
-
----
-
-## 5. `net_sdk::org::discovery` — verified discovery, OA-3 consumed
-
-### 5.1 The one real core touch: promote the store queries
-
-`ScopedDiscoveryStore`'s two queries are production-grade
-(expiry-safe, floor-current, verified-at-ingest) but reachable only
-through `#[doc(hidden)] *_for_test` accessors. S4 promotes them:
+### 5. `OrgError`
 
 ```rust
-impl MeshNode {
-    /// Verified private candidates under an installed consumer grant.
-    pub fn granted_capability_providers(&self, grant_id: [u8; 32])
-        -> Vec<VerifiedProviderCandidate>;
-    /// Verified owner-private candidates (own org).
-    pub fn owner_private_capability_providers(&self)
-        -> Vec<VerifiedProviderCandidate>;
+pub enum OrgError {
+    Credentials(OrgCredentialError),   // mismatch, expired, missing grant,
+                                       // ambiguous grant, audience mismatch
+    Discovery(OrgDiscoveryError),      // no authorized provider (with the
+                                       // considered count), provider not direct
+    AdmissionDenied(CoarseAdmissionReason),
+    Rpc(RpcError),
 }
 ```
 
-Owned snapshot records (no lock-holding borrows across `await`),
-projected from `VerifiedScopedCapability`: provider `EntityId`,
-`owner_org`, capability tag(s), generation, effective expiry,
-provenance. The `_for_test` seams become thin aliases or are
-retired. **This is a read-only projection of already-verified state
-— no authority semantics move.**
+Four meaningful domains to branch on — not a 20-variant flattened
+implementation map. The nested enums carry the detail (all local, so
+they leak nothing); the remote reason stays the coarse 3-bucket wire
+value by design (denial reasons must not become a credential oracle
+— E2.2). An undecodable 0x0009 body maps to
+`AdmissionDenied(Denied)`, never an error-about-an-error.
 
-### 5.2 `find_service` — an authenticated query, not envelope surgery
+Naming collision, decided at S0 (Q2): `net_sdk::org` already
+re-exports the canonical issuance error as `OrgError`
+(`behavior::org::OrgError`). Recommendation: the facade error owns
+the short name at the `org` root; the issuance error is additionally
+aliased (`pub use ... as OrgIssuanceError`) and its existing path
+under `org::types` remains valid — no break, one obvious name for
+the common path.
 
-```rust
-let candidates: Vec<VerifiedProviderCandidate> = client
-    .find_service("customer.read")
-    .owner(provider_org)          // optional filter/expectation
-    .private_only()               // optional; default = both planes
-    .await?;
+---
+
+## Secure defaults — access implies visibility
+
+`serve_org` collapses admission and visibility into the secure
+common interpretation. Protected services are **private by
+default**:
+
+```
+serve_org(s, OrgAccess::Granted, h)  → CrossOrgGranted admission
+                                       + GrantedAudience encrypted discovery
+                                       (core serve_rpc_granted)
+serve_org(s, OrgAccess::SameOrg, h)  → OwnerDelegated admission
+                                       + OwnerScoped encrypted discovery
+                                       (core serve_rpc_owner_scoped)
 ```
 
-Semantics:
+No common caller ever sees an admission × visibility matrix.
+Protected-but-publicly-discoverable registration remains available
+through the existing low-level core API
+(`serve_rpc_protected`); if repeated consumers demand it, an
+explicit `serve_org_public(...)` is added then — not before
+(§Deferred).
 
-- **Granted plane:** for each installed (grant, secret) pair whose
-  capability matches and whose rights ⊇ DISCOVER, query
-  `granted_capability_providers(grant_id)`. The full chain — outer
-  signature → owner cert/currentness → audience selection → AEAD
-  open → descriptor↔grant binding — already ran at ingest
-  (`verify_scoped_ingest`); the SDK surfaces only its output and
-  re-checks currentness through the store's floor-aware query.
-- **Owner plane:** `owner_private_capability_providers()` when the
-  actor's org owns this node's authority.
-- **Public plane:** the plaintext fold query for the `nrpc:` tag,
-  with each candidate's ownership resolved through the ingest-verified
-  owner-cert projection (`owner_org_for`); candidates with no
-  verified owner projection are marked `owner: None` and are never
-  eligible for automatic selection in `call_service` (they cannot be
-  mode-classified or grant-matched).
-- Every candidate carries provenance (`Public` / `OwnerPrivate` /
-  `Granted { grant_id }`) — visibility is never conflated with
-  authority, and DISCOVER-derived knowledge never implies INVOKE.
-- One-shot query; no watch/subscribe in v1 (matches the substrate —
-  nothing watches announcements today).
+Provider policy in v1 **is the handler**: `serve_org` installs the
+trivial `|_| true` proof policy, and application-level decisions are
+made in the handler body with `OrgCaller` in hand (including
+`grant_id`-based refusal). The step-11 proof-policy hook stays fully
+available on the low-level serve APIs — the §D1 provider-local
+grant-denylist remains expressible there today; the facade sugar for
+it is deferred.
 
-Raw `ScopedCapabilityAnnouncement` codecs remain public for advanced
-consumers; normal applications receive only verified candidates.
-
-### 5.3 Audience state
-
-`OrgClient::install_audience_secret` (§3.2) also forwards to the
-existing node-side consumer registry
-(`MeshNode::install_consumer_grant_audience`) so ingest can open
-envelopes for that grant, and removal forwards to `remove_*`. The
-SDK wallet and the node's ingest registry are kept in lockstep by
-construction — one install call, both surfaces. Provider-side
-audience install (`install_provider_grant_audience`) is wrapped in
-`net_sdk::org::provider` for symmetric ergonomics.
+Provider-side audience *provisioning* (installing B's (grant,
+secret) pairs so a node can seal granted envelopes —
+`install_provider_grant_audience`) is operational state, like
+adoption and revocation files: it stays at the core/operational
+layer in v1 and is not part of the verb facade (Q3).
 
 ---
 
-## 6. `call_service` — the composed path
+## Discovery is internal
 
-`client.call_service(service, req, opts)`:
+`org.call(...)` consumes verified discovery internally. No public
+candidate ontology, no `VerifiedProviderCandidate`, no
+`find_service` builder — the implementation needs a candidate model;
+the public surface does not. All discovery inputs are
+ingest-verified state: the scoped store's floor/expiry-safe queries
+(the full envelope chain — outer signature, owner cert, audience
+selection, AEAD, descriptor↔grant binding — already ran at
+`verify_scoped_ingest`), and the plaintext fold with the
+ingest-verified owner-cert projection for public candidates.
+Knowledge never implies invocation authority; the wallet-relation
+match and the provider's admission remain the only authority steps.
 
-1. Derive the capability id (§3.4 step 1).
-2. `find_service(service)` across the planes the wallet can see.
-3. Filter to candidates the wallet could actually call: mode-classify
-   each (owner-delegated vs cross-org by owner org), require an
-   INVOKE-satisfying grant relation for cross-org candidates
-   (§3.2), require a resolvable direct session (E0.3).
-4. Select **exactly one** provider: `opts.selector` hook if provided;
-   otherwise deterministic (documented tie-break: prefer
-   `Granted`/`OwnerPrivate` provenance over `Public`, then lowest
-   provider `EntityId` — stable across runs; no hidden load
-   balancing in v1).
-5. Zero eligible → `NoAuthorizedProvider { considered }` — the count
-   distinguishes "nothing discovered" from "discovered but no
-   authority/session".
-6. Continue as the exact-target `call` (§3.4) against the selected
-   provider — pin, pre-flight, intent, one request.
-
-`call_service` never fans out, never retries across providers on an
-admission denial (a second provider seeing a fresh proof is a new
-authority decision the application must own), and never falls back
-from protected to public.
+If a named consumer later needs to enumerate providers, compare
+provenance, inspect expiry, or rank manually, add
+`org.discover("customer.read")` shaped by that consumer's actual
+requirements (§Deferred).
 
 ---
 
-## 7. Core-touch inventory (exhaustive)
+## Credential loading is separable
 
-Everything in this plan is SDK-crate code except:
-
-1. **`MeshNode` discovery accessors** (§5.1) — promote two read-only
-   store queries out of `#[doc(hidden)]`. New public surface,
-   no semantic change.
-2. **Ownership accessor** — a public `MeshNode`-level
-   `owner_org_of(node_id) -> Option<OrgId>` over the existing
-   projection, if the current accessor is not already publicly
-   reachable (confirm at S4; the projection itself exists —
-   `capability_bridge.rs:476`).
-3. **Re-exports** — `net_sdk::org::types` additions
-   (`CoarseAdmissionReason`, `Admitted`, `OrgAdmission`,
-   `CapabilityVisibility`, `OrgProofIntent` alias). Pure re-export.
-4. **File-envelope codec relocation** (§2, Q3) — move/share, not
-   change.
-
-Explicitly untouched: `verify_org_admission` and every admission
-step, the serve gates and `UnaryAdmission`, all wire objects and
-headers, `RpcStatus`/coarse-reason wire shape, the replay guard,
-`may_execute` (byte-for-byte re-verified at the exit gate), the RED
-seam, and `OrgProofIntent` itself.
+`OrgCredentials::new` takes in-memory canonical types. File
+formats, permissions, DACL checks, CLI envelopes, and secret
+publication stay where they are (CLI + config codecs) — filesystem
+credential handling has demonstrated review gravity and must not
+block the call/serve facade. An optional
+`org_files::load_credentials(path)` helper may come later
+(§Deferred), reusing the CLI's envelope codecs rather than inventing
+new ones.
 
 ---
 
-## 8. Slices (six bounded commits, stop-and-review per slice)
+## Core-touch inventory (exhaustive)
 
-**S0 — types + errors spine.** `net_sdk::org::{types}` restructure
-(compat re-exports), `OrgSdkError`, the 0x0009 coarse decode.
-Witnesses: exhaustive `CoarseAdmissionReason` wire round-trip at the
-SDK layer; undecodable-body fallback; module-path compat (old
-`net_sdk::org::X` paths still resolve). No core diff.
+Everything is SDK-crate code except:
 
-**S1 — admin.** `OrgAdmin`, envelope-codec sharing, CLI rebase.
-Witnesses: CLI integration tests pass unchanged in behavior
-(including every secret-hygiene witness — seed never echoed, 0600
-staging, no-CWD-fallback); an `OrgAdmin`-minted cert/grant/floors
-file is byte-decodable by the shared codecs and verifies under the
-same org id; `admin` module has no transport dependency
-(compile-time witness).
+1. **Promote the two scoped-store queries** out of their
+  `#[doc(hidden)] *_for_test` names into production `MeshNode`
+  methods (owned snapshot returns, no lock-holding borrows). They
+  are consumed internally by `org.call`; nothing new is re-exported
+  publicly from the SDK. Test seams become aliases or are retired —
+  test-named seams must not be load-bearing production API.
+2. **`Admitted.grant_id: Option<[u8; 32]>`** (or an equivalent
+  additive surface on the admission result): populated by
+  `verify_org_admission` from the verified capability grant;
+  provider-side only; never a wire object change. Required for
+  `OrgCaller.grant_id`; independently closes the §D1 attribution
+  gap at the handler.
+3. **Node-identity access for intent minting.** `OrgProofIntent.caller`
+  is `Arc<EntityKeypair>`; the facade signs with the node's own
+  identity. Confirm at S1 whether the SDK can already reach it, else
+  add one narrow accessor (or an intent-minting helper on
+  `MeshNode`) — decided at S1 review, recorded here either way.
+4. **Ownership accessor reachability** — `owner_org_for`
+  (`capability_bridge.rs:476`) needs to be publicly reachable from
+  the SDK crate for the public-plane candidate check; confirm or add
+  a thin `MeshNode` accessor at S1.
+5. **Re-exports** in `org::types` (`Admitted`, `OrgAdmission`,
+  `CoarseAdmissionReason`, `OrgProofIntent` alias, the
+  `OrgIssuanceError` alias per Q2). Pure re-export.
 
-**S2 — client wallet + exact-target call.** `OrgActor`,
-`OrgCredentialStore`, `OrgClient::call`. Witnesses:
-- intent-equality: for each admission mode, the client-built
-  `OrgProofIntent` equals a hand-assembled reference field-for-field
-  (all nine fields) given the same inputs;
-- live accept parity: `client.call` admits end-to-end against the
-  existing T1 provider setups (owner-delegated + cross-org reuse of
-  `integration_nrpc_protected.rs` fixtures);
-- pre-flight agreement matrix: every `PreflightReason` row maps to
-  the `AdmissionDenied` variant the provider produces for the same
-  defect (referencing the OA-4 T2/T3 witnesses — same predicate,
-  same verdict);
-- ambiguity witness: two overlapping grants → `AmbiguousCapabilityGrant`,
-  resolved by `use_grant`;
-- wallet hygiene: non-serializability (type-level), redacted `Debug`,
-  commitment-mismatch install refusal (reuses the §2.6 relation);
-- retry rule: a transport-level retry produces a fresh call id and
-  fresh proof (never a byte-identical resend).
+Explicitly untouched: every `verify_org_admission` step and its
+order, the serve gates and `UnaryAdmission`, all wire objects,
+headers, and status codes, the replay guard, the RED seam,
+`OrgProofIntent` itself, and `may_execute` (byte-for-byte
+re-verified at the exit gate).
 
-**S3 — provider typed surface.** `serve_org_typed`, `OrgCall`,
-`OrgServicePolicy` (+ `deny_grant_ids`, both policy hooks, the
-(admission × visibility) matrix pinned). Witnesses:
-- `Admitted` five-field facts reach the typed handler; raw
-  `net-org-admission` header absent (reuses the OA-4 attribution
-  assertions through the new wrapper);
-- request-policy veto returns the pinned application-level status
-  and never `0x0009`; proof-policy veto returns `0x0009`
-  (`ProviderPolicyRejected` coarse `Denied`);
-- `deny_grant_ids`: listed grant denied live, unlisted admitted;
-  runtime deny-list mutation takes effect without re-registration;
-- no-fallback: `serve_rpc`/`serve_rpc_typed` behavior byte-unchanged
-  beside a protected registration (reuses the public-caps-unchanged
-  T1);
+---
+
+## Slices (four bounded commits, stop-and-review per slice)
+
+**S0 — credentials and errors.** `OrgCredentials` + structural
+validation, mesh-identity binding (including the internal audience
+install), `OrgError` hierarchy, `org::types` re-exports + naming
+decision (Q2). Witnesses: structural-validation matrix (each broken
+relationship → its typed `OrgCredentialError`); binding refusal on
+`membership.member != mesh.entity_id()`; audience-mismatch refusal
+(reuses the §2.6 commitment relation); container
+non-serializability + redacted `Debug` (type-level); existing flat
+`net_sdk::org::*` paths still resolve. No core diff.
+
+**S1 — `org.call`.** Internal verified discovery (core promotions,
+items 1/3/4), mode classification, exact grant matching, selection,
+intent, coarse decode. Witnesses:
+- intent-equality: for both modes, the facade-built `OrgProofIntent`
+  equals a hand-assembled reference field-for-field given the same
+  inputs;
+- **one live SameOrg witness and one live Granted witness** — real
+  two-node `MeshNode::call` traversal end-to-end (reusing the
+  `integration_nrpc_protected.rs` fixtures), the Granted one
+  discovering through a real encrypted envelope;
+- ambiguity: two overlapping valid grants → typed ambiguity error,
+  nothing sent;
+- temporal refusal: expired grant/membership → local
+  `Credentials(Expired…)`, mirroring the provider's T3 verdict for
+  the same defect (same predicate, same outcome direction);
+- DISCOVER-only grant: resolves internally, refused locally as
+  missing-INVOKE — no provider round-trip consumed;
+- exhaustive coarse-byte decode round-trip + undecodable-body
+  fallback; `NoAuthorizedProvider` considered-count semantics;
+  `ProviderNotDirect` for a discovered-but-not-direct candidate;
+- no-retry: consecutive `org.call`s produce distinct call ids and
+  proofs; no code path resends a signed proof.
+
+**S2 — `serve_org`.** `OrgAccess`, private-by-default visibility
+mapping, typed request/response wrapper, `OrgCaller` projection
+(+ core item 2), public path unchanged. Witnesses:
+- `OrgCaller` fields (incl. `grant_id` presence ⇔ Granted) reach the
+  handler; raw `net-org-admission` header absent (reuses the OA-4
+  attribution assertions through the wrapper);
+- Granted registration: service absent from plaintext CAP-ANN,
+  present only inside the grant envelope; SameOrg registration: owner
+  envelope only (both reuse the closed OA-3/OA-4 emission witnesses
+  through the new registration path);
+- `serve_rpc`/`serve_rpc_typed` behavior unchanged beside a
+  `serve_org` registration (reuses the public-caps-unchanged T1);
 - the `org_admission == None` internal-error path is unreachable
-  through the real gate (bridge-level witness).
+  through the real gate (bridge-level witness);
+- streaming shapes refused (inherited unary-only, typed error).
 
-**S4 — discovery + `call_service`.** Core accessor promotion (§7.1–2),
-`find_service`, the composed `call_service`. Witnesses:
-- promoted queries return only ingest-verified, unexpired,
-  floor-current records (reuses the store witnesses through the new
-  surface); no raw envelope type appears in any SDK return type
-  (type-level scan);
-- provenance labeling: the same service visible publicly and under a
-  grant yields two candidates with distinct provenance;
-- DISCOVER-only grant: `find_service` resolves, `call_service` →
-  `MissingCapabilityGrant`/`PreflightRefused(InsufficientRights)`
-  locally — mirroring the OA-4 "resolves but cannot invoke" row
-  without burning a provider round-trip; the live remote-denial row
-  is retained by hand-building the intent through the
-  `OrgProofIntent` escape hatch (no pre-flight-bypass seam is added
-  to the SDK, in test builds or otherwise);
-- ownership recheck: a `Public` candidate with no verified owner
-  projection is never auto-selected;
-- deterministic selection witness; `NoAuthorizedProvider` count
-  semantics;
-- `ProviderNotDirect` on a relayed-only candidate (E0.3 surface).
+**S3 — composed exit.** `ORG_SDK_EXIT_GATE.md` mapping every claim
+above to its witness (new or referenced OA-3/OA-4 test); the
+composed example —
 
-**S5 — composed exit gate.** `ORG_SDK_EXIT_GATE.md` mapping every
-§1–§6 claim to its witness (new or referenced OA-3/OA-4 test);
-the short-path acceptance witness — a complete working example
-(actor → installs → `call_service` → typed response) in ≤ 25 lines
-of application code, compiled and run live two-node; a full-chain
-preservation assertion (the example's call traverses
-`verify_org_admission` — witnessed via the admission stamp/audit
-surface, not assumed); `may_execute` byte-identity re-check; source
-scan: no new `#[cfg(test)]` bypass, no new authority seam outside
-the §7 inventory. Then STOP: no further org-SDK work without a named
-application consumer or a measured failure.
+```rust
+let org = mesh.org(credentials)?;
+let result: Customer = org.call("customer.read", &request).await?;
+```
 
-**Gate cadence** (mirrors OA-4): per slice — new focused tests + the
-touched integration target + clippy for touched targets + fmt +
-diff review. After S4 (the only core-touching slice) the relevant
-full lib/integration gates. After S5 the full serial battery once
-(clippy `--lib --features cortex -D warnings`;
-`--no-default-features`; fmt; full lib cortex;
-`integration_nrpc_protected`; `org_ownership`; `org_admission_wire`;
-CLI suites; `may_execute` body unchanged).
+— live two-node, both modes, with an assertion that the call
+traversed full canonical admission (witnessed via the admission
+audit surface, not assumed); the design-test witness (the example
+compiles importing none of the §Design-test names); `may_execute`
+byte-identity; source scan proving the core-touch inventory is
+exhaustive and no new bypass or authority seam exists. **Then
+stop.** No further org-SDK work without a named application consumer
+or a measured failure.
+
+**Gate cadence** (mirrors OA-4): per slice — new focused tests, the
+touched integration target, clippy for touched targets, fmt, diff
+review. After S1 (the core-touching slice) the relevant full
+lib/integration gates. After S3 the full serial battery once (clippy
+`--lib --features cortex -D warnings`; `--no-default-features`; fmt;
+full lib cortex; `integration_nrpc_protected`; `org_ownership`;
+`org_admission_wire`; `may_execute` body unchanged).
 
 ---
 
-## 9. Deliberately NOT in v1
+## Deferred — must earn its way in via a named consumer
 
-- **Bindings parity** (Node / Python / Go) — Rust-first, consistent
-  with the substrate plan's "language parity" deferral; a separate
-  plan once the Rust surface is review-frozen.
-- **Watch/subscribe discovery** — one-shot queries only; nothing in
-  the substrate watches announcements yet.
-- **Automatic credential renewal / refresh** — issuance is offline
-  and occasional by design; the SDK reports expiry, it does not
-  phone home for new certs.
-- **Cross-provider retry / failover on admission denial** — a fresh
-  authority decision belongs to the application.
-- **Grant revocation store** — remains the deferred substrate item;
-  `deny_grant_ids` (§4.3) is the documented provider-local
-  mitigation, not a substitute.
-- **Live revocation-bundle push tooling** — admin-ops follow-up with
-  its own review (§2).
-- **Core policy-signature extension** (request-aware step-11 policy)
-  — rejected for v1 (§4.4, Q1).
-- **Streaming protected calls** — inherited unary-only boundary.
-- **Any change to proof, header, status, or announcement wire
-  shapes.**
+Removed from the common facade by the v0.2 ruling (none inherently
+bad; none belong in the first facade). The low-level canonical APIs
+keep every capability available meanwhile.
+
+- `OrgAdmin`, file-envelope relocation, CLI rebase — issuance
+  already flows through the canonical constructors via the
+  `net_sdk::org` re-exports; a grouping type waits for an admin-tool
+  consumer.
+- `OrgActor` / public `OrgCredentialStore` / mutable
+  `install_grant` / `install_audience_secret` — replaced by the
+  closed `OrgCredentials` collection.
+- Public discovery: `find_service` builder,
+  `VerifiedProviderCandidate`, provenance/expiry inspection →
+  future `org.discover(...)` shaped by a real consumer.
+- `OrgCallOptions` / `call_with` / provider selector / `use_grant` /
+  exact-target `OrgClient::call(provider, …)`.
+- `OrgServicePolicy`, proof/request policy hooks, the mutable
+  `deny_grant_ids` denylist sugar (the §D1 mitigation remains
+  expressible today via the low-level `OrgProviderPolicy` closure,
+  and at the facade level via `OrgCaller.grant_id` in the handler),
+  public visibility configuration, `serve_org_public`,
+  `OrgCall::ctx()`.
+- `org_files::load_credentials` file helper.
+- Live revocation-bundle push tooling; grant-revocation store
+  (substrate deferrals, unchanged).
+- Bindings parity (Node/Python/Go); watch/subscribe discovery;
+  automatic credential renewal; cross-provider failover on denial;
+  streaming protection; any wire-shape change.
 
 ---
 
-## 10. Locked design points (proposed; frozen at review)
+## Locked design points (proposed; frozen at review)
 
-1. The SDK is a facade over the closed OA substrate — it never
-   admits, and pre-flight can only refuse to send.
-2. Pre-flight predicates are the provider's own functions, never a
-   reimplementation.
-3. Credential matching is exact and total (the complete authority
-   relation); ambiguity is a typed error, never a silent choice.
-4. Admission mode is inferred from the org relation, never
-   caller-specified.
-5. Secrets remain structurally non-serializable end-to-end; the
-   wallet adds no serialization and no `Debug` leak.
-6. No new wire surface of any kind; `0x0009` + the coarse byte are
-   consumed, not extended; `0x0009` is never emitted by SDK code.
-7. A signed proof is never resent; every retry is a new call id and
-   new signature.
-8. Discovery returns only ingest-verified candidates; provenance is
-   explicit; knowledge never implies invocation authority.
-9. Protected and public serve surfaces are disjoint; no fallback
-   registration mode exists.
-10. `OrgProofIntent` stays public, unchanged, as the escape hatch;
-    everything the SDK does is expressible through it by hand.
-11. `OrgAdmin` and the CLI share one set of canonical constructors
-    and one set of file-envelope codecs.
-12. The core-touch inventory (§7) is exhaustive; anything beyond it
-    requires reopening this plan's review.
+1. The SDK is a **verb layer** over the closed OA substrate — two
+   verbs (`org.call`, `serve_org`) plus five public concepts. It
+   never admits; local checks only ever refuse to send.
+2. Structural + signature validation at construction; temporal
+   validity at call time (the ruling's split).
+3. Local predicates are the provider's own functions
+   (`is_valid_at_with_skew`, `covers_capability`,
+   `GrantTargetScope::covers`, `GrantRights::contains`,
+   `matches_grant`) — never a reimplementation.
+4. Credential matching is exact and total; ambiguity is a typed
+   error, never a silent choice, with no override in the facade.
+5. Admission mode is inferred from the org relation, never
+   caller-specified; access implies encrypted visibility
+   (private-by-default), and no fallback mode exists.
+6. Secrets stay structurally non-serializable end-to-end; the
+   credential container adds no serialization and no `Debug` leak.
+7. No new wire surface; `0x0009` + the coarse byte are consumed,
+   not extended, and never emitted by SDK code.
+8. A signed proof is never resent; the facade performs no automatic
+   retry.
+9. Discovery is internal and ingest-verified only; knowledge never
+   implies invocation authority.
+10. `OrgCaller` is a projection of canonical `Admitted`; the common
+    handler never sees `RpcContext` or proof bytes.
+11. `OrgProofIntent` and the low-level serve/discovery APIs stay
+    public and unchanged as the advanced seam; everything the facade
+    does is expressible through them by hand.
+12. The core-touch inventory is exhaustive; anything beyond it
+    reopens this plan's review.
 
 ---
 
 ## Open questions
 
-- **Q1 — request-aware policy placement.** v1 ships the two-hook
-  model (§4.4: core proof policy + SDK request policy). Confirm at
-  S3 review that the application-level denial status for a
-  request-policy veto is acceptable, or name the consumer that
-  justifies extending the core step-11 signature instead.
-- **Q2 — `VerifiedProviderCandidate` shape.** Trimmed projection vs
-  a clone of `VerifiedScopedCapability`; decide at S4 with the
-  owned-snapshot constraint (§5.1) in hand.
-- **Q3 — file-envelope codec home.** CLI → `net_sdk::org::types` vs
-  core `behavior::org_files`; decide at S1 (constraint: the CLI must
-  not depend on more of the SDK than `net_sdk::org`, and the SDK
-  must not depend on the CLI).
-- **Q4 — selection determinism vs load.** The v1 tie-break (§6.4) is
-  deliberately load-blind. If a real consumer needs spreading,
-  extend `opts.selector` — never the default — and witness
-  determinism separately.
-- **Q5 — `OrgActor` construction-time expiry.** Hard error vs
-  warn-and-construct for an already-expired membership at
-  `OrgActor::new` (an actor may be assembled long before use).
-  Provisional: hard error, `try_new_unchecked` escape hatch;
-  confirm at S2 review.
+- **Q1 — default codec.** One default owned by the SDK on both
+  sides of the wire (provisional: `Codec::Json` for debuggability;
+  postcard is the compact alternative). Freeze at S0.
+- **Q2 — `OrgError` naming collision** with the canonical issuance
+  `OrgError` re-export. Recommendation in §5; freeze at S0.
+- **Q3 — provider-side audience provisioning boundary.** v1 keeps
+  `install_provider_grant_audience` at the core/operational layer
+  (like adoption). Confirm at S2 that no facade affordance is
+  needed for the first provider consumer.
+- **Q4 — shape of the `grant_id` admission extension** (field on
+  `Admitted` vs a parallel accessor beside it). Additive either
+  way; freeze at S2 with the OA-2 owners.
+- **Q5 — binding side-effect semantics.** Consumer-audience installs
+  are idempotent and persist for the node's lifetime (no
+  uninstall-on-drop). Confirm at S0, including the
+  two-clients-one-grant case.
