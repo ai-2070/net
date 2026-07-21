@@ -116,6 +116,32 @@ fn forged_request(route: u64, service: &str, origin: u64, body: &[u8]) -> Bytes 
 /// A concurrent cross-service frame from a DIFFERENT peer, injected
 /// while the victim's call is paused in the handler, must NOT disturb
 /// the victim's response delivery.
+///
+/// SCOPE — what this does and does NOT witness (§T3, Kyra).
+///
+/// This is an END-TO-END liveness check: under concurrent hostile traffic
+/// the victim still gets its own response. It is deliberately
+/// belt-and-braces, and it is multiply guarded — the injected frame is
+/// refused by `is_cross_service_request` (wrong service),
+/// by `bridge_origin_check` (packet vs payload origin), AND
+/// structurally by the route cache being keyed on `inbound.from_node`,
+/// which makes an attacker on a different session incapable of touching
+/// the victim's entry. Deleting `response_route_is_trustworthy` entirely
+/// therefore leaves this test green. It is not, and should not be read
+/// as, the witness for that predicate.
+///
+/// The predicate IS witnessed, exhaustively and by construction, in
+/// `mesh_rpc.rs::origin_cache_tests::response_route_trust_requires_authenticated_direct_origin`
+/// — a pure unit test over all five refusal branches (claimed origin not
+/// equal to the authenticated peer's own origin; control frames; UNPINNED
+/// peer, which Gate-3 cannot catch because packet and payload origin agree;
+/// the loopback sentinel; a non-decodable dispatch). Verified: stubbing
+/// `response_route_is_trustworthy` to return `true` unconditionally fails
+/// that test and leaves this file green.
+///
+/// Keeping both is deliberate — the unit test pins the decision, this one
+/// pins that the decision is wired into a live two-peer call — but only the
+/// unit test constrains the predicate.
 #[tokio::test]
 async fn concurrent_injection_does_not_disturb_a_victims_response() {
     let server = build_node().await;

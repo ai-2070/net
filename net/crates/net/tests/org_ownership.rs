@@ -91,8 +91,24 @@ fn org() -> OrgKeypair {
     OrgKeypair::from_bytes([0x42u8; 32])
 }
 
+/// A unique per-run scratch directory.
+///
+/// §T8: the name mixes a monotonic counter with the pid, and the directory is
+/// REMOVED first if it already exists. Keying on the pid alone was a real
+/// hazard here — several tests deliberately write corrupt state (the
+/// `"startup"` tag writes invalid JSON on purpose) and only clean up on their
+/// happy path, so a pid-recycled rerun inherited that residue and failed
+/// inside `NodeAuthority::adopt` for a reason unrelated to the test. Starting
+/// from a known-empty directory makes a rerun deterministic.
 fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("net-org-ownership-{tag}-{}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "net-org-ownership-{tag}-{}-{seq}",
+        std::process::id()
+    ));
+    // Inherited residue is never wanted: every caller wants a fresh scaffold.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
@@ -113,8 +129,19 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
         OrgMembershipCert::try_issue(&org(), a.entity_id().clone(), 1, 3600).expect("issue cert");
     let authority = NodeAuthority::adopt(&dir, cert, a.entity_id(), 0, None).expect("adopt");
 
-    // Phase 1 — emission OFF (default): announce, verify B folds
-    // the caps but projects NO ownership (pre-OA-1 byte shape).
+    // §T8: the authority is installed FIRST, before the emission-off phase.
+    //
+    // This ordering used to be reversed, which made phase 1 vacuous:
+    // `owner_cert_for_emission_at` early-returns when no authority is
+    // installed and never reaches the emission flag, so "emission off ⇒ no
+    // ownership projected" was satisfied by the ABSENT AUTHORITY rather than
+    // by the flag. Flipping the flag's default to `true` left it green.
+    // With the authority present, phase 1 now constrains the flag itself.
+    a.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+
+    // Phase 1 — authority INSTALLED, emission OFF (default): announce, verify
+    // B folds the caps but projects NO ownership (pre-OA-1 byte shape).
     a.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
         .await
         .expect("announce");
@@ -129,16 +156,13 @@ async fn owner_cert_projects_across_the_wire_only_when_emitted() {
     assert_eq!(
         owner_org_for(b.capability_fold(), a_id),
         None,
-        "emission off ⇒ no ownership projected"
+        "emission off ⇒ no ownership projected, even with an authority installed"
     );
 
-    // Phase 2 — install the loaded authority as THE production
-    // authority object, then flip emission ON (Migration step 3
-    // switch; review-8 §3 — the installed authority is the only
-    // certificate source). The next announcement carries exactly
-    // the installed cert; B's real ingest verifies + projects.
-    a.install_node_authority(Arc::new(authority))
-        .expect("install authority");
+    // Phase 2 — flip emission ON (Migration step 3 switch; review-8 §3 — the
+    // installed authority is the only certificate source). The next
+    // announcement carries exactly the installed cert; B's real ingest
+    // verifies + projects.
     a.set_owner_cert_emission(true).expect("enable emission");
     a.announce_capabilities(CapabilitySet::new().add_tag("nrpc:oa1-echo"))
         .await
@@ -970,12 +994,30 @@ async fn active_raise_and_replacement_serialize_on_the_publish_guard() {
                 let store_for_raise = store_a.clone();
                 let bundle_for_raise = bundle10.clone();
                 let done = raise_done.clone();
+                // §T8: signal ENTRY so the wait below cannot be satisfied by
+                // spawn latency. This previously slept 300 ms and asserted
+                // `!raise_done`, which a thread still queued to start
+                // satisfies identically — the assertion held whether or not
+                // the publish guard was doing anything.
+                let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let started_in_thread = started.clone();
                 let raise = std::thread::spawn(move || {
+                    started_in_thread.store(true, std::sync::atomic::Ordering::Release);
                     store_for_raise
                         .apply_bundle(&bundle_for_raise)
                         .expect("raise eventually succeeds");
                     done.store(true, std::sync::atomic::Ordering::Release);
                 });
+                let spin = std::time::Instant::now() + Duration::from_secs(5);
+                while !started.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < spin
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    started.load(std::sync::atomic::Ordering::Acquire),
+                    "the raise thread must actually be running before we time it",
+                );
                 std::thread::sleep(Duration::from_millis(300));
                 assert!(
                     !raise_done.load(std::sync::atomic::Ordering::Acquire),
@@ -1075,10 +1117,25 @@ async fn authority_install_pins_candidate_floors_across_verification() {
                 let store = auth_for_pause.revocation.clone();
                 let bundle = bundle2.clone();
                 let done = raise_done.clone();
+                // §T8: see the sibling above — gate on thread ENTRY so spawn
+                // latency cannot masquerade as "correctly blocked".
+                let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let started_in_thread = started.clone();
                 let raise = std::thread::spawn(move || {
+                    started_in_thread.store(true, std::sync::atomic::Ordering::Release);
                     store.apply_bundle(&bundle).expect("raise eventually lands");
                     done.store(true, std::sync::atomic::Ordering::Release);
                 });
+                let spin = std::time::Instant::now() + Duration::from_secs(5);
+                while !started.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < spin
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    started.load(std::sync::atomic::Ordering::Acquire),
+                    "the raise thread must actually be running before we time it",
+                );
                 std::thread::sleep(Duration::from_millis(300));
                 assert!(
                     !raise_done.load(std::sync::atomic::Ordering::Acquire),

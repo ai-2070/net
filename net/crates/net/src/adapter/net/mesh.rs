@@ -5471,6 +5471,58 @@ pub struct MeshNode {
     accept_in_flight: std::sync::atomic::AtomicUsize,
 }
 
+/// Verify an announcement's owner cert against `floors`, apply the
+/// translated announcement to `capability_fold`, and run the review-9
+/// post-apply floor recheck.
+///
+/// §T8 — ONE implementation, called by both the live inbound dispatch path
+/// and `MeshNode::test_inject_capability_announcement`. The seam used to be a
+/// hand-copied duplicate of these ~20 lines, which meant roughly ten
+/// org-ownership tests exercised the COPY: deleting the owner-cert
+/// verification from the real dispatch path (or passing `None` for
+/// `verified_owner` there) left every one of them green, including the
+/// headline `node_ingest_drops_bad_cert_but_keeps_announcement`. Sharing the
+/// body makes that divergence unrepresentable.
+///
+/// `signature_verified` is the caller-asserted OUTER announcement signature
+/// (review-8 §1): a valid replayed cert must never lend ownership to an
+/// unsigned capability statement, so it stays an explicit parameter rather
+/// than being recomputed here.
+fn ingest_announcement_with_owner_projection(
+    capability_fold: &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    org_revocation: &ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+    ann: &super::behavior::capability::CapabilityAnnouncement,
+    signature_verified: bool,
+) {
+    let verified_owner = {
+        let store = org_revocation.load();
+        let floors = store.as_ref().map(|s| s.snapshot());
+        super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+            ann,
+            signature_verified,
+            floors.as_deref(),
+            0,
+        )
+    };
+    let fold_ann =
+        super::behavior::fold::capability_bridge::translate_announcement(ann, verified_owner);
+    let _ = capability_fold.apply(fold_ann);
+    // Review-9: post-apply floor recheck — a raise that landed between the
+    // verification above and this apply would have finished its retraction
+    // callback before the projection existed; reread the CURRENT floors and
+    // retract if the just-applied projection is already below them.
+    if let Some(owner) = &verified_owner {
+        let store = org_revocation.load();
+        let floors = store.as_ref().map(|s| s.snapshot());
+        super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+            capability_fold,
+            floors.as_deref(),
+            &ann.entity_id,
+            owner,
+        );
+    }
+}
+
 impl MeshNode {
     /// Get the Noise static public key (for peers to connect to this node).
     pub fn public_key(&self) -> &[u8; 32] {
@@ -17713,34 +17765,14 @@ impl MeshNode {
         // cert reaches the fold's `owner` projection. Runs after
         // the forward block: the signed bytes (cert included)
         // propagate verbatim and every receiver re-verifies.
-        let verified_owner = {
-            let store = ctx.org_revocation.load();
-            let floors = store.as_ref().map(|s| s.snapshot());
-            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
-                &ann,
-                signature_verified,
-                floors.as_deref(),
-                0,
-            )
-        };
-        let fold_ann =
-            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
-        let _ = ctx.capability_fold.apply(fold_ann);
-        // Review-9: post-apply floor recheck — a raise that landed
-        // between the verification above and this apply would have
-        // finished its retraction callback before the projection
-        // existed; reread the CURRENT floors and retract if the
-        // just-applied projection is already below them.
-        if let Some(owner) = &verified_owner {
-            let store = ctx.org_revocation.load();
-            let floors = store.as_ref().map(|s| s.snapshot());
-            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
-                &ctx.capability_fold,
-                floors.as_deref(),
-                &ann.entity_id,
-                owner,
-            );
-        }
+        // §T8: the SHARED ingest body — the test seam calls this same
+        // function, so the two cannot drift.
+        ingest_announcement_with_owner_projection(
+            &ctx.capability_fold,
+            &ctx.org_revocation,
+            &ann,
+            signature_verified,
+        );
 
         // SI-6 review P1 (unified scheduler-input generation): fold
         // membership is a scheduler-relevant plane — a changed
@@ -22450,37 +22482,23 @@ impl MeshNode {
         &self,
         ann: super::behavior::capability::CapabilityAnnouncement,
     ) {
-        // Mirrors the inbound dispatch path, including OA-1
-        // owner-cert verification — the outer-signature
-        // precondition is computed here exactly as dispatch's step
-        // 5 does — against this node's installed revocation floors,
-        // so exit-gate fixtures exercise the real ingest semantics.
+        // §T8: calls the SAME `ingest_announcement_with_owner_projection` the
+        // live inbound dispatch path calls. This used to be a hand-copied
+        // duplicate, so roughly ten org-ownership tests exercised the copy —
+        // deleting the owner-cert verification from the real dispatch path
+        // left every one of them green, including the headline
+        // `node_ingest_drops_bad_cert_but_keeps_announcement`. Sharing the
+        // body makes that divergence unrepresentable.
+        //
+        // The outer-signature precondition is computed here exactly as
+        // dispatch's step 5 does.
         let outer_signature_verified = ann.verify().is_ok();
-        let verified_owner = {
-            let store = self.org_revocation.load();
-            let floors = store.as_ref().map(|s| s.snapshot());
-            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
-                &ann,
-                outer_signature_verified,
-                floors.as_deref(),
-                0,
-            )
-        };
-        let fold_ann =
-            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
-        let _ = self.capability_fold.apply(fold_ann);
-        // Review-9: post-apply floor recheck (see the dispatch
-        // path) — fixtures exercise the same ordering guarantees.
-        if let Some(owner) = &verified_owner {
-            let store = self.org_revocation.load();
-            let floors = store.as_ref().map(|s| s.snapshot());
-            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
-                &self.capability_fold,
-                floors.as_deref(),
-                &ann.entity_id,
-                owner,
-            );
-        }
+        ingest_announcement_with_owner_projection(
+            &self.capability_fold,
+            &self.org_revocation,
+            &ann,
+            outer_signature_verified,
+        );
     }
 
     /// Test-only helper — does the fold know about an entry
