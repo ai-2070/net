@@ -872,6 +872,7 @@ async fn owner_scoped_service_ships_only_inside_the_encrypted_owner_envelope() {
         floors: &floors,
         now_secs,
         skew_secs: 5,
+        local_member: None,
     };
     let verified = verify_scoped_ingest(&envelope, &audience, &ctx).expect("owner ingest opens");
     let descriptor = CapabilitySet::from_bytes(verified.descriptor()).expect("descriptor caps");
@@ -1043,6 +1044,7 @@ fn open_granted_envelope(
         floors: &floors,
         now_secs,
         skew_secs: 5,
+        local_member: None,
     };
     let verified = verify_scoped_ingest(&env, &authority, &ctx).ok()?;
     CapabilitySet::from_bytes(verified.descriptor())
@@ -1671,6 +1673,7 @@ async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
             floors: &floors,
             now_secs,
             skew_secs: 5,
+            local_member: None,
         },
     )
     .expect("E1 opens under K1");
@@ -1689,6 +1692,7 @@ async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
             floors: &floors,
             now_secs,
             skew_secs: 5,
+            local_member: None,
         },
     )
     .expect("E2 opens under K2");
@@ -1710,6 +1714,7 @@ async fn a_same_org_audience_rotation_refuses_the_stale_scoped_envelope() {
                 floors: &floors,
                 now_secs,
                 skew_secs: 5,
+                local_member: None,
             },
         )
         .is_err(),

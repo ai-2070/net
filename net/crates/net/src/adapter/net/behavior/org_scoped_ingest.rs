@@ -118,6 +118,18 @@ impl<'a> AudienceAuthority<'a> {
     }
 }
 
+/// The local node's own membership standing, for the §9 self-revocation gate.
+#[derive(Clone, Debug)]
+pub struct LocalMemberStanding {
+    /// This node's entity id — the `member` a floor for it would name.
+    pub member: EntityId,
+    /// The generation of the membership certificate this node is running
+    /// under. Revoked when a floor for `(local_owner_org, member)` rises
+    /// ABOVE it (`generation < floor`, the same boundary every other floor
+    /// check in the tree uses).
+    pub generation: u32,
+}
+
 /// Per-ingest context: the local node's identity and the single clock sample /
 /// revocation view every credential check shares.
 pub struct ScopedIngestContext<'a> {
@@ -127,6 +139,31 @@ pub struct ScopedIngestContext<'a> {
     pub local_owner_org: OrgId,
     /// Persisted revocation floors for the `owner_cert` generation check.
     pub floors: &'a OrgRevocationState,
+    /// The LOCAL node's own membership in `local_owner_org` — its entity id and
+    /// the generation of the certificate it is running under (§9).
+    ///
+    /// Checked against `floors` before any inbound envelope is admitted, so a
+    /// node that its own org has revoked stops ingesting. Without this, ingest
+    /// authority checked only the PUBLISHER's standing: revoking a member
+    /// raised its floor everywhere, so every other node refused ITS
+    /// announcements and ITS invocations — but the revoked node's copy of
+    /// `owner-audience.key` and the owner `audience_handle` are unchanged, so
+    /// it kept ingesting and storing every owner-scoped announcement from
+    /// every remaining node in the org: the full name list of the org's
+    /// internal private capabilities, indefinitely.
+    ///
+    /// This is defense in depth, not a replacement for key rotation. A
+    /// revoked node still HOLDS the symmetric owner key and can decrypt
+    /// anything it captured off the wire; closing that needs the §3.4 hard
+    /// cutover (redistribute `owner-audience.key` to every node in the org),
+    /// which no code path triggers today. What this does close is continued
+    /// acceptance of FUTURE announcements through the live ingest authority,
+    /// and it gives an operator a signal that a rotation is due.
+    ///
+    /// `None` for a node with no installed membership of its own (a pure
+    /// consumer holding only granted audiences), which cannot be floored in
+    /// `local_owner_org` and so has nothing to check.
+    pub local_member: Option<LocalMemberStanding>,
     /// The single clock sample (unix seconds) all freshness checks use.
     pub now_secs: u64,
     /// Clock-skew tolerance applied to certificate/grant/envelope windows.
@@ -263,6 +300,13 @@ pub enum ScopedIngestError {
     /// The `owner_cert` generation is below the revocation floor for
     /// `(org, provider)`.
     MembershipRevoked,
+    /// THIS node's own membership is below the revocation floor for
+    /// `(local_owner_org, self)` — the local org revoked us, so we stop
+    /// ingesting scoped announcements entirely (§9). Distinct from
+    /// [`Self::MembershipRevoked`], which is about the PUBLISHER: an operator
+    /// seeing this needs to rotate `owner-audience.key`, not investigate a
+    /// peer.
+    LocalMembershipRevoked,
     /// The envelope has expired.
     Expired,
     /// The grant's signature or validity window failed (granted ingest).
@@ -301,6 +345,10 @@ impl std::fmt::Display for ScopedIngestError {
             ScopedIngestError::ProviderCertMismatch => "provider membership cert does not bind P",
             ScopedIngestError::MembershipInvalid => "provider membership cert invalid",
             ScopedIngestError::MembershipRevoked => "provider membership below revocation floor",
+            ScopedIngestError::LocalMembershipRevoked => {
+                "this node's own membership is below its org's revocation floor \
+                 (rotate the owner audience key)"
+            }
             ScopedIngestError::Expired => "scoped announcement expired",
             ScopedIngestError::GrantInvalid => "capability grant invalid",
             ScopedIngestError::GrantWrongGrantee => "grant does not name this org",
@@ -332,6 +380,22 @@ pub fn verify_scoped_ingest(
     authority: &AudienceAuthority<'_>,
     ctx: &ScopedIngestContext<'_>,
 ) -> Result<VerifiedScopedCapability, ScopedIngestError> {
+    // §9 — the LOCAL node's own standing, before any authority-specific work.
+    //
+    // Every other check here concerns the PUBLISHER. Nothing asked whether the
+    // reader is still a member in good standing, so raising a floor for this
+    // node stopped everyone else from accepting it while leaving it free to
+    // keep ingesting the org's private capability list from every remaining
+    // node. Checked at the shared entry rather than inside `verify_owner_ingest`
+    // so a granted authority is covered too: a node revoked from its own org
+    // should not keep harvesting cross-org discoveries either.
+
+    if let Some(local) = &ctx.local_member {
+        let floor = ctx.floors.floor_for(&ctx.local_owner_org, &local.member);
+        if local.generation < floor {
+            return Err(ScopedIngestError::LocalMembershipRevoked);
+        }
+    }
     match authority {
         AudienceAuthority::Owner {
             owner_org,
@@ -602,6 +666,7 @@ mod tests {
             floors,
             now_secs: NOW,
             skew_secs: SKEW,
+            local_member: None,
         }
     }
 
@@ -621,6 +686,102 @@ mod tests {
         );
         assert_eq!(verified.provider(), f.provider.entity_id());
         assert_eq!(verified.descriptor(), f.descriptor.as_slice());
+    }
+
+    /// §9 — a node its OWN org has revoked stops ingesting scoped
+    /// announcements, even though its audience key still decrypts them.
+    ///
+    /// Every other check in this module concerns the PUBLISHER. Raising a floor
+    /// for a member made every OTHER node refuse its announcements and its
+    /// invocations — but its copy of `owner-audience.key` and the owner
+    /// `audience_handle` are unchanged, so it kept ingesting and storing the
+    /// org's full internal private-capability list from every remaining node,
+    /// indefinitely. Nothing looked at the reader's own cert.
+    ///
+    /// Note what this does NOT fix: the revoked node still holds the symmetric
+    /// owner key and can decrypt anything it captured off the wire. Closing
+    /// that requires the §3.4 hard cutover (redistribute the key to every node
+    /// in the org), which no code path triggers. This closes continued
+    /// acceptance of FUTURE announcements and gives operators a signal.
+    ///
+    /// Red-witness: deleting the `local_member` check in `verify_scoped_ingest`
+    /// makes the floored ingest succeed.
+    #[test]
+    fn a_locally_revoked_node_stops_ingesting() {
+        let f = owner_fixture();
+        // The READER is a different node from the publisher, so a floor on it
+        // cannot trip the publisher's `MembershipRevoked` check. Without that
+        // separation the test would pass identically with the new check
+        // deleted — the publisher gate would refuse for its own reasons.
+        let local = EntityKeypair::from_bytes([0x5Au8; 32]).entity_id().clone();
+        assert_ne!(
+            &local,
+            f.provider.entity_id(),
+            "the reader must be distinct from the publisher",
+        );
+        let authority = AudienceAuthority::owner(f.org.org_id(), &f.credential);
+        fn ctx_at<'a>(
+            org: OrgId,
+            member: &EntityId,
+            floors: &'a OrgRevocationState,
+            generation: u32,
+        ) -> ScopedIngestContext<'a> {
+            ScopedIngestContext {
+                local_owner_org: org,
+                floors,
+                now_secs: NOW,
+                skew_secs: SKEW,
+                local_member: Some(LocalMemberStanding {
+                    member: member.clone(),
+                    generation,
+                }),
+            }
+        }
+        let org_id = f.org.org_id();
+
+        // Positive control: no floor, ingest succeeds. Without this a later
+        // refusal could be an artifact of the fixture rather than the floor.
+        let no_floors = OrgRevocationState::empty();
+        assert!(
+            verify_scoped_ingest(
+                &f.envelope,
+                &authority,
+                &ctx_at(org_id, &local, &no_floors, 3)
+            )
+            .is_ok(),
+            "an in-good-standing reader ingests normally",
+        );
+
+        // The org raises a floor ABOVE this reader's own generation — signed by
+        // the org root, exactly as `net org issue-floors` would.
+        let mut floors_map = std::collections::BTreeMap::new();
+        floors_map.insert(local.clone(), 4u32);
+        let bundle = OrgRevocationBundle::try_issue(&f.org, &floors_map).expect("bundle");
+        let mut floored = OrgRevocationState::empty();
+        floored.merge_bundle(&bundle);
+
+        assert_eq!(
+            verify_scoped_ingest(
+                &f.envelope,
+                &authority,
+                &ctx_at(org_id, &local, &floored, 3)
+            )
+            .unwrap_err(),
+            ScopedIngestError::LocalMembershipRevoked,
+            "a locally revoked reader must refuse the ingest",
+        );
+
+        // Boundary: a cert AT the floor is still alive (`generation < floor`),
+        // matching every other floor comparison in the tree.
+        assert!(
+            verify_scoped_ingest(
+                &f.envelope,
+                &authority,
+                &ctx_at(org_id, &local, &floored, 4)
+            )
+            .is_ok(),
+            "a cert AT the floor is not revoked",
+        );
     }
 
     #[test]
@@ -720,6 +881,7 @@ mod tests {
             floors: &floors,
             now_secs: 20_000 + SKEW,
             skew_secs: SKEW,
+            local_member: None,
         };
         assert_eq!(
             verify_scoped_ingest(&f.envelope, &authority, &ctx).unwrap_err(),
@@ -816,6 +978,7 @@ mod tests {
             floors,
             now_secs,
             skew_secs: SKEW,
+            local_member: None,
         }
     }
 

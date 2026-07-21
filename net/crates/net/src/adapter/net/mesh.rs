@@ -17274,7 +17274,7 @@ impl MeshNode {
     ) {
         use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ingest::{
-            verify_scoped_ingest, AudienceAuthority, ScopedIngestContext,
+            verify_scoped_ingest, AudienceAuthority, LocalMemberStanding, ScopedIngestContext,
         };
 
         // The caller has already decoded the frame and outer-verified this
@@ -17326,6 +17326,13 @@ impl MeshNode {
             floors,
             now_secs,
             skew_secs: authority.config.verification_skew_secs,
+            // §9: our OWN standing, checked against the same pinned floors. An
+            // installed authority always carries this node's cert, so it is
+            // `Some` on every production ingest.
+            local_member: Some(LocalMemberStanding {
+                member: authority.config.owner_cert.member.clone(),
+                generation: authority.config.owner_cert.generation,
+            }),
         };
         // OA3-4b2 audience selection: owner (zero sentinel) opens against this
         // node's OWN owner audience; a nonzero grant id selects an installed
