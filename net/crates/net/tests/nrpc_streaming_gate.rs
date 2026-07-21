@@ -163,14 +163,24 @@ async fn client_streaming_denies_unauthorized_caller() {
         .expect("serve");
     arrange_server_denies(&server, &caller, "cs");
 
-    if let Ok(mut call) = caller
+    // §T7: the caller MUST be told. `let _ = timeout(...)` silently accepted a
+    // hang here — and `CallOptions::default()` has `deadline: None`
+    // ("waits indefinitely"), so a regression that bumps the denial metric but
+    // skips `emit_capability_denial` does not fail a test, it hangs one. Every
+    // denied streaming caller would then block forever in production while CI
+    // stayed green. Assert the terminal denial actually ARRIVES.
+    let mut call = caller
         .call_client_stream(server.node_id(), "cs", CallOptions::default())
         .await
-    {
-        let _ = call.send(Bytes::from_static(b"x")).await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), call.finish()).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+        .expect("the call opens; the denial arrives as a terminal frame");
+    let _ = call.send(Bytes::from_static(b"x")).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), call.finish())
+        .await
+        .expect("a denied client-streaming caller must be told, not left hanging");
+    assert!(
+        outcome.is_err(),
+        "the terminal frame must be a denial, not a success: {outcome:?}",
+    );
 
     assert_eq!(hits.load(Ordering::Relaxed), 0, "handler must not run");
     assert_gated(&server, "cs");
@@ -191,14 +201,22 @@ async fn duplex_denies_unauthorized_caller() {
         .expect("serve");
     arrange_server_denies(&server, &caller, "dx");
 
-    if let Ok(mut call) = caller
+    // §T7: the duplex variant was worse than the client-streaming one — it
+    // slept 200 ms and never awaited a terminal frame at all, so it asserted
+    // nothing about the caller's fate. Drive the stream and require the
+    // denial to arrive.
+    let mut call = caller
         .call_duplex(server.node_id(), "dx", CallOptions::default())
         .await
-    {
-        let _ = call.send(Bytes::from_static(b"x")).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        .expect("the call opens; the denial arrives as a terminal frame");
+    let _ = call.send(Bytes::from_static(b"x")).await;
+    let terminal = tokio::time::timeout(Duration::from_secs(5), call.next())
+        .await
+        .expect("a denied duplex caller must be told, not left hanging");
+    match terminal {
+        Some(Err(_)) => {}
+        other => panic!("expected a terminal denial on the duplex stream, got {other:?}"),
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(hits.load(Ordering::Relaxed), 0, "handler must not run");
     assert_gated(&server, "dx");

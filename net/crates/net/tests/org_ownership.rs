@@ -747,7 +747,9 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     store.apply_bundle(&bundle5).expect("apply floor 5");
     node.install_org_revocation_store(store).expect("install");
 
-    let inject = |generation: u32, version: u64| {
+    // Takes the node as a parameter rather than capturing it, so the first
+    // node can be DROPPED for the restart below.
+    let inject = |node: &Arc<MeshNode>, generation: u32, version: u64| {
         let cert =
             OrgMembershipCert::try_issue(&org(), publisher.entity_id().clone(), generation, 3600)
                 .expect("issue");
@@ -763,23 +765,49 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     };
 
     // Below the floor: cert dropped (announcement kept).
-    inject(4, 100);
+    inject(&node, 4, 100);
     assert_eq!(
         owner_org_for(node.capability_fold(), publisher_node_id),
         None
     );
     // At the floor: projects.
-    inject(5, 200);
+    inject(&node, 5, 200);
     assert_eq!(
         owner_org_for(node.capability_fold(), publisher_node_id),
         Some(org().org_id())
     );
 
-    // RESTART: reopen the persisted maxima from disk and apply a
-    // VALID lower bundle (generation 3) — the §1.6 witness. The
-    // floor must remain 5 and a generation-4 cert must still be
-    // dropped.
+    // RESTART — a REAL one (§T5).
+    //
+    // `join_or_create_core` keys a process-global registry of live
+    // `StoreCore`s and hands back the EXISTING core whenever one is still
+    // alive for the path, and `StoreCore::publish` then merges incoming disk
+    // state UNDER the live view with a per-key max. So reopening while the
+    // first store was still held (moved into `install_org_revocation_store`,
+    // kept alive by `node`) returned the same in-memory core and the floor
+    // came from RAM — the disk round-trip this test is named for never ran.
+    // Emptying `to_file_bytes` or skipping the durable write in `apply_bundle`
+    // left it green.
+    //
+    // Drop EVERY strong reference first — the local handle and the node that
+    // owns the installed one. `cores` holds `Weak`s and GCs dead entries, so
+    // after this the reopen genuinely reads from disk.
+    let node_origin = node.origin_hash();
+    drop(node);
+    // A fresh node stands in for the restarted process.
+    let node = build_node().await;
+    assert_ne!(
+        node.origin_hash(),
+        node_origin,
+        "the restarted node must be a distinct instance",
+    );
+
     let restarted = Arc::new(OrgRevocationStore::open_existing(&state_path).expect("reopen"));
+    assert_eq!(
+        restarted.floor_for(&org().org_id(), publisher.entity_id()),
+        5,
+        "the floor was reconstructed FROM DISK, not inherited from a live core",
+    );
     let mut lower = std::collections::BTreeMap::new();
     lower.insert(publisher.entity_id().clone(), 3u32);
     let bundle3 = OrgRevocationBundle::try_issue(&org(), &lower).expect("issue");
@@ -794,7 +822,7 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     );
     node.install_org_revocation_store(restarted)
         .expect("install restarted");
-    inject(4, 300);
+    inject(&node, 4, 300);
     assert_eq!(
         owner_org_for(node.capability_fold(), publisher_node_id),
         None,
@@ -1536,12 +1564,27 @@ async fn opener_cannot_publish_during_authority_installation() {
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let ap = a_path.clone();
             std::thread::spawn(move || {
-                let s = OrgRevocationStore::open_existing(&ap).expect("open A");
-                let _ = done_tx.send(());
-                std::thread::sleep(Duration::from_millis(50));
-                drop(s);
+                // §T8: see the sibling above — a panic here would drop the
+                // sender and make `recv_timeout` return Disconnected
+                // immediately, which `.is_err()` misread as "blocked".
+                let opened = OrgRevocationStore::open_existing(&ap);
+                let ok = opened.is_ok();
+                let _ = done_tx.send(ok);
+                if let Ok(s) = opened {
+                    std::thread::sleep(Duration::from_millis(50));
+                    drop(s);
+                }
             });
-            let blocked = done_rx.recv_timeout(Duration::from_millis(400)).is_err();
+            let blocked = match done_rx.recv_timeout(Duration::from_millis(400)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "the opener thread died instead of blocking — a panic here                      used to read as 'correctly blocked'"
+                ),
+                Ok(opened_ok) => {
+                    assert!(opened_ok, "the opener failed rather than blocking");
+                    false
+                }
+            };
             ob.store(blocked, std::sync::atomic::Ordering::Release);
         })
     });

@@ -380,11 +380,18 @@ async fn a_security_refused_deferred_flush_drives_a_corrective_send() {
     server.start();
     client.start();
 
-    let _handle = server
-        .serve_rpc("deferred-svc", Arc::new(TrivialHandler))
-        .expect("serve");
-    // Publish an emission for the flush to find, without letting it reach the
-    // client yet: the tag must arrive via the CORRECTIVE pass below, not this.
+    // §T6: seed BEFORE the service exists, so the seed announce cannot carry
+    // `nrpc:deferred-svc`. The tag can then only reach the client via the
+    // corrective pass — which is what this test is named for.
+    //
+    // Previously the service was registered first and the seed announce
+    // carried the tag, so the test asserted as a PRECONDITION that the client
+    // could see it and then, after the action, asserted the identical
+    // predicate again. Nothing in between could remove the entry, so the final
+    // assertion held whether or not a corrective pass ever happened: making
+    // the refused-flush branch `return` early left it green. The code had
+    // drifted from the comment directly above it, which already stated the
+    // right intent.
     server
         .announce_capabilities(CapabilitySet::new())
         .await
@@ -393,12 +400,23 @@ async fn a_security_refused_deferred_flush_drives_a_corrective_send() {
     let served = CapabilityFilter::new().require_tag("nrpc:deferred-svc");
     assert!(
         wait_until(
-            || client.find_nodes_by_filter(&served).contains(&server_id),
+            || client
+                .find_nodes_by_filter(&CapabilityFilter::new())
+                .contains(&server_id),
             Duration::from_secs(10),
         )
         .await,
-        "precondition: the seed announce reaches the client",
+        "precondition: the client sees the server at all",
     );
+    assert!(
+        !client.find_nodes_by_filter(&served).contains(&server_id),
+        "precondition: the client must NOT yet know the tag — otherwise the          final assertion cannot distinguish a corrective pass from the seed",
+    );
+
+    // NOW register the service. This is what the deferred flush will carry.
+    let _handle = server
+        .serve_rpc("deferred-svc", Arc::new(TrivialHandler))
+        .expect("serve");
 
     // Now force the DEFERRED flush's send to be refused, one-shot.
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -432,7 +450,11 @@ async fn a_security_refused_deferred_flush_drives_a_corrective_send() {
          republished a coherent emission",
     );
     assert!(
-        client.find_nodes_by_filter(&served).contains(&server_id),
-        "the client's view must remain coherent across the refused flush",
+        wait_until(
+            || client.find_nodes_by_filter(&served).contains(&server_id),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the tag must reach the client via the CORRECTIVE pass — the seed          announce predates the service, so this is the only way it can arrive",
     );
 }
