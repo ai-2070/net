@@ -5,9 +5,9 @@
  * generates and consumes — and asserts this binding's classifier recovers the
  * identical domain, kind, and local/remote verdict.
  *
- * Uses synthetic `Error` objects rather than a live mesh, following
- * `abi_stability.test.ts`: no native module is required, so a vocabulary
- * rename fails here immediately rather than after a cdylib rebuild.
+ * Imports from `../errors`, which is native-free, so this runs with no
+ * compiled cdylib at all — following `abi_stability.test.ts`. A vocabulary
+ * rename therefore fails here immediately, not after a rebuild.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -15,13 +15,14 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
+  classifyError,
   classifyOrgError,
   OrgAdmissionDeniedError,
   OrgCredentialsError,
   OrgDiscoveryError,
   OrgError,
   OrgUnclassifiedError,
-} from '../org'
+} from '../errors'
 
 interface Vector {
   wire: string
@@ -129,5 +130,21 @@ describe('org error vocabulary (cross-language fixture)', () => {
   it('passes through errors that are not org errors', () => {
     const other = new Error('nrpc:timeout: elapsed_ms=5000')
     expect(classifyOrgError(other)).toBe(other)
+  })
+
+  /**
+   * N5 — the GENERIC classifier routes org errors too, so a caller doing
+   * `classifyError(e)` at a shared catch site gets a typed org error without
+   * having to know the org module exists.
+   */
+  it('is reachable through the generic classifyError', () => {
+    for (const v of fixture.vectors) {
+      const classified = classifyError(new Error(v.wire))
+      expect(classified, v.wire).toBeInstanceOf(OrgError)
+      expect((classified as OrgError).domain, v.wire).toBe(v.domain)
+    }
+    // And it does not disturb the vocabularies that were already there.
+    const rpc = classifyError(new Error('nrpc:timeout: elapsed_ms=5000'))
+    expect(rpc).not.toBeInstanceOf(OrgError)
   })
 })
