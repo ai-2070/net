@@ -696,9 +696,12 @@ mod tests {
     /// residue may be a PREFIX of the seed file rather than nothing.
     ///
     /// Driven deterministically by handing the writer a READ-ONLY handle to an
-    /// existing file: `write_all` then fails with a permission error on every
-    /// platform. Forcing a genuine ENOSPC/EIO from inside the blocking closure
-    /// is not portable, which is why the cleanup was extracted into
+    /// existing file: `write_all` then fails on every platform, though the
+    /// error differs — POSIX `write(2)` on an `O_RDONLY` fd is EBADF (no
+    /// `ErrorKind` mapping, so `Uncategorized`), while Windows `WriteFile`
+    /// without `GENERIC_WRITE` is `ERROR_ACCESS_DENIED` (`PermissionDenied`).
+    /// Forcing a genuine ENOSPC/EIO from inside the blocking closure is not
+    /// portable, which is why the cleanup was extracted into
     /// `write_sync_or_remove`.
     ///
     /// Red-witness: deleting the removal block leaves the file on disk and
@@ -715,6 +718,13 @@ mod tests {
 
         let err = write_sync_or_remove(read_only, &tmp, b"the-real-seed")
             .expect_err("writing through a read-only handle must fail");
+        #[cfg(unix)]
+        assert_eq!(
+            err.raw_os_error(),
+            Some(9), // EBADF — write(2) on an O_RDONLY fd; same value on Linux/macOS/BSDs
+            "precondition: the failure is the write itself, not something else",
+        );
+        #[cfg(windows)]
         assert_eq!(
             err.kind(),
             std::io::ErrorKind::PermissionDenied,
