@@ -449,8 +449,13 @@ struct MeshNewConfig {
     /// path and migrated (Stage 3; optimization, not correctness —
     /// traffic rides the relay until the swap). Silently ignored
     /// when the cdylib is built without `--features nat-traversal`.
+    ///
+    /// Tri-state on purpose: absent inherits the core default (on),
+    /// `false` is an explicit kill switch. A plain `bool` here would
+    /// collapse "unset" into "off" and make the flag impossible to
+    /// disable through a JSON surface that omits empty values.
     #[serde(default)]
-    auto_direct_upgrade: bool,
+    auto_direct_upgrade: Option<bool>,
 }
 
 /// FFI handle for a [`MeshNode`].
@@ -575,8 +580,8 @@ pub unsafe extern "C" fn net_mesh_new(
     #[cfg(not(feature = "port-mapping"))]
     let _ = cfg.try_port_mapping;
     #[cfg(feature = "nat-traversal")]
-    if cfg.auto_direct_upgrade {
-        node_cfg = node_cfg.with_auto_direct_upgrade(true);
+    if let Some(enabled) = cfg.auto_direct_upgrade {
+        node_cfg = node_cfg.with_auto_direct_upgrade(enabled);
     }
     // Same drop-on-the-floor pattern as reflex_override above.
     #[cfg(not(feature = "nat-traversal"))]

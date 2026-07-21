@@ -39,13 +39,13 @@ When enabled, the runtime probes for UPnP-IGD on the local router, requests a po
 
 The decision to enable port mapping is environmental. Use it in single-tenant residential or office environments where modifying the router is expected. Skip it in cloud environments (where the router doesn't speak UPnP) and in multi-tenant networks (where modifying the router has implications for other users).
 
-## Background direct-path upgrade (opt-in)
+## Background direct-path upgrade
 
-When two peers first reach each other through a relay, that relayed session works — but every packet pays the extra hop. With `auto_direct_upgrade` enabled, the runtime notices relay-routed sessions in the background and opportunistically re-handshakes over a direct path (the peer's advertised external address), migrating the session once the direct path lands. Traffic rides the relay until the swap; if the direct attempt fails, nothing changes.
+When two peers first reach each other through a relay, that relayed session works — but every packet pays the extra hop. The runtime notices relay-routed sessions in the background and opportunistically re-handshakes over a direct path (the peer's advertised external address), migrating the session once the direct path lands. Traffic rides the relay until the swap; if the direct attempt fails, nothing changes.
 
 The swap is guarded so it never disrupts in-flight work: only one side initiates (the lower node id, so re-handshakes can't cross), the install is compare-and-swapped against any racing handshake, and a session with open streams or unacked data defers the upgrade until it goes quiescent. Failed attempts back off exponentially per peer.
 
-Off by default. Enable it per-deployment: `auto_direct_upgrade(true)` on the Rust SDK builder, `autoDirectUpgrade: true` in the Node options, `auto_direct_upgrade=True` on the Python constructor, `AutoDirectUpgrade: true` in the Go config. There is also a one-shot form — `connect_direct_auto(peer, pubkey)` (`connectDirectAuto` / `ConnectDirectAuto`) — which picks the rendezvous coordinator automatically and establishes the best available path for a single peer on demand.
+On by default as of v0.34 (it was opt-in in v0.32–v0.33), validated against the netns + nftables real-NAT harness in CI. To pin traffic to the relay path, disable it explicitly: `auto_direct_upgrade(false)` on the Rust SDK builder, `autoDirectUpgrade: false` in the Node options, `auto_direct_upgrade=False` on the Python constructor, `AutoDirectUpgrade: &false` in the Go config (the field is a `*bool`, so leaving it `nil` inherits the default). There is also a one-shot form — `connect_direct_auto(peer, pubkey)` (`connectDirectAuto` / `ConnectDirectAuto`) — which picks the rendezvous coordinator automatically and establishes the best available path for a single peer on demand.
 
 ## Failure detection
 

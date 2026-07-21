@@ -1203,8 +1203,9 @@ mod mesh_bindings {
         ///
         /// **Optimization, not correctness** — traffic rides the
         /// relay until (and unless) a direct path lands. Default
-        /// `false`. Silently ignored when the binding was built
-        /// without `--features nat-traversal`.
+        /// `true`; pass `false` to pin traffic to the relay path.
+        /// Silently ignored when the binding was built without
+        /// `--features nat-traversal`.
         pub auto_direct_upgrade: Option<bool>,
         /// Opt out of channel authorization: when `true`, no
         /// `ChannelConfigRegistry` is installed on the node, so
@@ -1528,9 +1529,12 @@ mod mesh_bindings {
             if options.try_port_mapping == Some(true) {
                 config = config.with_try_port_mapping(true);
             }
+            // `if let`, not `== Some(true)`: the flag defaults on, so
+            // `autoDirectUpgrade: false` must reach the core config
+            // rather than being swallowed as "not opted in".
             #[cfg(feature = "nat-traversal")]
-            if options.auto_direct_upgrade == Some(true) {
-                config = config.with_auto_direct_upgrade(true);
+            if let Some(enabled) = options.auto_direct_upgrade {
+                config = config.with_auto_direct_upgrade(enabled);
             }
 
             let identity = match options.identity_seed {
