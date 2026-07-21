@@ -660,3 +660,160 @@ async fn two_mesh_wrappers_over_one_node_share_the_audience_lease() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// 6. The node-based bind seam (OSDK-L N)
+// ---------------------------------------------------------------------------
+
+/// Witness 1 — seam parity. `Mesh::org` and `OrgClient::bind_node` are two
+/// doors onto ONE pipeline, so a binding using the node seam gets exactly the
+/// authority the in-process facade gets: same successes, same refusals.
+#[tokio::test]
+async fn the_mesh_and_node_bind_seams_are_equivalent() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("seam-parity", Some(&a)).await;
+    let creds = || {
+        let (cert, dg) = belonging(&a, identity.entity_id());
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles")
+    };
+
+    let via_mesh = mesh.org(creds()).expect("Mesh::org binds");
+    let via_node = crate::org::OrgClient::bind_node(mesh.node().clone(), creds())
+        .expect("OrgClient::bind_node binds");
+    assert_eq!(via_mesh.acting_org(), via_node.acting_org());
+    assert_eq!(via_mesh.caller(), via_node.caller());
+
+    // And they refuse the same way: a membership for someone else.
+    let stranger = EntityKeypair::generate().entity_id().clone();
+    let bad = || {
+        let (cert, dg) = belonging(&a, &stranger);
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles")
+    };
+    let e1 = mesh.org(bad()).expect_err("mesh refuses");
+    let e2 = crate::org::OrgClient::bind_node(mesh.node().clone(), bad())
+        .expect_err("node seam refuses");
+    assert!(matches!(
+        e1,
+        crate::org::OrgSdkError::Credentials(OrgCredentialError::MemberBindingMismatch { .. })
+    ));
+    assert!(
+        matches!(
+            e2,
+            crate::org::OrgSdkError::Credentials(OrgCredentialError::MemberBindingMismatch { .. })
+        ),
+        "got {e2:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Witness 2 — implicit identity refusal. A node whose keypair the runtime
+/// generated is not a durable entity, so org credentials cannot bind to it.
+/// This is the check a binding holding only `Arc<MeshNode>` could not make
+/// before construction provenance existed.
+#[tokio::test]
+async fn a_generated_fallback_identity_cannot_bind_org_credentials() {
+    let a = org_a();
+    // No `.identity(..)` — the builder mints an ephemeral keypair.
+    let mesh = Mesh::builder("127.0.0.1:0", &[0x54u8; 32])
+        .expect("builder")
+        .build()
+        .await
+        .expect("mesh");
+    assert!(
+        !mesh.node().has_configured_identity(),
+        "a generated fallback is not configured provenance"
+    );
+
+    let member = mesh.node().entity_id().clone();
+    let (cert, dg) = belonging(&a, &member);
+    let creds = OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles");
+
+    let err = crate::org::OrgClient::bind_node(mesh.node().clone(), creds)
+        .expect_err("must refuse a generated identity");
+    assert!(
+        matches!(
+            err,
+            crate::org::OrgSdkError::Credentials(OrgCredentialError::PersistentIdentityRequired)
+        ),
+        "got {err:?}"
+    );
+}
+
+/// Witness 3 — configured identity succeeds. The positive control for the
+/// provenance flag: `MeshBuilder::identity(..)` records it, and the bind
+/// proceeds to the authority relation.
+#[tokio::test]
+async fn an_explicitly_configured_identity_binds() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("provenance-ok", Some(&a)).await;
+    assert!(
+        mesh.node().has_configured_identity(),
+        "MeshBuilder::identity records configured provenance"
+    );
+    let (cert, dg) = belonging(&a, identity.entity_id());
+    crate::org::OrgClient::bind_node(
+        mesh.node().clone(),
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles"),
+    )
+    .expect("binds");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Witness 4 — identity mismatch through the node seam. Provenance is not a
+/// substitute for the member binding: a configured identity that is not the
+/// one the membership vouches for is still refused.
+#[tokio::test]
+async fn the_node_seam_still_enforces_the_member_binding() {
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("seam-member", Some(&a)).await;
+    let stranger = EntityKeypair::generate().entity_id().clone();
+    let (cert, dg) = belonging(&a, &stranger);
+
+    let err = crate::org::OrgClient::bind_node(
+        mesh.node().clone(),
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles"),
+    )
+    .expect_err("must refuse");
+    assert!(
+        matches!(
+            err,
+            crate::org::OrgSdkError::Credentials(OrgCredentialError::MemberBindingMismatch { .. })
+        ),
+        "got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Witness 5 — the node-shutdown lifecycle, at the Rust level.
+///
+/// A live `OrgClient` holds an `Arc<MeshNode>`, so the node has outstanding
+/// references; dropping the client releases them. This is the Rust-side fact
+/// behind the corrected Node witness: `NetMesh.shutdown()` drains, then REJECTS
+/// with an outstanding-references error and restores the node — it does not
+/// hang, and the node stays usable for a later retry.
+#[tokio::test]
+async fn a_live_org_client_holds_a_node_reference_until_dropped() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("shutdown-refs", Some(&a)).await;
+    let node = mesh.node().clone();
+    let before = Arc::strong_count(&node);
+
+    let (cert, dg) = belonging(&a, identity.entity_id());
+    let client = crate::org::OrgClient::bind_node(
+        node.clone(),
+        OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles"),
+    )
+    .expect("binds");
+    assert!(
+        Arc::strong_count(&node) > before,
+        "a live client holds node references — what makes shutdown refuse"
+    );
+
+    drop(client);
+    assert_eq!(
+        Arc::strong_count(&node),
+        before,
+        "dropping the client releases them, so a retried shutdown can succeed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

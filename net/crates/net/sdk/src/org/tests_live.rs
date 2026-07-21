@@ -129,6 +129,9 @@ async fn fast_mesh(
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5));
     cfg.min_announce_interval = Duration::from_millis(50);
+    // The caller IS supplying an identity here (below), so record that
+    // provenance the way MeshBuilder::identity would.
+    cfg.configured_identity = true;
 
     let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
         .await

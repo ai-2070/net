@@ -191,6 +191,46 @@ impl Mesh {
 `call` and `serve_org` are then re-expressed in terms of them, so there is one
 code path and the typed layer is provably just JSON.
 
+### D1a. The bind seam is node-based
+
+Bindings hold `Arc<MeshNode>`, not an SDK `Mesh` (`bindings/node/src/lib.rs:1468`,
+and Python/Go likewise). Three tempting shapes are all wrong: fabricating a
+throwaway `Mesh` per bind makes `from_node_arc` an accidental binding adapter
+and initializes unrelated wrapper state; holding a persistent `Mesh` adds a
+permanent `Arc<MeshNode>` that makes `shutdown()` reject; and putting `org()`
+on core `MeshNode` would invert the dependency direction, since
+`OrgCredentials`, `OrgClient`, and `OrgSdkError` are SDK types.
+
+So the bind pipeline has ONE implementation, reached by two doors:
+
+```rust
+impl OrgClient {
+    #[doc(hidden)]
+    pub fn bind_node(node: Arc<MeshNode>, credentials: OrgCredentials)
+        -> Result<Self, OrgSdkError>;
+}
+impl Mesh {
+    pub fn org(&self, credentials: OrgCredentials) -> Result<OrgClient, OrgSdkError> {
+        OrgClient::bind_node(self.node().clone(), credentials)
+    }
+}
+```
+
+**Prerequisite: identity provenance must be node-visible.** `Mesh::org`
+previously decided "was an identity configured?" from `Mesh.identity:
+Option<Identity>`, which a binding holding only the node cannot see. Rather
+than weaken the check or pass an unaudited boolean across the seam, the node
+records immutable construction provenance: `MeshNodeConfig::configured_identity`
+→ `MeshNode::has_configured_identity()`, set true by `MeshBuilder::identity(..)`
+and by each binding when the caller supplies an identity, false for a generated
+fallback.
+
+It is **node metadata, not an authority decision** — nothing there verifies a
+key, and membership, authority, signatures, and admission stay canonical. It is
+named `configured` rather than "persistent" or "proven" because a caller may
+pass `Identity::generate()` explicitly; it records the SDK's existing contract
+(caller-supplied vs implicit fallback) and no more.
+
 ### D2. The credential boundary — the one place bindings differ from Rust
 
 The credential set splits cleanly along a security line:
@@ -700,15 +740,23 @@ will do.
 **Acceptance:** a Node service serves a private cross-org capability and a Node
 client calls it, with the handler reading `caller.actingOrg`.
 
-The disposal witness asserts the blocking behavior §D3 documents, rather than
-only the happy path — and does it with bounded timeouts at **both** states, so
-the test never hangs to prove a hang:
+The disposal witness asserts what `NetMesh.shutdown()` actually does, which is
+**reject, not hang** — it drains `Arc::try_unwrap` for ~250 ms (50 x 5 ms),
+then returns `"cannot shutdown: outstanding references exist"` and **restores
+the node**, so the node stays usable and a later retry can succeed
+(`bindings/node/src/lib.rs:2134`):
 
 ```
-mesh.shutdown() is still PENDING while a live OrgClient exists   (bounded wait)
+live OrgClient
+→ shutdown() REJECTS with the outstanding-references error
+→ the node is still usable
 → orgClient.close()
-→ shutdown() completes                                            (bounded wait)
+→ shutdown() retried → succeeds
 ```
+
+An earlier draft said "shutdown remains pending until close." That did not
+match the implementation, and a witness written against it would have asserted
+a hang that never happens.
 
 ### Workstream P — Python (house style: sync/async pairs, GIL release, stub discipline)
 

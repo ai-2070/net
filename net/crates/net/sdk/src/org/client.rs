@@ -106,18 +106,31 @@ impl std::fmt::Debug for OrgClient {
     }
 }
 
-impl Mesh {
-    /// Bind an organization credential set to this mesh (OSDK §1).
+impl OrgClient {
+    /// Bind a credential set to a NODE — the one implementation of the bind
+    /// pipeline (OSDK-L N).
+    ///
+    /// [`Mesh::org`] delegates here, and so does every language binding: the
+    /// Node, Python, and Go/C surfaces hold `Arc<MeshNode>` rather than an SDK
+    /// [`Mesh`], and neither fabricating a throwaway `Mesh` per bind nor
+    /// pinning a permanent one is acceptable — the first makes
+    /// `Mesh::from_node_arc` an accidental binding adapter, the second adds a
+    /// permanent `Arc<MeshNode>` that blocks shutdown.
+    ///
+    /// `#[doc(hidden)]` because applications should use [`Mesh::org`]; this is
+    /// the binding seam, not a second public way to do the same thing. There is
+    /// exactly one authority pipeline and both doors reach it.
     ///
     /// Refuses unless the complete private-discovery identity relation holds:
     ///
-    /// 1. the mesh has a configured durable identity — org membership binds to
-    ///    a durable cryptographic entity, never a generated ephemeral keypair;
+    /// 1. the node's identity was EXPLICITLY configured — org membership binds
+    ///    to a durable cryptographic entity, never a generated ephemeral
+    ///    keypair whose entity id changes on restart;
     /// 2. a node authority is installed — consumer-audience installation and
     ///    owner-private discovery both require it, so binding without one would
     ///    search private state that can never exist;
     /// 3. that authority's owner org is the membership's org;
-    /// 4. the membership vouches for THIS mesh's identity (the provider's TOFU
+    /// 4. the membership vouches for THIS node's entity (the provider's TOFU
     ///    member binding would refuse otherwise — fail before signing).
     ///
     /// Then each DISCOVER grant's audience is leased into the node's consumer
@@ -126,12 +139,18 @@ impl Mesh {
     /// rather than leaving a client that silently discovers nothing.
     ///
     /// The lease is released when the last clone of the returned client drops.
-    pub fn org(&self, credentials: OrgCredentials) -> Result<OrgClient, OrgSdkError> {
-        let identity = self
-            .identity()
-            .ok_or(OrgCredentialError::PersistentIdentityRequired)?;
-        let authority = self
-            .node()
+    #[doc(hidden)]
+    pub fn bind_node(
+        node: Arc<MeshNode>,
+        credentials: OrgCredentials,
+    ) -> Result<Self, OrgSdkError> {
+        // Node metadata, not an authority decision — but the facade's contract
+        // is that org credentials bind to a durable entity, and a generated
+        // fallback identity is not one.
+        if !node.has_configured_identity() {
+            return Err(OrgCredentialError::PersistentIdentityRequired.into());
+        }
+        let authority = node
             .node_authority()
             .ok_or(OrgCredentialError::NodeAuthorityRequired)?;
 
@@ -143,9 +162,9 @@ impl Mesh {
             }
             .into());
         }
-        if credentials.member() != identity.entity_id() {
+        if credentials.member() != node.entity_id() {
             return Err(OrgCredentialError::MemberBindingMismatch {
-                expected: identity.entity_id().clone(),
+                expected: node.entity_id().clone(),
                 credential: credentials.member().clone(),
             }
             .into());
@@ -167,10 +186,9 @@ impl Mesh {
             pairs.push((grant.clone(), secret));
         }
 
-        // The lease registry lives on the NODE, so every `Mesh` wrapper over
-        // this node shares one refcount per grant id.
-        let grant_ids = self
-            .node()
+        // The lease registry lives on the NODE, so every wrapper over this node
+        // shares one refcount per grant id.
+        let grant_ids = node
             .acquire_consumer_audience_leases(pairs)
             .map_err(|(id, source)| OrgCredentialError::AudienceInstallRefused {
                 grant_id: hex32(&id),
@@ -178,14 +196,24 @@ impl Mesh {
             })?;
 
         Ok(OrgClient {
-            node: self.node().clone(),
-            caller: identity.keypair().clone(),
+            caller: node.entity_keypair_arc(),
             membership,
             dispatcher,
             grants,
             acting_org,
             skew_secs: authority.config.verification_skew_secs,
-            _lease: Arc::new(AudienceLeaseGuard::new(self.node().clone(), grant_ids)),
+            _lease: Arc::new(AudienceLeaseGuard::new(node.clone(), grant_ids)),
+            node,
         })
+    }
+}
+
+impl Mesh {
+    /// Bind an organization credential set to this mesh (OSDK §1).
+    ///
+    /// Thin delegation to [`OrgClient::bind_node`], which documents the
+    /// complete relation this refuses on. One pipeline, two doors.
+    pub fn org(&self, credentials: OrgCredentials) -> Result<OrgClient, OrgSdkError> {
+        OrgClient::bind_node(self.node().clone(), credentials)
     }
 }

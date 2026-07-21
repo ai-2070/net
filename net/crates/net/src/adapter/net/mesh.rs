@@ -1596,6 +1596,22 @@ pub struct MeshNodeConfig {
     /// in-window broadcast is dropped as before). Rate-limits apps
     /// that re-announce in tight loops.
     pub min_announce_interval: Duration,
+
+    /// Whether the caller EXPLICITLY supplied this node's identity, as opposed
+    /// to the runtime generating an ephemeral fallback (OSDK-L N).
+    ///
+    /// Node metadata, not an authority decision: nothing here verifies a key,
+    /// and every membership/authority/admission check remains canonical. It
+    /// exists because the organization facade refuses to bind to a generated
+    /// ephemeral identity — org membership binds to a durable entity — and a
+    /// language binding holding only `Arc<MeshNode>` cannot otherwise tell the
+    /// two apart.
+    ///
+    /// Deliberately named `configured`, not "persistent" or "proven": a caller
+    /// may pass `Identity::generate()` explicitly. It records the SDK's existing
+    /// contract exactly — caller-supplied versus implicit fallback — and no
+    /// more.
+    pub configured_identity: bool,
     /// Debounce window for the change-driven announcer (RT-3,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). When a local
     /// capability mutation fires the RT-2 change signal — a
@@ -1890,6 +1906,7 @@ impl MeshNodeConfig {
             subnet_policy: None,
             default_visibility: Visibility::Global,
             min_announce_interval: Duration::from_secs(10),
+            configured_identity: false,
             announce_debounce: Duration::from_millis(100),
             event_pingwave_min_gap: Duration::from_millis(250),
             enable_route_withdraw: true,
@@ -6602,6 +6619,16 @@ impl MeshNode {
         &self.identity
     }
 
+    /// The node's identity keypair as a shared handle (OSDK-L N).
+    ///
+    /// The organization facade signs proofs with the node's own identity and
+    /// needs to hold it for the client's lifetime, so it takes the `Arc` rather
+    /// than a borrow. Same key the `entity_keypair` borrow exposes — no new
+    /// material crosses any boundary, and bindings still never see it.
+    pub fn entity_keypair_arc(&self) -> Arc<EntityKeypair> {
+        self.identity.clone()
+    }
+
     /// Look up a peer's pinned `entity_id`, if the TOFU binding
     /// has been established. Returns `None` before we've received
     /// a signature-verified `CapabilityAnnouncement` from the peer.
@@ -8374,6 +8401,16 @@ impl MeshNode {
             },
             None => false,
         }
+    }
+
+    /// Whether the caller explicitly supplied this node's identity (OSDK-L N).
+    ///
+    /// `false` means the runtime generated an ephemeral keypair, whose entity
+    /// id changes on every restart. The organization facade refuses to bind
+    /// credentials to such a node, because an org membership certificate names
+    /// a durable entity.
+    pub fn has_configured_identity(&self) -> bool {
+        self.config.configured_identity
     }
 
     /// The node's consumer-audience lease registry (OSDK S0).
