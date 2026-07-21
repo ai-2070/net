@@ -210,33 +210,60 @@ fn grant_capability_discover_mints_secret_file_0600() {
     }
 }
 
+/// §T4 — each flag-validation case must be refused for its OWN reason.
+///
+/// Three of the five cases used to pass `--target-any-owned-by
+/// TARGET_ORG_HEX`, an org that is NOT the freshly keygen'd issuer. That
+/// tripped `check_target_owner` -> `TargetOrgNotIssuer` -> `invalid_args` ->
+/// exit 2, which is the same code the test asserted for the check under
+/// test. Deleting the no-rights arm, the `--discover requires --audience-out`
+/// arm, or the `--audience-out without --discover` arm therefore left it
+/// green: control simply fell through to `try_issue` and died identically.
+///
+/// Fixed twice over: the target org is now the ISSUER's own (so
+/// `check_target_owner` passes and cannot mask anything), and every case
+/// asserts the stderr TEXT of its own rule rather than only the exit code —
+/// clap's usage code and `ExitCodeKind::InvalidArgs` are both 2.
 #[test]
 fn grant_capability_flag_validation() {
     let dir = tempfile::tempdir().unwrap();
     let key = keygen(dir.path(), "org.toml");
     let out = dir.path().join("x.grant.json");
+    // `AnyNodeOwnedBy` must name the ISSUING org, or `check_target_owner`
+    // refuses first and masks the rule actually under test.
+    let issuer_org = org_id_of(&key);
 
-    // Each of these fails validation BEFORE any file is written.
-    for extra in [
+    // Each of these fails validation BEFORE any file is written, and the
+    // expected substring pins WHICH rule refused it.
+    for (extra, expect) in [
         // no rights
-        vec!["--target-any-owned-by", TARGET_ORG_HEX],
+        (
+            vec!["--target-any-owned-by", issuer_org.as_str()],
+            "at least one of --invoke or --discover",
+        ),
         // --discover without --audience-out
-        vec![
-            "--invoke",
-            "--discover",
-            "--target-any-owned-by",
-            TARGET_ORG_HEX,
-        ],
+        (
+            vec![
+                "--invoke",
+                "--discover",
+                "--target-any-owned-by",
+                issuer_org.as_str(),
+            ],
+            "--audience-out",
+        ),
         // both target flags
-        vec![
-            "--invoke",
-            "--target-node",
-            TARGET_NODE_HEX,
-            "--target-any-owned-by",
-            TARGET_ORG_HEX,
-        ],
+        (
+            vec![
+                "--invoke",
+                "--target-node",
+                TARGET_NODE_HEX,
+                "--target-any-owned-by",
+                issuer_org.as_str(),
+            ],
+            "mutually exclusive",
+        ),
         // neither target flag
-        vec!["--invoke"],
+        (vec!["--invoke"], "one of --target-node"),
     ] {
         let mut c = Command::cargo_bin("net-mesh").unwrap();
         c.args(["org", "grant-capability", "--org-key"])
@@ -248,7 +275,12 @@ fn grant_capability_flag_validation() {
         for a in &extra {
             c.arg(a);
         }
-        c.assert().code(2);
+        let assert = c.assert().code(2);
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+        assert!(
+            stderr.contains(expect),
+            "case {extra:?} must be refused by its OWN rule (expected {expect:?});              got: {stderr}",
+        );
     }
 
     // --audience-out without --discover → refused.
@@ -402,7 +434,15 @@ fn grant_capability_rejects_aliased_paths() {
     let same = dir.path().join("same.json");
 
     // --out aliased onto --audience-out → refused (would collide the pair).
-    Command::cargo_bin("net-mesh")
+    //
+    // §T4: both cases now assert the alias guard's OWN message. Asserting only
+    // `.code(2)` let `refuse_aliased_paths` be deleted wholesale and stay
+    // green — the no-clobber publish (`ErrorKind::AlreadyExists`) produces the
+    // identical exit code, and the rollback cleans up so the follow-up
+    // assertions held too. Production's own comment calls the alias check
+    // "best-effort", with the real safety in no-clobber publication, so an
+    // exit-code-only test pinned nothing about the guard it is named for.
+    let assert_pair = Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["org", "grant-capability", "--org-key"])
         .arg(&key)
@@ -417,9 +457,14 @@ fn grant_capability_rejects_aliased_paths() {
         .arg(&same)
         .assert()
         .code(2);
+    let stderr = String::from_utf8_lossy(&assert_pair.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("resolve to the same path"),
+        "the PAIR collision must be refused by the alias guard, not by          no-clobber publication (which would also exit 2); got: {stderr}",
+    );
 
     // --out aliased onto the org key → refused (would clobber the root seed).
-    Command::cargo_bin("net-mesh")
+    let assert_key = Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["org", "grant-capability", "--org-key"])
         .arg(&key)
@@ -431,6 +476,11 @@ fn grant_capability_rejects_aliased_paths() {
         .arg(&key)
         .assert()
         .code(2);
+    let stderr = String::from_utf8_lossy(&assert_key.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("resolve to the same path"),
+        "the org-key alias must be refused by the alias guard specifically;          got: {stderr}",
+    );
     assert!(
         std::fs::read_to_string(&key).unwrap().contains("seed_hex"),
         "the org key was not clobbered",

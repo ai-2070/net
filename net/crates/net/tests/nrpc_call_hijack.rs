@@ -234,11 +234,29 @@ async fn a_forged_cancel_claiming_a_victims_origin_is_dropped_at_the_origin_bind
 /// stop it now is that `InFlightCalls` keys on `(from_node, origin,
 /// call_id)`: the attacker's tuple simply does not name the victim's entry.
 ///
-/// Red-witness: reverting `cortex/rpc.rs`'s key to `(origin, seq_or_ts)`
-/// still misses here (the origins differ), but reverting it to `seq_or_ts`
-/// alone — the shape a call_id-only cache would have — cancels the victim.
-/// The origin-mismatch counter is asserted UNCHANGED so this test provably
-/// exercises the fold path and not the bind.
+/// SCOPE — what this does and does NOT witness (§T2, Kyra).
+///
+/// It witnesses that a call_id ALONE does not name a call: the attacker's
+/// frame reaches `apply_inbound` and misses. It does NOT witness the
+/// `from_node` component of the key, because the origins differ here, so
+/// reverting the key to `(origin, call_id)` leaves this green.
+///
+/// That component cannot be witnessed from an integration test at all, and
+/// the reason is a correct ordering rather than a gap: `bridge_origin_check`
+/// requires `inbound.origin_hash == meta.origin_hash`, and `inbound.origin_hash`
+/// is set by the transport from the AUTHENTICATED sender. A remote attacker
+/// therefore cannot present the victim's origin — Gate-3 rejects the frame
+/// before the fold ever sees it. The `from_node` component is defense in
+/// depth BEHIND that bind.
+///
+/// Where it IS witnessed, at the layer where it is reachable: the four
+/// fold-level tests in `cortex/rpc.rs` —
+/// `unary_fold_foreign_session_cancel_cannot_hijack_a_call` and its
+/// streaming / client-streaming / duplex siblings — drive `apply_inbound`
+/// directly with the SAME origin and a DIFFERENT `from_node`. Verified:
+/// collapsing the session component of the key
+/// (`(from_node, origin, seq)` -> `(0, origin, seq)`) fails all four and
+/// leaves this file green, which is exactly the split described above.
 #[tokio::test]
 async fn a_cancel_under_the_attackers_own_origin_cannot_reach_a_victims_call() {
     let server = build_node().await;
