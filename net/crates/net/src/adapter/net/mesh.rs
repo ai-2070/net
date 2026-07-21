@@ -1492,6 +1492,10 @@ pub struct MeshNodeConfig {
     /// values waste CPU; high values keep stale peers queryable past
     /// their TTL.
     pub capability_gc_interval: Duration,
+    /// Replay-guard capacity envelope (§5) — global cap, owner reserve,
+    /// per-external-org quota, per-caller quota. See
+    /// [`MeshNodeConfig::with_admission_replay_config`].
+    pub admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig,
     /// How often this node re-announces its own capabilities to keep its
     /// entry alive. Capability entries carry a TTL (default 300 s) and the
     /// fold sweeper evicts them on expiry, so without a periodic
@@ -1845,6 +1849,8 @@ impl MeshNodeConfig {
             membership_ack_timeout: Duration::from_secs(5),
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
+            admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
+            ),
             capability_reannounce_interval: Duration::from_secs(150),
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
@@ -1950,6 +1956,26 @@ impl MeshNodeConfig {
     /// trace is emitted).
     pub fn with_require_signed_capabilities(mut self, require: bool) -> Self {
         self.require_signed_capabilities = require;
+        self
+    }
+
+    /// Replay-guard capacity envelope (§5).
+    ///
+    /// The defaults are SAFE defaults, not universal workload limits: they
+    /// partition a fixed 65 536-entry budget by trust domain so no external
+    /// coalition can deny the provider's own org. An operator running
+    /// high-rate protected RPC can raise the envelope knowingly — the point of
+    /// the partition is that the failure mode is attributable and bounded, not
+    /// that the numbers suit every deployment.
+    ///
+    /// Validated at node construction; an inconsistent envelope (a reserve at
+    /// or above the total, a per-org quota that cannot fit the external pool)
+    /// is refused loudly rather than clamped.
+    pub fn with_admission_replay_config(
+        mut self,
+        config: super::behavior::org_admission_replay::AdmissionReplayConfig,
+    ) -> Self {
+        self.admission_replay = config;
         self
     }
 
@@ -5927,6 +5953,10 @@ impl MeshNode {
         let sensing_leader_failure = sensing_leader.clone();
         let sensing_router_failure = router.clone();
         let sensing_addr_to_node_failure = addr_to_node.clone();
+        // §5 — captured BEFORE `config` is moved into the node, and validated
+        // here so an inconsistent envelope fails at construction rather than
+        // at the first protected call under load.
+        let admission_replay_config = config.admission_replay;
         let enable_sensing_failure = config.enable_sensing_coalescing;
         let sensing_overlay_recovery = sensing_overlay_changed.clone();
         let enable_sensing_recovery = config.enable_sensing_coalescing;
@@ -6262,7 +6292,9 @@ impl MeshNode {
             consumer_grant_mu: parking_lot::Mutex::new(()),
             #[cfg(feature = "cortex")]
             rpc_admission_replay: Arc::new(
-                super::behavior::org_admission_replay::AdmissionReplayGuard::with_defaults(),
+                super::behavior::org_admission_replay::AdmissionReplayGuard::new(
+                    admission_replay_config,
+                ),
             ),
             org_install: Arc::new(parking_lot::Mutex::new(())),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),

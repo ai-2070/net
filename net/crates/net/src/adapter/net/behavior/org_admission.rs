@@ -55,7 +55,7 @@
 
 use super::admission_clock::ClockSample;
 use super::org::OrgId;
-use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome};
+use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome, ReplayPrincipal};
 use super::org_call::{OrgCallProof, MAX_ORG_CALL_PROOF_BYTES};
 use super::org_grant::CapabilityAuthorityId;
 use super::org_revocation::OrgRevocationState;
@@ -183,6 +183,20 @@ pub enum AdmissionDenied {
     /// (E1.5) — denied fail-closed, but only for this caller; other
     /// callers are unaffected.
     PerCallerReplayCapacity,
+    /// THIS external acting ORG has filled its aggregate replay allocation
+    /// across all of its member identities (§5).
+    ///
+    /// Distinct from [`Self::PerCallerReplayCapacity`] because a coalition is
+    /// the point of the attack: identities are free to mint, so a per-caller
+    /// denial names the wrong subject and reads to an operator as a single
+    /// misconfigured client. This names the org, which is the thing an
+    /// operator can actually act on (revoke the grant).
+    PerOrganizationReplayCapacity,
+    /// The EXTERNAL pool is full with no single org over quota (§5) — many
+    /// distinct external orgs active at once. Notably NOT a state in which the
+    /// provider's own org is affected: the reserve is untouched by
+    /// construction.
+    ExternalPoolReplayCapacity,
     /// The provider-local policy (application veto, run LAST)
     /// rejected the call.
     ProviderPolicyRejected,
@@ -249,7 +263,9 @@ impl AdmissionDenied {
             D::ProviderAuthorityUnavailable
             | D::AuthorityChanged
             | D::ReplayCapacity
-            | D::PerCallerReplayCapacity => C::Unavailable,
+            | D::PerCallerReplayCapacity
+            | D::PerOrganizationReplayCapacity
+            | D::ExternalPoolReplayCapacity => C::Unavailable,
             // The call shape is unsupported on a protected unary service.
             D::StreamingUnsupported => C::NotSupported,
             // Everything else is a denial on the merits.
@@ -569,8 +585,19 @@ pub fn verify_org_admission(
     let skew_ns = MAX_TOKEN_CLOCK_SKEW_SECS.saturating_mul(1_000_000_000);
     let retain_until_wall_ns = proof.proof_expires_at_unix_ns.saturating_add(skew_ns);
     let expires_at = clock.monotonic_deadline_for(retain_until_wall_ns);
+    // §5 — the quota principal. `acting_org` here is the VERIFIED one: it was
+    // taken from the org-signed membership certificate at step 5 and
+    // cross-checked against the dispatcher grant, so it is not a wire claim
+    // and not the (attacker-choosable) certificate issuer. That is what makes
+    // the aggregate quota meaningful — identities are free to mint, a trusted
+    // acting org is not.
+    let principal = ReplayPrincipal {
+        caller: ctx.authenticated_caller,
+        acting_org: &acting_org,
+        provider_owner_org: &ctx.provider_owner_org,
+    };
     match replay.admit(
-        ctx.authenticated_caller,
+        principal,
         ctx.call_id,
         binding_digest,
         expires_at,
@@ -582,6 +609,12 @@ pub fn verify_org_admission(
         ReplayOutcome::CapacityExhausted => return Err(AdmissionDenied::ReplayCapacity),
         ReplayOutcome::PerCallerCapacityExhausted => {
             return Err(AdmissionDenied::PerCallerReplayCapacity)
+        }
+        ReplayOutcome::PerOrganizationCapacityExhausted => {
+            return Err(AdmissionDenied::PerOrganizationReplayCapacity)
+        }
+        ReplayOutcome::ExternalPoolCapacityExhausted => {
+            return Err(AdmissionDenied::ExternalPoolReplayCapacity)
         }
     }
 
