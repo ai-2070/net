@@ -241,8 +241,27 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
 /// `IgnoredOlder` / `IgnoredEqual`, and so a failing apply (invalid
 /// generation, signature mismatch — anything `FoldError` grows into)
 /// surfaces instead of being silently dropped. Test fixtures
-/// typically `.expect("apply")`; production callers that
-/// intentionally want a best-effort apply can `let _ = ` the result.
+/// typically `.expect("apply")`.
+///
+/// # Not a production ingest path
+///
+/// This is a FIXTURE helper. It passes `floors = None`, meaning every
+/// certificate generation is admissible — the revocation floor check is
+/// skipped entirely — because a fixture priming a bare fold has no node state
+/// to check against. Real ingest goes through the dispatch path in `mesh.rs`,
+/// which supplies the node's live floors and pairs the apply with a
+/// `recheck_projected_owner_floor`.
+///
+/// Every in-tree caller is a test or a bench (verified: no production call
+/// site remains, which makes the "~30 production call sites" note in
+/// `CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md` MD-1 stale). It stays `pub`
+/// only because `benches/net.rs` is a separate compilation target and cannot
+/// see a `#[cfg(test)]` item.
+///
+/// The unretractable-projection hazard this used to carry is closed at the
+/// producer instead: [`verify_announced_owner_cert`] now refuses a cert whose
+/// entity does not derive the announced node id (§12), so no caller of this
+/// helper can install ownership that a floor raise could never clear.
 pub fn apply_legacy_announcement(
     fold: &Fold<CapabilityFold>,
     ann: CapabilityAnnouncement,
@@ -319,6 +338,61 @@ pub(crate) fn verify_announced_owner_cert(
             node_id = format!("{:#x}", ann.node_id),
             org = %cert.org_id,
             "dropping owner cert: member does not match announcing entity (announcement kept)"
+        );
+        return None;
+    }
+    // §12 — the entity must actually BE the announcing node.
+    //
+    // `retract_floored_ownership` locates entries to retract via
+    // `member.node_id()`, and the install sweep and post-apply recheck both
+    // search `by_node[entity.node_id()]`. That only works because production
+    // ingest guarantees `ann.entity_id.node_id() == ann.node_id` (enforced at
+    // the dispatch site). An announcement violating it lands the projection in
+    // `by_node[ann.node_id]` while every retraction path looks under
+    // `by_node[entity.node_id()]` — so NO floor raise, no store install, and no
+    // recheck can ever clear it, and `owner_org_for` keeps reporting the
+    // revoked org indefinitely.
+    //
+    // Checked HERE rather than only at the dispatch site because this function
+    // is the single producer of a `Some(VerifiedOwner)`: the `#[doc(hidden)]`
+    // `MeshNode::test_inject_capability_announcement` seam (which ships in
+    // release builds and is re-exported by the Python / Node / Go bindings as a
+    // synthetic-peer helper) and the `pub` `apply_legacy_announcement` fixture
+    // helper both reach the fold without passing the dispatch check. Enforcing
+    // the bind at the producer makes the retraction invariant hold for every
+    // path, present and future.
+    //
+    // Synthetic-peer injection is unaffected: those announcements carry no
+    // `owner_cert`, so they return at the `?` above and never reach this check.
+    // §12 — the entity must actually BE the announcing node.
+    //
+    // `retract_floored_ownership` locates entries to retract via
+    // `member.node_id()`, and the install sweep and post-apply recheck both
+    // search `by_node[entity.node_id()]`. That only works because production
+    // ingest guarantees `ann.entity_id.node_id() == ann.node_id` (enforced at
+    // the dispatch site). An announcement violating it lands the projection in
+    // `by_node[ann.node_id]` while every retraction path looks under
+    // `by_node[entity.node_id()]` — so NO floor raise, no store install, and no
+    // recheck can ever clear it, and `owner_org_for` keeps reporting the
+    // revoked org indefinitely.
+    //
+    // Checked HERE rather than only at the dispatch site because this function
+    // is the single producer of a `Some(VerifiedOwner)`: the `#[doc(hidden)]`
+    // `MeshNode::test_inject_capability_announcement` seam (which ships in
+    // release builds and is re-exported by the Python / Node / Go bindings as a
+    // synthetic-peer helper) and the `pub` `apply_legacy_announcement` fixture
+    // helper both reach the fold without passing the dispatch check. Enforcing
+    // the bind at the producer makes the retraction invariant hold for every
+    // path, present and future.
+    //
+    // Synthetic-peer injection is unaffected: those announcements carry no
+    // `owner_cert`, so they return at the `?` above and never reach this check.
+    if ann.entity_id.node_id() != ann.node_id {
+        tracing::debug!(
+            node_id = format!("{:#x}", ann.node_id),
+            entity_node_id = format!("{:#x}", ann.entity_id.node_id()),
+            org = %cert.org_id,
+            "dropping owner cert: announcing entity does not derive the announced              node id — an ownership projection under a mismatched node id could              never be retracted (announcement kept)"
         );
         return None;
     }
@@ -2261,11 +2335,19 @@ mod tests {
         OrgKeypair::from_bytes([0x42u8; 32])
     }
 
+    /// Build a signed announcement the way PRODUCTION dispatch would.
+    ///
+    /// `node_id` is derived from the keypair rather than taken as a parameter:
+    /// real ingest enforces `ann.entity_id.node_id() == ann.node_id`, and
+    /// `verify_announced_owner_cert` now refuses a cert that violates it (§12),
+    /// because an ownership projection filed under a mismatched node id could
+    /// never be retracted. Fixtures that passed an unrelated literal were
+    /// building announcements the wire could not carry.
     fn signed_announcement_with_cert(
         kp: &EntityKeypair,
-        node_id: NodeId,
         cert: Option<OrgMembershipCert>,
     ) -> CapabilityAnnouncement {
+        let node_id = kp.entity_id().node_id();
         use crate::adapter::net::behavior::capability::CapabilitySet;
         let caps = CapabilitySet::new().add_tag("nrpc:echo".to_string());
         let mut ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps)
@@ -2282,10 +2364,95 @@ mod tests {
         let kp = EntityKeypair::generate();
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
             .expect("issue");
-        let ann = signed_announcement_with_cert(&kp, 0xA1, Some(cert));
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
 
         apply_legacy_announcement(&fold, ann).expect("apply");
-        assert_eq!(owner_org_for(&fold, 0xA1), Some(org_root().org_id()));
+        assert_eq!(
+            owner_org_for(&fold, kp.entity_id().node_id()),
+            Some(org_root().org_id())
+        );
+    }
+
+    /// §12 — a cert on an announcement whose entity does not derive the
+    /// announced node id is DROPPED, so no ownership projection can be filed
+    /// where retraction would never find it.
+    ///
+    /// `retract_floored_ownership` locates entries via `member.node_id()`, and
+    /// the install sweep and post-apply recheck both search
+    /// `by_node[entity.node_id()]`. A projection filed under a mismatched
+    /// `ann.node_id` therefore sits in a bucket no retraction path ever
+    /// visits: no floor raise, no store install, and no recheck can clear it,
+    /// and `owner_org_for` keeps reporting the revoked org forever.
+    ///
+    /// Production dispatch already enforced the bind, but
+    /// `verify_announced_owner_cert` is the single producer of a
+    /// `Some(VerifiedOwner)` and two other callers reach it: the
+    /// `#[doc(hidden)]` `MeshNode::test_inject_capability_announcement` seam,
+    /// which ships in release builds and is re-exported through the Python /
+    /// Node / Go bindings, and the `pub` `apply_legacy_announcement` fixture
+    /// helper. Enforcing at the producer covers all three.
+    ///
+    /// The announcement itself is KEPT (OA-1 exit-gate contract: ingest drops
+    /// bad certs, not announcements) — only the ownership projection is
+    /// refused.
+    ///
+    /// Red-witness: removing the bind check makes `owner_org_for` return the
+    /// org under the mismatched node id.
+    #[test]
+    fn a_cert_whose_entity_does_not_derive_the_node_id_is_dropped() {
+        let kp = EntityKeypair::generate();
+        let real_node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+            .expect("issue");
+
+        // Hand-build the announcement production could never emit: a node id
+        // unrelated to the announcing entity.
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        let mismatched: NodeId = real_node_id ^ 0xFFFF_FFFF;
+        assert_ne!(mismatched, real_node_id, "fixture must actually differ");
+        let caps = CapabilitySet::new().add_tag("nrpc:echo".to_string());
+        let mut ann = CapabilityAnnouncement::new(mismatched, kp.entity_id().clone(), 1, caps)
+            .with_owner_cert(Some(cert));
+        ann.sign(&kp);
+
+        // The cert is refused even though it is otherwise entirely valid:
+        // signed, in-window, member matches the announcing entity, no floors.
+        assert_eq!(
+            verify_announced_owner_cert(&ann, true, None, 0),
+            None,
+            "a cert under a mismatched node id must not project ownership",
+        );
+
+        // …and the announcement survives: the publisher stays discoverable,
+        // just unowned.
+        let fold = new_fold();
+        apply_legacy_announcement(&fold, ann).expect("apply");
+        let filter = LegacyFilter {
+            require_tags: vec!["nrpc:echo".into()],
+            ..LegacyFilter::default()
+        };
+        assert!(
+            find_nodes_matching(&fold, &filter).contains(&mismatched),
+            "the announcement itself must be kept",
+        );
+        assert_eq!(
+            owner_org_for(&fold, mismatched),
+            None,
+            "no ownership may be projected under the mismatched node id",
+        );
+
+        // Positive control: the same cert on a correctly-bound announcement
+        // DOES project — so the refusal above is the bind, not the fixture.
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+            .expect("issue");
+        let bound = signed_announcement_with_cert(&kp, Some(cert));
+        let fold = new_fold();
+        apply_legacy_announcement(&fold, bound).expect("apply");
+        assert_eq!(
+            owner_org_for(&fold, real_node_id),
+            Some(org_root().org_id()),
+            "a correctly-bound announcement still projects ownership",
+        );
     }
 
     /// OA-1 exit-gate contract: ingest drops bad CERTS, not
@@ -2319,13 +2486,14 @@ mod tests {
             7,
         );
 
-        for (label, cert, node_id) in [
-            ("member mismatch", wrong_member, 0xB1),
-            ("tampered signature", tampered, 0xB2),
-            ("expired window", expired, 0xB3),
+        let node_id = kp.entity_id().node_id();
+        for (label, cert) in [
+            ("member mismatch", wrong_member),
+            ("tampered signature", tampered),
+            ("expired window", expired),
         ] {
             let fold = new_fold();
-            let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+            let ann = signed_announcement_with_cert(&kp, Some(cert));
             apply_legacy_announcement(&fold, ann).expect("apply");
             // Announcement kept: the publisher is in the fold and
             // queryable by tag.
@@ -2365,8 +2533,8 @@ mod tests {
         let at = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 5, 3600)
             .expect("issue");
 
-        let ann_below = signed_announcement_with_cert(&kp, 0xC1, Some(below));
-        let ann_at = signed_announcement_with_cert(&kp, 0xC2, Some(at));
+        let ann_below = signed_announcement_with_cert(&kp, Some(below));
+        let ann_at = signed_announcement_with_cert(&kp, Some(at));
 
         assert_eq!(
             verify_announced_owner_cert(&ann_below, true, Some(&floors), 0),
@@ -2424,7 +2592,7 @@ mod tests {
 
         // Signature-INVALID outer announcement: same refusal.
         let fold = new_fold();
-        let mut tampered = signed_announcement_with_cert(&kp, 0xE2, Some(cert));
+        let mut tampered = signed_announcement_with_cert(&kp, Some(cert));
         tampered.version += 1; // breaks the outer signature
         apply_legacy_announcement(&fold, tampered).expect("apply");
         assert_eq!(
@@ -2448,7 +2616,7 @@ mod tests {
         let node_id = kp.entity_id().node_id();
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
-        let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
 
         // 1. Ingest verifies the cert at floor 0 (no floors yet).
         let owner = verify_announced_owner_cert(&ann, true, None, 0).expect("verifies at floor 0");
@@ -2499,7 +2667,7 @@ mod tests {
         let node_id = kp.entity_id().node_id();
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
-        let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
         apply_legacy_announcement(&fold, ann).expect("apply");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
 
@@ -2531,7 +2699,7 @@ mod tests {
         let node_id = kp.entity_id().node_id();
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
-        let ann = signed_announcement_with_cert(&kp, node_id, Some(cert));
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
         apply_legacy_announcement(&fold, ann).expect("apply");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
 
@@ -2556,7 +2724,7 @@ mod tests {
         let fold = new_fold();
         let cert7 = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 7, 3600)
             .expect("issue");
-        let ann7 = signed_announcement_with_cert(&kp, node_id, Some(cert7));
+        let ann7 = signed_announcement_with_cert(&kp, Some(cert7));
         apply_legacy_announcement(&fold, ann7).expect("apply");
         let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
         assert_eq!(retracted, 0, "generation 7 ≥ floor 5 must survive");
@@ -2580,10 +2748,10 @@ mod tests {
         // Permissive (no allow-lists): admitted with or without cert.
         for with_cert in [false, true] {
             let fold = new_fold();
-            let ann = signed_announcement_with_cert(&kp, 0xD1, with_cert.then(cert));
+            let ann = signed_announcement_with_cert(&kp, with_cert.then(cert));
             apply_legacy_announcement(&fold, ann).expect("apply");
             assert!(
-                may_execute(&fold, 0xD1, "nrpc:echo", caller),
+                may_execute(&fold, kp.entity_id().node_id(), "nrpc:echo", caller),
                 "permissive verdict must not depend on owner_org (with_cert={with_cert})"
             );
         }
@@ -2591,12 +2759,12 @@ mod tests {
         // Restricted to a different node: denied with or without cert.
         for with_cert in [false, true] {
             let fold = new_fold();
-            let mut ann = signed_announcement_with_cert(&kp, 0xD2, with_cert.then(cert));
+            let mut ann = signed_announcement_with_cert(&kp, with_cert.then(cert));
             ann.allowed_nodes = vec![0xFFFF];
             ann.sign(&kp);
             apply_legacy_announcement(&fold, ann).expect("apply");
             assert!(
-                !may_execute(&fold, 0xD2, "nrpc:echo", caller),
+                !may_execute(&fold, kp.entity_id().node_id(), "nrpc:echo", caller),
                 "restricted verdict must not depend on owner_org (with_cert={with_cert})"
             );
         }
