@@ -494,6 +494,24 @@ pub enum OrgAuthorityError {
         /// The observed mode bits.
         mode: u32,
     },
+    /// The Windows counterpart of [`Self::PermissiveAudienceFile`]:
+    /// `owner-audience.key`'s OWN security descriptor grants access to an
+    /// untrusted principal, or is owned by one.
+    ///
+    /// The Unix side has re-checked the key file's mode at every startup and
+    /// re-adoption since review-8 §10, with the stated rationale that
+    /// creation-time 0600 is insufficient because config management, copying,
+    /// or manual edits weaken it later. Windows had no analog at all: the
+    /// directory's descriptor was validated and the FILE's never was, so an
+    /// explicit non-inherited ACE on the key itself — an `icacls` mistake, a
+    /// restore tool, or the file arriving from a share during the org-wide key
+    /// distribution this design REQUIRES — was invisible to every check (§11).
+    PermissiveAudienceAcl {
+        /// The key file's path.
+        path: String,
+        /// What made the descriptor unacceptable.
+        reason: String,
+    },
     /// The authority directory is not a safe local security boundary
     /// (Gate-1): on Unix it is owned by another user, is group/other-
     /// writable, or is not a directory. The authority directory is a
@@ -586,6 +604,11 @@ impl std::fmt::Display for OrgAuthorityError {
                 "owner audience key {path} has permissive mode {mode:#o} (group/other \
                  readable); tighten to 0600 — refusing to treat a possibly-disclosed \
                  audience key as installed"
+            ),
+            Self::PermissiveAudienceAcl { path, reason } => write!(
+                f,
+                "owner audience key {path} has a permissive ACL ({reason}); refusing to \
+                 treat a possibly-disclosed audience key as installed"
             ),
             Self::InsecureAuthorityDir { path, reason } => write!(
                 f,
@@ -1349,6 +1372,95 @@ fn create_dir_with_owner_only_dacl(path: &Path, sid: &[u32]) -> std::io::Result<
     Ok(())
 }
 
+/// Sever inheritance on an EXISTING directory by writing a PROTECTED,
+/// owner-only DACL onto it (Gate-1, Windows) — the repair half of the §20
+/// residual.
+///
+/// An unprotected directory keeps merging inheritable aces from its ancestors,
+/// so whoever controls any ancestor can propagate access onto
+/// `owner-audience.key` AFTER validation passes, without holding any right on
+/// the authority directory itself. Refusing such a directory outright would be
+/// safe but would reject the common and legitimate
+/// `mkdir ~/net-authority && net node adopt --authority-dir ~/net-authority`,
+/// and every directory created by config management — a usability regression
+/// in exchange for a hazard we can simply remove.
+///
+/// So: repair rather than refuse. The caller validates every OTHER rule first
+/// (owner trusted, no untrusted aces, no NULL DACL) and only then calls this,
+/// so a foreign-owned or already-compromised directory is never silently
+/// "fixed" into looking clean — the repair is for a directory that is fine
+/// today and cannot prove it will stay that way.
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn protect_existing_dir_dacl(path: &Path, sid: &[u32]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    type Pv = *mut std::ffi::c_void;
+    extern "system" {
+        fn InitializeAcl(acl: Pv, len: u32, revision: u32) -> i32;
+        fn AddAccessAllowedAceEx(acl: Pv, revision: u32, flags: u32, mask: u32, sid: Pv) -> i32;
+        fn SetNamedSecurityInfoW(
+            object_name: *mut u16,
+            object_type: u32,
+            security_info: u32,
+            owner: Pv,
+            group: Pv,
+            dacl: Pv,
+            sacl: Pv,
+        ) -> u32;
+    }
+    const ACL_REVISION: u32 = 2;
+    const OBJECT_INHERIT_ACE: u32 = 0x1;
+    const CONTAINER_INHERIT_ACE: u32 = 0x2;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    // Setting this is what actually severs inheritance: the DACL stops merging
+    // inheritable aces from the parent chain.
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    const ERROR_SUCCESS: u32 = 0;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // 4-byte-aligned ACL storage; one ACE plus a user SID fits easily in 512 B.
+    let mut acl_buf = [0u32; 128];
+    // SAFETY: `acl_buf` (4-aligned, 512 B) receives one ACCESS_ALLOWED ACE for
+    // `sid` (aligned, valid, outlives the call). `wide` is NUL-terminated and
+    // outlives the call. `SetNamedSecurityInfoW` copies the ACL, so nothing
+    // dangles after return. Every Win32 return value is checked.
+    unsafe {
+        let acl: Pv = acl_buf.as_mut_ptr().cast();
+        let sid_ptr = sid.as_ptr() as Pv;
+        if InitializeAcl(acl, (acl_buf.len() * 4) as u32, ACL_REVISION) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // OI|CI so the owner-only grant propagates to the authority FILES,
+        // which is what gives `owner-audience.key` its ACL on NTFS.
+        if AddAccessAllowedAceEx(
+            acl,
+            ACL_REVISION,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            FILE_ALL_ACCESS,
+            sid_ptr,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rc = SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null_mut(),
+        );
+        if rc != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+    }
+    Ok(())
+}
+
 /// Create every missing component of `dir` (missing intermediate parents AND the
 /// final directory) each with a PROTECTED owner-only DACL (Gate-1, Windows).
 /// Mirrors the Unix `create_missing_components_0700`: a non-recursive,
@@ -1422,10 +1534,29 @@ struct DaclView {
     /// Ownership is a write-capable path that never appears as an ACE, so the
     /// ACE walk below cannot see it (§3).
     owner_sid: String,
-    /// `SE_DACL_PROTECTED` — asserted on a FRESHLY created dir by the witnesses;
-    /// NOT a production criterion for a pre-existing dir, which may legitimately
-    /// inherit an owner-only ACL from a protected parent profile.
-    #[allow(dead_code)]
+    /// `SE_DACL_PROTECTED` — a PRODUCTION criterion, checked by
+    /// [`validate_dacl_view`].
+    ///
+    /// An earlier revision carried this `#[allow(dead_code)]` with the note
+    /// "NOT a production criterion for a pre-existing dir, which may
+    /// legitimately inherit an owner-only ACL from a protected parent
+    /// profile". That reasoning describes what the ACL looks like NOW and
+    /// misses what an UNPROTECTED ACL means: it stays subject to Windows'
+    /// automatic inheritance propagation, so whoever controls any ancestor can
+    /// push a new inheritable ACE down into this directory — and onto the
+    /// files in it — at any time AFTER validation returns.
+    ///
+    /// That is the same class of hole as the foreign-OWNER one above, one
+    /// level up: the §20 inheritance rule refuses an inheritable untrusted ACE
+    /// that is present at validation time, and this refuses a descriptor that
+    /// cannot stop one being added a second later. Without it the §20 fix
+    /// rested on "only a trusted principal has WRITE_DAC on this directory",
+    /// which is not the privilege the attack needs — the ancestor's owner
+    /// needs no rights on the authority directory at all.
+    ///
+    /// This is the third field in this struct to arrive `#[allow(dead_code)]`
+    /// with a note asserting it is not a production criterion. For `owner_sid`
+    /// that assertion was wrong and became §3. Treat the pattern as a smell.
     protected: bool,
     null_dacl: bool,
     aces: Vec<AceInfo>,
@@ -1796,6 +1927,42 @@ fn validate_existing_dir_dacl(dir: &Path) -> Result<(), OrgAuthorityError> {
         path: dir.display().to_string(),
         reason: format!("resolve current user SID: {e}"),
     })?;
+    // §20 residual — an unprotected DACL still merges inheritable aces from
+    // the ancestor chain, so a clean ace list here is not a durable statement:
+    // the owner of ANY ancestor can propagate access onto the authority files
+    // afterwards, needing no permission on this directory at all.
+    //
+    // Repair rather than refuse. Every OTHER rule is checked FIRST against the
+    // descriptor as found, so a foreign-owned directory, one with untrusted
+    // aces, or one with a NULL DACL is never silently "fixed" into looking
+    // clean — those still fail, loudly and unrepaired. Only a directory that
+    // is fine today, and merely cannot prove it will stay that way, gets its
+    // inheritance severed. Refusing instead would reject the ordinary
+    // `mkdir && net node adopt`, trading a real usability regression for a
+    // hazard we can simply remove.
+    if !view.protected {
+        validate_dacl_rules(&view, &user_sid, dir)?;
+        let sid = process_user_sid().map_err(|e| OrgAuthorityError::Io {
+            path: dir.display().to_string(),
+            reason: format!("resolve current user SID: {e}"),
+        })?;
+        protect_existing_dir_dacl(dir, &sid).map_err(|e| OrgAuthorityError::Io {
+            path: dir.display().to_string(),
+            reason: format!("sever DACL inheritance on the authority directory: {e}"),
+        })?;
+        tracing::info!(
+            path = %dir.display(),
+            "severed DACL inheritance on the pre-existing authority directory so \
+             an ancestor cannot later propagate access onto the authority files",
+        );
+        // Re-read and validate for real: the repair must have taken, and the
+        // full rule set (including `protected`) is what has to pass.
+        let view = read_object_security(dir).map_err(|e| OrgAuthorityError::Io {
+            path: dir.display().to_string(),
+            reason: format!("re-read security descriptor after severing inheritance: {e}"),
+        })?;
+        return validate_dacl_view(&view, &user_sid, dir);
+    }
     validate_dacl_view(&view, &user_sid, dir)
 }
 
@@ -1811,6 +1978,42 @@ fn validate_existing_dir_dacl(dir: &Path) -> Result<(), OrgAuthorityError> {
 /// `#[allow(dead_code)]` in the first place.
 #[cfg(windows)]
 fn validate_dacl_view(
+    view: &DaclView,
+    user_sid: &str,
+    dir: &Path,
+) -> Result<(), OrgAuthorityError> {
+    validate_dacl_rules(view, user_sid, dir)?;
+    // §20 residual — see `validate_existing_dir_dacl`, which repairs an
+    // unprotected directory before reaching here. By this point the flag is a
+    // hard requirement: an unprotected DACL keeps merging inheritable aces
+    // from the ancestor chain, so the rule set above describes only this
+    // instant and nothing prevents an ancestor's owner from propagating access
+    // onto the authority files a moment later — without needing any permission
+    // on this directory.
+    if !view.protected {
+        return Err(OrgAuthorityError::InsecureAuthorityDir {
+            path: dir.display().to_string(),
+            reason: format!(
+                "authority directory does not have a PROTECTED DACL (SE_DACL_PROTECTED is \
+                 unset), so it still inherits from its parents — anyone who can write an \
+                 inheritable ace on ANY ancestor can propagate access onto \
+                 {OWNER_AUDIENCE_FILE} after this validation passes, without needing any \
+                 permission on the authority directory itself. Sever inheritance on this \
+                 directory (`icacls <dir> /inheritance:r`) or let `net node adopt` create it"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Every owner-only rule EXCEPT the `SE_DACL_PROTECTED` requirement.
+///
+/// Split from [`validate_dacl_view`] so [`validate_existing_dir_dacl`] can
+/// establish that a pre-existing directory is otherwise sound BEFORE severing
+/// its inheritance: a foreign-owned directory, or one already carrying
+/// untrusted aces, must fail rather than be repaired into passing.
+#[cfg(windows)]
+fn validate_dacl_rules(
     view: &DaclView,
     user_sid: &str,
     dir: &Path,
@@ -1978,11 +2181,29 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
             });
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // NTFS ACLs have no clean 0o600 analog reachable from
-        // `std::fs`; surface a stderr warning (mirrors the CLI
-        // identity gate) rather than a silent no-op.
+        // §11 — validate the key file's OWN descriptor, not just the
+        // directory's.
+        //
+        // This was a bare `eprintln!` no-op, so the Unix invariant
+        // ("creation-time 0600 is insufficient — re-check at every startup and
+        // re-adoption", review-8 §10) had no Windows counterpart at all. The
+        // directory was validated and the FILE never was, so an explicit,
+        // non-inherited ace on `owner-audience.key` itself was invisible to
+        // every check: an `icacls` mistake, a backup/restore tool, or the file
+        // arriving from a share during the org-wide key distribution this
+        // design REQUIRES.
+        //
+        // Strictly tighter than the directory rule, which tolerates a
+        // read-only untrusted non-inheritable ace. For the raw owner discovery
+        // key there is no harmless read — it decrypts every OwnerScoped
+        // announcement for the org — so ANY untrusted grant refuses, whatever
+        // its mask.
+        validate_audience_file_acl(path)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         eprintln!(
             "warning: audience-key permission gate is a no-op on this platform; \
              ACLs on {} are not validated — manage them out-of-band.",
@@ -1997,6 +2218,104 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
             reason: e.to_string(),
         })?;
     Ok(Some(bytes))
+}
+
+/// §11 — validate `owner-audience.key`'s OWN security descriptor on Windows.
+///
+/// The directory check ([`validate_existing_dir_dacl`]) governs what a NEW
+/// file inherits; it says nothing about an ace written directly onto an
+/// existing key file, and nothing about the file's owner. Both are reachable
+/// without touching the directory at all.
+///
+/// The rule is deliberately stricter than the directory's: any grant to an
+/// untrusted principal refuses regardless of mask. The directory tolerates a
+/// read-only untrusted non-inheritable ace because reading a DIRECTORY leaks
+/// only file names; reading THIS file leaks the raw owner discovery key, which
+/// decrypts every OwnerScoped announcement for the org.
+///
+/// `SE_DACL_PROTECTED` is deliberately NOT required here, unlike on the
+/// directory: a file provisioned inside a protected owner-only directory
+/// correctly inherits that directory's ace and is normally unprotected. The
+/// directory rule is what bounds inheritance; this rule bounds what is written
+/// onto the file itself.
+#[cfg(windows)]
+fn validate_audience_file_acl(path: &Path) -> Result<(), OrgAuthorityError> {
+    let view = read_object_security(path).map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("read audience key security descriptor: {e}"),
+    })?;
+    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("resolve current user SID: {e}"),
+    })?;
+    validate_audience_acl_view(&view, &user_sid, path)
+}
+
+/// The PURE half of [`validate_audience_file_acl`], split out for the same
+/// reason as [`validate_dacl_view`]: the foreign-owner and untrusted-ace cases
+/// cannot be produced end-to-end without a second account, so without this
+/// seam they would ship untested.
+#[cfg(windows)]
+fn validate_audience_acl_view(
+    view: &DaclView,
+    user_sid: &str,
+    path: &Path,
+) -> Result<(), OrgAuthorityError> {
+    if view.null_dacl {
+        return Err(OrgAuthorityError::PermissiveAudienceAcl {
+            path: path.display().to_string(),
+            reason: "NULL/absent DACL grants everyone full access".to_string(),
+        });
+    }
+    const LOCAL_SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let trusted = |sid: &str| sid == user_sid || sid == LOCAL_SYSTEM || sid == ADMINISTRATORS;
+
+    // Ownership first, for the same reason as the directory rule: the owner
+    // holds implicit WRITE_DAC and can re-grant itself access after this
+    // returns, so no ace walk can substitute for it.
+    if !trusted(&view.owner_sid) {
+        return Err(OrgAuthorityError::PermissiveAudienceAcl {
+            path: path.display().to_string(),
+            reason: format!(
+                "owned by untrusted principal {} — the owner holds implicit WRITE_DAC and \
+                 can re-grant itself read access at any time",
+                view.owner_sid
+            ),
+        });
+    }
+
+    for ace in &view.aces {
+        // Deny aces can never broaden access.
+        const ACCESS_DENIED: u8 = 1;
+        const ACCESS_DENIED_OBJECT: u8 = 6;
+        const ACCESS_DENIED_CALLBACK: u8 = 10;
+        const ACCESS_DENIED_CALLBACK_OBJECT: u8 = 12;
+        if matches!(
+            ace.ace_type,
+            ACCESS_DENIED
+                | ACCESS_DENIED_OBJECT
+                | ACCESS_DENIED_CALLBACK
+                | ACCESS_DENIED_CALLBACK_OBJECT
+        ) {
+            continue;
+        }
+        // Everything else grants. An unparsed (non-simple) ace carries the
+        // sentinel SID, which can never compare equal to a trusted principal,
+        // so it fails closed here exactly as it does on the directory.
+        if !trusted(&ace.sid) {
+            return Err(OrgAuthorityError::PermissiveAudienceAcl {
+                path: path.display().to_string(),
+                reason: format!(
+                    "grants access to untrusted principal {} (ace type {}, mask {:#010x}); \
+                     the raw owner discovery key must be readable only by its owner, \
+                     SYSTEM, and Administrators",
+                    ace.sid, ace.ace_type, ace.mask
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// No-follow optional read for the non-secret authority files
@@ -2984,6 +3303,187 @@ mod tests {
             OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
                 reason.contains("owned by untrusted principal") && reason.contains(foreign),
                 "the refusal must name ownership as the cause and identify the owner; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+    }
+
+    /// §20 residual, LIVE on NTFS: adopting into a pre-existing directory that
+    /// inherits from its parent SEVERS that inheritance, so an ancestor cannot
+    /// later propagate access onto the authority files.
+    ///
+    /// The synthetic test below pins the rule; this pins that the repair
+    /// actually runs and takes effect against the real Win32 APIs. `mkdir`
+    /// (here `create_dir_all`) produces exactly the unprotected shape an
+    /// operator gets from `mkdir ~/net-authority` or from config management.
+    #[cfg(windows)]
+    #[test]
+    fn adopting_into_an_inheriting_directory_severs_inheritance() {
+        let scratch = Scratch::new();
+        let dir = scratch.dir().join("pre-existing");
+        std::fs::create_dir_all(&dir).expect("plain mkdir");
+
+        // Precondition: a plainly-created directory inherits — otherwise this
+        // test would prove nothing about the repair.
+        let before = read_object_security(&dir).expect("read before");
+        assert!(
+            !before.protected,
+            "precondition: a plainly-created directory must be unprotected, \
+             else the repair under test is never exercised",
+        );
+
+        let kp = node_identity();
+        let authority = NodeAuthority::adopt(&dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt into a pre-existing inheriting directory must succeed");
+        assert_eq!(authority.owner_org(), org().org_id());
+
+        let after = read_object_security(&dir).expect("read after");
+        assert!(
+            after.protected,
+            "adopt must sever inheritance on the directory it provisions secrets into",
+        );
+    }
+
+    /// §20 residual — an UNPROTECTED DACL is refused even when the ACL, as it
+    /// stands at validation time, is impeccable.
+    ///
+    /// This is the gap the §20 fix left open. That fix refuses an inheritable
+    /// untrusted ACE that is PRESENT; it accepted a descriptor which cannot
+    /// stop one being added a moment later. With inheritance un-severed, the
+    /// owner of any ancestor propagates a read ACE onto `owner-audience.key`
+    /// without touching the authority directory or holding any right on it —
+    /// so the accepted-residual argument ("only a trusted principal has
+    /// WRITE_DAC here") named the wrong privilege.
+    ///
+    /// The two views below are IDENTICAL apart from `protected`, so the
+    /// refusal can only be attributable to that flag.
+    #[cfg(windows)]
+    #[test]
+    fn an_unprotected_dacl_is_refused_even_when_its_aces_are_clean() {
+        let user = current_process_sid_string().expect("user sid");
+        let dir = Path::new("C:\\ProgramData\\net-authority");
+        let clean_ace = AceInfo {
+            sid: user.clone(),
+            mask: 0x001F_01FF, // FILE_ALL_ACCESS, for the OWNER only
+            ace_type: 0,
+            flags: 0x03, // OI|CI — trusted, so §20 tolerates it
+        };
+
+        // Protected: accepted. Establishes the ACE list is not the cause.
+        let protected = DaclView {
+            owner_sid: user.clone(),
+            protected: true,
+            null_dacl: false,
+            aces: vec![clean_ace.clone()],
+        };
+        validate_dacl_view(&protected, &user, dir)
+            .expect("a protected owner-only dir must validate");
+
+        // Only `protected` differs.
+        let unprotected = DaclView {
+            owner_sid: user.clone(),
+            protected: false,
+            null_dacl: false,
+            aces: vec![clean_ace],
+        };
+        let err = validate_dacl_view(&unprotected, &user, dir)
+            .expect_err("an unprotected authority directory must be refused");
+        match &err {
+            OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
+                reason.contains("PROTECTED") && reason.contains("inherit"),
+                "the refusal must name inheritance as the cause, so an operator \
+                 knows to sever it rather than hunting for a bad ace; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+    }
+
+    /// §11 — the audience key's OWN descriptor is validated, and the rule is
+    /// tighter than the directory's: a READ-ONLY grant to an untrusted
+    /// principal refuses.
+    ///
+    /// The directory tolerates exactly that ace shape (reading a directory
+    /// leaks file names). Reading THIS file leaks the raw owner discovery key,
+    /// which decrypts every OwnerScoped announcement for the org — so the two
+    /// rules must differ, and this pins the difference.
+    #[cfg(windows)]
+    #[test]
+    fn an_untrusted_read_ace_on_the_audience_key_is_refused() {
+        let user = current_process_sid_string().expect("user sid");
+        let everyone = "S-1-1-0";
+        let key = Path::new("C:\\ProgramData\\net-authority\\owner-audience.key");
+        let owner_ace = AceInfo {
+            sid: user.clone(),
+            mask: 0x001F_01FF,
+            ace_type: 0,
+            flags: 0x10, // INHERITED from the protected authority dir
+        };
+
+        // Owner-only: accepted. NB `protected` is false — a file inheriting
+        // from a protected directory is normally unprotected, and requiring it
+        // here would refuse every legitimately provisioned key.
+        let clean = DaclView {
+            owner_sid: user.clone(),
+            protected: false,
+            null_dacl: false,
+            aces: vec![owner_ace.clone()],
+        };
+        validate_audience_acl_view(&clean, &user, key)
+            .expect("an owner-only inherited ace must validate");
+
+        // Add a READ-ONLY ace for Everyone — harmless on the directory,
+        // fatal here.
+        let leaked = DaclView {
+            owner_sid: user.clone(),
+            protected: false,
+            null_dacl: false,
+            aces: vec![
+                owner_ace,
+                AceInfo {
+                    sid: everyone.to_string(),
+                    mask: 0x0000_0001, // FILE_READ_DATA only
+                    ace_type: 0,
+                    flags: 0x00, // NOT inheritable, NOT inherited
+                },
+            ],
+        };
+        let err = validate_audience_acl_view(&leaked, &user, key)
+            .expect_err("a read ace for Everyone on the audience key must refuse");
+        match &err {
+            OrgAuthorityError::PermissiveAudienceAcl { reason, .. } => assert!(
+                reason.contains(everyone),
+                "the refusal must name the principal; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+    }
+
+    /// The ownership half of §11: a foreign OWNER holds implicit WRITE_DAC, so
+    /// an impeccable ace list does not save it. Mirrors the §3 directory rule.
+    #[cfg(windows)]
+    #[test]
+    fn a_foreign_owned_audience_key_is_refused() {
+        let user = current_process_sid_string().expect("user sid");
+        let foreign = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let key = Path::new("C:\\ProgramData\\net-authority\\owner-audience.key");
+        let only_us = AceInfo {
+            sid: user.clone(),
+            mask: 0x001F_01FF,
+            ace_type: 0,
+            flags: 0x10,
+        };
+        let view = DaclView {
+            owner_sid: foreign.to_string(),
+            protected: false,
+            null_dacl: false,
+            aces: vec![only_us],
+        };
+        let err = validate_audience_acl_view(&view, &user, key)
+            .expect_err("a foreign-owned audience key must refuse");
+        match &err {
+            OrgAuthorityError::PermissiveAudienceAcl { reason, .. } => assert!(
+                reason.contains("WRITE_DAC") && reason.contains(foreign),
+                "the refusal must explain WHY ownership matters; got: {reason}",
             ),
             other => panic!("wrong error variant: {other}"),
         }
