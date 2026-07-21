@@ -31,6 +31,7 @@ use net_sdk::meshos::{EntityKeypair, LoggingDispatcher, MeshOsConfig, MeshOsDaem
 use crate::config::Profile;
 use crate::error::{connection_failure, generic, invalid_args, sdk, CliError};
 use crate::parsers::{hex_decode_32, parse_u64_flexible};
+use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
 /// Resolved remote-attach target. Built from subcommand flags +
 /// profile fallbacks via [`resolve_remote_attach`]. Carrying it
@@ -375,33 +376,47 @@ pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, 
 /// shared by [`load_identity_keypair`] (→ `EntityKeypair`) and
 /// [`load_operator_identity`] (→ `Identity`) so the two never drift.
 pub(crate) async fn load_identity_seed(path: &Path) -> Result<[u8; 32], CliError> {
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+    // §10 — the READ side of the identity seed, shared by `net wrap`,
+    // `net mcp serve` and `net cap`. Three separate copies of the private key
+    // pass through here and all three used to drop un-zeroed: the whole file
+    // text, the parsed `seed_hex`, and the decoded bytes. The write side was
+    // hardened for §10; this side was not.
+    let text = ScrubbedString::new(tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(
             "failed to read identity file {}: {e}",
             path.display()
         ))
-    })?;
-    let parsed: PartialIdentityFile = toml::from_str(&text).map_err(|e| {
+    })?);
+    // NEVER interpolate the parse error. `toml::de::Error`'s `Display` embeds
+    // the offending SOURCE LINE, which for this file is `seed_hex = "..."` —
+    // so a malformed identity file printed the operator's private key to
+    // stderr. `org.rs` omits it for exactly this reason at both its parse
+    // sites; this one did not.
+    let mut parsed: PartialIdentityFile = toml::from_str(text.as_str()).map_err(|_| {
         invalid_args(format!(
-            "identity file {} failed to parse: {e}",
+            "identity file {} failed to parse as identity TOML",
             path.display()
         ))
     })?;
-    let seed_bytes = hex::decode(&parsed.seed_hex).map_err(|e| {
+    let decoded = hex::decode(&parsed.seed_hex).map_err(|e| {
         invalid_args(format!(
             "identity file {} `seed_hex` is not valid hex: {e}",
             path.display()
         ))
-    })?;
-    if seed_bytes.len() != 32 {
+    });
+    // Scrub the parsed field before ANY early return below, including the
+    // hex-decode failure.
+    zeroize_string(&mut parsed.seed_hex);
+    let seed_bytes = ScrubbedBytes::new(decoded?);
+    if seed_bytes.as_slice().len() != 32 {
         return Err(invalid_args(format!(
             "identity file {} `seed_hex` decodes to {} bytes; expected 32",
             path.display(),
-            seed_bytes.len()
+            seed_bytes.as_slice().len()
         )));
     }
     let mut arr = [0u8; 32];
-    arr.copy_from_slice(&seed_bytes);
+    arr.copy_from_slice(seed_bytes.as_slice());
     Ok(arr)
 }
 
@@ -539,5 +554,40 @@ mod tests {
         )
         .expect_err("should reject garbage addr");
         assert_eq!(err.kind(), ExitCodeKind::InvalidArgs);
+    }
+    /// §10 — a malformed identity file must not print the seed.
+    ///
+    /// `toml::de::Error`'s `Display` embeds the OFFENDING SOURCE LINE. For an
+    /// identity file that line is `seed_hex = "<the operator's private key>"`,
+    /// so interpolating the parse error into the CLI's stderr message leaked
+    /// the key to the terminal, to CI logs, and to any shell that captured it.
+    /// `org.rs` omits the error at both its parse sites for exactly this
+    /// reason; this reader did not.
+    #[tokio::test]
+    async fn a_malformed_identity_file_never_echoes_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("operator.toml");
+        // Valid TOML shape, but `seed_hex` is the wrong TYPE — enough to make
+        // serde fail while quoting the offending line.
+        let seed = "aa".repeat(32);
+        std::fs::write(
+            &path,
+            format!("operator_id_hex = \"0x1\"\nseed_hex = [\"{seed}\"]\n"),
+        )
+        .expect("write");
+
+        let err = load_identity_seed(&path)
+            .await
+            .expect_err("a malformed identity file must be refused");
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains(&seed),
+            "the parse failure echoed the seed: {rendered}",
+        );
+        assert!(
+            !rendered.contains("seed_hex"),
+            "the parse failure quoted the seed_hex line, which carries the key \
+             in a well-formed file: {rendered}",
+        );
     }
 }

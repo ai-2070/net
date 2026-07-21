@@ -312,9 +312,17 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
     let keypair = OrgKeypair::generate();
     let org_id_hex = hex::encode(keypair.org_id().as_bytes());
 
-    let path = args
-        .out
-        .unwrap_or_else(|| default_org_key_path(&org_id_hex));
+    let path = match args.out {
+        Some(explicit) => explicit,
+        None => default_org_key_path(&org_id_hex).ok_or_else(|| {
+            invalid_args(
+                "cannot resolve the platform config directory, and refusing to fall back to \
+                 the working directory — this file holds the ORG ROOT SEED. Pass an explicit \
+                 --out."
+                    .to_string(),
+            )
+        })?,
+    };
     // UX pre-check only — the real no-clobber boundary is the hard link in
     // `publish_staged` below. Before §2's closure this stat WAS the only
     // boundary keygen had, because it published through the identity helper's
@@ -1298,11 +1306,26 @@ async fn publish_staged_replace(tmp: &Path, final_path: &Path) -> Result<(), Cli
 // both of which stage beside the destination first. Do not reintroduce a
 // direct-write helper here.
 
-fn default_org_key_path(org_id_hex: &str) -> PathBuf {
+/// The default org key path, or `None` when the platform config directory
+/// cannot be resolved (§19).
+///
+/// Deliberately NOT falling back to `PathBuf::from(".")`. This file holds the
+/// ORG ROOT SEED — the key that signs every membership certificate and every
+/// revocation floor, and the single most sensitive artifact this CLI writes. A
+/// CWD fallback silently writes it wherever the operator happened to be
+/// standing: a git checkout, an archived CI workspace, a shared build
+/// directory. On Windows it then inherits that directory's DACL and
+/// `enforce_strict_permissions` is a no-op, so a world-readable CWD yields a
+/// world-readable org root with no warning.
+///
+/// `node.rs::default_authority_dir` refused this fallback for
+/// `owner-audience.key`; the org root is strictly more sensitive and kept it.
+fn default_org_key_path(org_id_hex: &str) -> Option<PathBuf> {
     let short = &org_id_hex[..org_id_hex.len().min(16)];
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("net-mesh")
-        .join("orgs")
-        .join(format!("org-{short}.toml"))
+    Some(
+        dirs::config_dir()?
+            .join("net-mesh")
+            .join("orgs")
+            .join(format!("org-{short}.toml")),
+    )
 }

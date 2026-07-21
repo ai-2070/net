@@ -73,6 +73,11 @@ impl ScrubbedString {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
+    /// Borrow as `&str` — for callers that must PARSE the protected text
+    /// (e.g. the identity-file reader) rather than write it out.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Drop for ScrubbedString {

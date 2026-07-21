@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::org::{refuse_replacing_foreign_seed, SeedArtifact};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::prelude::{emit_value, OutputFormat};
-use crate::secret::ScrubbedBytes;
+use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
 #[derive(Subcommand, Debug)]
 pub enum IdentityCommand {
@@ -123,12 +123,25 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
 
     let identity = OperatorIdentity::generate();
     let operator_id = identity.operator_id();
-    let seed = *identity.keypair().secret_bytes();
+    // §10 — the seed is copied out of the keypair here, so this local is a
+    // second live copy of the private key and must be scrubbed on EVERY exit,
+    // not just the success tail. `org.rs:run_keygen` avoids the copy entirely
+    // by consuming `secret_bytes()` inline; this path needs it twice (the file
+    // body and nothing else), so it gets an RAII guard instead.
+    let seed = ScrubbedBytes::new(identity.keypair().secret_bytes().to_vec());
     let public_key = *identity.keypair().entity_id().as_bytes();
 
-    let path = args
-        .out
-        .unwrap_or_else(|| default_identity_path(operator_id));
+    let path = match args.out {
+        Some(explicit) => explicit,
+        None => default_identity_path(operator_id).ok_or_else(|| {
+            invalid_args(
+                "cannot resolve the platform config directory, and refusing to fall back to \
+                 the working directory — this file holds the operator's private seed. Pass \
+                 an explicit --out."
+                    .to_string(),
+            )
+        })?,
+    };
 
     // `try_exists` distinguishes "file is absent" (Ok(false)) from
     // "I can't tell because of a permission error" (Err). Pre-fix
@@ -184,13 +197,18 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
 
     let file = IdentityFile {
         operator_id_hex: format!("0x{operator_id:016x}"),
-        seed_hex: hex::encode(seed),
+        seed_hex: hex::encode(seed.as_slice()),
         public_key_hex: hex::encode(public_key),
         created_at: now_iso8601(),
         note: args.note.clone(),
     };
-    let toml_text = toml::to_string_pretty(&file)
-        .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?;
+    // The serialized TOML carries the seed too — wrap it so a failed write or
+    // permission step scrubs it as well, not only the success tail. `file`
+    // scrubs its own `seed_hex` on Drop.
+    let toml_text = ScrubbedString::new(
+        toml::to_string_pretty(&file)
+            .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?,
+    );
 
     // Atomic, mode-restricted publish. Pre-fix `tokio::fs::write`
     // created the file with the process umask (commonly 0o644 —
@@ -318,7 +336,15 @@ pub(crate) fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
 // Disk shape
 // =========================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
+/// §10 — deliberately NO `Debug` derive, and a `Drop` that scrubs `seed_hex`.
+///
+/// `OrgKeyFile` has had both since OA2-F for exactly this reason; this struct
+/// is the same shape holding the same class of secret (a 32-byte ed25519 seed
+/// as 64 hex chars) and had neither. The `Debug` derive was the sharper half:
+/// a single `{file:?}` in a diagnostic — or a `#[derive(Debug)]` on any struct
+/// that came to contain one — renders the operator's private key into a log
+/// line.
+#[derive(Serialize, Deserialize)]
 pub(crate) struct IdentityFile {
     pub(crate) operator_id_hex: String,
     pub(crate) seed_hex: String,
@@ -326,6 +352,14 @@ pub(crate) struct IdentityFile {
     pub(crate) created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+}
+
+impl Drop for IdentityFile {
+    fn drop(&mut self) {
+        // The operator identity seed rides in `seed_hex`; scrub it on drop so
+        // no copy is left in freed memory (mirrors `OrgKeyFile`).
+        zeroize_string(&mut self.seed_hex);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -550,12 +584,26 @@ pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError
     Ok(())
 }
 
-fn default_identity_path(operator_id: u64) -> PathBuf {
-    let base = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("net-mesh")
-        .join("identities");
-    base.join(format!("operator-0x{operator_id:016x}.toml"))
+/// The default identity path, or `None` when the platform config directory
+/// cannot be resolved (§19).
+///
+/// Deliberately NOT falling back to `PathBuf::from(".")`. This file holds the
+/// operator's ed25519 SEED; a CWD fallback silently writes it wherever the
+/// operator happened to be standing — a git checkout, an archived CI
+/// workspace, a shared build directory. On Windows the file then inherits that
+/// directory's DACL and `enforce_strict_permissions` is a no-op, so a
+/// world-readable CWD yields a world-readable private key with no warning.
+///
+/// `node.rs::default_authority_dir` was hardened this way for `owner-audience.key`;
+/// the same argument applies at least as strongly here, and `config.rs` already
+/// used the `Option` pattern — it simply was not propagated.
+fn default_identity_path(operator_id: u64) -> Option<PathBuf> {
+    Some(
+        dirs::config_dir()?
+            .join("net-mesh")
+            .join("identities")
+            .join(format!("operator-0x{operator_id:016x}.toml")),
+    )
 }
 
 pub(crate) fn now_iso8601() -> String {
