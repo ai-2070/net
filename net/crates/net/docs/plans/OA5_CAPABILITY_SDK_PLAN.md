@@ -1,4 +1,4 @@
-# OA-5 — Capability sending: library wiring + SDK exposure
+# OA-5 — Capability sending: library wiring + SDK exposure (Status: EXPLORATORY DESIGN/ARCHIVED IN FAVOR OF ORG_CAPABILITY_SDK_PLAN)
 
 **Version:** v1.0 (2026-07-21) — **Status: PROPOSAL — HOLD (not authorized).**
 No phase below may start before OA5-Gate-0 is SIGNED OFF (Kyra). This plan
