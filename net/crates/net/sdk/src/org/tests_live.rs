@@ -635,6 +635,140 @@ async fn live_raw_and_typed_seams_interoperate() {
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// **Workstream R's acceptance witness — the binding rehearsal.**
+///
+/// Drives the entire facade the way a language binding will, and only that way:
+///
+/// - credentials arrive as canonical wire BYTES plus an audience-secret file
+///   PATH (`from_parts`), so no in-memory secret and no Rust-typed credential
+///   is constructed by the "application";
+/// - the provider registers through `serve_org_bytes` and the caller invokes
+///   through `call_bytes`, so no generic crosses the seam;
+/// - the handler still receives the five verified `OrgCaller` facts;
+/// - and it runs cross-org over real two-node transport, so the audience-secret
+///   file is genuinely load-bearing — without it the caller discovers nothing.
+///
+/// If this passes, the path every binding will take is proven to work before
+/// any binding exists. If it fails, no amount of napi/PyO3/cgo marshaling would
+/// have saved it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_binding_rehearsal_from_files_through_the_raw_seams() {
+    use std::io::Write;
+
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_identity, p_dir) = fast_mesh("live-rehearsal-provider", &b, None).await;
+    let (caller, c_identity, c_dir) = fast_mesh("live-rehearsal-caller", &a, None).await;
+    bring_up(&caller, &provider).await;
+
+    // ---- provider: the RAW seam, doing its own JSON like a binding does ----
+    let facts_ok = Arc::new(AtomicBool::new(false));
+    let seen = facts_ok.clone();
+    let expected_caller = c_identity.entity_id().clone();
+    let (a_id, b_id) = (a.org_id(), b.org_id());
+    let _serve = provider
+        .serve_org_bytes(
+            "customer.read",
+            OrgAccess::Granted,
+            move |c: OrgCaller, body: bytes::Bytes| {
+                let seen = seen.clone();
+                let expected_caller = expected_caller.clone();
+                async move {
+                    seen.store(
+                        c.entity == expected_caller
+                            && c.acting_org == a_id
+                            && c.provider_org == b_id
+                            && c.capability == cap("nrpc:customer.read")
+                            && !c.is_same_org(),
+                        Ordering::SeqCst,
+                    );
+                    let req: Ping = serde_json::from_slice(&body).map_err(|e| {
+                        crate::org::OrgHandlerError::Application {
+                            code: 0x8000,
+                            message: format!("bad body: {e}"),
+                        }
+                    })?;
+                    let out = serde_json::to_vec(&Pong {
+                        n: req.n * 2,
+                        served_by: "rehearsal".to_string(),
+                    })
+                    .expect("encode");
+                    Ok(bytes::Bytes::from(out))
+                }
+            },
+        )
+        .expect("raw serve");
+
+    // ---- operator: issue the grant, provision both sides out of band ----
+    let (grant, secret) = discover_grant(&b, a.org_id(), cap("nrpc:customer.read"), 3600);
+    let provider_secret =
+        OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy for provider");
+    provider
+        .node()
+        .install_provider_grant_audience(grant.clone(), provider_secret)
+        .expect("provider audience");
+
+    // The grantee's copy lands on DISK, 0600 — the only way a binding can
+    // supply it, because the key never crosses a language boundary.
+    let secret_dir = std::env::temp_dir().join(format!(
+        "net-osdk-rehearsal-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&secret_dir);
+    std::fs::create_dir_all(&secret_dir).expect("secret dir");
+    let secret_path = secret_dir.join("customer-read.audience");
+    {
+        let mut f = std::fs::File::create(&secret_path).expect("create");
+        f.write_all(&secret.encode_config()).expect("write");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600");
+    }
+    // The application's own copy of the secret is dropped here; from now on the
+    // key exists only inside Rust, loaded from the file.
+    drop(secret);
+
+    // ---- caller: bytes + a path, exactly the binding constructor ----
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::from_parts(
+        &cert.to_bytes(),
+        &dg.to_bytes(),
+        &[grant.to_bytes()],
+        &[secret_path],
+    )
+    .expect("credentials load from wire bytes + a secret file");
+
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge_discovery(&provider, &org, &cap("nrpc:customer.read")).await,
+        "the file-loaded audience secret really did enable private discovery"
+    );
+
+    // ---- the call: raw bytes in, raw bytes out ----
+    let reply = org
+        .call_bytes(
+            "customer.read",
+            bytes::Bytes::from(serde_json::to_vec(&Ping { n: 21 }).expect("encode")),
+        )
+        .await
+        .expect("the cross-org protected call is admitted");
+    let pong: Pong = serde_json::from_slice(&reply).expect("decode");
+
+    assert_eq!(pong.n, 42);
+    assert_eq!(pong.served_by, "rehearsal");
+    assert!(
+        facts_ok.load(Ordering::SeqCst),
+        "four-party attribution reached the RAW handler — canonical admission ran"
+    );
+
+    let _ = std::fs::remove_dir_all(&secret_dir);
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 // ---------------------------------------------------------------------------
 // The design test
 // ---------------------------------------------------------------------------

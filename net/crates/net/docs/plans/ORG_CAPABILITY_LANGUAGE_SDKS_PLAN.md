@@ -35,11 +35,27 @@ promised `Call(ctx, …)` had no deadline or cancel token in the C ABI to make i
 real, so `net_org_call` now carries both (§D6a). G3 also pins the `MeshRpc`
 close/finalizer ordering explicitly.
 
-**Design only. Not started.** Activation gates on Workstream R (§R), which is
-Rust-side work that must land before any binding can compile against the
-facade. R is not optional plumbing: the facade as shipped is
-**unbindable** — both verbs are generic over `serde` types, and generics do not
-cross an FFI boundary.
+**Progress (2026-07-21).** The two steps that gate on nothing are **DONE**:
+
+| Step | Commit | Content |
+|---|---|---|
+| R1 + R3 | `a60d2fe84` | `call_bytes` / `serve_org_bytes` + `OrgHandlerError`; the `org:` vocabulary, `OrgErrorDomain`, `unknown` |
+| R2 | `c8f029029` | `load_grant_audience_secret` + `OrgCredentials::from_parts` |
+| X1 | `3b99c39c7` | `tests/cross_lang_org/error_vectors.json` + `parse_org_wire` + drift guard |
+| R acceptance | (this) | the binding rehearsal — files + raw seams + live two-node |
+
+R4 moved to Workstream C by the v0.2 ruling (marshaling belongs in `org-ffi`,
+and `OrgCaller`'s fields already expose public byte accessors, so R needed
+nothing for it). R5's disposal contract is carried in the doc comments R1–R3
+landed.
+
+**Every remaining workstream is language-gated.** N, P, and C+G activate only
+on a named consumer for that language, per §Activation gate.
+
+Activation gated on Workstream R (§R), which is Rust-side work that must land
+before any binding can compile against the facade. R was not optional
+plumbing: the facade as shipped was **unbindable** — both verbs are generic
+over `serde` types, and generics do not cross an FFI boundary.
 
 The Rust facade itself is IMPLEMENTED and closed (four slices, `a9ec879a4` →
 `04d66e9b8`, plus `b4e585d23`), on substrate base `07820a9de`.
