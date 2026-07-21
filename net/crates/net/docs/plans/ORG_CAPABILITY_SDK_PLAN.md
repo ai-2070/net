@@ -24,7 +24,7 @@ Companion docs:
 caller/provider seams the verbs sit on).
 
 **Status: IMPLEMENTED (2026-07-21).** All four slices landed on
-branch `org-capability-auth`, each its own commit, against substrate
+branch `org-capability-sdk`, each its own commit, against substrate
 base `07820a9de`:
 
 | Slice | Commit | Content |
@@ -45,10 +45,17 @@ pinned substrate commit" once the open organization-auth Pass-2
 findings closed. Implementation was authorized directly by the
 operator before that pin was recorded, so the substrate base is
 pinned retroactively above (`07820a9de`) rather than by a prior
-review. Any Pass-2 finding that lands after it should be checked
-against §Core-touch inventory — the facade adds no authority
-semantics, so the exposure is that a substrate fix could change
-behavior the witnesses currently pin.
+review.
+
+The base is at least a *complete* substrate: `git rev-list --count
+07820a9de..org-capability-auth` is **0**, so every commit on the
+organization-auth branch is contained in it — the facade was not
+built against a partial OA tree. What remains open is only the
+*forward* direction: a Pass-2 finding landing after this base should
+be checked against §Core-touch inventory. The facade adds no
+authority semantics, so the exposure is narrow — a substrate fix
+could change behavior these witnesses currently pin, not create an
+authority gap the facade would hide.
 
 **The measured gap (OA-4 STOP-gate answer).** The gap is NOT
 "applications need to inspect private-discovery records." The gap
