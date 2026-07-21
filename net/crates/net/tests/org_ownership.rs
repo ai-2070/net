@@ -1993,6 +1993,10 @@ async fn send_seqlock_pins_authority_and_store_arcs() {
 /// `publish_generation()` read would observe the stale generation,
 /// find the stamp "unchanged", and emit the now-below-floor certified
 /// bytes.
+///
+/// `arm_publish_pause_for_test` is a §19 `fixtures`-gated seam, so this
+/// witness only exists under `--features fixtures` (CI enables it).
+#[cfg(feature = "fixtures")]
 #[tokio::test]
 async fn send_seqlock_barrier_catches_a_paused_mid_swap_publish() {
     use parking_lot::Mutex as PlMutex;

@@ -254,6 +254,10 @@ async fn provider_with_expired_cert_cannot_admit() {
 
 /// KC10 negative — a POISONED installed store cannot admit: the
 /// durability-uncertain branch denies before any self-verify.
+///
+/// `mark_poisoned_for_test` is a §19 `fixtures`-gated seam, so this witness
+/// only exists under `--features fixtures` (CI enables it).
+#[cfg(feature = "fixtures")]
 #[tokio::test]
 async fn provider_with_poisoned_store_cannot_admit() {
     let node = build_node().await;

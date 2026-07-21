@@ -513,6 +513,10 @@ async fn live_two_node_missing_proof_denied() {
 /// authority is durability-uncertain), the handler stays dark, and the caller
 /// sees 0x0009 — proving the live gate reads current provider state, not
 /// registration-time state.
+///
+/// `mark_poisoned_for_test` is a §19 `fixtures`-gated seam, so this witness
+/// only exists under `--features fixtures` (CI enables it).
+#[cfg(feature = "fixtures")]
 #[tokio::test]
 async fn live_two_node_provider_store_poison_denies() {
     const CALLER_SEED: [u8; 32] = [0x09u8; 32];
