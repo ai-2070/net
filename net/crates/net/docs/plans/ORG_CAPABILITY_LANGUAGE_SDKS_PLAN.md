@@ -15,48 +15,59 @@ a discovery key in garbage-collected memory.
 
 ## Status
 
-**v0.3 (2026-07-21).** Product and binding architecture **SIGNED OFF**;
-**Workstream R is AUTHORIZED**. Individual language workstreams still activate
-only on a named consumer for that language.
+**v0.4 (2026-07-22).** Product and binding architecture **SIGNED OFF** (v0.3).
+Workstream R, X1, **Node (N)**, and **Python (P)** are **IMPLEMENTED**. Go
+(C+G) remains, gated on a named consumer.
 
-v0.2 applied Kyra's five architecture findings — (1) R2 is a NEW
-security-sensitive loader, not reuse of an existing helper (§D2a); (2)
-canonical `OrgCaller` is marshaled, never reshaped for the C ABI (§R4); (3) the
-C ABI takes a typed arc and exact ownership, and drops the dishonest
-"idempotent" free (§D7); (4) an unclassifiable error becomes `org:unknown`,
-never a counterfeit admission denial (§D5a); (5) rollout follows named
-consumers (§Rollout).
+| Workstream | State | Commits | Verified |
+|---|---|---|---|
+| **R** — bindable seam, vocabulary, secret loader | done | `a60d2fe84`, `c8f029029` | Rust: 77 SDK org tests |
+| **R acceptance** — the binding rehearsal | done | `1c9430ef9` | live two-node, from files, raw seams |
+| **X1** — cross-language error fixture + drift guard | done | `3b99c39c7` | drift guard proven to fail on a rename |
+| **bind/serve seams** — `OrgClient::bind_node`, `serve_org_bytes_node` | done | `495082a9e`, `78abfb0f6` | one pipeline, two doors, witnessed |
+| **N** — Node caller + provider | done | `751b8796a`, `78abfb0f6`, `42f4934f2`, `39230fe1a` | **built + tested: 63 JS tests, `tsc` clean** |
+| **P** — Python caller + provider | done | `16ce249a3` | **built + tested: 12 pytest, stub drift clean** |
+| **C + G** — Go over a new C ABI | not started | — | consumer-gated |
 
-v0.3 closes three internal inconsistencies in that revision: the R2 bullet
-still carried the superseded "reuse the CLI's 0600 gate" wording; the
-`Box<OrgAudienceSecret>` claim was withdrawn because it does not compose with
-the by-value credential pipeline and only postpones the move (§D2a); and Go's
-promised `Call(ctx, …)` had no deadline or cancel token in the C ABI to make it
-real, so `net_org_call` now carries both (§D6a). G3 also pins the `MeshRpc`
-close/finalizer ordering explicitly.
+**Two substrate bugs were found and fixed by doing the binding work** — the
+reason R was sequenced first, vindicated:
 
-**Progress (2026-07-21).** The two steps that gate on nothing are **DONE**:
+1. **The audience lease was keyed to the wrong owner** (`71c2fbf71`). The
+   refcount lived on the SDK `Mesh` wrapper, but it guards the NODE's consumer
+   registry, and `Mesh::from_node_arc` is public — so two wrappers over one
+   node each thought they were the first installer, and the first to drop
+   withdrew a live client's audience. Reproduced by a test, then rehomed to
+   `MeshNode`. The pre-existing lease witnesses were correct about semantics
+   and blind to scope, because they only ever built one `Mesh`.
+2. **The provenance check was missing on every non-SDK mesh constructor**
+   (`39230fe1a` Node, folded into `16ce249a3` Python). `Mesh::org` decided
+   "was an identity configured?" from `Mesh.identity`, invisible to a binding
+   holding only `Arc<MeshNode>`. The fix (§D1a) records
+   `MeshNode::configured_identity` at construction — but each language's mesh
+   constructor is a SEPARATE code path from the Rust `MeshBuilder`, so each had
+   to set it, and Node's and Python's both silently did not. A seeded Node or
+   Python caller was refused `persistent_identity_required` until fixed.
+   **Go's `NewMeshNode` will have the identical gap** and must set
+   `configured_identity` before the Go org surface can work.
 
-| Step | Commit | Content |
-|---|---|---|
-| R1 + R3 | `a60d2fe84` | `call_bytes` / `serve_org_bytes` + `OrgHandlerError`; the `org:` vocabulary, `OrgErrorDomain`, `unknown` |
-| R2 | `c8f029029` | `load_grant_audience_secret` + `OrgCredentials::from_parts` |
-| X1 | `3b99c39c7` | `tests/cross_lang_org/error_vectors.json` + `parse_org_wire` + drift guard |
-| R acceptance | (this) | the binding rehearsal — files + raw seams + live two-node |
+**Architecture-revision history.** v0.2 applied Kyra's five findings — (1) R2 is
+a NEW security-sensitive loader (§D2a); (2) canonical `OrgCaller` is marshaled,
+never reshaped for the C ABI (§R4); (3) the C ABI takes a typed arc and exact
+ownership, dropping the dishonest "idempotent" free (§D7); (4) an unclassifiable
+error is `org:unknown`, never a counterfeit admission denial (§D5a); (5) rollout
+follows named consumers (§Rollout). v0.3 closed three internal inconsistencies:
+the stale "reuse the CLI's 0600 gate" R2 wording; the withdrawn
+`Box<OrgAudienceSecret>` claim (it only postpones a by-value move, §D2a); and
+Go's `Call(ctx, …)` gaining the `deadline_ms` + `cancel_token` the C ABI needs
+to make it real (§D6a).
 
-R4 moved to Workstream C by the v0.2 ruling (marshaling belongs in `org-ffi`,
-and `OrgCaller`'s fields already expose public byte accessors, so R needed
-nothing for it). R5's disposal contract is carried in the doc comments R1–R3
-landed.
+R4 moved to Workstream C by the v0.2 ruling (marshaling belongs in `org-ffi`).
+R5's disposal contract rides the doc comments N and P landed.
 
-**Every remaining workstream is language-gated.** N, P, and C+G activate only
-on a named consumer for that language, per §Activation gate.
+**Go and C remain language-gated** on a named consumer, per §Activation gate.
 
-Activation gated on Workstream R (§R), which is Rust-side work that must land
-before any binding can compile against the facade. R was not optional
-plumbing: the facade as shipped was **unbindable** — both verbs are generic
-over `serde` types, and generics do not cross an FFI boundary.
-
+R was not optional plumbing: the facade as shipped was **unbindable** — both
+verbs are generic over `serde` types, and generics do not cross an FFI boundary.
 The Rust facade itself is IMPLEMENTED and closed (four slices, `a9ec879a4` →
 `04d66e9b8`, plus `b4e585d23`), on substrate base `07820a9de`.
 
@@ -665,37 +676,60 @@ JSON, byte-identical to Rust's `Codec::Json`. The raw byte surface
 ## The parity matrix (the contract)
 
 A language column is "done" when every row is `✅`. Cross-referenced from
-`net_sdk::org`'s module doc.
+`net_sdk::org`'s module doc. TS and Python are **complete and verified**; Go
+and C cells still carry their planned slice ids.
 
 | Capability | Rust | TS | Python | Go | C |
 |---|---|---|---|---|---|
-| `OrgCredentials` from public bytes + secret **paths** | R2 | N1 | P1 | G2 | C1 |
-| Audience secret cannot cross as bytes (no API exists) | R2 | N1 | P1 | G2 | C1 |
-| `mesh.org(credentials)` → client | ✅ | N2 | P2 | G3 | C2 |
-| Explicit close releases the lease | ✅ (Drop) | N2 | P2 | G3 | C2 |
-| Documented teardown order + leak consequence | R5 | N2 | P2 | G3 | C2 |
-| `call(service, req)` typed (JSON) | ✅ | N3 | P3 | G4 | C3 |
-| `callBytes` raw | R1 | N3 | P3 | G4 | C3 |
-| `serveOrg(service, access, handler)` | ✅ | N4 | P4 | G5 | C4 |
-| Handler receives `OrgCaller` (5 fields) | ✅ | N4 | P4 | G5 | C4 |
-| `OrgAccess` SameOrg/Granted → private visibility | ✅ | N4 | P4 | G5 | C4 |
-| Four error domains, `org:` vocabulary | R3 | N5 | P5 | G6 | C5 |
-| Coarse remote reason preserved | ✅ | N5 | P5 | G6 | C5 |
-| `unknown` fallback that impersonates no domain | R3 | N5 | P5 | G6 | C5 |
-| Async dual | ✅ | ✅ (Promise) | P6 | ctx | — |
-| Error-vocabulary golden vector | X1 | X1 | X1 | X1 | X1 |
-| Live cross-language call matrix | X2 | X2 | X2 | X2 | — |
-| Header/stub/ABI drift guard | — | X3 | X3 | X3 | X3 |
+| `OrgCredentials` from public bytes + secret **paths** | ✅ | ✅ | ✅ | G2 | C1 |
+| Audience secret cannot cross as bytes (no API exists) | ✅ | ✅ | ✅ | G2 | C1 |
+| `mesh.org(credentials)` → client | ✅ | ✅ | ✅ | G3 | C2 |
+| Explicit close releases the lease | ✅ (Drop) | ✅ | ✅ | G3 | C2 |
+| Documented teardown order + leak consequence | ✅ | ✅ | ✅ | G3 | C2 |
+| `call(service, req)` typed (JSON) | ✅ | ✅ | ✅ | G4 | C3 |
+| `callBytes` raw | ✅ | ✅ | ✅ | G4 | C3 |
+| `serveOrg(service, access, handler)` | ✅ | ✅ | ✅ | G5 | C4 |
+| Handler receives `OrgCaller` (5 fields) | ✅ | ✅ | ✅ | G5 | C4 |
+| `OrgAccess` SameOrg/Granted → private visibility | ✅ | ✅ | ✅ | G5 | C4 |
+| Four error domains, `org:` vocabulary | ✅ | ✅ | ✅ | G6 | C5 |
+| Coarse remote reason preserved | ✅ | ✅ | ✅ | G6 | C5 |
+| `unknown` fallback that impersonates no domain | ✅ | ✅ | ✅ | G6 | C5 |
+| Node/binding identity provenance (§D1a) | ✅ | ✅ | ✅ | **G-prov** | — |
+| Async dual | ✅ | ✅ (Promise) | ✅ (GIL release) | ctx | — |
+| Error-vocabulary golden vector | ✅ | ✅ | ✅ | X1 | X1 |
+| Live cross-language call matrix | ✅ | — | — | X2 | — |
+| Header/stub/ABI drift guard | — | ✅ | ✅ | X3 | X3 |
+
+**Not yet done in any shipped column:** the live cross-language call matrix
+(X2) — Node and Python are each verified in isolation and against the shared
+error fixture, but a live *X-serves, Y-calls* run needs at least two languages
+present with adopted node authorities in one harness. It is the strongest
+parity witness and is deferred until Go lands (three languages make it worth
+the harness) or a consumer needs it sooner. Recorded here rather than implied
+by the ✅s above.
+
+**New matrix row, learned from N and P:** every language's mesh constructor
+must set `configured_identity` (§D1a). It is not free per language — Node and
+Python each silently omitted it — so Go carries an explicit **G-prov** slice.
 
 ---
 
 ## Workstreams
 
-### Workstream R — Rust: make the facade bindable (blocks everything)
+### Workstream R — Rust: make the facade bindable (DONE — blocked everything)
 
-- **R1 — raw-byte duals.** `OrgClient::call_bytes`, `Mesh::serve_org_bytes`
-  (§D1). The typed verbs are rewritten on top; a witness asserts the typed path
-  is exactly bytes + JSON.
+Landed as `a60d2fe84` (R1+R3), `c8f029029` (R2), `1c9430ef9` (acceptance), with
+the bind/serve seams (§D1a) in `495082a9e` / `78abfb0f6`. Also added, not in the
+original R inventory but required by it: `serve_org_bytes_node` (the serve
+counterpart to `bind_node`), `OrgHandlerError` (so a binding can signal an
+application status rather than flattening every handler failure), and
+`MeshNode::has_configured_identity` / `entity_keypair_arc` (§D1a).
+
+- [x] **R1 — raw-byte duals.** `OrgClient::call_bytes`, `Mesh::serve_org_bytes`
+  (§D1). The typed verbs are rewritten on top, and a live witness proves the
+  seam interoperates: a TYPED handler answers a hand-written-JSON `call_bytes`
+  and a RAW handler answers a typed `call`, so the codec layer is provably just
+  marshaling.
 - **R2 — credential loading.** Add
   `OrgCredentials::from_parts(membership_bytes, dispatcher_bytes, grant_bytes,
   audience_secret_paths)` using the **new opened-object loader specified by
@@ -724,21 +758,48 @@ A language column is "done" when every row is `✅`. Cross-referenced from
 never touching a generic or an in-memory secret — i.e. exactly what a binding
 will do.
 
-### Workstream N — Node/TS (house style: napi + hand-written TS beside the generated index)
+### Workstream N — Node/TS (DONE) — napi + hand-written TS beside the generated index
 
-- **N1** `OrgCredentials` napi class; `audienceSecretPaths: string[]`, no bytes
-  variant.
-- **N2** `NetMesh.org(credentials)` → `OrgClient` with `close()`; teardown order
-  in the class doc.
-- **N3** `call` (`async fn` → Promise) + `callBytes`.
-- **N4** `serveOrg` with a `ThreadsafeFunction<OrgCallArg, Promise<Buffer>, …,
-  false>` bridge carrying `(caller, req)`, two-stage timeout, `NonBlocking`,
-  `let _ = tx.send(..)` — the `mesh_rpc.rs:294-385` shape.
-- **N5** `org.ts`: `OrgError` classes + `classifyError` extension; `OrgAccess`
-  as a `#[napi(string_enum)]`.
+- [x] **N1** `OrgCredentials.create` napi factory; `audienceSecretPaths:
+  string[]`, no bytes variant (`bindings/node/src/org.rs`).
+- [x] **N2** `OrgClient.bind(mesh, credentials)` factory over `node_arc_clone()`
+  and `OrgClient::bind_node`, with `close()` / `isClosed`. The client lives in
+  an `ArcSwapOption`, so `close()` and an in-flight `callBytes` cannot race — a
+  call snapshots the client first, and clones share one lease + node reference.
+- [x] **N3** `TypedOrgClient.call` (JSON over `callBytes`) + raw `callBytes`
+  (`async fn` → Promise).
+- [x] **N4** `serveOrg` with a `ThreadsafeFunction<OrgRequest, Promise<Buffer>,
+  …, false>` bridge carrying `{ caller, request }`, two-stage timeout,
+  `NonBlocking`, `let _ = tx.send(..)` — the `mesh_rpc.rs:294-385` shape, copied
+  not reinvented. `OrgAccess` as a `#[napi(string_enum)]`.
+- [x] **N5** the `OrgError` taxonomy + `classifyOrgError` live in native-free
+  `errors.ts` (so `abi_stability.test.ts` runs with no cdylib), and the generic
+  `classifyError` routes `org:` to it. `org.ts` re-exports for one-stop import.
 
-**Acceptance:** a Node service serves a private cross-org capability and a Node
-client calls it, with the handler reading `caller.actingOrg`.
+**Verified (built + run, `39230fe1a`, `751b8796a`, `78abfb0f6`, `42f4934f2`):**
+`napi build --features net,cortex,org` generates the full org surface into
+`index.d.ts`; `tsc --noEmit` over `errors.ts` + `org.ts` is clean;
+`org_error_vectors.test.ts` (8) runs with NO native module; `org_binding.test.ts`
+(5) runs through the real napi boundary — malformed AND correctly-sized-but-
+unsigned credentials both refused with the `org:` vocabulary intact and
+classified into the credentials domain, seeded meshes stable / ephemeral not;
+`abi_stability` + `errors` + `cross_lang_compat` (50) unchanged.
+
+**Found by building it:** the napi `NetMesh.create` did not set
+`configured_identity` for a supplied `identitySeed` (§D1a), so a seeded Node
+caller was refused as ephemeral. Fixed at the constructor.
+
+**Acceptance (still owed at the live tier):** a Node service serving a private
+cross-org capability that a Node client calls, with the handler reading
+`caller.actingOrg`, needs an adopted node authority in the JS harness. The Rust
+live suite proves the seam; the JS live variant lands with X2.
+
+The disposal contract asserts what `NetMesh.shutdown()` actually does, which is
+**reject, not hang** — it drains `Arc::try_unwrap` for ~250 ms (50 x 5 ms),
+then returns `"cannot shutdown: outstanding references exist"` and **restores
+the node**, so the node stays usable and a later retry can succeed
+(`bindings/node/src/lib.rs:2134`). An earlier draft said "shutdown remains
+pending until close"; that did not match the implementation.
 
 The disposal witness asserts what `NetMesh.shutdown()` actually does, which is
 **reject, not hang** — it drains `Arc::try_unwrap` for ~250 ms (50 x 5 ms),
@@ -758,21 +819,43 @@ An earlier draft said "shutdown remains pending until close." That did not
 match the implementation, and a witness written against it would have asserted
 a hang that never happens.
 
-### Workstream P — Python (house style: sync/async pairs, GIL release, stub discipline)
+### Workstream P — Python (DONE) — GIL release + stub discipline
 
-- **P1** `OrgCredentials` pyclass, kwargs signature, `audience_secret_paths`.
-- **P2** `NetMesh.org(...)` → `OrgClient` with `close()`/`__enter__`/`__exit__`.
-- **P3** `call` with `py.detach(|| runtime.block_on(..))`.
-- **P4** `serve_org`; handler bridged via `Py<PyAny>` + `spawn_blocking` +
-  `Python::attach`, with the coroutine path going through
-  `async_bridge::dispatch_handler_coro`.
-- **P5** `OrgError` + subclasses via `create_exception!`; message-prefix
-  parsing helper beside `classify_error`.
-- **P6** `AsyncOrgClient` with `aclose()`/`__aenter__`/`__aexit__`.
-- **P7** `_net.pyi` entries (drift-tested by `test_stub_drift.py`).
+- [x] **P1** `OrgCredentials(membership, dispatcher, grants,
+  audience_secret_paths)` pyclass (`bindings/python/src/org.rs`).
+- [x] **P2** `OrgClient.bind(mesh, credentials)` over `node_arc_clone()` and
+  `bind_node`, with `close()` / `__enter__` / `__exit__`. Same `ArcSwapOption`
+  close/call race handling as Node.
+- [x] **P3** `call` releasing the GIL via `py.detach(|| runtime.block_on(..))`.
+- [x] **P4** `serve_org`; handler bridged via `Py<PyAny>` + `spawn_blocking` +
+  `Python::attach`, following `PyRpcHandler` exactly; handler receives
+  `(caller: dict, request: bytes)`.
+- [x] **P5** `OrgError` + subclasses via `create_exception!` carrying the `org:`
+  wire string; `parse_org_error` (pure Python, `net/org.py`) mirrors
+  `parse_org_wire`.
+- [x] **P7** `_net.pyi` entries (drift-tested by `test_stub_drift.py` — all 7
+  org classes matched runtime).
 
-**Acceptance:** the Node acceptance sentence, in Python, both sync and async —
-and `pytest` fails if a stub entry is missing.
+**Deferred — P6 (`AsyncOrgClient`).** The sync GIL-releasing `OrgClient` is the
+one common shape; the `Foo`/`AsyncFoo` pair is real work (a
+`pyo3-async-runtimes` future path through `async_bridge`, plus
+`aclose`/`__aenter__`/`__aexit__`) and the plan's async-dual row does not gate
+the sync surface. Entry criteria: a Python consumer whose call site is `async
+def`. Recorded, not silently dropped.
+
+**Verified (built with maturin + pytest, `16ce249a3`):**
+`test_org_error_vectors.py` (6, pure Python — no extension needed);
+`test_org_binding.py` (6, real PyO3 boundary — credential refusals classified,
+the `OrgError` hierarchy catchable as a base, no bytes path for a secret, seeded
+meshes stable / ephemeral not); `test_stub_drift.py` clean on all org classes.
+
+**Found by building it:** the same `configured_identity` gap as Node, in the
+PyO3 `NetMesh.__new__` — the SECOND non-SDK constructor to omit it. Fixed.
+
+**Acceptance (live tier owed with X2, as for Node):** the Node acceptance
+sentence in Python. The sync surface is proven at the construction/refusal tier
+a Python app can reach without operator setup; the live admitted call needs an
+adopted authority.
 
 ### Workstream C — C: the header IS the SDK
 
@@ -787,6 +870,14 @@ create/serve/call/free.
 
 ### Workstream G — Go over the C ABI (house style: rpc-ffi doctrine verbatim)
 
+- **G-prov** (do this FIRST, before anything binds) — set
+  `config.configured_identity` in Go's mesh constructor when the caller supplied
+  an identity. Node and Python each silently omitted this on their own
+  constructor and each refused a seeded caller until fixed (§D1a); Go's
+  `NewMeshNode` is a third separate code path and will have the identical gap.
+  This is a one-line fix plus a witness (a seeded mesh binds; an unseeded one is
+  refused `persistent_identity_required`), and skipping it makes every later G
+  slice appear broken for a non-obvious reason.
 - **G1** register `bindings/go/org-ffi` in the workspace `members` and in the
   `go-tests` CI build (the job enumerates every cdylib by name).
 - **G2** `go/org.go`: `OrgCredentialsConfig` struct + `NewOrgCredentials`.
@@ -841,28 +932,35 @@ between two bindings fails CI without anyone having to notice it by hand.
 
 ## Rollout order
 
-Only the first two steps are fixed. The language order follows **named
+Only the first two steps were fixed. The language order follows **named
 consumers**, because this plan describes eventual parity — it does not activate
 four languages as one program.
 
-1. **R** — nothing compiles against the facade until it lands.
-2. **X1** — the vocabulary fixture, so every binding is written against one
-   frozen contract rather than N readings of it.
+1. ✅ **R** — nothing compiles against the facade until it lands. Done.
+2. ✅ **X1** — the vocabulary fixture, so every binding is written against one
+   frozen contract rather than N readings of it. Done.
 3. **The named language workstream(s)**, in demand order:
-   - **Node named** → **N** lands immediately after R + X1. It already depends
-     on `net-mesh-sdk`; nothing else blocks it.
-   - **Python named** → **P** lands immediately after R + X1, same reasoning.
+   - ✅ **N (Node)** — landed after R + X1; already depended on `net-mesh-sdk`.
+   - ✅ **P (Python)** — landed after N, same reasoning; both SDK-dependent
+     bindings are now done.
    - **Go named** → **C + G** as one inseparable reviewed unit (the header and
      the FFI crate are one artifact; Go is the only consumer that proves the C
-     ABI is usable).
-4. **X2** — starts once **two independently implemented languages exist**, so
-   the matrix proves interoperation rather than a Rust-side coincidence.
-5. **X3** — lands **per binding**, with that binding, rather than waiting for
-   every language.
+     ABI is usable), starting with **G-prov** (the provenance fix N and P both
+     needed).
+4. **X2** — starts once two independently implemented languages have adopted
+   authorities in one harness. Node and Python are each verified in isolation
+   and against the shared error fixture, but the live *X-serves-Y-calls* matrix
+   is **not yet built**; it lands with Go (three languages) or a consumer sooner.
+5. **X3** — lands **per binding**. Node (`abi_stability` + the org vocabulary
+   test) and Python (`test_stub_drift` + the vocabulary test) are done; Go's
+   `header_parity_test.go` + ABI pin lands with G.
 
-An earlier draft hardcoded C+G ahead of N and P. That would impose roughly a
-week and a half of Go/C work on a Python or Node consumer who is blocked on
-neither — the opposite of the activation gate's own rule.
+An earlier draft hardcoded C+G ahead of N and P. That would have imposed ~1.5
+weeks of Go/C work on a Node or Python consumer blocked on neither — the
+opposite of the activation gate's own rule. In practice N then P landed first
+and each surfaced a substrate bug (§Status), so the ordering also front-loaded
+the cheap-to-fix discoveries into the SDK-dependent languages before the
+heavier C-ABI branch.
 
 ---
 
@@ -960,15 +1058,44 @@ X1 ~1 day; X2 ~2 days once two languages exist; X3 rides each binding.
 
 ## Activation gate
 
-- **R** gates on nothing beyond review of this plan — it is additive Rust work
-  on a closed facade.
-- **N, P, C, G** gate on R and X1 landing.
-- **X2** gates on at least two non-Rust languages being complete.
-- The whole plan gates on a **named consumer per language**. The Rust facade's
-  exit gate says "no further org work without a named consumer or a measured
-  failure," and that rule does not weaken by crossing a language boundary: ship
-  the languages someone is actually waiting for, in that order, rather than all
-  four on principle.
+- ✅ **R** gated on nothing beyond review — additive Rust work on a closed
+  facade. Done.
+- ✅ **N, P** gated on R and X1. Done and verified.
+- **C, G** gate on R + X1 (met) **and a named Go/C consumer**. Not started.
+- **X2** gates on two non-Rust languages having adopted authorities in one
+  harness; owed (see §Rollout step 4).
+- The plan gates each remaining language on a **named consumer**. The Rust
+  facade's exit gate says "no further org work without a named consumer or a
+  measured failure," and that rule does not weaken by crossing a language
+  boundary. Node and Python were built ahead of a named external consumer as the
+  proven-template pair (both already SDK-dependent, both cheap); Go is the
+  heavier branch and stays gated.
+
+## What N and P taught, for whoever does Go
+
+Recorded so the Go implementer inherits the lessons rather than the surprises:
+
+1. **Do G-prov first.** Every non-SDK mesh constructor is a separate code path
+   from `MeshBuilder`, and the provenance flag (§D1a) was omitted on Node's and
+   Python's independently. Go's `NewMeshNode` is the third. Set
+   `config.configured_identity` and witness it before anything binds, or every
+   later slice looks broken for a non-obvious reason.
+2. **The seams already exist.** `OrgClient::bind_node` and
+   `serve_org_bytes_node` are the one-implementation bind/serve pipeline; Go
+   reaches them exactly as N and P did (`node_arc_clone` → `bind_node`). Do not
+   add a Go-specific path.
+3. **The close/call race is structural, not a test.** N and P both put the
+   client in an `ArcSwapOption` and snapshot before the async boundary; the Go
+   equivalent is the `withHandle` read-lock across the whole cgo call plus the
+   `closed.Swap` teardown (§G3). Get the ordering right and the race is closed
+   by construction.
+4. **Build and run it, do not trust a clean compile.** Both bugs above passed
+   `cargo check`, `clippy`, and every Rust test — because none of them traverse
+   a binding constructor. Node's were caught by `napi build` + vitest, Python's
+   by maturin + pytest. Go's will be caught by `go test` with the cdylib built,
+   or not at all until a user hits them. Both binding suites also caught test
+   bugs of mine (`.length` arity in JS, property-vs-method in Python) — writing
+   binding tests without running them produces confidently wrong tests.
 
 ---
 
