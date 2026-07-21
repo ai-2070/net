@@ -44,6 +44,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use net::adapter::net::behavior::org_admission::Admitted;
 use net::adapter::net::identity::EntityId;
+use net::adapter::net::MeshNode;
 
 use super::types::{CapabilityAuthorityId, OrgId};
 use crate::mesh::Mesh;
@@ -223,18 +224,70 @@ impl Mesh {
         F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
     {
-        let raw = Arc::new(OrgBytesHandler {
-            inner: Arc::new(handler),
-        });
-        self.auto_register_rpc_channels(service);
-        // The trivial proof policy: v1 decides in the handler, with the verified
-        // facts in hand. The low-level API keeps the step-11 seam for providers
-        // that must refuse before the replay insert.
-        let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
-        match access {
-            OrgAccess::SameOrg => self.node().serve_rpc_owner_scoped(service, raw, policy),
-            OrgAccess::Granted => self.node().serve_rpc_granted(service, raw, policy),
-        }
+        serve_org_bytes_node(self.node().clone(), service, access, handler)
+    }
+}
+
+/// Register a protected service on a NODE — the one implementation of the serve
+/// pipeline (OSDK-L N4).
+///
+/// [`Mesh::serve_org_bytes`] delegates here, and so does every language
+/// binding, for the same reason [`OrgClient::bind_node`] exists: bindings hold
+/// `Arc<MeshNode>`, and neither fabricating a throwaway [`Mesh`] nor pinning a
+/// permanent one is acceptable.
+///
+/// `#[doc(hidden)]` — applications use `mesh.serve_org(..)`; this is the
+/// binding seam, not a second public way to register a service.
+#[doc(hidden)]
+pub fn serve_org_bytes_node<F, Fut>(
+    node: Arc<MeshNode>,
+    service: &str,
+    access: OrgAccess,
+    handler: F,
+) -> Result<ServeHandle, ServeError>
+where
+    F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+{
+    let raw = Arc::new(OrgBytesHandler {
+        inner: Arc::new(handler),
+    });
+    auto_register_org_channels(&node, service);
+    // The trivial proof policy: v1 decides in the handler, with the verified
+    // facts in hand. The low-level API keeps the step-11 seam for providers
+    // that must refuse before the replay insert.
+    let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
+    match access {
+        OrgAccess::SameOrg => node.serve_rpc_owner_scoped(service, raw, policy),
+        OrgAccess::Granted => node.serve_rpc_granted(service, raw, policy),
+    }
+}
+
+/// Register the request/reply channels a served nRPC service needs, through the
+/// NODE's registry so the SDK and binding paths register identically.
+///
+/// A node built without a channel registry (possible via the bare
+/// `MeshNode::new` path) simply skips this — the same tolerance the SDK's
+/// `auto_register_rpc_channels` has, since a missing registry means channel ACLs
+/// are not in play for that node.
+fn auto_register_org_channels(node: &MeshNode, service: &str) {
+    use net::adapter::net::channel::{ChannelId, ChannelName};
+    use net::adapter::net::ChannelConfig;
+
+    let Some(registry) = node.channel_configs() else {
+        return;
+    };
+    // Exact: `<service>.requests`.
+    if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
+        registry.insert(ChannelConfig::new(ChannelId::new(req_channel)));
+    }
+    // Prefix: `<service>.replies.` — admits every per-caller
+    // `<service>.replies.<caller_origin>` subscribe.
+    if let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) {
+        registry.insert_prefix(
+            format!("{service}.replies."),
+            ChannelConfig::new(ChannelId::new(sentinel)),
+        );
     }
 }
 

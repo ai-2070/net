@@ -34,8 +34,12 @@
 //! node stays usable and a retry after `close()` succeeds — but the first
 //! shutdown fails, visibly.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use arc_swap::ArcSwapOption;
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
 /// Inputs for [`OrgCredentials::create`].
@@ -210,4 +214,207 @@ impl OrgClient {
 /// from the contract by inventing its own text.
 fn org_error(e: net_sdk::org::OrgSdkError) -> Error {
     Error::from_reason(e.to_wire())
+}
+
+// ---------------------------------------------------------------------------
+// The provider verb
+// ---------------------------------------------------------------------------
+
+/// Who may call a protected service, and how it is announced.
+///
+/// Access implies visibility — both variants are announced ONLY inside an
+/// encrypted audience, never on the plaintext plane. Protected-but-publicly-
+/// discoverable registration stays on the low-level Rust API.
+#[napi(string_enum)]
+pub enum OrgAccess {
+    /// Members of this node's own organization, acting under a dispatcher
+    /// grant. Announced inside the encrypted owner audience.
+    SameOrg,
+    /// Members of another organization holding a capability grant this node's
+    /// owner issued. Announced inside the encrypted per-grant audiences.
+    Granted,
+}
+
+/// The provider-verified facts about an admitted call.
+///
+/// An exact projection of the canonical `Admitted` — the same five fields,
+/// nothing added. Every one was verified by `verify_org_admission` before the
+/// handler ran; none is caller-claimed. Ids are 32 raw bytes.
+#[napi(object)]
+pub struct OrgCaller {
+    /// The acting entity — the caller.
+    pub entity: Buffer,
+    /// The organization the caller acted for.
+    pub acting_org: Buffer,
+    /// This provider's owner organization.
+    pub provider_org: Buffer,
+    /// This exact provider node.
+    pub provider: Buffer,
+    /// The capability that was invoked.
+    pub capability: Buffer,
+    /// Whether the call came from this provider's own organization.
+    pub is_same_org: bool,
+}
+
+/// What the JS handler receives: the verified facts plus the request bytes.
+#[napi(object)]
+pub struct OrgRequest {
+    /// Provider-verified attribution.
+    pub caller: OrgCaller,
+    /// The raw request body.
+    pub request: Buffer,
+}
+
+/// Application status for a handler that rejected — the same value the typed
+/// nRPC layer uses (`NRPC_TYPED_HANDLER_ERROR`), so a caller routes org handler
+/// errors exactly as it routes typed-RPC ones. Deliberately in the
+/// application band: a handler cannot counterfeit an admission denial.
+const ORG_HANDLER_ERROR: u16 = 0x8001;
+
+/// Handler bridge: `(req: OrgRequest) => Promise<Buffer>`.
+///
+/// The trailing `false` means NOT callee-handled, so a JS throw surfaces as a
+/// `Result::Err` in the callback rather than crashing the process — the
+/// invariant every TSFN site in this crate holds.
+type OrgHandlerTsfn = ThreadsafeFunction<OrgRequest, Promise<Buffer>, OrgRequest, Status, false>;
+
+/// Handle for a served organization service. `close()` unregisters.
+#[napi]
+pub struct OrgServeHandle {
+    inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+}
+
+#[napi]
+impl OrgServeHandle {
+    /// Unregister the service. Idempotent. In-flight handlers run to
+    /// completion.
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.inner.lock().take();
+    }
+}
+
+/// Serve a protected, privately-discoverable service.
+///
+/// The handler receives `{ caller, request }` and returns the response bytes.
+/// `access` selects both who may call AND how the service is announced; there
+/// is no separate visibility knob, because every combination a common provider
+/// should want is one of these two.
+///
+/// Returning a rejected promise surfaces as an application error, never as an
+/// admission denial — `0x0009` is the admission engine's word, and a handler
+/// cannot counterfeit it.
+///
+/// Requires an installed node authority; a protected registration without one
+/// is refused loudly.
+#[napi]
+pub fn serve_org(
+    mesh: &crate::NetMesh,
+    service: String,
+    access: OrgAccess,
+    handler: Function<'_, OrgRequest, Promise<Buffer>>,
+    handler_timeout_ms: Option<u32>,
+) -> Result<OrgServeHandle> {
+    let node = mesh.node_arc_clone()?;
+    let tsfn: OrgHandlerTsfn = handler
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .build()?;
+    let tsfn = Arc::new(tsfn);
+    // 0 disables the cap, matching `MeshRpc.serve`'s contract.
+    let timeout = match handler_timeout_ms {
+        Some(0) => Duration::from_secs(u64::from(u32::MAX)),
+        Some(ms) => Duration::from_millis(u64::from(ms)),
+        None => Duration::from_secs(60),
+    };
+
+    let access = match access {
+        OrgAccess::SameOrg => net_sdk::org::OrgAccess::SameOrg,
+        OrgAccess::Granted => net_sdk::org::OrgAccess::Granted,
+    };
+
+    let handle = net_sdk::org::serve_org_bytes_node(
+        node,
+        &service,
+        access,
+        move |caller: net_sdk::org::OrgCaller, body: bytes::Bytes| {
+            let tsfn = tsfn.clone();
+            async move { dispatch_to_js(tsfn, caller, body, timeout).await }
+        },
+    )
+    .map_err(|e| Error::from_reason(format!("org:serve_failed: {e}")))?;
+
+    Ok(OrgServeHandle {
+        inner: parking_lot::Mutex::new(Some(handle)),
+    })
+}
+
+/// The two-stage TSFN bridge, following `mesh_rpc.rs`'s RPC handler exactly:
+/// stage 1 waits for JS to return a Promise, stage 2 awaits it. Both are
+/// bounded, `NonBlocking` is always used, and a dropped receiver is swallowed
+/// (napi-rs escalates an unhandled one to a fatal process exit).
+async fn dispatch_to_js(
+    tsfn: Arc<OrgHandlerTsfn>,
+    caller: net_sdk::org::OrgCaller,
+    body: bytes::Bytes,
+    timeout: Duration,
+) -> std::result::Result<bytes::Bytes, net_sdk::org::OrgHandlerError> {
+    let arg = OrgRequest {
+        caller: OrgCaller {
+            entity: Buffer::from(caller.entity.as_bytes().to_vec()),
+            acting_org: Buffer::from(caller.acting_org.as_bytes().to_vec()),
+            provider_org: Buffer::from(caller.provider_org.as_bytes().to_vec()),
+            provider: Buffer::from(caller.provider.as_bytes().to_vec()),
+            capability: Buffer::from(caller.capability.as_bytes().to_vec()),
+            is_same_org: caller.is_same_org(),
+        },
+        request: Buffer::from(body.to_vec()),
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+    let status = tsfn.call_with_return_value(
+        arg,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret: napi::Result<Promise<Buffer>>, _env| {
+            // A dropped receiver means the handler task was cancelled before
+            // the JS callback fired — discard silently.
+            let _ = tx.send(ret);
+            napi::Result::Ok(())
+        },
+    );
+    if status != Status::Ok {
+        return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "TSFN enqueue failed: {status:?}"
+        )));
+    }
+
+    // Stage 1 — JS returns a Promise.
+    let promise = match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org handler threw synchronously: {e}"
+            )))
+        }
+        Ok(Err(_)) => {
+            return Err(net_sdk::org::OrgHandlerError::Internal(
+                "JS callback channel disconnected before the org handler responded".to_string(),
+            ))
+        }
+        Err(_) => {
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org handler did not respond within {} ms",
+                timeout.as_millis()
+            )))
+        }
+    };
+
+    // Stage 2 — await it.
+    match promise.await {
+        Ok(buf) => Ok(bytes::Bytes::from(buf.to_vec())),
+        Err(e) => Err(net_sdk::org::OrgHandlerError::Application {
+            code: ORG_HANDLER_ERROR,
+            message: format!("org handler rejected: {e}"),
+        }),
+    }
 }
