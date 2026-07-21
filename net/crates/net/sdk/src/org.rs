@@ -53,8 +53,16 @@ mod credentials;
 mod error;
 mod lease;
 pub use credentials::OrgCredentials;
-pub use error::{OrgCredentialError, OrgDiscoveryError, OrgSdkError};
+pub use error::{
+    parse_org_wire, OrgCredentialError, OrgDiscoveryError, OrgErrorDomain, OrgSdkError,
+    ERR_ORG_PREFIX,
+};
 pub(crate) use lease::OrgAudienceLeases;
+
+#[doc(hidden)]
+pub mod fixtures;
+#[doc(hidden)]
+pub use fixtures::render_error_vectors;
 
 mod client;
 pub use client::OrgClient;
@@ -72,6 +80,8 @@ pub use serve::{OrgAccess, OrgCaller, OrgHandlerError};
 mod tests;
 #[cfg(all(test, feature = "cortex"))]
 mod tests_call;
+#[cfg(test)]
+mod tests_fixture;
 #[cfg(all(test, feature = "cortex"))]
 mod tests_live;
 #[cfg(test)]

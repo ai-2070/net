@@ -119,6 +119,35 @@ impl OrgErrorDomain {
     }
 }
 
+/// Parse a wire string into its domain and kind — the reference implementation
+/// every binding mirrors (OSDK-L X1).
+///
+/// Anything that does not match `org:<domain>:<kind>` with a domain this build
+/// knows yields [`OrgErrorDomain::Unclassified`] and `None`. That is the whole
+/// point: a binding meeting an unfamiliar vocabulary must say so, never guess a
+/// domain — reporting `admission_denied` for an unparsed string would assert
+/// that a request reached a provider and its admission engine evaluated it.
+pub fn parse_org_wire(wire: &str) -> (OrgErrorDomain, Option<&str>) {
+    let Some(rest) = wire.strip_prefix(ERR_ORG_PREFIX) else {
+        return (OrgErrorDomain::Unclassified, None);
+    };
+    // `domain:kind[: detail]` — the kind runs to the next colon, and the
+    // detail (if any) is human-facing and never parsed for semantics.
+    let mut parts = rest.splitn(3, ':');
+    let (Some(domain), Some(kind)) = (parts.next(), parts.next()) else {
+        return (OrgErrorDomain::Unclassified, None);
+    };
+    match OrgErrorDomain::from_wire(domain) {
+        // `unknown` is a fallback classification, not something a peer asserts.
+        Some(OrgErrorDomain::Unclassified) | None => (OrgErrorDomain::Unclassified, None),
+        Some(d) if kind.is_empty() => {
+            let _ = d;
+            (OrgErrorDomain::Unclassified, None)
+        }
+        Some(d) => (d, Some(kind)),
+    }
+}
+
 impl OrgSdkError {
     /// The domain this error belongs to.
     pub fn domain(&self) -> OrgErrorDomain {
