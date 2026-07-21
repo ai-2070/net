@@ -322,6 +322,32 @@ impl ScopedAnnRelayGate {
         RelayAdmission::Fresh
     }
 
+    /// Release an identity admitted by [`Self::admit`] whose LOCAL ingest was
+    /// refused by a condition that can clear on its own (§24).
+    ///
+    /// The gate is primed before the local open/store runs — it has to be,
+    /// because forwarding must not wait on an audience open a relay may not be
+    /// able to perform. Without this, a fail-closed refusal (poisoned
+    /// revocation view, publication race, store at capacity) consumed the
+    /// identity for the full retention horizon with nothing stored, and every
+    /// re-delivery of that generation was dropped as a duplicate.
+    ///
+    /// Only ever called for a Retryable disposition: releasing after a FINAL
+    /// decision would re-open the dedup gate for an envelope this node has
+    /// already judged, which is the loop suppression the gate exists for.
+    /// Returns the per-peer slot too, so a peer is not charged for an
+    /// admission that did not stick.
+    pub fn release(&self, key: &RelayDedupKey) {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.seen.remove(key) {
+            if let Some(count) = inner.per_peer.get_mut(&entry.admitted_by) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.per_peer.remove(&entry.admitted_by);
+                }
+            }
+        }
+    }
     /// Number of tracked (currently-remembered) relay identities. Used by the
     /// module unit tests and the live relay witness's `_for_test` seam to
     /// confirm a relay ADMITTED (and thus forwarded) an envelope it can't store.
@@ -348,6 +374,9 @@ pub struct ScopedRelayAdmit {
     /// The hop-incremented frame to forward to peers-except-ingress, or `None`
     /// at the hop boundary (the frame has reached its forwarding depth).
     pub forward: Option<Vec<u8>>,
+    /// The dedup identity this admission occupies, so the caller can RELEASE
+    /// it if the local ingest turns out to be retryable (§24).
+    pub dedup_key: RelayDedupKey,
     /// Whether to also run the LOCAL audience open/store step.
     ///
     /// `false` for a §8 shorter-path re-forward: the identity is already in the
@@ -406,6 +435,7 @@ pub fn decide_scoped_relay(
         audience_handle: *envelope.audience_handle(),
         generation: envelope.generation(),
     };
+    let key_for_result = key.clone();
     let admission = gate.admit(from_node, key, frame.hop_count, now_secs);
     if !admission.forwards() {
         return None;
@@ -423,6 +453,7 @@ pub fn decide_scoped_relay(
     Some(ScopedRelayAdmit {
         envelope,
         forward,
+        dedup_key: key_for_result,
         ingest_locally: admission.ingests_locally(),
     })
 }
@@ -435,6 +466,69 @@ mod tests {
     // §8 — a relay must not be able to truncate the flood.
     // ------------------------------------------------------------------
 
+    /// §24 — releasing a retryable identity lets the SAME generation be
+    /// reconsidered; a final one stays deduped.
+    ///
+    /// The gate is primed before the local ingest runs, so a fail-closed
+    /// refusal (poisoned revocation view, publication race, store at capacity)
+    /// consumed the identity for the full 600 s retention with nothing stored,
+    /// and every re-delivery of that generation was dropped as a duplicate. It
+    /// self-healed only because the next periodic emission bumps the
+    /// generation — incidental, and gone entirely if generation ever becomes
+    /// change-triggered rather than emission-triggered.
+    ///
+    /// Both halves matter: release must restore admissibility, and NOT
+    /// releasing must keep the loop suppression the gate exists for.
+    #[test]
+    fn a_released_identity_is_admissible_again_and_a_retained_one_is_not() {
+        let gate = ScopedAnnRelayGate::new();
+        const PEER: u64 = 9;
+        let key = key_n(1, 7);
+
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 0, 1_000),
+            RelayAdmission::Fresh,
+        );
+        // Retained: the ordinary duplicate path is untouched.
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 0, 1_000),
+            RelayAdmission::Drop,
+            "without a release, a re-delivery is still a duplicate — this is \
+             the loop suppression the gate exists for",
+        );
+
+        // Released (the local ingest was refused by a transient condition).
+        gate.release(&key);
+        assert_eq!(gate.len(), 0, "the identity must leave the gate");
+        assert_eq!(
+            gate.admit(PEER, key.clone(), 0, 1_000),
+            RelayAdmission::Fresh,
+            "the same generation must be reconsidered after a retryable \
+             refusal, not swallowed for the retention horizon",
+        );
+
+        // The per-peer budget is returned too, or a peer would be charged for
+        // an admission that did not stick and could be starved by its own
+        // retries.
+        gate.release(&key);
+        for index in 0..ScopedAnnRelayGate::MAX_ENTRIES_PER_PEER as u64 {
+            assert_eq!(
+                gate.admit(PEER, key_n(index + 100, 1), 0, 1_000),
+                RelayAdmission::Fresh,
+                "peer budget leaked across release at index {index}",
+            );
+        }
+    }
+
+    /// Releasing an identity the gate never admitted is a no-op, not a panic
+    /// or an underflow of the per-peer budget.
+    #[test]
+    fn releasing_an_unknown_identity_is_harmless() {
+        let gate = ScopedAnnRelayGate::new();
+        gate.release(&key_n(42, 1));
+        assert_eq!(gate.len(), 0);
+        assert_eq!(gate.admit(7, key_n(42, 1), 0, 1_000), RelayAdmission::Fresh,);
+    }
     /// The attack: `hop_count` rides OUTSIDE the provider's signature, so a
     /// malicious relay can re-emit a legitimate envelope verbatim at the hop
     /// boundary. The victim admits it, ingests locally, and forwards NOTHING.

@@ -981,6 +981,33 @@ type RpcInboundDispatcherMap = DashMap<
 >;
 
 /// edge reconciliation task captures a clone — a boundary sleeper
+/// Whether a scoped ingest reached a DECISION or was refused by a condition
+/// that can clear on its own (§24).
+///
+/// The relay dedup gate is primed BEFORE the local ingest runs — it has to be,
+/// because forwarding must not wait on an audience open the relay may not even
+/// be able to perform. But that means a fail-closed refusal (poisoned
+/// revocation view, publication race, store at capacity) consumed the
+/// `(provider, grant, handle, generation)` identity for the full 600 s
+/// retention with nothing stored, and every re-delivery of that same generation
+/// was silently dropped as a duplicate.
+///
+/// It self-healed only because the next periodic emission bumps the generation
+/// — incidental recovery, not designed, and it disappears entirely if
+/// generation ever becomes change-triggered rather than emission-triggered.
+/// Reporting the disposition lets the caller release the identity so the
+/// retryable cases are actually retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopedIngestDisposition {
+    /// Stored, updated, stale, or refused for a reason re-delivery would reach
+    /// again (wrong audience, expired, no authority, no matching credential).
+    /// The dedup identity is RETAINED.
+    Final,
+    /// Refused by a transient condition. The dedup identity is RELEASED so the
+    /// same generation can be reconsidered.
+    Retryable,
+}
+
 /// outlives the dispatch call that scheduled it, so it cannot
 /// borrow.
 #[derive(Clone)]
@@ -11877,7 +11904,7 @@ impl MeshNode {
                 // AEAD open would let a peer solicit repeated crypto work by
                 // replaying one envelope at ever-lower hop counts.
                 if admit.ingest_locally {
-                    Self::ingest_scoped_announcement(
+                    let disposition = Self::ingest_scoped_announcement(
                         &ctx.node_authority,
                         &ctx.org_revocation,
                         &ctx.consumer_grant_audiences,
@@ -11886,6 +11913,15 @@ impl MeshNode {
                         from_node,
                         None,
                     );
+                    // §24 — a fail-closed refusal that can clear on its own
+                    // (poison, publication race, store capacity) must not
+                    // consume the dedup identity for the whole retention
+                    // horizon with nothing stored. Release it so the next
+                    // delivery of the SAME generation is reconsidered rather
+                    // than silently dropped as a duplicate.
+                    if disposition == ScopedIngestDisposition::Retryable {
+                        ctx.scoped_relay_gate.release(&admit.dedup_key);
+                    }
                 }
             }
             return;
@@ -17513,7 +17549,7 @@ impl MeshNode {
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
-    ) {
+    ) -> ScopedIngestDisposition {
         use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ingest::{
             verify_scoped_ingest, AudienceAuthority, LocalMemberStanding, ScopedIngestContext,
@@ -17525,7 +17561,7 @@ impl MeshNode {
         // authority ⇒ no owner audience key AND no grantee identity ⇒ cannot open,
         // drop (an INVOKE-only / un-adopted relay forwards but never stores).
         let Some(authority) = node_authority.load_full() else {
-            return;
+            return ScopedIngestDisposition::Final;
         };
         let owner_org = authority.owner_org();
         let store = org_revocation.load_full();
@@ -17540,7 +17576,11 @@ impl MeshNode {
                 from_node = format!("{:#x}", from_node),
                 "scoped-ann: revocation view poisoned; ingest refused until recovery"
             );
-            return;
+            // §24 — RETRYABLE: poison clears on recovery, and the sender has no
+            // way to know we refused. Releasing the dedup identity lets the
+            // next delivery of this same generation be reconsidered instead of
+            // being swallowed for the whole retention horizon.
+            return ScopedIngestDisposition::Retryable;
         }
         // Verify against the node's LIVE revocation floors, so a provider whose
         // cert generation the org has since floored is refused at ingest. Hold
@@ -17603,14 +17643,14 @@ impl MeshNode {
                         from_node = format!("{:#x}", from_node),
                         "scoped-ann: no installed consumer grant for this grant id; drop"
                     );
-                    return;
+                    return ScopedIngestDisposition::Final;
                 };
                 if record.audience_handle() != envelope.audience_handle() {
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         "scoped-ann: consumer grant audience-handle mismatch; drop"
                     );
-                    return;
+                    return ScopedIngestDisposition::Final;
                 }
                 (
                     AudienceAuthority::granted(record.grant(), record.secret()),
@@ -17672,7 +17712,10 @@ impl MeshNode {
                         "scoped-ann: security view moved during verify; ingest refused \
                          (publication race)"
                     );
-                    return;
+                    // §24 — RETRYABLE: the view settles and the sender
+                    // re-announces, but the dedup gate would have suppressed
+                    // that re-announce at the same generation.
+                    return ScopedIngestDisposition::Retryable;
                 }
                 let outcome = scoped_discovery.lock().ingest(verified, now_secs);
                 tracing::debug!(
@@ -17680,6 +17723,18 @@ impl MeshNode {
                     ?outcome,
                     "scoped-ann: scoped capability ingested"
                 );
+                // §24 — `AtCapacity` is the store refusing fail-closed with
+                // nothing stored; a slot frees on the next sweep or expiry, so
+                // the identity must stay retryable. Every other outcome is a
+                // decision that re-delivery would reach again.
+                if matches!(
+                    outcome,
+                    super::behavior::org_scoped_store::ScopedStoreOutcome::AtCapacity
+                ) {
+                    ScopedIngestDisposition::Retryable
+                } else {
+                    ScopedIngestDisposition::Final
+                }
             }
             Err(e) => {
                 tracing::trace!(
@@ -17687,6 +17742,7 @@ impl MeshNode {
                     error = %e,
                     "scoped-ann: verify refused"
                 );
+                ScopedIngestDisposition::Final
             }
         }
     }
