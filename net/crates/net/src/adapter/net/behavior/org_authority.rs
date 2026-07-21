@@ -71,6 +71,7 @@ use serde::{Deserialize, Serialize};
 use super::org::{current_timestamp, OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
 use super::org_revocation::{
     write_atomic, OrgRevocationError, OrgRevocationState, OrgRevocationStore,
+    ProvisioningExpectation,
 };
 use crate::adapter::net::identity::EntityId;
 
@@ -710,7 +711,7 @@ impl NodeAuthority {
         //    valid signature, naming THIS node — may act as the
         //    ownership lock; a hand-edited `owner_org` must not
         //    turn a corrupt file into an ownership transfer.
-        if let Some(existing) = read_optional(&membership_path)? {
+        let had_membership = if let Some(existing) = read_optional(&membership_path)? {
             let existing: NodeAuthorityConfig = parse_membership(&existing, &membership_path)?;
             existing.verify_binding(local_entity).map_err(|e| {
                 tracing::error!(
@@ -725,7 +726,10 @@ impl NodeAuthority {
                     requested: owner_cert.org_id,
                 });
             }
-        }
+            true
+        } else {
+            false
+        };
 
         // 2. Validate any preserved audience credential BEFORE the
         //    ceremony commits anything: no-follow regular-file
@@ -780,7 +784,19 @@ impl NodeAuthority {
         //    Revocation first (monotone, never rolled back): create
         //    or open the store and apply the bundle through the
         //    locked reread path.
-        let revocation = Arc::new(OrgRevocationStore::init(&revocation_path)?);
+        //    A membership certificate or an audience key already sitting in
+        //    this directory proves the node was provisioned before, so the
+        //    revocation state MUST exist too. Saying so here is what stops a
+        //    re-adopt against a deleted `revocation-state.json` from silently
+        //    re-creating it EMPTY and un-revoking every certificate the org
+        //    has retired (the store cannot tell loss from a first adopt on its
+        //    own — see `ProvisioningExpectation`).
+        let expect = if had_membership || have_audience {
+            ProvisioningExpectation::MustExist
+        } else {
+            ProvisioningExpectation::MayBeFresh
+        };
+        let revocation = Arc::new(OrgRevocationStore::init(&revocation_path, expect)?);
         if let Some(bundle) = owner_floors {
             revocation.apply_bundle(bundle)?;
         }
@@ -3501,7 +3517,8 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let raiser = std::thread::spawn(move || {
             std::fs::create_dir_all(raise_path.parent().expect("parent")).expect("mkdir");
-            let store = OrgRevocationStore::init(&raise_path).expect("init");
+            let store = OrgRevocationStore::init(&raise_path, ProvisioningExpectation::MayBeFresh)
+                .expect("init");
             started_tx.send(()).expect("signal");
             let mut floors = BTreeMap::new();
             floors.insert(member, 5u32);

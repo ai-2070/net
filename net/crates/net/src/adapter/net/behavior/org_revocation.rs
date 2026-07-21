@@ -988,13 +988,64 @@ pub struct OrgRevocationStore {
     core: Arc<StoreCore>,
 }
 
+/// Caller-supplied evidence about whether a revocation state file is expected
+/// to exist already — the difference between a first-ever adopt and a lost
+/// state file, which are IDENTICAL on disk from this module's point of view.
+///
+/// This exists because "absence" is the one input the store cannot interpret on
+/// its own, and the two readings sit at opposite ends of the safety spectrum:
+/// creating an empty state on a genuine fresh adopt is correct, and creating
+/// one because the file went missing silently discards every floor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProvisioningExpectation {
+    /// Nothing else at this authority path implies prior provisioning, so a
+    /// missing state file is a first adopt and is created empty.
+    MayBeFresh,
+    /// Other authority artifacts are already present, so this store MUST exist
+    /// too. A missing state file is data loss and is refused.
+    MustExist,
+}
+
 impl OrgRevocationStore {
     /// Adopt-time entry point: load the existing file if present
     /// (re-adoption preserves maxima — monotonicity survives even
     /// an operator re-running adopt), otherwise durably create an
     /// empty state file. Runs under the interprocess lock so two
     /// concurrent adoptions cannot race the create.
-    pub fn init(path: impl Into<PathBuf>) -> Result<Self, OrgRevocationError> {
+    ///
+    /// # Absence is not automatically "fresh"
+    ///
+    /// This entry point and [`Self::open_existing`] used to read a missing
+    /// state file in exactly OPPOSITE ways: `open_existing` raised
+    /// [`OrgRevocationError::MissingState`] and refused, while `init` wrote an
+    /// empty state and continued — silently resetting every floor, and thereby
+    /// re-admitting every membership certificate the org had revoked.
+    ///
+    /// The permissive reading sat on the path an operator reaches for when
+    /// something already looks wrong (`net node adopt`); the strict one sat on
+    /// the path that merely reopens. And if a same-path core was still live,
+    /// `publish`'s per-key max kept the RUNNING node enforcing the old floors,
+    /// so the rollback did not surface until the next restart.
+    ///
+    /// Two independent signals now have to agree before an empty state is
+    /// created:
+    ///
+    /// 1. `expect`, supplied by the caller, which can see the rest of the
+    ///    authority directory (a node holding a membership certificate has
+    ///    demonstrably been provisioned before);
+    /// 2. the `.lock` sidecar, which is created beside the state file and
+    ///    survives its deletion. It is probed BEFORE [`lock_state_file`] can
+    ///    create it — the previous ordering destroyed exactly the evidence
+    ///    needed here.
+    ///
+    /// Residual, deliberately not closed: deleting BOTH the state file and its
+    /// sidecar is indistinguishable from a fresh adopt at this layer. Signal 1
+    /// is what covers that case, which is why it is a caller obligation and not
+    /// merely an internal check.
+    pub fn init(
+        path: impl Into<PathBuf>,
+        expect: ProvisioningExpectation,
+    ) -> Result<Self, OrgRevocationError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1005,6 +1056,17 @@ impl OrgRevocationStore {
             }
         }
         let path = normalize_backing_path(&path)?;
+        // Probe the sidecar BEFORE `lock_state_file` can create it. Its
+        // presence beside a MISSING state file means this store was
+        // provisioned and its state has since been removed — the one piece of
+        // evidence that distinguishes loss from a first adopt, and the
+        // previous ordering unconditionally `create(true)`'d it away before
+        // anything could look.
+        let sidecar_predates_us = {
+            let mut lock_path = path.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            std::fs::symlink_metadata(PathBuf::from(lock_path)).is_ok()
+        };
         let lock = lock_state_file(&path)?;
         // AV-9: identity is the stable `.lock` inode, so case-aliases
         // share one core + poison entry.
@@ -1016,6 +1078,24 @@ impl OrgRevocationStore {
         let state = match read_regular_nofollow(&path) {
             Ok(bytes) => OrgRevocationState::from_file_bytes(&bytes, &path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Fail CLOSED when either signal says this store already
+                // existed. Creating an empty state here would durably reset
+                // every floor and re-admit every revoked certificate.
+                if expect == ProvisioningExpectation::MustExist || sidecar_predates_us {
+                    let err = OrgRevocationError::MissingState {
+                        path: path.display().to_string(),
+                    };
+                    tracing::error!(
+                        sidecar_predates_us,
+                        ?expect,
+                        "{err}; refusing to re-create it as EMPTY — that would \
+                         discard every revocation floor and re-admit every \
+                         certificate this org has revoked. Restore the state \
+                         file from backup, or remove the whole authority \
+                         directory to provision deliberately from scratch."
+                    );
+                    return Err(err);
+                }
                 let state = OrgRevocationState::empty();
                 write_atomic(&path, &state.to_file_bytes()?)?;
                 state
@@ -2180,7 +2260,8 @@ mod tests {
         let lower = scratch.0.join("revocation-state.json");
         let upper = scratch.0.join("REVOCATION-STATE.JSON");
 
-        let a = OrgRevocationStore::init(&lower).expect("init lower alias");
+        let a = OrgRevocationStore::init(&lower, ProvisioningExpectation::MayBeFresh)
+            .expect("init lower alias");
 
         // Probe the filesystem: does the upper-cased alias resolve to
         // the file just created? If not (case-sensitive FS), there is
@@ -2219,7 +2300,8 @@ mod tests {
         let scratch = Scratch::new();
         let path = scratch.state_path();
 
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         assert!(store.snapshot().is_empty());
         assert!(path.exists());
 
@@ -2238,7 +2320,9 @@ mod tests {
     #[test]
     fn apply_bundle_raises_persists_and_publishes() {
         let scratch = Scratch::new();
-        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
 
         let raised = store.apply_bundle(&bundle_with_floor(5)).expect("apply");
         assert_eq!(raised, vec![(org().org_id(), member(), 5)]);
@@ -2264,7 +2348,8 @@ mod tests {
         let path = scratch.state_path();
 
         // Load floor generation 5 → persist.
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
         drop(store);
 
@@ -2290,7 +2375,9 @@ mod tests {
     #[test]
     fn corrupt_incoming_bundle_keeps_last_good() {
         let scratch = Scratch::new();
-        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
 
         // Tamper the signature of a higher-generation bundle.
@@ -2310,7 +2397,7 @@ mod tests {
     fn corrupt_persisted_state_is_loud_at_startup() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        OrgRevocationStore::init(&path).expect("init");
+        OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
 
         std::fs::write(&path, b"{ not json").expect("corrupt");
         let err = OrgRevocationStore::open_existing(&path).expect_err("corrupt is loud");
@@ -2342,13 +2429,103 @@ mod tests {
     fn init_preserves_existing_maxima_on_readopt() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply");
         drop(store);
 
         // Re-running adopt must NOT reset floors to empty.
-        let readopted = OrgRevocationStore::init(&path).expect("re-init");
+        let readopted =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("re-init");
         assert_eq!(readopted.floor_for(&org().org_id(), &member()), 5);
+    }
+
+    /// The sibling of the test above, for the case it does NOT cover: the file
+    /// is not merely stale, it is GONE.
+    ///
+    /// `init` used to read that as a first adopt and durably write an empty
+    /// state — un-revoking every certificate the org had retired — while
+    /// `open_existing` read the identical situation as `MissingState` and
+    /// refused. The permissive reading was on `net node adopt`, the path an
+    /// operator reaches for when something already looks wrong.
+    ///
+    /// The `.lock` sidecar outlives the state file and is the evidence that
+    /// this store was provisioned before. Note the caller still says
+    /// `MayBeFresh` here: this asserts the store defends itself even when the
+    /// caller believes a fresh adopt is plausible.
+    #[test]
+    fn init_refuses_to_recreate_a_state_file_that_was_deleted() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh)
+            .expect("first adopt");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        drop(store);
+
+        // Config management / a restore / a selective delete removes the state
+        // file. The sidecar stays.
+        std::fs::remove_file(&path).expect("remove state file");
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".lock");
+        assert!(
+            std::fs::symlink_metadata(PathBuf::from(sidecar)).is_ok(),
+            "precondition: the sidecar must outlive the state file, otherwise \
+             this test proves nothing about the signal under test",
+        );
+
+        let err = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh)
+            .expect_err("a deleted state file must not be re-created as empty");
+        assert!(
+            matches!(err, OrgRevocationError::MissingState { .. }),
+            "expected MissingState, got {err:?}",
+        );
+
+        // And the refusal is fail-closed: nothing was written in its place, so
+        // a later repair still sees an absent file rather than an empty one
+        // that silently reads as "no floors".
+        assert!(
+            !path.exists(),
+            "the refusal wrote an empty state anyway — the floors are gone",
+        );
+    }
+
+    /// The residual the sidecar signal cannot cover: BOTH files removed. Only
+    /// the caller can tell, because only the caller sees the rest of the
+    /// authority directory — which is why the expectation is a parameter and
+    /// not merely an internal check.
+    #[test]
+    fn init_honours_the_callers_must_exist_expectation() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh)
+            .expect("first adopt");
+        store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
+        drop(store);
+
+        std::fs::remove_file(&path).expect("remove state file");
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+
+        let err = OrgRevocationStore::init(&path, ProvisioningExpectation::MustExist)
+            .expect_err("MustExist must refuse an absent state file");
+        assert!(
+            matches!(err, OrgRevocationError::MissingState { .. }),
+            "expected MissingState, got {err:?}",
+        );
+    }
+
+    /// Positive control for both refusals: a genuinely fresh path still adopts.
+    /// Without this, a regression that refused unconditionally would pass the
+    /// two tests above.
+    #[test]
+    fn init_still_creates_a_genuinely_fresh_store() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh)
+            .expect("a first adopt on a clean path must succeed");
+        assert_eq!(store.floor_for(&org().org_id(), &member()), 0);
+        assert!(path.exists(), "a fresh adopt must durably create the state");
     }
 
     #[test]
@@ -2393,7 +2570,8 @@ mod tests {
     fn persist_failure_never_publishes_the_live_view() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
 
         // Force the atomic rename to fail: replace the state file
@@ -2440,7 +2618,8 @@ mod tests {
         let member_x = EntityId::from_bytes([0xAAu8; 32]);
         let member_y = EntityId::from_bytes([0xBBu8; 32]);
 
-        let store_a = OrgRevocationStore::init(&path).expect("init A");
+        let store_a =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init A");
         let store_b = OrgRevocationStore::open_existing(&path).expect("open B");
         assert!(
             store_a.shares_core_with(&store_b),
@@ -2477,7 +2656,7 @@ mod tests {
     fn fresh_open_serializes_behind_the_state_lock_and_recovers_poison() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        drop(OrgRevocationStore::init(&path).expect("init"));
+        drop(OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init"));
         let norm = normalize_backing_path(&path).expect("normalize");
 
         // Writer holds the interprocess lock…
@@ -2538,7 +2717,8 @@ mod tests {
         let scratch = Scratch::new();
         let path = scratch.state_path();
         // store_a creates and keeps the core alive at floor 0.
-        let store_a = OrgRevocationStore::init(&path).expect("init");
+        let store_a =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
 
         // A stronger state is already durable on disk (an operator
         // bundle another writer persisted); an opener would read and
@@ -2593,7 +2773,8 @@ mod tests {
     fn multiple_subscribers_on_one_path_all_observe_raises() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store_a = OrgRevocationStore::init(&path).expect("init A");
+        let store_a =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init A");
         let store_b = OrgRevocationStore::open_existing(&path).expect("open B");
 
         let seen_a: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2645,7 +2826,9 @@ mod tests {
     #[test]
     fn dropping_the_subscription_guard_unsubscribes_while_the_store_lives() {
         let scratch = Scratch::new();
-        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
         assert_eq!(store.subscriber_count(), 0);
         let subscription = store.subscribe_floors_raised(|_raised| {});
         assert_eq!(
@@ -2684,7 +2867,10 @@ mod tests {
         use std::time::Duration;
 
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
 
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -2761,7 +2947,10 @@ mod tests {
     #[test]
     fn dropping_the_external_guard_breaks_a_store_capturing_cycle() {
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
         let weak = Arc::downgrade(&store);
         // The callback CAPTURES the store Arc — the exact cycle.
         let captured = Arc::clone(&store);
@@ -2793,7 +2982,10 @@ mod tests {
         use std::time::Duration;
 
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
         // The guard lives in a slot the callback takes + drops from inside.
         let slot: Arc<Mutex<Option<RaiseSubscription>>> = Arc::new(Mutex::new(None));
         let slot_cb = Arc::clone(&slot);
@@ -2845,7 +3037,10 @@ mod tests {
         use std::time::Duration;
 
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
 
         // A user lock A holds across its self-unsubscribe and B needs.
         let user_lock = Arc::new(Mutex::new(()));
@@ -2952,7 +3147,8 @@ mod tests {
         let direct = sub.join("revocation-state.json");
         let dotted = scratch.0.join("sub/../sub/revocation-state.json");
 
-        let store_a = OrgRevocationStore::init(&direct).expect("init direct");
+        let store_a = OrgRevocationStore::init(&direct, ProvisioningExpectation::MayBeFresh)
+            .expect("init direct");
         let store_b = OrgRevocationStore::open_existing(&dotted).expect("open dotted alias");
         assert!(
             store_a.shares_core_with(&store_b),
@@ -3003,7 +3199,7 @@ mod tests {
     fn final_component_symlink_is_refused_atomically() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        OrgRevocationStore::init(&path).expect("init");
+        OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         drop(OrgRevocationStore::open_existing(&path).expect("regular final opens"));
 
         // Swap the final component for a symlink to a real file: the
@@ -3039,7 +3235,8 @@ mod tests {
             .expect("run mkfifo");
         assert!(status.success(), "mkfifo failed");
 
-        let err = OrgRevocationStore::init(&path).expect_err("FIFO lock must refuse");
+        let err = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh)
+            .expect_err("FIFO lock must refuse");
         assert!(matches!(err, OrgRevocationError::Io { .. }), "got: {err}");
     }
 
@@ -3060,7 +3257,7 @@ mod tests {
         let path = scratch.state_path();
         // First open creates the sidecar (nlink == 1), then drops so its
         // advisory lock and core are released.
-        drop(OrgRevocationStore::init(&path).expect("init"));
+        drop(OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init"));
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
@@ -3114,7 +3311,8 @@ mod tests {
         let path = scratch.state_path();
         // Keep the first store ALIVE: its core (and the path→identity
         // binding) survive the whole test.
-        let live = OrgRevocationStore::init(&path).expect("init");
+        let live =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
@@ -3147,7 +3345,9 @@ mod tests {
     #[test]
     fn raise_callback_fires_only_on_raises() {
         let scratch = Scratch::new();
-        let store = OrgRevocationStore::init(scratch.state_path()).expect("init");
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
 
         let seen: Arc<Mutex<Vec<RaisedFloor>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
@@ -3174,7 +3374,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         // A second instance on the SAME path, opened before the
         // failure — path-wide poison must gate it too (review-9).
         let sibling = OrgRevocationStore::open_existing(&path).expect("sibling");
@@ -3255,7 +3456,8 @@ mod tests {
         let lock_path = PathBuf::from(lock_path);
 
         // 1. Create + poison via a real post-rename parent-fsync failure.
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
         std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300))
             .expect("chmod 0300");
@@ -3314,7 +3516,8 @@ mod tests {
         let lower = scratch.0.join("revocation-state.json");
         let upper = scratch.0.join("REVOCATION-STATE.JSON");
 
-        let store = OrgRevocationStore::init(&lower).expect("init lower");
+        let store = OrgRevocationStore::init(&lower, ProvisioningExpectation::MayBeFresh)
+            .expect("init lower");
         // Case-insensitivity probe — a no-op on a case-sensitive FS.
         if !upper.exists() {
             return;
@@ -3405,7 +3608,11 @@ mod tests {
         std::fs::create_dir_all(&parent).expect("mkdir parent");
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
             .expect("chmod 0755");
-        let store = OrgRevocationStore::init(parent.join("revocation-state.json")).expect("init");
+        let store = OrgRevocationStore::init(
+            parent.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init");
         drop(store);
         let mode = std::fs::metadata(&parent)
             .expect("metadata")
@@ -3433,7 +3640,8 @@ mod tests {
     fn existing_handle_refuses_a_replaced_sidecar() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
 
         // Replace the `.lock` sidecar under the LIVE store. The store's
@@ -3481,7 +3689,10 @@ mod tests {
     #[test]
     fn reentrant_callback_does_not_deadlock() {
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
 
         let reentered = Arc::new(Mutex::new(false));
         let store_for_callback = Arc::downgrade(&store);
@@ -3511,7 +3722,8 @@ mod tests {
     fn symlinked_state_and_lock_files_are_refused() {
         let scratch = Scratch::new();
         let path = scratch.state_path();
-        let store = OrgRevocationStore::init(&path).expect("init");
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
         store.apply_bundle(&bundle_with_floor(5)).expect("apply 5");
         drop(store);
 
@@ -3563,7 +3775,10 @@ mod tests {
         use std::sync::mpsc;
 
         let scratch = Scratch::new();
-        let store = Arc::new(OrgRevocationStore::init(scratch.state_path()).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init"),
+        );
         let g0 = store.barriered_generation();
 
         // Arm the one-shot pause, then raise a floor on another thread:

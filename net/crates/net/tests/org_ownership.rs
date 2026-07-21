@@ -26,7 +26,7 @@ use net::adapter::net::behavior::capability::{CapabilityAnnouncement, Capability
 use net::adapter::net::behavior::fold::capability_bridge::{may_execute, owner_org_for};
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
-use net::adapter::net::behavior::org_revocation::OrgRevocationStore;
+use net::adapter::net::behavior::org_revocation::{OrgRevocationStore, ProvisioningExpectation};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -239,7 +239,13 @@ async fn store_replacement_never_lowers_the_live_view() {
     let dir_hi = scratch_dir("store-hi");
     let dir_lo = scratch_dir("store-lo");
 
-    let hi = Arc::new(OrgRevocationStore::init(dir_hi.join("revocation-state.json")).expect("hi"));
+    let hi = Arc::new(
+        OrgRevocationStore::init(
+            dir_hi.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("hi"),
+    );
     let mut floors = std::collections::BTreeMap::new();
     floors.insert(publisher.entity_id().clone(), 5u32);
     hi.apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("issue"))
@@ -252,7 +258,13 @@ async fn store_replacement_never_lowers_the_live_view() {
 
     let mut low_floors = std::collections::BTreeMap::new();
     low_floors.insert(publisher.entity_id().clone(), 3u32);
-    let lo = Arc::new(OrgRevocationStore::init(dir_lo.join("revocation-state.json")).expect("lo"));
+    let lo = Arc::new(
+        OrgRevocationStore::init(
+            dir_lo.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("lo"),
+    );
     lo.apply_bundle(&OrgRevocationBundle::try_issue(&org(), &low_floors).expect("issue"))
         .expect("floor 3");
     assert!(
@@ -300,8 +312,13 @@ async fn installing_pre_raised_store_reconciles_existing_projections() {
     );
 
     // An independent store already carries floor 5.
-    let store =
-        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let store = Arc::new(
+        OrgRevocationStore::init(
+            dir.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init"),
+    );
     let mut floors = std::collections::BTreeMap::new();
     floors.insert(publisher.entity_id().clone(), 5u32);
     store
@@ -341,13 +358,23 @@ async fn detached_store_cannot_mutate_the_node() {
     let dir_old = scratch_dir("detached-old");
     let dir_new = scratch_dir("detached-new");
 
-    let old =
-        Arc::new(OrgRevocationStore::init(dir_old.join("revocation-state.json")).expect("old"));
+    let old = Arc::new(
+        OrgRevocationStore::init(
+            dir_old.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("old"),
+    );
     node.install_org_revocation_store(old.clone())
         .expect("install old");
     // Replace with an (empty, trivially dominating) current store.
-    let current =
-        Arc::new(OrgRevocationStore::init(dir_new.join("revocation-state.json")).expect("new"));
+    let current = Arc::new(
+        OrgRevocationStore::init(
+            dir_new.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("new"),
+    );
     node.install_org_revocation_store(current.clone())
         .expect("replace with current");
 
@@ -408,8 +435,13 @@ async fn concurrent_replacements_never_lower_the_installed_floor() {
     let dir7 = scratch_dir("repl-7");
 
     let make_store = |dir: &PathBuf, floor: u32| {
-        let store =
-            Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(
+                dir.join("revocation-state.json"),
+                ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("init"),
+        );
         let mut floors = std::collections::BTreeMap::new();
         floors.insert(publisher.entity_id().clone(), floor);
         store
@@ -751,6 +783,94 @@ async fn node_ingest_drops_bad_cert_but_keeps_announcement() {
     );
 }
 
+/// §1 — re-running `adopt` against an authority directory whose
+/// `revocation-state.json` has gone missing must REFUSE, not silently
+/// re-provision it empty.
+///
+/// This is the end-to-end shape of the unit witnesses in
+/// `org_revocation::tests`: it exercises the wiring in `NodeAuthority::adopt`
+/// that turns "a membership cert / audience key is already here" into
+/// `ProvisioningExpectation::MustExist`, which is the signal that survives an
+/// operator deleting the sidecar along with the state file.
+///
+/// The failure it guards is not subtle: `init` used to read the absence as a
+/// first adopt, write an empty state, and continue — resetting every floor and
+/// re-admitting every certificate the org had revoked. And because
+/// `NodeAuthority::open` (the RESTART path) already refused the identical
+/// situation, the existing restart witness below could never catch it. The
+/// permissive branch was the one an operator reaches for by hand.
+#[tokio::test]
+async fn readopt_refuses_a_missing_revocation_state() {
+    let node = build_node().await;
+    let dir = scratch_dir("readopt-missing-floors");
+
+    // First adopt: real ceremony, then raise a floor so there is something to
+    // lose.
+    let cert = OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600)
+        .expect("issue cert");
+    let authority =
+        NodeAuthority::adopt(&dir, cert.clone(), node.entity_id(), 0, None).expect("first adopt");
+    let victim = EntityKeypair::generate();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(victim.entity_id().clone(), 5u32);
+    let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue floors");
+    authority.revocation.apply_bundle(&bundle).expect("apply");
+    assert_eq!(
+        authority
+            .revocation
+            .floor_for(&org().org_id(), victim.entity_id()),
+        5,
+        "precondition: the floor must actually be persisted",
+    );
+    drop(authority);
+
+    // The membership certificate and audience key stay; only the revocation
+    // state is lost. Remove its sidecar too, so the ONLY signal left is the
+    // caller's — proving the `adopt` wiring carries its weight rather than
+    // leaning on the store's internal sidecar probe.
+    let state_path = dir.join("revocation-state.json");
+    std::fs::remove_file(&state_path).expect("remove revocation state");
+    let mut sidecar = state_path.as_os_str().to_os_string();
+    sidecar.push(".lock");
+    let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    assert!(
+        dir.join("owner-membership.json").exists(),
+        "precondition: the membership cert must remain, or the node would \
+         genuinely be unprovisioned and a fresh adopt would be correct",
+    );
+
+    let err = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None)
+        .expect_err("re-adopt over a missing revocation state must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("MissingState"),
+        "expected a MissingState refusal, got {msg}",
+    );
+    assert!(
+        !state_path.exists(),
+        "the refused adopt wrote an empty state anyway — floors are gone",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Positive control for the above: a first adopt on a clean directory still
+/// works. Without this, a regression that refused every adopt would pass.
+#[tokio::test]
+async fn first_adopt_on_a_clean_directory_still_succeeds() {
+    let node = build_node().await;
+    let dir = scratch_dir("readopt-clean");
+
+    let cert = OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600)
+        .expect("issue cert");
+    let authority =
+        NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("first adopt");
+    assert_eq!(authority.owner_org(), org().org_id());
+    assert!(dir.join("revocation-state.json").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // 3. Floor witness + restart chain at the node level.
 // ---------------------------------------------------------------------------
@@ -764,7 +884,9 @@ async fn floors_gate_ingest_and_survive_restart_with_lower_valid_bundle() {
     let state_path = dir.join("revocation-state.json");
 
     // Install a persisted store with floor 5 for the publisher.
-    let store = Arc::new(OrgRevocationStore::init(&state_path).expect("init"));
+    let store = Arc::new(
+        OrgRevocationStore::init(&state_path, ProvisioningExpectation::MayBeFresh).expect("init"),
+    );
     let mut floors = std::collections::BTreeMap::new();
     floors.insert(publisher.entity_id().clone(), 5u32);
     let bundle5 = OrgRevocationBundle::try_issue(&org(), &floors).expect("issue");
@@ -941,8 +1063,13 @@ async fn active_raise_and_replacement_serialize_on_the_publish_guard() {
     let dir_b = scratch_dir("guard-b");
 
     let make_store = |dir: &PathBuf, floor: u32| {
-        let store =
-            Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+        let store = Arc::new(
+            OrgRevocationStore::init(
+                dir.join("revocation-state.json"),
+                ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("init"),
+        );
         let mut floors = std::collections::BTreeMap::new();
         floors.insert(publisher.entity_id().clone(), floor);
         store
@@ -1471,8 +1598,13 @@ async fn one_store_installed_into_two_nodes_notifies_both() {
     let node2 = build_node().await;
     let dir = scratch_dir("two-nodes");
 
-    let store =
-        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let store = Arc::new(
+        OrgRevocationStore::init(
+            dir.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init"),
+    );
     node1
         .install_org_revocation_store(store.clone())
         .expect("install into node1");
@@ -1537,12 +1669,19 @@ async fn opener_cannot_publish_during_store_replacement() {
     let dir_b = scratch_dir("r11-openrepl-b");
     let a_path = dir_a.join("revocation-state.json");
 
-    let a = Arc::new(OrgRevocationStore::init(&a_path).expect("init A"));
+    let a = Arc::new(
+        OrgRevocationStore::init(&a_path, ProvisioningExpectation::MayBeFresh).expect("init A"),
+    );
     node.install_org_revocation_store(a.clone())
         .expect("install A");
     // Candidate B (different core, empty → dominates empty A).
-    let b =
-        Arc::new(OrgRevocationStore::init(dir_b.join("revocation-state.json")).expect("init B"));
+    let b = Arc::new(
+        OrgRevocationStore::init(
+            dir_b.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init B"),
+    );
 
     let opener_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ob = opener_blocked.clone();
@@ -1668,8 +1807,20 @@ async fn two_nodes_opposite_store_swaps_do_not_deadlock() {
     let dir_b = scratch_dir("r11-abba-b");
 
     // Empty stores dominate each other, so both swaps are legal.
-    let a = Arc::new(OrgRevocationStore::init(dir_a.join("revocation-state.json")).expect("A"));
-    let b = Arc::new(OrgRevocationStore::init(dir_b.join("revocation-state.json")).expect("B"));
+    let a = Arc::new(
+        OrgRevocationStore::init(
+            dir_a.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("A"),
+    );
+    let b = Arc::new(
+        OrgRevocationStore::init(
+            dir_b.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("B"),
+    );
     n1.install_org_revocation_store(a.clone())
         .expect("n1 installs A");
     n2.install_org_revocation_store(b.clone())
@@ -2006,8 +2157,13 @@ async fn expired_certificate_cache_reuse_is_cert_free_without_authority_event() 
 #[tokio::test]
 async fn dropping_a_node_unsubscribes_its_raise_callback() {
     let dir = scratch_dir("r11-leak");
-    let store =
-        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let store = Arc::new(
+        OrgRevocationStore::init(
+            dir.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init"),
+    );
     assert_eq!(store.subscriber_count(), 0);
 
     let node = build_node().await;
@@ -2056,7 +2212,7 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
 fn dropping_the_external_guard_unsubscribes_from_the_shared_core() {
     let dir = scratch_dir("r34-guard-drop");
     let path = dir.join("revocation-state.json");
-    let a = OrgRevocationStore::init(&path).expect("init a");
+    let a = OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init a");
     let b = OrgRevocationStore::open_existing(&path).expect("open b");
     assert!(a.shares_core_with(&b), "same path shares one core");
     assert_eq!(b.subscriber_count(), 0);
@@ -2094,8 +2250,13 @@ fn dropping_the_external_guard_unsubscribes_from_the_shared_core() {
 #[tokio::test]
 async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     let dir = scratch_dir("av10-snapshot");
-    let store =
-        Arc::new(OrgRevocationStore::init(dir.join("revocation-state.json")).expect("init"));
+    let store = Arc::new(
+        OrgRevocationStore::init(
+            dir.join("revocation-state.json"),
+            ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init"),
+    );
     let node = build_node().await;
     node.install_org_revocation_store(store.clone())
         .expect("install");
