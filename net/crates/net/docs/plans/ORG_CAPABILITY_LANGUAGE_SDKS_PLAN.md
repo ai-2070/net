@@ -15,6 +15,16 @@ a discovery key in garbage-collected memory.
 
 ## Status
 
+**v0.2 — applies Kyra's review (2026-07-21).** Product surface and binding
+doctrine **SIGNED OFF**; five narrow corrections applied — (1) R2 is a NEW
+security-sensitive loader, not reuse of an existing helper (§D2a); (2)
+canonical `OrgCaller` is marshaled, never reshaped for the C ABI (§R4); (3) the
+C ABI takes a typed arc and exact ownership, and drops the dishonest
+"idempotent" free (§D7); (4) an unclassifiable error becomes `org:unknown`,
+never a counterfeit admission denial (§D5a); (5) rollout follows named
+consumers rather than hardcoding C+G first (§Rollout). Plus the Node
+acceptance witness now asserts the *blocking* behavior it documents.
+
 **Design only. Not started.** Activation gates on Workstream R (§R), which is
 Rust-side work that must land before any binding can compile against the
 facade. R is not optional plumbing: the facade as shipped is
@@ -23,6 +33,10 @@ cross an FFI boundary.
 
 The Rust facade itself is IMPLEMENTED and closed (four slices, `a9ec879a4` →
 `04d66e9b8`, plus `b4e585d23`), on substrate base `07820a9de`.
+
+**Scope boundary.** This is the organization facade only. Language bindings for
+the sensing/watch surface follow separately, after the Rust watch lifecycle
+proves itself; they are not folded into this workstream.
 
 ---
 
@@ -112,8 +126,9 @@ must preserve:
   the org audience secret.
 - **Wire vocabulary is single-sourced.** The `org:` error kinds are generated
   from one Rust function and pinned by one fixture, consumed by five suites.
-- **Fail-closed.** A binding that cannot classify an error reports the
-  least-informative *denial*, never a success and never a transport error.
+- **Fail-closed, without counterfeiting.** A binding that cannot classify an
+  error reports `unknown` (§D5a) — never a success, and never one of the four
+  canonical domains it could not actually establish.
 - **Explicit disposal, documented consequence.** Every language states what a
   leaked `OrgClient` costs.
 
@@ -199,15 +214,60 @@ creds, err := net.NewOrgCredentials(net.OrgCredentialsConfig{
 ```
 
 R therefore adds `net_sdk::org::OrgCredentials::from_parts(..., secret_paths)`
-which reads each file with the CLI's existing 0600 permission gate and
-`OrgAudienceSecret::decode_config`, and **never returns the secret to its
-caller**.
+which loads each secret through the new checked loader of §D2a and **never
+returns the secret to its caller**.
 
 **Consequence, stated plainly:** a language SDK cannot construct credentials
 entirely in memory. That is deliberate. An application that wants to fetch
 credentials from a secret manager writes them to a 0600 file (or a tmpfs path)
 first — the same thing the CLI does, and the same trust boundary
 `ensure_secure_authority_dir` already polices.
+
+### D2a. The grant-side secret loader is NEW code, not reuse
+
+An earlier draft said R2 could reuse "the CLI's existing 0600 permission
+gate." That was wrong, and the substrate says so explicitly.
+`OrgAudienceSecret::decode_config`'s doc (`org_grant.rs:410-419`) states:
+
+> There is deliberately no in-crate loader that does this FOR you: the
+> owner-side equivalent (`NodeAuthority::open`) reads through
+> `read_audience_checked`, which additionally requires a regular file and gates
+> the mode on the ALREADY-OPENED descriptor, closing the TOCTOU a path-based
+> check leaves open. A grant-side loader would need the same treatment, and
+> shipping one that merely wrapped this call would imply a safety it does not
+> provide.
+
+So R2 builds a narrow canonical loader mirroring `read_audience_checked`
+(`org_authority.rs:2269`), which is the only correct model in the tree:
+
+1. open **without following** symlinks / reparse points
+   (`org_revocation::open_regular_nofollow`);
+2. verify the already-open object is a **regular file**;
+3. validate ownership and permissions **on the opened descriptor** — Unix uses
+   `file.metadata()`, never `metadata(path)` followed by `open(path)`;
+4. on Windows validate the **file's own protected DACL**, not merely its
+   containing directory — the §11 correction `read_audience_checked` already
+   carries, which exists precisely because org-wide key distribution means the
+   file may arrive from a share or a restore tool with its own explicit ACE;
+5. validate the trusted ancestor chain;
+6. read exactly `OrgAudienceSecret::ENCODED_SIZE` into a **scrub-on-drop**
+   buffer (the CLI's `ScrubbedBytes` shape), never `std::fs::read`, whose
+   `Vec` leaves the key in freed heap reachable from a core dump or swap;
+7. reject trailing bytes;
+8. call `decode_config`;
+9. scrub the input buffer on **every** path, success and failure alike, and
+   never let key bytes reach a log, an error `Display`, or a `Debug`.
+
+**A residual to not multiply.** `decode_config`'s §27/§29 note records that
+both codecs move key material *by value*, and a Rust move is a memcpy that does
+not run `Drop` on the source — so each construction hop strands an unscrubbed
+copy in a dead stack frame. A loader adds hops. The loader should therefore
+return `Box<OrgAudienceSecret>` (the fix that note names) rather than widening
+the residual it inherits, and R2's review should check that it did not add a
+by-value hop.
+
+This is still narrow work, but it is **new security-sensitive code with its own
+review**, not plumbing. It is the single highest-risk item in this plan.
 
 ### D3. Disposal — explicit everywhere, with the cost written down
 
@@ -328,7 +388,40 @@ C error block, taking the next free range after NAT's `-130..-137`:
 #define NET_ERR_ORG_ADMISSION_DENIED  -142
 #define NET_ERR_ORG_RPC               -143
 #define NET_ERR_ORG_CLOSED            -144
+#define NET_ERR_ORG_UNCLASSIFIED      -145   /* §D5a — parser/ABI fallback */
 ```
+
+### D5a. `unknown` is a fifth class, and it is not an admission result
+
+The four domains carry one fact each, and the most important is *where the
+refusal happened*:
+
+```
+credentials / discovery  → LOCAL; nothing was sent
+admission_denied         → REMOTE; a provider's admission engine refused
+rpc                      → transport, or a non-admission server failure
+```
+
+An unclassifiable string cannot be reported as `admission_denied`, because
+doing so asserts three things the binding does not know: that a request
+reached a provider, that the admission engine evaluated it, and that retry and
+audit semantics are remote rather than local. It would also be the one
+misclassification that *looks* plausible in a log, which is what makes it
+dangerous.
+
+So the bindings carry a fifth class used **only** when parsing fails:
+
+```
+org:unknown         (wire)          OrgError::Unclassified   (Go)
+                                    OrgUnclassifiedError     (TS / Python)
+                                    NET_ERR_ORG_UNCLASSIFIED (C)
+```
+
+It exposes no detail beyond the unparsed kind token. The frozen four remain the
+normal protocol vocabulary; `unknown` means *this binding and this Rust build
+disagree about the vocabulary* — an internal compatibility failure, which is
+exactly what X3's drift guards exist to make loud. A binding that never emits
+`unknown` in CI is a binding whose vocabulary is in sync.
 
 ### D6. Async model per language — each language's existing dual
 
@@ -369,12 +462,22 @@ int net_org_credentials_new(
     const char* const* audience_secret_paths, size_t audience_secret_count,
     NetOrgCredentials** out_creds, char** out_err);
 
-/* Consumes `creds` on success. `mesh_arc` is borrowed. */
-int net_org_bind(void* mesh_arc, NetOrgCredentials* creds,
+/* Typed arc, not void* — the compiler rejects unrelated pointers. The
+ * pointer MUST come from net_mesh_arc_clone; it is BORROWED here.
+ *
+ * `credentials` is an in/out param: on SUCCESS ownership transfers and
+ * *credentials is set to NULL, so a wrapper's finalizer cannot free a
+ * consumed handle. On failure it is left intact and the caller still owns it. */
+int net_org_bind(net_compute_mesh_arc_t* mesh_arc,
+                 NetOrgCredentials** credentials,
                  NetOrgClient** out_client, char** out_err);
 
-/* Releases the consumer-audience lease. Idempotent. */
-void net_org_client_free(NetOrgClient* client);
+/* Closes the client, releases the consumer-audience lease, frees the handle,
+ * and sets *client to NULL. Passing NULL or a pointer to NULL is a no-op.
+ * Every non-NULL handle must be freed exactly once. */
+void net_org_client_free(NetOrgClient** client);
+void net_org_credentials_free(NetOrgCredentials** credentials);
+void net_org_serve_handle_free(NetOrgServeHandle** handle);
 
 int net_org_call(NetOrgClient* client,
                  const char* service_ptr, size_t service_len,
@@ -389,15 +492,22 @@ typedef int (*NetOrgHandlerFn)(
 void     net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher); /* first-call-wins */
 uint64_t net_org_reserve_handler_id(void);
 
-int net_org_serve(void* mesh_arc,
+int net_org_serve(net_compute_mesh_arc_t* mesh_arc,
                   const char* service_ptr, size_t service_len,
                   int access, uint64_t handler_id,
                   NetOrgServeHandle** out_handle, char** out_err);
-void net_org_serve_handle_free(NetOrgServeHandle* handle);
 
 uint32_t net_org_abi_version(void);
 int      net_org_check_abi_version(uint32_t expected);
 ```
+
+**On ownership honesty.** An earlier draft called
+`net_org_client_free(NetOrgClient*)` "idempotent." It cannot be: after the
+first `Box::from_raw` the pointer dangles, and a second call cannot inspect it
+safely — the claim contradicted the repo's own "free exactly once" rule. The
+double-pointer form above is the honest contract, and it also removes the
+class of bug where a Go finalizer and an explicit `Close()` race to free the
+same handle.
 
 Every entry point wraps its body in `ffi_guard!`, adopts `HandleGuard` per the
 5-step checklist in `src/ffi/handle_guard.rs`, and follows the response-buffer
@@ -434,6 +544,7 @@ A language column is "done" when every row is `✅`. Cross-referenced from
 | `OrgAccess` SameOrg/Granted → private visibility | ✅ | N4 | P4 | G5 | C4 |
 | Four error domains, `org:` vocabulary | R3 | N5 | P5 | G6 | C5 |
 | Coarse remote reason preserved | ✅ | N5 | P5 | G6 | C5 |
+| `unknown` fallback that impersonates no domain | R3 | N5 | P5 | G6 | C5 |
 | Async dual | ✅ | ✅ (Promise) | P6 | ctx | — |
 | Error-vocabulary golden vector | X1 | X1 | X1 | X1 | X1 |
 | Live cross-language call matrix | X2 | X2 | X2 | X2 | — |
@@ -455,8 +566,14 @@ A language column is "done" when every row is `✅`. Cross-referenced from
 - **R3 — the `org:` error vocabulary.** One function
   `OrgSdkError::to_wire_kind() -> (&'static str, String)`; the four domains and
   every kind string frozen here and nowhere else.
-- **R4 — `OrgCaller` as a `#[repr(C)]`-friendly projection** (a plain
-  five-array struct the FFI crates can copy without knowing SDK types).
+- **R4 — an `OrgCaller` → `net_org_caller_t` conversion in `org-ffi`, pure and
+  tested. `OrgCaller`'s Rust representation does not change.** The canonical
+  type carries typed fields (`EntityId`, `OrgId`, `CapabilityAuthorityId`) and
+  keeps them; the FFI crate copies each id out through its public byte accessor
+  into a `#[repr(C)]` POD. Reshaping `OrgCaller` into five raw arrays would
+  make the common Rust facade's memory layout part of the C ABI — a coupling
+  no other surface in the tree accepts, and one that would let a C-ABI concern
+  drive a Rust type's design.
 - **R5 — docs:** the disposal contract and its security consequence, written
   once in Rust and quoted by each binding.
 
@@ -479,8 +596,17 @@ will do.
   as a `#[napi(string_enum)]`.
 
 **Acceptance:** a Node service serves a private cross-org capability and a Node
-client calls it, with the handler reading `caller.actingOrg` — and an
-un-closed client is caught by a test asserting `shutdown()` completes.
+client calls it, with the handler reading `caller.actingOrg`.
+
+The disposal witness asserts the blocking behavior §D3 documents, rather than
+only the happy path — and does it with bounded timeouts at **both** states, so
+the test never hangs to prove a hang:
+
+```
+mesh.shutdown() is still PENDING while a live OrgClient exists   (bounded wait)
+→ orgClient.close()
+→ shutdown() completes                                            (bounded wait)
+```
 
 ### Workstream P — Python (house style: sync/async pairs, GIL release, stub discipline)
 
@@ -549,15 +675,28 @@ between two bindings fails CI without anyone having to notice it by hand.
 
 ## Rollout order
 
+Only the first two steps are fixed. The language order follows **named
+consumers**, because this plan describes eventual parity — it does not activate
+four languages as one program.
+
 1. **R** — nothing compiles against the facade until it lands.
-2. **X1** — the vocabulary fixture, so four bindings are written against one
-   frozen contract rather than four readings of it.
-3. **C + G together** — the header and the FFI crate are one artifact reviewed
-   twice; Go is the only consumer that proves the C ABI is usable.
-4. **N and P in parallel** — independent of C/G and of each other; both already
-   depend on `net-mesh-sdk`, so they need no new crate wiring.
-5. **X2 + X3 last** — the live matrix needs every language present, and the
-   drift guards need every vocabulary consumer in place.
+2. **X1** — the vocabulary fixture, so every binding is written against one
+   frozen contract rather than N readings of it.
+3. **The named language workstream(s)**, in demand order:
+   - **Node named** → **N** lands immediately after R + X1. It already depends
+     on `net-mesh-sdk`; nothing else blocks it.
+   - **Python named** → **P** lands immediately after R + X1, same reasoning.
+   - **Go named** → **C + G** as one inseparable reviewed unit (the header and
+     the FFI crate are one artifact; Go is the only consumer that proves the C
+     ABI is usable).
+4. **X2** — starts once **two independently implemented languages exist**, so
+   the matrix proves interoperation rather than a Rust-side coincidence.
+5. **X3** — lands **per binding**, with that binding, rather than waiting for
+   every language.
+
+An earlier draft hardcoded C+G ahead of N and P. That would impose roughly a
+week and a half of Go/C work on a Python or Node consumer who is blocked on
+neither — the opposite of the activation gate's own rule.
 
 ---
 
@@ -598,6 +737,17 @@ between two bindings fails CI without anyone having to notice it by hand.
    one fixture consumed by five suites.
 6. **The remote reason stays coarse** (three buckets). A binding that
    "enriches" it builds a credential oracle.
+6a. **An unclassifiable error is `unknown`, never a canonical domain.**
+   Reporting `admission_denied` for something a binding could not parse asserts
+   a remote evaluation that may never have happened (§D5a).
+6b. **The audience-secret loader validates the opened object**, not a path
+   (§D2a). A path-based check is a TOCTOU, and the substrate refused to ship
+   one precisely so that this plan could not inherit a false safety.
+6c. **The C ABI takes typed handles and exact ownership.** No `void*` for the
+   mesh arc; no free that claims idempotence it cannot deliver; `bind` NULLs
+   the credentials pointer it consumes.
+6d. **`OrgCaller`'s Rust representation is not an ABI concern.** The FFI crate
+   marshals; the Rust type keeps its typed fields.
 7. **Explicit disposal in every language**, with the security consequence
    documented, and Node's teardown-blocking behavior stated rather than
    smoothed over.
@@ -615,6 +765,9 @@ between two bindings fails CI without anyone having to notice it by hand.
 | Risk | Containment |
 |---|---|
 | A binding author adds a secret-bytes constructor "for convenience" | Locked decision #1 + a per-language test asserting the API's *absence*; the Rust loader returns no accessor to a secret, so there is nothing to forward |
+| **The new secret loader (§D2a) is the plan's highest-risk item** — it is fresh security code handling raw key material, not marshaling | Mirror `read_audience_checked` structurally rather than writing a fresh design; its own review pass separate from R's other items; per-step tests (symlink refused, non-regular file refused, group-readable refused, Windows own-DACL refused, trailing bytes refused, buffer scrubbed on the failure path); reviewed against the §27/§29 by-value residual so it does not widen it |
+| A wrapper's finalizer frees credentials that `bind` already consumed | `net_org_bind` takes `NetOrgCredentials**` and NULLs it on success, so the double-free is unrepresentable rather than merely documented |
+| A binding silently mislabels an unparsed error as a remote denial | `unknown` is a distinct class in all four languages (§D5a); X1's fixture includes an unknown-kind row, so every binding's parser is exercised on it |
 | `org-ffi`'s `net-mesh` feature list diverges from the standalone `libnet` build → silent UB from cfg-gated field offsets | The exact hazard `compute-ffi`/`rpc-ffi` already document; copy their feature list verbatim and their warning comment, and add `-p net-org-ffi` to the single CI cargo invocation so features unify in one pass |
 | `org-ffi` is the first Go FFI crate to depend on `net-mesh-sdk` | Pin the SDK dep to the same version/features the node and python bindings already use — they have carried this dependency in production since 0.33.0 |
 | A leaked `OrgClient` silently retains ingest authority | Explicit close in every language + a test asserting the consumer-audience count returns to zero; Go keeps the finalizer as a documented backstop |
@@ -627,11 +780,15 @@ between two bindings fails CI without anyone having to notice it by hand.
 
 ## Effort
 
-~3,600 LoC. Rust R ~400 (raw duals, loader, vocabulary); Node ~700 (napi +
-`org.ts` + tests); Python ~750 (pyclass pair + stubs + tests); C/org-ffi ~800
-(crate + header); Go ~750 (`org.go` + trampoline + tests); X ~200 (fixture
-generator + five consumers). R is ~3 days; C+G ~1.5 weeks; N and P ~1 week each
-in parallel; X ~3 days.
+~3,800 LoC. Rust R ~600 — raw duals ~150, **the checked secret loader ~250
+including its tests**, vocabulary ~100, `OrgCaller` marshaling + docs ~100;
+Node ~700 (napi + `org.ts` + tests); Python ~750 (pyclass pair + stubs +
+tests); C/org-ffi ~800 (crate + header); Go ~750 (`org.go` + trampoline +
+tests); X ~200 (fixture generator + five consumers).
+
+R is ~4 days, of which the loader is ~2 and carries its own review. Each named
+language is then independent: N ~1 week, P ~1 week, C+G ~1.5 weeks as one unit.
+X1 ~1 day; X2 ~2 days once two languages exist; X3 rides each binding.
 
 ---
 
