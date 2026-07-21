@@ -1,12 +1,28 @@
 # CODE REVIEW 2026-07-21 — Organization Capability Auth, second pass (`org-capability-auth`)
 
-> **Status: NOT signed off. 6 blocking items, one of them a Critical the
-> 2026-07-20 pass recorded as resolved.**
+> **Status: ALL FINDINGS REMEDIATED — awaiting independent review.**
 >
-> This is a second, independent review of the same branch, run at
-> `187ef4213` — i.e. AFTER the 2026-07-20 pass and its full §1-§20 / §T1-§T9
-> remediation. It has two jobs: audit whether those remediations actually
-> closed, and find what the first pass missed.
+> Every finding below is closed, across 23 commits (`523bb9fc4` … `eeb7db040`),
+> each red-witnessed against the branch's own standard: the guard was disabled,
+> the targeted witness confirmed to fail while its positive controls still
+> passed, then restored.
+>
+> **This document is now the record of what was found and what was done about
+> it, not a list of outstanding work.** The findings are retained in full —
+> they are the justification for changes a reviewer has to evaluate, and
+> deleting them would leave 23 commits with no stated cause. Each carries its
+> disposition in the [remediation table](#remediation-status).
+>
+> **What still needs doing is REVIEW, not remediation.** Nothing here has been
+> independently checked. Two places encode a judgement about the deployment
+> rather than a property of the code, and are the first things to scrutinise:
+> the §5 replay partition envelope and the §6 rate-limit envelope. Both ship
+> safe defaults and are operator-configurable; neither is a universal limit.
+>
+> This was a second, independent review of the branch at `187ef4213` — i.e.
+> AFTER the 2026-07-20 pass and its full §1-§20 / §T1-§T9 remediation. It had
+> two jobs: audit whether those remediations actually closed, and find what the
+> first pass missed.
 >
 > **The core authorization design holds.** `may_execute` is byte-unchanged,
 > the `#[cfg(test)]` RED-witness seam is unreachable in release, no scoped tag
@@ -16,43 +32,76 @@
 > scrutiny — see [Verified-clean register](#verified-clean-register), which is
 > written to be re-checkable rather than trusted.
 >
-> **What is open is the seams, again.** Six of the twenty 2026-07-20 findings
-> are INCOMPLETE, and five of those six are the same *propagation gap* the
-> first review named as its dominant pattern — the fix was applied to the path
-> under review and not to its siblings. The new findings are largely a second
-> instance of that shape, plus a second shape worth naming: **bounds that are
-> correct in isolation and do not compose**.
+> **What was open was the seams, again.** Six of the twenty 2026-07-20
+> findings were INCOMPLETE, and five of those six were the same *propagation
+> gap* the first review named as its dominant pattern — the fix applied to the
+> path under review and not to its siblings. The new findings were largely a
+> second instance of that shape, plus a second shape worth naming: **bounds
+> that are correct in isolation and do not compose**.
 >
-> **The branch does not currently pass its own gates.** `cargo clippy --lib
-> --features cortex -- -D warnings` fails at HEAD, and the branch's own new
-> `windows-security-tests` CI job fails on its clippy step and therefore never
-> runs any of the three security suites it was added to gate (§C1).
+> **The branch did not pass its own gates at review time.** `cargo clippy
+> --lib --features cortex -- -D warnings` failed at `187ef4213`, and the
+> branch's own new `windows-security-tests` CI job failed on its clippy step
+> and therefore never ran any of the three security suites it was added to
+> gate (§C1). Fixed first, in `523bb9fc4`, because until it landed nothing
+> else could be verified on the platform §11/§12/§13 concern.
+>
+> Gates at the remediated head: lib cortex **5088**,
+> integration_nrpc_protected 41, org_ownership 32, org_admission_gate 9,
+> org_admission_wire 2, org_scoped_relay 18, net-cli 93 + integration; clippy
+> clean under `cortex`, `net`, `cortex fixtures` and `--no-default-features`;
+> `cargo fmt` clean.
 >
 > ---
 >
-> ## Remediation status (updated as fixes land)
+> ## Remediation status
 >
-> | Item | Sev | State |
+> Three dispositions, deliberately distinguished. **FIXED** = behaviour
+> changed. **DECIDED** = behaviour kept, and the reasoning recorded at the line
+> where a reader would otherwise assume it was an oversight. **BOUNDED** = a
+> real property boundary stated at the point where the surrounding code reads
+> as if it covers the case; not something code alone can close.
+>
+> | Item | Sev | Disposition |
 > |---|---|---|
-> | §C1 / §C2 / §C3 — CI gate | Med | **FIXED** `523bb9fc4` |
-> | 2026-07-20 §2 — org root destroyable | **Crit** | **FIXED** `67bc26f4d` |
+> | §C1 / §C2 / §C3 — CI gate blind, Windows job red | Med | **FIXED** `523bb9fc4` |
+> | 2026-07-20 §2 — org root still destroyable | **Crit** | **FIXED** `67bc26f4d` |
 > | §1 — floor reset on re-adopt | High | **FIXED** `59dc0bc70` |
 > | §2 — audience key inherited across orgs | High | **FIXED** `54ec6fab2` |
-> | §3 + §4 — scoped expiry / store budget | High | **FIXED** `417700942` |
+> | §3 + §4 — scoped expiry clamp / per-scope budget | High | **FIXED** `417700942` |
 > | 2026-07-20 §20 residual + §11 — Windows DACL | High | **FIXED** `d1e0f241b` |
-> | 2026-07-20 §10 / §19 / §17 — CLI hygiene | Med/Low | **FIXED** `781d8991d` |
+> | 2026-07-20 §10 / §19 / §17 — CLI secret hygiene | Med/Low | **FIXED** `781d8991d` |
 > | §T1 / §T2 / §T3 — test falsifiability | — | **FIXED** `4c5c6db6e` |
-> | §12 — Windows ancestor chain | Med | **OPEN** (partially mitigated by the inheritance severing in `d1e0f241b`) |
-> | §5 / §6 / §7 — admission DoS | Med | OPEN |
-> | §8 / §9 / §24 — relay + store lifecycle | Med | OPEN |
-> | §10 — GrantedAudience existence oracle | Med | OPEN |
-> | §13 — Windows durability boundary | Med | OPEN |
-> | §14 — cross-org floors absent-means-zero | Med/Low | OPEN |
-> | §15–§34 — low cluster | Low | OPEN |
-> | §T4–§T9 — remaining test quality | — | OPEN |
+> | §D1 — 2026-07-20 production-closure overclaim | — | **FIXED** `0c074b48c` |
+> | §8 / §9 — relay truncation, unswept store | Med | **FIXED** `b81d6c67d` |
+> | §10 — GrantedAudience existence oracle | Med | **FIXED** `17e841ac0` |
+> | §5 — replay budget partitioned by trust domain | Med | **FIXED** `8f35fd94c` |
+> | §7 — denials off the serialized bridge loop | Med | **FIXED** `1830a3497` |
+> | §13 + §19 — Windows durability, gated seams | Med/Low | **FIXED** `e3e866b5d` |
+> | §15 / §18 / §20 / §21 — revocation lows | Low | **FIXED** `d8d59ac4a` |
+> | §16 / §17 — poison durability limits | Low | **BOUNDED** `d8d59ac4a` |
+> | §22 / §25 / §26 / §31 / §32 — low cluster | Low | **FIXED** `3c0f5897f` |
+> | §33 — pre-epoch fail-safe reasoning inverted | Low | **FIXED** (doc) `3c0f5897f` |
+> | §14 — cross-org floors absent-means-zero | Med/Low | **BOUNDED** `67dd13581` |
+> | §23 — cleartext relay framing | Low | **BOUNDED** `67dd13581` |
+> | §27 / §28 / §29 — secret-lifecycle obligations | Low | **BOUNDED** `67dd13581` |
+> | §30 — baseline residue un-suppresses | Low | **DECIDED** `67dd13581` |
+> | §T4 – §T9 — remaining test quality | — | **FIXED / DECIDED** `9234a4584` |
+> | §12 — Windows ancestor chain | Med | **FIXED** `1801880b7` |
+> | §24 — dedup identity consumed on refusal | Low | **FIXED** `129bf39ad` |
+> | §6 — unmetered pre-credential signature work | Med | **FIXED** `eeb7db040` |
+> | §34 — provider-posture oracle ordering | Low | **BOUNDED** (see below) |
 >
-> Two findings were also discovered while FIXING rather than reviewing, and are
-> recorded here because neither was reachable by reading:
+> §34 is the one finding with no dedicated commit: the ordering it describes
+> (provider self-verify before caller-credential checks, so `Unavailable`
+> versus `Denied` is observable pre-credential) is unchanged, and §6's
+> throttle now bounds how fast an uncredentialed peer can probe it. Reordering
+> the gate to hide it would move provider self-verification after credential
+> work, which is a worse trade: the check exists to fail fast when the provider
+> cannot admit at all.
+>
+> Two findings were discovered while FIXING rather than reviewing. Neither was
+> reachable by reading, and both are recorded because that is the point:
 >
 > - **`NO_COLOR=1` broke every subcommand.** `#[arg(long, global = true,
 >   env = "NO_COLOR")] no_color: bool` made clap parse the variable's VALUE as a
@@ -65,6 +114,46 @@
 >   `toml::de::Error`'s `Display` embeds the offending source line — which for
 >   that file is `seed_hex = "…"`. `org.rs` omits the error at both its parse
 >   sites for exactly this reason. Fixed in `781d8991d`, red-witnessed.
+>
+> ## Corrections to this document and to the work
+>
+> Recorded rather than quietly amended, because a review that hides its own
+> errors is worth less than one that does not.
+>
+> 1. **A stale-table claim in §D1 was wrong.** An earlier revision asserted the
+>    2026-07-20 TEST table was stale at §T2/§T4. It is not — it reads DONE and
+>    the commits it cites exist. The claim came from a remediation-audit
+>    subagent that read an older revision and was relayed without checking the
+>    file at HEAD. Retracted in `0c074b48c`; see §D1.
+> 2. **The first §13 implementation was wrong.** It used `FlushFileBuffers` on
+>    a `FILE_FLAG_BACKUP_SEMANTICS` directory handle, by analogy with the POSIX
+>    parent fsync. Windows has no directory fsync — that returns
+>    `ERROR_ACCESS_DENIED` and failed every store test. The documented
+>    primitive is `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` on the rename.
+> 3. **The first §20-residual fix was too blunt.** Refusing every unprotected
+>    DACL broke 15 tests and would have rejected the ordinary
+>    `mkdir && net node adopt`. Changed to repair-then-validate: check every
+>    other rule first, then sever inheritance.
+>
+> **Two verification traps hit during this work, both of which produced a false
+> PASS.** They are process findings, not code findings, and matter to anyone
+> reproducing these results:
+>
+> - **Stale artifacts after a restore.** Restoring a file with `Copy-Item
+>   backup → file` preserves the *backup's* mtime, which can predate the
+>   compiled artifact, so cargo skips recompilation and reports results for
+>   code that is no longer on disk. A §26 witness "failed" against a binary
+>   predating its own fix. Red witnesses are safe (their writes move mtime
+>   forward); *post-restore verification* is the exposed direction.
+> - **A vacuous red witness.** A PowerShell string replace silently failed to
+>   match, so "neutering the throttle" for §6 changed nothing and the suite
+>   passed against unmodified code — briefly reported as the throttle being
+>   unfalsifiable. **A red witness that PASSES means a broken test or a broken
+>   patch; assuming the former is how a false green ships.** Confirm the patch
+>   applied before trusting a red run.
+>
+> Every gate quoted in this document was re-run after explicitly touching all
+> modified sources.
 
 ## Conventions
 
@@ -173,6 +262,12 @@ commits ahead of `master`, +47,711/−1,147 across 101 files.
 
 # Part I — Audit of the 2026-07-20 remediations
 
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
+
 Verdicts across all twenty production findings:
 
 | § | Sev | Verdict |
@@ -201,7 +296,7 @@ Verdicts across all twenty production findings:
 No REGRESSED, no UNVERIFIABLE. Every fix changed production code; none was
 cosmetic or test-only.
 
-## I.1 — 2026-07-20 §2 is still open, and still Critical **[verified]**
+## I.1 — 2026-07-20 §2 was still open, and still Critical **[verified]** — FIXED `67bc26f4d`
 
 **Location:** `cli/src/commands/identity.rs:138-189`, `cli/src/commands/org.rs:300-329`
 
@@ -255,7 +350,7 @@ rather than the stat, and adopt `stage_nonce()` for the temp name (keygen's
 `org.rs:328` uses pid only, so a stale temp from a killed run permanently
 wedges the path against `create_new`).
 
-## I.2 — 2026-07-20 §20's accepted residual rests on a false premise **[verified]**
+## I.2 — 2026-07-20 §20's accepted residual rested on a false premise **[verified]** — FIXED `d1e0f241b`
 
 **Location:** `org_authority.rs:1353` (`DaclView.protected`)
 
@@ -311,7 +406,7 @@ and still wrong.
 **Minimum fix.** Enforce `view.protected` in `validate_dacl_view`, exactly as
 `owner_sid` was promoted for §3.
 
-## I.3 — 2026-07-20 §5 is bounded, not closed, while the code asserts closure **[reported]**
+## I.3 — 2026-07-20 §5 was bounded, not closed, while the code asserted closure **[reported]** — BOUNDED, recorded in the code
 
 **Location:** `org_admission.rs:556-561`, `:569`
 
@@ -348,7 +443,7 @@ handler runs a second time, with an `Admitted` attribution. At the default
 honestly instead of asserting it away, and consider anchoring freshness in the
 same monotonic base as retention.
 
-## I.4 — 2026-07-20 §10: three live seed copies still drop un-zeroed **[reported]**
+## I.4 — 2026-07-20 §10: three live seed copies dropped un-zeroed **[reported]** — FIXED `781d8991d`
 
 `identity.rs:420` is now `ScrubbedBytes::new(bytes.to_vec())`, and the wrappers
 were correctly promoted into `cli/src/secret.rs`. The org-key path in `org.rs`
@@ -370,7 +465,7 @@ Lower blast radius than the org root, but the same defect, in the same file,
 ~250 lines from the fixed line — and §10's own text says *"Same gap applies to
 `net identity generate`."*
 
-## I.5 — 2026-07-20 §19: CWD fallback still ships for both seed paths **[verified]**
+## I.5 — 2026-07-20 §19: CWD fallback shipped for both seed paths **[verified]** — FIXED `781d8991d`
 
 `cli/src/commands/node.rs:260-262` correctly returns `Option<PathBuf>` with no
 CWD fallback, with a written rationale. The same unguarded fallback still ships
@@ -398,7 +493,7 @@ while both *lesser* secrets do (`warn_secret_permissions` at `org.rs:1041` for
 the audience secret, `check_strict_permissions` for identity reads). The key
 that signs all membership and revocation gets silence.
 
-## I.6 — 2026-07-20 §17: anti-pattern survives verbatim at three sites **[reported]**
+## I.6 — 2026-07-20 §17: anti-pattern survived verbatim at three sites **[reported]** — FIXED `781d8991d`
 
 `org.rs:1090-1095` and `identity.rs:147-151` are fixed with explicit
 "deliberately NO `--force` advice" comments. Still shipping:
@@ -468,6 +563,12 @@ and incomplete**.
 ---
 
 # Part II — New production findings
+
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
 
 ## 1. High — `init()` silently resets persisted floors to empty **[verified]**
 
@@ -915,6 +1016,12 @@ closure as the sole cross-org revocation mechanism.
 
 # Part III — New low-severity findings
 
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
+
 ## 15. Low — Nothing enforces `disk ≥ live` **[reported]**
 `org_revocation.rs:455-462`, `:1390-1397`. `publish` unconditionally maxes the
 incoming state with the outgoing live view, so a persisted state *weaker* than
@@ -1089,6 +1196,12 @@ sound and exhaustive; the issue is the ordering.
 
 # Part IV — Test quality (§T1–§T9)
 
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
+
 The six suites audited here are the ones the 2026-07-20 pass never examined:
 `integration_nrpc_protected.rs` (3,744 lines — the branch's main live witness
 suite), `nrpc_registration_order.rs`, `nrpc_route_discriminator.rs`,
@@ -1233,6 +1346,12 @@ flake-prone.
 
 # Part V — Build and CI
 
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
+
 ## §C1 — Medium — The branch fails its own clippy gate; the new Windows security job is red **[verified — reproduced]**
 
 **Location:** `capability_bridge.rs:37-38`; `.github/workflows/ci.yml:1052`, `:1746`
@@ -1319,6 +1438,12 @@ comment says it exists to prevent.
 ---
 
 # Part VI — Documentation accuracy
+
+> **Findings below are stated AS FOUND, at `187ef4213`.** They are retained
+> verbatim because they are the evidence for the changes that followed — a
+> reviewer evaluating a commit needs the case that motivated it. Present-tense
+> claims describe the branch at review time, not now. Disposition and commit
+> for every item is in the [remediation table](#remediation-status).
 
 ## §D1 — The 2026-07-20 production claim is an overclaim by six
 
@@ -1469,33 +1594,63 @@ material. The one unguarded slice is §32, and it is currently unreachable.
 
 # Recommendation
 
-**Do not sign off.** The authorization core is sound and the confidentiality
-chokepoint holds — this is a well-built subsystem and most of what follows is
-small. But six items should close first, and one of them is a Critical the
-branch currently records as resolved.
+**Remediation is complete; sign-off depends on review, not on more work.**
 
-**Before merge:**
+Every finding is closed across 23 commits, each red-witnessed. Nothing here has
+been independently checked, and the process that produced it hit two
+verification traps that yielded a false PASS (see
+[Corrections](#corrections-to-this-document-and-to-the-work)). Both were caught
+by accident rather than by design, which is the strongest argument for a second
+pair of eyes on the result.
 
-1. **§C1** — two `#[cfg]` attributes plus a non-`--all-features` clippy step.
-   Do this first: until it lands, `windows-security-tests` runs nothing, and
-   §11/§12/§13 are all Windows-only.
-2. **2026-07-20 §2** — call `refuse_replacing_org_key` from both seed-writing
-   verbs. One call site each.
-3. **§1** — make `init` and `open_existing` agree on a missing state file.
-4. **§2** — bind the audience credential to an org; hoist the ownership gate out
-   of the `if let Some(existing)`; rewrite the `AlreadyOwned` guidance.
-5. **§3 + §4** — clamp `expires_at` at ingest and retain the binding window in
-   `VerifiedScopedCapability`. This is the one item needing a design decision
-   rather than a mechanical fix.
-6. **2026-07-20 §20** — enforce `view.protected` in `validate_dacl_view`.
+**Review these first — they are judgements about the deployment, not
+properties of the code:**
 
-**Before citing the test suite as evidence:** §T1 (one line) and §T2 (a settling
-window helper applied at ~12 sites).
+1. **§5 — the replay-budget partition.** `65_536` total / `16_384` owner
+   reserve / `4_096` per external org / `4_096` per caller, keyed on the
+   VERIFIED acting org. The rejected alternatives matter as much as the choice:
+   raising the global cap only changes the coalition size, and adaptive
+   per-org shares cannot be made safe because shrinking a share would require
+   evicting unexpired ADMITTED entries — the one thing this structure exists to
+   prevent. Note the shipped per-caller and per-org values are EQUAL, so for a
+   single identity the caller ceiling binds first; the org quota is
+   specifically the coalition bound and engages at ≥2 identities.
+2. **§6 — the failed-admission throttle.** `64` burst / `8` per second /
+   `4_096` tracked peers. The load-bearing decision is that it charges on
+   FAILURE rather than per attempt: an honest caller whose admissions succeed
+   is untouched however fast it calls, because the attacker's distinguishing
+   property is not its rate but that its admissions fail. Zero refill is
+   refused at validation rather than clamped — it would make the first burst
+   permanent.
 
-**Then:** update the 2026-07-20 header per §D1, and record §5-residual, §14 and
-§23 as accepted limitations rather than closed items — each is a real property
-boundary that operators need stated, and none is a defect that code alone can
-close.
+Both ship safe defaults and are operator-configurable
+(`MeshNodeConfig::with_admission_replay_config`,
+`::with_admission_rate_limit`). Neither is a universal workload limit.
+
+**Then review the three dispositions that are not code changes** — §14, §23,
+§16/§17, §27–§29 (BOUNDED) and §30 (DECIDED). Each is a place where the honest
+answer was to state a boundary rather than manufacture a fix, and each is
+therefore a place where a reviewer might legitimately disagree with the
+judgement.
+
+**Two structural checks worth repeating independently**, because they are the
+ones that would invalidate the most work if wrong: that `may_execute` is still
+byte-identical to `master`, and that no `#[cfg(test)]`/`fixtures` seam is
+reachable in a release build. Both are recorded with their method in the
+[Verified-clean register](#verified-clean-register) so they can be re-derived
+rather than taken on trust.
+
+**Two patterns worth carrying into the next pass**, because between them they
+predicted most of what this one found:
+
+- **The propagation gap** (the first review's own finding, which then recurred
+  in its remediation): five of six reopened items, and §1, §2, §3, §11, §12,
+  §20, §32 among the new ones. *When a fix lands, grep for every sibling call
+  site before closing.*
+- **Bounds correct in isolation that do not compose**: §4 (one global 8192
+  across owner + every grant), §5 (4,096 per caller × 16 = the global cap), §8
+  (relay gate), §21 (unbounded floors). *When adding a per-X bound, state what
+  N distinct X's do to the global.*
 
 **Two patterns worth carrying into the next pass**, because between them they
 predict where the following defect will be:
