@@ -31,9 +31,13 @@ use net_sdk::org::{
 };
 use serde::{Deserialize, Serialize};
 
+// NB: `write_identity_atomically` is deliberately NOT imported here any more.
+// `run_keygen` was its only caller in this file, and its unconditional `rename`
+// is exactly why keygen had no race-free clobber boundary (§2). Every publish
+// in this module now goes through `stage_beside` + `publish_staged` /
+// `publish_staged_replace`.
 use crate::commands::identity::{
     check_strict_permissions, enforce_strict_permissions, now_iso8601, parse_entity_hex,
-    write_identity_atomically,
 };
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -87,8 +91,22 @@ pub struct KeygenArgs {
     pub note: Option<String>,
 
     /// Overwrite an existing file. Refuses by default.
+    ///
+    /// Replaces an org key at this path — that is what it is for. It will
+    /// still refuse to replace a DIFFERENT kind of secret (an operator
+    /// identity), however the path is spelled.
     #[arg(long)]
     pub force: bool,
+
+    /// Acknowledge that the org key's mode is not enforced on Windows and
+    /// suppress the warning.
+    ///
+    /// Same gate, same reasoning as `net org grant-capability --discover`:
+    /// deliberately SEPARATE from `--insecure-permissions` (§16), which
+    /// relaxes a check on an INPUT rather than silencing the only signal that
+    /// a freshly written OUTPUT secret may be readable by others.
+    #[arg(long = "accept-windows-dacl")]
+    pub accept_windows_dacl: bool,
 }
 
 #[derive(Args, Debug)]
@@ -297,15 +315,17 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
     let path = args
         .out
         .unwrap_or_else(|| default_org_key_path(&org_id_hex));
+    // UX pre-check only — the real no-clobber boundary is the hard link in
+    // `publish_staged` below. Before §2's closure this stat WAS the only
+    // boundary keygen had, because it published through the identity helper's
+    // unconditional `rename`.
     refuse_existing(&path, args.force).await?;
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            generic(format!(
-                "failed to create parent directory {}: {e}",
-                parent.display()
-            ))
-        })?;
+    if args.force {
+        // `--force` here means "replace the org key at this path". It must not
+        // mean "replace whatever happens to be at this path" — an operator
+        // identity at the destination is a different secret and a different
+        // mistake.
+        refuse_replacing_foreign_seed(&path, SeedArtifact::OrgKey).await?;
     }
 
     let file = OrgKeyFile {
@@ -319,15 +339,32 @@ async fn run_keygen(args: KeygenArgs, output: Option<OutputFormat>) -> Result<()
             .map_err(|e| generic(format!("failed to serialize org key TOML: {e}")))?,
     );
 
-    // Same atomic, mode-restricted publish as operator identities — the org root
-    // seed must never be world-readable, even transiently. `toml_text` carries
-    // the serialized seed and scrubs on EVERY exit via its Drop guard — including
-    // a failed atomic write or permission-enforcement step, not only the success
-    // tail (Kyra OA2-F). `file` scrubs its own `seed_hex` on Drop.
-    let pid = std::process::id();
-    let tmp = path.with_extension(format!("tmp.{pid}"));
-    write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
+    // Stage beside the destination, then publish — the same race-free path every
+    // OTHER artifact in this file uses. keygen previously went through the
+    // identity helper, whose `create_new` guards only the TEMP and whose
+    // unconditional `rename` always replaces: the `try_exists` above was
+    // therefore keygen's ONLY clobber protection, contradicting
+    // `refuse_existing`'s own docstring, and it lost every race. Staging also
+    // gets a `stage_nonce()` temp name, so a stale temp from a killed run no
+    // longer wedges the path against `create_new` the way the bare-pid name did.
+    //
+    // `toml_text` carries the serialized seed and scrubs on EVERY exit via its
+    // Drop guard — including a failed stage, publish, or permission-enforcement
+    // step, not only the success tail (Kyra OA2-F). `file` scrubs its own
+    // `seed_hex` on Drop.
+    let tmp = stage_beside(&path, toml_text.as_bytes(), true).await?;
+    if args.force {
+        publish_staged_replace(&tmp, &path).await?;
+    } else {
+        publish_staged(&tmp, &path).await?;
+    }
     enforce_strict_permissions(&path).await?;
+    // The org root seed is the most sensitive file this CLI writes, and on
+    // Windows it has no 0600 analog — it inherits the parent directory's DACL.
+    // Both LESSER secrets already warn here (the minted audience secret via this
+    // same helper, identity reads via `check_strict_permissions`); the key that
+    // signs all membership and revocation was the one that stayed silent.
+    warn_secret_permissions(&path, args.accept_windows_dacl);
 
     // Public summary only — never the seed.
     let summary = OrgKeySummary {
@@ -1125,8 +1162,9 @@ async fn publish_json_artifact(
     if force {
         // Only the forced path needs this: without `--force` the no-clobber
         // hard-link already refuses anything that exists at the destination,
-        // whatever it contains.
-        refuse_replacing_org_key(final_path).await?;
+        // whatever it contains. A certificate / revocation bundle / grant
+        // envelope is not seed-bearing, so it may replace nothing seed-bearing.
+        refuse_replacing_foreign_seed(final_path, SeedArtifact::None).await?;
     }
     let tmp = stage_beside(final_path, json, false).await?;
     if force {
@@ -1136,43 +1174,97 @@ async fn publish_json_artifact(
     }
 }
 
-/// Refuse to publish over a file whose CONTENT is org root key material.
+/// What seed-bearing artifact, if any, currently lives at `path`.
 ///
 /// [`refuse_aliased_paths`] catches the common spelling, but it is a lexical,
 /// case-sensitive comparison that resolves neither `..` nor symlinks — so on a
 /// case-insensitive filesystem `--out ORG.TOML` against `--org-key org.toml`
-/// slips past it. Without `--force` that is harmless (publication is
-/// no-clobber, so the hard-link fails `AlreadyExists`). With `--force` the
-/// replace would succeed and the org root would be unrecoverable.
-///
-/// Rather than reach for a platform file-identity API (`st_dev`/`st_ino` vs
-/// `GetFileInformationByHandle`), this refuses on what actually matters: if the
-/// destination parses as an org key file, it is not a publication target
-/// however the path was spelled. One check covers case variants, symlinks,
-/// hard links, and `..` traversal alike.
-async fn refuse_replacing_org_key(path: &Path) -> Result<(), CliError> {
+/// slips past it. Rather than reach for a platform file-identity API
+/// (`st_dev`/`st_ino` vs `GetFileInformationByHandle`), classify on what
+/// actually matters: the CONTENT at the destination. One check covers case
+/// variants, symlinks, hard links, and `..` traversal alike.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SeedArtifact {
+    /// Absent, binary, unreadable, or not seed-bearing.
+    None,
+    /// An org ROOT key file (`seed_hex` + `org_id_hex`). Signs every membership
+    /// certificate and every revocation floor; unrecoverable if destroyed.
+    OrgKey,
+    /// An operator identity file (`seed_hex`, no `org_id_hex`).
+    Identity,
+}
+
+impl SeedArtifact {
+    fn describe(self) -> &'static str {
+        match self {
+            SeedArtifact::None => "no seed material",
+            SeedArtifact::OrgKey => "org root key material",
+            SeedArtifact::Identity => "operator identity key material",
+        }
+    }
+}
+
+/// Classify the artifact at `path` by content.
+pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
     // Absent, binary, or unreadable — nothing we can identify as key material,
     // and any real failure surfaces from the publish itself.
     let Ok(mut text) = tokio::fs::read_to_string(path).await else {
-        return Ok(());
+        return SeedArtifact::None;
     };
-    // The text may BE the seed; scrub it before returning on EITHER branch.
+    // The text may BE the seed; scrub it before returning on EVERY branch.
     // NEVER interpolate the parse error — its `Display` embeds the offending
-    // source line, which for this file is `seed_hex` (the same reasoning as
+    // source line, which for these files is `seed_hex` (same reasoning as
     // `load_org_key_from_text`).
-    let looks_like_org_key = toml::from_str::<toml::Value>(&text)
-        .ok()
-        .and_then(|v| v.get("seed_hex").cloned())
-        .is_some();
+    let parsed = toml::from_str::<toml::Value>(&text).ok();
+    let has_seed = parsed
+        .as_ref()
+        .and_then(|v| v.get("seed_hex"))
+        .is_some_and(|v| v.is_str());
+    let has_org_id = parsed
+        .as_ref()
+        .and_then(|v| v.get("org_id_hex"))
+        .is_some_and(|v| v.is_str());
     zeroize_string(&mut text);
-    if looks_like_org_key {
-        return Err(invalid_args(format!(
-            "refusing to overwrite {}: it contains org root key material. --out must not name \
-             the org key, however the path is spelled (case variant, symlink, or relative path).",
-            path.display()
-        )));
+    match (has_seed, has_org_id) {
+        (true, true) => SeedArtifact::OrgKey,
+        (true, false) => SeedArtifact::Identity,
+        _ => SeedArtifact::None,
     }
-    Ok(())
+}
+
+/// The publish-time rule for every verb that can replace a file:
+///
+/// > `--force` may replace an artifact of its OWN kind. It must never replace
+/// > a DIFFERENT kind of secret.
+///
+/// `publishing` is what the calling verb is about to write —
+/// [`SeedArtifact::None`] for the non-secret JSON artifacts (certificates,
+/// revocation bundles, grant envelopes), which may replace nothing seed-bearing
+/// at all.
+///
+/// This generalizes the original §2 fix, which guarded only `issue-cert` /
+/// `issue-floors` and keyed on "is there ANY `seed_hex` here". That left the
+/// two verbs which themselves WRITE seed files — `net org keygen` and
+/// `net identity generate` — unguarded on their `--force` path, so
+/// `net identity generate --out "$KEY" --force` with `$KEY` drifted onto the
+/// org key path replaced the org root with an operator identity and exited 0.
+/// Keying on the KIND rather than on mere presence closes that without
+/// refusing the legitimate same-kind replace each verb's `--force` exists for.
+pub(crate) async fn refuse_replacing_foreign_seed(
+    path: &Path,
+    publishing: SeedArtifact,
+) -> Result<(), CliError> {
+    let found = classify_seed_artifact(path).await;
+    if found == SeedArtifact::None || found == publishing {
+        return Ok(());
+    }
+    Err(invalid_args(format!(
+        "refusing to overwrite {}: it contains {}. --out must not name that file, however the \
+         path is spelled (case variant, symlink, hard link, or relative path). If you really \
+         mean to discard it, remove it explicitly first.",
+        path.display(),
+        found.describe(),
+    )))
 }
 
 /// Atomic REPLACE publish for renewable artifacts: `rename` the staged temp

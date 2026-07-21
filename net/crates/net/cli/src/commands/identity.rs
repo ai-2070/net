@@ -25,6 +25,7 @@ use clap::{Args, Subcommand};
 use net_sdk::identity::EntityId;
 use serde::{Deserialize, Serialize};
 
+use crate::commands::org::{refuse_replacing_foreign_seed, SeedArtifact};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 use crate::secret::ScrubbedBytes;
@@ -150,6 +151,23 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
                 return Err(generic(format!("failed to stat {}: {e}", path.display())));
             }
         }
+    } else {
+        // §2. `--force` here means "replace the identity at this path". Because
+        // the publish below ends in an unconditional `rename`, and because the
+        // block above is skipped entirely when forcing, this guard is the only
+        // thing standing between a drifted `--out` and the org root key:
+        //
+        //   net identity generate --out "$KEY" --force
+        //
+        // with `$KEY` pointing at an org key file used to replace the org root
+        // with an operator identity and exit 0 — root unrecoverable, no floor
+        // ever issuable again, every outstanding membership cert live until
+        // natural expiry. The original §2 fix guarded `issue-cert` /
+        // `issue-floors` and never reached the two verbs that write seed files.
+        //
+        // Replacing an identity with an identity stays allowed: that is the
+        // rotation `--force` exists for.
+        refuse_replacing_foreign_seed(&path, SeedArtifact::Identity).await?;
     }
 
     // Ensure the parent directory exists. We deliberately don't
