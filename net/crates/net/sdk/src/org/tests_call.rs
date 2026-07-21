@@ -525,8 +525,13 @@ async fn a_dispatcher_scope_that_excludes_the_capability_refuses_locally() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Stage 3: a client that bound while valid still refuses once its membership
-/// window closes — a long-lived client crosses expiry.
+/// Stage 3: an expired membership refuses at CALL time.
+///
+/// It also pins the stage boundary: binding does NOT check membership or
+/// dispatcher windows (only the installability of DISCOVER audiences), so an
+/// already-expired membership binds fine and fails on the first call. Waiting
+/// out the window BEFORE binding keeps the witness deterministic — extra delay
+/// under load can only strengthen it, never make the credential valid again.
 #[tokio::test]
 async fn an_expired_membership_refuses_at_call_time() {
     let a = org_a();
@@ -535,12 +540,15 @@ async fn an_expired_membership_refuses_at_call_time() {
     let dg =
         OrgDispatcherGrant::try_issue(&a, identity.entity_id().clone(), DispatcherScope::Any, 3600)
             .expect("dg");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
     let client = mesh
         .org(OrgCredentials::new(cert, dg, vec![], vec![]).expect("assembles"))
-        .expect("binds while still valid");
-    client.check_current().expect("current at bind");
+        .expect("an expired membership still BINDS — windows are a call-time check");
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    client
+        .check_current()
+        .expect_err("but the credentials are not current");
     let err = client.plan("internal.reindex").expect_err("expired");
     assert!(
         matches!(
