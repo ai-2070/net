@@ -28,6 +28,7 @@ use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_admission::OrgAdmission;
 use net::adapter::net::behavior::org_authority::NodeAuthority;
+use net::adapter::net::behavior::org_call::MAX_ORG_PROOF_TTL_SECS;
 use net::adapter::net::behavior::org_grant::OrgAudienceSecret;
 use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
@@ -3536,4 +3537,208 @@ fn invoke_only_grant_carries_no_discovery_material() {
         "an INVOKE-only grant confers no discovery right",
     );
     assert!(grant.permits_invoke(), "it does carry INVOKE");
+}
+
+// =========================================================================
+// §T1 — the caller BINDING, end to end over real transport.
+//
+// Every other protected test in this file builds the calling node and mints
+// the proof intent from the SAME seed, so none of them exercises the bind at
+// all: `authenticated_caller` and the proof's declared caller are identical
+// by construction. Repointing `AdmissionContext::authenticated_caller`
+// (mesh_rpc.rs) at the caller decoded FROM THE PROOF instead of the one
+// `resolve_direct_caller` derived from the AEAD session left all 38 tests
+// green — while making every captured proof universally replayable by any
+// peer that obtained it.
+//
+// The tests below are the ones that go red for that mutation.
+// =========================================================================
+
+/// A fully VALID owner-delegated proof, minted for entity X under org B, is
+/// DENIED when presented over entity Y's authenticated session.
+///
+/// Nothing about the proof is malformed: X holds a real membership cert and a
+/// real dispatcher grant from the provider's own owner org, the binding
+/// signature verifies, and it is well inside its TTL. The only thing wrong is
+/// that the session peer is Y — which is exactly the shape of a stolen or
+/// relayed proof.
+///
+/// Red-witness: sourcing `authenticated_caller` from the proof makes this
+/// admit.
+#[tokio::test]
+async fn live_two_node_proof_for_another_identity_is_denied() {
+    const SESSION_SEED: [u8; 32] = [0x71u8; 32];
+    const OTHER_SEED: [u8; 32] = [0x72u8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(SESSION_SEED)).await;
+    bring_up(&caller, &server).await;
+
+    let (org_b, dir) = install_authority(&server, "bindmismatch");
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    // The proof names OTHER_SEED's entity throughout — membership, dispatcher,
+    // and the binding signature. It is internally consistent and valid.
+    let other_kp = EntityKeypair::from_bytes(OTHER_SEED);
+    assert_ne!(
+        other_kp.entity_id(),
+        caller.entity_id(),
+        "the proof subject must differ from the session peer",
+    );
+    let intent = owner_delegated_intent(other_kp, &org_b, provider.clone(), "svc");
+
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let err = caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect_err("a proof minted for another identity must be denied");
+
+    match err {
+        RpcError::ServerError { status, .. } => assert_eq!(
+            status, 0x0009,
+            "a proof/session identity mismatch denies AdmissionDenied",
+        ),
+        other => panic!("expected AdmissionDenied, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the handler must stay dark for a proof bound to another identity",
+    );
+
+    // Positive control on the SAME server and session: a proof minted for the
+    // session's own identity admits. Without this the denial above could be an
+    // artifact of the fixture (a bad org, an unserved name) rather than the
+    // bind.
+    let self_intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(SESSION_SEED),
+        &org_b,
+        provider,
+        "svc",
+    );
+    let opts = CallOptions {
+        org_proof_intent: Some(self_intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect("a correctly-bound proof on the same session admits");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the correctly-bound call reached the handler",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The caller-side TTL ceiling is enforced LOCALLY, before anything leaves
+/// the node.
+///
+/// Note what is NOT testable end to end here, and why: `proof_ttl_secs` is
+/// applied when the proof is MINTED, which `call()` does fresh on every
+/// invocation. There is no way through the public API to present a proof that
+/// has already expired — the caller cannot hand one in (a caller-supplied
+/// `net-org-admission` header is rejected outright) and cannot age one. The
+/// expiry arm of `check_expiry_at` is therefore only reachable by a captured
+/// proof being replayed, which is exactly the attack the binding and replay
+/// guard exist to stop, and it is covered where it can be driven directly:
+/// the `org_admission` unit tests, which take an explicit `ClockSample`
+/// (`expired_proof_is_refused`,
+/// `widening_skew_does_not_reopen_an_already_used_proof`).
+///
+/// What IS testable at this layer is the caller-side ceiling: a TTL of 0 or
+/// one above `MAX_ORG_PROOF_TTL_SECS` (30 s) must fail on the calling node,
+/// with no frame emitted and the provider's handler untouched.
+#[tokio::test]
+async fn a_proof_ttl_outside_the_ceiling_fails_locally() {
+    const CALLER_SEED: [u8; 32] = [0x73u8; 32];
+    let server = build_node_with(EntityKeypair::generate()).await;
+    let caller = build_node_with(EntityKeypair::from_bytes(CALLER_SEED)).await;
+    bring_up(&caller, &server).await;
+
+    let (org_b, dir) = install_authority(&server, "ttlceiling");
+    let provider = server.entity_id().clone();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_protected(
+            "svc",
+            Arc::new(DarkHandler {
+                calls: calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve protected");
+
+    for bad_ttl in [0u64, MAX_ORG_PROOF_TTL_SECS + 1] {
+        let mut intent = owner_delegated_intent(
+            EntityKeypair::from_bytes(CALLER_SEED),
+            &org_b,
+            provider.clone(),
+            "svc",
+        );
+        intent.proof_ttl_secs = bad_ttl;
+        let opts = CallOptions {
+            org_proof_intent: Some(intent),
+            deadline: Some(Instant::now() + Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let err = caller
+            .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+            .await
+            .expect_err("a TTL outside 1..=MAX must be refused");
+        // Refused by the CALLER, so it is not a server status — and crucially
+        // not a timeout, which is what a silently-dropped frame would look
+        // like.
+        assert!(
+            !matches!(err, RpcError::Timeout { .. }),
+            "ttl {bad_ttl} must fail loudly on the caller, not time out: {err:?}",
+        );
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no frame reached the provider for an out-of-range TTL",
+    );
+
+    // Positive control: an in-range TTL on the same setup admits.
+    let mut intent = owner_delegated_intent(
+        EntityKeypair::from_bytes(CALLER_SEED),
+        &org_b,
+        provider,
+        "svc",
+    );
+    intent.proof_ttl_secs = MAX_ORG_PROOF_TTL_SECS;
+    let opts = CallOptions {
+        org_proof_intent: Some(intent),
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+        ..Default::default()
+    };
+    caller
+        .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
+        .await
+        .expect("a TTL at the ceiling admits");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only the valid TTL called");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
