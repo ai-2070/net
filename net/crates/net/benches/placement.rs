@@ -58,7 +58,7 @@ fn make_fold(count: usize) -> Arc<Fold<CapabilityFold>> {
             .with_metadata("intent", "ml-training")
             .with_metadata("region", if i % 2 == 0 { "us-east" } else { "us-west" });
         let ad = CapabilityAnnouncement::new(0x1000 + i as u64, eid.clone(), 1, caps);
-        capability_bridge::apply_legacy_announcement(&fold, ad)
+        capability_bridge::apply_legacy_announcement(&fold, ad, None, 0)
             .expect("apply legacy announcement in fixture");
     }
     Arc::new(fold)

@@ -256,6 +256,61 @@ async fn serve_rpc_self_indexes_announcement_with_nrpc_tag() {
     );
 }
 
+/// OA2-E0.1: a duplicate `serve_rpc` for a live service is refused
+/// with `AlreadyServing` WITHOUT silently breaking the incumbent.
+/// Pre-E0.1 the destructive registration installed the second
+/// dispatcher (whose bridge was never spawned) and dropped the
+/// first, so the service died while `serve_rpc` reported
+/// `AlreadyServing`. It also must leave no stray/removed tag: the
+/// `nrpc:echo` tag stays present exactly, and dropping the ORIGINAL
+/// handle is what actually tears the service down.
+#[tokio::test]
+async fn duplicate_serve_rpc_is_refused_without_breaking_the_incumbent() {
+    use net::adapter::net::mesh_rpc::ServeError;
+
+    let node = build_node().await;
+    let request_hash = net::adapter::net::ChannelName::new("echo.requests")
+        .unwrap()
+        .hash();
+
+    let serve1 = node
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("first serve_rpc");
+    assert!(node.rpc_inbound_dispatcher_registered(request_hash));
+    assert!(node
+        .test_capability_fold_get(node.node_id())
+        .has_tag("nrpc:echo"));
+
+    // Duplicate registration is refused… (ServeHandle is not Debug,
+    // so match rather than expect_err).
+    match node.serve_rpc("echo", Arc::new(EchoHandler)) {
+        Err(ServeError::AlreadyServing(s)) => assert_eq!(s, "echo"),
+        Err(other) => panic!("expected AlreadyServing, got {other:?}"),
+        Ok(_) => panic!("duplicate serve_rpc must fail"),
+    }
+
+    // …and the incumbent is intact: the request dispatcher is still
+    // registered and the tag is still present (the failed duplicate
+    // left nothing behind — no removed tag, no orphaned dispatcher).
+    assert!(
+        node.rpc_inbound_dispatcher_registered(request_hash),
+        "the incumbent request dispatcher must survive a refused duplicate",
+    );
+    assert!(
+        node.test_capability_fold_get(node.node_id())
+            .has_tag("nrpc:echo"),
+        "the service tag must remain after a refused duplicate",
+    );
+
+    // The ORIGINAL handle owns the registration; dropping it is what
+    // tears the service down.
+    drop(serve1);
+    assert!(
+        !node.rpc_inbound_dispatcher_registered(request_hash),
+        "dropping the original ServeHandle must unregister the dispatcher",
+    );
+}
+
 /// H2 regression — `announce_capabilities` BEFORE `serve_rpc`
 /// used to leave the self-announcement without the `nrpc:<service>`
 /// tag, causing the callee-side gate to deny every inbound call

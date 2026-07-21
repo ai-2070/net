@@ -240,6 +240,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
+            owner: None,
         };
         fold.apply(
             SignedAnnouncement::sign(

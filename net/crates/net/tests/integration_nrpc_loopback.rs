@@ -38,9 +38,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use net::adapter::net::cortex::{
-    EventMeta, RpcClientFold, RpcClientPending, RpcContext, RpcHandler, RpcHandlerError,
-    RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcStatus,
-    DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
+    encode_rpc_route, EventMeta, RpcClientFold, RpcClientPending, RpcContext, RpcHandler,
+    RpcHandlerError, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload, RpcServerFold,
+    RpcStatus, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
+    RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -50,8 +51,14 @@ use parking_lot::Mutex;
 // ============================================================================
 
 fn make_event(meta: EventMeta, payload_tail: &[u8]) -> RedexEvent {
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + payload_tail.len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + payload_tail.len());
     buf.extend_from_slice(&meta.to_bytes());
+    // OA2-E0.2: the RpcRouteV1 canonical discriminator sits between
+    // EventMeta and the payload. This loopback feeds the folds
+    // directly (no mesh ingress selecting on it), so a placeholder
+    // canonical is fine — the folds skip these 8 bytes to reach the
+    // payload at RPC_FRAME_BODY_OFFSET.
+    encode_rpc_route(&mut buf, 0);
     buf.extend_from_slice(payload_tail);
     RedexEvent {
         entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -97,7 +104,7 @@ impl<H: RpcHandler> Loopback<H> {
         // need a separate handle on the fold — `pending` is the
         // shared state that both sides observe.
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let ev = response_event(origin, call_id, &resp);
             // Drive the client fold synchronously. In the real
             // Mesh wire-up the emit closure publishes the RESPONSE

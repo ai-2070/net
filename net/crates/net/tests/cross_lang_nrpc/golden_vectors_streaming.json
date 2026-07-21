@@ -256,7 +256,9 @@
       { "name": "handler_duration_buckets",         "type": "list[u64]",   "section": "server-side",  "semantic": "Cumulative bucket counts for handler duration" },
       { "name": "streaming_chunks_emitted_total",   "type": "u64",         "section": "server-side",  "semantic": "Total streaming chunks emitted via RpcResponseSink::send" },
       { "name": "streaming_chunks_dropped_total",   "type": "u64",         "section": "server-side",  "semantic": "Total streaming chunks dropped by the per-call pump mpsc at sink.send() time (overflow signal)" },
-      { "name": "capability_denied_total",          "type": "u64",         "section": "server-side",  "semantic": "Inbound calls rejected by the capability-auth callee-side gate before handler invocation" }
+      { "name": "capability_denied_total",          "type": "u64",         "section": "server-side",  "semantic": "Inbound calls rejected by the capability-auth callee-side gate before handler invocation" },
+      { "name": "relayed_flow_controlled_rejected_total", "type": "u64",    "section": "server-side",  "semantic": "Flow-controlled upload REQUESTs rejected at admission because the caller session is relayed/untrusted (pinned origin != claimed origin)" },
+      { "name": "packet_origin_mismatch_dropped_total",   "type": "u64",    "section": "server-side",  "semantic": "Inbound frames dropped at the bridge preflight because the packet (transport) origin != the payload (EventMeta) origin" }
     ],
     "per_binding_field_naming": {
       "description": "Each binding's preferred field-name casing. Bindings re-serializing a snapshot to JSON for downstream consumers SHOULD use the substrate's snake_case form; only the in-process typed surface uses camelCase or PascalCase per language convention.",

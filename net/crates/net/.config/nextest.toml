@@ -17,3 +17,33 @@
 # matrix.
 [profile.default]
 retries = 2
+
+# A hung test must FAIL, not consume the job.
+#
+# Several bridges deliver a terminal frame that releases a caller blocked in
+# `finish()`, and `CallOptions::default()` has `deadline: None` — documented as
+# "waits indefinitely". A regression that bumps the denial metric but skips the
+# emit therefore does not fail a test; it hangs one, and without a timeout the
+# job dies at its `timeout-minutes` budget with no indication of WHICH test
+# stalled. `terminate-after` converts that into an ordinary named failure.
+#
+# Generous because the slowest legitimate suites stand up multi-node meshes
+# over loopback UDP under an oversubscribed CI CPU.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Security-critical suites get NO retries.
+#
+# The blanket `retries = 2` above is right for transport saturation noise, but
+# it is exactly wrong for these: their regression signal is INTERMITTENT by
+# construction. They drive deliberate races — a floor publish against a scoped
+# insert, a visibility change against serialization, a credential replacement
+# against a granted insert, an authority swap against an admission — and a
+# broken lock or a lost barrier does not fail every attempt, it fails some
+# fraction of them. Three attempts then turn a real security regression into a
+# green run.
+#
+# A genuine flake here is itself a defect worth seeing, so failing loudly on
+# the first attempt is the correct behavior, not a nuisance.
+[[profile.default.overrides]]
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order)'
+retries = 0

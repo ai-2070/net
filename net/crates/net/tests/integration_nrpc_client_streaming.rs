@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use net::adapter::net::behavior::CapabilitySet;
 use net::adapter::net::cortex::{
     RequestStream, RpcClientStreamingHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
     RpcStreamingContext,
@@ -76,6 +77,42 @@ async fn handshake_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
         .expect("accept failed");
     a.start();
     b.start();
+
+    // Exchange SIGNED capability announcements so each side TOFU-pins the
+    // other's entity id (`peer_entity_id`). A Noise session authenticates the
+    // transport, but the origin_hash <-> node_id binding is only learned from a
+    // signed announcement — and the Gate-3 upload-grant classifier
+    // (`classify_request_grant_route`) reads exactly that pin: an unpinned
+    // caller classifies as `RelayedOrUntrusted`, so a flow-controlled REQUEST is
+    // dropped before the fold and the caller just hangs until its deadline.
+    // Production peers always announce; this harness did not, which made every
+    // `request_window_initial` call unservable.
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("a announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("b announce");
+    assert!(
+        wait_until(
+            || a.peer_entity_id(b_id).is_some() && b.peer_entity_id(a_id).is_some(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "both peers must TOFU-pin each other before a flow-controlled call",
+    );
+}
+
+/// Poll `cond` until true or `timeout` elapses.
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 // ============================================================================
@@ -361,7 +398,8 @@ async fn client_streaming_handler_application_error_round_trips() {
 /// first two sends consume both initial credits; the third send
 /// must block (no auto-grants can fire until the server's first
 /// `next().await`). After the pre-sleep, the server drains
-/// quickly, grants flow back, and the third send unblocks.
+/// quickly, grants flow back, and THE SAME blocked send future
+/// completes — the REQUEST_GRANT round trip, not just the block.
 #[tokio::test]
 async fn client_streaming_window_throttles_caller_send() {
     let server = build_node().await;
@@ -395,40 +433,42 @@ async fn client_streaming_window_throttles_caller_send() {
     call.send(Bytes::from_static(b"a")).await.expect("send a");
     call.send(Bytes::from_static(b"b")).await.expect("send b");
 
-    // Third send must block on credit. The server is still
-    // pre-sleeping (500 ms), so no auto-grants have fired yet.
-    // A 100ms timeout proves the block. Drop the future after
-    // timing out so the credit isn't consumed — we'll redo the
-    // send after the pre-sleep completes.
+    // Third send must block on credit: the server is still pre-sleeping
+    // (500 ms), so it has consumed nothing and emitted no auto-grant.
+    //
+    // PIN the future and re-poll it rather than dropping it. Dropping after
+    // the first timeout proves only that credit is ENFORCED — a server that
+    // never emitted a single grant would pass that assertion just as happily
+    // (verified: with `add_request_grant_credits` neutered, the drop-based
+    // form of this test still passed). Holding the same future and driving it
+    // to completion is what actually pins the REQUEST_GRANT round trip.
     {
         let third = call.send(Bytes::from_static(b"c"));
-        let timed = tokio::time::timeout(Duration::from_millis(100), third).await;
+        tokio::pin!(third);
         assert!(
-            timed.is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut third)
+                .await
+                .is_err(),
             "third send must block on credit while server is still pre-sleeping"
         );
+        tokio::time::timeout(Duration::from_secs(5), &mut third)
+            .await
+            .expect("a REQUEST_GRANT must unblock the blocked send once the server drains")
+            .expect("send c");
     }
 
-    // Wait for the server's pre-sleep to end + the first auto-
-    // grant to land, then complete the call. After this the
-    // semaphore should have refills available and finish should
-    // proceed.
     let _reply = tokio::time::timeout(Duration::from_secs(5), call.finish())
         .await
         .expect("finish must complete")
         .expect("finish ok");
 
-    // Server saw the initial REQUEST body + the two user sends
-    // before pre-sleep ended. After the pre-sleep, the (suppressed
-    // by Drop) third send didn't fly to the wire, but the
-    // finish() emits a terminator (empty body + FLAG_END,
-    // suppressed by the fold's terminator-semantics rule). Total
-    // stream items the handler sees = 3 (initial body "a", chunk
-    // "b", and the finish-terminator doesn't yield).
-    let final_count = consumed.load(Ordering::SeqCst);
-    assert!(
-        final_count >= 2,
-        "server must observe at least 2 chunks (the two pre-block sends); got {final_count}"
+    // All three user sends reached the handler: "a" as the initial REQUEST
+    // body, "b" from the second credit, and "c" once a grant replenished it.
+    // finish()'s terminator (empty body + FLAG_END) yields no stream item.
+    assert_eq!(
+        consumed.load(Ordering::SeqCst),
+        3,
+        "handler must observe all three uploaded chunks",
     );
 }
 

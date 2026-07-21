@@ -56,13 +56,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    classify_streaming_chunk, encode_request_grant, EventMeta, RequestStream,
+    classify_streaming_chunk, encode_request_grant, encode_rpc_route, EventMeta, RequestStream,
     RpcAsyncResponseEmitter, RpcClientFold, RpcClientPending, RpcClientStreamingHandler,
     RpcDuplexFold, RpcDuplexHandler, RpcHandlerError, RpcRequestChunkPayload, RpcRequestPayload,
     RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
     RpcStreamingRequestFold, StreamingChunkKind, DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK,
     DISPATCH_RPC_RESPONSE, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
-    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
+    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, RPC_ROUTE_V1_SIZE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -180,8 +180,12 @@ impl RpcDuplexHandler for DuplexEchoHandler {
 // =====================================================================
 
 fn make_event(meta: EventMeta, payload_tail: &[u8]) -> RedexEvent {
-    let mut buf = Vec::with_capacity(EVENT_META_SIZE + payload_tail.len());
+    let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + payload_tail.len());
     buf.extend_from_slice(&meta.to_bytes());
+    // OA2-E0.2: RpcRouteV1 canonical discriminator placeholder — this
+    // harness feeds the folds directly (no mesh ingress select), and
+    // the folds skip these 8 bytes to reach the payload.
+    encode_rpc_route(&mut buf, 0);
     buf.extend_from_slice(payload_tail);
     RedexEvent {
         entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -238,7 +242,7 @@ impl ClientStreamLoopback {
     fn new() -> Self {
         let pending = Arc::new(RpcClientPending::new());
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let ev = response_event(origin, call_id, &resp);
             client_fold
                 .lock()
@@ -351,7 +355,7 @@ impl DuplexLoopback {
     fn new() -> Self {
         let pending = Arc::new(RpcClientPending::new());
         let client_fold = Arc::new(Mutex::new(RpcClientFold::new(pending.clone())));
-        let emit: RpcAsyncResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let client_fold = client_fold.clone();
             Box::pin(async move {
                 let ev = response_event(origin, call_id, &resp);
@@ -952,10 +956,10 @@ fn metrics_snapshot_invariants_fixture_is_well_formed() {
         .get("service_metrics_fields")
         .and_then(|v| v.as_array())
         .expect("service_metrics_fields is an array");
-    // The substrate's ServiceMetrics has 19 documented fields
-    // (1 identity + 9 caller-side + 9 server-side). Pin so a
+    // The substrate's ServiceMetrics has 21 documented fields
+    // (1 identity + 9 caller-side + 11 server-side). Pin so a
     // substrate-side field add/remove surfaces here.
-    assert_eq!(fields.len(), 19, "ServiceMetrics has 19 documented fields",);
+    assert_eq!(fields.len(), 21, "ServiceMetrics has 21 documented fields",);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for f in fields {
         let name = f
@@ -1067,7 +1071,7 @@ fn service_metrics_fields_match_fixture() {
     // a field rename surfaces the same way. A field ADDITION
     // surfaces via the
     // metrics_snapshot_invariants_fixture_is_well_formed test's
-    // 19-field count assertion.
+    // 21-field count assertion.
     let svc = ServiceMetrics {
         service: "test_service".to_string(),
         calls_total: 0,
@@ -1088,6 +1092,8 @@ fn service_metrics_fields_match_fixture() {
         streaming_chunks_emitted_total: 0,
         streaming_chunks_dropped_total: 0,
         capability_denied_total: 0,
+        relayed_flow_controlled_rejected_total: 0,
+        packet_origin_mismatch_dropped_total: 0,
     };
     // Touch every field — read-side mirror of the literal above
     // so a field rename caught at construction also catches at
@@ -1111,6 +1117,8 @@ fn service_metrics_fields_match_fixture() {
     let _: u64 = svc.streaming_chunks_emitted_total;
     let _: u64 = svc.streaming_chunks_dropped_total;
     let _: u64 = svc.capability_denied_total;
+    let _: u64 = svc.relayed_flow_controlled_rejected_total;
+    let _: u64 = svc.packet_origin_mismatch_dropped_total;
 
     // Sanity: the fixture lists the same field names.
     let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");

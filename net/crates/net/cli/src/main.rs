@@ -29,6 +29,7 @@ mod error;
 mod output;
 mod parsers;
 mod prelude;
+mod secret;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -79,9 +80,16 @@ struct Cli {
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Disable ANSI colour in table / text output. Follows
-    /// `$NO_COLOR` when not specified.
-    #[arg(long, global = true, env = "NO_COLOR")]
+    /// Disable ANSI colour in table / text output. Also honours `$NO_COLOR`
+    /// (see [`no_color_from_env`]).
+    ///
+    /// Deliberately NOT `env = "NO_COLOR"`. On a `bool` field clap parses the
+    /// VARIABLE'S VALUE as a bool literal, so the near-universal `NO_COLOR=1`
+    /// spelling made EVERY subcommand exit 2 with
+    /// `error: invalid value '1' for '--no-color'` before the CLI did any work
+    /// at all — `net org keygen`, `net identity generate`, all of them. The
+    /// env var is resolved by hand in `main` instead, to the actual convention.
+    #[arg(long, global = true)]
     no_color: bool,
 
     /// Global per-call timeout. Subcommand-specific timeouts
@@ -133,6 +141,13 @@ enum Command {
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
+    /// Organization root authority authoring (keygen / issue-cert
+    /// / issue-floors) — OA-1.
+    #[command(subcommand)]
+    Org(commands::org::OrgCommand),
+    /// Node ownership provisioning (`adopt`) — OA-1.
+    #[command(subcommand)]
+    Node(commands::node::NodeCommand),
     /// Hierarchical subnet inspection (`show|ls|tree`).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
@@ -197,9 +212,20 @@ enum DaemonCommand {
     Ls(commands::daemon::LsArgs),
 }
 
+/// `$NO_COLOR` per <https://no-color.org>: colour is disabled when the variable
+/// is PRESENT and non-empty, *whatever* the value. `NO_COLOR=1`, `NO_COLOR=x`
+/// and `NO_COLOR=false` all disable it; only absent or empty leaves it on.
+///
+/// That "whatever the value" clause is the whole reason this is hand-rolled
+/// rather than `env = "NO_COLOR"` on the clap field — see [`Cli::no_color`].
+fn no_color_from_env() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.no_color |= no_color_from_env();
     install_tracing(cli.verbose, cli.quiet);
 
     match dispatch(cli).await {
@@ -239,6 +265,8 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
+        Command::Org(cmd) => commands::org::run(cmd, output).await,
+        Command::Node(cmd) => commands::node::run(cmd, output).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
         Command::Channel(cmd) => commands::channel::run(cmd, output, config_path, profile).await,

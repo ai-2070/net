@@ -573,16 +573,21 @@ async fn run_restore(
             Ok(mut iter) => match iter.next_entry().await {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
+                // §17 — deliberately NO `--force` advice here. `--force` does
+                // not "override" an inspection failure, it SKIPS the emptiness
+                // check and overwrites whatever is there. Steering the operator
+                // toward it on the one path where we cannot see what we are
+                // about to replace is exactly backwards.
                 Err(e) => {
                     return Err(generic(format!(
-                        "failed to inspect target store {}: {e}; pass --force to override",
+                        "failed to inspect target store {}: {e}",
                         dest.display()
                     )));
                 }
             },
             Err(e) => {
                 return Err(generic(format!(
-                    "failed to open target store {} for inspection: {e}; pass --force to override",
+                    "failed to open target store {} for inspection: {e}",
                     dest.display()
                 )));
             }
@@ -832,7 +837,7 @@ async fn run_snapshot(
             Ok(false) => {}
             Err(e) => {
                 return Err(generic(format!(
-                    "failed to stat {}: {e}; pass --force to override",
+                    "failed to stat {}: {e}",
                     args.out.display()
                 )));
             }

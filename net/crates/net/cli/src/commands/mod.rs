@@ -27,6 +27,8 @@ pub mod logs;
 pub mod man;
 pub mod mcp;
 pub mod netdb;
+pub mod node;
+pub mod org;
 pub mod peer;
 pub mod port;
 pub mod rpc;

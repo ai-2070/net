@@ -327,8 +327,9 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
     };
     // Routed event-plane packets carry the builder-default channel
     // hash 0 — the test-only intake registers there (no sensing wire
-    // id exists yet; SI-1 commits 0x0C02).
-    assert!(node_r.register_rpc_inbound(0, dispatcher).is_none());
+    // id exists yet; SI-1 commits 0x0C02). OA2-E0.1: vacant-only
+    // register returns Some(id) on success.
+    assert!(node_r.register_rpc_inbound(0, dispatcher).is_some());
 
     node_a.start();
     node_x.start();

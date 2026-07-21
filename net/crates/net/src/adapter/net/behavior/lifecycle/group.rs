@@ -754,6 +754,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+                None,
+                0,
             )
             .expect("apply legacy announcement in fixture");
         }

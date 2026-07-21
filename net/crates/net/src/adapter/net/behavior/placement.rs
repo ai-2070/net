@@ -1589,6 +1589,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(*node_id, eid.clone(), 1, caps.clone()),
+                None,
+                0,
             )
             .expect("apply legacy announcement in fixture");
         }
@@ -2318,7 +2320,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -2527,7 +2529,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -2705,7 +2707,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -3191,7 +3193,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -3221,7 +3223,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -3252,7 +3254,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };
@@ -3282,7 +3284,7 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad)
+            capability_bridge::apply_legacy_announcement(&f, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
             f
         };

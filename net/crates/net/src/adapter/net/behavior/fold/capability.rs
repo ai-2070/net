@@ -126,6 +126,73 @@ pub struct CapabilityMembership {
     /// `metadata_equals` consult this map after `synthesize_capability_set`
     /// hydrates the synthesized set from the fold.
     pub metadata: BTreeMap<String, String>,
+    /// OA-1 ownership projection — the publisher's verified owner,
+    /// populated ONLY when BOTH the enclosing announcement
+    /// signature AND the embedded `owner_cert` passed ingest
+    /// verification (announcement signature, cert signature,
+    /// window, `member == entity_id` binding, revocation floors).
+    /// `None` for unowned publishers, for unsigned announcements
+    /// (a valid replayed cert must not lend ownership to an
+    /// unauthenticated capability statement — review-8 §1), and
+    /// for announcements whose cert failed verification (the cert
+    /// is dropped; the entry is kept).
+    ///
+    /// Unlike `allowed_*` / tag-derived axes this is not
+    /// self-declared — it is proven belonging. It is also NOT
+    /// execution authority: `may_execute` never consults it
+    /// (`ORG_CAPABILITY_AUTH_PLAN.md`, authority-dark OA-1).
+    ///
+    /// `#[serde(skip)]` is load-bearing twice over: (1) the fold
+    /// payload rides `SUBPROTOCOL_FOLD` as positional postcard, so
+    /// a serialized field would break every mixed-fleet fold frame
+    /// at upgrade time; (2) a wire-carried owner would be a
+    /// SELF-DECLARED ownership claim — the projection must only
+    /// ever be derived on the receiving node from a cert it
+    /// verified itself, and fold state (including snapshots) is
+    /// never admission evidence. Decode always yields `None`.
+    #[serde(skip)]
+    pub owner: Option<VerifiedOwner>,
+}
+
+/// An ingest-verified ownership projection: which org vouched for
+/// the publisher and at which certificate generation. The
+/// generation is retained so a rising revocation floor can retract
+/// exactly the projections that fell below it — no re-announcement
+/// required, no still-valid (higher-generation) projection
+/// over-cleared (review-8 §9).
+///
+/// Construction is `pub(crate)` and the fields are private
+/// (review-9): the verification bridge
+/// (`capability_bridge::verify_announced_owner_cert`) is the only
+/// legitimate producer, so a caller outside this crate cannot
+/// synthesize an unverified "verified" projection and feed it
+/// through `translate_announcement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedOwner {
+    /// The organization whose certificate verified at ingest.
+    org: super::super::org::OrgId,
+    /// The verified certificate's revocation generation.
+    generation: u32,
+}
+
+impl VerifiedOwner {
+    /// In-crate constructor — the verification bridge is the only
+    /// legitimate producer; everything else consumes.
+    pub(crate) fn new(org: super::super::org::OrgId, generation: u32) -> Self {
+        Self { org, generation }
+    }
+
+    /// The vouching organization.
+    #[inline]
+    pub fn org(&self) -> super::super::org::OrgId {
+        self.org
+    }
+
+    /// The verified certificate's revocation generation.
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -964,6 +1031,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
+                owner: None,
             },
         )
         .expect("sign succeeds")
@@ -1176,6 +1244,7 @@ mod tests {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
+            owner: None,
         };
         assert!(
             <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &base.clone()),
@@ -1264,6 +1333,7 @@ mod tests {
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
                     metadata: BTreeMap::new(),
+                    owner: None,
                 },
             )
             .expect("sign succeeds")
@@ -1935,6 +2005,7 @@ mod tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: BTreeMap::new(),
+                owner: None,
             },
         )
         .unwrap();

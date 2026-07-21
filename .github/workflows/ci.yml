@@ -91,6 +91,57 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Every OTHER test surface in this workflow is auto-discovered
+      # (`cargo test -p <crate>` / bare `pytest` / `go test ./...`), so a
+      # new test file there is picked up for free. This job is the sole
+      # exception: it pins `--test <name>` explicitly, per feature group,
+      # to keep the crate from recompiling once per test binary. The cost
+      # of that is a silent failure mode — a new `tests/*.rs` runs in NO
+      # job until someone remembers to edit this file, and nothing
+      # complains. `unit-tests` is `--lib` (never touches `tests/`) and
+      # the Coverage workflow, which does auto-discover, only fires on
+      # master + PRs and is pinned informational — so on a feature branch
+      # an unpinned test is gated by nothing at all.
+      #
+      # This guard closes that. Any new `tests/*.rs` must either appear in
+      # a `--test` flag below or be added to UNPINNED_OK with a reason.
+      - name: Guard — every tests/*.rs is pinned to a step
+        run: |
+          # Tests that intentionally run nowhere in THIS workflow.
+          UNPINNED_OK="
+          integration_redis      # required-features=[redis]; needs a service container
+          integration_jetstream  # required-features=[jetstream]; needs a service container
+          natsim                 # runs in natsim.yml (privileged netns harness, --ignored)
+          "
+          # Scrape the real pins only: drop YAML comment lines and this
+          # step's own `echo` prose, both of which mention the flag by name
+          # and would otherwise be scraped as bogus test targets.
+          sed '/^[[:space:]]*#/d' "$GITHUB_WORKSPACE/.github/workflows/ci.yml" \
+            | grep -v 'echo ' \
+            | grep -oE -- '--test [a-z0-9_]+' \
+            | sed 's/--test //' | sort -u > /tmp/pinned.txt
+          printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
+          ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present.txt
+          missing=$(comm -23 /tmp/present.txt <(sort -u /tmp/pinned.txt /tmp/allowed.txt))
+          if [ -n "$missing" ]; then
+            echo "::error::Integration test(s) present in tests/ but pinned to no CI step:"
+            printf '  %s\n' $missing
+            echo ""
+            echo "Add each to the matching feature group below (check the file's"
+            echo "#![cfg(...)] gate — a test listed under a feature set that does not"
+            echo "satisfy it compiles to a silent 0-test binary), or to UNPINNED_OK."
+            exit 1
+          fi
+          # The reverse drift: a --test flag naming a file that no longer exists
+          # fails the run with a confusing cargo error, so name it here instead.
+          stale=$(comm -13 /tmp/present.txt /tmp/pinned.txt)
+          if [ -n "$stale" ]; then
+            echo "::error::CI pins --test target(s) with no matching tests/*.rs:"
+            printf '  %s\n' $stale
+            exit 1
+          fi
+          echo "OK: $(wc -l < /tmp/present.txt) test files, all accounted for."
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -134,7 +185,7 @@ jobs:
       - name: Net mesh, capability, migration, nRPC dispatch
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features net
+          cargo nextest run --no-fail-fast --features "net fixtures"
           --test integration_net
           --test three_node_integration
           --test channel_auth
@@ -153,6 +204,8 @@ jobs:
           --test capability_auth_conformance
           --test capability_schema_doc_guard
           --test capability_aggregation_e2e
+          --test org_ownership
+          --test org_admission_wire
           --test gang_claim_node
           --test chain_discovery
           --test cross_lang_capability_fixtures
@@ -214,7 +267,7 @@ jobs:
       - name: CortEX + nRPC + AI Tools
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool"
+          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test integration_cortex_adapter
           --test integration_cortex_tasks
           --test integration_cortex_memories
@@ -222,6 +275,7 @@ jobs:
           --test integration_mesh_cancel
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
+          --test integration_nrpc_protected
           --test integration_nrpc_streaming
           --test integration_nrpc_client_streaming
           --test integration_nrpc_duplex
@@ -230,7 +284,15 @@ jobs:
           --test integration_nrpc_cross_lang
           --test integration_nrpc_cross_lang_streaming
           --test integration_tool_announce
+          --test capability_exposure_revocation
           --test nrpc_inbound_dispatcher
+          --test nrpc_call_hijack
+          --test nrpc_registration_order
+          --test nrpc_response_routing
+          --test nrpc_route_discriminator
+          --test nrpc_service_equality
+          --test nrpc_streaming_gate
+          --test org_admission_gate
           --test queue_group_dispatch
           --test aggregator_fold_query
           --test aggregator_registry_rpc
@@ -251,7 +313,7 @@ jobs:
       - name: Sensing
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool"
+          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test sensing_dispatch
           --test sensing_failure_plane
           --test sensing_fallback
@@ -989,6 +1051,30 @@ jobs:
       - name: Run clippy (production code, strict)
         run: cargo clippy --all-features --lib --bins -- -D warnings
 
+      # `--all-features` above lints exactly ONE configuration, and it is not
+      # one anybody ships: it force-enables every opt-in feature, including
+      # `fixtures` (the test/bench seam). That made CI structurally blind to
+      # breakage in the configurations people actually build — `cargo build`,
+      # `--features net`, `--features cortex` — none of which enable
+      # `fixtures`.
+      #
+      # This is not hypothetical. Gating `apply_legacy_announcement` behind
+      # `#[cfg(any(test, feature = "fixtures"))]` left the two imports that
+      # type its signature dangling in every non-`fixtures` build. The
+      # `--all-features` job stayed green while `cargo clippy --lib --features
+      # cortex -- -D warnings` failed, and so did the Windows security job
+      # below (which pins `--features net`) — so the platform-specific
+      # security suites it exists to gate silently ran in NO job.
+      #
+      # `--no-default-features` and the default set are the two ends of the
+      # range; between them they catch a cfg that only compiles under a
+      # feature nobody enables by default.
+      - name: Run clippy (default features, strict)
+        run: cargo clippy --lib --bins -- -D warnings
+
+      - name: Run clippy (no default features, strict)
+        run: cargo clippy --no-default-features --lib --bins -- -D warnings
+
       # `--all-targets` adds clippy coverage for tests / benches /
       # examples. Tests are allowed to `.unwrap()` / `.expect()` freely
       # (~5000 sites across the test surface) and rarely contain
@@ -1611,6 +1697,105 @@ jobs:
       - name: Run net-mesh-mcp tests
         if: ${{ !cancelled() }}
         run: cargo test -p net-mesh-mcp --features fixture
+
+  windows-security-tests:
+    # The ONLY job on a Windows runner.
+    #
+    # Every other job here is `ubuntu-latest`, which meant every
+    # `#[cfg(windows)]` assertion in the tree was dead code: it never
+    # compiled, never linked, never ran. That is precisely inverted from where
+    # the risk is — Windows is the platform where the file-permission model is
+    # WEAKEST for this crate. There is no 0600, so `owner-audience.key`
+    # confidentiality rests entirely on the authority directory's DACL and on
+    # a stderr warning, and both of those were untested in CI.
+    #
+    # Concretely, this job is what gates:
+    #
+    #   * `validate_dacl_view` — the owner check (a foreign owner holds
+    #     implicit WRITE_DAC and can re-open the boundary after validation
+    #     passes) and the non-simple-ACE fail-closed rule (object / callback
+    #     ALLOW ACEs are real grants and were silently skipped);
+    #   * `read_object_security` — the binary GetFileSecurityW walk;
+    #   * `write_atomic`'s protected-DACL provisioning and the
+    #     `<non-simple-ace>` sentinel contract;
+    #   * `cli/tests/org_grant.rs`'s two `#[cfg(windows)]` witnesses, which
+    #     are the ONLY coverage of `warn_secret_permissions` — the entire
+    #     Windows substitute for the 0600 guarantee.
+    #
+    # Scoped to the org/authority surface rather than the whole matrix: the
+    # goal is to gate the platform-specific SECURITY code, not to double the
+    # CI bill re-running cross-platform logic ubuntu already covers.
+    name: Windows security tests
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-winsec-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # nextest here for the same reasons the ubuntu jobs use it, plus two
+      # that are specific to this job (see `.config/nextest.toml`):
+      #
+      #   * `slow-timeout` / `terminate-after` turn a hung test into a NAMED
+      #     failure. Under plain `cargo test` a hang consumed this job's whole
+      #     40-minute budget with no indication of which test stalled — the
+      #     exact failure the nextest config was written to prevent, which
+      #     this job was bypassing by not using nextest.
+      #   * the `retries = 0` override applies to the security suites, so a
+      #     deliberate-race regression cannot be retried into a green run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # The lib units carry the DACL validator witnesses (org_authority) plus
+      # the authority/revocation/ingest suites. `--features net` is the
+      # narrowest set that compiles the org modules.
+      #
+      # Two hazards, both learned the hard way:
+      #
+      #  1. `adapter::net::behavior::org` is a PREFIX, and not every
+      #     security-relevant module lives under it. `org_admission_gate` sits
+      #     at `adapter::net::org_admission_gate` — one level up — and was
+      #     silently excluded. Both surfaces are named explicitly below.
+      #
+      #  2. `cargo test -- <filter>` exits **0** when the filter matches
+      #     NOTHING, so a module rename turned this job into a green no-op —
+      #     the identical silent-coverage failure that the "every tests/*.rs is
+      #     pinned to a step" guard in the integration job exists to prevent.
+      #     That guard was never applied to its own neighbour. `--no-tests=fail`
+      #     closes it natively: an empty filterset is an error, not a pass.
+      - name: Org + authority unit tests
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
+
+      # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
+      # case-variant no-clobber guard (NTFS is case-insensitive, so a
+      # case-variant `--out` names the SAME file as the org key — the exact
+      # aliasing the lexical guard cannot catch).
+      - name: Net CLI tests
+        run: cargo nextest run -p net-cli --no-tests=fail
+
+      # Windows-only production paths must also LINT here: the DACL reader is
+      # `#[cfg(windows)]`, so the ubuntu clippy job never sees it.
+      - name: Clippy (production, strict)
+        run: cargo clippy --features net --lib --bins -- -D warnings
 
   fmt:
     name: Format

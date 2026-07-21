@@ -63,8 +63,13 @@ pub mod dataforts;
 pub mod mesh_rpc;
 #[cfg(feature = "cortex")]
 pub mod mesh_rpc_metrics;
+// OA2-E1 §2.4a admission gate glue — bridges the cortex RPC payload
+// (request digest) and the behavior-layer org admission engine.
+// Cortex-gated for the same reason as `mesh_rpc`.
 #[cfg(feature = "netdb")]
 pub mod netdb;
+#[cfg(feature = "cortex")]
+pub mod org_admission_gate;
 mod pool;
 mod protocol;
 mod proxy;

@@ -532,7 +532,7 @@ mod tests {
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for (node_id, caps) in nodes {
             let ad = CapabilityAnnouncement::new(node_id, eid.clone(), 1, caps);
-            capability_bridge::apply_legacy_announcement(&fold, ad)
+            capability_bridge::apply_legacy_announcement(&fold, ad, None, 0)
                 .expect("apply legacy announcement in fixture");
         }
         fold

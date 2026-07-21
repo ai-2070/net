@@ -53,6 +53,7 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::{
     RouteWithdrawal, WithdrawalSeqGate, SUBPROTOCOL_CAPABILITY_ANN, SUBPROTOCOL_ROUTE_WITHDRAW,
+    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
 };
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
@@ -610,6 +611,26 @@ enum PunchIntroduceOutcome {
     Rejected(super::traversal::rendezvous::RejectReason),
 }
 
+/// Typed outcome of [`MeshNode::try_publish_to_peer`] — distinguishes a
+/// *pre-send* missing session (nothing was transmitted, so a caller may
+/// safely fall back to another route) from an at/after-send failure
+/// (bytes may already be committed to the wire; retrying would duplicate
+/// the frame) and from success. The nRPC response router relies on this
+/// to route around a stale direct hint atomically, without a
+/// `has_peer_session`-then-`publish` TOCTOU (R2-6).
+pub(super) enum PeerPublishOutcome {
+    /// The frame was handed to the socket for the target peer.
+    Sent,
+    /// No session existed for the target peer at the instant we looked —
+    /// nothing was built or transmitted. Falling back to another route
+    /// cannot duplicate the frame.
+    NoSession,
+    /// A failure at or after the point where the frame could have hit the
+    /// wire (backpressure, closed/partitioned stream, socket error). The
+    /// caller MUST NOT retry on another route.
+    SendFailed(AdapterError),
+}
+
 /// Rendezvous abuse budgets (`NAT_TRAVERSAL_V2_PLAN.md` Stage 2,
 /// closing review Finding 5). Three independent limiters:
 ///
@@ -945,7 +966,48 @@ impl RetainedChain {
 ///
 /// `Clone`: every field is an `Arc` handle or a small config copy,
 /// so a clone is ~a round of refcount bumps. The SI-6.1 trailing-
+/// The per-`u16`-wire-bucket list of registered nRPC inbound
+/// dispatchers: `(canonical ChannelHash, registration_id,
+/// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
+/// Shared by `DispatchCtx` (read on the hot path) and `MeshNode`
+/// (registration).
+type RpcInboundDispatcherMap = DashMap<
+    u16,
+    Vec<(
+        ChannelHash,
+        u64,
+        crate::adapter::net::cortex::RpcInboundDispatcher,
+    )>,
+>;
+
 /// edge reconciliation task captures a clone — a boundary sleeper
+/// Whether a scoped ingest reached a DECISION or was refused by a condition
+/// that can clear on its own (§24).
+///
+/// The relay dedup gate is primed BEFORE the local ingest runs — it has to be,
+/// because forwarding must not wait on an audience open the relay may not even
+/// be able to perform. But that means a fail-closed refusal (poisoned
+/// revocation view, publication race, store at capacity) consumed the
+/// `(provider, grant, handle, generation)` identity for the full 600 s
+/// retention with nothing stored, and every re-delivery of that same generation
+/// was silently dropped as a duplicate.
+///
+/// It self-healed only because the next periodic emission bumps the generation
+/// — incidental recovery, not designed, and it disappears entirely if
+/// generation ever becomes change-triggered rather than emission-triggered.
+/// Reporting the disposition lets the caller release the identity so the
+/// retryable cases are actually retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopedIngestDisposition {
+    /// Stored, updated, stale, or refused for a reason re-delivery would reach
+    /// again (wrong audience, expired, no authority, no matching credential).
+    /// The dedup identity is RETAINED.
+    Final,
+    /// Refused by a transient condition. The dedup identity is RELEASED so the
+    /// same generation can be reconsidered.
+    Retryable,
+}
+
 /// outlives the dispatch call that scheduled it, so it cannot
 /// borrow.
 #[derive(Clone)]
@@ -973,15 +1035,10 @@ struct DispatchCtx {
     // the canonical `u32` hash is what each dispatcher is keyed on.
     // The `Vec` cost is paid only once per wire-bucket hit, and at
     // typical sizing there is exactly one entry per bucket.
-    rpc_inbound_dispatchers: Arc<
-        DashMap<
-            u16,
-            Vec<(
-                ChannelHash,
-                crate::adapter::net::cortex::RpcInboundDispatcher,
-            )>,
-        >,
-    >,
+    // OA2-E0.1: entries carry a monotonic registration id — a stale
+    // `ServeHandle` teardown removes ONLY its own id, so it cannot
+    // evict a newer registration for the same canonical channel.
+    rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -991,6 +1048,30 @@ struct DispatchCtx {
     /// before user migration traffic lands, which is otherwise
     /// awkward because a started `Mesh` is shared by `Arc`.
     migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
+    /// OA-1: node-local persisted org revocation maxima, installed
+    /// by the authority-adoption wiring
+    /// ([`MeshNode::install_org_revocation_store`]). Absent on
+    /// un-adopted nodes — announcement owner certs then verify
+    /// against implicit floor 0. Same `ArcSwapOption` install
+    /// surface as `migration_handler`.
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// OA3-5: the installed node authority — its owner audience credential
+    /// (discovery_key + handle) opens inbound owner-scoped announcement
+    /// envelopes. Absent ⇒ this node cannot ingest scoped discovery and drops
+    /// every `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` packet.
+    node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA3-5: the private-discovery store verified scoped announcements land in.
+    /// See the matching field doc on `MeshNode`.
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+    /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
+    /// propagation. See the matching field doc on `MeshNode`.
+    scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
+    /// OA3-4b2: the consumer grant-audience registry — the inbound nonzero-grant
+    /// ingest selector looks a record up here by `grant_id`. See the matching
+    /// field doc on `MeshNode`.
+    consumer_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
     /// Optional replication inbound router. See the matching
     /// field doc on `MeshNode`.
     #[cfg(feature = "redex")]
@@ -1114,6 +1195,17 @@ struct DispatchCtx {
     /// fleet root.
     #[cfg(feature = "redex")]
     sensing_local_entity_root: sensing::AudienceScopeCommitment,
+    /// §10: the local RPC service registry, so the sensing candidate
+    /// snapshot can refuse to DECLARE a capability this node serves
+    /// under a private visibility.
+    ///
+    /// The self-fold entry deliberately carries every registered service
+    /// regardless of visibility (`has_local_capability` needs that), and
+    /// the sensing audience gate keys on OWNER ROOT rather than grant
+    /// scope — so without this a same-root peer holding no grant could
+    /// confirm a grant-private service exists by probing for it.
+    #[cfg(feature = "redex")]
+    rpc_local_services: Arc<LocalServiceRegistry>,
     /// SI-3: the origin-emission scheduler slot. See the matching
     /// field on `MeshNode`; the dispatch arm feeds it when a
     /// `ProviderRegistration` targets this node.
@@ -1427,6 +1519,14 @@ pub struct MeshNodeConfig {
     /// values waste CPU; high values keep stale peers queryable past
     /// their TTL.
     pub capability_gc_interval: Duration,
+    /// Replay-guard capacity envelope (§5) — global cap, owner reserve,
+    /// per-external-org quota, per-caller quota. See
+    /// [`MeshNodeConfig::with_admission_replay_config`].
+    pub admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig,
+    /// §6 — per-peer throttle on the signature work a FAILING caller can
+    /// compel. Safe defaults, not universal limits; see
+    /// [`MeshNodeConfig::with_admission_rate_limit`].
+    pub admission_rate_limit: super::behavior::org_admission_replay::AdmissionRateLimitConfig,
     /// How often this node re-announces its own capabilities to keep its
     /// entry alive. Capability entries carry a TTL (default 300 s) and the
     /// fold sweeper evicts them on expiry, so without a periodic
@@ -1608,6 +1708,28 @@ pub struct MeshNodeConfig {
     /// the 0x0C02 dispatch arm; default-rooted nodes keep the strict
     /// entity-root rule.
     pub sensing_owner_root: Option<sensing::AudienceScopeCommitment>,
+    /// OA-1 (review-8 §2): the authority directory holding this
+    /// node's adopted ownership files (`owner-membership.json`,
+    /// `owner-audience.key`, `revocation-state.json` — provisioned
+    /// by `net node adopt`).
+    ///
+    /// `None` (the default): legacy un-adopted startup — the node
+    /// runs with no owner projection and no floors, exactly as
+    /// pre-OA-1. `Some(dir)`: [`MeshNode::new`] opens and
+    /// self-verifies the authority BEFORE any networking starts
+    /// and installs it as the one production authority object;
+    /// missing, corrupt, or floored authority state REFUSES
+    /// construction — configured authority never silently degrades
+    /// to an un-adopted node.
+    pub node_authority_dir: Option<std::path::PathBuf>,
+    /// OA-1: attach the installed authority's owner certificate to
+    /// this node's own capability announcements from startup.
+    /// `false` (the default) keeps announcements byte-identical to
+    /// pre-OA-1; flipping it is the plan's explicit Migration
+    /// step 3 (`upgrade-all-then-emit`) and requires
+    /// [`Self::node_authority_dir`] — construction refuses the
+    /// flag without a configured authority.
+    pub emit_owner_cert: bool,
     /// SI-3: the §4.6 origin incarnation this node's sensing plane
     /// signs attestations under. The caller owns persistence:
     /// derive the value with [`sensing::next_incarnation`] over a
@@ -1742,6 +1864,8 @@ impl MeshNodeConfig {
             psk,
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
+            admission_rate_limit:
+                super::behavior::org_admission_replay::AdmissionRateLimitConfig::default(),
             num_shards: 4,
             packet_pool_size: 64,
             default_reliable: false,
@@ -1758,6 +1882,8 @@ impl MeshNodeConfig {
             membership_ack_timeout: Duration::from_secs(5),
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
+            admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
+            ),
             capability_reannounce_interval: Duration::from_secs(150),
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
@@ -1773,6 +1899,8 @@ impl MeshNodeConfig {
             attestation_cadence_floor: sensing::DEFAULT_ATTESTATION_CADENCE_FLOOR,
             continuity_factor: 3,
             sensing_owner_root: None,
+            node_authority_dir: None,
+            emit_owner_cert: false,
             sensing_incarnation: None,
             token_sweep_interval: Duration::from_secs(30),
             max_auth_failures_per_window: 16,
@@ -1861,6 +1989,42 @@ impl MeshNodeConfig {
     /// trace is emitted).
     pub fn with_require_signed_capabilities(mut self, require: bool) -> Self {
         self.require_signed_capabilities = require;
+        self
+    }
+
+    /// Replay-guard capacity envelope (§5).
+    ///
+    /// The defaults are SAFE defaults, not universal workload limits: they
+    /// partition a fixed 65 536-entry budget by trust domain so no external
+    /// coalition can deny the provider's own org. An operator running
+    /// high-rate protected RPC can raise the envelope knowingly — the point of
+    /// the partition is that the failure mode is attributable and bounded, not
+    /// that the numbers suit every deployment.
+    ///
+    /// Validated at node construction; an inconsistent envelope (a reserve at
+    /// or above the total, a per-org quota that cannot fit the external pool)
+    /// is refused loudly rather than clamped.
+    /// §6 — the per-peer failed-admission envelope.
+    ///
+    /// Charged on FAILURE only, so an honest caller whose admissions succeed
+    /// is unaffected however fast it calls. Raise it knowingly if clients in
+    /// your deployment legitimately fail admission in bursts.
+    pub fn with_admission_rate_limit(
+        mut self,
+        config: super::behavior::org_admission_replay::AdmissionRateLimitConfig,
+    ) -> Self {
+        self.admission_rate_limit = config;
+        self
+    }
+
+    /// Replay-guard capacity envelope (§5) — global cap, owner reserve,
+    /// per-external-org quota, per-caller quota. Safe defaults, not universal
+    /// workload limits; validated at node construction.
+    pub fn with_admission_replay_config(
+        mut self,
+        config: super::behavior::org_admission_replay::AdmissionReplayConfig,
+    ) -> Self {
+        self.admission_replay = config;
         self
     }
 
@@ -1955,6 +2119,23 @@ impl MeshNodeConfig {
     /// [`Self::sensing_owner_root`].
     pub fn with_sensing_owner_root(mut self, root: sensing::AudienceScopeCommitment) -> Self {
         self.sensing_owner_root = Some(root);
+        self
+    }
+
+    /// OA-1: configure the adopted authority directory — see
+    /// [`Self::node_authority_dir`]. Startup opens and
+    /// self-verifies it before networking; missing/corrupt/floored
+    /// state refuses construction.
+    pub fn with_node_authority_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.node_authority_dir = Some(dir.into());
+        self
+    }
+
+    /// OA-1: enable owner-cert emission from startup — see
+    /// [`Self::emit_owner_cert`] (Migration step 3; requires
+    /// [`Self::with_node_authority_dir`]).
+    pub fn with_owner_cert_emission(mut self, emit: bool) -> Self {
+        self.emit_owner_cert = emit;
         self
     }
 
@@ -2517,7 +2698,118 @@ struct AnnounceGate {
     /// cannot later consume a DIFFERENT deferral's claim and fire
     /// inside a fresh window (RT-1 review Finding 12).
     deferral_generation: u64,
+    /// Monotonic id of the most recent BROADCAST-window claim (Kyra OA3 review,
+    /// Finding 4). A claimant that later discovers its send was refused may only
+    /// roll `last_broadcast_at` back if no one has claimed since — and `Instant`
+    /// equality cannot decide that: two claims can read the SAME `Instant::now()`
+    /// at platform clock resolution (coarse on Windows), so a timestamp match is
+    /// not proof of ownership. Comparing this counter makes "still ours"
+    /// structural rather than clock-resolution-dependent.
+    broadcast_claim_generation: u64,
+    /// The exposure-revocation epoch of the emission most recently BROADCAST
+    /// (Kyra OA3 review, Finding 3). While the live epoch runs ahead of this, a
+    /// revocation has been made locally but not yet superseded on the wire —
+    /// peers are still holding bytes that name a capability to an audience no
+    /// longer entitled to it. An announce in that state is SECURITY-PRIORITY and
+    /// bypasses the rate limit outright: coalescing it into a trailing-edge flush
+    /// leaves the stale exposure standing for the whole window, and on a
+    /// bare-`start` node (no flush task) it would stand until the keep-alive.
+    last_broadcast_exposure_generation: u64,
 }
+
+/// How one pass of [`MeshNode::announce_attempt`] should treat the origin-side
+/// rate limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnnounceMode {
+    /// Ordinary announce: honors the rate limit (coalesce / defer).
+    Routine,
+    /// A corrective re-announce driven by a sender whose own send was refused on
+    /// security grounds (Kyra OA3 review, Finding 3). It MUST bypass coalescing:
+    /// the point is to supersede a revoked exposure now, not at the end of the
+    /// window, and on a bare-`start` node no deferred flush exists at all.
+    SecurityCorrective,
+}
+
+/// What one pass of [`MeshNode::announce_attempt`] actually did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnnounceOutcome {
+    /// The emission was handed to the transport for every connected peer.
+    Sent,
+    /// Rate-limit coalesced or deferred — a pending flush owns the send.
+    Coalesced,
+    /// The send-time seqlock REFUSED the emission (exposure revoked, authority
+    /// rotated, grant snapshot swapped, or stamp churn). Nothing shipped and the
+    /// broadcast claim has been released; the caller owes a corrective pass.
+    RefusedBySecurity,
+}
+
+/// How many corrective passes a security-refused send may drive before giving
+/// up and logging. Each pass rebuilds from the CURRENT baseline, so the state
+/// that caused the refusal is already reflected; more than a couple of rounds
+/// means something is churning pathologically.
+const SECURITY_CORRECTIVE_ATTEMPTS: u8 = 3;
+
+/// A stable snapshot of the AUTHORITATIVE inputs to owner-cert
+/// emission (review-11 P1). Captured directly from live state —
+/// the installed store's identity and publish generation, the
+/// installed authority's identity, and the emission-switch
+/// generation — rather than from a lazily-bumped epoch counter, so
+/// it changes the instant any of those change, not when a
+/// subscriber callback later runs.
+///
+/// The send path uses it as a seqlock: capture stamp → derive the
+/// current certificate + serialize → capture stamp again → emit
+/// only if the stamp held still, else retry. A floor becoming live
+/// bumps the store's publish generation INSIDE `StoreCore::publish`
+/// (under the reload lock), before any notification, so this stamp
+/// closes the publish-before-notify gap the epoch counter left
+/// open. Certificate wall-clock expiry is handled separately (the
+/// send path re-derives the desired cert every time, which checks
+/// temporal validity), since expiry changes no generation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SendStamp {
+    /// `Arc::as_ptr` of the installed revocation store (0 = none).
+    store_ptr: usize,
+    /// The installed store's publish generation (bumped on every
+    /// floor publish, under the reload lock).
+    store_generation: u64,
+    /// `Arc::as_ptr` of the installed node authority (0 = none).
+    authority_ptr: usize,
+    /// Bumped by [`MeshNode::set_owner_cert_emission`] — a toggle
+    /// on the SAME authority/store changes no pointer or
+    /// generation, so it needs its own counter.
+    emission_generation: u64,
+}
+
+/// A [`SendStamp`] plus the exact authority/store `Arc`s it
+/// fingerprints, RETAINED for the send seqlock's lifetime (Kyra
+/// Gate-1 audit — pointer ABA). While this snapshot lives, the
+/// captured `store_ptr` / `authority_ptr` addresses cannot be reused
+/// by a different object, so the second stamp comparison cannot
+/// false-match "unchanged" after a replace/drop/realloc cycle.
+struct SendSecuritySnapshot {
+    stamp: SendStamp,
+    /// Pinned until the stability comparison completes; not read.
+    _authority: Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+    /// Pinned for the same reason.
+    _store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+}
+
+/// The node's slot in the installed revocation store's
+/// raise-subscriber registry — the store it subscribed on, the
+/// removable token (review-9 addendum), and an owner-liveness token
+/// (AV-10). `notify` clones the callback `Arc`s before invoking them
+/// outside the registry lock, so an unsubscribe cannot recall a
+/// callback already snapshotted; the liveness token — invalidated
+/// BEFORE the unsubscribe on teardown — makes such a late callback
+/// inert instead of mutating a fold the node no longer owns.
+/// The node's live raise-subscription guard (R2-2/R2-3). Dropping it
+/// drains any in-flight retraction callback and unsubscribes the node's
+/// callback from the installed store's shared core via a
+/// `Weak<StoreCore>` — so teardown and store replacement retire the
+/// subscription deterministically, without the old `(store, token, alive)`
+/// tuple or a `has_peer_session`-style check.
+type OrgRaiseSubscription = Option<super::behavior::org_revocation::RaiseSubscription>;
 
 /// Signal-carrying wrapper around the `nrpc:` local-service set
 /// (RT-2). `serve_rpc` inserts and `ServeHandle::drop` removes
@@ -2525,50 +2817,601 @@ struct AnnounceGate {
 /// live inside the collection — a call-site bump could be forgotten
 /// by the next registration path (same reasoning as
 /// `Fold::signal_changed` and `ToolMetadataRegistry`).
+///
+/// OA2-E0.2 P1: the tag is GENERATION-OWNED — each entry stores the
+/// owning registration's id (the same monotonic token the dispatcher
+/// slot carries). A stale `ServeHandle` whose registration was
+/// already torn down and replaced holds the OLD id, so its Drop
+/// (`remove_if`) cannot evict the REPLACEMENT's tag by name. Without
+/// this, an old handle preempted between dispatcher-unregister and
+/// tag-removal could delete a live replacement's service projection
+/// — the dispatcher stays registered but discovery/announcements
+/// lose the service.
+/// One registered local service: the owning registration id plus its
+/// announcement visibility. Visibility drives emission projection (OA3-4b1) —
+/// only `Public` services contribute an `nrpc:` tag to the plaintext broadcast;
+/// an `OwnerScoped` service is emitted solely as an encrypted owner-audience
+/// announcement and never rides a plaintext CAP-ANN.
+#[cfg(feature = "cortex")]
+#[derive(Clone, Copy)]
+struct LocalServiceEntry {
+    registration_id: u64,
+    visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+}
+
 #[cfg(feature = "cortex")]
 pub(super) struct LocalServiceRegistry {
-    set: dashmap::DashSet<String>,
+    /// `service name → { owning registration id, visibility }`.
+    map: dashmap::DashMap<String, LocalServiceEntry>,
     change_signal: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Counts only the transitions that REVOKE an exposure an already-built
+    /// emission may still be carrying — see [`Self::revokes_exposure`] and
+    /// [`Self::exposure_revocation_generation`]. Covers the encrypted scoped
+    /// envelopes as well as the plaintext set: an emission holds both.
+    exposure_revocation_signal: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "cortex")]
 impl LocalServiceRegistry {
     fn new(change_signal: Arc<tokio::sync::watch::Sender<u64>>) -> Self {
         Self {
-            set: dashmap::DashSet::new(),
+            map: dashmap::DashMap::new(),
             change_signal,
+            exposure_revocation_signal: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Insert a service name. Bumps the local-caps generation only
-    /// when the name is new — an idempotent re-serve is not a
-    /// capability change and must not wake the announcer.
-    pub(super) fn insert(&self, service: String) -> bool {
-        let inserted = self.set.insert(service);
-        if inserted {
+    /// Bump the exposure-revocation counter (see the field doc).
+    fn mark_exposure_revoked(&self) {
+        self.exposure_revocation_signal
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Does moving `service` from `previous` to `next` visibility REVOKE an
+    /// exposure that an emission built under `previous` may still be carrying?
+    ///
+    /// An emission holds a plaintext set AND encrypted owner/granted envelopes,
+    /// so the question is not "did it leave the public set" but "is any audience
+    /// that the cached bytes still address no longer entitled to this name":
+    ///
+    /// - `Public -> OwnerScoped` / `Public -> GrantedAudience` — the cached
+    ///   PLAINTEXT still names it.
+    /// - `OwnerScoped -> GrantedAudience` — the cached OWNER envelope still names
+    ///   it, but the owner audience is no longer the intended audience.
+    /// - `GrantedAudience -> OwnerScoped` — mirror: the cached GRANTED envelopes
+    ///   still name it to the former grantees.
+    ///
+    /// Widenings are safe and must NOT bump: `OwnerScoped -> Public` and
+    /// `GrantedAudience -> Public` leave cached private bytes revealing strictly
+    /// less than the new public state. A same-visibility re-token changes no
+    /// audience. A newly-present name cannot be carried by an emission built
+    /// before it existed, at any visibility.
+    ///
+    /// Grant-set churn WITHIN `GrantedAudience` is a different axis and stays
+    /// covered by the emission's `provider_grant_snapshot` pointer check.
+    fn revokes_exposure(
+        previous: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+        next: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+    ) -> bool {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        previous != next && !matches!(next, CapabilityVisibility::Public)
+    }
+
+    /// Install `service` owned by `registration_id` with `visibility`. Upserts: a
+    /// replacement (new id for the same name, after the incumbent's dispatcher
+    /// slot was freed) installs its own token over any lingering stale entry.
+    /// Wakes the announcer only when the NAME is newly present or its visibility
+    /// changed — the announced capability set is keyed by name, so re-tokening an
+    /// existing name is not a capability change.
+    ///
+    /// **Ordering (Kyra OA3 review, Finding 2).** The exposure-revocation epoch
+    /// MUST linearize BEFORE the projection mutation becomes externally visible,
+    /// so it is bumped under the SAME shard lock that installs the entry, ahead
+    /// of the install. Bumping after the insert leaves a window where the map
+    /// already reads private but the epoch still reads old — a concurrent sender
+    /// passes its staleness check and ships bytes naming a name that just became
+    /// private. The inverse skew (new epoch, old entry) is fail-safe: a sender
+    /// refuses an emission that is still technically valid, and the next build
+    /// blocks on this same shard lock and therefore observes the new entry.
+    ///
+    /// The announcer wake fires AFTER the lock is released — never under it —
+    /// giving the required `epoch -> mutation -> wake` order. Waking before the
+    /// epoch bump would let the announcer publish a fresh-but-immediately-stale
+    /// emission and then get no second wake.
+    pub(super) fn insert(
+        &self,
+        service: String,
+        registration_id: u64,
+        visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+        let installed = LocalServiceEntry {
+            registration_id,
+            visibility,
+        };
+        let (newly_present, projection_changed) = match self.map.entry(service) {
+            Entry::Occupied(mut occupied) => {
+                let previous = *occupied.get();
+                if Self::revokes_exposure(previous.visibility, visibility) {
+                    self.mark_exposure_revoked();
+                }
+                occupied.insert(installed);
+                (false, previous.visibility != visibility)
+            }
+            Entry::Vacant(vacant) => {
+                // A newly-present name revokes no exposure at any visibility: an
+                // emission built before this insert carries no tag for it.
+                vacant.insert(installed);
+                (true, true)
+            }
+        };
+        // Shard lock released above; wake last.
+        if projection_changed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
-        inserted
+        newly_present
     }
 
-    /// Remove a service name. Bumps only when it was present.
-    pub(super) fn remove(&self, service: &str) -> Option<String> {
-        let removed = self.set.remove(service);
-        if removed.is_some() {
+    /// The current EXPOSURE-REVOCATION generation — bumped only by transitions
+    /// that withdraw a name from an audience an already-built emission may still
+    /// be addressing (see [`Self::revokes_exposure`], [`Self::insert`], and
+    /// [`Self::remove_if`]). Threaded into the published
+    /// [`LocalCapabilityEmission`] so the send path can refuse bytes — plaintext
+    /// OR scoped envelope — whose audience is no longer entitled to them.
+    ///
+    /// Deliberately NOT the announcer's change signal. That signal also fires for
+    /// a benign new registration, and `serve_rpc` / `serve_tool` register several
+    /// services back to back: keying the send check on it made an announce built
+    /// mid-registration unsendable, and because the skipped send had already
+    /// claimed the rate-limit window, the replacement announce was coalesced away
+    /// and the node never published at all.
+    pub(super) fn exposure_revocation_generation(&self) -> u64 {
+        self.exposure_revocation_signal
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test seam: advance both generations exactly as a concurrent
+    /// exposure-revoking transition would, WITHOUT registering a service — so a
+    /// send-path staleness witness can observe the published emission being
+    /// rejected. Only reachable through
+    /// [`MeshNode::test_advance_visibility_generation`].
+    #[doc(hidden)]
+    pub(super) fn bump_for_test(&self) {
+        self.mark_exposure_revoked();
+        self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Remove `service` ONLY when the stored registration id matches
+    /// `registration_id`. A stale handle carrying a superseded id is
+    /// a no-op — the replacement's tag survives.
+    ///
+    /// Retiring a service at ANY visibility revokes the intent to expose it, so
+    /// an emission still advertising it — in plaintext or inside a scoped
+    /// envelope — is stale to whichever audience it addresses. The epoch is
+    /// therefore bumped inside the predicate, under the shard lock and BEFORE
+    /// the removal becomes visible, for the same linearization reason as
+    /// [`Self::insert`]. A stale-token no-op bumps nothing.
+    pub(super) fn remove_if(&self, service: &str, registration_id: u64) -> bool {
+        let removed = self
+            .map
+            .remove_if(service, |_, entry| {
+                if entry.registration_id != registration_id {
+                    return false;
+                }
+                self.mark_exposure_revoked();
+                true
+            })
+            .is_some();
+        // Shard lock released above; wake last.
+        if removed {
             self.change_signal.send_modify(|g| *g = g.wrapping_add(1));
         }
         removed
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.map.is_empty()
     }
 
-    /// Cloned name list for the announce-path tag merge. Announces
-    /// are rare relative to lookups; the allocation keeps the
-    /// DashSet's guard types out of the public surface.
-    pub(super) fn snapshot(&self) -> Vec<String> {
-        self.set.iter().map(|s| s.clone()).collect()
+    /// Names of `Public` services — the ONLY services whose `nrpc:` tag may enter
+    /// a plaintext CAP-ANN (OA3-4b1 confidentiality projection: an owner-scoped
+    /// tag must never appear in the clear).
+    pub(super) fn public_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::Public))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Names of `OwnerScoped` services — emitted only inside the encrypted owner
+    /// audience announcement, never plaintext.
+    pub(super) fn owner_scoped_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::OwnerScoped))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Names of `GrantedAudience` services — emitted only inside encrypted
+    /// grant-audience announcements (one envelope per active provider grant),
+    /// never plaintext (OA3-4b2).
+    pub(super) fn granted_snapshot(&self) -> Vec<String> {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map
+            .iter()
+            .filter(|e| matches!(e.value().visibility, CapabilityVisibility::GrantedAudience))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Whether `service` is registered under a PRIVATE visibility
+    /// (owner-scoped or granted-audience).
+    ///
+    /// A direct lookup rather than `owner_scoped_snapshot() ∪ granted_snapshot()`
+    /// because the sensing plane asks this once per inbound interest frame, and
+    /// building two `Vec<String>`s per probe would hand a peer a cheap
+    /// allocation amplifier.
+    pub(super) fn is_private(&self, service: &str) -> bool {
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        self.map.get(service).is_some_and(|e| {
+            matches!(
+                e.value().visibility,
+                CapabilityVisibility::OwnerScoped | CapabilityVisibility::GrantedAudience
+            )
+        })
+    }
+
+    /// ALL registered service names regardless of visibility — for the LOCAL
+    /// self-fold, so `has_local_capability` admits every locally registered
+    /// service (§2.4a). This set NEVER reaches the wire.
+    pub(super) fn all_snapshot(&self) -> Vec<String> {
+        self.map.iter().map(|e| e.key().clone()).collect()
+    }
+}
+
+/// One coherent publication of this node's local capability emission (Kyra OA3
+/// torn-snapshot invariant): the plaintext `public` announcement and the
+/// encrypted owner-scoped announcement bytes in `scoped` are stored and read as a
+/// SINGLE `ArcSwapOption` unit, so a late-join or deferred send can never pair a
+/// public generation with a stale scoped one.
+///
+/// `scoped` is populated only when `public` carries a valid owner cert; a
+/// cert-invalidating send-time rebuild (see [`MeshNode::rebuild_cached_announcement`])
+/// clears it, so a floored/expired provider never ships an owner-scoped envelope
+/// with a stale embedded certificate. It is empty until OA3-4b1 Commit B
+/// populates it — the review-11 P1 send-time seqlock re-validates `public`
+/// exactly as before.
+struct LocalCapabilityEmission {
+    public: CapabilityAnnouncement,
+    // Cloned into the send-time [`SendEmission`] by the combined send helper
+    // ([`MeshNode::send_emission_to`]) and shipped on
+    // `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`, one packet per envelope. Holds the
+    // owner-audience envelope (OA3-4b1) followed by the granted-audience envelopes
+    // (OA3-4b2), one per active provider grant. A cert-invalidating send-time
+    // rebuild clears it (see [`MeshNode::rebuild_cached_announcement`]).
+    scoped: Vec<Vec<u8>>,
+    /// The exact `Arc<NodeAuthority>` whose owner audience sealed the OWNER
+    /// envelopes in `scoped` (Kyra OA3-4b1 B2 rotation safety). `Some` only when an
+    /// owner envelope is present. The send path pointer-compares it against the
+    /// currently-installed authority and refuses the send if they differ: a
+    /// same-org authority replacement rotates the audience key while keeping the
+    /// public cert equal, so neither the cert rebuild nor the visibility check
+    /// would otherwise catch it. Holding the original Arc makes the comparison
+    /// ABA-safe — a replacement is necessarily a distinct allocation.
+    scoped_authority: Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+    /// The exact `Arc<ProviderGrantSnapshot>` whose grants sealed the GRANTED
+    /// envelopes in `scoped` (OA3-4b2 emission coherence, mirroring
+    /// `scoped_authority` for owner). `Some` only when a granted envelope is
+    /// present. The send path pointer-compares it against the currently-installed
+    /// provider registry: a grant install/remove/replace swaps the snapshot
+    /// pointer, so a cached granted envelope sealed under a since-mutated grant
+    /// can never ship — the mutation wakes a current-baseline rebuild that
+    /// republishes public + owner + granted coherently. ABA-safe: the emission
+    /// holds the original snapshot Arc alive, so a mutation is a distinct
+    /// allocation.
+    provider_grant_snapshot:
+        Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+    /// The local-service-registry PRIVATIZATION generation this emission's
+    /// public/scoped projection was derived from. The send path rejects the
+    /// emission if it has advanced — a concurrent visibility change made a
+    /// still-plaintext tag private (Kyra OA3 closure). A benign new registration
+    /// does NOT advance it, so registering a service never strands an in-flight
+    /// announce. `0` when there is no registry (non-`cortex`), where no
+    /// owner-scoped service can exist.
+    exposure_revocation_generation: u64,
+}
+
+/// One coherent send-time serialization of the published
+/// [`LocalCapabilityEmission`]: the plaintext public CAP-ANN `public` bytes and
+/// the encrypted owner-scoped envelopes `scoped`, BOTH taken from the same
+/// validated `local_emission` load (see
+/// [`MeshNode::announcement_bytes_for_send_probed`]) so a send can never pair a
+/// public generation with a stale scoped one (Kyra OA3 torn-snapshot invariant).
+/// An empty `scoped` ships nothing on `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`.
+struct SendEmission {
+    public: Vec<u8>,
+    scoped: Vec<Vec<u8>>,
+    /// The exposure-revocation epoch of the emission these bytes came from.
+    /// Recorded on the gate once they actually ship, so the "a revocation is
+    /// pending on the wire" test stays exact even if a concurrent announce
+    /// republished between this attempt's build and its send.
+    exposure_generation: u64,
+}
+
+#[cfg(all(test, feature = "cortex"))]
+mod local_service_registry_tests {
+    use super::LocalServiceRegistry;
+    use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+    use std::sync::Arc;
+
+    fn registry() -> (LocalServiceRegistry, tokio::sync::watch::Receiver<u64>) {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        (LocalServiceRegistry::new(Arc::new(tx)), rx)
+    }
+
+    /// OA2-E0.2 P1 — the barrier witness for old-handle retirement
+    /// versus a replacement registration.
+    ///
+    /// Deterministic replay of the exact interleaving Kyra flagged
+    /// (no threads, program order IS the barrier):
+    ///   1. old handle installs the tag under id 1;
+    ///   2. old handle's dispatcher is torn down and the slot freed
+    ///      — a REPLACEMENT `serve_rpc` re-registers it and upserts
+    ///      the tag under id 2 (the old handle is preempted BEFORE
+    ///      its tag-removal);
+    ///   3. the old handle resumes and retires by its OWN (stale)
+    ///      id 1.
+    ///
+    /// The replacement's tag MUST survive step 3, because retirement
+    /// is token-owned. A name-only removal (the pre-fix behavior)
+    /// would clobber it here.
+    #[test]
+    fn stale_handle_retirement_cannot_evict_a_replacement_tag() {
+        let (reg, _rx) = registry();
+
+        // (1) incumbent registration installs its tag.
+        assert!(
+            reg.insert("svc".to_string(), 1, CapabilityVisibility::Public),
+            "first insert is new"
+        );
+        assert_eq!(reg.all_snapshot(), vec!["svc".to_string()]);
+
+        // (2) replacement upserts under a new id while the incumbent
+        //     handle is mid-drop. Same NAME, so no capability change
+        //     — `insert` reports "not newly present".
+        assert!(
+            !reg.insert("svc".to_string(), 2, CapabilityVisibility::Public),
+            "re-tokening an existing name is not a new capability",
+        );
+
+        // (3) the stale incumbent handle retires by its OWN id.
+        assert!(
+            !reg.remove_if("svc", 1),
+            "a stale-id retirement must be a no-op",
+        );
+        assert_eq!(
+            reg.all_snapshot(),
+            vec!["svc".to_string()],
+            "the replacement's live tag must survive the stale retirement",
+        );
+        assert!(!reg.is_empty());
+
+        // The replacement's OWN handle later retires correctly.
+        assert!(reg.remove_if("svc", 2), "matching-id retirement removes");
+        assert!(
+            reg.is_empty(),
+            "registry drains once the live owner retires"
+        );
+    }
+
+    /// The change signal fires exactly on capability-set transitions
+    /// (name appears / name disappears), not on same-name re-tokening
+    /// — so a replacement doesn't spuriously wake the announcer and a
+    /// stale no-op retirement stays silent.
+    #[test]
+    fn change_signal_tracks_name_presence_not_token_churn() {
+        let (reg, rx) = registry();
+        let gen = |rx: &tokio::sync::watch::Receiver<u64>| *rx.borrow();
+
+        let g0 = gen(&rx);
+        assert!(reg.insert("svc".to_string(), 1, CapabilityVisibility::Public));
+        assert_ne!(gen(&rx), g0, "new name bumps");
+
+        let g1 = gen(&rx);
+        assert!(!reg.insert("svc".to_string(), 2, CapabilityVisibility::Public));
+        assert_eq!(gen(&rx), g1, "re-token of same name is silent");
+
+        assert!(!reg.remove_if("svc", 1));
+        assert_eq!(gen(&rx), g1, "stale no-op retirement is silent");
+
+        assert!(reg.remove_if("svc", 2));
+        assert_ne!(gen(&rx), g1, "name leaving the set bumps");
+    }
+
+    /// OA3 closure (Kyra #1): a same-name visibility CHANGE (Public → OwnerScoped)
+    /// must wake the announcer, or a stale plaintext `nrpc:` tag could linger in
+    /// the cached announcement. Same-name / same-visibility re-tokening stays
+    /// silent.
+    #[test]
+    fn same_name_visibility_change_bumps_the_signal() {
+        let (reg, rx) = registry();
+        let gen = |rx: &tokio::sync::watch::Receiver<u64>| *rx.borrow();
+
+        let g0 = gen(&rx);
+        assert!(reg.insert("svc".to_string(), 1, CapabilityVisibility::Public));
+        let g1 = gen(&rx);
+        assert_ne!(g1, g0, "a newly-present name bumps");
+
+        // Same name, SAME visibility, new registration id → silent re-token.
+        assert!(!reg.insert("svc".to_string(), 2, CapabilityVisibility::Public));
+        assert_eq!(gen(&rx), g1, "same-visibility re-token is silent");
+
+        // Same name, DIFFERENT visibility (Public → OwnerScoped) → MUST bump, so
+        // the announcer re-projects and drops the now-private plaintext tag.
+        assert!(!reg.insert("svc".to_string(), 3, CapabilityVisibility::OwnerScoped));
+        assert_ne!(gen(&rx), g1, "a visibility change bumps the signal");
+    }
+
+    /// Kyra OA3 review, Finding 1 — the send-path staleness counter must fire on
+    /// EXPOSURE REVOCATION, which is broader than "left the public set" and
+    /// narrower than the announcer's change signal.
+    ///
+    /// An emission carries plaintext AND encrypted owner/granted envelopes, so a
+    /// private-to-private move revokes an exposure too: after
+    /// `OwnerScoped -> GrantedAudience` the cached OWNER envelope still names the
+    /// service to an audience that is no longer the intended one, and the mirror
+    /// transition still names it to former grantees. A widening to `Public`
+    /// revokes nothing — cached private bytes reveal strictly less than the new
+    /// public state. A newly-present name at ANY visibility cannot be carried by
+    /// an emission built before it existed, so it must not strand that emission.
+    #[test]
+    fn exposure_revocation_generation_transition_matrix() {
+        use CapabilityVisibility::{GrantedAudience as G, OwnerScoped as O, Public as P};
+
+        // (label, seeded prior visibility, next visibility, must advance)
+        let cases: &[(
+            &str,
+            Option<CapabilityVisibility>,
+            CapabilityVisibility,
+            bool,
+        )] = &[
+            ("absent -> Public", None, P, false),
+            ("absent -> OwnerScoped", None, O, false),
+            ("absent -> GrantedAudience", None, G, false),
+            ("Public -> Public (re-token)", Some(P), P, false),
+            ("OwnerScoped -> OwnerScoped (re-token)", Some(O), O, false),
+            ("Granted -> Granted (re-token)", Some(G), G, false),
+            ("OwnerScoped -> Public (widening)", Some(O), P, false),
+            ("Granted -> Public (widening)", Some(G), P, false),
+            ("Public -> OwnerScoped", Some(P), O, true),
+            ("Public -> GrantedAudience", Some(P), G, true),
+            ("OwnerScoped -> GrantedAudience", Some(O), G, true),
+            ("GrantedAudience -> OwnerScoped", Some(G), O, true),
+        ];
+
+        for (label, seed, next, must_advance) in cases {
+            let (reg, _rx) = registry();
+            if let Some(seed) = seed {
+                reg.insert("svc".to_string(), 1, *seed);
+            }
+            let before = reg.exposure_revocation_generation();
+            reg.insert("svc".to_string(), 2, *next);
+            let after = reg.exposure_revocation_generation();
+            if *must_advance {
+                assert_ne!(
+                    after, before,
+                    "{label} revokes an exposure and MUST advance the epoch",
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "{label} revokes nothing and must NOT advance the epoch                      (advancing strands in-flight emissions)",
+                );
+            }
+        }
+    }
+
+    /// Retirement withdraws the intent to expose at EVERY visibility: a cached
+    /// emission still advertising the name is stale to whichever audience it
+    /// addresses — plaintext readers, the owner audience, or former grantees.
+    /// A stale-token retirement removes nothing and so revokes nothing.
+    #[test]
+    fn retirement_revokes_exposure_at_every_visibility() {
+        for (label, visibility) in [
+            ("Public", CapabilityVisibility::Public),
+            ("OwnerScoped", CapabilityVisibility::OwnerScoped),
+            ("GrantedAudience", CapabilityVisibility::GrantedAudience),
+        ] {
+            let (reg, _rx) = registry();
+            reg.insert("svc".to_string(), 1, visibility);
+            let before = reg.exposure_revocation_generation();
+            assert!(reg.remove_if("svc", 1), "{label}: live retirement removes");
+            assert_ne!(
+                reg.exposure_revocation_generation(),
+                before,
+                "{label}: retiring a registered service must advance the epoch",
+            );
+        }
+
+        // A superseded handle retiring by its OWN (stale) id removes nothing, so
+        // the replacement's exposure is untouched and the epoch must not move.
+        let (reg, _rx) = registry();
+        reg.insert("svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("svc".to_string(), 2, CapabilityVisibility::Public);
+        let before = reg.exposure_revocation_generation();
+        assert!(!reg.remove_if("svc", 1), "stale-id retirement is a no-op");
+        assert_eq!(
+            reg.exposure_revocation_generation(),
+            before,
+            "a no-op retirement revokes no exposure",
+        );
+    }
+
+    /// OA3-4b1 confidentiality projection: `public_snapshot` (→ the plaintext
+    /// broadcast) excludes an owner-scoped service, while `all_snapshot` (→ the
+    /// local self-fold, so `has_local_capability` admits it) includes it.
+    #[test]
+    fn snapshots_partition_by_visibility() {
+        let (reg, _rx) = registry();
+        reg.insert("pub-svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("own-svc".to_string(), 2, CapabilityVisibility::OwnerScoped);
+
+        // The plaintext broadcast set carries ONLY the public service.
+        assert_eq!(reg.public_snapshot(), vec!["pub-svc".to_string()]);
+        // The owner-scoped service is visible only to the encrypted-emission path.
+        assert_eq!(reg.owner_scoped_snapshot(), vec!["own-svc".to_string()]);
+        // The self-fold sees both (deterministic order for the assert).
+        let mut all = reg.all_snapshot();
+        all.sort();
+        assert_eq!(all, vec!["own-svc".to_string(), "pub-svc".to_string()]);
+    }
+
+    /// §10 — the predicate the sensing plane consults before DECLARING a
+    /// capability.
+    ///
+    /// The self-fold deliberately carries private services so
+    /// `has_local_capability` admits them (§2.4a), and that entry never reaches
+    /// the wire — but the sensing plane reads the same fold and gates on OWNER
+    /// ROOT, not grant scope. A same-root peer holding no grant could therefore
+    /// probe for a granted service and get a branch registration it would not
+    /// otherwise receive, confirming the service exists.
+    ///
+    /// Both private visibilities must answer `true`; a public service and an
+    /// unregistered name must answer `false`, or the sensing plane would stop
+    /// declaring capabilities it legitimately serves.
+    #[test]
+    fn is_private_covers_both_private_visibilities_and_nothing_else() {
+        let (reg, _rx) = registry();
+        reg.insert("pub-svc".to_string(), 1, CapabilityVisibility::Public);
+        reg.insert("own-svc".to_string(), 2, CapabilityVisibility::OwnerScoped);
+        reg.insert(
+            "granted-svc".to_string(),
+            3,
+            CapabilityVisibility::GrantedAudience,
+        );
+
+        assert!(
+            reg.is_private("own-svc"),
+            "an owner-scoped service must not be declared to the sensing plane",
+        );
+        assert!(
+            reg.is_private("granted-svc"),
+            "a granted-audience service must not be declared to the sensing \
+             plane — grant scope must not collapse to owner scope for existence",
+        );
+        assert!(
+            !reg.is_private("pub-svc"),
+            "a PUBLIC service must still be declared, or sensing stops working \
+             for the services it is meant to serve",
+        );
+        assert!(
+            !reg.is_private("never-registered"),
+            "an unregistered name is not private — it is simply absent",
+        );
     }
 }
 
@@ -3797,8 +4640,12 @@ fn sensing_candidate_snapshot_from_parts(
     local_entity_root: sensing::AudienceScopeCommitment,
     local_owner_root: &sensing::AudienceScopeCommitment,
     capability_id: &sensing::CapabilityId,
+    // `is_locally_private`: whether `capability_id` names a service this node
+    // serves under a PRIVATE visibility (owner-scoped or granted-audience).
+    // See the §10 note at the filter below.
+    is_locally_private: impl Fn(&sensing::CapabilityId) -> bool,
 ) -> Vec<sensing::CandidateProvider> {
-    let declarers = sensing::extract_declarers(capability_fold, capability_id, |node_id| {
+    let mut declarers = sensing::extract_declarers(capability_fold, capability_id, |node_id| {
         if node_id == local_node_id {
             Some(local_entity_root)
         } else {
@@ -3807,6 +4654,27 @@ fn sensing_candidate_snapshot_from_parts(
                 .map(|entry| sensing::AudienceScopeCommitment::owner_root(entry.value()))
         }
     });
+    // §10 — never DECLARE a locally private capability to the sensing plane.
+    //
+    // `index_self_with_local_services` deliberately puts every registered
+    // service into the SELF-fold entry regardless of visibility, so
+    // `has_local_capability` admits owner-scoped and granted services (§2.4a).
+    // That entry never reaches the wire — but the sensing plane reads the same
+    // fold, and its audience gate keys on OWNER ROOT, not on grant scope.
+    //
+    // So a peer in this node's own owner root, holding NO grant, could send a
+    // `SensingInterestFrame` naming `nrpc:<granted-service>`, match this node's
+    // self-entry, and receive a branch registration / warm-start it would not
+    // otherwise get — behaviourally confirming that the private service exists.
+    // Grant-scoped visibility was flattened to owner-scoped for EXISTENCE.
+    //
+    // The tag string itself never ships (no sensing frame carries a tag field,
+    // and `CandidateProvider` is not `Serialize`), so this is an oracle rather
+    // than a disclosure — but it is new on this branch, and the fix is simply
+    // to answer as a node that does not declare the capability at all.
+    if is_locally_private(capability_id) {
+        declarers.retain(|d| d.node_id != local_node_id);
+    }
     sensing::build_candidate_snapshot(
         &declarers,
         local_owner_root,
@@ -3924,15 +4792,15 @@ pub struct MeshNode {
     // the canonical `u32` hash is what each dispatcher is keyed on.
     // The `Vec` cost is paid only once per wire-bucket hit, and at
     // typical sizing there is exactly one entry per bucket.
-    rpc_inbound_dispatchers: Arc<
-        DashMap<
-            u16,
-            Vec<(
-                ChannelHash,
-                crate::adapter::net::cortex::RpcInboundDispatcher,
-            )>,
-        >,
-    >,
+    // OA2-E0.1: entries carry a monotonic registration id (see the
+    // `DispatchCtx` field for the teardown rationale).
+    rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// OA2-E0.1: monotonic source of registration ids for
+    /// [`Self::register_rpc_inbound`]. Bumped once per successful
+    /// (vacant-only) registration so each carries a unique id that
+    /// [`Self::unregister_rpc_inbound`] matches on.
+    #[cfg(feature = "cortex")]
+    rpc_registration_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Pending oneshots for in-flight `Mesh::call` invocations.
     /// Shared with the per-Mesh `RpcClientFold` so RESPONSE events
     /// arriving on reply channels complete the right call's
@@ -4039,6 +4907,104 @@ pub struct MeshNode {
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
     migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
+    /// OA-1: node-local persisted org revocation maxima. Shared
+    /// with [`DispatchCtx`] so announcement ingest floor-checks
+    /// owner certs; installed via
+    /// [`Self::install_org_revocation_store`] by the
+    /// authority-adoption wiring. `None` on un-adopted nodes.
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// OA-1: the node's loaded, self-verified authority — the ONLY
+    /// source of the owner certificate this node may emit
+    /// (review-8 §3: no raw-certificate bypass) and the owner of
+    /// the installed revocation store. Installed via
+    /// [`Self::install_node_authority`] (or the
+    /// `node_authority_dir` config at construction); replacement by
+    /// a DIFFERENT owner org is refused — one node, one owner.
+    node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OA3-5: the node's private-discovery store — verified owner/grant-scoped
+    /// capabilities opened from inbound `SUBPROTOCOL_SCOPED_CAPABILITY_ANN`
+    /// envelopes. Structurally disjoint from the plaintext capability fold; only
+    /// a node holding the matching audience key can populate it (an INVOKE-only /
+    /// un-adopted node drops every scoped envelope). `parking_lot` mutex — ingest
+    /// and sweep are short synchronous critical sections on the inbound dispatch
+    /// path, with no await held.
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+    /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
+    /// propagation. Shared across the inbound dispatch so a flooded envelope is
+    /// forwarded at most once per node; never decrypts or stores anything.
+    scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
+    /// OA3-4b2: the PROVIDER grant-audience registry — grants this node's own org
+    /// issued that apply to THIS provider, each paired with its out-of-band
+    /// secret. Lock-free `ArcSwap` so routine grant churn never rotates the
+    /// authority pointer or the owner-scoped emission; the granted-emission
+    /// projection reads it and the send seqlock pointer-compares the exact
+    /// snapshot it sealed under. Mutated only through
+    /// [`Self::install_provider_grant_audience`] /
+    /// [`Self::remove_provider_grant_audience`], serialized by
+    /// `provider_grant_mu`.
+    provider_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+    /// OA3-4b2: the CONSUMER grant-audience registry — grants whose `grantee_org`
+    /// is this node's own org. The inbound nonzero-grant ingest selector looks a
+    /// record up by `grant_id` (confirming the envelope's audience handle) to
+    /// build the granted authority a cross-org envelope verifies against. Role-
+    /// separated from the provider registry: one registry's mutation can never
+    /// invalidate the other. Serialized by `consumer_grant_mu`.
+    consumer_grant_audiences:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
+    /// Serializes provider grant-audience install/remove so two concurrent
+    /// mutations cannot both load the same snapshot and lose one. Reads stay
+    /// lock-free off the `ArcSwap` above.
+    provider_grant_mu: parking_lot::Mutex<()>,
+    /// Serializes consumer grant-audience install/remove (see
+    /// `provider_grant_mu`).
+    consumer_grant_mu: parking_lot::Mutex<()>,
+    /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
+    /// shared across EVERY protected `serve_rpc_protected` registration on this
+    /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
+    /// holds provider-wide: a captured proof cannot re-execute after a service
+    /// is torn down and re-registered, colliding call ids across distinct
+    /// protected services are caught, and the global replay capacity is one
+    /// budget, not one-per-service.
+    #[cfg(feature = "cortex")]
+    rpc_admission_replay: Arc<super::behavior::org_admission_replay::AdmissionReplayGuard>,
+    /// §6 — per-peer throttle on the signature work a FAILING caller can compel.
+    #[cfg(feature = "cortex")]
+    rpc_admission_rate_limit: Arc<super::behavior::org_admission_replay::AdmissionFailureLimiter>,
+    /// Review-9: serializes authority/store installation. The
+    /// check-then-store sequences (dominance validation, one-owner
+    /// comparison, callback wiring, reconciliation) must be one
+    /// coherent lifecycle operation — two concurrent installs must
+    /// not both validate against the same older view and publish
+    /// in reverse order.
+    org_install: Arc<parking_lot::Mutex<()>>,
+    /// OA-1: whether self-announcements attach the installed
+    /// authority's owner certificate. `false` (the default) keeps
+    /// the announcement byte-identical to the pre-OA-1 shape;
+    /// enabling is the plan's EXPLICIT migration step 3
+    /// (`upgrade-all-then-emit` — a not-yet-upgraded signed-mode
+    /// peer drops announcements carrying a populated cert) and
+    /// requires an installed authority
+    /// ([`Self::set_owner_cert_emission`]).
+    owner_cert_emission_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Review-9 addendum: the node's slot in the INSTALLED store's
+    /// raise-subscriber registry — `(store, token)`. Replacement
+    /// unsubscribes the outgoing store's token, so a detached
+    /// store neither keeps nor steals this node's notifications,
+    /// and installing one store `Arc` into several nodes leaves
+    /// every node subscribed (the registry replaced the old
+    /// single-slot callback).
+    org_raise_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
+    /// Review-11 P1: bumped ONLY by
+    /// [`Self::set_owner_cert_emission`]. Store/authority
+    /// (re)installations and floor raises are captured DIRECTLY by
+    /// the [`SendStamp`] (store/authority pointers + the store's
+    /// publish generation), so only the emission toggle — which
+    /// changes neither a pointer nor a generation — needs its own
+    /// counter. The send-path seqlock reads it through
+    /// [`Self::security_stamp`].
+    emission_generation: Arc<std::sync::atomic::AtomicU64>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -4418,11 +5384,16 @@ pub struct MeshNode {
     /// [`sensing::ProviderObservationKey`], packing, down-sampling,
     /// hop rule) subsumes the `latest` half.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
-    /// Most recent `CapabilityAnnouncement` this node published.
-    /// Pushed to new peers right after `accept` / `connect`
-    /// completes, so late joiners pick up our caps without waiting
-    /// for a re-announce. `None` until the first `announce_*` call.
-    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
+    /// Most recent `CapabilityAnnouncement` this node published,
+    /// stamped with the org authority/floor epoch it was built
+    /// under (review-9 addendum). Pushed to new peers right after
+    /// `accept` / `connect` completes, so late joiners pick up our
+    /// caps without waiting for a re-announce; every reusing send
+    /// path serializes it through
+    /// [`MeshNode::announcement_bytes_for_send`], which
+    /// re-validates the embedded owner certificate on an epoch
+    /// mismatch. `None` until the first `announce_*` call.
+    local_emission: Arc<ArcSwapOption<LocalCapabilityEmission>>,
     /// User-supplied capability baseline — the pre-augmentation set
     /// the most recent `announce_capabilities` call published. The
     /// `announce_chain` / `announce_chain_range` / `withdraw_chain`
@@ -4675,6 +5646,58 @@ pub struct MeshNode {
     accept_in_flight: std::sync::atomic::AtomicUsize,
 }
 
+/// Verify an announcement's owner cert against `floors`, apply the
+/// translated announcement to `capability_fold`, and run the review-9
+/// post-apply floor recheck.
+///
+/// §T8 — ONE implementation, called by both the live inbound dispatch path
+/// and `MeshNode::test_inject_capability_announcement`. The seam used to be a
+/// hand-copied duplicate of these ~20 lines, which meant roughly ten
+/// org-ownership tests exercised the COPY: deleting the owner-cert
+/// verification from the real dispatch path (or passing `None` for
+/// `verified_owner` there) left every one of them green, including the
+/// headline `node_ingest_drops_bad_cert_but_keeps_announcement`. Sharing the
+/// body makes that divergence unrepresentable.
+///
+/// `signature_verified` is the caller-asserted OUTER announcement signature
+/// (review-8 §1): a valid replayed cert must never lend ownership to an
+/// unsigned capability statement, so it stays an explicit parameter rather
+/// than being recomputed here.
+fn ingest_announcement_with_owner_projection(
+    capability_fold: &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    org_revocation: &ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+    ann: &super::behavior::capability::CapabilityAnnouncement,
+    signature_verified: bool,
+) {
+    let verified_owner = {
+        let store = org_revocation.load();
+        let floors = store.as_ref().map(|s| s.snapshot());
+        super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+            ann,
+            signature_verified,
+            floors.as_deref(),
+            0,
+        )
+    };
+    let fold_ann =
+        super::behavior::fold::capability_bridge::translate_announcement(ann, verified_owner);
+    let _ = capability_fold.apply(fold_ann);
+    // Review-9: post-apply floor recheck — a raise that landed between the
+    // verification above and this apply would have finished its retraction
+    // callback before the projection existed; reread the CURRENT floors and
+    // retract if the just-applied projection is already below them.
+    if let Some(owner) = &verified_owner {
+        let store = org_revocation.load();
+        let floors = store.as_ref().map(|s| s.snapshot());
+        super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+            capability_fold,
+            floors.as_deref(),
+            &ann.entity_id,
+            owner,
+        );
+    }
+}
+
 impl MeshNode {
     /// Get the Noise static public key (for peers to connect to this node).
     pub fn public_key(&self) -> &[u8; 32] {
@@ -4701,6 +5724,37 @@ impl MeshNode {
         config: MeshNodeConfig,
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
+
+        // OA-1 (review-8 §2): resolve the configured node authority
+        // BEFORE any networking starts. A configured-but-missing,
+        // corrupt, or floored authority REFUSES construction — it
+        // never silently degrades to an un-adopted node. The loaded
+        // value installs after the struct exists, below.
+        // Verification uses the skew the adoption ceremony
+        // PERSISTED into the membership config (review-9): what
+        // `net node adopt` accepted is exactly what startup
+        // accepts.
+        let node_authority = match &config.node_authority_dir {
+            Some(dir) => {
+                let authority =
+                    super::behavior::org_authority::NodeAuthority::open(dir, identity.entity_id())
+                        .map_err(|e| {
+                            AdapterError::Fatal(format!("node authority startup refusal: {e}"))
+                        })?;
+                Some(Arc::new(authority))
+            }
+            None => {
+                if config.emit_owner_cert {
+                    return Err(AdapterError::Fatal(
+                        "emit_owner_cert requires node_authority_dir: emission is \
+                         sourced only from an adopted authority"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
+        };
+
         let static_keypair = StaticKeypair::generate();
 
         let socket = NetSocket::with_config(config.bind_addr, config.socket_buffers)
@@ -4951,6 +6005,21 @@ impl MeshNode {
         let sensing_leader_failure = sensing_leader.clone();
         let sensing_router_failure = router.clone();
         let sensing_addr_to_node_failure = addr_to_node.clone();
+        // §5 — captured BEFORE `config` is moved into the node, and validated
+        // here so an inconsistent envelope fails at construction rather than
+        // at the first protected call under load.
+        let admission_replay_config = config.admission_replay;
+        // §6 — captured before `config` moves, and validated here so a
+        // degenerate envelope fails at construction rather than at the first
+        // throttled call.
+        let admission_rate_limit_config = config.admission_rate_limit;
+        if let Err(e) = admission_rate_limit_config.validate() {
+            // Loud, not clamped — mirrors `AdmissionReplayGuard::new`. A
+            // degenerate envelope (zero burst, zero refill) would throttle a
+            // peer permanently on its first failure, which is a far worse
+            // outcome than refusing to start.
+            panic!("invalid admission rate-limit config: {e}");
+        }
         let enable_sensing_failure = config.enable_sensing_coalescing;
         let sensing_overlay_recovery = sensing_overlay_changed.clone();
         let enable_sensing_recovery = config.enable_sensing_coalescing;
@@ -5229,7 +6298,7 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
-        Ok(Self {
+        let node = Self {
             identity: Arc::new(identity),
             static_keypair,
             node_id,
@@ -5242,6 +6311,8 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            #[cfg(feature = "cortex")]
+            rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             #[cfg(feature = "cortex")]
@@ -5266,6 +6337,44 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
+            org_revocation: Arc::new(ArcSwapOption::empty()),
+            node_authority: Arc::new(ArcSwapOption::empty()),
+            scoped_discovery: Arc::new(parking_lot::Mutex::new(
+                super::behavior::org_scoped_store::ScopedDiscoveryStore::new(),
+            )),
+            scoped_relay_gate: Arc::new(
+                super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
+            ),
+            provider_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
+                super::behavior::org_grant_registry::ProviderGrantSnapshot::empty(),
+            )),
+            consumer_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
+                super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+            )),
+            provider_grant_mu: parking_lot::Mutex::new(()),
+            consumer_grant_mu: parking_lot::Mutex::new(()),
+            #[cfg(feature = "cortex")]
+            rpc_admission_rate_limit: Arc::new(
+                // The envelope was validated (and panicked on) above, so this
+                // cannot fail; fall back to the safe defaults rather than a
+                // second panic — `expect()` is denied in production code here.
+                super::behavior::org_admission_replay::AdmissionFailureLimiter::try_new(
+                    admission_rate_limit_config,
+                )
+                .unwrap_or_else(|_| {
+                    super::behavior::org_admission_replay::AdmissionFailureLimiter::with_defaults()
+                }),
+            ),
+            #[cfg(feature = "cortex")]
+            rpc_admission_replay: Arc::new(
+                super::behavior::org_admission_replay::AdmissionReplayGuard::new(
+                    admission_replay_config,
+                ),
+            ),
+            org_install: Arc::new(parking_lot::Mutex::new(())),
+            owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
+            emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
@@ -5353,8 +6462,10 @@ impl MeshNode {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
                 deferral_generation: 0,
+                broadcast_claim_generation: 0,
+                last_broadcast_exposure_generation: 0,
             })),
-            local_announcement: Arc::new(ArcSwapOption::empty()),
+            local_emission: Arc::new(ArcSwapOption::empty()),
             user_caps: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "redex")]
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
@@ -5399,7 +6510,22 @@ impl MeshNode {
             started: AtomicBool::new(false),
             self_weak: Arc::new(std::sync::OnceLock::new()),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
-        })
+        };
+
+        // OA-1 (review-8 §2): install the authority loaded above as
+        // the one production authority object — revocation store
+        // (with the floor-raise retraction wiring) + retained owner
+        // certificate — and honor the explicit emission flag.
+        if let Some(authority) = node_authority {
+            node.install_node_authority(authority)
+                .map_err(|e| AdapterError::Fatal(format!("node authority install: {e}")))?;
+            if node.config.emit_owner_cert {
+                node.set_owner_cert_emission(true)
+                    .map_err(|e| AdapterError::Fatal(format!("owner-cert emission: {e}")))?;
+            }
+        }
+
+        Ok(node)
     }
 
     /// Get this node's ID.
@@ -5468,6 +6594,25 @@ impl MeshNode {
         self.peer_entity_ids
             .get(&node_id)
             .map(|e| e.value().clone())
+    }
+
+    /// OA-2 (E0.3): resolve the DIRECT-session caller entity for a protected
+    /// admission — the AEAD-authenticated session peer for `from_node` whose
+    /// PINNED origin equals the wire-`claimed_origin_hash`. Binds the
+    /// authenticated identity to the claimed routing origin: loopback
+    /// (`from_node == 0`), an unpinned peer, and an origin/peer mismatch are all
+    /// refused, so a peer cannot admit under its OWN proof while stamping a
+    /// victim's origin into the frame (split authenticated/claimed identity).
+    pub(crate) fn resolve_direct_caller(
+        &self,
+        from_node: u64,
+        claimed_origin_hash: u64,
+    ) -> Result<EntityId, super::behavior::caller_identity::CallerIdentityError> {
+        super::behavior::caller_identity::resolve_direct_caller(
+            &self.peer_entity_ids,
+            from_node,
+            claimed_origin_hash,
+        )
     }
 
     /// The peer's socket address, if we have an active session
@@ -6330,7 +7475,21 @@ impl MeshNode {
             sensing::AudienceScopeCommitment::owner_root(self.identity.entity_id()),
             &self.sensing_local_root,
             capability_id,
+            |cap| self.capability_is_locally_private(cap),
         )
+    }
+
+    /// §10 — does `capability_id` name a service THIS node serves under a
+    /// private visibility?
+    ///
+    /// Only `nrpc:` tags can correspond to a registered service, so anything
+    /// else is public by construction and answers `false` without a map probe.
+    #[cfg(feature = "redex")]
+    fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
+        capability_id
+            .as_str()
+            .strip_prefix("nrpc:")
+            .is_some_and(|svc| self.rpc_local_services.is_private(svc))
     }
 
     /// Test-only helper — TOFU-pin `entity_id` for `node_id` exactly
@@ -6525,6 +7684,1488 @@ impl MeshNode {
     /// that's already been torn down.
     pub fn clear_migration_handler(&self) {
         self.migration_handler.store(None);
+    }
+
+    /// OA-1: install the node's persisted org revocation store so
+    /// announcement ingest floor-checks owner certificates.
+    /// MONOTONIC (review-8 §4) and lifecycle-coherent (review-9):
+    ///
+    /// - installs are SERIALIZED (two concurrent dominance checks
+    ///   cannot both validate against the same older view and
+    ///   publish in reverse order);
+    /// - the CURRENT store's publish transaction is pinned across
+    ///   the dominance comparison and the swap (review-9
+    ///   addendum): an in-flight raise on the installed store
+    ///   either publishes first — the comparison sees it and
+    ///   refuses a lower candidate — or is forced to publish after
+    ///   the swap, where it is unambiguously a raise through a
+    ///   detached store whose subscription has been removed;
+    /// - installing over nothing is accepted, re-installing the
+    ///   same store is idempotent, a replacement whose live view is
+    ///   LOWER on any `(org, member)` floor is refused, and a
+    ///   durability-poisoned candidate is refused (uncertainty is
+    ///   never laundered through replacement);
+    /// - the node subscribes to the candidate through the store's
+    ///   subscriber REGISTRY and unsubscribes from the outgoing
+    ///   store — a detached store neither keeps nor steals this
+    ///   node's notifications, and one store installed into
+    ///   several nodes notifies all of them (review-9 addendum);
+    /// - the candidate's floors are RECONCILED against existing
+    ///   fold projections before returning, so a pre-raised store
+    ///   retracts stale ownership immediately (no floor-change
+    ///   event is needed after installation).
+    pub fn install_org_revocation_store(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        let _install = self.org_install.lock();
+        self.install_org_revocation_store_locked(store, false, None)
+    }
+
+    /// Deterministic-witness seam: run a store installation that
+    /// invokes `pause` while the publish pin is held, after the
+    /// dominance comparison and before the swap.
+    /// Exposed as `pub` (not `pub(crate)`) only so the
+    /// `tests/org_ownership.rs` race witnesses can reach it from a
+    /// separate crate; not for production use.
+    #[doc(hidden)]
+    pub fn install_org_revocation_store_paused_for_test(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        let _install = self.org_install.lock();
+        self.install_org_revocation_store_locked(store, false, Some(pause))
+    }
+
+    /// Body of [`Self::install_org_revocation_store`], called with
+    /// the install lock HELD — `install_node_authority` runs its
+    /// one-owner comparison and this store install under ONE lock
+    /// acquisition so no other install can interleave.
+    ///
+    /// `pin_held` is `true` when the caller already holds the
+    /// publish pin over BOTH the current and candidate cores
+    /// (`install_node_authority` pins them across its
+    /// verification): re-acquiring the same non-reentrant reload
+    /// guard here would deadlock, and the caller's pin already
+    /// froze both live views.
+    fn install_org_revocation_store_locked(
+        &self,
+        store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
+        pin_held: bool,
+        pause_before_swap: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+        // Fast poison reject (rechecked UNDER the pin below — a
+        // candidate can be poisoned between here and the swap).
+        if store.is_poisoned() {
+            return Err(
+                super::behavior::org_revocation::OrgRevocationError::Poisoned {
+                    path: store.path().display().to_string(),
+                },
+            );
+        }
+        let current = self.org_revocation.load_full();
+        if let Some(cur) = &current {
+            if Arc::ptr_eq(cur, &store) {
+                return Ok(());
+            }
+        }
+
+        // Pin BOTH the current AND candidate publish transactions
+        // across the poison recheck, the dominance comparison, and
+        // the swap (review-11 P1). Pinning only the current store
+        // (review-10) left the candidate free to publish a stronger
+        // then durability-uncertain view and poison itself between
+        // the poison check and the swap; pinning both freezes the
+        // candidate too. [`publish_guard_pair`] locks distinct
+        // cores in canonical normalized-path order, so two nodes
+        // swapping the opposite pair cannot deadlock ABBA. No
+        // callback runs under this guard (raises notify outside the
+        // reload lock), so holding it cannot deadlock notification.
+        let _pin = if pin_held {
+            None
+        } else {
+            match &current {
+                Some(cur) => Some(super::behavior::org_revocation::publish_guard_pair(
+                    cur, &store,
+                )),
+                None => Some(store.publish_guard()),
+            }
+        };
+
+        // Recheck candidate poison UNDER the pin (review-11 P1):
+        // with the candidate's reload frozen, no apply_bundle can be
+        // mid-rename on it, so this reflects a stable state that
+        // cannot change before the swap — a candidate that became
+        // durability-uncertain after the fast check is refused here.
+        if store.is_poisoned() {
+            return Err(
+                super::behavior::org_revocation::OrgRevocationError::Poisoned {
+                    path: store.path().display().to_string(),
+                },
+            );
+        }
+
+        if let Some(cur) = &current {
+            let current_view = cur.snapshot();
+            let candidate_view = store.snapshot();
+            let dominates = current_view
+                .iter()
+                .all(|((org, member), floor)| candidate_view.floor_for(org, member) >= *floor);
+            if !dominates {
+                return Err(
+                    super::behavior::org_revocation::OrgRevocationError::NonMonotonicReplacement {
+                        path: store.path().display().to_string(),
+                    },
+                );
+            }
+        }
+        if let Some(pause) = pause_before_swap {
+            pause();
+        }
+
+        // Floor raises retract exactly the fold ownership
+        // projections that fell below the new floor — immediately,
+        // with no re-announcement; capability entries untouched
+        // (review-8 §9). The callback first checks that ITS store
+        // is still the installed one (review-9): a detached store's
+        // late raises must not mutate a node it no longer speaks
+        // for. Registered through the subscriber REGISTRY (review-9
+        // addendum) so other observers — another node holding this
+        // same store `Arc`, a same-path sibling handle — keep
+        // their own registrations.
+        let fold = self.capability_fold.clone();
+        let slot = self.org_revocation.clone();
+        let me = Arc::downgrade(&store);
+        // AV-10 / R2-3: liveness is enforced by the subscription's
+        // exclusion lease inside `subscribe_floors_raised`, not a separate
+        // owner token. Dropping the returned guard on teardown/replacement
+        // marks the lease dead and DRAINS any in-flight run of this
+        // callback before removing it, so a callback already snapshotted
+        // by `notify` (which clones the callback Arcs outside the registry
+        // lock) never runs afterward, and one mid-retraction keeps
+        // teardown blocked until it finishes. The `still_installed` check
+        // below remains the store-identity gate for the replacement case.
+        let subscription = store.subscribe_floors_raised(move |raised| {
+            let installed = slot.load_full();
+            let still_installed = match (&installed, me.upgrade()) {
+                (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
+                _ => false,
+            };
+            if !still_installed {
+                return;
+            }
+            // The enforced floor view already changed before this
+            // callback runs — the store's publish generation bumped
+            // inside `StoreCore::publish`, so the send-path
+            // [`SendStamp`] observes it directly (review-11 P1); no
+            // epoch bump is needed here. This callback only retracts
+            // stale fold projections.
+            for (org, member, floor) in raised {
+                let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
+                    &fold, *org, member, *floor,
+                );
+                if retracted > 0 {
+                    tracing::info!(
+                        org = %org,
+                        floor,
+                        retracted,
+                        "revocation floor rise retracted stale ownership projection(s)"
+                    );
+                }
+            }
+        });
+        // Swap the node's observer slot: drop the guard held on the
+        // outgoing store FIRST so a detached store neither keeps nor
+        // steals this node's notifications (review-9 addendum). The old
+        // guard's Drop drains any in-flight old callback and unsubscribes
+        // it via the Weak core (R2-2/R2-3) before the new one is stored.
+        {
+            let mut slot = self.org_raise_subscription.lock();
+            slot.take();
+            *slot = Some(subscription);
+        }
+        self.org_revocation.store(Some(store.clone()));
+        drop(_pin);
+
+        // No epoch bump: the installed store's IDENTITY changed, and
+        // the send-path [`SendStamp`] captures store identity
+        // directly (review-11 P1).
+
+        // Reconcile the candidate's floors against projections that
+        // already exist in the fold: a store installed AFTER its
+        // floors rose produces no callback, so the install itself
+        // performs the retraction sweep (review-9). The snapshot is
+        // taken after the swap, so a raise landing in the gap is
+        // covered either by its (now active) subscription or by
+        // this sweep.
+        let snapshot = store.snapshot();
+        for ((org, member), floor) in snapshot.iter() {
+            let retracted = super::behavior::fold::capability_bridge::retract_floored_ownership(
+                &self.capability_fold,
+                *org,
+                member,
+                *floor,
+            );
+            if retracted > 0 {
+                tracing::info!(
+                    org = %org,
+                    floor,
+                    retracted,
+                    "store installation reconciled stale ownership projection(s)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// OA-1: the installed org revocation store, if any.
+    pub fn org_revocation_store(
+        &self,
+    ) -> Option<Arc<super::behavior::org_revocation::OrgRevocationStore>> {
+        self.org_revocation.load_full()
+    }
+
+    /// OA-2 (Kyra #47 B2): the node-owned admission replay guard shared by every
+    /// protected serve registration on this node — so `(caller, call_id)`
+    /// uniqueness is enforced provider-wide, not fragmented per service.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn rpc_admission_replay_arc(
+        &self,
+    ) -> Arc<super::behavior::org_admission_replay::AdmissionReplayGuard> {
+        self.rpc_admission_replay.clone()
+    }
+
+    /// §6 — the per-peer failed-admission throttle.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn admission_rate_limiter(
+        &self,
+    ) -> &super::behavior::org_admission_replay::AdmissionFailureLimiter {
+        &self.rpc_admission_rate_limit
+    }
+
+    /// OA-1 (review-8 §2/§3): install the node's loaded,
+    /// self-verified [`NodeAuthority`](super::behavior::org_authority::NodeAuthority)
+    /// as THE production authority object — the only certificate
+    /// source for emission and the owner of the installed
+    /// revocation store.
+    ///
+    /// Verifies the authority's certificate names THIS node's
+    /// entity; refuses replacement by a DIFFERENT owner org (one
+    /// node one owner — same-org renewal is accepted); installs
+    /// the authority's revocation store under the monotonic rules
+    /// of [`Self::install_org_revocation_store`]. Emission stays
+    /// wherever it was (off by default) — enabling is the
+    /// separate, explicit [`Self::set_owner_cert_emission`] step.
+    pub fn install_node_authority(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        self.install_node_authority_inner(authority, None)
+    }
+
+    /// Deterministic-witness seam: run an authority installation
+    /// that invokes `pause` while the CANDIDATE store's publish
+    /// guard is held, right after the self-verification. Exposed as
+    /// `pub` (not `pub(crate)`) only so the `tests/org_ownership.rs`
+    /// race witnesses can reach it from a separate crate; not for
+    /// production use.
+    #[doc(hidden)]
+    pub fn install_node_authority_paused_for_test(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        self.install_node_authority_inner(authority, Some(pause))
+    }
+
+    fn install_node_authority_inner(
+        &self,
+        authority: Arc<super::behavior::org_authority::NodeAuthority>,
+        pause_after_verify: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        // Serialize the one-owner comparison, the store install,
+        // and the authority publication under ONE lock acquisition
+        // (review-9: two concurrent installs must not both observe
+        // "no authority" and race different owners through separate
+        // ArcSwap fields).
+        let _install = self.org_install.lock();
+
+        // Review-9 addendum + review-11 P1: pin BOTH the candidate
+        // AND the currently-installed store across verification AND
+        // publication. Without the candidate pin, a concurrent apply
+        // can raise this node's own floor between `self_verify` and
+        // the store install, and the installation would return `Ok`
+        // with an authority that no longer satisfies its "currently
+        // self-verified" contract. Without the current pin, the
+        // downstream store install could not safely compare against
+        // a frozen current view. [`publish_guard_pair`] locks the
+        // two distinct cores in canonical normalized-path order, so
+        // two nodes installing the opposite pair cannot deadlock
+        // ABBA (review-11 P1); same-core dedups to one lock. Under
+        // the pin a racing raise publishes strictly AFTER the
+        // authority — an ordinary post-install raise the
+        // already-subscribed callback retracts, darkening emission.
+        // No callback runs under this pin.
+        let candidate_store = authority.revocation.clone();
+        let current_store = self.org_revocation.load_full();
+        let _pin = match &current_store {
+            Some(cur) if !Arc::ptr_eq(cur, &candidate_store) => Some(
+                super::behavior::org_revocation::publish_guard_pair(cur, &candidate_store),
+            ),
+            _ => Some(candidate_store.publish_guard()),
+        };
+
+        // Review-9: the authority object is RE-VERIFIED here in
+        // full, not trusted as a proof token — `NodeAuthority` is
+        // not immutable (its store can rise after adopt returned,
+        // its config fields are public), so "loaded, self-verified"
+        // must be re-established at the installation boundary:
+        // structural binding to THIS node, wall-clock validity
+        // under the persisted ceremony skew, and the certificate's
+        // standing against the authority's floor snapshot — pinned
+        // by the guard above until publication.
+        authority
+            .config
+            .self_verify(self.identity.entity_id(), &candidate_store.snapshot())?;
+        if let Some(pause) = pause_after_verify {
+            pause();
+        }
+
+        if let Some(existing) = self.node_authority.load_full() {
+            if existing.owner_org() != authority.owner_org() {
+                return Err(
+                    super::behavior::org_authority::OrgAuthorityError::AlreadyOwned {
+                        existing: existing.owner_org(),
+                        requested: authority.owner_org(),
+                    },
+                );
+            }
+        }
+        // The pin is already held over both cores → `pin_held = true`.
+        self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
+            .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
+        self.node_authority.store(Some(authority));
+        // No epoch bump: the installed authority's IDENTITY changed,
+        // captured directly by the send-path [`SendStamp`]
+        // (review-11 P1).
+        //
+        // Kyra OA3-4b1 B2 point 5: a same-org authority replacement rotates the
+        // owner audience key. The send path already refuses cached scoped
+        // ciphertext sealed under the OLD authority (pointer mismatch), but that
+        // stale emission must also be REBUILT under the new key. Wake an
+        // immediate re-announce so a fresh emission is published; until it lands,
+        // the send path keeps the stale scoped envelopes off the wire.
+        // Best-effort — only a node started via `start_arc` (populated
+        // `self_weak`) inside a runtime can spawn; a bare node reconciles on its
+        // next explicit announce.
+        if let Some(weak) = self.self_weak.get().cloned() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let shutdown = self.shutdown.clone();
+                handle.spawn(async move {
+                    let Some(node) = weak.upgrade() else {
+                        return;
+                    };
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Rebuild from the CURRENT live baseline (`None`), never a
+                    // captured snapshot: a captured baseline would reintroduce the
+                    // RT-3 stale-baseline race — a concurrent explicit announce's
+                    // newer baseline could be clobbered when this task resumes and
+                    // republishes its stale copy (Kyra OA3-4b1 B2). `None` re-reads
+                    // the live user baseline at publish time. The default 300s TTL
+                    // matches the prior call's behavior.
+                    if let Err(e) = node
+                        .announce_from_baseline(None, Duration::from_secs(300), true)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "authority install: post-install re-announce failed"
+                        );
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// OA-1: the installed node authority, if any.
+    pub fn node_authority(&self) -> Option<Arc<super::behavior::org_authority::NodeAuthority>> {
+        self.node_authority.load_full()
+    }
+
+    /// Best-effort wake of a current-baseline re-announce (OA3-4b2): a provider
+    /// grant mutation changes the granted-envelope projection, so republish a
+    /// fresh, coherent emission (public + owner + granted). Rebuilds from the
+    /// CURRENT live baseline (`None`), never a captured one — a captured baseline
+    /// would reintroduce the RT-3 stale-baseline race (Kyra OA3-4b1 B2). Only a
+    /// node started via `start_arc` (populated `self_weak`) inside a runtime can
+    /// spawn; a bare node reconciles on its next explicit announce, and until the
+    /// rebuild lands the send-path pointer check keeps the stale granted envelopes
+    /// off the wire.
+    fn wake_baseline_reannounce(&self) {
+        if let Some(weak) = self.self_weak.get().cloned() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let shutdown = self.shutdown.clone();
+                handle.spawn(async move {
+                    let Some(node) = weak.upgrade() else {
+                        return;
+                    };
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Err(e) = node
+                        .announce_from_baseline(None, Duration::from_secs(300), true)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "grant-audience mutation: post-mutation re-announce failed"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    /// OA3-4b2: install a PROVIDER grant-audience record — a grant this node's own
+    /// org issued that applies to THIS provider, plus its out-of-band secret. The
+    /// record must satisfy every install invariant (grant verifies, is currently
+    /// valid, carries DISCOVER + a discovery binding, the secret is the grant's
+    /// out-of-band key, `issuer_org == this node's owner org`, and the grant's
+    /// target scope covers this exact provider); otherwise it is refused
+    /// fail-closed. A byte-identical re-install is idempotent; a DIFFERENT
+    /// grant/secret under the same `grant_id` is a
+    /// [`GrantAudienceInstallError::Conflict`] (replacement is an explicit
+    /// remove-then-install). At capacity a new record is refused rather than
+    /// evicting an active one. REQUIRES an installed node authority.
+    ///
+    /// [`GrantAudienceInstallError::Conflict`]: super::behavior::org_grant_registry::GrantAudienceInstallError::Conflict
+    pub fn install_provider_grant_audience(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::GrantAudienceInstalled,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_provider_record, GrantAudienceInstallError, GrantAudienceInstalled,
+        };
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(GrantAudienceInstallError::NoAuthority)?;
+        let now_secs = super::behavior::org::current_timestamp();
+        let record = validate_provider_record(
+            grant,
+            secret,
+            &authority.owner_org(),
+            self.identity.entity_id(),
+            now_secs,
+            authority.config.verification_skew_secs,
+        )?;
+        // Serialize the read-validate-store so two concurrent installs cannot both
+        // load the same snapshot and lose one. Reads elsewhere stay lock-free.
+        let outcome = {
+            let _guard = self.provider_grant_mu.lock();
+            let current = self.provider_grant_audiences.load_full();
+            match current.with_record(Arc::new(record), now_secs)? {
+                Some(next) => {
+                    self.provider_grant_audiences.store(Arc::new(next));
+                    GrantAudienceInstalled::Installed
+                }
+                // Idempotent: an identical record was already present — do NOT
+                // rotate the pointer (a churned snapshot would invalidate cached
+                // emissions).
+                None => GrantAudienceInstalled::AlreadyPresent,
+            }
+        };
+        // Only a real install changes the granted-envelope projection; an
+        // idempotent no-op must not churn the emission.
+        if matches!(outcome, GrantAudienceInstalled::Installed) {
+            self.wake_baseline_reannounce();
+        }
+        Ok(outcome)
+    }
+
+    /// OA3-4b2: remove a PROVIDER grant-audience record by `grant_id`. Returns
+    /// `true` iff a record was removed. The removed record's `Arc` stays alive
+    /// while any in-flight snapshot or emission still holds it; its secret key is
+    /// zeroized when the last holder releases it (see
+    /// [`OrgAudienceSecret`](super::behavior::org_grant::OrgAudienceSecret)).
+    pub fn remove_provider_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
+        let removed = {
+            let _guard = self.provider_grant_mu.lock();
+            let current = self.provider_grant_audiences.load_full();
+            match current.without(grant_id) {
+                Some(next) => {
+                    self.provider_grant_audiences.store(Arc::new(next));
+                    true
+                }
+                None => false,
+            }
+        };
+        // A removal changes the granted-envelope projection: wake a rebuild so the
+        // cached (now-stale) granted envelope is republished without it. Until the
+        // rebuild lands, the send-path pointer check already refuses the stale one.
+        if removed {
+            self.wake_baseline_reannounce();
+        }
+        removed
+    }
+
+    /// OA3-4b2: install a CONSUMER grant-audience record — a grant whose
+    /// `grantee_org` is this node's own org, plus its out-of-band secret. Same
+    /// invariants as the provider install except the role check is
+    /// `grantee_org == this node's owner org` (the grant names A, this node); no
+    /// target-scope check (the target is the remote provider). Idempotent /
+    /// conflict / capacity semantics match the provider install. REQUIRES an
+    /// installed node authority.
+    pub fn install_consumer_grant_audience(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::GrantAudienceInstalled,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_consumer_record, GrantAudienceInstallError, GrantAudienceInstalled,
+        };
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(GrantAudienceInstallError::NoAuthority)?;
+        let now_secs = super::behavior::org::current_timestamp();
+        let record = validate_consumer_record(
+            grant,
+            secret,
+            &authority.owner_org(),
+            now_secs,
+            authority.config.verification_skew_secs,
+        )?;
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.with_record(Arc::new(record), now_secs)? {
+            Some(next) => {
+                self.consumer_grant_audiences.store(Arc::new(next));
+                Ok(GrantAudienceInstalled::Installed)
+            }
+            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+        }
+    }
+
+    /// OA3-4b2: remove a CONSUMER grant-audience record by `grant_id`. Returns
+    /// `true` iff a record was removed. Once removed, no inbound envelope for the
+    /// grant can be opened, and any already-stored record for it becomes
+    /// non-queryable (OA3-4b2 slice 4 query-time consumer currentness).
+    pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.without(grant_id) {
+            Some(next) => {
+                self.consumer_grant_audiences.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test seam (OA3-4b2): the number of active PROVIDER grant-audience records.
+    #[doc(hidden)]
+    pub fn provider_grant_audiences_len_for_test(&self) -> usize {
+        self.provider_grant_audiences.load().len()
+    }
+
+    /// Test seam (OA3-4b2): the number of active CONSUMER grant-audience records.
+    #[doc(hidden)]
+    pub fn consumer_grant_audiences_len_for_test(&self) -> usize {
+        self.consumer_grant_audiences.load().len()
+    }
+
+    /// OA-1: enable or disable attaching the INSTALLED authority's
+    /// owner certificate to this node's own capability
+    /// announcements. There is no way to emit any other
+    /// certificate (review-8 §3) — the local scaffold selects the
+    /// one authoritative owner.
+    ///
+    /// This is the plan's Migration **step 3** switch
+    /// (`upgrade-all-then-emit`): with emission off the signed
+    /// announcement bytes stay identical to pre-OA-1, so mixed
+    /// fleets interoperate; with emission on, a not-yet-upgraded
+    /// signed-mode peer fails signature verification on the new
+    /// field and drops this node's announcements (fail-closed).
+    /// Enable only after every participant is upgraded.
+    ///
+    /// Enabling on a node with no installed authority fails loudly.
+    /// The next self-announcement (periodic or service-driven)
+    /// carries the change; no immediate re-broadcast is forced.
+    pub fn set_owner_cert_emission(
+        &self,
+        enabled: bool,
+    ) -> Result<(), super::behavior::org_authority::OrgAuthorityError> {
+        if enabled && self.node_authority.load().is_none() {
+            return Err(super::behavior::org_authority::OrgAuthorityError::NoAuthorityInstalled);
+        }
+        self.owner_cert_emission_enabled
+            .store(enabled, Ordering::Release);
+        // The emission toggle changes neither a store/authority
+        // pointer nor a publish generation, so it is the one input
+        // the send-path [`SendStamp`] cannot observe indirectly —
+        // bump its dedicated counter so a cached announcement
+        // re-validates before its next send (review-11 P1).
+        self.emission_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Seal this node's owner-scoped services into encrypted owner-audience
+    /// announcement envelope(s) for `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` (OA3-4b1
+    /// Commit B2). The descriptor is a [`CapabilitySet`] of the owner-scoped
+    /// `nrpc:<svc>` tags — the private services this envelope confidentially
+    /// advertises to the node's OWN owner audience; a single envelope carries all
+    /// of them (granted-audience fanout is a later slice).
+    ///
+    /// `authority` and `owner_cert` are PINNED by the caller — the same
+    /// `Arc<NodeAuthority>` that supplied the public announcement's cert also
+    /// supplies the audience key here, so a concurrent same-org rotation cannot
+    /// pair one authority's cert with another's key (Kyra OA3-4b1 B2). The caller
+    /// records that Arc in the emission so the send path refuses if it is later
+    /// replaced. A seal/sign failure logs and drops the envelope (fail-safe)
+    /// without blocking the plaintext announcement.
+    #[cfg(feature = "cortex")]
+    fn owner_scoped_envelopes(
+        &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        owner_cert: super::behavior::org::OrgMembershipCert,
+        owner_scoped: &[String],
+        generation: u64,
+        now_secs: u64,
+        ttl: Duration,
+    ) -> Vec<Vec<u8>> {
+        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+        let mut descriptor_caps = CapabilitySet::new();
+        for svc in owner_scoped {
+            descriptor_caps = descriptor_caps.add_tag(format!("nrpc:{}", svc.as_str()));
+        }
+        let descriptor = descriptor_caps.to_bytes_compact();
+        let expires_at = now_secs.saturating_add(ttl.as_secs());
+        match ScopedCapabilityAnnouncement::build_owner(
+            &self.identity,
+            authority.owner_org(),
+            owner_cert,
+            authority.audience.audience_handle,
+            authority.audience.discovery_key(),
+            generation,
+            expires_at,
+            &descriptor,
+        ) {
+            Ok(envelope) => vec![envelope.to_bytes()],
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "owner-scoped announcement seal failed; envelope dropped this round"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// OA3-4b2: the bounded GRANTED-audience envelopes for one emission. For each
+    /// ACTIVE provider grant record, select the locally-registered
+    /// `GrantedAudience` service tags whose capability id equals the grant's
+    /// capability; if that set is nonempty, build EXACTLY ONE `build_granted`
+    /// envelope sealed under that grant's key. Overlapping grants (two valid
+    /// grants for the same capability) yield TWO independently-decryptable
+    /// envelopes — never coalesced by capability, grantee org, or handle: each
+    /// grant/key pair is its own revocation + expiry boundary. The whole fanout
+    /// is bounded by [`MAX_PROVIDER_GRANT_AUDIENCES`](super::behavior::org_grant_registry::MAX_PROVIDER_GRANT_AUDIENCES)
+    /// (the registry cap), so an emission ships at most one granted envelope per
+    /// active record.
+    ///
+    /// `expires_at = min(now + ttl, grant.not_after, owner_cert.not_after)` — a
+    /// descriptor never outlives its grant or the provider's membership; a
+    /// born-expired record (grant or cert already lapsed) is skipped rather than
+    /// shipped. The grant's stored bytes were signature-verified at install and
+    /// are immutable, so this hot path re-checks only the (cheap) time bound via
+    /// the expiry min — never the ed25519 signature. `authority` + `owner_cert`
+    /// are the SAME pinned pair the public/owner envelopes use; the caller retains
+    /// the exact `Arc<ProviderGrantSnapshot>` so the send path refuses if a grant
+    /// mutation swaps it. A per-envelope seal/sign failure logs and drops that
+    /// envelope (fail-safe), never blocking the others or the plaintext announce.
+    #[cfg(feature = "cortex")]
+    #[allow(clippy::too_many_arguments)]
+    fn granted_envelopes(
+        &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        owner_cert: &super::behavior::org::OrgMembershipCert,
+        provider_grants: &super::behavior::org_grant_registry::ProviderGrantSnapshot,
+        granted_services: &[String],
+        generation: u64,
+        now_secs: u64,
+        ttl: Duration,
+    ) -> Vec<Vec<u8>> {
+        use super::behavior::org_grant::CapabilityAuthorityId;
+        use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+        // Precompute each granted service's capability id ONCE (blake3 per tag),
+        // then match records against it — O(services + services*records) rather
+        // than a hash per (service, record) pair.
+        let tagged: Vec<(String, CapabilityAuthorityId)> = granted_services
+            .iter()
+            .map(|svc| {
+                let tag = format!("nrpc:{}", svc.as_str());
+                let id = CapabilityAuthorityId::for_tag(&tag);
+                (tag, id)
+            })
+            .collect();
+
+        let base_expiry = now_secs.saturating_add(ttl.as_secs());
+        let mut envelopes = Vec::new();
+        for record in provider_grants.records() {
+            let grant = record.grant();
+            // Emission is a LATER authority decision than installation (Kyra
+            // OA3-4b2 closure): re-check the full validity window, issuer
+            // applicability, and target coverage against THIS emission's clock +
+            // authority before building. An inactive record (not-yet-valid,
+            // expired, or inapplicable under a since-changed authority) is omitted
+            // for this round; the snapshot stays installed for when it applies.
+            if !super::behavior::org_grant_registry::grant_active_for_emission(
+                grant,
+                self.identity.entity_id(),
+                &authority.owner_org(),
+                now_secs,
+                authority.config.verification_skew_secs,
+            ) {
+                continue;
+            }
+            // The descriptor names every locally-registered granted tag matching
+            // THIS grant's capability (ordinarily exactly one).
+            let mut descriptor_caps = CapabilitySet::new();
+            let mut matched = false;
+            for (tag, id) in &tagged {
+                if id == &grant.capability {
+                    descriptor_caps = descriptor_caps.add_tag(tag.clone());
+                    matched = true;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            // expires_at bounded by the grant and the provider's membership; a
+            // record whose grant or cert has already lapsed is born-expired — skip.
+            let expires_at = base_expiry.min(grant.not_after).min(owner_cert.not_after);
+            if expires_at <= now_secs {
+                continue;
+            }
+            let descriptor = descriptor_caps.to_bytes_compact();
+            match ScopedCapabilityAnnouncement::build_granted(
+                &self.identity,
+                authority.owner_org(),
+                owner_cert.clone(),
+                grant.grant_id,
+                *record.audience_handle(),
+                record.secret().discovery_key(),
+                generation,
+                expires_at,
+                &descriptor,
+            ) {
+                Ok(envelope) => envelopes.push(envelope.to_bytes()),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "granted-audience announcement seal failed; envelope dropped this round"
+                    );
+                }
+            }
+        }
+        envelopes
+    }
+
+    /// The certificate self-announcements attach right now: the
+    /// installed authority's owner cert iff emission is enabled.
+    fn owner_cert_for_emission(&self) -> Option<super::behavior::org::OrgMembershipCert> {
+        self.owner_cert_for_emission_at(super::behavior::org::current_timestamp())
+    }
+
+    /// Explicit-time variant of [`Self::owner_cert_for_emission`]
+    /// (AV-11): evaluates the owner cert's temporal validity against
+    /// `now_secs` rather than a fresh wall read, so the send seqlock —
+    /// and the deterministic expiry tests that drive it — can decide
+    /// expiry at a chosen instant with no real sleep.
+    fn owner_cert_for_emission_at(
+        &self,
+        now_secs: u64,
+    ) -> Option<super::behavior::org::OrgMembershipCert> {
+        let authority = self.node_authority.load_full()?;
+        self.owner_cert_under(&authority, now_secs)
+    }
+
+    /// The valid emission cert under a SPECIFIC pinned authority — the shared
+    /// body of [`Self::owner_cert_for_emission_at`]. `announce_from_baseline`
+    /// pins one `Arc<NodeAuthority>` and derives BOTH the public cert (here) and
+    /// the scoped envelope's audience key from it, so a concurrent same-org
+    /// rotation cannot pair one authority's cert with another's key (Kyra
+    /// OA3-4b1 B2).
+    fn owner_cert_under(
+        &self,
+        authority: &super::behavior::org_authority::NodeAuthority,
+        now_secs: u64,
+    ) -> Option<super::behavior::org::OrgMembershipCert> {
+        if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let cert = &authority.config.owner_cert;
+        // Review-9: emission must not keep advertising a
+        // certificate that is no longer valid against the ACTIVE
+        // authority state — an expired window or a floor raised
+        // above the cert's own generation (self-revocation) goes
+        // loudly dark instead of continuing to claim belonging.
+        if let Err(e) =
+            cert.is_valid_at_with_skew(now_secs, authority.config.verification_skew_secs)
+        {
+            tracing::warn!(
+                org = %cert.org_id,
+                error = %e,
+                "owner-cert emission dark: installed certificate is no longer valid"
+            );
+            return None;
+        }
+        if let Some(store) = self.org_revocation.load_full() {
+            let floor = store.floor_for(&cert.org_id, &cert.member);
+            if cert.generation < floor {
+                tracing::warn!(
+                    org = %cert.org_id,
+                    generation = cert.generation,
+                    floor,
+                    "owner-cert emission dark: revocation floor rose above this node's \
+                     own certificate — renew via `net node adopt`"
+                );
+                return None;
+            }
+        }
+        Some(cert.clone())
+    }
+
+    /// Capture the current [`SendStamp`] — the authoritative inputs
+    /// to owner-cert emission, read directly from live state
+    /// (review-11 P1). Two reads with an equal stamp bracket an
+    /// interval in which no store/authority (re)installation, no
+    /// floor publish, and no emission toggle occurred.
+    fn security_stamp(&self) -> SendStamp {
+        self.security_snapshot().stamp
+    }
+
+    /// Capture the [`SendStamp`] AND retain the exact authority/store
+    /// `Arc`s it fingerprints (Kyra Gate-1 audit). The seqlock holds
+    /// the returned snapshot across derive → serialize → the second
+    /// stamp comparison so those `Arc`s cannot be dropped and their
+    /// addresses reused for a DIFFERENT authority/store mid-send — the
+    /// pointer-ABA that a raw `Arc::as_ptr` comparison alone would
+    /// miss. The store generation is read via
+    /// [`OrgRevocationStore::barriered_generation`], which synchronizes
+    /// through the live-view lock, so a floor publish that has swapped
+    /// the view but not yet bumped the generation is never observed as
+    /// "unchanged".
+    fn security_snapshot(&self) -> SendSecuritySnapshot {
+        let store = self.org_revocation.load_full();
+        let authority = self.node_authority.load_full();
+        let stamp = SendStamp {
+            store_ptr: store
+                .as_ref()
+                .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
+            store_generation: store.as_ref().map_or(0, |s| s.barriered_generation()),
+            authority_ptr: authority
+                .as_ref()
+                .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
+            emission_generation: self
+                .emission_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        };
+        SendSecuritySnapshot {
+            stamp,
+            _authority: authority,
+            _store: store,
+        }
+    }
+
+    /// Serialize the cached local announcement for a reusing send
+    /// path — the immediate broadcast, the trailing-edge flush,
+    /// the session-open push (review-9 addendum). Runs as a SEQLOCK
+    /// over the [`SendStamp`] (review-11 P1): capture the stamp,
+    /// derive the certificate emission would attach NOW (which
+    /// re-checks wall-clock validity + floor + emission), serialize,
+    /// and emit the bytes ONLY if the stamp still holds — otherwise
+    /// the enforced state moved during the read and we retry. A
+    /// cached certificate that no longer matches the derived one
+    /// (self-floor rose, authority swapped, emission toggled, OR
+    /// the certificate simply expired by wall clock) triggers a
+    /// rebuild WITHOUT it — re-signed, version-bumped so it
+    /// supersedes the certified form at peers that already hold it.
+    /// Returns the coherent [`SendEmission`] — the public CAP-ANN bytes plus any
+    /// owner-scoped envelopes, both from one validated `local_emission` load — or
+    /// `None` when nothing has been announced yet, or (only under pathological
+    /// continuous churn) when the seqlock cannot converge — skipping one send is
+    /// fail-safe (never a stale cert).
+    fn announcement_bytes_for_send(&self) -> Option<SendEmission> {
+        self.announcement_bytes_for_send_probed(None, super::behavior::org::current_timestamp())
+    }
+
+    /// Seqlock body of [`Self::announcement_bytes_for_send`].
+    /// `probe`, when set, runs AFTER the first stamp + serialize and
+    /// BEFORE the stability recheck — the exact window a concurrent
+    /// floor publish / store swap / authority swap would land in.
+    /// A test injects a state change there to prove the recheck
+    /// catches it and the stale bytes are discarded rather than
+    /// emitted. The closure fires every iteration; a one-shot test
+    /// closure makes the loop converge.
+    fn announcement_bytes_for_send_probed(
+        &self,
+        probe: Option<&dyn Fn()>,
+        now_secs: u64,
+    ) -> Option<SendEmission> {
+        for _ in 0..16 {
+            let cached = self.local_emission.load_full()?;
+            // Reject an emission derived from a STALE visibility snapshot: if a
+            // concurrent registration took a name OUT of the public projection
+            // since this emission was built, its plaintext tag set is no longer
+            // correct (an owner-scoped service could have replaced a public one).
+            // Skip the send — the same transition woke a re-announce that publishes
+            // a fresh, coherent emission, and the caller releases the rate-limit
+            // window it claimed so that re-announce isn't coalesced away (Kyra OA3
+            // closure).
+            #[cfg(feature = "cortex")]
+            if cached.exposure_revocation_generation
+                != self.rpc_local_services.exposure_revocation_generation()
+            {
+                return None;
+            }
+            // Capture the stamp AND PIN the authority/store Arcs it
+            // fingerprints (Kyra Gate-1 audit — ABA). `snapshot` is
+            // held across the derive + serialize + recheck below, so
+            // the captured addresses cannot be reused mid-send.
+            let snapshot = self.security_snapshot();
+            let stamp = snapshot.stamp;
+            // Derive what emission would attach right now. This
+            // re-checks temporal validity every send, so a cert
+            // that expired by wall clock (which bumps no
+            // generation) is caught here even with a stable stamp
+            // (review-11 P1 — certificate expiry honored on every
+            // reuse boundary).
+            let desired = self.owner_cert_for_emission_at(now_secs);
+            if desired == cached.public.owner_cert {
+                let bytes = cached.public.to_bytes();
+                if let Some(probe) = probe {
+                    probe();
+                }
+                // Recheck the visibility generation BESIDE the final security-stamp
+                // comparison (Kyra OA3 item-2 race): a Public -> OwnerScoped
+                // transition landing AFTER serialization but before this check must
+                // not release the already-serialized stale plaintext bytes. The
+                // early check at the top of the loop is only a cheap fast-path; THIS
+                // is the correctness boundary.
+                #[cfg(feature = "cortex")]
+                let visibility_stable = cached.exposure_revocation_generation
+                    == self.rpc_local_services.exposure_revocation_generation();
+                #[cfg(not(feature = "cortex"))]
+                let visibility_stable = true;
+                // Kyra OA3-4b1 B2 rotation safety: the owner-scoped envelopes in
+                // `cached.scoped` were sealed under a specific owner audience key,
+                // recorded as `scoped_authority`. If a same-org authority
+                // replacement rotated that key after this emission was built, the
+                // public cert stays equal (so the cert rebuild above does not fire)
+                // and the visibility generation is unchanged — only a direct
+                // authority-identity comparison catches it. Pointer comparison is
+                // ABA-safe: `cached` holds the original Arc alive, so a replacement
+                // is necessarily a different allocation.
+                let authority_stable = match &cached.scoped_authority {
+                    Some(built) => self
+                        .node_authority
+                        .load_full()
+                        .as_ref()
+                        .map(|current| Arc::ptr_eq(current, built))
+                        .unwrap_or(false),
+                    None => true,
+                };
+                // OA3-4b2 emission coherence: the granted envelopes in
+                // `cached.scoped` were sealed under a specific provider grant
+                // snapshot, recorded as `provider_grant_snapshot`. A grant
+                // install/remove/replace swaps the registry pointer, so a cached
+                // granted ciphertext sealed under a since-mutated grant must not
+                // ship. Same ABA-safe pointer comparison as the owner authority —
+                // `cached` holds the original snapshot Arc alive.
+                let provider_grants_stable = match &cached.provider_grant_snapshot {
+                    Some(built) => Arc::ptr_eq(&self.provider_grant_audiences.load_full(), built),
+                    None => true,
+                };
+                // Emit only if nothing moved during the derive + serialize — the
+                // security stamp, the visibility generation, the sealing authority,
+                // AND the sealing provider snapshot all still hold. The pinned
+                // `snapshot` Arcs are still alive for this comparison, so a
+                // swapped-away authority/store cannot reuse the captured addresses.
+                if self.security_stamp() == stamp
+                    && visibility_stable
+                    && authority_stable
+                    && provider_grants_stable
+                {
+                    // Pair the serialized public bytes with the owner + granted
+                    // envelopes from the SAME validated `cached` load — one coherent
+                    // generation, never a torn public/scoped snapshot (Kyra OA3). A
+                    // cert-invalidating rebuild has already cleared `scoped`, so an
+                    // envelope embedding a stale cert cannot ship.
+                    return Some(SendEmission {
+                        public: bytes,
+                        scoped: cached.scoped.clone(),
+                        exposure_generation: cached.exposure_revocation_generation,
+                    });
+                }
+                // A visibility change, an authority rotation, or a grant mutation is
+                // terminal for this send — each already woke a re-announce that will
+                // publish a coherent emission; do not retry against state that just
+                // changed.
+                if !visibility_stable || !authority_stable || !provider_grants_stable {
+                    return None;
+                }
+                continue;
+            }
+            // The cached cert is stale: rebuild cert-adjusted and
+            // republish, then loop to serialize the rebuilt form
+            // under a fresh stability check.
+            self.rebuild_cached_announcement(desired);
+        }
+        tracing::warn!(
+            "announcement send skipped: emission state churned past the seqlock \
+             retry budget; the next send will reconcile"
+        );
+        None
+    }
+
+    /// Deterministic-witness seam (Kyra OA3 review, Finding 3): run a normal
+    /// announce with `probe` fired inside the send seqlock. A witness advances
+    /// the exposure epoch there — exactly what a concurrent revocation does —
+    /// forcing THIS attempt to be refused on security grounds, then observes
+    /// that the refusing sender itself drives a corrective send. Make the probe
+    /// one-shot or the corrective passes are refused too.
+    #[doc(hidden)]
+    pub async fn announce_with_send_probe_for_test(
+        &self,
+        caps: CapabilitySet,
+        probe: &(dyn Fn() + Sync),
+    ) -> Result<(), AdapterError> {
+        self.announce_from_baseline_probed(Some(caps), Duration::from_secs(300), true, Some(probe))
+            .await
+    }
+
+    /// Deterministic-witness seam (Kyra OA3 review, Finding 4): claim the
+    /// broadcast window AT AN EXPLICIT INSTANT, returning
+    /// `(claim_id, previous_timestamp)`. Taking `now` explicitly lets a witness
+    /// give two claimants the SAME `Instant` — the case a timestamp-equality
+    /// ownership test gets wrong and a monotonic token gets right.
+    #[doc(hidden)]
+    pub fn test_claim_broadcast_window_at(
+        &self,
+        now: std::time::Instant,
+    ) -> (u64, Option<std::time::Instant>) {
+        // Delegates to the production claim helper — see
+        // `test_release_broadcast_claim` for why these seams must not mirror.
+        self.claim_broadcast_window(now)
+    }
+
+    /// Deterministic-witness seam: the release half of
+    /// [`Self::test_claim_broadcast_window_at`], applying the same still-ours
+    /// rule the refused-send path uses.
+    #[doc(hidden)]
+    pub fn test_release_broadcast_claim(
+        &self,
+        claim_id: u64,
+        previous: Option<std::time::Instant>,
+    ) {
+        // Delegates to the PRODUCTION rule — a mirrored copy here would let the
+        // witness keep passing while the real release path regressed.
+        self.release_broadcast_claim(claim_id, previous);
+    }
+
+    /// Claim the broadcast window under an ALREADY-HELD gate lock, returning
+    /// `(claim_id, displaced timestamp)`.
+    ///
+    /// Every path that takes ownership of the window goes through here or its
+    /// locking wrapper — the immediate announce, the deferred trailing-edge
+    /// flush, and the witness seam. A path that wrote `last_broadcast_at`
+    /// WITHOUT advancing the token would be invisible to
+    /// [`Self::release_broadcast_claim`]: an older refused sender would still
+    /// compare equal and roll its predecessor back over the newer window (Kyra
+    /// OA3 review — deferred-flush claim ownership).
+    fn claim_broadcast_window_locked(
+        gate: &mut AnnounceGate,
+        now: std::time::Instant,
+    ) -> (u64, Option<std::time::Instant>) {
+        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
+        (
+            gate.broadcast_claim_generation,
+            gate.last_broadcast_at.replace(now),
+        )
+    }
+
+    /// [`Self::claim_broadcast_window_locked`], taking the gate lock.
+    fn claim_broadcast_window(&self, now: std::time::Instant) -> (u64, Option<std::time::Instant>) {
+        let mut gate = self.announce_gate.lock();
+        Self::claim_broadcast_window_locked(&mut gate, now)
+    }
+
+    /// Reset the rate-limit floor so the next announce broadcasts
+    /// unconditionally, cancelling any pending trailing-edge flush.
+    ///
+    /// Advancing the claim token is load-bearing, not bookkeeping: a reset
+    /// INVALIDATES outstanding ownership. Without the bump, a sender that
+    /// claimed before the reset and is refused after it would still hold a
+    /// matching token and restore its predecessor timestamp over the reset —
+    /// silently re-arming the rate limit the reset just cleared.
+    fn invalidate_broadcast_window(&self) {
+        let mut gate = self.announce_gate.lock();
+        gate.broadcast_claim_generation = gate.broadcast_claim_generation.wrapping_add(1);
+        gate.last_broadcast_at = None;
+        gate.deferred_scheduled = false;
+    }
+
+    /// Record that the wire now reflects every exposure revocation up to
+    /// `shipped`, so ordinary rate limiting resumes until the next one. Shared
+    /// by the immediate and deferred send paths — a path that broadcasts
+    /// without recording would leave every later announce permanently
+    /// security-priority.
+    fn record_broadcast_exposure_generation(&self, shipped: u64) {
+        let mut gate = self.announce_gate.lock();
+        gate.last_broadcast_exposure_generation =
+            gate.last_broadcast_exposure_generation.max(shipped);
+    }
+
+    /// Release a broadcast-window claim, but ONLY if it is still ours. Ownership
+    /// is decided by the monotonic claim token, never by comparing the stored
+    /// `Instant` to the one we wrote: two claimants can read the same
+    /// `Instant::now()` at platform clock resolution, and a timestamp match would
+    /// then let a stale claimant reopen a window a newer claimant owns (Kyra OA3
+    /// review, Finding 4).
+    fn release_broadcast_claim(&self, claim_id: u64, previous: Option<std::time::Instant>) {
+        let mut gate = self.announce_gate.lock();
+        if gate.broadcast_claim_generation == claim_id {
+            gate.last_broadcast_at = previous;
+        }
+    }
+
+    /// Deterministic-witness seam: arm a deferred trailing-edge flush slot and
+    /// return its deferral generation, so a witness can drive the REAL
+    /// [`Self::flush_deferred_announce`] without waiting on a timer.
+    #[doc(hidden)]
+    pub fn test_arm_deferred_flush(&self) -> u64 {
+        let mut gate = self.announce_gate.lock();
+        gate.deferred_scheduled = true;
+        gate.deferral_generation = gate.deferral_generation.wrapping_add(1);
+        gate.deferral_generation
+    }
+
+    /// Deterministic-witness seam: run the REAL deferred flush, optionally with
+    /// a probe fired inside its send seqlock. Delegates to the production path —
+    /// the witness must exercise the flush's own claim/refusal handling, not a
+    /// copy of it.
+    #[doc(hidden)]
+    pub async fn test_flush_deferred_announce(
+        &self,
+        generation: u64,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) {
+        self.flush_deferred_announce_probed(generation, probe).await
+    }
+
+    /// Deterministic-witness seam: the rate-limit-floor reset the reflex-override
+    /// paths perform. Delegates to the production
+    /// [`Self::invalidate_broadcast_window`] so the witness covers the real rule
+    /// (and stays reachable without the `nat-traversal` feature).
+    #[doc(hidden)]
+    pub fn test_invalidate_broadcast_window(&self) {
+        self.invalidate_broadcast_window();
+    }
+
+    /// Deterministic-witness seam: the current broadcast-window timestamp.
+    #[doc(hidden)]
+    pub fn test_broadcast_window_at(&self) -> Option<std::time::Instant> {
+        self.announce_gate.lock().last_broadcast_at
+    }
+
+    /// Deterministic-witness seam for the send-time serialization
+    /// boundary every reusing path shares. Exposed as `pub` (not
+    /// `pub(crate)`) only so `tests/org_ownership.rs` can decode
+    /// what a send path would put on the wire; not for production
+    /// use.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_for_test(&self) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send().map(|e| e.public)
+    }
+
+    /// Deterministic-witness seam: the owner-scoped encrypted envelopes a send
+    /// would ship on `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` right now, taken from
+    /// the SAME validated emission load as
+    /// [`Self::announcement_bytes_for_send_for_test`] (so a test observes the
+    /// public and scoped forms of one coherent generation). Empty when nothing
+    /// has been announced or no owner-scoped service is emitting. Test-only.
+    #[doc(hidden)]
+    pub fn announcement_scoped_for_send_for_test(&self) -> Vec<Vec<u8>> {
+        self.announcement_bytes_for_send()
+            .map(|e| e.scoped)
+            .unwrap_or_default()
+    }
+
+    /// Test seam (OA3-5): drive the exact inbound owner-scoped ingest path with a
+    /// raw envelope, without a live two-node transport. Verifies against this
+    /// node's installed authority + live revocation floors and stores on success
+    /// — identical to the `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` dispatch arm.
+    #[doc(hidden)]
+    pub fn ingest_scoped_announcement_for_test(&self, envelope: &[u8]) {
+        let Ok(decoded) =
+            super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::from_bytes(envelope)
+        else {
+            return;
+        };
+        Self::ingest_scoped_announcement(
+            &self.node_authority,
+            &self.org_revocation,
+            &self.consumer_grant_audiences,
+            &self.scoped_discovery,
+            &decoded,
+            0,
+            None,
+        );
+    }
+
+    /// Deterministic-witness seam (OA3-5 publication-race): drive the inbound
+    /// owner-scoped ingest with a `probe` fired in the exact window between a
+    /// successful verify and the pre-insert stability recheck — where a
+    /// concurrent floor publish / store swap / authority rotation would land. A
+    /// witness raises a floor (or rotates the authority) inside `probe` to prove
+    /// the recheck refuses the now-stale insert. Test-only.
+    #[doc(hidden)]
+    pub fn ingest_scoped_announcement_probed_for_test(
+        &self,
+        envelope: &[u8],
+        probe: &(dyn Fn() + Sync),
+    ) {
+        let Ok(decoded) =
+            super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement::from_bytes(envelope)
+        else {
+            return;
+        };
+        Self::ingest_scoped_announcement(
+            &self.node_authority,
+            &self.org_revocation,
+            &self.consumer_grant_audiences,
+            &self.scoped_discovery,
+            &decoded,
+            0,
+            Some(probe),
+        );
+    }
+
+    /// Test seam (OA3-5): the provider entity ids of the owner-scoped
+    /// capabilities the private-discovery store exposes at `now_secs`
+    /// (expiry-safe — tombstoned/expired entries excluded; currentness-safe —
+    /// entries whose provider floor has since risen are excluded against the
+    /// node's LIVE revocation snapshot, exactly as a real query would).
+    /// Test seam (OA3-5 §3.2): how many outer identities the relay dedup gate is
+    /// currently tracking. A relay that FORWARDED an envelope has admitted it
+    /// here even though (lacking the audience) it stored nothing in the scoped
+    /// discovery store.
+    #[doc(hidden)]
+    pub fn scoped_relay_gate_len_for_test(&self) -> usize {
+        self.scoped_relay_gate.len()
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
+        // node with no revocation store queries against an implicit empty floor
+        // set), so the currentness filter reflects real node state.
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        self.scoped_discovery
+            .lock()
+            .find_owner_private_capabilities(now_secs, floors, |_| true)
+            .into_iter()
+            .map(|c| c.provider().clone())
+            .collect()
+    }
+
+    /// Test seam (OA3-4b2): the provider entity ids of the GRANTED-audience
+    /// capabilities discovered under `grant_id`, at `now_secs`. Applies QUERY-TIME
+    /// CONSUMER CURRENTNESS bound to the EXACT installed grant authority (Kyra
+    /// OA3-4b2 closure): a granted record is visible only while this node still
+    /// holds a consumer grant whose `grant_id`, audience handle, AND verified
+    /// signature match the record's. Because the registry supports explicit
+    /// remove-then-install replacement, a DIFFERENT canonical grant reusing the
+    /// same `grant_id` (different signature/authority) must NOT re-expose the old
+    /// record — its stored signature won't match. Removing the credential retracts
+    /// every record for that grant IMMEDIATELY, with no re-announce and no sweep
+    /// (the record stays physically stored; retraction is a read-time filter,
+    /// mirroring the floor-currentness filter for owner records). Also expiry- and
+    /// floor-currentness-safe, exactly as a real query would be.
+    #[doc(hidden)]
+    pub fn scoped_granted_providers_for_test(
+        &self,
+        grant_id: &[u8; 32],
+        now_secs: u64,
+    ) -> Vec<EntityId> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
+        // Query-time consumer currentness: no installed consumer grant for this id
+        // ⇒ nothing is discoverable under it, even if a record is still stored.
+        let consumer = self.consumer_grant_audiences.load();
+        let Some(record) = consumer.get(grant_id) else {
+            return Vec::new();
+        };
+        // Pin the EXACT installed grant authority — signature binds the whole
+        // canonical grant; the handle is defense in depth.
+        let current_signature = record.grant().signature;
+        let current_handle = *record.audience_handle();
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        self.scoped_discovery
+            .lock()
+            .find_capabilities_for_grant(grant_id, now_secs, floors, |c| {
+                c.grant_signature() == Some(&current_signature)
+                    && matches!(
+                        c.scope(),
+                        CapabilityAudienceScope::Grant { audience_handle, .. }
+                            if audience_handle == &current_handle
+                    )
+            })
+            .into_iter()
+            .map(|c| c.provider().clone())
+            .collect()
+    }
+
+    /// Test seam (OA3 closure witness): advance the visibility generation as a
+    /// concurrent registration would, so a send fired after a visibility change
+    /// can be observed rejecting the now-stale emission (the send path skips it
+    /// rather than ship a tag a visibility change may have made private).
+    #[cfg(feature = "cortex")]
+    #[doc(hidden)]
+    pub fn test_advance_visibility_generation(&self) {
+        self.rpc_local_services.bump_for_test();
+    }
+
+    /// Deterministic-witness seam (AV-11): run the send seqlock while
+    /// evaluating owner-cert temporal validity at an EXPLICIT wall time
+    /// `now_secs`, so an expiry test can drive the cert past its window
+    /// without a real sleep or a race against a deliberately-short one.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_at_for_test(&self, now_secs: u64) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send_probed(None, now_secs)
+            .map(|e| e.public)
+    }
+
+    /// Deterministic-witness seam: run the send seqlock with a probe
+    /// fired inside the stability window (see
+    /// [`Self::announcement_bytes_for_send_probed`]). Test-only.
+    #[doc(hidden)]
+    pub fn announcement_bytes_for_send_probed_for_test(
+        &self,
+        probe: &(dyn Fn() + Sync),
+    ) -> Option<Vec<u8>> {
+        self.announcement_bytes_for_send_probed(
+            Some(probe),
+            super::behavior::org::current_timestamp(),
+        )
+        .map(|e| e.public)
+    }
+
+    /// Rebuild the cached announcement so its owner certificate
+    /// matches `desired` (the current emission output), under
+    /// `announce_mu` (every `local_announcement` store runs under
+    /// it). Refreshes the timestamp, bumps the version so the
+    /// replacement supersedes the certified form at peers that
+    /// already received it, re-signs, and self-indexes to the same
+    /// proof standard as the wire. A concurrent writer that already
+    /// reconciled the cache to `desired` makes this a no-op.
+    fn rebuild_cached_announcement(
+        &self,
+        desired: Option<super::behavior::org::OrgMembershipCert>,
+    ) {
+        let _announce_guard = self.announce_mu.lock();
+        let Some(cached) = self.local_emission.load_full() else {
+            return;
+        };
+        if cached.public.owner_cert == desired {
+            return; // already reconciled by another send
+        }
+        let mut ann = cached.public.clone();
+        ann.owner_cert = desired;
+        ann.version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        ann.timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let signed = cached.public.signature.is_some();
+        if signed {
+            ann.sign(&self.identity);
+        }
+
+        // Self-index the rebuilt announcement exactly like the
+        // announce path does — the node's own projection is held
+        // to the identical proof standard as the wire form.
+        let verified_owner = {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                signed,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
+        let _ = self.capability_fold.apply(fold_ann);
+        if let Some(owner) = &verified_owner {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &self.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
+
+        let has_cert = ann.owner_cert.is_some();
+        let version = ann.version;
+        // Republish the rebuilt PUBLIC announcement with `scoped` CLEARED: an
+        // owner-scoped envelope embeds the previous owner cert, so once that cert
+        // changed (floor rise / expiry / authority swap) it must not ship. The
+        // next full announce rebuilds `scoped` against the current cert (Kyra
+        // OA3 — scoped rides public-cert validity, one coherent generation).
+        self.local_emission
+            .store(Some(Arc::new(LocalCapabilityEmission {
+                public: ann,
+                scoped: Vec::new(),
+                // Scoped cleared ⇒ no sealing authority to track (Kyra B2).
+                scoped_authority: None,
+                // Scoped cleared ⇒ no sealing provider snapshot to track either
+                // (the granted envelopes embed the same cert, OA3-4b2).
+                provider_grant_snapshot: None,
+                // A cert rebuild does NOT change visibility — preserve the
+                // generation so the send-time freshness check still holds.
+                exposure_revocation_generation: cached.exposure_revocation_generation,
+            })));
+        tracing::info!(
+            version,
+            has_cert,
+            "cached announcement re-validated: owner certificate no longer \
+             matches emission state; republished"
+        );
     }
 
     /// Returns `true` iff a migration subprotocol handler is
@@ -7234,6 +9875,26 @@ impl MeshNode {
     /// Interval from `config.capability_gc_interval` (default 60s).
     fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
         let seen = self.seen_announcements.clone();
+        // §9 — the scoped-discovery store had NO periodic sweep. `sweep_expired`
+        // existed but its only non-test caller was the at-capacity branch of
+        // `ingest`, so on a node that was merely idle (or below capacity) it
+        // never ran at all. Three consequences, all closed by ticking it here:
+        //
+        //   * decrypted descriptors — the PLAINTEXT names of private
+        //     capabilities — were retained indefinitely past the lifetime
+        //     they were authorized for;
+        //   * the budget silently filled with dead entries, turning into the
+        //     §4 capacity wedge with no attacker involved;
+        //   * the generation high-water outlived its designed tombstone
+        //     horizon, so a provider that restarted (its `capability_version`
+        //     counter resets to 0) re-announced at generation 1 against a
+        //     consumer still holding, say, 500 — every announcement `Stale`,
+        //     the key never forgotten, that provider undiscoverable at every
+        //     prior consumer until its counter climbed past the old mark.
+        //
+        // This loop is the right home: same cadence (60 s), same purpose
+        // (bounded retention of observation state), already shutdown-aware.
+        let scoped = self.scoped_discovery.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -7251,6 +9912,14 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                        let now_secs = super::behavior::org::current_timestamp();
+                        let forgotten = scoped.lock().sweep_expired(now_secs);
+                        if forgotten > 0 {
+                            tracing::debug!(
+                                forgotten,
+                                "scoped discovery: swept fully-forgotten entries",
+                            );
+                        }
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -7822,6 +10491,11 @@ impl MeshNode {
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
+            org_revocation: self.org_revocation.clone(),
+            node_authority: self.node_authority.clone(),
+            scoped_discovery: self.scoped_discovery.clone(),
+            scoped_relay_gate: self.scoped_relay_gate.clone(),
+            consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
@@ -7859,6 +10533,8 @@ impl MeshNode {
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
             ),
+            #[cfg(feature = "redex")]
+            rpc_local_services: self.rpc_local_services.clone(),
             sensing_emitter: self.sensing_emitter.clone(),
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
             signing_identity: self.identity.clone(),
@@ -9246,6 +11922,67 @@ impl MeshNode {
             return;
         }
 
+        // OA3-5: owner/grant-scoped ENCRYPTED capability announcements. Each
+        // event is one `ScopedCapabilityAnnouncement` envelope; only a node
+        // holding the matching audience key opens + verifies it (an INVOKE-only /
+        // un-adopted node ingests nothing). Session-authenticated transport like
+        // the CAP-ANN arm above; the envelope additionally carries its own
+        // provider signature + AEAD, so a forwarded or forged frame this node's
+        // audience cannot open is silently discarded. Dark by default: an unknown
+        // id degrades the same way at the catch-all guard below.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_SCOPED_CAPABILITY_ANN {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            let now_secs = super::behavior::org::current_timestamp();
+            for payload in events {
+                // Decode the relay frame, outer-verify, bind the direct origin,
+                // check expiry, and dedup — a pure decision, no I/O (OA3-5 §3.2).
+                let Some(admit) = super::behavior::org_scoped_relay::decide_scoped_relay(
+                    &payload,
+                    from_node,
+                    &ctx.scoped_relay_gate,
+                    now_secs,
+                ) else {
+                    continue;
+                };
+                // Forward the OPAQUE frame to peers-except-ingress while below the
+                // hop cap — an authority-less relay forwards even though it can
+                // never open or store the envelope.
+                if let Some(frame) = admit.forward {
+                    Self::forward_scoped_announcement(frame, from_node, ctx);
+                }
+                // Independently attempt the LOCAL audience open/store. A node with
+                // no matching audience (a pure relay, or a wrong-audience
+                // envelope) simply stores nothing; the forward above already
+                // shipped regardless of the local outcome.
+                //
+                // Skipped for a §8 shorter-path re-forward: that identity was
+                // already ingested on its first sighting, and re-running the
+                // AEAD open would let a peer solicit repeated crypto work by
+                // replaying one envelope at ever-lower hop counts.
+                if admit.ingest_locally {
+                    let disposition = Self::ingest_scoped_announcement(
+                        &ctx.node_authority,
+                        &ctx.org_revocation,
+                        &ctx.consumer_grant_audiences,
+                        &ctx.scoped_discovery,
+                        &admit.envelope,
+                        from_node,
+                        None,
+                    );
+                    // §24 — a fail-closed refusal that can clear on its own
+                    // (poison, publication race, store capacity) must not
+                    // consume the dedup identity for the whole retention
+                    // horizon with nothing stored. Release it so the next
+                    // delivery of the SAME generation is reconsidered rather
+                    // than silently dropped as a duplicate.
+                    if disposition == ScopedIngestDisposition::Retryable {
+                        ctx.scoped_relay_gate.release(&admit.dedup_key);
+                    }
+                }
+            }
+            return;
+        }
+
         // Route withdrawal (RT-5): poison-reverse "dest unreachable
         // via the sender". Session-authenticated by construction —
         // the `via` leg is `from_node`, resolved from the decrypting
@@ -9914,11 +12651,15 @@ impl MeshNode {
                     drop(entry);
                     return;
                 }
+                // OA2-E0.1: the middle field is the registration id;
+                // the dispatch hot path does not need it (E0.2 will
+                // thread the canonical hash + id for the control-frame
+                // discriminator), so drop it from the snapshot here.
                 [only] => {
-                    let (c, d) = only.clone();
+                    let (c, _id, d) = only.clone();
                     Snapshot::Single(c, d)
                 }
-                many => Snapshot::Many(many.to_vec()),
+                many => Snapshot::Many(many.iter().map(|(c, _id, d)| (*c, d.clone())).collect()),
             };
             drop(entry);
             let origin_hash = parsed.header.origin_hash;
@@ -9974,9 +12715,41 @@ impl MeshNode {
                 );
                 return;
             };
+            // OA2-E0.2: classify a frame as an nRPC dispatch frame
+            // (carries the RpcRouteV1 canonical discriminator) vs a
+            // non-RPC dispatcher registration (e.g. the sensing
+            // intake). `Some(route)` = nRPC frame with a readable
+            // discriminator → route to EXACTLY ONE matching canonical
+            // dispatcher. `None` and a non-RPC dispatch type → legacy
+            // fan-out. `None` for an nRPC dispatch type (malformed /
+            // truncated route) → drop.
+            let classify = |frame: &Bytes| -> (bool, Option<ChannelHash>) {
+                let is_rpc = frame
+                    .get(..crate::adapter::net::cortex::EVENT_META_SIZE)
+                    .and_then(crate::adapter::net::cortex::EventMeta::from_bytes)
+                    .is_some_and(|m| {
+                        crate::adapter::net::cortex::is_rpc_dispatch_frame(m.dispatch)
+                    });
+                let route = if is_rpc {
+                    crate::adapter::net::cortex::decode_rpc_route(frame)
+                } else {
+                    None
+                };
+                (is_rpc, route)
+            };
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
+                        let (is_rpc, route) = classify(&event_data);
+                        // An nRPC frame is delivered ONLY if its route
+                        // matches this dispatcher's canonical — a
+                        // bucket-colliding frame for a different
+                        // canonical (or a malformed route) is dropped,
+                        // never misdelivered. Non-RPC frames deliver
+                        // (legacy behavior for the sole registration).
+                        if is_rpc && route != Some(canonical) {
+                            continue;
+                        }
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
                             channel_hash: canonical,
                             origin_hash,
@@ -9987,13 +12760,38 @@ impl MeshNode {
                 }
                 Snapshot::Many(pairs) => {
                     for event_data in events.into_iter() {
-                        for (canonical, disp) in &pairs {
-                            disp(crate::adapter::net::cortex::RpcInboundEvent {
-                                channel_hash: *canonical,
-                                origin_hash,
-                                from_node,
-                                payload: event_data.clone(),
-                            });
+                        let (is_rpc, route) = classify(&event_data);
+                        if is_rpc {
+                            // nRPC frame: select EXACTLY ONE canonical
+                            // dispatcher by the wire discriminator.
+                            // Absent / malformed / (impossibly) >1
+                            // match → drop, with no competing response
+                            // from a colliding sibling.
+                            let Some(route) = route else {
+                                continue;
+                            };
+                            let mut matching = pairs.iter().filter(|(c, _)| *c == route);
+                            if let (Some((canonical, disp)), None) =
+                                (matching.next(), matching.next())
+                            {
+                                disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    channel_hash: *canonical,
+                                    origin_hash,
+                                    from_node,
+                                    payload: event_data,
+                                });
+                            }
+                        } else {
+                            // Non-RPC dispatcher registrations keep
+                            // the legacy fan-out to every candidate.
+                            for (canonical, disp) in &pairs {
+                                disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    channel_hash: *canonical,
+                                    origin_hash,
+                                    from_node,
+                                    payload: event_data.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -11367,11 +14165,22 @@ impl MeshNode {
     /// `Mesh::call` to receive RPC events without polling the
     /// shard queue.
     ///
-    /// Returns the previous dispatcher (if any) so callers can
-    /// detect a slot collision (typically a programming error —
-    /// two `serve_rpc` registrations for the same service on the
-    /// same node, or a hash collision between two different
-    /// channel names; the latter is bounded at ~1/65536 per pair).
+    /// **VACANT-ONLY (OA2-E0.1).** If a dispatcher is already
+    /// registered for this canonical hash, the incumbent is LEFT
+    /// UNTOUCHED and this returns `None` (occupied). It never
+    /// destroys a live registration. On success it returns
+    /// `Some(registration_id)` — a unique monotonic id the caller
+    /// stores and passes back to [`Self::unregister_rpc_inbound`],
+    /// so a stale teardown cannot evict a newer registration.
+    ///
+    /// Pre-E0.1 this method DESTRUCTIVELY replaced the incumbent and
+    /// returned it, but every caller only ever wanted "fail if
+    /// occupied": `serve_rpc` reported `AlreadyServing` AFTER the
+    /// replace had already installed a dispatcher whose bridge was
+    /// never spawned (silently killing the service), and the
+    /// caller-side reply path immediately restored the prior
+    /// dispatcher. Vacant-only serves both correctly and removes the
+    /// restore dance.
     ///
     /// **Hot-path cost.** One DashMap get per inbound packet.
     /// Absent registrations skip the conditional entirely.
@@ -11380,39 +14189,50 @@ impl MeshNode {
         &self,
         channel_hash: ChannelHash,
         dispatcher: crate::adapter::net::cortex::RpcInboundDispatcher,
-    ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
+    ) -> Option<u64> {
         // The dispatcher map is indexed by the wire `u16` hash for
         // O(1) lookup on the inbound packet path; each bucket holds
-        // a list of `(canonical ChannelHash, dispatcher)` entries so
-        // wire-bucket collisions between independently-registered
-        // canonical channels don't share a dispatcher slot. Replace
-        // any existing entry for the same canonical hash; otherwise
-        // append.
+        // a list of `(canonical ChannelHash, registration_id,
+        // dispatcher)` entries so wire-bucket collisions between
+        // independently-registered canonical channels don't share a
+        // dispatcher slot. Vacant-only: if the canonical hash is
+        // already present, refuse WITHOUT mutating.
         let wire = channel_hash as u16;
         let mut entry = self.rpc_inbound_dispatchers.entry(wire).or_default();
-        for (existing_canonical, existing_disp) in entry.iter_mut() {
-            if *existing_canonical == channel_hash {
-                return Some(std::mem::replace(existing_disp, dispatcher));
-            }
+        if entry
+            .iter()
+            .any(|(existing, _, _)| *existing == channel_hash)
+        {
+            return None;
         }
-        entry.push((channel_hash, dispatcher));
-        None
+        let registration_id = self
+            .rpc_registration_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        entry.push((channel_hash, registration_id, dispatcher));
+        Some(registration_id)
     }
 
-    /// Remove the registered dispatcher for `channel_hash`. Returns
-    /// the prior dispatcher if one was registered. After removal,
-    /// inbound events for `channel_hash` resume landing in the
-    /// per-shard inbound queue.
+    /// Remove the dispatcher registered for `channel_hash` UNDER
+    /// `registration_id` (OA2-E0.1). Returns the removed dispatcher
+    /// iff both the canonical hash AND the id match — a stale
+    /// `ServeHandle` whose registration was already replaced by a
+    /// newer one is a NO-OP (it cannot evict the newer
+    /// registration). After removal, inbound events for
+    /// `channel_hash` resume landing in the per-shard inbound queue.
     #[cfg(feature = "cortex")]
     pub fn unregister_rpc_inbound(
         &self,
         channel_hash: ChannelHash,
+        registration_id: u64,
     ) -> Option<crate::adapter::net::cortex::RpcInboundDispatcher> {
         let wire = channel_hash as u16;
         let removed = {
             let mut entry = self.rpc_inbound_dispatchers.get_mut(&wire)?;
-            let pos = entry.iter().position(|(c, _)| *c == channel_hash)?;
-            let (_, removed) = entry.remove(pos);
+            let pos = entry
+                .iter()
+                .position(|(c, id, _)| *c == channel_hash && *id == registration_id)?;
+            let (_, _, removed) = entry.remove(pos);
             removed
         };
         // Release the wire-bucket slot only if it's *still* empty when
@@ -11438,8 +14258,44 @@ impl MeshNode {
     pub fn rpc_inbound_dispatcher_registered(&self, channel_hash: ChannelHash) -> bool {
         self.rpc_inbound_dispatchers
             .get(&(channel_hash as u16))
-            .map(|entry| entry.iter().any(|(c, _)| *c == channel_hash))
+            .map(|entry| entry.iter().any(|(c, _, _)| *c == channel_hash))
             .unwrap_or(false)
+    }
+
+    /// Test-only: deliver a synthetic `RpcInboundEvent` to the registered serve
+    /// bridge for `channel_hash`, exactly as the packet-ingress path does — so
+    /// a test can drive the REAL bridge task (preflight → reject → fold) with a
+    /// crafted frame that the honest `call*` path could never produce (e.g. a
+    /// packet/payload origin mismatch, or a relayed caller). Returns `true` iff
+    /// a matching dispatcher was found and invoked. The dispatcher snapshot +
+    /// lock release mirror the production ingress path (mesh.rs ingress).
+    ///
+    /// `#[cfg(test)]` + `pub(crate)`: this bypasses packet ingress (and could
+    /// inject the `from_node == 0` loopback-compat path), so it MUST NOT exist
+    /// in a non-test library build — a production build exposes no synthetic
+    /// inbound-delivery API.
+    #[cfg(all(test, feature = "cortex"))]
+    pub(crate) fn deliver_rpc_inbound_for_test(
+        &self,
+        channel_hash: ChannelHash,
+        event: crate::adapter::net::cortex::RpcInboundEvent,
+    ) -> bool {
+        let dispatcher = {
+            let Some(entry) = self.rpc_inbound_dispatchers.get(&(channel_hash as u16)) else {
+                return false;
+            };
+            entry
+                .iter()
+                .find(|(c, _, _)| *c == channel_hash)
+                .map(|(_, _, d)| d.clone())
+        };
+        match dispatcher {
+            Some(d) => {
+                d(event);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Per-Mesh shared `RpcClientPending` — accessor for the
@@ -13095,6 +15951,11 @@ impl MeshNode {
                         ctx.sensing_local_entity_root,
                         &ctx.sensing_local_root,
                         capability_id,
+                        |cap| {
+                            cap.as_str()
+                                .strip_prefix("nrpc:")
+                                .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
+                        },
                     );
                     let mut slot = ctx.sensing_leader.lock();
                     let Some(leader) = slot.as_mut() else {
@@ -14498,6 +17359,11 @@ impl MeshNode {
             ctx.sensing_local_entity_root,
             &ctx.sensing_local_root,
             capability_id,
+            |cap| {
+                cap.as_str()
+                    .strip_prefix("nrpc:")
+                    .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
+            },
         );
         let reconciliation = {
             let mut slot = ctx.sensing_leader.lock();
@@ -14708,6 +17574,232 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             );
+        }
+    }
+
+    /// OA3-5: open, verify, and store ONE inbound owner-scoped announcement
+    /// envelope. Shared by the [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] dispatch arm
+    /// (parts from [`DispatchCtx`]) and the test seam
+    /// (`ingest_scoped_announcement_for_test`) so both exercise the identical
+    /// verify+store path.
+    ///
+    /// A node WITHOUT an installed authority holds neither an owner audience key
+    /// nor a grantee identity and drops every envelope (INVOKE-only / un-adopted
+    /// relays ingest nothing). The audience is selected by the envelope's grant
+    /// id: the reserved ZERO sentinel opens against this node's OWN owner audience
+    /// (OA3-4b1); a NONZERO grant id selects an installed CONSUMER grant/secret by
+    /// an EXACT bounded lookup — `consumer_grant_audiences.get(grant_id)` plus an
+    /// audience-handle match, never a scan across secrets (OA3-4b2). In both cases
+    /// `verify_scoped_ingest` re-checks everything against the LIVE revocation
+    /// floors; a wrong-audience, expired, floored-provider, wrong-grantee, or
+    /// forged envelope is refused and never stored.
+    fn ingest_scoped_announcement(
+        node_authority: &Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+        org_revocation: &Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+        consumer_grant_audiences: &Arc<
+            arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+        >,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
+        >,
+        envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
+        from_node: u64,
+        probe: Option<&dyn Fn()>,
+    ) -> ScopedIngestDisposition {
+        use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_ingest::{
+            verify_scoped_ingest, AudienceAuthority, LocalMemberStanding, ScopedIngestContext,
+        };
+
+        // The caller has already decoded the frame and outer-verified this
+        // envelope (structural + bounds + the provider's outer signature, via
+        // `from_bytes`). This is the LOCAL open/store half only: no installed
+        // authority ⇒ no owner audience key AND no grantee identity ⇒ cannot open,
+        // drop (an INVOKE-only / un-adopted relay forwards but never stores).
+        let Some(authority) = node_authority.load_full() else {
+            return ScopedIngestDisposition::Final;
+        };
+        let owner_org = authority.owner_org();
+        let store = org_revocation.load_full();
+        // Fail-closed on a POISONED (durability-uncertain) revocation view: while
+        // a floor raise's durability is unproven, the private-discovery plane must
+        // not admit new capabilities — recovery re-opens ingest (Kyra OA3-5). The
+        // in-memory floors are already never-weaker, so the floor check itself is
+        // poison-safe; this adds the conservative refusal for the more-sensitive
+        // private plane.
+        if store.as_ref().map(|s| s.is_poisoned()).unwrap_or(false) {
+            tracing::warn!(
+                from_node = format!("{:#x}", from_node),
+                "scoped-ann: revocation view poisoned; ingest refused until recovery"
+            );
+            // §24 — RETRYABLE: poison clears on recovery, and the sender has no
+            // way to know we refused. Releasing the dedup identity lets the
+            // next delivery of this same generation be reconsidered instead of
+            // being swallowed for the whole retention horizon.
+            return ScopedIngestDisposition::Retryable;
+        }
+        // Verify against the node's LIVE revocation floors, so a provider whose
+        // cert generation the org has since floored is refused at ingest. Hold
+        // the snapshot `Arc` and borrow through it; an un-adopted node with no
+        // revocation store floor-checks against an implicit empty floor set. PIN
+        // the security inputs verify runs against (Kyra OA3-5 publication-race
+        // closure): the authority + revocation-store Arcs — held alive for the
+        // whole call, so the address comparison below is ABA-safe — and the floor
+        // GENERATION the snapshot reflects (read under one guard with the floors,
+        // so the pair is internally consistent).
+        let authority_ptr = Arc::as_ptr(&authority) as *const () as usize;
+        let store_ptr = store
+            .as_ref()
+            .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
+        let empty_floors = OrgRevocationState::empty();
+        let pinned = store.as_ref().map(|s| s.snapshot_with_generation());
+        let floors: &OrgRevocationState = pinned
+            .as_ref()
+            .map(|(f, _)| f.as_ref())
+            .unwrap_or(&empty_floors);
+        let pinned_generation = pinned.as_ref().map_or(0, |(_, g)| *g);
+        let now_secs = super::behavior::org::current_timestamp();
+        let ctx = ScopedIngestContext {
+            local_owner_org: owner_org,
+            floors,
+            now_secs,
+            skew_secs: authority.config.verification_skew_secs,
+            // §9: our OWN standing, checked against the same pinned floors. An
+            // installed authority always carries this node's cert, so it is
+            // `Some` on every production ingest.
+            local_member: Some(LocalMemberStanding {
+                member: authority.config.owner_cert.member.clone(),
+                generation: authority.config.owner_cert.generation,
+            }),
+        };
+        // OA3-4b2 audience selection: owner (zero sentinel) opens against this
+        // node's OWN owner audience; a nonzero grant id selects an installed
+        // CONSUMER credential by an EXACT bounded lookup. PIN the consumer snapshot
+        // Arc for a granted ingest (held alive across verify→insert, ABA-safe) so a
+        // removed/replaced credential racing the verify refuses the stale result
+        // (mirrors the OA3-5 3a authority/store race closure).
+        let consumer = if envelope.is_owner_audience() {
+            None
+        } else {
+            Some(consumer_grant_audiences.load_full())
+        };
+        let (audience, consumer_ptr) = match &consumer {
+            None => (
+                AudienceAuthority::owner(owner_org, &authority.audience),
+                0usize,
+            ),
+            Some(snapshot) => {
+                let ptr = Arc::as_ptr(snapshot) as *const () as usize;
+                // Exact lookup by grant id, then confirm the envelope's audience
+                // handle matches the record — never a scan across secrets. No
+                // installed consumer grant for this id ⇒ drop (this node is not a
+                // grantee for it, e.g. a relay or a wrong-grantee node).
+                let Some(record) = snapshot.get(envelope.grant_id()) else {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: no installed consumer grant for this grant id; drop"
+                    );
+                    return ScopedIngestDisposition::Final;
+                };
+                if record.audience_handle() != envelope.audience_handle() {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: consumer grant audience-handle mismatch; drop"
+                    );
+                    return ScopedIngestDisposition::Final;
+                }
+                (
+                    AudienceAuthority::granted(record.grant(), record.secret()),
+                    ptr,
+                )
+            }
+        };
+        match verify_scoped_ingest(envelope, &audience, &ctx) {
+            Ok(verified) => {
+                // A test probe fires in the exact verify→recheck window a
+                // concurrent floor publish / store swap / authority rotation would
+                // land in, proving the recheck below catches it.
+                if let Some(probe) = probe {
+                    probe();
+                }
+                // Publication-race recheck, FAIL-CLOSED (Kyra OA3-5): the
+                // capability was verified against an authority/store/floor view
+                // that must still be current at the instant of insert. If a
+                // same-org authority rotation, a revocation-store (re)install, a
+                // floor publish (generation bump), or a poison transition landed
+                // during verify, refuse — the sender re-announces against the
+                // settled view. Query-time currentness (3b) is the second line of
+                // defense; this stops a stale record from ever entering the store.
+                let authority_stable = node_authority
+                    .load_full()
+                    .as_ref()
+                    .map(|a| Arc::as_ptr(a) as *const () as usize == authority_ptr)
+                    .unwrap_or(false);
+                let current_store = org_revocation.load_full();
+                let store_ptr_now = current_store
+                    .as_ref()
+                    .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
+                let generation_now = current_store
+                    .as_ref()
+                    .map_or(0, |s| s.barriered_generation());
+                let poisoned_now = current_store
+                    .as_ref()
+                    .map(|s| s.is_poisoned())
+                    .unwrap_or(false);
+                let store_stable = store_ptr_now == store_ptr
+                    && generation_now == pinned_generation
+                    && !poisoned_now;
+                // OA3-4b2: for a granted ingest, the CONSUMER snapshot must also be
+                // unchanged. A credential removal or replacement (remove-then-
+                // install, or an unrelated install) swaps the registry pointer, so
+                // a result verified under a since-mutated consumer credential is
+                // refused before it can land — mirroring the store/authority race
+                // above. Owner ingest (`consumer` is `None`) is unaffected.
+                let consumer_stable = match &consumer {
+                    None => true,
+                    Some(_) => {
+                        Arc::as_ptr(&consumer_grant_audiences.load_full()) as *const () as usize
+                            == consumer_ptr
+                    }
+                };
+                if !authority_stable || !store_stable || !consumer_stable {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "scoped-ann: security view moved during verify; ingest refused \
+                         (publication race)"
+                    );
+                    // §24 — RETRYABLE: the view settles and the sender
+                    // re-announces, but the dedup gate would have suppressed
+                    // that re-announce at the same generation.
+                    return ScopedIngestDisposition::Retryable;
+                }
+                let outcome = scoped_discovery.lock().ingest(verified, now_secs);
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    ?outcome,
+                    "scoped-ann: scoped capability ingested"
+                );
+                // §24 — `AtCapacity` is the store refusing fail-closed with
+                // nothing stored; a slot frees on the next sweep or expiry, so
+                // the identity must stay retryable. Every other outcome is a
+                // decision that re-delivery would reach again.
+                if matches!(
+                    outcome,
+                    super::behavior::org_scoped_store::ScopedStoreOutcome::AtCapacity
+                ) {
+                    ScopedIngestDisposition::Retryable
+                } else {
+                    ScopedIngestDisposition::Final
+                }
+            }
+            Err(e) => {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    error = %e,
+                    "scoped-ann: verify refused"
+                );
+                ScopedIngestDisposition::Final
+            }
         }
     }
 
@@ -14964,8 +18056,25 @@ impl MeshNode {
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
-        let _ = ctx.capability_fold.apply(fold_ann);
+        // OA-1: verify the announcement's owner cert (if any) at
+        // the ingest boundary — the OUTER announcement signature is
+        // an explicit precondition (`signature_verified` from step
+        // 5 above; a valid replayed cert must not lend ownership to
+        // an unsigned capability statement — review-8 §1), then the
+        // cert's signature, window, member binding, and the node's
+        // persisted revocation floors. A bad cert is dropped here
+        // (announcement handling unchanged); ONLY a fully verified
+        // cert reaches the fold's `owner` projection. Runs after
+        // the forward block: the signed bytes (cert included)
+        // propagate verbatim and every receiver re-verifies.
+        // §T8: the SHARED ingest body — the test seam calls this same
+        // function, so the two cannot drift.
+        ingest_announcement_with_owner_projection(
+            &ctx.capability_fold,
+            &ctx.org_revocation,
+            &ann,
+            signature_verified,
+        );
 
         // SI-6 review P1 (unified scheduler-input generation): fold
         // membership is a scheduler-relevant plane — a changed
@@ -15058,6 +18167,51 @@ impl MeshNode {
     /// encryption and network send. Mirrors the pingwave forwarding
     /// loop at the top of `dispatch_packet` — same split-horizon
     /// rule, same best-effort send semantics.
+    /// Forward an OPAQUE scoped-announcement relay frame (hop already
+    /// incremented by [`decide_scoped_relay`](super::behavior::org_scoped_relay::decide_scoped_relay))
+    /// to every live peer EXCEPT the ingress `from_node` — the OA3-5 §3.2 opaque
+    /// flood. Mirrors [`Self::forward_capability_announcement`] but on
+    /// [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] and with NO split-horizon: the
+    /// bounded relay dedup gate (not route-based suppression) terminates loops,
+    /// and a relay generally has no route to the provider anyway. The frame bytes
+    /// ship verbatim — a relay never opens, stores, or re-signs them.
+    fn forward_scoped_announcement(frame: Vec<u8>, from_node: u64, ctx: &DispatchCtx) {
+        let peers = ctx.peers.clone();
+        let socket = ctx.socket.clone();
+        let partition_filter = ctx.partition_filter.clone();
+
+        tokio::spawn(async move {
+            for entry in peers.iter() {
+                let peer = entry.value();
+                if peer.node_id == from_node {
+                    continue; // never send back to the ingress peer
+                }
+                if partition_filter.contains(&peer.addr) {
+                    continue;
+                }
+                let session = &peer.session;
+                let stream_id = SUBPROTOCOL_SCOPED_CAPABILITY_ANN as u64;
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session.get_or_create_stream(stream_id);
+                    stream.next_tx_seq()
+                };
+                let events = vec![Bytes::copy_from_slice(&frame)];
+                let packet = builder.build_subprotocol(
+                    stream_id,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+                );
+                let _ = socket.send_to(&packet, peer.addr).await;
+                drop(builder);
+                session.touch();
+            }
+        });
+    }
+
     fn forward_capability_announcement(
         payload: Vec<u8>,
         origin_node_id: u64,
@@ -16087,10 +19241,10 @@ impl MeshNode {
         if let Some(cfg) = cfg_snapshot.as_ref() {
             if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
-                    .local_announcement
+                    .local_emission
                     .load()
                     .as_deref()
-                    .map(|ann| ann.capabilities.clone())
+                    .map(|e| e.public.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
                 // Build the publish chain. Prefer an explicitly-held
@@ -16445,6 +19599,14 @@ impl MeshNode {
     /// (which routes via the subscriber roster) and by the
     /// `mesh_rpc` glue (which knows the target directly and bypasses
     /// the roster).
+    ///
+    /// A thin `Result`-flattening wrapper over [`Self::try_publish_to_peer`]:
+    /// the *pre-send* missing-session outcome collapses back into the same
+    /// `Connection("publish: no session ...")` error every existing caller
+    /// already expects, so this seam is behaviourally unchanged. Callers
+    /// that must distinguish "nothing was transmitted, a fallback is safe"
+    /// from an at/after-send failure (the nRPC response router — R2-6) call
+    /// [`Self::try_publish_to_peer`] directly for the typed outcome.
     pub(super) async fn publish_to_peer(
         &self,
         peer_node_id: u64,
@@ -16453,18 +19615,46 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> Result<(), AdapterError> {
+        match self
+            .try_publish_to_peer(peer_node_id, channel_hash, stream_id, reliable, events)
+            .await
+        {
+            PeerPublishOutcome::Sent => Ok(()),
+            // Preserve the exact pre-refactor error the None branch used to
+            // return, so string-scraping / logging callers see no drift.
+            PeerPublishOutcome::NoSession => Err(AdapterError::Connection(format!(
+                "publish: no session for subscriber {:#x}",
+                peer_node_id
+            ))),
+            PeerPublishOutcome::SendFailed(e) => Err(e),
+        }
+    }
+
+    /// Atomic direct-to-peer publish that reports *why* it did or did not
+    /// transmit as a typed [`PeerPublishOutcome`] rather than a stringly
+    /// `Result`. The session lookup is the single gate: if `peer_node_id`
+    /// has no session at the instant we look, nothing is built or sent and
+    /// [`PeerPublishOutcome::NoSession`] is returned — so a caller can fall
+    /// back to another route without a check-then-act TOCTOU (R2-6). Every
+    /// path that reaches the socket (or fails at/after the credit acquire)
+    /// returns [`PeerPublishOutcome::Sent`] or
+    /// [`PeerPublishOutcome::SendFailed`]; a `SendFailed` MUST NOT be retried
+    /// on another route (bytes may already be committed to the wire).
+    pub(super) async fn try_publish_to_peer(
+        &self,
+        peer_node_id: u64,
+        channel_hash: ChannelHash,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+    ) -> PeerPublishOutcome {
         let (dest_addr, session) = match self.peers.get(&peer_node_id) {
             Some(p) => (p.value().addr, p.value().session.clone()),
-            None => {
-                return Err(AdapterError::Connection(format!(
-                    "publish: no session for subscriber {:#x}",
-                    peer_node_id
-                )));
-            }
+            None => return PeerPublishOutcome::NoSession,
         };
 
         if self.partition_filter.contains(&dest_addr) {
-            return Err(AdapterError::Connection(format!(
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish: peer {:#x} is partitioned",
                 peer_node_id
             )));
@@ -16485,13 +19675,13 @@ impl MeshNode {
         let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
             TxAdmit::Acquired { guard, seq } => (guard, seq),
             TxAdmit::WindowFull => {
-                return Err(AdapterError::Connection(format!(
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                     "publish: stream {:#x} backpressured",
                     stream_id
                 )));
             }
             TxAdmit::StreamClosed => {
-                return Err(AdapterError::Connection(format!(
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                     "publish: stream {:#x} closed",
                     stream_id
                 )));
@@ -16556,15 +19746,17 @@ impl MeshNode {
             .lookup(peer_node_id)
             .unwrap_or(dest_addr);
 
-        self.socket
-            .send_to(&packet, next_hop)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("publish send failed: {}", e)))?;
+        if let Err(e) = self.socket.send_to(&packet, next_hop).await {
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                "publish send failed: {}",
+                e
+            )));
+        }
         guard.commit(); // wire-accepted — bytes now belong to the receiver
 
         drop(builder);
         session.touch();
-        Ok(())
+        PeerPublishOutcome::Sent
     }
 
     /// Encode a [`super::behavior::fold::SignedAnnouncement`] and
@@ -16876,9 +20068,12 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(crate) fn index_self_with_local_services(&self) {
         let baseline = self.user_caps_snapshot();
+        // Self-fold: ALL locally registered services regardless of visibility, so
+        // `has_local_capability` admits owner-scoped services too (§2.4a). This
+        // set is local-only and never reaches the wire.
         let merged = {
             let mut m = baseline;
-            for svc in self.rpc_local_services.snapshot() {
+            for svc in self.rpc_local_services.all_snapshot() {
                 m = m.add_tag(format!("nrpc:{}", svc.as_str()));
             }
             m
@@ -16890,10 +20085,44 @@ impl MeshNode {
             version,
             merged,
         )
-        .with_ttl(300);
+        .with_ttl(300)
+        // OA-1: attach the INSTALLED authority's owner cert iff
+        // emission is enabled (Migration step 3 switch; `None`
+        // keeps pre-OA-1 bytes; no other cert source exists).
+        .with_owner_cert(self.owner_cert_for_emission());
         ann.sign(&self.identity);
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        // OA-1: self-index runs the same owner-cert verification as
+        // inbound ingest — a node's own projection is held to the
+        // identical proof standard (no cert on the announcement →
+        // no owner projection, exactly like a peer would see). The
+        // outer signature was produced by `sign` on the line above,
+        // so the precondition holds by construction.
+        let verified_owner = {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                &ann,
+                true,
+                floors.as_deref(),
+                0,
+            )
+        };
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
         let _ = self.capability_fold.apply(fold_ann);
+        // Review-9: post-apply floor recheck (see the dispatch
+        // path) — self-index is held to the identical ordering
+        // guarantees.
+        if let Some(owner) = &verified_owner {
+            let store = self.org_revocation.load();
+            let floors = store.as_ref().map(|s| s.snapshot());
+            super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                &self.capability_fold,
+                floors.as_deref(),
+                &ann.entity_id,
+                owner,
+            );
+        }
     }
 
     /// Announce this node's capabilities to every directly-connected
@@ -16952,8 +20181,79 @@ impl MeshNode {
         ttl: Duration,
         sign: bool,
     ) -> Result<(), AdapterError> {
-        // `Some(bytes)` to broadcast after releasing the lock; `None`
-        // when the announce was rate-limit-deferred or coalesced.
+        // Kyra OA3 review, Finding 3: a send refused on security grounds must not
+        // rely on the wake that its own invalidation fired. That wake may ALREADY
+        // have run — observed this sender's in-window claim, deferred or (on a
+        // bare-`start` node, which has no flush task) returned outright — and no
+        // second wake is coming. Restoring the timestamp reopens the window for a
+        // wake that has been consumed. So the refusing sender drives the
+        // corrective pass itself, from a fresh baseline, bypassing coalescing.
+        self.announce_from_baseline_probed(new_baseline, ttl, sign, None)
+            .await
+    }
+
+    /// [`Self::announce_from_baseline`] with an optional probe fired inside the
+    /// send seqlock (see [`Self::announcement_bytes_for_send_probed`]). A witness
+    /// injects an exposure revocation there to force a security refusal and then
+    /// observes the corrective pass actually superseding it. `None` in production.
+    async fn announce_from_baseline_probed(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), AdapterError> {
+        self.announce_loop(new_baseline, ttl, sign, AnnounceMode::Routine, probe)
+            .await
+    }
+
+    /// The corrective loop shared by every announce entry point. `start_mode`
+    /// is `Routine` for an ordinary announce and `SecurityCorrective` for a
+    /// caller that has ALREADY had a send refused — the deferred flush, whose
+    /// own send the seqlock rejected, enters here so it drives exactly the same
+    /// bounded correction the immediate path does (Kyra OA3 review — deferred
+    /// security correction).
+    async fn announce_loop(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        start_mode: AnnounceMode,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<(), AdapterError> {
+        let mut baseline = new_baseline;
+        let mut mode = start_mode;
+        for _ in 0..=SECURITY_CORRECTIVE_ATTEMPTS {
+            match self
+                .announce_attempt(baseline.take(), ttl, sign, mode, probe)
+                .await?
+            {
+                AnnounceOutcome::Sent | AnnounceOutcome::Coalesced => return Ok(()),
+                AnnounceOutcome::RefusedBySecurity => mode = AnnounceMode::SecurityCorrective,
+            }
+        }
+        tracing::warn!(
+            "capability: security-corrective re-announce exhausted its attempt budget; \
+             peers may hold a superseded projection until the next announce or the \
+             keep-alive"
+        );
+        Ok(())
+    }
+
+    /// ONE pass of the announce path: build + publish the emission, then either
+    /// broadcast it, coalesce it, or refuse it. See [`Self::announce_from_baseline`]
+    /// for the corrective loop wrapped around this.
+    async fn announce_attempt(
+        &self,
+        new_baseline: Option<CapabilitySet>,
+        ttl: Duration,
+        sign: bool,
+        mode: AnnounceMode,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<AnnounceOutcome, AdapterError> {
+        // `Some(())` = broadcast after releasing the lock (bytes are
+        // serialized at send time through the epoch-checked path);
+        // `None` = the announce was rate-limit-deferred or coalesced.
         let to_broadcast = {
             let _announce_guard = self.announce_mu.lock();
             // Set a new baseline or re-read the current one — both
@@ -16978,17 +20278,69 @@ impl MeshNode {
             // Gated on `cortex` because `rpc_local_services` only
             // exists when the cortex layer (which provides serve_rpc)
             // is compiled in.
+            // Capture the exposure-revocation generation BEFORE deriving the
+            // projection and thread it into the published emission: if a concurrent
+            // visibility change advances it, the send path refuses the (now stale)
+            // emission rather than ship bytes to an audience no longer entitled to
+            // them, and the refusing sender itself drives a corrective re-announce
+            // at the new generation (Kyra OA3 closure, Findings 1-3).
+            #[cfg(feature = "cortex")]
+            let exposure_revocation_generation =
+                self.rpc_local_services.exposure_revocation_generation();
+            #[cfg(not(feature = "cortex"))]
+            let exposure_revocation_generation = 0u64;
+
+            // OA3-4b1 confidentiality projection: ONLY `Public` services
+            // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
+            // Owner-scoped services are emitted solely as an encrypted
+            // owner-audience announcement and must never appear in the clear.
+            // Registration visibility is AUTHORITATIVE over baseline residue: a
+            // caller that pre-tagged (or reused an old baseline containing) an
+            // owner-scoped `nrpc:<svc>` would otherwise leak it — strip those exact
+            // tags from the plaintext set too (Kyra OA3 closure).
             #[cfg(feature = "cortex")]
             let caps = if self.rpc_local_services.is_empty() {
                 caps
             } else {
                 let mut merged = caps;
-                for svc in self.rpc_local_services.snapshot() {
-                    let tag = format!("nrpc:{}", svc.as_str());
-                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via
-                    // builder so the parsed-tag form lands and dedupes
-                    // against existing entries.
-                    merged = merged.add_tag(tag);
+                for svc in self.rpc_local_services.public_snapshot() {
+                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via builder so
+                    // the parsed-tag form lands and dedupes against existing tags.
+                    merged = merged.add_tag(format!("nrpc:{}", svc.as_str()));
+                }
+                // Registration visibility is AUTHORITATIVE over baseline residue: a
+                // caller that pre-tagged (or reused an old baseline containing) a
+                // private `nrpc:<svc>` would otherwise leak it. Strip every
+                // owner-scoped AND granted tag from the plaintext set (OA3-4b1 /
+                // OA3-4b2 confidentiality).
+                //
+                // §30 — DECIDED, not overlooked: this suppression is keyed on
+                // the CURRENTLY-REGISTERED private set, so it is not sticky.
+                // Drop the `ServeHandle` and the next re-announce ships an
+                // operator's own `nrpc:<svc>` baseline tag in the clear again.
+                //
+                // That asymmetry is deliberate. The tag is in the plaintext set
+                // only because the OPERATOR put it in `user_caps` — merged
+                // `nrpc:` tags are never written back into the baseline
+                // (`announce_from_baseline` snapshots the caller's set BEFORE
+                // the merge), so the only way one is present is explicit
+                // intent to advertise. A private registration temporarily
+                // overrides that intent; ending the registration restores it.
+                // Making suppression permanent would mean a process that once
+                // served `X` privately could never advertise `X` publicly
+                // again without a restart, which is a worse and far more
+                // surprising failure.
+                //
+                // What this is NOT: a leak of a service the operator never
+                // asked to advertise. Those tags come from the registry, not
+                // the baseline, and disappear with the registration.
+                for svc in self
+                    .rpc_local_services
+                    .owner_scoped_snapshot()
+                    .into_iter()
+                    .chain(self.rpc_local_services.granted_snapshot())
+                {
+                    merged = merged.remove_tag(&format!("nrpc:{}", svc.as_str()));
                 }
                 merged
             };
@@ -17145,34 +20497,195 @@ impl MeshNode {
             // rate-limit branch, same as the self-index below, so a
             // coalesced announce still refreshes the local pingwave
             // state.
+            // Proximity pingwaves piggyback the CURRENT capability summary and
+            // ride to peers, so they carry the PUBLIC set only (never an
+            // owner-scoped tag).
             self.proximity_graph.set_local_capabilities(caps.clone());
 
-            let mut ann = CapabilityAnnouncement::new(
+            // The PUBLIC broadcast announcement — the ONLY object every plaintext
+            // send path reads (`local_announcement`). Owner-scoped `nrpc:` tags
+            // were already excluded from `caps` above (OA3-4b1).
+            // Kyra OA3-4b1 B2 rotation safety: pin ONE authority for BOTH the
+            // public cert and the scoped envelope's audience key, and derive the
+            // cert from it exactly as `owner_cert_for_emission` would. A
+            // concurrent same-org rotation therefore cannot pair one authority's
+            // cert with another's key; the emission records this exact Arc so the
+            // send path refuses a rotation that lands after the build.
+            let now_secs = super::behavior::org::current_timestamp();
+            let emission_authority = self.node_authority.load_full();
+            let owner_cert = emission_authority
+                .as_ref()
+                .and_then(|authority| self.owner_cert_under(authority, now_secs));
+
+            let mut broadcast_ann = CapabilityAnnouncement::new(
                 self.node_id,
                 self.identity.entity_id().clone(),
                 version,
-                caps,
+                caps.clone(),
             )
-            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
+            // OA-1: attach the pinned authority's owner cert iff emission is
+            // enabled (Migration step 3 switch; `None` keeps pre-OA-1 bytes; no
+            // other cert source exists).
+            .with_owner_cert(owner_cert.clone());
             #[cfg(feature = "nat-traversal")]
             {
-                ann = ann.with_reflex_addr(reflex_snapshot);
+                broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
             if sign {
-                ann.sign(&self.identity);
+                broadcast_ann.sign(&self.identity);
             }
+
+            // The SELF-FOLD announcement — the PUBLIC set plus owner-scoped AND
+            // granted `nrpc:` tags. LOCAL ONLY: it feeds the self-fold so
+            // `has_local_capability` admits every locally-registered private
+            // service (§2.4a) — a granted service must be dispatchable even before
+            // a matching grant is installed (OA3-4b2 register-before-grant). NEVER
+            // stored in `local_announcement` or sent. When no private service is
+            // registered it is identical to the broadcast form.
+            #[cfg(feature = "cortex")]
+            let (self_ann, scoped_envelopes, scoped_authority, provider_grant_snapshot) = {
+                let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
+                let granted = self.rpc_local_services.granted_snapshot();
+                if owner_scoped.is_empty() && granted.is_empty() {
+                    (broadcast_ann.clone(), Vec::new(), None, None)
+                } else {
+                    let mut self_caps = caps;
+                    for svc in owner_scoped.iter().chain(granted.iter()) {
+                        self_caps = self_caps.add_tag(format!("nrpc:{}", svc.as_str()));
+                    }
+                    let mut a = CapabilityAnnouncement::new(
+                        self.node_id,
+                        self.identity.entity_id().clone(),
+                        version,
+                        self_caps,
+                    )
+                    .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32)
+                    .with_owner_cert(owner_cert.clone());
+                    #[cfg(feature = "nat-traversal")]
+                    {
+                        a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    if sign {
+                        a.sign(&self.identity);
+                    }
+                    // Seal the private services into encrypted envelopes carried on
+                    // SUBPROTOCOL_SCOPED_CAPABILITY_ANN — never in the plaintext
+                    // `broadcast_ann`. Owner-scoped (OA3-4b1) and granted-audience
+                    // (OA3-4b2) envelopes ride the SAME pinned cert `a`/
+                    // `broadcast_ann` embed; each family retains the exact Arc it
+                    // sealed under (owner audience / provider grant snapshot) so the
+                    // send path refuses if that Arc is later replaced.
+                    let mut scoped_envelopes: Vec<Vec<u8>> = Vec::new();
+                    let mut scoped_authority = None;
+                    let mut provider_grant_snapshot = None;
+                    if let (Some(authority), Some(cert)) =
+                        (emission_authority.as_ref(), owner_cert.as_ref())
+                    {
+                        // OA3-4b1: ONE owner-audience envelope for all owner-scoped
+                        // services (only when one is registered — a granted-only
+                        // node emits no owner envelope).
+                        if !owner_scoped.is_empty() {
+                            let owner_env = self.owner_scoped_envelopes(
+                                authority,
+                                cert.clone(),
+                                &owner_scoped,
+                                version,
+                                now_secs,
+                                ttl,
+                            );
+                            if !owner_env.is_empty() {
+                                scoped_envelopes.extend(owner_env);
+                                scoped_authority = Some(Arc::clone(authority));
+                            }
+                        }
+                        // OA3-4b2: one granted-audience envelope per active provider
+                        // grant matching a locally-registered granted service.
+                        // Retain the exact snapshot Arc so a grant mutation (which
+                        // swaps the pointer) refuses the cached ciphertext.
+                        if !granted.is_empty() {
+                            let snapshot = self.provider_grant_audiences.load_full();
+                            let granted_env = self.granted_envelopes(
+                                authority, cert, &snapshot, &granted, version, now_secs, ttl,
+                            );
+                            if !granted_env.is_empty() {
+                                scoped_envelopes.extend(granted_env);
+                                provider_grant_snapshot = Some(snapshot);
+                            }
+                        }
+                    }
+                    (
+                        a,
+                        scoped_envelopes,
+                        scoped_authority,
+                        provider_grant_snapshot,
+                    )
+                }
+            };
+            #[cfg(not(feature = "cortex"))]
+            let self_ann = broadcast_ann.clone();
+            #[cfg(not(feature = "cortex"))]
+            let (scoped_envelopes, scoped_authority, provider_grant_snapshot): (
+                Vec<Vec<u8>>,
+                Option<Arc<super::behavior::org_authority::NodeAuthority>>,
+                Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+            ) = (Vec::new(), None, None);
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
-            // latest intended announcement.
-            let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+            // latest intended announcement. OA-1: same owner-cert
+            // verification as inbound ingest (see
+            // `index_self_with_local_services`); the outer-signature
+            // precondition is `sign` — an unsigned announcement
+            // projects no ownership even for ourselves. Uses the FULL
+            // (self-fold) announcement so owner-scoped tags land locally.
+            let verified_owner = {
+                let store = self.org_revocation.load();
+                let floors = store.as_ref().map(|s| s.snapshot());
+                super::behavior::fold::capability_bridge::verify_announced_owner_cert(
+                    &self_ann,
+                    sign,
+                    floors.as_deref(),
+                    0,
+                )
+            };
+            let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(
+                &self_ann,
+                verified_owner,
+            );
             let _ = self.capability_fold.apply(fold_ann);
+            // Review-9: post-apply floor recheck (see the dispatch
+            // path).
+            if let Some(owner) = &verified_owner {
+                let store = self.org_revocation.load();
+                let floors = store.as_ref().map(|s| s.snapshot());
+                super::behavior::fold::capability_bridge::recheck_projected_owner_floor(
+                    &self.capability_fold,
+                    floors.as_deref(),
+                    &self_ann.entity_id,
+                    owner,
+                );
+            }
 
-            // Publish as the latest local announcement so future
-            // session-opens push this version to new peers. Also always
+            // Publish the PUBLIC announcement as the latest local announcement so
+            // future session-opens push this version to new peers. Also always
             // runs so late joiners get the latest caps even when we've
-            // rate-limited away the broadcast.
-            self.local_announcement.store(Some(Arc::new(ann.clone())));
+            // rate-limited away the broadcast. The send path re-validates the
+            // owner cert against live state via the [`SendStamp`] seqlock, so no
+            // build-time stamp is stored (review-11 P1).
+            // Publish public + scoped as ONE unit (Kyra OA3 torn-snapshot
+            // invariant): the plaintext `broadcast_ann` and the owner-scoped
+            // envelopes sealed above go out under one visibility generation. The
+            // review-11 P1 send-time seqlock re-validates `public` and clears
+            // `scoped` if the owner cert it embeds goes stale before a send.
+            self.local_emission
+                .store(Some(Arc::new(LocalCapabilityEmission {
+                    public: broadcast_ann,
+                    scoped: scoped_envelopes,
+                    scoped_authority,
+                    provider_grant_snapshot,
+                    exposure_revocation_generation,
+                })));
 
             // Origin-side rate limit: within-window calls update the
             // self-index + `local_announcement` and coalesce into one
@@ -17186,18 +20699,35 @@ impl MeshNode {
             // send of the newest version.
             let now = std::time::Instant::now();
             let min_interval = self.config.min_announce_interval;
-            let defer_for = {
+            {
                 let mut gate = self.announce_gate.lock();
                 let elapsed = gate
                     .last_broadcast_at
                     .map(|t| now.saturating_duration_since(t));
-                match elapsed {
+                // Two reasons to bypass coalescing (Finding 3):
+                //
+                //  * this is a corrective pass driven by a sender whose own send
+                //    was refused — the ordinary wake/defer machinery already
+                //    failed to carry the supersession; or
+                //  * a local exposure revocation has not yet been superseded on
+                //    the wire, so peers are still holding bytes naming a
+                //    capability to an audience that lost entitlement to it.
+                //
+                // In both cases a trailing-edge flush is too late (and on a
+                // bare-`start` node the deferral arm is a silent drop), so the
+                // send must go now.
+                let revocation_pending_on_the_wire =
+                    exposure_revocation_generation > gate.last_broadcast_exposure_generation;
+                let security_priority = matches!(mode, AnnounceMode::SecurityCorrective)
+                    || revocation_pending_on_the_wire;
+                let in_window = if security_priority { None } else { elapsed };
+                match in_window {
                     Some(e) if e < min_interval => {
                         // In-window with a flush already pending: that
                         // flush will pick up the `local_announcement`
                         // we just stored. Nothing to schedule.
                         if gate.deferred_scheduled {
-                            return Ok(());
+                            return Ok(AnnounceOutcome::Coalesced);
                         }
                         // Bare-start node (no `start_arc`): there is no
                         // owned `Arc` for a flush task to hold — same
@@ -17210,7 +20740,7 @@ impl MeshNode {
                                 "capability: in-window announce not deferred \
                              (node not started via start_arc)"
                             );
-                            return Ok(());
+                            return Ok(AnnounceOutcome::Coalesced);
                         }
                         gate.deferred_scheduled = true;
                         // New deferral claim → new generation. The
@@ -17218,46 +20748,95 @@ impl MeshNode {
                         // a task orphaned by a rate-limit-floor reset
                         // can't fire against this claim (Finding 12).
                         gate.deferral_generation = gate.deferral_generation.wrapping_add(1);
-                        Some((min_interval - e, gate.deferral_generation))
-                    }
-                    _ => {
-                        gate.last_broadcast_at = Some(now);
+                        let (delay, generation) = (min_interval - e, gate.deferral_generation);
+                        // Never spawn under the gate lock (unchanged ordering).
+                        drop(gate);
+                        self.spawn_deferred_announce(delay, generation);
                         None
                     }
+                    _ => {
+                        // Claim the window under a fresh ownership token, carrying
+                        // out what it held: if the send below is refused nothing
+                        // actually shipped, and the claim must be released rather
+                        // than coalesce away the corrective re-announce.
+                        Some(Self::claim_broadcast_window_locked(&mut gate, now))
+                    }
                 }
-            };
-            if let Some((delay, generation)) = defer_for {
-                self.spawn_deferred_announce(delay, generation);
-                None
-            } else {
-                Some(ann.to_bytes())
             }
         };
         // `announce_mu` is released here — the peer broadcast is
         // network I/O and must never hold the announce lock.
 
-        // Fan out to currently-connected peers.
-        let Some(bytes) = to_broadcast else {
-            return Ok(());
+        // Fan out to currently-connected peers. The bytes are
+        // serialized AT SEND TIME through the epoch-checked path
+        // (review-9 addendum): a self-floor raised between the
+        // build above and this send must not ship the certified
+        // form.
+        let Some((claim_id, previous_broadcast_at)) = to_broadcast else {
+            return Ok(AnnounceOutcome::Coalesced);
         };
-        self.broadcast_announcement_bytes(&bytes).await;
-        Ok(())
+        let Some(emission) = self.announcement_bytes_for_send_probed(
+            probe.map(|p| p as &dyn Fn()),
+            super::behavior::org::current_timestamp(),
+        ) else {
+            // The send-time seqlock refused this emission (exposure revoked,
+            // authority rotated, grant snapshot swapped, or stamp churn). NOTHING
+            // shipped, so release the window we claimed — a phantom claim would
+            // coalesce away the corrective pass. Roll back only if the claim is
+            // STILL OURS, decided by the monotonic claim token rather than by
+            // `Instant` equality, which two claimants can share at platform clock
+            // resolution (Finding 4).
+            self.release_broadcast_claim(claim_id, previous_broadcast_at);
+            return Ok(AnnounceOutcome::RefusedBySecurity);
+        };
+        let shipped_generation = emission.exposure_generation;
+        self.broadcast_emission(&emission).await;
+        self.record_broadcast_exposure_generation(shipped_generation);
+        Ok(AnnounceOutcome::Sent)
     }
 
-    /// Broadcast a serialized `CapabilityAnnouncement` to every
-    /// currently-connected peer. Best-effort — a per-peer send failure
-    /// is logged and skipped rather than short-circuiting the fan-out.
-    /// Shared by the immediate announce path and the RT-1 trailing-edge
-    /// flush so the two can't drift (RT-1 review Finding 14).
-    async fn broadcast_announcement_bytes(&self, bytes: &[u8]) {
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
-        for addr in peer_addrs {
+    /// Send one coherent local emission to `addr`: the plaintext public CAP-ANN
+    /// on [`SUBPROTOCOL_CAPABILITY_ANN`], then each encrypted owner-scoped
+    /// envelope on [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`], one packet apiece. THE
+    /// single per-peer emit chokepoint — the broadcast fan-out and the late-join
+    /// unicast both route through it so the public and scoped forms can never
+    /// drift (Kyra OA3 — one combined send helper, no second forgettable path).
+    /// Best-effort per packet: a failure is logged and skipped.
+    async fn send_emission_to(&self, addr: SocketAddr, emission: &SendEmission) {
+        if let Err(e) = self
+            .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
+            .await
+        {
+            tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+        }
+        for envelope in &emission.scoped {
+            // OA3-5 §3.2: wrap the canonical envelope in the outer relay frame at
+            // hop 0 (the origin). Relays rewrite only the hop prefix; the signed
+            // envelope bytes travel verbatim.
+            let frame =
+                super::behavior::org_scoped_relay::ScopedCapabilityRelayFrame::encode(0, envelope);
             if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, bytes)
+                .send_subprotocol(addr, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, &frame)
                 .await
             {
-                tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+                tracing::trace!(
+                    peer = %addr,
+                    error = %e,
+                    "capability: scoped announce send failed"
+                );
             }
+        }
+    }
+
+    /// Broadcast one coherent local emission (public + owner-scoped) to every
+    /// currently-connected peer via [`Self::send_emission_to`]. Best-effort — a
+    /// per-peer failure is logged and skipped rather than short-circuiting the
+    /// fan-out. Shared by the immediate announce path and the RT-1 trailing-edge
+    /// flush so the two can't drift (RT-1 review Finding 14).
+    async fn broadcast_emission(&self, emission: &SendEmission) {
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        for addr in peer_addrs {
+            self.send_emission_to(addr, emission).await;
         }
     }
 
@@ -17306,20 +20885,69 @@ impl MeshNode {
     /// (Finding 12); the reset's documented follow-up announce
     /// supersedes the flush.
     async fn flush_deferred_announce(&self, generation: u64) {
-        {
+        self.flush_deferred_announce_probed(generation, None).await
+    }
+
+    /// [`Self::flush_deferred_announce`] with an optional send-seqlock probe, so
+    /// a witness can force this path's send to be refused and observe that it
+    /// releases its own claim and drives a corrective pass. `None` in production.
+    async fn flush_deferred_announce_probed(
+        &self,
+        generation: u64,
+        probe: Option<&(dyn Fn() + Sync)>,
+    ) {
+        // Claim through the SHARED helper so this path advances the ownership
+        // token like every other claimant. Writing `last_broadcast_at` directly
+        // (the pre-review shape) left the flush invisible to
+        // `release_broadcast_claim`: an immediate sender that claimed earlier and
+        // was refused later still matched its own token and rolled its
+        // predecessor back over this newer window.
+        let (claim_id, previous_broadcast_at) = {
             let mut gate = self.announce_gate.lock();
             if !gate.deferred_scheduled || gate.deferral_generation != generation {
                 return;
             }
             gate.deferred_scheduled = false;
-            gate.last_broadcast_at = Some(std::time::Instant::now());
-        }
+            Self::claim_broadcast_window_locked(&mut gate, std::time::Instant::now())
+        };
         // `local_announcement` is stored before the gate on every
-        // announce path, so a scheduled flush always finds it.
-        let Some(ann) = self.local_announcement.load_full() else {
+        // announce path, so a scheduled flush always finds it. The
+        // bytes are serialized through the epoch-checked path
+        // (review-9 addendum): a self-floor raised during the
+        // deferral window must not ship the certified form.
+        let Some(emission) = self.announcement_bytes_for_send_probed(
+            probe.map(|p| p as &dyn Fn()),
+            super::behavior::org::current_timestamp(),
+        ) else {
+            // Refused on security grounds. Previously this path simply returned:
+            // it consumed its window, sent nothing, drove no correction, and left
+            // the on-wire exposure generation untouched. Exposure revocations
+            // usually wake a security-priority immediate announce, but an
+            // AUTHORITY or PROVIDER-GRANT invalidation moves no exposure epoch —
+            // so nothing else was guaranteed to carry the supersession, and the
+            // "a security-refused sender drives its own correction" contract was
+            // false for this path.
+            self.release_broadcast_claim(claim_id, previous_broadcast_at);
+            if let Err(e) = self
+                .announce_loop(
+                    None,
+                    Duration::from_secs(300),
+                    true,
+                    AnnounceMode::SecurityCorrective,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "capability: deferred flush refused on security grounds and its                      corrective re-announce failed",
+                );
+            }
             return;
         };
-        self.broadcast_announcement_bytes(&ann.to_bytes()).await;
+        let shipped_generation = emission.exposure_generation;
+        self.broadcast_emission(&emission).await;
+        self.record_broadcast_exposure_generation(shipped_generation);
     }
 
     // ── Chain-tag discovery helpers ───────────────────────────────────
@@ -19179,8 +22807,23 @@ impl MeshNode {
         &self,
         ann: super::behavior::capability::CapabilityAnnouncement,
     ) {
-        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
-        let _ = self.capability_fold.apply(fold_ann);
+        // §T8: calls the SAME `ingest_announcement_with_owner_projection` the
+        // live inbound dispatch path calls. This used to be a hand-copied
+        // duplicate, so roughly ten org-ownership tests exercised the copy —
+        // deleting the owner-cert verification from the real dispatch path
+        // left every one of them green, including the headline
+        // `node_ingest_drops_bad_cert_but_keeps_announcement`. Sharing the
+        // body makes that divergence unrepresentable.
+        //
+        // The outer-signature precondition is computed here exactly as
+        // dispatch's step 5 does.
+        let outer_signature_verified = ann.verify().is_ok();
+        ingest_announcement_with_owner_projection(
+            &self.capability_fold,
+            &self.org_revocation,
+            &ann,
+            outer_signature_verified,
+        );
     }
 
     /// Test-only helper — does the fold know about an entry
@@ -19218,25 +22861,31 @@ impl MeshNode {
         self.origin_hash_to_node.get(&origin_hash).map(|v| *v)
     }
 
+    /// Whether a peer entry exists for `node_id`. Once AV-5's production
+    /// caller — a `has_peer_session`-then-`publish_to_peer` pre-check —
+    /// was replaced by the atomic [`Self::try_publish_to_peer`] (R2-6,
+    /// which folds the session-existence check into the single send gate
+    /// with no check-then-act TOCTOU), the only remaining callers are
+    /// tests that assert a node is genuinely disconnected before
+    /// exercising the fallback/drop policies, so this is `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(super) fn has_peer_session(&self, node_id: u64) -> bool {
+        self.peers.contains_key(&node_id)
+    }
+
     /// Push the currently-stored local announcement (if any) to
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
     /// when we haven't yet announced anything.
     async fn push_local_announcement(&self, peer_addr: SocketAddr) {
-        let Some(ann) = self.local_announcement.load_full() else {
+        // Serialized through the epoch-checked path (review-9
+        // addendum): a late joiner must receive what this node's
+        // CURRENT state would emit, never a cached certificate a
+        // floor raise has since invalidated.
+        let Some(emission) = self.announcement_bytes_for_send() else {
             return;
         };
-        let bytes = ann.to_bytes();
-        if let Err(e) = self
-            .send_subprotocol(peer_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
-            .await
-        {
-            tracing::trace!(
-                peer = %peer_addr,
-                error = %e,
-                "capability: session-open push failed"
-            );
-        }
+        self.send_emission_to(peer_addr, &emission).await;
     }
 
     // ── Stream API ─────────────────────────────────────────────────────
@@ -20753,11 +24402,7 @@ impl MeshNode {
         // fire too would put a second broadcast inside the fresh
         // window. The parked flush task no-ops when it finds the
         // slot cleared.
-        {
-            let mut gate = self.announce_gate.lock();
-            gate.last_broadcast_at = None;
-            gate.deferred_scheduled = false;
-        }
+        self.invalidate_broadcast_window();
     }
 
     /// Drop a previously-installed runtime reflex override. The
@@ -20806,11 +24451,7 @@ impl MeshNode {
         // previous send, and a pending trailing-edge flush is
         // canceled for the same reason. See that method's
         // comment for details (cubic P2 + RT-1 follow-up).
-        {
-            let mut gate = self.announce_gate.lock();
-            gate.last_broadcast_at = None;
-            gate.deferred_scheduled = false;
-        }
+        self.invalidate_broadcast_window();
     }
 
     /// Reflex-diff re-classification trigger
@@ -20841,13 +24482,13 @@ impl MeshNode {
         if self.reflex_override_active.load(AtOrd::Acquire) {
             return false;
         }
-        let Some(published) = self.local_announcement.load_full() else {
+        let Some(published) = self.local_emission.load_full() else {
             return false;
         };
         let Some(observed) = self.reflex_addr() else {
             return false;
         };
-        if published.reflex_addr == Some(observed) {
+        if published.public.reflex_addr == Some(observed) {
             return false;
         }
         self.reclassify_nat().await;
@@ -20905,7 +24546,9 @@ impl MeshNode {
     /// return torn pairs under concurrent mutation.
     #[doc(hidden)]
     pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
-        self.local_announcement.load_full()
+        self.local_emission
+            .load_full()
+            .map(|e| Arc::new(e.public.clone()))
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking
@@ -21416,6 +25059,25 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+        // Review-11 P2: unsubscribe this node's raise callback from
+        // its installed store. Without this, the callback the
+        // shared `StoreCore` retains captures the node's
+        // `org_revocation` slot (an `ArcSwapOption` holding the
+        // installed store, which holds the core), forming a
+        // core → callback → slot → store → core cycle that outlives
+        // the node — the core, its old callback, and the stale fold
+        // it captures never drop. Removing the callback breaks the
+        // cycle so the core is released once the last store handle
+        // drops.
+        // AV-10 / R2-2 / R2-3: dropping the node's raise-subscription
+        // guard marks its exclusion lease dead and DRAINS any in-flight
+        // run of the retraction callback (`notify` clones subscriber
+        // callbacks outside the registry lock, so a raise landing
+        // concurrently with teardown could already be executing this one),
+        // then removes it from the installed store's shared core via a
+        // `Weak<StoreCore>`. So a late callback neither starts nor is left
+        // mid-retraction against a fold the node no longer owns.
+        drop(self.org_raise_subscription.lock().take());
     }
 }
 
@@ -22341,6 +26003,7 @@ mod fold_publisher_helpers_tests {
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                owner: None,
             })
             .await;
         assert!(result.is_ok());
@@ -23918,12 +27581,18 @@ mod heartbeat_aead_tests {
     /// flag for `is_priority` / `is_control`, and `is_reliable` is
     /// the obvious next addition. This source-level pin ensures the
     /// fix doesn't get reverted before the dispatch path catches up.
+    ///
+    /// R2-6 moved the packet-build body into the atomic
+    /// [`MeshNode::try_publish_to_peer`] delegate (`publish_to_peer` is
+    /// now a thin `Result`-flattening wrapper), so the pin scans there —
+    /// that is where the wire packet, and thus the `reliable` flag, is
+    /// built.
     #[test]
     fn publish_to_peer_propagates_reliable_to_packet_flags() {
         let src = include_str!("mesh.rs");
         let start = src
-            .find("async fn publish_to_peer(")
-            .expect("publish_to_peer must exist");
+            .find("async fn try_publish_to_peer(")
+            .expect("try_publish_to_peer must exist");
         // Round down to a char boundary — the source has multibyte
         // box-drawing characters in doc comments, and a fixed-byte
         // window can land mid-UTF-8 sequence after edits to the
@@ -25117,7 +28786,7 @@ mod stream_ack_batching_tests {
         // handler does before invalidating the cache).
         let caps = CapabilitySet::new().add_tag(ACK_RANGES_CAPABILITY_TAG.to_string());
         let ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps);
-        fold.apply(translate_announcement(&ann))
+        fold.apply(translate_announcement(&ann, None))
             .expect("fold apply");
 
         // Without invalidation the stale `false` still wins (the bug).
@@ -25388,5 +29057,157 @@ mod stream_ack_batching_tests {
         // small | big-alone | small — three chunks, none empty.
         assert_eq!(ranges.len(), 3);
         assert!(ranges.iter().all(|r| !r.is_empty()));
+    }
+}
+
+/// OA3-4b2 (Kyra closure): query-time consumer currentness must bind to the EXACT
+/// installed grant authority, not merely `grant_id` presence — the registry
+/// supports explicit remove-then-install replacement, so a DISTINCT canonical
+/// grant reusing the same `grant_id` must not re-expose a record admitted under
+/// the previous grant.
+#[cfg(test)]
+mod oa34b2_query_currentness_tests {
+    use super::*;
+    use crate::adapter::net::behavior::org::{current_timestamp, OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::behavior::org_grant::{
+        CapabilityAuthorityId, GrantRights, GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant,
+    };
+    use crate::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    use std::net::SocketAddr;
+
+    /// A byte-identical copy of a secret (install consumes the original), scrubbing
+    /// the temporary key-bearing buffer after decode (OA2-F hygiene bar).
+    fn copy_secret(s: &OrgAudienceSecret) -> OrgAudienceSecret {
+        let mut buf = s.encode_config();
+        let copy = OrgAudienceSecret::decode_config(&buf).expect("copy secret");
+        for b in buf.iter_mut() {
+            // SAFETY: `b` is a valid mutable reference into the owned array.
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        copy
+    }
+
+    async fn adopted_consumer(org: &OrgKeypair, tag: &str) -> (Arc<MeshNode>, std::path::PathBuf) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let cfg = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+        let entity = node.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        let dir = std::env::temp_dir().join(format!("net-oa34b2-qc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+        node.install_node_authority(Arc::new(authority))
+            .expect("install authority");
+        (node, dir)
+    }
+
+    /// A granted envelope from provider `p` (org B) under `grant`/`secret`, naming
+    /// `svc` (the descriptor must name exactly the grant's capability).
+    fn granted_envelope(
+        p: &EntityKeypair,
+        org_b: &OrgKeypair,
+        grant: &OrgCapabilityGrant,
+        secret: &OrgAudienceSecret,
+        svc: &str,
+        expires_at: u64,
+    ) -> Vec<u8> {
+        let cert =
+            OrgMembershipCert::try_issue(org_b, p.entity_id().clone(), 1, 3600).expect("P cert");
+        let descriptor = CapabilitySet::new()
+            .add_tag(format!("nrpc:{svc}"))
+            .to_bytes_compact();
+        ScopedCapabilityAnnouncement::build_granted(
+            p,
+            org_b.org_id(),
+            cert,
+            grant.grant_id,
+            secret.audience_handle,
+            secret.discovery_key(),
+            1,
+            expires_at,
+            &descriptor,
+        )
+        .expect("build granted")
+        .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_distinct_grant_reusing_the_grant_id_does_not_re_expose_the_old_record() {
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB0u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        // G1: a canonical B→A DISCOVER grant over P (random grant_id).
+        let (g1, s1) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue g1");
+        let s1 = s1.expect("secret");
+        let grant_id = g1.grant_id;
+
+        // G2: a DISTINCT canonical grant REUSING G1's grant_id — different
+        // capability + a fresh audience binding + nonce → a different signature.
+        let (s2, b2) = OrgAudienceSecret::mint(grant_id);
+        let g2 = OrgCapabilityGrant::issue_at(
+            &org_b,
+            grant_id,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-b"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            Some(b2),
+            n.saturating_sub(60),
+            n + 3600,
+            0xABCD,
+        );
+        assert_eq!(g1.grant_id, g2.grant_id, "same grant id");
+        assert_ne!(g1.signature, g2.signature, "distinct signed authority");
+
+        let (c, dir) = adopted_consumer(&org_a, "reexpose").await;
+        c.install_consumer_grant_audience(g1.clone(), copy_secret(&s1))
+            .expect("install g1");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(
+            &p, &org_b, &g1, &s1, "svc-a", exp,
+        ));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the G1 record resolves under G1",
+        );
+
+        // Replace G1 with the DISTINCT G2 (same grant_id): the old G1 record must
+        // NOT re-appear — its stored grant signature does not match G2's.
+        assert!(c.remove_consumer_grant_audience(&grant_id));
+        c.install_consumer_grant_audience(g2.clone(), copy_secret(&s2))
+            .expect("install g2");
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "a distinct-authority grant reusing the grant_id does not re-expose the old record",
+        );
+
+        // Ingesting a G2 announcement stores + resolves under the NEW authority.
+        c.ingest_scoped_announcement_for_test(&granted_envelope(
+            &p, &org_b, &g2, &s2, "svc-b", exp,
+        ));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity],
+            "only the G2 record is visible under the replacement authority",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

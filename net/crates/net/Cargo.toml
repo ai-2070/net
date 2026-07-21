@@ -67,6 +67,20 @@ name = "net"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
+# Test/bench-only fixture helpers that bypass a production invariant.
+#
+# `capability_bridge::apply_legacy_announcement` applies an announcement to a
+# fold WITHOUT the live revocation floors, and `MeshNode::capability_fold()` is
+# `pub` — so in a release build any consumer could pair the two and install an
+# ownership projection for a certificate already below a live floor, outside
+# the revocation-aware ingest path and with no callback left to retract it
+# (§12 residual, Kyra).
+#
+# A Cargo feature rather than `#[cfg(test)]` alone: benches AND integration
+# tests link the library as an external crate and cannot see `#[cfg(test)]`
+# items. Off by default, so a downstream `cargo add net-mesh` cannot reach it
+# at all.
+fixtures = []
 # Out-of-the-box `cargo add net-mesh` ships the same stack the
 # Python wheel and Node npm package ship by default — mesh transport
 # + NAT traversal + CortEX (folded state) + NetDb + RedEX disk +
@@ -247,7 +261,7 @@ tracing = "0.1"
 arc-swap = "1.7.1"
 
 # Net adapter (optional)
-chacha20poly1305 = { version = "0.11", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true, features = ["zeroize"] }
 # Packet-path AEAD (RFC 8439 ChaCha20-Poly1305) — CRYPTO SPIKE
 # (2026-06-11). The RustCrypto chacha20poly1305 stack pays ~700 ns
 # of per-MESSAGE fixed cost in poly1305 0.8's AVX2 backend
@@ -396,7 +410,7 @@ harness = false
 [[bench]]
 name = "net"
 harness = false
-required-features = ["net"]
+required-features = ["net", "fixtures"]
 
 [[bench]]
 name = "mesh"
@@ -426,7 +440,7 @@ required-features = ["net"]
 [[bench]]
 name = "placement"
 harness = false
-required-features = ["net"]
+required-features = ["net", "fixtures"]
 
 [[bench]]
 name = "origin_cache_bench"
@@ -438,6 +452,14 @@ required-features = ["net"]
 # (rendezvous alone rides `redex`).
 [[bench]]
 name = "sensing_signature"
+harness = false
+required-features = ["net"]
+
+# OA-1 §1.6 (ORG_CAPABILITY_AUTH_PLAN): uncached org cert / floors
+# verification cost at fold ingest — the number any future
+# verified-cert cache must justify itself against.
+[[bench]]
+name = "org_signature"
 harness = false
 required-features = ["net"]
 

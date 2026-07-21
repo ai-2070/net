@@ -127,12 +127,16 @@ async fn queue_group_distributes_events_across_two_subscribers() {
     let dispatcher_c: RpcInboundDispatcher = Arc::new(move |_ev: RpcInboundEvent| {
         count_c_for_disp.fetch_add(1, Ordering::Relaxed);
     });
+    // Vacant-only registration (OA2-E0.1) returns `Some(registration_id)`
+    // on success and `None` when the canonical hash is already occupied.
+    // (Pre-E0.1 this returned the DISPLACED dispatcher, so `is_none()` was
+    // the success assertion — the semantics inverted, this call site didn't.)
     assert!(worker_b
         .register_rpc_inbound(channel_hash, dispatcher_b)
-        .is_none());
+        .is_some());
     assert!(worker_c
         .register_rpc_inbound(channel_hash, dispatcher_c)
-        .is_none());
+        .is_some());
 
     // Publish N events.
     let n: usize = 100;

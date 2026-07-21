@@ -25,8 +25,10 @@ use clap::{Args, Subcommand};
 use net_sdk::identity::EntityId;
 use serde::{Deserialize, Serialize};
 
+use crate::commands::org::{refuse_replacing_foreign_seed, SeedArtifact};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::prelude::{emit_value, OutputFormat};
+use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
 #[derive(Subcommand, Debug)]
 pub enum IdentityCommand {
@@ -121,12 +123,25 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
 
     let identity = OperatorIdentity::generate();
     let operator_id = identity.operator_id();
-    let seed = *identity.keypair().secret_bytes();
+    // §10 — the seed is copied out of the keypair here, so this local is a
+    // second live copy of the private key and must be scrubbed on EVERY exit,
+    // not just the success tail. `org.rs:run_keygen` avoids the copy entirely
+    // by consuming `secret_bytes()` inline; this path needs it twice (the file
+    // body and nothing else), so it gets an RAII guard instead.
+    let seed = ScrubbedBytes::new(identity.keypair().secret_bytes().to_vec());
     let public_key = *identity.keypair().entity_id().as_bytes();
 
-    let path = args
-        .out
-        .unwrap_or_else(|| default_identity_path(operator_id));
+    let path = match args.out {
+        Some(explicit) => explicit,
+        None => default_identity_path(operator_id).ok_or_else(|| {
+            invalid_args(
+                "cannot resolve the platform config directory, and refusing to fall back to \
+                 the working directory — this file holds the operator's private seed. Pass \
+                 an explicit --out."
+                    .to_string(),
+            )
+        })?,
+    };
 
     // `try_exists` distinguishes "file is absent" (Ok(false)) from
     // "I can't tell because of a permission error" (Err). Pre-fix
@@ -143,13 +158,29 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
                 )));
             }
             Ok(false) => {}
+            // No `--force` advice: it does not override a stat failure, it
+            // skips the check and overwrites whatever is there (§17).
             Err(e) => {
-                return Err(generic(format!(
-                    "failed to stat {}: {e}; pass --force to override",
-                    path.display()
-                )));
+                return Err(generic(format!("failed to stat {}: {e}", path.display())));
             }
         }
+    } else {
+        // §2. `--force` here means "replace the identity at this path". Because
+        // the publish below ends in an unconditional `rename`, and because the
+        // block above is skipped entirely when forcing, this guard is the only
+        // thing standing between a drifted `--out` and the org root key:
+        //
+        //   net identity generate --out "$KEY" --force
+        //
+        // with `$KEY` pointing at an org key file used to replace the org root
+        // with an operator identity and exit 0 — root unrecoverable, no floor
+        // ever issuable again, every outstanding membership cert live until
+        // natural expiry. The original §2 fix guarded `issue-cert` /
+        // `issue-floors` and never reached the two verbs that write seed files.
+        //
+        // Replacing an identity with an identity stays allowed: that is the
+        // rotation `--force` exists for.
+        refuse_replacing_foreign_seed(&path, SeedArtifact::Identity).await?;
     }
 
     // Ensure the parent directory exists. We deliberately don't
@@ -166,13 +197,18 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
 
     let file = IdentityFile {
         operator_id_hex: format!("0x{operator_id:016x}"),
-        seed_hex: hex::encode(seed),
+        seed_hex: hex::encode(seed.as_slice()),
         public_key_hex: hex::encode(public_key),
         created_at: now_iso8601(),
         note: args.note.clone(),
     };
-    let toml_text = toml::to_string_pretty(&file)
-        .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?;
+    // The serialized TOML carries the seed too — wrap it so a failed write or
+    // permission step scrubs it as well, not only the success tail. `file`
+    // scrubs its own `seed_hex` on Drop.
+    let toml_text = ScrubbedString::new(
+        toml::to_string_pretty(&file)
+            .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?,
+    );
 
     // Atomic, mode-restricted publish. Pre-fix `tokio::fs::write`
     // created the file with the process umask (commonly 0o644 —
@@ -280,7 +316,7 @@ async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<()
 
 /// Parse an issuer entity-id: 64 hex chars (optional `0x`) → 32-byte
 /// [`EntityId`].
-fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
+pub(crate) fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
     let trimmed = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
@@ -300,14 +336,30 @@ fn parse_entity_hex(raw: &str) -> Result<EntityId, CliError> {
 // Disk shape
 // =========================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-struct IdentityFile {
-    operator_id_hex: String,
-    seed_hex: String,
-    public_key_hex: String,
-    created_at: String,
+/// §10 — deliberately NO `Debug` derive, and a `Drop` that scrubs `seed_hex`.
+///
+/// `OrgKeyFile` has had both since OA2-F for exactly this reason; this struct
+/// is the same shape holding the same class of secret (a 32-byte ed25519 seed
+/// as 64 hex chars) and had neither. The `Debug` derive was the sharper half:
+/// a single `{file:?}` in a diagnostic — or a `#[derive(Debug)]` on any struct
+/// that came to contain one — renders the operator's private key into a log
+/// line.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct IdentityFile {
+    pub(crate) operator_id_hex: String,
+    pub(crate) seed_hex: String,
+    pub(crate) public_key_hex: String,
+    pub(crate) created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+}
+
+impl Drop for IdentityFile {
+    fn drop(&mut self) {
+        // The operator identity seed rides in `seed_hex`; scrub it on drop so
+        // no copy is left in freed memory (mirrors `OrgKeyFile`).
+        zeroize_string(&mut self.seed_hex);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -338,7 +390,7 @@ struct RevokeOutput {
     store: String,
 }
 
-async fn read_identity_file(
+pub(crate) async fn read_identity_file(
     path: &Path,
     insecure_permissions: bool,
 ) -> Result<IdentityFile, CliError> {
@@ -360,6 +412,44 @@ async fn read_identity_file(
     Ok(parsed)
 }
 
+/// Write `bytes` into the already-created `f` and fsync it, REMOVING `tmp` if
+/// any step fails.
+///
+/// §11, second half. The first pass cleaned up only after a failed RENAME, but
+/// `OpenOptions::open` creates the file before a single byte is written — so a
+/// disk-full, quota, read-only-remount or fsync failure stranded a partial
+/// org-root or node-identity seed on disk. `write_all` can fail mid-buffer, so
+/// the residue may be a PREFIX of the seed file rather than nothing at all.
+///
+/// Split out from the `spawn_blocking` closure so the failure can be driven
+/// deterministically in a test: hand it a read-only handle and `write_all`
+/// fails on every platform. There is no portable way to force that from
+/// inside the closure.
+fn write_sync_or_remove(mut f: std::fs::File, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let written = std::io::Write::write_all(&mut f, bytes).and_then(|()| {
+        // Without the fsync a crash after this returns could still lose the
+        // bytes; a sync failure means they are not durable.
+        f.sync_all()
+    });
+    let Err(e) = written else {
+        return Ok(());
+    };
+    // Close before unlinking — Windows refuses to remove an open file.
+    drop(f);
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+        // Loud, with the exact path — the same discipline the rename-failure
+        // path uses. A silent best-effort removal would be the original defect
+        // in a new place.
+        Err(rm) => eprintln!(
+            "warning: failed to remove partially-written seed temp {}: {rm};              REMOVE IT MANUALLY — it may contain key material.",
+            tmp.display()
+        ),
+    }
+    Err(e)
+}
+
 /// Write `bytes` to `tmp` with the tightest creation mode the
 /// platform supports, then atomic-rename onto `final_path`. On Unix
 /// the temp file is created with `O_CREAT | O_EXCL` and mode 0o600
@@ -367,13 +457,19 @@ async fn read_identity_file(
 /// concurrent reader at the default umask. On Windows the temp
 /// file is created with default ACLs — managed out-of-band per the
 /// module header — and `enforce_strict_permissions` is a no-op.
-async fn write_identity_atomically(
+pub(crate) async fn write_identity_atomically(
     tmp: &Path,
     final_path: &Path,
     bytes: &[u8],
 ) -> Result<(), CliError> {
     let tmp_owned = tmp.to_path_buf();
-    let bytes_owned = bytes.to_vec();
+    // §10: the copy MUST scrub. Callers wrap the serialized seed in
+    // `ScrubbedString` precisely so every exit path zeroes it — and a plain
+    // `bytes.to_vec()` here defeated that ceremony entirely, leaving the org
+    // root seed (or a node identity seed) in freed heap for a core dump, a
+    // swapped page, or heap reuse to disclose. `ScrubbedBytes` zeroes on drop,
+    // including when the blocking task unwinds.
+    let bytes_owned = ScrubbedBytes::new(bytes.to_vec());
 
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
@@ -383,10 +479,8 @@ async fn write_identity_atomically(
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp_owned)?;
-        std::io::Write::write_all(&mut f, &bytes_owned)?;
-        f.sync_all()?;
-        Ok(())
+        let f = opts.open(&tmp_owned)?;
+        write_sync_or_remove(f, &tmp_owned, bytes_owned.as_slice())
     })
     .await
     .map_err(|e| generic(format!("seed-write task panicked: {e}")))?
@@ -397,22 +491,33 @@ async fn write_identity_atomically(
         ))
     })?;
 
-    tokio::fs::rename(tmp, final_path).await.map_err(|e| {
-        let tmp_for_cleanup = tmp.to_path_buf();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(tmp_for_cleanup).await;
-        });
-        generic(format!(
+    // §11: the temp holds SEED MATERIAL, so a failed rename must not orphan it
+    // silently. The previous cleanup was a detached `tokio::spawn` — in a
+    // one-shot CLI the error propagates straight out of `dispatch` and the
+    // process exits, so that task was almost never scheduled and the seed was
+    // left on disk with only a "rename failed" message that never mentioned
+    // it. Await the removal, and if it fails say so LOUDLY with the exact path
+    // so the operator can remove it by hand.
+    if let Err(e) = tokio::fs::rename(tmp, final_path).await {
+        match tokio::fs::remove_file(tmp).await {
+            Ok(()) => {}
+            Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+            Err(rm) => eprintln!(
+                "warning: failed to remove seed-bearing temp file {}: {rm};                  REMOVE IT MANUALLY — it contains key material.",
+                tmp.display()
+            ),
+        }
+        return Err(generic(format!(
             "rename identity tmp {} -> {}: {e}",
             tmp.display(),
             final_path.display()
-        ))
-    })?;
+        )));
+    }
     Ok(())
 }
 
 #[cfg(unix)]
-async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o600);
     tokio::fs::set_permissions(path, perms).await.map_err(|e| {
@@ -424,7 +529,7 @@ async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
+pub(crate) async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
     // No-op on Windows — file ACLs don't have a clean
     // 0o600 analog accessible from std::fs. Operators on
     // Windows are expected to manage NTFS ACLs out-of-band.
@@ -432,7 +537,7 @@ async fn enforce_strict_permissions(_path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(unix)]
-async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
     let meta = tokio::fs::metadata(path).await.map_err(|e| {
         generic(format!(
@@ -455,7 +560,7 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
     // NTFS ACLs don't have a clean 0o600 analog reachable from
     // `std::fs`, so structurally the permission gate is a no-op
     // on Windows — but pre-fix that no-op was silent and every
@@ -479,15 +584,29 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn default_identity_path(operator_id: u64) -> PathBuf {
-    let base = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("net-mesh")
-        .join("identities");
-    base.join(format!("operator-0x{operator_id:016x}.toml"))
+/// The default identity path, or `None` when the platform config directory
+/// cannot be resolved (§19).
+///
+/// Deliberately NOT falling back to `PathBuf::from(".")`. This file holds the
+/// operator's ed25519 SEED; a CWD fallback silently writes it wherever the
+/// operator happened to be standing — a git checkout, an archived CI
+/// workspace, a shared build directory. On Windows the file then inherits that
+/// directory's DACL and `enforce_strict_permissions` is a no-op, so a
+/// world-readable CWD yields a world-readable private key with no warning.
+///
+/// `node.rs::default_authority_dir` was hardened this way for `owner-audience.key`;
+/// the same argument applies at least as strongly here, and `config.rs` already
+/// used the `Option` pattern — it simply was not propagated.
+fn default_identity_path(operator_id: u64) -> Option<PathBuf> {
+    Some(
+        dirs::config_dir()?
+            .join("net-mesh")
+            .join("identities")
+            .join(format!("operator-0x{operator_id:016x}.toml")),
+    )
 }
 
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     // The chrono crate isn't in the CLI's deps; format the
     // current SystemTime as ISO-8601 by hand. Format:
     // `YYYY-MM-DDTHH:MM:SSZ` (no sub-second precision).
@@ -530,6 +649,140 @@ fn format_iso8601_utc(secs_since_epoch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §11 — a failed rename must not orphan the seed-bearing temp file.
+    ///
+    /// The temp holds raw key material (an org root seed via `net org keygen`,
+    /// or a node identity seed). The previous cleanup was a detached
+    /// `tokio::spawn`, and this is a one-shot CLI: the error propagates
+    /// straight out of `dispatch` and the process exits, so that task was
+    /// almost never scheduled. The operator saw only "rename failed" — nothing
+    /// said a seed file had been left behind.
+    ///
+    /// The rename is forced to fail by pointing `final_path` at an existing
+    /// DIRECTORY, which is portable (EISDIR on Unix, ERROR_ACCESS_DENIED on
+    /// Windows) and needs no permission games.
+    ///
+    /// Red-witness: restoring the detached `tokio::spawn` cleanup leaves the
+    /// temp on disk and fails the assertion.
+    #[tokio::test]
+    async fn a_failed_rename_removes_the_seed_bearing_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+        // An existing directory can never be replaced by a file rename.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("mkdir");
+
+        let err = write_identity_atomically(&tmp, &occupied, b"seed-material")
+            .await
+            .expect_err("renaming onto a directory must fail");
+        assert!(
+            format!("{err}").contains("rename identity tmp"),
+            "the error must name the failed step; got: {err}",
+        );
+        assert!(
+            !tmp.exists(),
+            "the seed-bearing temp {} must not be left on disk",
+            tmp.display(),
+        );
+    }
+
+    /// §11 (second half) — a failed WRITE or SYNC must not orphan the temp.
+    ///
+    /// The first §11 fix cleaned up only after a failed RENAME. But
+    /// `OpenOptions::open` creates the file before a byte is written, so
+    /// disk-full, quota, read-only-remount and fsync failures still stranded
+    /// seed material — and because `write_all` can fail mid-buffer, the
+    /// residue may be a PREFIX of the seed file rather than nothing.
+    ///
+    /// Driven deterministically by handing the writer a READ-ONLY handle to an
+    /// existing file: `write_all` then fails on every platform, though the
+    /// error differs — POSIX `write(2)` on an `O_RDONLY` fd is EBADF (no
+    /// `ErrorKind` mapping, so `Uncategorized`), while Windows `WriteFile`
+    /// without `GENERIC_WRITE` is `ERROR_ACCESS_DENIED` (`PermissionDenied`).
+    /// Forcing a genuine ENOSPC/EIO from inside the blocking closure is not
+    /// portable, which is why the cleanup was extracted into
+    /// `write_sync_or_remove`.
+    ///
+    /// Red-witness: deleting the removal block leaves the file on disk and
+    /// fails the second assertion.
+    #[test]
+    fn a_failed_write_removes_the_partial_seed_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+
+        // Stand in for a temp the writer had already created and partially
+        // filled before the failure.
+        std::fs::write(&tmp, b"partial-seed-material").expect("seed the temp");
+        let read_only = std::fs::File::open(&tmp).expect("open read-only");
+
+        let err = write_sync_or_remove(read_only, &tmp, b"the-real-seed")
+            .expect_err("writing through a read-only handle must fail");
+        #[cfg(unix)]
+        assert_eq!(
+            err.raw_os_error(),
+            Some(9), // EBADF — write(2) on an O_RDONLY fd; same value on Linux/macOS/BSDs
+            "precondition: the failure is the write itself, not something else",
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "precondition: the failure is the write itself, not something else",
+        );
+        assert!(
+            !tmp.exists(),
+            "a partially-written seed temp must be removed on write failure",
+        );
+    }
+
+    /// The success path leaves the file in place and reports Ok — the cleanup
+    /// must not fire on a healthy write.
+    #[test]
+    fn a_successful_write_keeps_the_temp_for_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .expect("create");
+        write_sync_or_remove(f, &tmp, b"seed-material").expect("healthy write succeeds");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read back"),
+            b"seed-material",
+            "the payload is intact and the temp survives for the rename",
+        );
+    }
+
+    /// The happy path still writes, renames, and leaves no temp behind.
+    #[tokio::test]
+    async fn a_successful_write_renames_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+        let final_path = dir.path().join("identity.toml");
+
+        write_identity_atomically(&tmp, &final_path, b"seed-material")
+            .await
+            .expect("write succeeds");
+        assert_eq!(
+            std::fs::read(&final_path).expect("read final"),
+            b"seed-material",
+            "the payload landed intact",
+        );
+        assert!(!tmp.exists(), "no temp is left behind on success");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&final_path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "seed file must be owner-only, got {mode:o}"
+            );
+        }
+    }
 
     #[test]
     fn iso8601_formats_unix_epoch() {

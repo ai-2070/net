@@ -1826,6 +1826,8 @@ mod tests {
                     1,
                     caps,
                 ),
+                None,
+                0,
             )
             .expect("apply legacy announcement in fixture");
         }

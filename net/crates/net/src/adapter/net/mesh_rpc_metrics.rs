@@ -116,6 +116,20 @@ pub struct ServiceMetricsAtomic {
     /// runs) doesn't move. Pair with the caller-side metric
     /// `errors_server` on the calling node for a complete picture.
     pub capability_denied_total: AtomicU64,
+    /// Flow-controlled upload REQUESTs (client-streaming / duplex) rejected
+    /// at admission because the caller session is relayed/untrusted — a
+    /// nonzero `from_node` whose pinned origin does NOT match the claimed
+    /// caller origin (Kyra Gate-3). Secure upload grants require a directly
+    /// authenticated caller session, so such a call is dropped BEFORE the
+    /// fold rather than admitted and then silently starved of grants. A
+    /// nonzero value means a relayed flow-controlled caller was refused.
+    pub relayed_flow_controlled_rejected_total: AtomicU64,
+    /// Inbound frames dropped at the shared bridge preflight because the
+    /// packet (transport) origin did not equal the payload (EventMeta) origin
+    /// — a direct peer stamping a forged payload origin (Kyra Gate-3). Dropped
+    /// BEFORE capability admission, response-cache mutation, or fold execution,
+    /// so the fold never runs under an origin the packet did not authenticate.
+    pub packet_origin_mismatch_dropped_total: AtomicU64,
 }
 
 impl ServiceMetricsAtomic {
@@ -139,6 +153,8 @@ impl ServiceMetricsAtomic {
             streaming_chunks_emitted_total: AtomicU64::new(0),
             streaming_chunks_dropped_total: AtomicU64::new(0),
             capability_denied_total: AtomicU64::new(0),
+            relayed_flow_controlled_rejected_total: AtomicU64::new(0),
+            packet_origin_mismatch_dropped_total: AtomicU64::new(0),
         }
     }
 
@@ -336,6 +352,12 @@ impl RpcMetricsRegistry {
                     .streaming_chunks_dropped_total
                     .load(Ordering::Relaxed),
                 capability_denied_total: m.capability_denied_total.load(Ordering::Relaxed),
+                relayed_flow_controlled_rejected_total: m
+                    .relayed_flow_controlled_rejected_total
+                    .load(Ordering::Relaxed),
+                packet_origin_mismatch_dropped_total: m
+                    .packet_origin_mismatch_dropped_total
+                    .load(Ordering::Relaxed),
             });
         }
         services.sort_by(|a, b| a.service.cmp(&b.service));
@@ -431,6 +453,16 @@ pub struct ServiceMetrics {
     /// zero `handler_invocations_total` movement is the
     /// distinguishing signature of a noisy unauthorized caller.
     pub capability_denied_total: u64,
+    /// Flow-controlled upload REQUESTs rejected at admission because the
+    /// caller session is relayed/untrusted (pinned origin != claimed
+    /// origin). A nonzero value means a relayed client-streaming/duplex
+    /// caller was dropped before the fold — relayed flow-controlled nRPC is
+    /// unsupported until end-to-end recipient correlation exists.
+    pub relayed_flow_controlled_rejected_total: u64,
+    /// Inbound frames dropped at the shared bridge preflight because the
+    /// packet origin != the payload (EventMeta) origin (a forged payload
+    /// origin). Dropped before capability admission, cache mutation, or fold.
+    pub packet_origin_mismatch_dropped_total: u64,
 }
 
 impl RpcMetricsSnapshot {
@@ -654,6 +686,36 @@ impl RpcMetricsSnapshot {
                 "nrpc_capability_denied_total{{service=\"{}\"}} {}",
                 escape_label(&s.service),
                 s.capability_denied_total
+            );
+        }
+
+        // relayed_flow_controlled_rejected_total — flow-controlled upload
+        // REQUESTs dropped at admission for a relayed/untrusted caller.
+        out.push_str(
+            "# HELP nrpc_relayed_flow_controlled_rejected_total Flow-controlled upload REQUESTs rejected at admission because the caller session is relayed/untrusted (pinned origin != claimed origin).\n",
+        );
+        out.push_str("# TYPE nrpc_relayed_flow_controlled_rejected_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_relayed_flow_controlled_rejected_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.relayed_flow_controlled_rejected_total
+            );
+        }
+
+        // packet_origin_mismatch_dropped_total — frames dropped at preflight
+        // because the packet origin != the payload (EventMeta) origin.
+        out.push_str(
+            "# HELP nrpc_packet_origin_mismatch_dropped_total Inbound frames dropped at the bridge preflight because the packet (transport) origin did not equal the payload (EventMeta) origin.\n",
+        );
+        out.push_str("# TYPE nrpc_packet_origin_mismatch_dropped_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_packet_origin_mismatch_dropped_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.packet_origin_mismatch_dropped_total
             );
         }
 
@@ -940,6 +1002,45 @@ mod tests {
         let txt = snap.prometheus_text();
         assert!(
             txt.contains("nrpc_capability_denied_total{service=\"locked\"} 2"),
+            "prometheus output must surface the counter; got:\n{txt}",
+        );
+    }
+
+    /// Gate-3: `relayed_flow_controlled_rejected_total` is bumped when a
+    /// relayed/untrusted flow-controlled upload REQUEST is dropped at
+    /// admission (before the fold) and surfaces through the snapshot +
+    /// Prometheus path, distinct from `capability_denied_total`.
+    #[test]
+    fn relayed_flow_controlled_rejected_counter_surfaces_through_snapshot_and_prometheus() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("upload");
+        m.relayed_flow_controlled_rejected_total
+            .fetch_add(3, Ordering::Relaxed);
+        let snap = r.snapshot();
+        assert_eq!(snap.services[0].relayed_flow_controlled_rejected_total, 3);
+        let txt = snap.prometheus_text();
+        assert!(
+            txt.contains("nrpc_relayed_flow_controlled_rejected_total{service=\"upload\"} 3"),
+            "prometheus output must surface the counter; got:\n{txt}",
+        );
+    }
+
+    /// Gate-3: `packet_origin_mismatch_dropped_total` is bumped when a bridge
+    /// drops an inbound frame whose packet (transport) origin != the payload
+    /// (EventMeta) origin, and surfaces through the snapshot + Prometheus path
+    /// (atomic → snapshot field → Prometheus text), distinct from the relayed
+    /// flow-controlled counter.
+    #[test]
+    fn packet_origin_mismatch_dropped_counter_surfaces_through_snapshot_and_prometheus() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("upload");
+        m.packet_origin_mismatch_dropped_total
+            .fetch_add(5, Ordering::Relaxed);
+        let snap = r.snapshot();
+        assert_eq!(snap.services[0].packet_origin_mismatch_dropped_total, 5);
+        let txt = snap.prometheus_text();
+        assert!(
+            txt.contains("nrpc_packet_origin_mismatch_dropped_total{service=\"upload\"} 5"),
             "prometheus output must surface the counter; got:\n{txt}",
         );
     }

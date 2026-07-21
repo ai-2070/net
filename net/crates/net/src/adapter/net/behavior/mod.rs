@@ -46,7 +46,21 @@ pub mod meshos;
 // import each other (integration-plan Locked Decision 5); every
 // cross-layer projection lives here. Spans both feature surfaces, so
 // it needs both gates.
+pub mod admission_clock;
+pub mod caller_identity;
 pub mod metadata;
+pub mod org;
+pub mod org_admission;
+pub mod org_admission_replay;
+pub mod org_authority;
+pub mod org_call;
+pub mod org_grant;
+pub mod org_grant_registry;
+pub mod org_revocation;
+pub mod org_scoped_ann;
+pub mod org_scoped_ingest;
+pub mod org_scoped_relay;
+pub mod org_scoped_store;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;
@@ -89,6 +103,22 @@ pub use dataforts_capabilities::{
 // taxonomy. Re-exported from the behavior plane root so downstream
 // callers reach `Tag` / `TagKey` / `TaxonomyAxis` via the same path
 // they already use for `CapabilitySet`.
+pub use org::{
+    OrgError, OrgId, OrgKeypair, OrgMembershipCert, OrgRevocationBundle, MAX_ORG_CERT_TTL_SECS,
+    MAX_REVOCATION_FLOORS_PER_BUNDLE, ORG_CERT_SIG_DOMAIN, ORG_CERT_TTL_SECS_RECOMMENDED,
+    ORG_FLOORS_SIG_DOMAIN,
+};
+
+pub use org_authority::{
+    authority_dir, NodeAuthority, NodeAuthorityConfig, OrgAuthorityError, OwnerAudienceCredential,
+    NODE_AUTHORITY_CONFIG_VERSION, OWNER_AUDIENCE_FILE, OWNER_MEMBERSHIP_FILE,
+    REVOCATION_STATE_FILE,
+};
+
+pub use org_revocation::{
+    OrgRevocationError, OrgRevocationState, OrgRevocationStore, ORG_REVOCATION_STATE_VERSION,
+};
+
 pub use tag::{AxisSeparator, CapabilityTagError, Tag, TagKey, TaxonomyAxis, RESERVED_PREFIXES};
 
 pub use predicate::{

@@ -101,6 +101,128 @@ pub const DISPATCH_RPC_REQUEST_CHUNK: u8 = 0x15;
 pub const DISPATCH_RPC_REQUEST_GRANT: u8 = 0x16;
 
 // ============================================================================
+// OA2-E0.2 — RpcRouteV1 frame discriminator.
+//
+// Every nRPC frame is laid out `EventMeta ‖ RpcRouteV1 ‖ payload`,
+// where RpcRouteV1 is the CANONICAL u64 ChannelHash of the physical
+// channel the frame rides (caller → provider: `<service>.requests`;
+// provider → caller: the reply channel). The wire packet header
+// carries only a `u16` bucket, which can collide; this discriminator
+// lets mesh ingress select EXACTLY ONE registered canonical
+// dispatcher instead of fanning the frame to every candidate and
+// asking each fold to self-filter (the removed ambiguity).
+//
+// This is a coordinated nRPC frame-version change — every nRPC
+// sender writes it and mesh ingress requires it for RPC event types.
+// ============================================================================
+
+/// Size of the [`RpcRouteV1`](encode_rpc_route) discriminator: one
+/// canonical u64 `ChannelHash`.
+pub const RPC_ROUTE_V1_SIZE: usize = 8;
+
+/// Byte offset of the frame-specific payload inside an nRPC frame:
+/// past the `EventMeta` prefix AND the RpcRouteV1 discriminator.
+pub const RPC_FRAME_BODY_OFFSET: usize = EVENT_META_SIZE + RPC_ROUTE_V1_SIZE;
+
+/// Append the RpcRouteV1 discriminator (`canonical` channel hash)
+/// to a frame buffer that already holds the `EventMeta` prefix
+/// (OA2-E0.2). Every nRPC frame builder calls this immediately
+/// after `meta.to_bytes()`.
+#[inline]
+pub fn encode_rpc_route(buf: &mut Vec<u8>, canonical: crate::adapter::net::channel::ChannelHash) {
+    buf.extend_from_slice(&canonical.to_le_bytes());
+}
+
+/// Insert the RpcRouteV1 discriminator into an already-assembled
+/// `EventMeta ‖ payload` frame, producing `EventMeta ‖ route ‖
+/// payload` (OA2-E0.2). Used at the centralized response publish
+/// choke point (`publish_response_to_caller`), where the frame is
+/// built before the reply-channel hash is threaded in — one small
+/// copy per response frame. Direct request-direction builders use
+/// [`encode_rpc_route`] inline instead (no copy). Frames shorter
+/// than `EVENT_META_SIZE` are returned unchanged (never a real
+/// nRPC frame).
+pub fn insert_rpc_route(
+    frame: bytes::Bytes,
+    canonical: crate::adapter::net::channel::ChannelHash,
+) -> bytes::Bytes {
+    if frame.len() < EVENT_META_SIZE {
+        return frame;
+    }
+    let mut out = Vec::with_capacity(frame.len() + RPC_ROUTE_V1_SIZE);
+    out.extend_from_slice(&frame[..EVENT_META_SIZE]);
+    out.extend_from_slice(&canonical.to_le_bytes());
+    out.extend_from_slice(&frame[EVENT_META_SIZE..]);
+    bytes::Bytes::from(out)
+}
+
+/// Read the RpcRouteV1 discriminator from a full nRPC frame
+/// (`EventMeta ‖ route ‖ payload`). `None` if the frame is too
+/// short to carry it — a malformed/legacy frame that ingress drops.
+#[inline]
+pub fn decode_rpc_route(frame: &[u8]) -> Option<crate::adapter::net::channel::ChannelHash> {
+    let bytes = frame.get(EVENT_META_SIZE..EVENT_META_SIZE + RPC_ROUTE_V1_SIZE)?;
+    let arr: [u8; RPC_ROUTE_V1_SIZE] = bytes.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
+/// `true` iff `event_type` is an nRPC dispatch frame that carries
+/// the RpcRouteV1 discriminator (OA2-E0.2). Mesh ingress uses this
+/// to apply route-based single-select to RPC frames while leaving
+/// non-RPC dispatcher registrations (e.g. the sensing intake) on
+/// the legacy fan-out path.
+#[inline]
+pub fn is_rpc_dispatch_frame(event_type: u8) -> bool {
+    matches!(
+        event_type,
+        DISPATCH_RPC_REQUEST
+            | DISPATCH_RPC_RESPONSE
+            | DISPATCH_RPC_CANCEL
+            | DISPATCH_RPC_DEADLINE_EXCEEDED
+            | DISPATCH_RPC_STREAM_GRANT
+            | DISPATCH_RPC_REQUEST_CHUNK
+            | DISPATCH_RPC_REQUEST_GRANT
+    )
+}
+
+/// Peek the self-declared `service` field of an initial-REQUEST
+/// frame (`EventMeta ‖ RpcRouteV1 ‖ RpcRequestPayload`) WITHOUT a
+/// full payload decode (OA2-E0.2 P0).
+///
+/// The route discriminator (E0.2) already selected a dispatcher by
+/// *canonical channel hash*, but `RpcRequestPayload` also carries
+/// its OWN `service` string — the first body field (`u8` length ‖
+/// bytes, see [`RpcRequestPayload::encode_into`]). The serve bridge
+/// uses this to enforce `payload.service == captured_service` before
+/// the capability gate or any fold state, so a frame routed to
+/// `admin.requests` whose payload names `echo` never reaches the
+/// admin handler.
+///
+/// Returns `None` when the service field is unreadable — frame too
+/// short (missing the route or the length byte), an empty or
+/// over-cap length, or non-UTF-8 bytes. Those exactly mirror the
+/// `Err` arms of [`RpcRequestPayload::decode`], so an unreadable
+/// service falls through to the fold's full decode, which rejects it
+/// (`UnknownVersion`) — no handler runs either way. A `Some(svc)`
+/// return borrows the service bytes straight out of `frame`.
+///
+/// Only meaningful for `DISPATCH_RPC_REQUEST` frames; control frames
+/// (CANCEL / CHUNK / GRANT) carry no service and inherit the
+/// route-selected active call, so callers gate on the dispatch type
+/// before calling this.
+#[inline]
+pub fn peek_request_service(frame: &[u8]) -> Option<&str> {
+    let body = frame.get(RPC_FRAME_BODY_OFFSET..)?;
+    let (&svc_len, rest) = body.split_first()?;
+    let svc_len = svc_len as usize;
+    if svc_len == 0 || svc_len > MAX_RPC_SERVICE_NAME_LEN {
+        return None;
+    }
+    let svc = rest.get(..svc_len)?;
+    std::str::from_utf8(svc).ok()
+}
+
+// ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
 
@@ -210,6 +332,17 @@ pub enum RpcStatus {
     /// gRPC equivalent: `PERMISSION_DENIED` (7) — same outward
     /// shape as `Unauthorized` but a separate substrate code.
     CapabilityDenied = 0x0008,
+    /// OA-2 org admission (E2.2): a PROTECTED service denied this call —
+    /// the caller's `net-org-admission` proof failed verification, the
+    /// provider cannot admit right now, or the call shape is unsupported.
+    /// A COARSE reason (denied / not-supported / unavailable) rides the
+    /// response; the DETAILED `AdmissionDenied` variant stays provider-
+    /// side audit only, so denial is not a credential oracle. Distinct
+    /// from `CapabilityDenied` (v0.4 allow-list) and `Unauthorized`
+    /// (channel-auth / token-scope) so operators can tell the
+    /// enforcement surfaces apart.
+    /// gRPC equivalent: `PERMISSION_DENIED` (7).
+    AdmissionDenied = 0x0009,
     /// Application-defined status. The wire carries the raw u16;
     /// callers / servers agree on the meaning out of band.
     Application(u16),
@@ -228,12 +361,13 @@ impl RpcStatus {
             Self::Internal => 0x0006,
             Self::UnknownVersion => 0x0007,
             Self::CapabilityDenied => 0x0008,
+            Self::AdmissionDenied => 0x0009,
             Self::Application(v) => v,
         }
     }
 
     /// Decode from the wire `u16`. Reserved values
-    /// (`0x0009..=0x7FFF`) decode as `Application(v)` rather than
+    /// (`0x000A..=0x7FFF`) decode as `Application(v)` rather than
     /// failing — forward-compat with future status assignments.
     pub fn from_wire(v: u16) -> Self {
         match v {
@@ -246,6 +380,7 @@ impl RpcStatus {
             0x0006 => Self::Internal,
             0x0007 => Self::UnknownVersion,
             0x0008 => Self::CapabilityDenied,
+            0x0009 => Self::AdmissionDenied,
             other => Self::Application(other),
         }
     }
@@ -438,6 +573,57 @@ pub enum RpcCodecError {
 }
 
 impl RpcRequestPayload {
+    /// Validate every length field against the wire ceilings the codec's
+    /// `u8` / `u16` / `u32` length prefixes assume, BEFORE any encode.
+    /// In release builds [`Self::encode_into`] truncates an over-cap
+    /// length via its `as u8` / `as u16` / `as u32` casts (debug builds
+    /// `debug_assert`), which would let an oversized, publicly-
+    /// constructed request produce an ambiguous / non-round-tripping
+    /// encoding. Any caller that must NOT silently truncate — the org
+    /// request digest (AV-7 item 7), and any future checked send path —
+    /// validates first and refuses rather than hashing a collision-prone
+    /// encoding.
+    pub fn validate_wire_bounds(&self) -> Result<(), RpcCodecError> {
+        if self.service.len() > MAX_RPC_SERVICE_NAME_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "service",
+                actual: self.service.len(),
+                limit: MAX_RPC_SERVICE_NAME_LEN,
+            });
+        }
+        if self.headers.len() > MAX_RPC_HEADERS {
+            return Err(RpcCodecError::TooLarge {
+                field: "headers",
+                actual: self.headers.len(),
+                limit: MAX_RPC_HEADERS,
+            });
+        }
+        for (name, value) in &self.headers {
+            if name.len() > MAX_RPC_HEADER_NAME_LEN {
+                return Err(RpcCodecError::TooLarge {
+                    field: "header name",
+                    actual: name.len(),
+                    limit: MAX_RPC_HEADER_NAME_LEN,
+                });
+            }
+            if value.len() > MAX_RPC_HEADER_VALUE_LEN {
+                return Err(RpcCodecError::TooLarge {
+                    field: "header value",
+                    actual: value.len(),
+                    limit: MAX_RPC_HEADER_VALUE_LEN,
+                });
+            }
+        }
+        if self.body.len() > MAX_RPC_BODY_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "body",
+                actual: self.body.len(),
+                limit: MAX_RPC_BODY_LEN,
+            });
+        }
+        Ok(())
+    }
+
     /// Compute the encoded byte length WITHOUT actually encoding.
     /// Used by [`request_wire_size`] and any caller that needs to
     /// budget event size at the bus layer (e.g., to refuse a
@@ -913,13 +1099,14 @@ fn decode_headers(
 /// Exposed so callers can budget the total event size at the bus
 /// layer without doing the encode first.
 pub fn request_wire_size(payload: &RpcRequestPayload) -> usize {
-    EVENT_META_SIZE + payload.encoded_len()
+    // OA2-E0.2: EventMeta + RpcRouteV1 discriminator + payload.
+    RPC_FRAME_BODY_OFFSET + payload.encoded_len()
 }
 
 /// Same for `RpcResponsePayload` after the `EventMeta` prefix in a
 /// `DISPATCH_RPC_RESPONSE` event.
 pub fn response_wire_size(payload: &RpcResponsePayload) -> usize {
-    EVENT_META_SIZE + payload.encoded_len()
+    RPC_FRAME_BODY_OFFSET + payload.encoded_len()
 }
 
 // ============================================================================
@@ -1310,6 +1497,16 @@ pub struct RpcContext {
     /// trace. `None` for calls that didn't propagate trace
     /// context.
     pub trace_context: Option<TraceContext>,
+    /// OA-2 org-admission attribution (E1.6). `Some(Admitted)` for a
+    /// call that passed the PROTECTED-service admission gate — the
+    /// four-party verified identity (caller, acting org, provider org,
+    /// exact provider, capability). The raw `net-org-admission` proof
+    /// header is STRIPPED from `payload.headers` before the handler
+    /// sees it, so application code receives verified attribution, never
+    /// raw credential material. `None` for public
+    /// (`PublicAuthenticated`) calls, which keep existing header
+    /// behavior.
+    pub org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
 }
 
 /// Handler-side error that doesn't fit the application's normal
@@ -1355,8 +1552,13 @@ pub trait RpcHandler: Send + Sync + 'static {
 /// `<service>.replies.<caller_origin>`. Type-erased so the fold
 /// doesn't depend on the mesh layer directly.
 ///
-/// Arguments: `(caller_origin, call_id, response_payload)`.
-pub type RpcResponseEmitter = Arc<dyn Fn(u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
+/// Arguments: `(from_node, caller_origin, call_id, response_payload)`.
+/// `from_node` (R2-5) is the AEAD-authenticated session peer that
+/// delivered the REQUEST — the authoritative response destination, so
+/// two sessions pinned to the same entity/origin submitting the same
+/// call_id each route their response to their OWN session.
+pub type RpcResponseEmitter =
+    Arc<dyn Fn(u64, u64, u64, RpcResponsePayload) + Send + Sync + 'static>;
 
 /// Async counterpart of [`RpcResponseEmitter`] used by the
 /// streaming fold's pump task to serialize per-call publishes.
@@ -1368,11 +1570,19 @@ pub type RpcResponseEmitter = Arc<dyn Fn(u64, u64, RpcResponsePayload) + Send + 
 /// — it emits exactly one RESPONSE per call — so it sticks with
 /// the simpler sync `RpcResponseEmitter`.)
 pub type RpcAsyncResponseEmitter = Arc<
-    dyn Fn(u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
+    dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
         + Send
         + Sync
         + 'static,
 >;
+
+/// `(from_node, caller_origin, call_id)` → cancellation token for an
+/// in-flight call. `from_node` (AV-1 item 1) is the AEAD-authenticated
+/// last-hop session peer, so a control frame that copies another peer's
+/// origin + call_id lands under a distinct, absent key and cannot
+/// cancel or otherwise mutate the victim's call. Shared across all four
+/// server folds.
+type InFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64), RpcCancellationToken>>>;
 
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
@@ -1387,13 +1597,17 @@ pub type RpcAsyncResponseEmitter = Arc<
 pub struct RpcServerFold {
     handler: Arc<dyn RpcHandler>,
     emit: RpcResponseEmitter,
-    /// (caller_origin, call_id) → cancellation token for the
-    /// in-flight handler. Inserted on REQUEST, removed by either
-    /// the spawned handler task on completion or by the fold on
-    /// CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned tasks can
-    /// remove their own entries without going back through the
-    /// fold.
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// (from_node, caller_origin, call_id) → cancellation token for
+    /// the in-flight handler. `from_node` is the AEAD-authenticated
+    /// last-hop session peer (AV-1 item 1): binding it into the key
+    /// means a peer that copies another peer's origin + call_id onto
+    /// a forged CANCEL looks up a distinct, absent key and no-ops
+    /// rather than cancelling the victim's call. Inserted on REQUEST,
+    /// removed by either the spawned handler task on completion or by
+    /// the fold on CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned
+    /// tasks can remove their own entries without going back through
+    /// the fold.
+    in_flight: InFlightCalls,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1451,7 +1665,7 @@ impl RpcServerFold {
 
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
         self.in_flight.lock().keys().copied().collect()
     }
 
@@ -1491,52 +1705,100 @@ impl RpcServerFold {
 /// within the threshold an NTP-disciplined cluster ever drifts to.
 pub const DEADLINE_SKEW_TOLERANCE_NS: u64 = 10_000_000_000; // 10 seconds
 
-impl RedexFold<()> for RpcServerFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+impl RpcServerFold {
+    /// Production-path entry point. The serve bridge calls this with
+    /// the AEAD-verified session peer's `NodeId` in `ev.from_node`;
+    /// all per-call state is keyed by `(from_node, claimed_origin,
+    /// call_id)` so no peer can create, cancel, or otherwise mutate
+    /// another peer's call by copying its origin + call_id (AV-1
+    /// item 1).
+    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload, None)
+    }
+
+    /// OA-2 protected entry point (E1.6). The protected serve bridge
+    /// calls this AFTER `verify_org_admission` succeeds, handing the
+    /// four-party [`Admitted`](crate::adapter::net::behavior::org_admission::Admitted)
+    /// attribution the fold places into `RpcContext::org_admission`; the
+    /// fold also STRIPS every `net-org-admission` header from the payload
+    /// so the handler never sees the raw proof. Unary-only — the
+    /// streaming/duplex folds have no admitted entry point (E1.8).
+    pub fn apply_inbound_admitted(
+        &mut self,
+        ev: &RpcInboundEvent,
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+    ) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload, Some(admitted))
+    }
+
+    /// Core frame application shared by [`Self::apply_inbound`] (real
+    /// authenticated `from_node`) and the [`RedexFold`] loopback shim
+    /// (`from_node = 0`, test / loopback paths with no session peer).
+    /// `org_admission` is `Some` only on the initial REQUEST of an
+    /// admitted protected call; it is placed into the handler's
+    /// `RpcContext` and its presence triggers the proof-header strip.
+    fn apply_frame(
+        &mut self,
+        from_node: u64,
+        frame: &Bytes,
+        org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
+    ) -> Result<(), RedexError> {
         // Decode the meta header. A garbled meta means the event
         // doesn't even claim to be an RPC packet — log and skip
         // rather than killing the fold. Returning `Err(Decode)`
         // here would stop the entire cortex adapter for one
         // malformed event, which is wrong for an RPC server that
         // needs to keep serving.
-        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
-            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        let Some(meta) = (if frame.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&frame[..EVENT_META_SIZE])
         } else {
             None
         }) else {
             tracing::warn!(
-                payload_len = ev.payload.len(),
+                payload_len = frame.len(),
                 "rpc server fold: event payload too short for EventMeta; skipping",
             );
             return Ok(());
         };
-        let key = (meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Malformed request payload. Surface as
-                        // `UnknownVersion` to the caller — they sent
-                        // bytes we couldn't parse, which usually
-                        // means a wire-format mismatch (the most
-                        // common cause). Log so operators can
-                        // diagnose.
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc server fold: malformed request payload",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::UnknownVersion,
-                            headers: vec![],
-                            body: Bytes::from(format!("malformed request: {e}")),
-                        };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                };
+                let mut payload =
+                    match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // Malformed request payload. Surface as
+                            // `UnknownVersion` to the caller — they sent
+                            // bytes we couldn't parse, which usually
+                            // means a wire-format mismatch (the most
+                            // common cause). Log so operators can
+                            // diagnose.
+                            tracing::warn!(
+                                error = %e,
+                                caller_origin = format!("{:#x}", meta.origin_hash),
+                                call_id = meta.seq_or_ts,
+                                "rpc server fold: malformed request payload",
+                            );
+                            let resp = RpcResponsePayload {
+                                status: RpcStatus::UnknownVersion,
+                                headers: vec![],
+                                body: Bytes::from(format!("malformed request: {e}")),
+                            };
+                            (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
+                            return Ok(());
+                        }
+                    };
+                // E1.6: an admitted protected call STRIPS the raw
+                // `net-org-admission` proof header(s) before the handler
+                // sees the payload — application code receives verified
+                // attribution via `RpcContext::org_admission`, never the
+                // credential material. Public calls (`org_admission` None)
+                // keep their headers untouched.
+                if org_admission.is_some() {
+                    payload.headers.retain(|(name, _)| {
+                        name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+                    });
+                }
                 // Fast deadline-already-passed short-circuit.
                 // Server-side `Timeout` without invoking the
                 // handler. Includes a clock-skew tolerance window
@@ -1549,7 +1811,7 @@ impl RedexFold<()> for RpcServerFold {
                         headers: vec![],
                         body: Bytes::from_static(b"deadline already passed when request landed"),
                     };
-                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -1576,7 +1838,7 @@ impl RedexFold<()> for RpcServerFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 }
@@ -1622,6 +1884,7 @@ impl RedexFold<()> for RpcServerFold {
                         payload,
                         cancellation,
                         trace_context,
+                        org_admission,
                     };
                     // Catch panics so a misbehaving handler can't
                     // take down the runtime. `AssertUnwindSafe` is
@@ -1700,7 +1963,7 @@ impl RedexFold<()> for RpcServerFold {
                         }
                     };
                     in_flight.lock().remove(&key);
-                    emit(caller_origin, call_id, resp);
+                    emit(from_node, caller_origin, call_id, resp);
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -1722,6 +1985,15 @@ impl RedexFold<()> for RpcServerFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcServerFold {
+    /// Loopback / test shim: no session peer to resolve, so this
+    /// drives `apply_frame` with `from_node = 0` (AV-1 item 1). The
+    /// production wire path uses [`RpcServerFold::apply_inbound`].
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_frame(0, &ev.payload, None)
     }
 }
 
@@ -1892,7 +2164,13 @@ pub struct RpcStreamingContext {
 /// initial window).
 ///
 /// Bidi streaming plan (Phase B).
-pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u32) + Send + Sync + 'static>;
+/// Arguments: `(from_node, caller_origin, call_id, credits)`. R3-1 —
+/// the AEAD-authenticated `from_node` is carried so an upload grant is
+/// session-scoped: coalesced and published per `(from_node, origin,
+/// call_id)`, and (for a trusted direct route) delivered ONLY to the
+/// session that issued the call, never roster-fanned to a same-origin
+/// sibling whose request semaphore it would otherwise wrongly refill.
+pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u64, u32) + Send + Sync + 'static>;
 
 /// Server-side stream of inbound request chunk bodies for one
 /// client-streaming (or duplex) call. Yields one `Bytes` per
@@ -1923,6 +2201,9 @@ pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u32) + Send + Sync + 'sta
 pub struct RequestStream {
     inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     grant_emitter: Option<RpcRequestGrantEmitter>,
+    /// AEAD-authenticated session that issued this call (R3-1) — the
+    /// grant identity, so a grant refills only THIS call's semaphore.
+    from_node: u64,
     caller_origin: u64,
     call_id: u64,
 }
@@ -1931,16 +2212,19 @@ impl RequestStream {
     /// Visible to the fold (and only the fold) for constructing
     /// a stream tied to a specific receiver + caller. The
     /// `grant_emitter` is `None` when the caller didn't opt into
-    /// flow control; `Some(...)` when they did.
+    /// flow control; `Some(...)` when they did. `from_node` is the
+    /// authenticated session the fold bound the call to (R3-1).
     pub(crate) fn new(
         inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
         grant_emitter: Option<RpcRequestGrantEmitter>,
+        from_node: u64,
         caller_origin: u64,
         call_id: u64,
     ) -> Self {
         Self {
             inner,
             grant_emitter,
+            from_node,
             caller_origin,
             call_id,
         }
@@ -1961,7 +2245,7 @@ impl futures::Stream for RequestStream {
                 // fire-and-forget; missed grants are recovered
                 // by subsequent pulls.
                 if let Some(emit) = self.grant_emitter.as_ref() {
-                    emit(self.caller_origin, self.call_id, 1);
+                    emit(self.from_node, self.caller_origin, self.call_id, 1);
                 }
                 std::task::Poll::Ready(Some(bytes))
             }
@@ -2068,7 +2352,11 @@ pub trait RpcStreamingHandler: Send + Sync + 'static {
 /// `Semaphore` shared between the pump task (which awaits
 /// permits) and the fold's `apply()` method handling
 /// STREAM_GRANT events (which add permits).
-type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>>;
+// Keyed on `(from_node, caller_origin, call_id)` (AV-1 item 1): the
+// authenticated last-hop session peer is part of the key so a peer
+// cannot refill another peer's flow-control window by copying its
+// origin + call_id onto a forged STREAM_GRANT.
+type FlowControlMap = Arc<Mutex<HashMap<(u64, u64, u64), Arc<tokio::sync::Semaphore>>>>;
 
 /// Server-side fold for streaming RPC. Parallel to `RpcServerFold`
 /// but multi-fire emit: each handler invocation may produce many
@@ -2081,7 +2369,10 @@ type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>
 pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// (from_node, caller_origin, call_id) → cancellation token —
+    /// authenticated-peer-scoped so a forged CANCEL can't cancel
+    /// another peer's stream (AV-1 item 1).
+    in_flight: InFlightCalls,
     /// Per-call flow-control semaphore (when the caller opted in).
     /// `Some(sem)` means "pump must `acquire().await` one permit
     /// per chunk before emitting; STREAM_GRANT events
@@ -2131,28 +2422,52 @@ impl RpcServerStreamingFold {
 
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
         self.in_flight.lock().keys().copied().collect()
+    }
+
+    /// Test-only: available flow-control permits for a call key
+    /// `(from_node, origin, call_id)`, or `None` if no per-call
+    /// semaphore is installed. Lets the AV-1 STREAM_GRANT-hijack
+    /// witness prove a forged grant from a foreign session does not
+    /// refill the victim's window.
+    #[cfg(test)]
+    pub fn flow_control_permits(&self, key: (u64, u64, u64)) -> Option<usize> {
+        self.flow_control
+            .lock()
+            .get(&key)
+            .map(|s| s.available_permits())
     }
 }
 
-impl RedexFold<()> for RpcServerStreamingFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
-        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
-            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+impl RpcServerStreamingFold {
+    /// Production-path entry point. Keys per-call state (in-flight
+    /// token + flow-control semaphore) by `(from_node,
+    /// claimed_origin, call_id)` so a forged CANCEL / STREAM_GRANT
+    /// from another peer misses the map and no-ops (AV-1 item 1).
+    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload)
+    }
+
+    /// Core frame application shared by [`Self::apply_inbound`] (real
+    /// `from_node`) and the [`RedexFold`] loopback shim (`0`).
+    fn apply_frame(&mut self, from_node: u64, frame: &Bytes) -> Result<(), RedexError> {
+        let Some(meta) = (if frame.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&frame[..EVENT_META_SIZE])
         } else {
             None
         }) else {
             tracing::warn!(
-                payload_len = ev.payload.len(),
+                payload_len = frame.len(),
                 "rpc streaming server fold: event payload too short for EventMeta",
             );
             return Ok(());
         };
-        let key = (meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
+                {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -2177,7 +2492,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -2219,7 +2534,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -2270,6 +2585,8 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         payload,
                         cancellation,
                         trace_context,
+                        // Streaming is never protected (E1.8) — always public.
+                        org_admission: None,
                     };
                     // Build the sink + receive end. Spawn a
                     // pump that forwards each chunk to the emit
@@ -2333,7 +2650,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                             // publish path and arrive out of order
                             // (or be eclipsed by the terminal frame
                             // and lost entirely on the caller side).
-                            pump_emit(caller_origin, call_id, resp).await;
+                            pump_emit(from_node, caller_origin, call_id, resp).await;
                         }
                     });
                     // Run the handler. Catch panics so a
@@ -2422,7 +2739,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                     // wire (the pump has already drained, but the
                     // emit itself is still async and we must await
                     // it before the spawned task ends).
-                    emit(caller_origin, call_id, terminal).await;
+                    emit(from_node, caller_origin, call_id, terminal).await;
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -2444,7 +2761,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // the caller is racing a terminal vs. sending a
                 // grant for a non-flow-controlled stream, and
                 // both are harmless to ignore.
-                let amount = match decode_stream_grant(&ev.payload[EVENT_META_SIZE..]) {
+                let amount = match decode_stream_grant(&frame[RPC_FRAME_BODY_OFFSET..]) {
                     Some(n) => n,
                     None => {
                         tracing::debug!(
@@ -2470,6 +2787,15 @@ impl RedexFold<()> for RpcServerStreamingFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcServerStreamingFold {
+    /// Loopback / test shim: drives `apply_frame` with
+    /// `from_node = 0` (AV-1 item 1). Production uses
+    /// [`RpcServerStreamingFold::apply_inbound`].
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_frame(0, &ev.payload)
     }
 }
 
@@ -2502,12 +2828,15 @@ impl RedexFold<()> for RpcServerStreamingFold {
 // ============================================================================
 
 /// Per-call request-direction sender map type. Keyed on
-/// `(caller_origin_hash, call_id)`; value is the bounded mpsc
-/// sender the fold's `apply()` pushes REQUEST_CHUNK bodies into.
-/// The matching receiver lives inside the handler's
-/// [`RequestStream`]; dropping the sender (on REQUEST_END or
-/// CANCEL) closes the stream.
-type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+/// `(from_node, caller_origin_hash, call_id)` (AV-1 item 1): the
+/// AEAD-authenticated last-hop session peer is part of the key so a
+/// peer cannot push a REQUEST_CHUNK into another peer's upload stream
+/// by copying its origin + call_id. Value is the bounded mpsc sender
+/// the fold's `apply_frame()` pushes REQUEST_CHUNK bodies into. The
+/// matching receiver lives inside the handler's [`RequestStream`];
+/// dropping the sender (on REQUEST_END or CANCEL) closes the stream.
+type RequestChunkSenders =
+    Arc<Mutex<HashMap<(u64, u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
 
 /// Shared REQUEST_CHUNK handling used by both
 /// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
@@ -2522,6 +2851,7 @@ type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Send
 /// otherwise identical — both folds carry the same wire format
 /// and the same per-call mpsc + sender-map contract.
 fn apply_request_chunk_to_senders(
+    from_node: u64,
     payload_bytes: Bytes,
     meta: &EventMeta,
     senders: &RequestChunkSenders,
@@ -2550,7 +2880,10 @@ fn apply_request_chunk_to_senders(
         );
         return;
     }
-    let key = (meta.origin_hash, meta.seq_or_ts);
+    // Scope the sender lookup to the authenticated session peer so a
+    // forged REQUEST_CHUNK carrying another peer's origin + call_id
+    // misses the map (AV-1 item 1).
+    let key = (from_node, meta.origin_hash, meta.seq_or_ts);
     let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
     let sender = senders.lock().get(&key).cloned();
     let Some(sender) = sender else {
@@ -2607,7 +2940,9 @@ pub struct RpcStreamingRequestFold {
     /// refill and stall once their initial window is exhausted —
     /// honest behavior for a fold not wired up for grants).
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// (from_node, caller_origin, call_id) → cancellation token —
+    /// authenticated-peer-scoped (AV-1 item 1).
+    in_flight: InFlightCalls,
     senders: RequestChunkSenders,
     /// Optional per-service metrics handle. Same shape as the
     /// other folds. Reuses the response-side counters where they
@@ -2661,7 +2996,7 @@ impl RpcStreamingRequestFold {
 
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
         self.in_flight.lock().keys().copied().collect()
     }
 
@@ -2669,28 +3004,39 @@ impl RpcStreamingRequestFold {
     /// Useful for tests that need to assert a call's sender has
     /// been dropped after REQUEST_END / CANCEL.
     #[cfg(test)]
-    pub fn sender_keys(&self) -> Vec<(u64, u64)> {
+    pub fn sender_keys(&self) -> Vec<(u64, u64, u64)> {
         self.senders.lock().keys().copied().collect()
     }
 }
 
-impl RedexFold<()> for RpcStreamingRequestFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
-        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
-            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+impl RpcStreamingRequestFold {
+    /// Production-path entry point. Keys per-call state (in-flight
+    /// token + request-chunk sender) by `(from_node, claimed_origin,
+    /// call_id)` so a forged REQUEST_CHUNK / CANCEL from another peer
+    /// misses the map and no-ops (AV-1 item 1).
+    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload)
+    }
+
+    /// Core frame application shared by [`Self::apply_inbound`] (real
+    /// `from_node`) and the [`RedexFold`] loopback shim (`0`).
+    fn apply_frame(&mut self, from_node: u64, frame: &Bytes) -> Result<(), RedexError> {
+        let Some(meta) = (if frame.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&frame[..EVENT_META_SIZE])
         } else {
             None
         }) else {
             tracing::warn!(
-                payload_len = ev.payload.len(),
+                payload_len = frame.len(),
                 "rpc client-streaming server fold: event payload too short for EventMeta",
             );
             return Ok(());
         };
-        let key = (meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
+                {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -2704,7 +3050,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                             headers: vec![],
                             body: Bytes::from(format!("malformed request: {e}")),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 };
@@ -2725,7 +3071,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                             b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST",
                         ),
                     };
-                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
                 }
                 // Refuse a duplicate REQUEST with the same
@@ -2750,7 +3096,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                                 b"duplicate REQUEST for already-in-flight call_id",
                             ),
                         };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        (self.emit)(from_node, meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
                     }
                 }
@@ -2810,8 +3156,13 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 } else {
                     None
                 };
-                let request_stream =
-                    RequestStream::new(rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+                let request_stream = RequestStream::new(
+                    rx,
+                    grant_emitter,
+                    from_node,
+                    meta.origin_hash,
+                    meta.seq_or_ts,
+                );
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
                     extract_trace_context(&payload.headers)
                 } else {
@@ -2945,12 +3296,13 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     // that returned without consuming all chunks
                     // doesn't leak the entry).
                     senders.lock().remove(&key);
-                    (emit)(caller_origin, call_id, terminal);
+                    (emit)(from_node, caller_origin, call_id, terminal);
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    ev.payload.slice(EVENT_META_SIZE..),
+                    from_node,
+                    frame.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
                     "client-streaming",
@@ -2972,6 +3324,15 @@ impl RedexFold<()> for RpcStreamingRequestFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcStreamingRequestFold {
+    /// Loopback / test shim: drives `apply_frame` with
+    /// `from_node = 0` (AV-1 item 1). Production uses
+    /// [`RpcStreamingRequestFold::apply_inbound`].
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_frame(0, &ev.payload)
     }
 }
 
@@ -3012,7 +3373,9 @@ pub struct RpcDuplexFold {
     emit: RpcAsyncResponseEmitter,
     /// Optional request-direction grant emitter.
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// (from_node, caller_origin, call_id) → cancellation token —
+    /// authenticated-peer-scoped (AV-1 item 1).
+    in_flight: InFlightCalls,
     senders: RequestChunkSenders,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
@@ -3056,34 +3419,45 @@ impl RpcDuplexFold {
 
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
         self.in_flight.lock().keys().copied().collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
     #[cfg(test)]
-    pub fn sender_keys(&self) -> Vec<(u64, u64)> {
+    pub fn sender_keys(&self) -> Vec<(u64, u64, u64)> {
         self.senders.lock().keys().copied().collect()
     }
 }
 
-impl RedexFold<()> for RpcDuplexFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
-        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
-            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+impl RpcDuplexFold {
+    /// Production-path entry point. Keys per-call state (in-flight
+    /// token + request-chunk sender) by `(from_node, claimed_origin,
+    /// call_id)` so a forged REQUEST_CHUNK / CANCEL from another peer
+    /// misses the map and no-ops (AV-1 item 1).
+    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.apply_frame(ev.from_node, &ev.payload)
+    }
+
+    /// Core frame application shared by [`Self::apply_inbound`] (real
+    /// `from_node`) and the [`RedexFold`] loopback shim (`0`).
+    fn apply_frame(&mut self, from_node: u64, frame: &Bytes) -> Result<(), RedexError> {
+        let Some(meta) = (if frame.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&frame[..EVENT_META_SIZE])
         } else {
             None
         }) else {
             tracing::warn!(
-                payload_len = ev.payload.len(),
+                payload_len = frame.len(),
                 "rpc duplex server fold: event payload too short for EventMeta",
             );
             return Ok(());
         };
-        let key = (meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
+                {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -3104,7 +3478,7 @@ impl RedexFold<()> for RpcDuplexFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -3136,7 +3510,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     let caller_origin = meta.origin_hash;
                     let call_id = meta.seq_or_ts;
                     tokio::spawn(async move {
-                        emit(caller_origin, call_id, resp).await;
+                        emit(from_node, caller_origin, call_id, resp).await;
                     });
                     return Ok(());
                 }
@@ -3164,7 +3538,7 @@ impl RedexFold<()> for RpcDuplexFold {
                         let caller_origin = meta.origin_hash;
                         let call_id = meta.seq_or_ts;
                         tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
+                            emit(from_node, caller_origin, call_id, resp).await;
                         });
                         return Ok(());
                     }
@@ -3203,8 +3577,13 @@ impl RedexFold<()> for RpcDuplexFold {
                 } else {
                     None
                 };
-                let request_stream =
-                    RequestStream::new(req_rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+                let request_stream = RequestStream::new(
+                    req_rx,
+                    grant_emitter,
+                    from_node,
+                    meta.origin_hash,
+                    meta.seq_or_ts,
+                );
 
                 // Build the per-call response-side mpsc (existing
                 // server-streaming-response pattern). The handler
@@ -3259,7 +3638,7 @@ impl RedexFold<()> for RpcDuplexFold {
                             )],
                             body: chunk.clone(),
                         };
-                        pump_emit(caller_origin, call_id, resp).await;
+                        pump_emit(from_node, caller_origin, call_id, resp).await;
                     }
                 });
 
@@ -3373,12 +3752,13 @@ impl RedexFold<()> for RpcDuplexFold {
                     };
                     in_flight.lock().remove(&key);
                     senders.lock().remove(&key);
-                    emit(caller_origin, call_id, terminal).await;
+                    emit(from_node, caller_origin, call_id, terminal).await;
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    ev.payload.slice(EVENT_META_SIZE..),
+                    from_node,
+                    frame.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
                     "duplex",
@@ -3393,6 +3773,15 @@ impl RedexFold<()> for RpcDuplexFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcDuplexFold {
+    /// Loopback / test shim: drives `apply_frame` with
+    /// `from_node = 0` (AV-1 item 1). Production uses
+    /// [`RpcDuplexFold::apply_inbound`].
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_frame(0, &ev.payload)
     }
 }
 
@@ -3867,7 +4256,7 @@ impl RpcClientFold {
         };
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
                     Err(e) => {
                         tracing::warn!(
@@ -3884,7 +4273,7 @@ impl RpcClientFold {
                 // matching pending entry's grant mpsc; non-client-
                 // streaming entries silently ignore (see
                 // RpcClientPending::deliver_grant docs).
-                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                match decode_request_grant(&ev.payload[RPC_FRAME_BODY_OFFSET..]) {
                     Some(grant) => {
                         // The payload's `call_id` MUST agree with
                         // the EventMeta's `seq_or_ts`: producer
@@ -3953,7 +4342,7 @@ impl RedexFold<()> for RpcClientFold {
         // peer routing.
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
+                match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
                     Err(e) => {
                         // Malformed RESPONSE on the reply channel.
@@ -3973,7 +4362,7 @@ impl RedexFold<()> for RpcClientFold {
                 }
             }
             DISPATCH_RPC_REQUEST_GRANT => {
-                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                match decode_request_grant(&ev.payload[RPC_FRAME_BODY_OFFSET..]) {
                     Some(grant) => {
                         // See `apply_inbound` REQUEST_GRANT arm for
                         // the meta/payload call_id invariant.
@@ -4013,6 +4402,70 @@ mod tests {
     }
 
     // --------------------------------------------------------------------
+    // OA2-E0.2 P0 — `peek_request_service` boundary contract.
+    // --------------------------------------------------------------------
+
+    /// Build a REQUEST frame `EventMeta ‖ RpcRouteV1(0) ‖
+    /// RpcRequestPayload{service, ..}` for the peek unit tests.
+    fn request_frame_for_peek(service: &str) -> Vec<u8> {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0);
+        let req = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"body"),
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        req.encode_into(&mut buf);
+        buf
+    }
+
+    /// The peek reads back exactly the `service` the full encoder
+    /// wrote — the invariant the serve-bridge equality check relies
+    /// on (peek and full decode agree on the service).
+    #[test]
+    fn peek_request_service_matches_full_decode() {
+        for name in ["admin", "echo.v1", "x"] {
+            let frame = request_frame_for_peek(name);
+            assert_eq!(peek_request_service(&frame), Some(name));
+            // And it agrees with the authoritative decoder.
+            let decoded =
+                RpcRequestPayload::decode(Bytes::from(frame[RPC_FRAME_BODY_OFFSET..].to_vec()))
+                    .expect("decode");
+            assert_eq!(decoded.service, name);
+        }
+    }
+
+    /// Unreadable service fields return `None`, mirroring the `Err`
+    /// arms of `RpcRequestPayload::decode` — the bridge then lets the
+    /// fold's full decode reject the frame (`UnknownVersion`) rather
+    /// than silently dropping it.
+    #[test]
+    fn peek_request_service_none_on_malformed() {
+        // Frame with no room for the route/body at all.
+        let short = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0).to_bytes();
+        assert_eq!(peek_request_service(&short), None);
+
+        // Route present but zero-length service (decode rejects empty).
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0, 1, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        buf.push(0u8); // svc_len = 0
+        assert_eq!(peek_request_service(&buf), None);
+
+        // Length byte claims more bytes than remain.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, 0);
+        buf.push(5u8); // svc_len = 5 but no bytes follow
+        assert_eq!(peek_request_service(&buf), None);
+    }
+
+    // --------------------------------------------------------------------
     // Status code numbering.
     // --------------------------------------------------------------------
 
@@ -4033,22 +4486,23 @@ mod tests {
             (RpcStatus::Internal, 0x0006),
             (RpcStatus::UnknownVersion, 0x0007),
             (RpcStatus::CapabilityDenied, 0x0008),
+            (RpcStatus::AdmissionDenied, 0x0009),
         ] {
             assert_eq!(status.to_wire(), expected, "{status:?}");
             assert_eq!(RpcStatus::from_wire(expected), status);
         }
     }
 
-    /// Reserved numeric range (`0x0009..=0x7FFF`) decodes as
+    /// Reserved numeric range (`0x000A..=0x7FFF`) decodes as
     /// `Application(v)` for forward-compat with future canonical
-    /// assignments. A future status numbered `0x0009` would round-
-    /// trip via `from_wire(0x0009)` until that variant is added,
+    /// assignments. A future status numbered `0x000A` would round-
+    /// trip via `from_wire(0x000A)` until that variant is added,
     /// at which point the variant takes precedence.
     #[test]
     fn reserved_status_range_decodes_as_application_for_forward_compat() {
-        let decoded = RpcStatus::from_wire(0x0009);
-        assert_eq!(decoded, RpcStatus::Application(0x0009));
-        assert_eq!(decoded.to_wire(), 0x0009);
+        let decoded = RpcStatus::from_wire(0x000A);
+        assert_eq!(decoded, RpcStatus::Application(0x000A));
+        assert_eq!(decoded.to_wire(), 0x000A);
     }
 
     /// Application range (`0x8000..=0xFFFF`) encodes / decodes
@@ -4315,6 +4769,68 @@ mod tests {
         }
     }
 
+    /// R3-1: a `RequestStream` auto-grant carries the call's
+    /// AEAD-authenticated `from_node`, so the upload grant is
+    /// session-scoped — the fold binds each call to its own session, and
+    /// two calls sharing one entity/origin + caller-chosen call_id
+    /// produce grants with DISTINCT identities that cannot collapse and
+    /// refill each other's request semaphore.
+    ///
+    /// Red-witness: the pre-R3-1 emit dropped `from_node` (fired
+    /// `(origin, call_id, 1)`), so both sessions' grants collapsed to the
+    /// same `(origin, call_id)` — reproduced here by hardcoding
+    /// `from_node = 0` in the emit, which makes the two captured grants
+    /// identical and fails the distinctness assertion.
+    #[tokio::test]
+    async fn request_stream_auto_grant_carries_the_authenticated_from_node() {
+        use futures::StreamExt;
+
+        const ORIGIN: u64 = 0xBEEF;
+        const CALL: u64 = 7;
+        const NODE_A: u64 = 0xAAAA;
+        const NODE_B: u64 = 0xBBBB;
+
+        // A capturing grant emitter (production `RpcRequestGrantEmitter`
+        // signature) records every `(from_node, origin, call_id, credits)`.
+        type Grants = Arc<Mutex<Vec<(u64, u64, u64, u32)>>>;
+        let captured: Grants = Arc::new(Mutex::new(Vec::new()));
+        let mk_emitter = |sink: Grants| -> RpcRequestGrantEmitter {
+            Arc::new(move |from_node, origin, call_id, credits| {
+                sink.lock().push((from_node, origin, call_id, credits));
+            })
+        };
+
+        // Drive one poll of a RequestStream bound to `node`, over the same
+        // ORIGIN + CALL, and return the grant it fired.
+        async fn one_grant(node: u64, emit: RpcRequestGrantEmitter) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+            tx.send(Bytes::from_static(b"chunk"))
+                .await
+                .expect("queue chunk");
+            drop(tx);
+            let mut stream = RequestStream::new(rx, Some(emit), node, ORIGIN, CALL);
+            assert_eq!(
+                stream.next().await.as_deref(),
+                Some(&b"chunk"[..]),
+                "the stream must yield the queued chunk",
+            );
+        }
+
+        one_grant(NODE_A, mk_emitter(captured.clone())).await;
+        one_grant(NODE_B, mk_emitter(captured.clone())).await;
+
+        let grants = captured.lock().clone();
+        assert_eq!(
+            grants,
+            vec![(NODE_A, ORIGIN, CALL, 1), (NODE_B, ORIGIN, CALL, 1)],
+            "each poll fires ONE grant carrying that call's from_node",
+        );
+        assert_ne!(
+            grants[0], grants[1],
+            "two sessions over the same origin+call_id must produce DISTINCT grant identities",
+        );
+    }
+
     /// 5/5 — RequestGrant round-trip + truncation rejection. The
     /// payload is fixed-size (12 bytes), so the test surface is
     /// "exactly 12 bytes decodes" + "any other length errors".
@@ -4526,7 +5042,7 @@ mod tests {
         let size = p.encode().len();
         // 1 (svc len) + 1 (svc bytes) + 8 (deadline) + 2 (flags) + 1 (headers count) + 4 (body len) = 17
         assert_eq!(size, 17, "minimum request encodes in 17 bytes");
-        assert_eq!(request_wire_size(&p), EVENT_META_SIZE + 17);
+        assert_eq!(request_wire_size(&p), RPC_FRAME_BODY_OFFSET + 17);
     }
 
     #[test]
@@ -4539,7 +5055,7 @@ mod tests {
         let size = p.encode().len();
         // 2 (status) + 1 (headers count) + 4 (body len) = 7
         assert_eq!(size, 7, "minimum response encodes in 7 bytes");
-        assert_eq!(response_wire_size(&p), EVENT_META_SIZE + 7);
+        assert_eq!(response_wire_size(&p), RPC_FRAME_BODY_OFFSET + 7);
     }
 
     // ====================================================================
@@ -4571,6 +5087,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -4580,10 +5100,27 @@ mod tests {
 
     fn rpc_cancel_event(caller_origin: u64, call_id: u64) -> RedexEvent {
         let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, caller_origin, call_id, 0);
-        let buf = meta.to_bytes().to_vec();
+        let mut buf = meta.to_bytes().to_vec();
+        // OA2-E0.2: RpcRouteV1 route placeholder (folds skip it).
+        encode_rpc_route(&mut buf, 0);
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
             payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// AV-1 item 1: wrap a synthetic frame as an inbound event from
+    /// the AEAD-authenticated session peer `from_node`, so a test can
+    /// drive the production `apply_inbound` seam directly. The folds
+    /// read the caller origin + call_id from the frame's `EventMeta`;
+    /// `channel_hash` / `origin_hash` are ignored, so only `from_node`
+    /// and `payload` are load-bearing for the call-identity key.
+    fn inbound(from_node: u64, frame: bytes::Bytes) -> RpcInboundEvent {
+        RpcInboundEvent {
+            channel_hash: 0,
+            origin_hash: 0,
+            from_node,
+            payload: frame,
         }
     }
 
@@ -4591,7 +5128,7 @@ mod tests {
     fn capturing_emitter() -> (RpcResponseEmitter, CapturedResponses) {
         let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
-        let emit: RpcResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             captured_clone.lock().push((origin, call_id, resp));
         });
         (emit, captured)
@@ -4655,6 +5192,80 @@ mod tests {
         assert_eq!(resp.body.as_ref(), b"hello");
         // In-flight set is cleaned up after the handler completes.
         assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// E1.6: `apply_inbound_admitted` delivers the four-party `Admitted`
+    /// to the handler via `RpcContext::org_admission` AND strips every
+    /// `net-org-admission` proof header from the payload the handler
+    /// sees, preserving the surrounding headers in order. (The public
+    /// `apply_inbound` path leaves `org_admission` `None` — the other
+    /// fold tests never set it, and their handlers keep their headers.)
+    #[tokio::test]
+    async fn admitted_request_delivers_attribution_and_strips_proof_header() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_admission::Admitted;
+        use crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER;
+        use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
+        use crate::adapter::net::identity::EntityId;
+
+        type Seen = Arc<Mutex<Option<(Option<Admitted>, Vec<RpcHeader>)>>>;
+        struct SpyHandler(Seen);
+        #[async_trait::async_trait]
+        impl RpcHandler for SpyHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                *self.0.lock() = Some((ctx.org_admission.clone(), ctx.payload.headers.clone()));
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            }
+        }
+
+        let seen: Seen = Arc::new(Mutex::new(None));
+        let (emit, _captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(SpyHandler(seen.clone())), emit);
+
+        let admitted = Admitted {
+            caller: EntityId::from_bytes([0x24u8; 32]),
+            acting_org: OrgKeypair::from_bytes([0x77u8; 32]).org_id(),
+            provider_org: OrgKeypair::from_bytes([0x42u8; 32]).org_id(),
+            provider: EntityId::from_bytes([0x99u8; 32]),
+            capability: CapabilityAuthorityId::for_tag("nrpc:oa2-echo"),
+        };
+        let req = RpcRequestPayload {
+            service: "oa2-echo".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![
+                ("x-keep".to_string(), b"1".to_vec()),
+                (ORG_ADMISSION_HEADER.to_string(), b"opaque-proof".to_vec()),
+                ("y-keep".to_string(), b"2".to_vec()),
+            ],
+            body: Bytes::from_static(b"hi"),
+        };
+        let frame = rpc_request_event(0xCAFE, 7, req).payload;
+        fold.apply_inbound_admitted(&inbound(0x61, frame), admitted.clone())
+            .unwrap();
+
+        assert!(
+            wait_until(|| seen.lock().is_some(), Duration::from_secs(2)).await,
+            "handler must run for an admitted request",
+        );
+        let (got_admission, got_headers) = seen.lock().clone().unwrap();
+        assert_eq!(
+            got_admission,
+            Some(admitted),
+            "the four-party Admitted must reach the handler",
+        );
+        assert_eq!(
+            got_headers,
+            vec![
+                ("x-keep".to_string(), b"1".to_vec()),
+                ("y-keep".to_string(), b"2".to_vec()),
+            ],
+            "the proof header is stripped; surrounding headers stay, in order",
+        );
     }
 
     /// Application error: handler returns
@@ -4901,7 +5512,7 @@ mod tests {
         // CANCEL.
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(1, 42)),
+                || fold.in_flight_keys().contains(&(0, 1, 42)),
                 Duration::from_secs(1)
             )
             .await
@@ -4932,6 +5543,387 @@ mod tests {
         // CANCEL also removes the in-flight entry directly.
         // Handler completion removes it again (idempotent).
         assert!(fold.in_flight_keys().is_empty());
+    }
+
+    // ====================================================================
+    // AV-1 item 1 — server-fold call/control identity is bound to the
+    // AEAD-authenticated session peer `from_node`. Each witness drives
+    // the production `apply_inbound` seam with a victim frame on one
+    // session and an adversarial control frame that copies the victim's
+    // origin + call_id but arrives on a DIFFERENT session. The forged
+    // frame must miss the `(from_node, origin, call_id)` key and leave
+    // the victim's call/control state untouched.
+    // ====================================================================
+
+    /// CANCEL hijack (unary). An attacker that copies the victim's
+    /// origin + call_id onto a CANCEL, but sends it on its own session,
+    /// must not cancel the victim's in-flight call. Only a CANCEL from
+    /// the victim's own session cancels it.
+    #[tokio::test]
+    async fn unary_fold_foreign_session_cancel_cannot_hijack_a_call() {
+        const VICTIM: u64 = 0xA;
+        const ATTACKER: u64 = 0xB;
+        const ORIGIN: u64 = 0x1111;
+        const CALL_ID: u64 = 42;
+        let resumed = Arc::new(AtomicBool::new(false));
+        struct H {
+            resumed: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for H {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                tokio::select! {
+                    _ = ctx.cancellation.cancelled() => {
+                        self.resumed.store(true, Ordering::Release);
+                        Err(RpcHandlerError::Internal("cancelled".to_string()))
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: Bytes::from_static(b"slept"),
+                    }),
+                }
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(
+            Arc::new(H {
+                resumed: resumed.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        // Victim's REQUEST on the victim's session.
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_event(ORIGIN, CALL_ID, req).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Attacker's forged CANCEL on a DIFFERENT session — must miss.
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_cancel_event(ORIGIN, CALL_ID).payload,
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            "forged CANCEL from a foreign session must not remove the victim's entry",
+        );
+        assert!(
+            !resumed.load(Ordering::Acquire),
+            "victim handler must not observe the forged CANCEL",
+        );
+        assert!(
+            captured.lock().is_empty(),
+            "a hijacked CANCEL must not produce a terminal response",
+        );
+        // The victim's OWN CANCEL cancels the call.
+        fold.apply_inbound(&inbound(VICTIM, rpc_cancel_event(ORIGIN, CALL_ID).payload))
+            .unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "the victim's own CANCEL must cancel the call",
+        );
+        assert!(resumed.load(Ordering::Acquire));
+        assert_eq!(captured.lock()[0].2.status, RpcStatus::Cancelled);
+    }
+
+    /// STREAM_GRANT + CANCEL hijack (server-streaming). A forged
+    /// STREAM_GRANT from a foreign session must not refill the victim's
+    /// flow-control window, and a forged CANCEL must not tear the call
+    /// down.
+    #[tokio::test]
+    async fn streaming_fold_foreign_session_cannot_refill_or_cancel() {
+        const VICTIM: u64 = 0xA;
+        const ATTACKER: u64 = 0xB;
+        const ORIGIN: u64 = 0x2222;
+        const CALL_ID: u64 = 7;
+        let release = Arc::new(Notify::new());
+        struct Blocking {
+            release: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for Blocking {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                _sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                // Never emit a chunk (so the pump consumes no permits);
+                // hold the call open until released.
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+        let (emit, _captured) = capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(
+            Arc::new(Blocking {
+                release: release.clone(),
+            }),
+            emit,
+        );
+        // Victim REQUEST opting into flow control with an initial
+        // window of 2.
+        let req = RpcRequestPayload {
+            service: "s".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![(HEADER_NRPC_STREAM_WINDOW_INITIAL.to_string(), b"2".to_vec())],
+            body: Bytes::new(),
+        };
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_event(ORIGIN, CALL_ID, req).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert_eq!(
+            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            Some(2),
+            "victim's initial window",
+        );
+        // Attacker STREAM_GRANT(5) on its own session — must miss.
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_stream_grant_event(ORIGIN, CALL_ID, 5).payload,
+        ))
+        .unwrap();
+        assert_eq!(
+            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            Some(2),
+            "a forged STREAM_GRANT from a foreign session must not refill the victim's window",
+        );
+        // Attacker CANCEL on its own session — must miss.
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_cancel_event(ORIGIN, CALL_ID).payload,
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            "a forged CANCEL from a foreign session must not tear down the victim's stream",
+        );
+        // The victim's own STREAM_GRANT(5) DOES refill.
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_stream_grant_event(ORIGIN, CALL_ID, 5).payload,
+        ))
+        .unwrap();
+        assert_eq!(
+            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            Some(7),
+            "the victim's own STREAM_GRANT must refill its window",
+        );
+        release.notify_one();
+    }
+
+    /// REQUEST_CHUNK + CANCEL hijack (client-streaming). A forged
+    /// REQUEST_CHUNK from a foreign session must not enter the victim's
+    /// upload stream, and a forged CANCEL must not close it.
+    #[tokio::test]
+    async fn client_streaming_fold_foreign_session_cannot_feed_or_cancel() {
+        const VICTIM: u64 = 0xA;
+        const ATTACKER: u64 = 0xB;
+        const ORIGIN: u64 = 0xCAFE;
+        const CALL_ID: u64 = 7;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(
+            Arc::new(CollectingClientStreamHandler {
+                seen: seen.clone(),
+                observed_cancel: observed_cancel.clone(),
+            }),
+            emit,
+        );
+        // Victim REQUEST (client-streaming flag), initial body "a".
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            headers: vec![],
+            body: Bytes::from_static(b"a"),
+        };
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_event(ORIGIN, CALL_ID, req).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(
+                || fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Attacker forges a REQUEST_CHUNK and a CANCEL with the victim's
+        // origin + call_id, both on its OWN session — both must miss.
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, 0, b"ATTACK".to_vec()).payload,
+        ))
+        .unwrap();
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_cancel_event(ORIGIN, CALL_ID).payload,
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            "forged frames must not close the victim's upload stream",
+        );
+        // Victim feeds a legit chunk and ends its own stream.
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, 0, b"b".to_vec()).payload,
+        ))
+        .unwrap();
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, FLAG_RPC_REQUEST_END, b"c".to_vec()).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE",
+        );
+        let bodies: Vec<Vec<u8>> = seen.lock().iter().map(|b| b.to_vec()).collect();
+        assert_eq!(
+            bodies,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the attacker's forged chunk must never enter the victim's stream",
+        );
+        assert!(
+            !observed_cancel.load(Ordering::SeqCst),
+            "the attacker's forged CANCEL must not cancel the victim's stream",
+        );
+    }
+
+    /// REQUEST_CHUNK + CANCEL hijack (duplex). Same contract as the
+    /// client-streaming witness, on the duplex fold.
+    #[tokio::test]
+    async fn duplex_fold_foreign_session_cannot_feed_or_cancel() {
+        const VICTIM: u64 = 0xA;
+        const ATTACKER: u64 = 0xB;
+        const ORIGIN: u64 = 0xBEEF;
+        const CALL_ID: u64 = 9;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        struct DuplexCollect {
+            seen: Arc<Mutex<Vec<bytes::Bytes>>>,
+            observed_cancel: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl RpcDuplexHandler for DuplexCollect {
+            async fn call(
+                &self,
+                ctx: RpcStreamingContext,
+                mut requests: RequestStream,
+                _responses: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                use futures::StreamExt;
+                while let Some(chunk) = requests.next().await {
+                    self.seen.lock().push(chunk);
+                }
+                if ctx.cancellation.is_cancelled() {
+                    self.observed_cancel.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+        let (emit, _captured) = capturing_async_emitter();
+        let mut fold = RpcDuplexFold::new(
+            Arc::new(DuplexCollect {
+                seen: seen.clone(),
+                observed_cancel: observed_cancel.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "dx".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE,
+            headers: vec![],
+            body: Bytes::from_static(b"a"),
+        };
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_event(ORIGIN, CALL_ID, req).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(
+                || fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Attacker forges a chunk + cancel on its own session — miss.
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, 0, b"ATTACK".to_vec()).payload,
+        ))
+        .unwrap();
+        fold.apply_inbound(&inbound(
+            ATTACKER,
+            rpc_cancel_event(ORIGIN, CALL_ID).payload,
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            "forged frames must not close the victim's duplex upload stream",
+        );
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, 0, b"b".to_vec()).payload,
+        ))
+        .unwrap();
+        fold.apply_inbound(&inbound(
+            VICTIM,
+            rpc_request_chunk_event(ORIGIN, CALL_ID, FLAG_RPC_REQUEST_END, b"c".to_vec()).payload,
+        ))
+        .unwrap();
+        assert!(
+            wait_until(
+                || !seen.lock().is_empty() && seen.lock().len() >= 3,
+                Duration::from_secs(2)
+            )
+            .await,
+            "victim's chunks must reach the handler",
+        );
+        let bodies: Vec<Vec<u8>> = seen.lock().iter().map(|b| b.to_vec()).collect();
+        assert_eq!(
+            bodies,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the attacker's forged chunk must never enter the victim's duplex stream",
+        );
+        assert!(
+            !observed_cancel.load(Ordering::SeqCst),
+            "the attacker's forged CANCEL must not cancel the victim's duplex stream",
+        );
     }
 
     /// Regression: a duplicate REQUEST for an already-in-flight
@@ -4977,7 +5969,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(1, 99)),
+                || fold.in_flight_keys().contains(&(0, 1, 99)),
                 Duration::from_secs(1)
             )
             .await
@@ -5048,7 +6040,7 @@ mod tests {
         // before the handler's sleep elapses.
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(7, 11)),
+                || fold.in_flight_keys().contains(&(0, 7, 11)),
                 Duration::from_secs(1)
             )
             .await
@@ -5097,6 +6089,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 7, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0x00); // svc_len = 0 → empty service → Truncated
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5339,6 +6335,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, caller_origin, call_id, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5464,6 +6464,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 11, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0xFF);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5557,6 +6561,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_request_grant(call_id, credits));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5676,6 +6684,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5720,6 +6732,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_request_grant(0xBEEF, 5));
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5765,7 +6781,7 @@ mod tests {
     fn capturing_async_emitter() -> (RpcAsyncResponseEmitter, CapturedResponses) {
         let captured: CapturedResponses = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
-        let emit: RpcAsyncResponseEmitter = Arc::new(move |origin, call_id, resp| {
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |_from_node, origin, call_id, resp| {
             let captured_clone = captured_clone.clone();
             Box::pin(async move {
                 captured_clone.lock().push((origin, call_id, resp));
@@ -5780,6 +6796,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&encode_stream_grant(n));
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -5970,7 +6990,7 @@ mod tests {
         // handler is parked (in_flight key present), then CANCEL.
         assert!(
             wait_until(
-                || !captured.lock().is_empty() && fold.in_flight_keys().contains(&(7, 13)),
+                || !captured.lock().is_empty() && fold.in_flight_keys().contains(&(0, 7, 13)),
                 Duration::from_secs(2)
             )
             .await
@@ -6032,7 +7052,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(1, 99)),
+                || fold.in_flight_keys().contains(&(0, 1, 99)),
                 Duration::from_secs(1)
             )
             .await
@@ -6141,6 +7161,10 @@ mod tests {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 1, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.push(0x00);
         let ev = RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6186,6 +7210,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
+        // OA2-E0.2: RpcRouteV1 route placeholder — these test frames
+        // feed the folds directly (no ingress select), and the folds
+        // skip the route to reach the payload at RPC_FRAME_BODY_OFFSET.
+        encode_rpc_route(&mut buf, 0);
         buf.extend_from_slice(&payload.encode());
         RedexEvent {
             entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
@@ -6259,7 +7287,7 @@ mod tests {
         // picked up the request and the apply path completed).
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(0xCAFE, 7)),
+                || fold.sender_keys().contains(&(0, 0xCAFE, 7)),
                 Duration::from_secs(1)
             )
             .await
@@ -6376,7 +7404,7 @@ mod tests {
         // draining.
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(2, 17)),
+                || fold.sender_keys().contains(&(0, 2, 17)),
                 Duration::from_secs(1)
             )
             .await
@@ -6542,7 +7570,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(5, 99)),
+                || fold.in_flight_keys().contains(&(0, 5, 99)),
                 Duration::from_secs(1)
             )
             .await

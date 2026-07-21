@@ -816,7 +816,7 @@ mod tests {
         let ann = crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
             peer_id, entity, 1, peer_caps,
         );
-        capability_bridge::apply_legacy_announcement(&fold, ann)
+        capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
             .expect("apply legacy announcement in fixture");
         fold
     }
@@ -1052,6 +1052,8 @@ mod tests {
                 1,
                 publisher,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         capability_bridge::apply_legacy_announcement(
@@ -1062,6 +1064,8 @@ mod tests {
                 1,
                 cache_holder,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
 
@@ -1128,6 +1132,8 @@ mod tests {
                 1,
                 publisher,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         capability_bridge::apply_legacy_announcement(
@@ -1138,6 +1144,8 @@ mod tests {
                 1,
                 tag_only,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
 
@@ -1235,6 +1243,8 @@ mod tests {
                 1,
                 make_caps_with_heat("mesh", 0xA0, flood),
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         capability_bridge::apply_legacy_announcement(
@@ -1245,6 +1255,8 @@ mod tests {
                 1,
                 make_caps_with_heat("mesh", 0xB0, flood),
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         let local = participating_local("mesh", 128, 1024);
@@ -1476,6 +1488,8 @@ mod tests {
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 100, entity_a, 1, a_caps,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         capability_bridge::apply_legacy_announcement(
@@ -1483,6 +1497,8 @@ mod tests {
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 200, entity_b, 1, b_caps,
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
 
