@@ -630,7 +630,7 @@ mod tests {
     fn owner_fixture() -> OwnerFixture {
         let provider = provider_kp();
         let org = OrgKeypair::from_bytes([1u8; 32]);
-        let credential = OwnerAudienceCredential::generate();
+        let credential = OwnerAudienceCredential::generate(org.org_id());
         let cert = OrgMembershipCert::issue_at(
             &org,
             provider.entity_id().clone(),
@@ -1095,7 +1095,7 @@ mod tests {
     fn granted_ingest_rejects_owner_authority() {
         let p = provider_kp();
         let f = granted_fixture(exact_target(&p));
-        let credential = OwnerAudienceCredential::generate();
+        let credential = OwnerAudienceCredential::generate(f.issuer.org_id());
         let floors = OrgRevocationState::empty();
         let authority = AudienceAuthority::owner(f.issuer.org_id(), &credential);
         let ctx = granted_ctx(f.issuer.org_id(), f.now + 5, &floors);

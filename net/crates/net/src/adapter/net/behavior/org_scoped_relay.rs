@@ -528,7 +528,7 @@ mod tests {
 
         let provider = EntityKeypair::from_bytes([provider_seed; 32]);
         let org = OrgKeypair::from_bytes([1u8; 32]);
-        let credential = OwnerAudienceCredential::generate();
+        let credential = OwnerAudienceCredential::generate(org.org_id());
         let cert = OrgMembershipCert::issue_at(
             &org,
             provider.entity_id().clone(),

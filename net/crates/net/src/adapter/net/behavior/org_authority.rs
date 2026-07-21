@@ -88,7 +88,14 @@ pub const REVOCATION_STATE_FILE: &str = "revocation-state.json";
 pub const NODE_AUTHORITY_CONFIG_VERSION: u32 = 1;
 
 /// Format version byte of `owner-audience.key`.
-pub const OWNER_AUDIENCE_KEY_VERSION: u8 = 1;
+///
+/// v2 added the owning `OrgId` ahead of the handle, so the file states which
+/// org it belongs to and `adopt` can refuse to carry it across an ownership
+/// change (§2). v1 files are refused rather than migrated: a v1 file cannot
+/// say which org it was minted for, which is precisely the ambiguity the
+/// version exists to remove, and guessing "it belongs to whoever is adopting
+/// now" would reinstate the bug. Re-provision the node.
+pub const OWNER_AUDIENCE_KEY_VERSION: u8 = 2;
 
 /// The node's ownership statement: which single organization owns
 /// this node, proven by `owner_cert`. Serialized as
@@ -231,6 +238,23 @@ impl NodeAuthorityConfig {
 /// in. Rotation is config management (install new file, restart or
 /// reload), not a mesh key-epoch protocol.
 pub struct OwnerAudienceCredential {
+    /// The org this credential belongs to.
+    ///
+    /// Bound into the on-disk codec so a credential can never be silently
+    /// carried across an ownership change. Without it the file was three
+    /// anonymous fields, and `adopt` — which preserves an existing
+    /// `owner-audience.key` unconditionally — would happily seal a NEW org's
+    /// private capability catalog under the PREVIOUS org's key. That key is
+    /// org-wide and distributed to every node in that org by design, so every
+    /// current and former node of the old org could read the new org's
+    /// owner-scoped announcements straight off the wire.
+    ///
+    /// It is not a secret (it is the org's public id) and it is not
+    /// authenticated by itself — it is a consistency binding, checked against
+    /// the membership certificate at load. Forging it buys nothing: the check
+    /// it defeats is the one that would have refused, and the resulting
+    /// credential still cannot open anything the real audience key protects.
+    pub owner_org: OrgId,
     /// Public-ish routing handle for the owner audience. Random;
     /// reveals nothing but linkage.
     pub audience_handle: [u8; 32],
@@ -262,14 +286,13 @@ const _: fn() = || {
 
 impl OwnerAudienceCredential {
     /// Encoded size of the explicit config codec:
-    /// version byte ‖ handle (32) ‖ key (32).
-    pub const ENCODED_SIZE: usize = 1 + 32 + 32;
+    /// version byte ‖ owner org (32) ‖ handle (32) ‖ key (32).
+    pub const ENCODED_SIZE: usize = 1 + 32 + 32 + 32;
 
-    /// Generate a fresh credential. `getrandom` failure aborts —
-    /// a predictable discovery key would let anyone decrypt
-    /// owner-scoped announcements (same rationale as
-    /// `EntityKeypair::generate`).
-    pub fn generate() -> Self {
+    /// Generate a fresh credential for `owner_org`. `getrandom` failure aborts
+    /// — a predictable discovery key would let anyone decrypt owner-scoped
+    /// announcements (same rationale as `EntityKeypair::generate`).
+    pub fn generate(owner_org: OrgId) -> Self {
         let mut bytes = [0u8; 64];
         if let Err(e) = getrandom::fill(&mut bytes) {
             eprintln!(
@@ -290,6 +313,7 @@ impl OwnerAudienceCredential {
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         Self {
+            owner_org,
             audience_handle,
             discovery_key,
         }
@@ -303,13 +327,14 @@ impl OwnerAudienceCredential {
     }
 
     /// Explicit config-file codec (NOT a wire format):
-    /// `version ‖ handle ‖ key`, exactly
+    /// `version ‖ owner_org ‖ handle ‖ key`, exactly
     /// [`Self::ENCODED_SIZE`] bytes.
     pub fn encode_config(&self) -> [u8; Self::ENCODED_SIZE] {
         let mut buf = [0u8; Self::ENCODED_SIZE];
         buf[0] = OWNER_AUDIENCE_KEY_VERSION;
-        buf[1..33].copy_from_slice(&self.audience_handle);
-        buf[33..65].copy_from_slice(&self.discovery_key);
+        buf[1..33].copy_from_slice(self.owner_org.as_bytes());
+        buf[33..65].copy_from_slice(&self.audience_handle);
+        buf[65..97].copy_from_slice(&self.discovery_key);
         buf
     }
 
@@ -336,9 +361,11 @@ impl OwnerAudienceCredential {
                 found: bytes[0] as u32,
             });
         }
+        let owner_org: [u8; 32] = bytes[1..33].try_into().unwrap();
         Ok(Self {
-            audience_handle: bytes[1..33].try_into().unwrap(),
-            discovery_key: bytes[33..65].try_into().unwrap(),
+            owner_org: OrgId(owner_org),
+            audience_handle: bytes[33..65].try_into().unwrap(),
+            discovery_key: bytes[65..97].try_into().unwrap(),
         })
     }
 }
@@ -541,7 +568,10 @@ impl std::fmt::Display for OrgAuthorityError {
             } => write!(
                 f,
                 "node already owned by org {existing}; refusing adoption by {requested} \
-                 (one node one owner — remove the existing authority explicitly to transfer)"
+                 (one node one owner). To transfer, remove the WHOLE authority directory \
+                 and re-adopt — deleting only the membership file leaves the previous \
+                 org's audience key in place, and the new org's private capabilities \
+                 would be sealed under a key that org does not control"
             ),
             Self::ForeignFloorBundle {
                 bundle_org,
@@ -689,6 +719,10 @@ impl NodeAuthority {
         let audience_path = dir.join(OWNER_AUDIENCE_FILE);
         let revocation_path = dir.join(REVOCATION_STATE_FILE);
 
+        // `OrgId` is `Copy`, but `owner_cert` itself is moved into the config
+        // at step 6 — capture the org up front so steps 7-9 can still name it.
+        let owner_org_id = owner_cert.org_id;
+
         // Gate-1: the authority directory is a trusted local security
         // boundary. Create it owner-only (0700) if missing, or validate an
         // existing one (a directory owned by the current user and not
@@ -736,11 +770,37 @@ impl NodeAuthority {
         //    handle, strict codec, AND the 0600 mode gate on the
         //    opened descriptor (a possibly-disclosed key must not
         //    be silently re-blessed by a renewal).
+        //
+        //    §2 — the credential is ALSO a second ownership witness, and it is
+        //    the one that survives the failure mode step 1 cannot see. Step 1
+        //    only refuses a foreign org when `owner-membership.json` is
+        //    present, and the `AlreadyOwned` error told operators to "remove
+        //    the existing authority explicitly to transfer" — so the
+        //    documented remediation was to DELETE that file, which skipped the
+        //    gate entirely. Adoption under a new org then preserved the old
+        //    org's audience key (step 8 only mints when absent) and sealed the
+        //    new org's private catalog under it.
+        //
+        //    Checking the credential's own `owner_org` closes that: the key
+        //    file states which org it belongs to, so a mismatch is refused as
+        //    the ownership conflict it is, whether or not the membership file
+        //    is still there.
         let have_audience = match read_audience_checked(&audience_path)? {
             Some(bytes) => {
                 // The read buffer carries the raw key — scrub it on every exit.
                 let bytes = ScrubbedBytes(bytes);
-                let _ = OwnerAudienceCredential::decode_config(bytes.as_slice())?;
+                let credential = OwnerAudienceCredential::decode_config(bytes.as_slice())?;
+                if credential.owner_org != owner_cert.org_id {
+                    tracing::error!(
+                        "the audience key in this authority directory belongs to a different \
+                         org; refusing to carry it across an ownership change. Remove the whole \
+                         authority directory to re-provision this node under the new org."
+                    );
+                    return Err(OrgAuthorityError::AlreadyOwned {
+                        existing: credential.owner_org,
+                        requested: owner_cert.org_id,
+                    });
+                }
                 true
             }
             None => false,
@@ -804,7 +864,7 @@ impl NodeAuthority {
         // 8. Audience material: preserved, or created and written
         //    now (0600, atomic, fresh temp inode).
         if !have_audience {
-            let audience = OwnerAudienceCredential::generate();
+            let audience = OwnerAudienceCredential::generate(owner_org_id);
             // The serialized key buffer scrubs on every exit: the source array
             // inline (before the `?`), the Vec copy via its RAII guard.
             let mut raw = audience.encode_config();
@@ -3634,9 +3694,10 @@ mod tests {
 
     #[test]
     fn audience_codec_round_trips_and_debug_redacts() {
-        let credential = OwnerAudienceCredential::generate();
+        let credential = OwnerAudienceCredential::generate(org().org_id());
         let encoded = credential.encode_config();
         let decoded = OwnerAudienceCredential::decode_config(&encoded).expect("decode");
+        assert_eq!(decoded.owner_org, credential.owner_org);
         assert_eq!(decoded.audience_handle, credential.audience_handle);
         assert_eq!(decoded.discovery_key(), credential.discovery_key());
 
@@ -3651,12 +3712,130 @@ mod tests {
         assert!(!debug.contains(&hex::encode(credential.discovery_key())));
     }
 
+    /// §2 — the codec must actually CARRY the org, at a distinct offset from
+    /// the handle and the key.
+    ///
+    /// Without this the previous format was three anonymous fields, and an
+    /// `owner-audience.key` said nothing about which org it belonged to — the
+    /// ambiguity `adopt` then resolved by simply keeping whatever was there.
+    #[test]
+    fn audience_codec_binds_the_owning_org() {
+        let org_a = OrgKeypair::from_bytes([0xA1u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xB2u8; 32]);
+        let a = OwnerAudienceCredential::generate(org_a.org_id());
+        let b = OwnerAudienceCredential::generate(org_b.org_id());
+
+        assert_eq!(a.owner_org, org_a.org_id());
+        assert_eq!(b.owner_org, org_b.org_id());
+
+        // The org occupies its own bytes: encoding differs in the org region
+        // even though both are freshly generated.
+        let (ea, eb) = (a.encode_config(), b.encode_config());
+        assert_eq!(&ea[1..33], org_a.org_id().as_bytes());
+        assert_eq!(&eb[1..33], org_b.org_id().as_bytes());
+        // ...and the secret is NOT in that region.
+        assert_ne!(&ea[1..33], a.discovery_key());
+
+        // A v1-shaped file (no org field) is refused rather than guessed at.
+        // Guessing "it belongs to whoever is adopting now" is exactly the
+        // §2 bug, so a shorter file must not decode.
+        let v1_shaped = &ea[..1 + 32 + 32];
+        assert!(
+            OwnerAudienceCredential::decode_config(v1_shaped).is_err(),
+            "a pre-binding audience file must be refused, never migrated by \
+             assuming the current adopter's org",
+        );
+    }
+
     // ----------------- review-8 ceremony witnesses -----------------
 
     fn floors_bundle(member: &EntityId, generation: u32) -> OrgRevocationBundle {
         let mut floors = BTreeMap::new();
         floors.insert(member.clone(), generation);
         OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
+    }
+
+    /// §2 — the org-wide audience key must never be carried across an
+    /// ownership change.
+    ///
+    /// The attack is the DOCUMENTED remediation path. `AlreadyOwned` told
+    /// operators to "remove the existing authority explicitly to transfer", so
+    /// they deleted `owner-membership.json` — which is the one file the
+    /// ownership gate read. Adoption under the new org then succeeded, and
+    /// step 8 preserved the OLD org's `owner-audience.key` (it only mints when
+    /// absent). The new org's private capability catalog was then sealed under
+    /// a key that, by design, has been distributed to every node of the old
+    /// org.
+    ///
+    /// The credential now states its own org, so the audience file is a second
+    /// ownership witness and the deletion no longer helps.
+    #[test]
+    fn adopt_refuses_to_inherit_another_orgs_audience_key() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let org_a = OrgKeypair::from_bytes([0xA1u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xB2u8; 32]);
+
+        // Node is adopted by org A.
+        let cert_a =
+            OrgMembershipCert::try_issue(&org_a, kp.entity_id().clone(), 1, 3600).expect("issue A");
+        let authority_a =
+            NodeAuthority::adopt(scratch.dir(), cert_a, kp.entity_id(), 0, None).expect("adopt A");
+        let a_key = *authority_a.audience.discovery_key();
+        let a_handle = authority_a.audience.audience_handle;
+        drop(authority_a);
+
+        // Operator follows the old guidance literally and deletes ONLY the
+        // membership file, then re-adopts under org B.
+        std::fs::remove_file(scratch.dir().join(OWNER_MEMBERSHIP_FILE)).expect("remove membership");
+        let cert_b =
+            OrgMembershipCert::try_issue(&org_b, kp.entity_id().clone(), 1, 3600).expect("issue B");
+        let err = NodeAuthority::adopt(scratch.dir(), cert_b, kp.entity_id(), 0, None)
+            .expect_err("B must not inherit A's audience key");
+        assert!(
+            matches!(
+                err,
+                OrgAuthorityError::AlreadyOwned { existing, requested }
+                    if existing == org_a.org_id() && requested == org_b.org_id()
+            ),
+            "expected AlreadyOwned(A -> B), got {err:?}",
+        );
+
+        // A's key is untouched — the refusal did not rotate or clobber it,
+        // so recovering the original ownership is still possible.
+        let reopened = read_audience_checked(&scratch.dir().join(OWNER_AUDIENCE_FILE))
+            .expect("read audience")
+            .expect("audience present");
+        let cred = OwnerAudienceCredential::decode_config(&reopened).expect("decode");
+        assert_eq!(cred.owner_org, org_a.org_id());
+        assert_eq!(cred.discovery_key(), &a_key);
+        assert_eq!(cred.audience_handle, a_handle);
+    }
+
+    /// Positive control: re-adopting under the SAME org still preserves the
+    /// audience key, which is the behaviour the preservation branch exists for
+    /// (rotating it on every renewal would partition the node from its own
+    /// org's scoped discovery). Without this, a regression that refused every
+    /// preserved credential would pass the test above.
+    #[test]
+    fn readopt_under_the_same_org_preserves_the_audience_key() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+
+        let first = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("first adopt");
+        let key = *first.audience.discovery_key();
+        let handle = first.audience.audience_handle;
+        drop(first);
+
+        let second = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("same-org re-adopt must succeed");
+        assert_eq!(
+            second.audience.discovery_key(),
+            &key,
+            "a same-org renewal must NOT rotate the audience key",
+        );
+        assert_eq!(second.audience.audience_handle, handle);
     }
 
     /// Review-8 §7: a certificate the supplied bundle immediately
