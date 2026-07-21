@@ -42,7 +42,9 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeError, ServeHandle};
+use net::adapter::net::mesh_rpc::{
+    CallOptions, CodecDirection, OrgProofIntent, RpcError, ServeError, ServeHandle,
+};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -295,6 +297,67 @@ impl RpcHandler for DarkHandler {
     }
 }
 
+/// §T2 — assert a handler stayed dark, and KEEPS being dark.
+///
+/// A bare `assert_eq!(calls.load(..), 0)` immediately after observing a denial
+/// proves only that the handler had not YET incremented at that instant. On the
+/// admit path the gate hands the request to the fold via
+/// `apply_inbound_admitted` and the handler BODY runs on a separate task; on the
+/// deny path it awaits `emit_admission_denial` and returns. A regression that
+/// did BOTH — apply, then emit — would deliver the denial to the caller first,
+/// and the counter would read 0 before the handler task was ever scheduled.
+///
+/// That is the single worst failure an admission gate can have — "denies to the
+/// caller but still executes the handler" — and every darkness assertion in this
+/// file was blind to it. The comment claiming the witness is "race-free because
+/// `call` blocks on the denial response" is true only of the CORRECT
+/// implementation, which is the thing under test.
+///
+/// Polling a bounded window converts "not yet" into "not at all": the handler
+/// gets real scheduler time to run before we conclude it did not.
+async fn assert_handler_stays_dark(calls: &Arc<AtomicUsize>, what: &str) {
+    const SETTLE: Duration = Duration::from_millis(200);
+    const STEP: Duration = Duration::from_millis(10);
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let observed = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "{what}: the handler RAN ({observed} call(s)) despite the denial — \
+             the request reached the fold even though the caller was denied",
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(STEP).await;
+    }
+}
+
+/// Self-witness for [`assert_handler_stays_dark`]: it must catch a handler that
+/// runs LATE — which is precisely what the previous instant-read assertion
+/// could not.
+///
+/// The increment here lands 50 ms after the denial would have been observed. An
+/// `assert_eq!(calls.load(..), 0)` at that instant reads 0 and PASSES, which is
+/// the blind spot §T2 is about; the bounded window sees the same handler run and
+/// fails. Without this test the new helper would itself be unwitnessed.
+#[tokio::test]
+#[should_panic(expected = "the handler RAN")]
+async fn the_darkness_window_catches_a_handler_that_runs_late() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Sanity: at the instant a denial would be observed, the counter IS 0 —
+    // so the old assertion form would have passed here.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let late = Arc::clone(&calls);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        late.fetch_add(1, Ordering::SeqCst);
+    });
+
+    assert_handler_stays_dark(&calls, "a handler scheduled after the denial").await;
+}
+
 /// LIVE owner-delegated admit over the real transport: a valid proof is minted
 /// by `call`, verified by the provider gate, and the handler runs exactly once
 /// with the four-party attribution and the raw proof header stripped; the caller
@@ -417,9 +480,21 @@ async fn live_two_node_missing_proof_denied() {
                 1,
                 "the deny body carries exactly one coarse reason byte",
             );
-            assert!(
-                matches!(message.as_bytes()[0], 0..=2),
-                "the single byte is a valid coarse reason (Denied/NotSupported/Unavailable)",
+            // §T3 — pin the EXACT reason, not the whole valid range.
+            //
+            // `0..=2` accepted any coarse reason, so a regression that
+            // answered a missing proof with `Unavailable` (2) or
+            // `NotSupported` (1) passed. Those bytes disclose provider state
+            // — whether an authority is installed, whether its store is
+            // poisoned — to a caller that presented no credential at all.
+            // A missing proof is deterministically `Denied`. The sibling
+            // poison test already pins `&[2u8]` exactly, so the precision was
+            // available and simply not used here.
+            assert_eq!(
+                message.as_bytes(),
+                &[0u8],
+                "a missing proof must report exactly Denied (0); a different \
+                 coarse reason leaks provider state to an uncredentialed caller",
             );
         }
         other => panic!(
@@ -427,11 +502,7 @@ async fn live_two_node_missing_proof_denied() {
              (a Timeout here would be a denial masquerading as a timeout)"
         ),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler stayed dark for the denied call",
-    );
+    assert_handler_stays_dark(&calls, "the handler stayed dark for the denied call").await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -498,11 +569,7 @@ async fn live_two_node_provider_store_poison_denies() {
         }
         other => panic!("expected an AdmissionDenied ServerError, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler stayed dark under the poisoned store",
-    );
+    assert_handler_stays_dark(&calls, "the handler stayed dark under the poisoned store").await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -564,11 +631,7 @@ async fn live_two_node_policy_veto_denies() {
             panic!("expected an AdmissionDenied ServerError, got {other:?} (no timeout masquerade)")
         }
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler stayed dark under the policy veto",
-    );
+    assert_handler_stays_dark(&calls, "the handler stayed dark under the policy veto").await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -707,11 +770,7 @@ async fn live_two_node_protected_call_service_bypasses_legacy_gate() {
         matches!(deny, RpcError::CapabilityDenied { .. }),
         "public call_service is denied by the legacy allow-list, got {deny:?}",
     );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the denied public call never reached the handler",
-    );
+    assert_handler_stays_dark(&calls, "the denied public call never reached the handler").await;
 
     // Protected: proof intent → call_service bypasses `may_execute`, selects the
     // exact provider, and the live org gate admits.
@@ -2652,11 +2711,11 @@ async fn live_two_node_protected_missing_local_capability_denies() {
         }
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
+    assert_handler_stays_dark(
+        &calls,
         "the handler stayed dark — the possession precheck denied before admission",
-    );
+    )
+    .await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2806,11 +2865,7 @@ async fn live_cross_org_any_node_owned_by_reuse_and_deny() {
         }
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        pc_calls.load(Ordering::SeqCst),
-        0,
-        "the non-B provider's handler stayed dark",
-    );
+    assert_handler_stays_dark(&pc_calls, "the non-B provider's handler stayed dark").await;
 
     for d in [dir2, dir2b, dirc] {
         let _ = std::fs::remove_dir_all(&d);
@@ -2883,7 +2938,7 @@ async fn live_two_node_owner_delegated_membership_only_denied() {
         RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler stayed dark");
+    assert_handler_stays_dark(&calls, "the handler stayed dark").await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2966,11 +3021,7 @@ async fn live_two_node_public_capability_unchanged_beside_protected() {
         RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        prot_calls.load(Ordering::SeqCst),
-        0,
-        "the protected handler stayed dark",
-    );
+    assert_handler_stays_dark(&prot_calls, "the protected handler stayed dark").await;
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3076,11 +3127,7 @@ async fn live_two_node_owner_delegated_floor_survives_restart_denies() {
         }
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler stayed dark for the below-floor call",
-    );
+    assert_handler_stays_dark(&calls, "the handler stayed dark for the below-floor call").await;
 
     // At the floor (generation 5): admitted — proving the floor is exactly 5.
     let intent5 = owner_delegated_intent_gen(
@@ -3320,11 +3367,11 @@ async fn live_granted_audience_discover_only_resolves_but_cannot_invoke() {
         RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
+    assert_handler_stays_dark(
+        &calls,
         "the handler stayed dark — discovery did not confer invocation",
-    );
+    )
+    .await;
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&a_dir);
@@ -3411,7 +3458,7 @@ async fn live_granted_audience_wrong_dispatcher_resolves_but_invocation_denied()
         RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler stayed dark");
+    assert_handler_stays_dark(&calls, "the handler stayed dark").await;
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&a_dir);
@@ -3499,11 +3546,7 @@ async fn live_granted_audience_provider_policy_final() {
         RpcError::ServerError { status, .. } => assert_eq!(status, 0x0009, "AdmissionDenied"),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler stayed dark under the policy veto",
-    );
+    assert_handler_stays_dark(&calls, "the handler stayed dark under the policy veto").await;
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&a_dir);
@@ -3615,11 +3658,11 @@ async fn live_two_node_proof_for_another_identity_is_denied() {
         ),
         other => panic!("expected AdmissionDenied, got {other:?}"),
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
+    assert_handler_stays_dark(
+        &calls,
         "the handler must stay dark for a proof bound to another identity",
-    );
+    )
+    .await;
 
     // Positive control on the SAME server and session: a proof minted for the
     // session's own identity admits. Without this the denial above could be an
@@ -3706,20 +3749,39 @@ async fn a_proof_ttl_outside_the_ceiling_fails_locally() {
             .call(server.node_id(), "svc", Bytes::from_static(b"ping"), opts)
             .await
             .expect_err("a TTL outside 1..=MAX must be refused");
-        // Refused by the CALLER, so it is not a server status — and crucially
-        // not a timeout, which is what a silently-dropped frame would look
-        // like.
+        // §T1 — assert the CALLER-SIDE error, not merely "not a timeout".
+        //
+        // `!matches!(err, Timeout)` was non-falsifiable for the property this
+        // test names. Delete the ceiling check at mesh_rpc.rs and the proof is
+        // minted with ttl 0 / 31, shipped, and rejected by the PROVIDER
+        // (`org_call.rs` → Expired / TtlTooLong, these tests run with
+        // verification_skew_secs = 0). The caller then sees
+        // `ServerError { status: 0x0009 }` — not a timeout, so the old
+        // assertion passed, and the handler is dark, so the `calls == 0` below
+        // passed too. The test was fully green with the check under test
+        // removed.
+        //
+        // `Codec { direction: Encode }` can ONLY be produced locally, before a
+        // frame exists, so it is exactly the "enforced locally, nothing left
+        // the node" claim in this test's name.
         assert!(
-            !matches!(err, RpcError::Timeout { .. }),
-            "ttl {bad_ttl} must fail loudly on the caller, not time out: {err:?}",
+            matches!(
+                err,
+                RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    ..
+                }
+            ),
+            "ttl {bad_ttl} must be refused by the CALLER at encode time, \
+             before any frame is emitted; got: {err:?}",
         );
     }
 
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
+    assert_handler_stays_dark(
+        &calls,
         "no frame reached the provider for an out-of-range TTL",
-    );
+    )
+    .await;
 
     // Positive control: an in-range TTL on the same setup admits.
     let mut intent = owner_delegated_intent(
