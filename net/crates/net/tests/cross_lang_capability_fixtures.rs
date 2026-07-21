@@ -805,6 +805,8 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(target_node, eid, 1, caps.clone()),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
 
@@ -973,6 +975,8 @@ fn placement_score_fixture_matches_substrate() {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(node_id, eid, 1, cand_caps),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
 

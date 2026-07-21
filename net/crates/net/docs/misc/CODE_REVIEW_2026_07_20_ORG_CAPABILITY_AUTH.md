@@ -1,56 +1,60 @@
 # CODE REVIEW 2026-07-20 — Organization Capability Auth (`org-capability-auth`)
 
-> **Status: all 20 production findings + §T1-§T9 + §D1-§D4 RESOLVED on this
-> branch** (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4, `e21a9d23c`
-> §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8, `8e2b85596` §9,
-> `7b54c211d` §10+§11+§17, `b937e63e6` §12, `49ed592af` §13, `6b492b349`
-> §14-§19, `087a90d07` §T1, `353115c72` §T9, `fc94c960e` §T2-§T8, §20 in
-> this commit).
+> **Status: 20 production findings resolved; TEST closure is PARTIAL.**
 >
-> **§20 was found by the user reviewing this closure, not by the original
-> review.** It is a Windows CONFIDENTIALITY break that the §3/§4 fix left open:
-> the validator tolerated read-only aces, but authority files inherit the
-> directory's ACL on Windows, so an `(OI)(CI)(R)` grant reached
-> `owner-audience.key`. Reproduced against live NTFS, then fixed and
-> red-witnessed. The original §3/§4 witnesses missed it because both used
-> write-capable aces — a reminder that "the tests pass" and "the property
-> holds" are different claims, which is the same failure mode §T1-§T8
-> catalogues elsewhere in this document.
+> Production fixes (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4,
+> `e21a9d23c` §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8,
+> `8e2b85596` §9, `7b54c211d` §10+§11+§17, `b937e63e6` §12, `49ed592af` §13,
+> `6b492b349` §14-§19, `5d9870c5b` §20, plus the §11/§12 residuals in the
+> commit carrying this note).
 >
-> Every fix is RED-WITNESSED: each new test was verified to fail against the
-> original code and pass against the fix, and the witness is recorded in the
-> commit. The crate passes `cargo fmt`, both CI clippy gates (production-strict
-> and `--all-targets` with the four panic lints allowed), 5210 lib tests, and
-> every affected integration suite.
+> **An earlier revision of this block claimed "all 19 production findings +
+> §T1-§T9 + §D1-§D4 RESOLVED". That was an overclaim and is retracted.**
+> Kyra's closure review established three things it got wrong, and they are
+> recorded here rather than quietly fixed:
 >
-> **Three corrections to this document, found while fixing it:**
+> - **§20 existed and the §3/§4 fix did not close it.** An untrusted
+>   INHERITABLE read ace propagated onto `owner-audience.key`, because Windows
+>   authority files inherit the directory ACL and the validator tolerated
+>   read-only aces. Reproduced on live NTFS. Fixed in `5d9870c5b`.
+> - **§11 was only half closed.** The first fix cleaned up after a failed
+>   RENAME, but `OpenOptions::open` creates the file before any byte is
+>   written, so write/fsync failures still stranded partial seed material.
+> - **§12 was only half closed.** The entity-to-node bind closed the
+>   unretractable projection, but `apply_legacy_announcement` stayed `pub`,
+>   release-compiled, with `floors = None` — and `MeshNode::capability_fold()`
+>   is also `pub`.
 >
-> 1. **§T1's mutation analysis was incomplete.** The caller-identity property
->    is defended TWICE — step 5's TOFU member bind and step 7's
->    `dispatcher_grant.dispatcher != *ctx.authenticated_caller`. Deleting
->    either alone still denies (verified). The review's claimed mutation is
->    dangerous precisely because it repoints `authenticated_caller`, which both
->    checks read; a test aimed at one check would have missed it. The new test
->    is the only one of 40 that fails under it.
-> 2. **§T1's proof-expiry gap does not exist as stated.** `proof_ttl_secs` is
->    applied when the proof is MINTED, and `call()` mints fresh on every
->    invocation, so no already-expired proof can be presented through the
->    public API. Expiry is reachable only via a captured proof being replayed —
->    the attack the binding and replay guard exist to stop — and is covered in
->    the `org_admission` units, which take an explicit `ClockSample`. Replaced
->    with the caller-side TTL-ceiling test, which IS reachable.
-> 3. **§12 was worse than described.** `test_inject_capability_announcement` is
->    not merely `#[doc(hidden)] pub` in Rust — it is re-exported through the
->    Python, Node and Go bindings as a callable method of the shipped
->    libraries. It was therefore fixed at the producer
->    (`verify_announced_owner_cert`) rather than by gating the seam, which
->    would have broken real callers.
+> **TEST closure (§T1-§T9) is NOT complete.** What actually landed:
 >
-> Two findings were also fixed more narrowly than proposed, deliberately:
-> §2 keeps `--force` available (certs and floor bundles are renewable by
-> design) and makes the replace SAFE via staging + atomic rename, rather than
-> refusing it as the grant verbs do; §9 is defense-in-depth only and does NOT
-> substitute for the §3.4 key rotation, which remains unimplemented.
+> | Item | State |
+> |---|---|
+> | §T1 | PARTIAL — the wrong-caller-identity witness is real and red-witnessed; the replay and wire-tamper witnesses were NOT added. (Proof expiry is unreachable end-to-end; see below.) |
+> | §T2 | PARTIAL — the origin-bind half is now asserted, but the companion still passes under a `(origin, call_id)` key, so the session component named by §T2 is still not witnessed. |
+> | §T3 | NOT DONE — `nrpc_response_routing.rs` is unchanged and still multiply guarded. |
+> | §T4 | PARTIAL — `org_adopt.rs` gained stderr-asserting tests; the principal wrong-reason cases at `org_grant.rs:214` and `:399` are unchanged. |
+> | §T5 | DONE — the restart is real and red-witnessed. |
+> | §T6 | DONE — the precondition no longer masks the assertion. |
+> | §T7 | DONE — both hangs now fail. |
+> | §T8 | PARTIAL — the `recv_timeout` shapes are fixed; the sleep-based blocking assertions, the copied-ingest seam coverage, the emission-flag setup and the PID-reuse scratch hazard are not. |
+> | §T9 | Config landed and locally verified; **CI has not been observed green at HEAD.** |
+>
+> One §T1 item is not a gap but a correction: proof EXPIRY is unreachable
+> end-to-end through the public API, because `proof_ttl_secs` is applied at
+> mint time and `call()` mints fresh every invocation. It is covered in the
+> `org_admission` units, which take an explicit `ClockSample`.
+>
+> Two further review corrections found while fixing: §T1's mutation analysis
+> was incomplete (the identity property is defended TWICE, by step 5 and step
+> 7, so the dangerous mutation is dangerous because it repoints
+> `authenticated_caller`, which both read), and §12 was worse than described
+> (the injection seam is re-exported through the Python, Node and Go bindings,
+> so it was fixed at the producer rather than gated).
+>
+> Every production fix is RED-WITNESSED: each test was verified to fail
+> against the original code and pass against the fix, with the witness in the
+> commit. `cargo fmt`, both clippy gates and both rustdoc gates are clean;
+> 5211 lib tests and every affected integration suite pass locally.
 
 Findings are ordered by severity; §1 and §2 were merge-blocking.
 

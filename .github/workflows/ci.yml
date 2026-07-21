@@ -185,7 +185,7 @@ jobs:
       - name: Net mesh, capability, migration, nRPC dispatch
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features net
+          cargo nextest run --no-fail-fast --features "net fixtures"
           --test integration_net
           --test three_node_integration
           --test channel_auth

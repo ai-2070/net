@@ -336,6 +336,8 @@ fn test_start_migration_auto() {
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0x2222, test_entity_id(), 1, target_caps),
+        None,
+        0,
     )
     .expect("apply legacy announcement in fixture");
 
@@ -991,6 +993,8 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0xAAAA, test_entity_id(), 1, node_a_caps),
+        None,
+        0,
     )
     .expect("apply legacy announcement in fixture");
 
@@ -999,6 +1003,8 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0xBBBB, test_entity_id(), 1, node_b_caps),
+        None,
+        0,
     )
     .expect("apply legacy announcement in fixture");
 
@@ -1695,6 +1701,8 @@ fn make_scheduler_for_groups() -> Scheduler {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(node_id, test_entity_id(), 1, CapabilitySet::new()),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
     }

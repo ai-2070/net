@@ -870,6 +870,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
+                None,
+                0,
             )
             .expect("apply legacy announcement in fixture");
         }
@@ -1130,6 +1132,8 @@ mod tests {
                 1,
                 CapabilitySet::new(),
             ),
+            None,
+            0,
         )
         .expect("apply legacy announcement in fixture");
         let sched = Scheduler::new(fold, 0x1111, CapabilitySet::new());
@@ -1161,6 +1165,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+                None,
+                0,
             )
             .expect("apply legacy announcement in fixture");
         }

@@ -252,26 +252,52 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
 /// which supplies the node's live floors and pairs the apply with a
 /// `recheck_projected_owner_floor`.
 ///
-/// Every in-tree caller is a test or a bench (verified: no production call
-/// site remains, which makes the "~30 production call sites" note in
-/// `CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md` MD-1 stale). It stays `pub`
-/// only because `benches/net.rs` is a separate compilation target and cannot
-/// see a `#[cfg(test)]` item.
+/// `floors` is EXPLICIT (§12 residual, Kyra). It used to be hardcoded `None`
+/// inside this function, silently skipping the revocation floor check — and
+/// because `MeshNode::capability_fold()` is also `pub`, a release build let
+/// any caller pair the two and install an ownership projection for a
+/// certificate already below a live floor, outside the revocation-aware
+/// ingest path and with no callback left to retract it (the floor raise that
+/// would have fired had already happened).
+///
+/// Pass the node's live floors to get production semantics. `None` is still
+/// permitted — a fixture priming a bare fold has no floors to check — but it
+/// is now a visible decision at each call site rather than a default buried
+/// in the helper.
+///
+/// It is ALSO gated behind `#[cfg(any(test, feature = "fixtures"))]`, so a
+/// downstream `cargo add net-mesh` cannot reach it at all. `#[cfg(test)]`
+/// alone was never sufficient: benches AND four integration tests link the
+/// library as an external crate and cannot see `#[cfg(test)]` items, so the
+/// helper had to stay `pub` for them — which is exactly how it stayed
+/// reachable from a release build.
+///
+/// The two gates are complementary. The feature removes the helper from
+/// consumer builds; the explicit `floors` parameter makes the skip visible to
+/// the fixture authors who legitimately keep it.
+///
+/// Callers are `#[cfg(test)]` modules, benches (`net`, `placement` — both now
+/// `required-features = [..., "fixtures"]`), and the four integration tests in
+/// the CI `net` group (which now runs `--features "net fixtures"`). No
+/// production call site remains, which makes the "~30 production call sites"
+/// note in `CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md` MD-1 stale.
 ///
 /// The unretractable-projection hazard this used to carry is closed at the
 /// producer instead: `verify_announced_owner_cert` now refuses a cert whose
 /// entity does not derive the announced node id (§12), so no caller of this
 /// helper can install ownership that a floor raise could never clear.
+#[cfg(any(test, feature = "fixtures"))]
 pub fn apply_legacy_announcement(
     fold: &Fold<CapabilityFold>,
     ann: CapabilityAnnouncement,
+    floors: Option<&OrgRevocationState>,
+    skew_secs: u64,
 ) -> Result<ApplyOutcome, FoldError> {
-    // Mirror the production dispatch path's OA-1 ingest
-    // verification, INCLUDING the outer-signature precondition (no
-    // revocation floors in this fixture-shaped helper — floors are
-    // node state, and fixtures priming a bare fold have none).
+    // Mirror the production dispatch path's OA-1 ingest verification,
+    // INCLUDING the outer-signature precondition.
     let outer_signature_verified = ann.verify().is_ok();
-    let verified_owner = verify_announced_owner_cert(&ann, outer_signature_verified, None, 0);
+    let verified_owner =
+        verify_announced_owner_cert(&ann, outer_signature_verified, floors, skew_secs);
     let fold_ann = translate_announcement(&ann, verified_owner);
     fold.apply(fold_ann)
 }
@@ -2388,7 +2414,7 @@ mod tests {
             .expect("issue");
         let ann = signed_announcement_with_cert(&kp, Some(cert));
 
-        apply_legacy_announcement(&fold, ann).expect("apply");
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
         assert_eq!(
             owner_org_for(&fold, kp.entity_id().node_id()),
             Some(org_root().org_id())
@@ -2448,7 +2474,7 @@ mod tests {
         // …and the announcement survives: the publisher stays discoverable,
         // just unowned.
         let fold = new_fold();
-        apply_legacy_announcement(&fold, ann).expect("apply");
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
         let filter = LegacyFilter {
             require_tags: vec!["nrpc:echo".into()],
             ..LegacyFilter::default()
@@ -2469,7 +2495,7 @@ mod tests {
             .expect("issue");
         let bound = signed_announcement_with_cert(&kp, Some(cert));
         let fold = new_fold();
-        apply_legacy_announcement(&fold, bound).expect("apply");
+        apply_legacy_announcement(&fold, bound, None, 0).expect("apply");
         assert_eq!(
             owner_org_for(&fold, real_node_id),
             Some(org_root().org_id()),
@@ -2516,7 +2542,7 @@ mod tests {
         ] {
             let fold = new_fold();
             let ann = signed_announcement_with_cert(&kp, Some(cert));
-            apply_legacy_announcement(&fold, ann).expect("apply");
+            apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
             // Announcement kept: the publisher is in the fold and
             // queryable by tag.
             let filter = LegacyFilter {
@@ -2598,7 +2624,7 @@ mod tests {
         )
         .with_owner_cert(Some(cert.clone()));
         assert!(unsigned.signature.is_none());
-        apply_legacy_announcement(&fold, unsigned).expect("apply");
+        apply_legacy_announcement(&fold, unsigned, None, 0).expect("apply");
         // Discoverable in unsigned mode…
         let filter = LegacyFilter {
             require_tags: vec!["nrpc:echo".into()],
@@ -2616,7 +2642,7 @@ mod tests {
         let fold = new_fold();
         let mut tampered = signed_announcement_with_cert(&kp, Some(cert));
         tampered.version += 1; // breaks the outer signature
-        apply_legacy_announcement(&fold, tampered).expect("apply");
+        apply_legacy_announcement(&fold, tampered, None, 0).expect("apply");
         assert_eq!(
             owner_org_for(&fold, 0xE2),
             None,
@@ -2690,7 +2716,7 @@ mod tests {
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
         let ann = signed_announcement_with_cert(&kp, Some(cert));
-        apply_legacy_announcement(&fold, ann).expect("apply");
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
 
         let before = fold.change_generation();
@@ -2732,7 +2758,7 @@ mod tests {
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
         let ann = signed_announcement_with_cert(&kp, Some(cert));
-        apply_legacy_announcement(&fold, ann).expect("apply");
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
 
         // Install the sink AFTER the apply so the only event we can observe is
@@ -2781,7 +2807,7 @@ mod tests {
         let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
             .expect("issue");
         let ann = signed_announcement_with_cert(&kp, Some(cert));
-        apply_legacy_announcement(&fold, ann).expect("apply");
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
 
         // Floor rises to 5: the generation-4 projection retracts.
@@ -2806,7 +2832,7 @@ mod tests {
         let cert7 = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 7, 3600)
             .expect("issue");
         let ann7 = signed_announcement_with_cert(&kp, Some(cert7));
-        apply_legacy_announcement(&fold, ann7).expect("apply");
+        apply_legacy_announcement(&fold, ann7, None, 0).expect("apply");
         let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
         assert_eq!(retracted, 0, "generation 7 ≥ floor 5 must survive");
         assert_eq!(owner_org_for(&fold, node_id), Some(org_root().org_id()));
@@ -2830,7 +2856,7 @@ mod tests {
         for with_cert in [false, true] {
             let fold = new_fold();
             let ann = signed_announcement_with_cert(&kp, with_cert.then(cert));
-            apply_legacy_announcement(&fold, ann).expect("apply");
+            apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
             assert!(
                 may_execute(&fold, kp.entity_id().node_id(), "nrpc:echo", caller),
                 "permissive verdict must not depend on owner_org (with_cert={with_cert})"
@@ -2843,7 +2869,7 @@ mod tests {
             let mut ann = signed_announcement_with_cert(&kp, with_cert.then(cert));
             ann.allowed_nodes = vec![0xFFFF];
             ann.sign(&kp);
-            apply_legacy_announcement(&fold, ann).expect("apply");
+            apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
             assert!(
                 !may_execute(&fold, kp.entity_id().node_id(), "nrpc:echo", caller),
                 "restricted verdict must not depend on owner_org (with_cert={with_cert})"

@@ -360,6 +360,44 @@ pub(crate) async fn read_identity_file(
     Ok(parsed)
 }
 
+/// Write `bytes` into the already-created `f` and fsync it, REMOVING `tmp` if
+/// any step fails.
+///
+/// §11, second half. The first pass cleaned up only after a failed RENAME, but
+/// `OpenOptions::open` creates the file before a single byte is written — so a
+/// disk-full, quota, read-only-remount or fsync failure stranded a partial
+/// org-root or node-identity seed on disk. `write_all` can fail mid-buffer, so
+/// the residue may be a PREFIX of the seed file rather than nothing at all.
+///
+/// Split out from the `spawn_blocking` closure so the failure can be driven
+/// deterministically in a test: hand it a read-only handle and `write_all`
+/// fails on every platform. There is no portable way to force that from
+/// inside the closure.
+fn write_sync_or_remove(mut f: std::fs::File, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let written = std::io::Write::write_all(&mut f, bytes).and_then(|()| {
+        // Without the fsync a crash after this returns could still lose the
+        // bytes; a sync failure means they are not durable.
+        f.sync_all()
+    });
+    let Err(e) = written else {
+        return Ok(());
+    };
+    // Close before unlinking — Windows refuses to remove an open file.
+    drop(f);
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+        // Loud, with the exact path — the same discipline the rename-failure
+        // path uses. A silent best-effort removal would be the original defect
+        // in a new place.
+        Err(rm) => eprintln!(
+            "warning: failed to remove partially-written seed temp {}: {rm};              REMOVE IT MANUALLY — it may contain key material.",
+            tmp.display()
+        ),
+    }
+    Err(e)
+}
+
 /// Write `bytes` to `tmp` with the tightest creation mode the
 /// platform supports, then atomic-rename onto `final_path`. On Unix
 /// the temp file is created with `O_CREAT | O_EXCL` and mode 0o600
@@ -389,10 +427,8 @@ pub(crate) async fn write_identity_atomically(
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp_owned)?;
-        std::io::Write::write_all(&mut f, bytes_owned.as_slice())?;
-        f.sync_all()?;
-        Ok(())
+        let f = opts.open(&tmp_owned)?;
+        write_sync_or_remove(f, &tmp_owned, bytes_owned.as_slice())
     })
     .await
     .map_err(|e| generic(format!("seed-write task panicked: {e}")))?
@@ -582,6 +618,64 @@ mod tests {
             !tmp.exists(),
             "the seed-bearing temp {} must not be left on disk",
             tmp.display(),
+        );
+    }
+
+    /// §11 (second half) — a failed WRITE or SYNC must not orphan the temp.
+    ///
+    /// The first §11 fix cleaned up only after a failed RENAME. But
+    /// `OpenOptions::open` creates the file before a byte is written, so
+    /// disk-full, quota, read-only-remount and fsync failures still stranded
+    /// seed material — and because `write_all` can fail mid-buffer, the
+    /// residue may be a PREFIX of the seed file rather than nothing.
+    ///
+    /// Driven deterministically by handing the writer a READ-ONLY handle to an
+    /// existing file: `write_all` then fails with a permission error on every
+    /// platform. Forcing a genuine ENOSPC/EIO from inside the blocking closure
+    /// is not portable, which is why the cleanup was extracted into
+    /// `write_sync_or_remove`.
+    ///
+    /// Red-witness: deleting the removal block leaves the file on disk and
+    /// fails the second assertion.
+    #[test]
+    fn a_failed_write_removes_the_partial_seed_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+
+        // Stand in for a temp the writer had already created and partially
+        // filled before the failure.
+        std::fs::write(&tmp, b"partial-seed-material").expect("seed the temp");
+        let read_only = std::fs::File::open(&tmp).expect("open read-only");
+
+        let err = write_sync_or_remove(read_only, &tmp, b"the-real-seed")
+            .expect_err("writing through a read-only handle must fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "precondition: the failure is the write itself, not something else",
+        );
+        assert!(
+            !tmp.exists(),
+            "a partially-written seed temp must be removed on write failure",
+        );
+    }
+
+    /// The success path leaves the file in place and reports Ok — the cleanup
+    /// must not fire on a healthy write.
+    #[test]
+    fn a_successful_write_keeps_the_temp_for_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("identity.tmp");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .expect("create");
+        write_sync_or_remove(f, &tmp, b"seed-material").expect("healthy write succeeds");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read back"),
+            b"seed-material",
+            "the payload is intact and the temp survives for the rename",
         );
     }
 

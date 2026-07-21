@@ -2317,7 +2317,7 @@ fn bench_capability_fold_insert(c: &mut Criterion) {
                             1,
                             caps,
                         );
-                        capability_bridge::apply_legacy_announcement(&fold, ann)
+                        capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
                             .expect("apply legacy announcement in fixture");
                     }
                     fold
@@ -2339,7 +2339,7 @@ fn bench_capability_fold_query(c: &mut Criterion) {
     for i in 0..10000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        capability_bridge::apply_legacy_announcement(&fold, ann)
+        capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
             .expect("apply legacy announcement in fixture");
     }
 
@@ -2412,7 +2412,7 @@ fn bench_capability_fold_find_best(c: &mut Criterion) {
     for i in 0..10000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        capability_bridge::apply_legacy_announcement(&fold, ann)
+        capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
             .expect("apply legacy announcement in fixture");
     }
 
@@ -2460,7 +2460,7 @@ fn bench_capability_fold_scaling(c: &mut Criterion) {
             }
             let ann =
                 CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
-            capability_bridge::apply_legacy_announcement(&fold, ann)
+            capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
                 .expect("apply legacy announcement in fixture");
         }
 
@@ -2555,7 +2555,7 @@ fn bench_capability_fold_concurrent(c: &mut Criterion) {
                                         1,
                                         caps,
                                     );
-                                    capability_bridge::apply_legacy_announcement(&f, ann)
+                                    capability_bridge::apply_legacy_announcement(&f, ann, None, 0)
                                         .expect("apply legacy announcement in fixture");
                                 }
                             })
@@ -2574,7 +2574,7 @@ fn bench_capability_fold_concurrent(c: &mut Criterion) {
         for i in 0..10000 {
             let caps = sample_capability_set(i);
             let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-            capability_bridge::apply_legacy_announcement(&query_fold, ann)
+            capability_bridge::apply_legacy_announcement(&query_fold, ann, None, 0)
                 .expect("apply legacy announcement in fixture");
         }
 
@@ -2628,8 +2628,10 @@ fn bench_capability_fold_concurrent(c: &mut Criterion) {
                                             1,
                                             caps,
                                         );
-                                        capability_bridge::apply_legacy_announcement(&f, ann)
-                                            .expect("apply legacy announcement in fixture");
+                                        capability_bridge::apply_legacy_announcement(
+                                            &f, ann, None, 0,
+                                        )
+                                        .expect("apply legacy announcement in fixture");
                                     } else {
                                         // 90% reads
                                         let filter =
@@ -2663,7 +2665,7 @@ fn bench_capability_fold_updates(c: &mut Criterion) {
     for i in 0..1000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        capability_bridge::apply_legacy_announcement(&fold, ann)
+        capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
             .expect("apply legacy announcement in fixture");
     }
 
@@ -2674,7 +2676,7 @@ fn bench_capability_fold_updates(c: &mut Criterion) {
             let caps = sample_capability_set(500);
             let ann =
                 CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), version, caps);
-            capability_bridge::apply_legacy_announcement(&fold, ann)
+            capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
                 .expect("apply legacy announcement in fixture");
             version += 1;
         });
@@ -2685,7 +2687,7 @@ fn bench_capability_fold_updates(c: &mut Criterion) {
         b.iter(|| {
             let caps = sample_capability_set(500);
             let ann = CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), 1, caps);
-            capability_bridge::apply_legacy_announcement(&fold, ann)
+            capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
                 .expect("apply legacy announcement in fixture");
         });
     });
@@ -2697,7 +2699,7 @@ fn bench_capability_fold_updates(c: &mut Criterion) {
             // Add
             let caps = sample_capability_set(id);
             let ann = CapabilityAnnouncement::new(id, EntityId::from_bytes([0u8; 32]), 1, caps);
-            capability_bridge::apply_legacy_announcement(&fold, ann)
+            capability_bridge::apply_legacy_announcement(&fold, ann, None, 0)
                 .expect("apply legacy announcement in fixture");
             // Remove
             fold.evict_node(id, "bench");
