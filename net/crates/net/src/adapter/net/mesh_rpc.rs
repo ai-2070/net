@@ -7954,6 +7954,184 @@ mod roster_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// §T1 — a byte-identical REPLAY of an admitted proof frame is denied, and
+    /// a wire-TAMPERED proof is denied.
+    ///
+    /// Neither was covered. Every integration test mints a fresh proof per
+    /// `call()`, so no test ever re-sent one frame twice: the mutation
+    /// "construct a fresh `AdmissionReplayGuard::with_defaults()` per call"
+    /// stayed green across the whole suite. And nothing mutated proof bytes on
+    /// the wire, because `call()` refuses a caller-supplied
+    /// `net-org-admission` header outright, so there is no way to inject one
+    /// through the public API.
+    ///
+    /// Both are reachable here because `deliver_rpc_inbound_for_test` drives
+    /// the REAL bridge with a crafted frame. The frame is built ONCE and the
+    /// same `Bytes` delivered twice — a genuine replay, not two equivalent
+    /// frames.
+    #[tokio::test]
+    async fn protected_replayed_and_tampered_proof_frames_are_denied() {
+        use crate::adapter::net::behavior::org::{
+            current_timestamp, OrgKeypair, OrgMembershipCert,
+        };
+        use crate::adapter::net::behavior::org_admission::OrgAdmission;
+        use crate::adapter::net::behavior::org_authority::NodeAuthority;
+        use crate::adapter::net::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+        };
+        use crate::adapter::net::org_admission_gate::org_request_digest;
+
+        let admits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingHandler(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RpcHandler for CountingHandler {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::from_static(b"pong"),
+                })
+            }
+        }
+
+        let server = build_server().await;
+        let node_entity = server.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org_b, node_entity.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!("net-oa2-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
+        server
+            .install_node_authority(std::sync::Arc::new(authority))
+            .expect("install authority");
+
+        let serve = server
+            .serve_rpc_protected(
+                "svc",
+                std::sync::Arc::new(CountingHandler(admits.clone())),
+                OrgAdmission::OwnerDelegated,
+                std::sync::Arc::new(|_| true),
+            )
+            .expect("serve protected");
+        let channel_hash = serve.channel_hash;
+
+        const CALLER_NODE: u64 = 0x91;
+        let caller_kp = EntityKeypair::generate();
+        let caller_entity = caller_kp.entity_id().clone();
+        let caller_origin = caller_entity.origin_hash();
+        server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+
+        let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+        let call_id = 7u64;
+        let base = RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"ping"),
+        };
+        let digest = org_request_digest(&base).expect("digest");
+        let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
+            .expect("caller cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_b,
+            caller_entity.clone(),
+            DispatcherScope::Exact(cap),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let expiry = (current_timestamp() + 20) * 1_000_000_000;
+        let proof = OrgCallProof::sign_for_call(
+            &caller_kp,
+            membership,
+            dispatcher,
+            None,
+            org_b.org_id(),
+            org_b.org_id(),
+            node_entity.clone(),
+            call_id,
+            cap,
+            expiry,
+            digest,
+        );
+        let proof_bytes = proof.encode().expect("encode proof");
+
+        // Build the frame ONCE — the same bytes are delivered twice below.
+        let mut payload = base.clone();
+        payload
+            .headers
+            .push((ORG_ADMISSION_HEADER.to_string(), proof_bytes.clone()));
+        let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut frame, 0);
+        frame.extend_from_slice(&payload.encode());
+        let frame = Bytes::from(frame);
+        let event = |payload: Bytes| RpcInboundEvent {
+            channel_hash,
+            origin_hash: caller_origin,
+            from_node: CALLER_NODE,
+            payload,
+        };
+
+        // 1. First delivery: admitted.
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, event(frame.clone())));
+        assert!(
+            wait_until_at_least(
+                || admits.load(std::sync::atomic::Ordering::SeqCst) as u64,
+                1
+            )
+            .await,
+            "the first delivery must be admitted",
+        );
+
+        // 2. REPLAY — the identical bytes again. The guard is keyed on
+        //    (caller, call_id) and the binding digest matches, so this is a
+        //    Replay rather than a CallIdCollision.
+        assert!(server.deliver_rpc_inbound_for_test(channel_hash, event(frame.clone())));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            admits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a byte-identical replay must NOT reach the handler a second time",
+        );
+
+        // 3. TAMPER — flip one byte inside the signed proof header value. The
+        //    call-binding signature covers it, so the gate must refuse. A
+        //    DIFFERENT call_id is used so the replay guard cannot be what
+        //    refuses it: the refusal must come from proof verification.
+        let mut tampered_proof = proof_bytes.clone();
+        let last = tampered_proof.len() - 1;
+        tampered_proof[last] ^= 0xFF;
+        assert_ne!(tampered_proof, proof_bytes, "the tamper must change bytes");
+        let mut tampered_payload = base.clone();
+        tampered_payload
+            .headers
+            .push((ORG_ADMISSION_HEADER.to_string(), tampered_proof));
+        let tampered_call_id = call_id + 1;
+        let mut tampered_frame =
+            EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, tampered_call_id, 0)
+                .to_bytes()
+                .to_vec();
+        encode_rpc_route(&mut tampered_frame, 0);
+        tampered_frame.extend_from_slice(&tampered_payload.encode());
+        assert!(
+            server.deliver_rpc_inbound_for_test(channel_hash, event(Bytes::from(tampered_frame)))
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            admits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a wire-tampered proof must never reach the handler",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// E1 fail-closed, end-to-end: a REQUEST whose proof binds a DIFFERENT
     /// call_id than the frame carries is DENIED (`BindingInvalid`) — the handler
     /// NEVER runs — while a valid follow-up on the same single-consumer bridge
