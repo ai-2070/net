@@ -1066,6 +1066,19 @@ async fn admit_and_dispatch_protected(
         return;
     }
 
+    // §32 — length guard, matching the two sibling helpers
+    // (`strip_public_admission_header`, `reject_relayed_flow_controlled_request`).
+    // `Bytes::slice` PANICS on an out-of-range start, and this was the one of
+    // the three that lacked the check. Currently unreachable — mesh ingress
+    // requires `decode_rpc_route` to succeed, which needs
+    // `len >= RPC_FRAME_BODY_OFFSET` — but that safety rests on a constant
+    // relationship two modules away, and a panic HERE kills the bridge task
+    // permanently (`ServeHandle._bridge` is never joined or restarted),
+    // silently retiring the service rather than failing one call.
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET {
+        return;
+    }
+
     // Decode the finalized request for the digest + admission header(s).
     let Ok(payload) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..))
     else {
@@ -4358,6 +4371,22 @@ impl MeshNode {
                 direction: CodecDirection::Encode,
                 message: "request_window_initial must be None or >= 1; Some(0) deadlocks send"
                     .to_string(),
+            });
+        }
+        // §31 — the DOWNLOAD direction needs the same guard, and
+        // `call_duplex` only had the upload one. `call_streaming` rejects
+        // `stream_window_initial == Some(0)` up front; duplex validated the
+        // upload window and then emitted `nrpc-stream-window-initial: 0`
+        // verbatim. The server's response pump awaits one credit per chunk
+        // and the caller's auto-grant only fires on CONSUMED chunks, so the
+        // first chunk can never be delivered: a hung call plus a server-side
+        // pump and semaphore held until the deadline.
+        if matches!(opts.stream_window_initial, Some(0)) {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message:
+                    "stream_window_initial must be None or >= 1; Some(0) deadlocks the response pump"
+                        .to_string(),
             });
         }
         // T1.3: per-service route cache (see PERF_AUDIT

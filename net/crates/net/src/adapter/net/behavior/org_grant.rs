@@ -396,6 +396,17 @@ impl OrgAudienceSecret {
         if bytes.len() != Self::ENCODED_SIZE || bytes[0] != ORG_AUDIENCE_SECRET_VERSION {
             return Err(OrgError::InvalidFormat);
         }
+        // §26 — grant id 0 is the RESERVED owner-audience sentinel
+        // (`OWNER_AUDIENCE_GRANT_SENTINEL`), and every grant-side path already
+        // refuses it (`try_issue`, `verify`, `from_bytes`). This is the one
+        // public constructor of a secret-bearing type that takes a
+        // caller-chosen id, and it did not — so the type system permitted an
+        // owner-credential-shaped grant secret. Inert today (a zero-id secret
+        // cannot satisfy `matches_grant`), but the invariant should be
+        // STRUCTURAL rather than resting on a downstream check.
+        if bytes[1..33].iter().all(|b| *b == 0) {
+            return Err(OrgError::InvalidFormat);
+        }
         Ok(Self {
             grant_id: bytes[1..33].try_into().unwrap(),
             audience_handle: bytes[33..65].try_into().unwrap(),
@@ -1209,6 +1220,42 @@ mod tests {
         CapabilityAuthorityId::for_tag("nrpc:oa2-echo")
     }
 
+    /// §26 — `decode_config` must refuse the reserved zero grant id.
+    ///
+    /// Zero is `OWNER_AUDIENCE_GRANT_SENTINEL`, and every grant-side path
+    /// already rejects it (`try_issue`, `verify`, `from_bytes`). This is the
+    /// one PUBLIC constructor of a secret-bearing type that takes a
+    /// caller-chosen id, and it did not — so the type system permitted
+    /// constructing an owner-credential-shaped grant secret. Inert today (such
+    /// a secret cannot satisfy `matches_grant`), which is exactly why the
+    /// invariant should be structural rather than resting on a downstream
+    /// check that might later move.
+    #[test]
+    fn decode_config_refuses_the_reserved_zero_grant_id() {
+        let (_, secret) = OrgCapabilityGrant::try_issue(
+            &OrgKeypair::from_bytes([7u8; 32]),
+            OrgKeypair::from_bytes([8u8; 32]).org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::AnyNodeOwnedBy(OrgKeypair::from_bytes([7u8; 32]).org_id()),
+            3600,
+        )
+        .expect("issue");
+        let secret = secret.expect("DISCOVER mints a secret");
+
+        // A well-formed encoding round-trips.
+        let encoded = secret.encode_config();
+        OrgAudienceSecret::decode_config(&encoded).expect("valid secret decodes");
+
+        // The same bytes with the grant id zeroed must be refused.
+        let mut sentinel = encoded;
+        sentinel[1..33].fill(0);
+        assert!(
+            OrgAudienceSecret::decode_config(&sentinel).is_err(),
+            "grant id 0 is the owner-audience sentinel and must not be \
+             constructible as a GRANT secret",
+        );
+    }
     #[test]
     fn capability_authority_id_is_deterministic_and_tag_separated() {
         assert_eq!(cap(), CapabilityAuthorityId::for_tag("nrpc:oa2-echo"));

@@ -327,7 +327,16 @@ pub fn seal_descriptor(
 /// [`seal_descriptor`] (fresh random nonce); this exists so golden vectors can
 /// pin a fixed nonce. NEVER reuse a `(discovery_key, nonce)` pair across two
 /// distinct plaintexts.
-pub fn seal_descriptor_with_nonce(
+///
+/// §22 — `pub(crate)`, not `pub`. `behavior::org_scoped_ann` is reachable from
+/// outside the crate through a fully public module chain, so this was an
+/// exported footgun: two seals sharing `(key, nonce)` give keystream reuse AND
+/// Poly1305 one-time-key recovery — plaintext recovery and forgery of
+/// arbitrary ciphertexts under a key that is org-wide by design. The
+/// envelope-level deterministic builders were already `#[cfg(test)]`; this one
+/// was missed. Every caller is in-crate (`seal_descriptor`, one `#[cfg(test)]`
+/// builder, and the golden-vector tests), so narrowing costs nothing.
+pub(crate) fn seal_descriptor_with_nonce(
     discovery_key: &[u8; 32],
     nonce: &[u8; SCOPED_ANN_NONCE_SIZE],
     aad: &[u8],

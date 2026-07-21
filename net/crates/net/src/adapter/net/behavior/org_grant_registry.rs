@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use super::org::OrgId;
 use super::org_grant::{OrgAudienceSecret, OrgCapabilityGrant};
-use crate::adapter::net::identity::EntityId;
+use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
 /// Hard cap on active PROVIDER grant-audience records (OA3-4b2, Kyra-pinned).
 /// This is exactly the maximum number of granted envelopes a single emission may
@@ -221,7 +221,28 @@ impl GrantAudienceRecords {
             // Reclaim only FULLY-EXPIRED records (installed valid, since expired)
             // — a not-yet-valid record can never have been installed. Never evict
             // an active record to admit a new one.
-            next.retain(|_, r| r.grant().not_after > now_secs);
+            // §25 — reclaim only records that are expired WITH SKEW, matching
+            // every other validity decision in the grant family
+            // (`is_valid_at_with_skew`). A bare `not_after > now` sweeps a
+            // record that is still valid within tolerance, and `now_secs` is
+            // wall-clock (`current_timestamp`), so a single forward NTP jump
+            // coinciding with one install at capacity would delete ALL of the
+            // installed records at once — granted-envelope fanout then stops
+            // silently, with no error surfaced and no way to notice short of
+            // re-installing.
+            let horizon = now_secs.saturating_sub(MAX_TOKEN_CLOCK_SKEW_SECS);
+            let before = next.len();
+            next.retain(|_, r| r.grant().not_after > horizon);
+            let swept = before - next.len();
+            if swept > 8 {
+                tracing::warn!(
+                    swept,
+                    remaining = next.len(),
+                    "org grant registry: capacity sweep reclaimed an unusually \
+                     large number of installed records at once; if this was not \
+                     a mass expiry, check for a wall-clock jump",
+                );
+            }
             if next.len() >= capacity {
                 return Err(GrantAudienceInstallError::AtCapacity);
             }

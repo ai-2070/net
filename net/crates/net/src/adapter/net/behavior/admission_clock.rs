@@ -37,11 +37,27 @@ pub struct ClockSample {
 }
 
 impl ClockSample {
-    /// Capture both clocks together. A pre-epoch system clock
-    /// saturates `wall_ns` to 0 (the same fail-safe the org module's
-    /// `current_timestamp` uses); admission then treats every finite
-    /// expiry as in the future, which is fine — the monotonic
-    /// deadline still bounds retention.
+    /// Capture both clocks together. A pre-epoch system clock saturates
+    /// `wall_ns` to 0 (the same fail-safe the org module's
+    /// `current_timestamp` uses).
+    ///
+    /// §33 — what that fail-safe actually buys, corrected. The previous note
+    /// said admission "treats every finite expiry as in the future, which is
+    /// fine". The first half is right and the conclusion is not: with
+    /// `wall_ns == 0`, `check_expiry_at(0, skew)` can never expire a proof and
+    /// its TTL ceiling collapses to `MAX_ORG_PROOF_TTL + skew`, so proof
+    /// FRESHNESS is entirely defeated, not merely permissive.
+    ///
+    /// The call is still denied — but by an unrelated check:
+    /// `is_valid_at_with_skew(0, skew)` returns `NotYetValid` for any real
+    /// certificate, because no certificate's `not_before` is 0. So the
+    /// composition is fail-closed today for a reason this comment did not
+    /// state, and any future `ClockSample` consumer that checks only an UPPER
+    /// time bound would fail OPEN on a machine that boots with a dead RTC.
+    ///
+    /// Reachable in practice: a board with a dead battery comes up at the
+    /// epoch, and this is exactly when an operator is least likely to be
+    /// watching admission decisions.
     pub fn now() -> Self {
         let wall_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
