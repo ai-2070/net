@@ -1806,10 +1806,53 @@ fn validate_dacl_view(
         }
         // Audit / alarm ACE types (2, 3, 7, 8, 13, 14, 15, 17…) live in the
         // SACL, not the DACL, so they should not appear here at all. If one
-        // does, it is not something we understand — the write-capability check
-        // below still applies, which is the conservative outcome.
+        // does, it is not something we understand — the checks below still
+        // apply, which is the conservative outcome.
+
+        // §20 — INHERITANCE FIRST, before any read/write distinction.
+        //
+        // The authority files are NOT given an explicit DACL on Windows:
+        // `write_atomic_phased` sets `mode(0o600)` under `#[cfg(unix)]` only,
+        // so on NTFS each file gets whatever it INHERITS from this directory.
+        // An `OBJECT_INHERIT` ACE therefore propagates onto
+        // `owner-audience.key` — the raw owner discovery key, which decrypts
+        // every OwnerScoped announcement for the org.
+        //
+        // A read-only grant looked harmless and was skipped by the
+        // write-capability check below, so a directory carrying
+        // `(A;OICI;FR;;;WD)` validated, adopted, and handed Everyone read
+        // access to the key. Verified on live NTFS: validator accepted,
+        // adopt succeeded, Everyone could read the key file. The earlier
+        // §3/§4 witnesses missed it because both used write-capable ACEs.
+        //
+        // So: any untrusted ACE that propagates to child OBJECTS is refused
+        // whatever it grants. `CONTAINER_INHERIT` alone (subdirectories) is
+        // covered by the same rule since the flags travel together in
+        // practice and the authority dir has no legitimate subdirectories.
+        const OBJECT_INHERIT_ACE: u8 = 0x01;
+        const CONTAINER_INHERIT_ACE: u8 = 0x02;
+        if ace.flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0 && !trusted(&ace.sid) {
+            return Err(OrgAuthorityError::InsecureAuthorityDir {
+                path: dir.display().to_string(),
+                reason: format!(
+                    "authority directory carries an INHERITABLE ace for untrusted principal \
+                     {} (ace type {}, mask {:#010x}, flags {:#04x}) — authority files inherit \
+                     this directory's ACL on Windows, so it would propagate onto \
+                     {OWNER_AUDIENCE_FILE}. Only the owner, SYSTEM, and Administrators may \
+                     hold an inheritable ace here, read-only or not",
+                    ace.sid, ace.ace_type, ace.mask, ace.flags
+                ),
+            });
+        }
+
         if ace.mask & WRITE_MASK == 0 {
-            continue; // a read-only grant to anyone is tolerated
+            // A NON-inheriting read grant on the directory itself is
+            // tolerated: it confers `FILE_LIST_DIRECTORY` and nothing more.
+            // The authority file names are fixed compile-time constants
+            // (`NodeAuthority::file_names`), so listing them discloses
+            // nothing the attacker did not already know, and the ace cannot
+            // reach the files' contents because it does not propagate.
+            continue;
         }
         if !trusted(&ace.sid) {
             return Err(OrgAuthorityError::InsecureAuthorityDir {
@@ -2881,7 +2924,10 @@ mod tests {
     fn every_non_simple_grant_type_fails_closed_when_write_capable() {
         let user = current_process_sid_string().expect("user sid");
         let dir = Path::new("C:\\ProgramData\\net-authority");
-        let view_with = |ace_type: u8, mask: u32| DaclView {
+        // `flags` is a parameter now: §20 refuses an untrusted INHERITABLE ace
+        // whatever it grants, so the read-only tolerance below has to use a
+        // non-inheriting ace to isolate the property it is testing.
+        let view_with = |ace_type: u8, mask: u32, flags: u8| DaclView {
             owner_sid: user.clone(),
             protected: true,
             null_dacl: false,
@@ -2896,14 +2942,15 @@ mod tests {
                     sid: NON_SIMPLE_ACE_SID.to_string(),
                     mask,
                     ace_type,
-                    flags: 0x03,
+                    flags,
                 },
             ],
         };
 
         // ACCESS_ALLOWED_OBJECT (5), _CALLBACK (9), _CALLBACK_OBJECT (11).
+        // Non-inheriting, so the refusal is the write capability specifically.
         for ace_type in [5u8, 9, 11] {
-            let err = validate_dacl_view(&view_with(ace_type, WRITE_MASK), &user, dir)
+            let err = validate_dacl_view(&view_with(ace_type, WRITE_MASK, 0x00), &user, dir)
                 .expect_err("a write-capable unparsed ACE must be refused");
             assert!(
                 matches!(&err, OrgAuthorityError::InsecureAuthorityDir { .. }),
@@ -2911,15 +2958,31 @@ mod tests {
             );
         }
 
-        // Read-only (FILE_READ_DATA) carries no WRITE_MASK bit, so it stays
-        // tolerated — the rule is "write-capable and unidentifiable", not
-        // "unidentifiable".
-        validate_dacl_view(&view_with(9, 0x0000_0001), &user, dir)
-            .expect("a read-only non-simple ACE is tolerated");
+        // Read-only (FILE_READ_DATA) and NON-inheriting: tolerated. It confers
+        // `FILE_LIST_DIRECTORY` on this directory and cannot reach the files'
+        // contents, and the authority file names are compile-time constants.
+        validate_dacl_view(&view_with(9, 0x0000_0001, 0x00), &user, dir)
+            .expect("a read-only NON-inheriting non-simple ACE is tolerated");
 
-        // And the DENY forms are skipped rather than treated as grants.
+        // …but the SAME read-only ace, made inheritable, is refused (§20): on
+        // Windows the authority files inherit this directory's ACL, so it
+        // would propagate onto the audience key.
+        for flags in [0x01u8, 0x02, 0x03] {
+            let err = validate_dacl_view(&view_with(9, 0x0000_0001, flags), &user, dir)
+                .expect_err("an inheritable untrusted ace must be refused even read-only");
+            match &err {
+                OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
+                    reason.contains("INHERITABLE"),
+                    "flags {flags:#04x}: the refusal must cite inheritance; got {reason}",
+                ),
+                other => panic!("flags {flags:#04x}: wrong variant: {other}"),
+            }
+        }
+
+        // And the DENY forms are skipped rather than treated as grants —
+        // including inheritable ones, since a deny never broadens access.
         for ace_type in [1u8, 6, 10, 12] {
-            validate_dacl_view(&view_with(ace_type, WRITE_MASK), &user, dir)
+            validate_dacl_view(&view_with(ace_type, WRITE_MASK, 0x03), &user, dir)
                 .unwrap_or_else(|e| panic!("deny ace_type {ace_type} must not refuse: {e}"));
         }
     }
@@ -2994,6 +3057,109 @@ mod tests {
         assert!(
             matches!(&adopt_err, OrgAuthorityError::InsecureAuthorityDir { .. }),
             "got: {adopt_err}",
+        );
+    }
+
+    /// §20 (Windows): an untrusted INHERITABLE ace is refused whatever it
+    /// grants — because authority files INHERIT this directory's ACL.
+    ///
+    /// `write_atomic_phased` sets `mode(0o600)` under `#[cfg(unix)]` only.
+    /// There is no Windows explicit-DACL branch, so on NTFS every provisioned
+    /// authority file gets what it inherits from the directory. An
+    /// `OBJECT_INHERIT` ace therefore lands on `owner-audience.key` — the raw
+    /// owner discovery key, which decrypts every OwnerScoped announcement for
+    /// the org.
+    ///
+    /// The validator used to skip any ace with no write bits ("a read-only
+    /// grant to anyone is tolerated"), so `(A;OICI;FR;;;WD)` validated,
+    /// adopted, and handed Everyone read access to the key. Confirmed against
+    /// live NTFS before the fix: validator accepted, adopt succeeded,
+    /// Everyone could read the key. The §3/§4 witnesses missed it because
+    /// both used write-capable aces.
+    ///
+    /// This asserts the FILE's ACL, not merely the validator's verdict — the
+    /// verdict alone would not have caught the original defect's consequence.
+    ///
+    /// Red-witness: moving the inheritance check back below the
+    /// `mask & WRITE_MASK == 0` early-continue makes the directory validate
+    /// and Everyone regain read on the key.
+    #[cfg(windows)]
+    #[test]
+    fn an_untrusted_inheritable_read_ace_is_refused_and_never_reaches_the_key() {
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const EVERYONE: &str = "S-1-1-0";
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let user = current_process_sid_string().expect("user sid");
+
+        // Owner full control + Everyone READ, both object+container
+        // inheritable. Everyone holds NO write bit — exactly the shape the
+        // old write-only check waved through.
+        let dir = scratch.dir().join("inheritable-read");
+        std::fs::create_dir(&dir).expect("mkdir");
+        apply_sddl(&dir, &format!("D:P(A;OICI;FA;;;{user})(A;OICI;FR;;;WD)"))
+            .expect("apply inheritable read ace");
+
+        // Precondition: the ace really is inheritable, read-only, untrusted —
+        // otherwise this could pass for an unrelated reason.
+        let view = read_object_security(&dir).expect("read dir sd");
+        let probe = view
+            .aces
+            .iter()
+            .find(|a| a.sid == EVERYONE)
+            .expect("Everyone ace present");
+        assert_eq!(
+            probe.mask & WRITE_MASK,
+            0,
+            "the ace under test is read-only"
+        );
+        assert_ne!(
+            probe.flags & 0x01,
+            0,
+            "the ace under test is OBJECT_INHERIT"
+        );
+
+        let err = validate_existing_dir_dacl(&dir)
+            .expect_err("an untrusted inheritable ace must be refused");
+        match &err {
+            OrgAuthorityError::InsecureAuthorityDir { reason, .. } => assert!(
+                reason.contains("INHERITABLE"),
+                "the refusal must name inheritance as the cause; got: {reason}",
+            ),
+            other => panic!("wrong error variant: {other}"),
+        }
+
+        // Through the full ceremony, with the CONSEQUENCE asserted.
+        let adopt_err = NodeAuthority::adopt(&dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect_err("adopt into an inheritable-read dir must be refused");
+        assert!(
+            matches!(&adopt_err, OrgAuthorityError::InsecureAuthorityDir { .. }),
+            "got: {adopt_err}",
+        );
+        assert!(
+            !dir.join(OWNER_AUDIENCE_FILE).exists(),
+            "a refused adoption must provision no key material",
+        );
+
+        // Positive control: the same shape WITHOUT the Everyone ace adopts,
+        // and the provisioned key is not readable by Everyone. Proves the
+        // refusal is the inheritable ace and not the fixture, and pins the
+        // property this test exists for.
+        let ok_dir = scratch.dir().join("owner-only");
+        std::fs::create_dir(&ok_dir).expect("mkdir");
+        apply_sddl(&ok_dir, &format!("D:P(A;OICI;FA;;;{user})")).expect("apply owner-only");
+        validate_existing_dir_dacl(&ok_dir).expect("an owner-only dir validates");
+        NodeAuthority::adopt(&ok_dir, cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt into an owner-only dir");
+        let key_view =
+            read_object_security(&ok_dir.join(OWNER_AUDIENCE_FILE)).expect("read key sd");
+        assert!(
+            !key_view
+                .aces
+                .iter()
+                .any(|a| a.ace_type == 0 && a.sid == EVERYONE && a.mask & FILE_READ_DATA != 0),
+            "Everyone must not be able to read the audience key; got {:?}",
+            key_view.aces,
         );
     }
 

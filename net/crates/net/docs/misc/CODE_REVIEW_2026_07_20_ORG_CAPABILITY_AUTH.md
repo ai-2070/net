@@ -1,10 +1,21 @@
 # CODE REVIEW 2026-07-20 — Organization Capability Auth (`org-capability-auth`)
 
-> **Status: all 19 production findings + §T1-§T9 + §D1-§D4 RESOLVED on this
+> **Status: all 20 production findings + §T1-§T9 + §D1-§D4 RESOLVED on this
 > branch** (`1e18c4827` §1, `2776e545d` §2, `ffd4bcfdc` §3+§4, `e21a9d23c`
 > §5+§D3, `73839135b` §6, `a5dc376e6` §7, `35c2849ed` §8, `8e2b85596` §9,
 > `7b54c211d` §10+§11+§17, `b937e63e6` §12, `49ed592af` §13, `6b492b349`
-> §14-§19, `087a90d07` §T1, `353115c72` §T9, `fc94c960e` §T2-§T8).
+> §14-§19, `087a90d07` §T1, `353115c72` §T9, `fc94c960e` §T2-§T8, §20 in
+> this commit).
+>
+> **§20 was found by the user reviewing this closure, not by the original
+> review.** It is a Windows CONFIDENTIALITY break that the §3/§4 fix left open:
+> the validator tolerated read-only aces, but authority files inherit the
+> directory's ACL on Windows, so an `(OI)(CI)(R)` grant reached
+> `owner-audience.key`. Reproduced against live NTFS, then fixed and
+> red-witnessed. The original §3/§4 witnesses missed it because both used
+> write-capable aces — a reminder that "the tests pass" and "the property
+> holds" are different claims, which is the same failure mode §T1-§T8
+> catalogues elsewhere in this document.
 >
 > Every fix is RED-WITNESSED: each new test was verified to fail against the
 > original code and pass against the fix, and the witness is recorded in the
@@ -87,12 +98,13 @@ left alone. §2 (guard on 2 of 4 CLI verbs), §8 (strip on 1 of 4 serve bridges)
 new staging helper zeroizes and awaits cleanup; the older shared helper it
 delegates to does neither) are all this same shape.
 
-Severity summary:
+Severity summary (20 production findings; §20 added during closure review):
 
 | # | Sev | Location | One-line |
 |---|-----|----------|----------|
 | 1 | **Critical** | `mesh_rpc.rs:2805`, `:3469` | Org-protected RPC responses roster-fan to any peer squatting the reply channel |
 | 2 | **Critical** | `cli/…/org.rs:343`, `:397` | `issue-cert --force` / `issue-floors --force` can truncate the org root key |
+| 20 | **High** | `org_authority.rs` `validate_dacl_view` | Untrusted INHERITABLE read ace propagates onto `owner-audience.key` (found in closure review) |
 | 3 | **High** | `org_authority.rs:1693` | Windows authority-dir validator never checks the directory OWNER (implicit `WRITE_DAC`) |
 | 4 | **High** | `org_authority.rs:1713` | Windows ACE loop fail-open on every non-type-0 ACE, including *allow*-callback/object |
 | 5 | **High** | `org_admission.rs:523` | Replay retention derives from mutable skew; widening it re-admits already-used proofs |
@@ -282,6 +294,70 @@ Route `issue-cert` and `issue-floors` through `refuse_force` +
 `refuse_aliased_paths` + `stage_beside`/`publish_staged`, identically to the
 grant verbs. Add the four missing negative tests, asserting **stderr content**
 and not merely exit code (see §T4).
+
+---
+
+## 20. High — An untrusted INHERITABLE read ACE propagates onto `owner-audience.key`
+
+**Location:** `org_authority.rs` (`validate_existing_dir_dacl` / `validate_dacl_view`,
+the `mask & WRITE_MASK == 0 → continue` arm), with
+`org_revocation.rs` `write_atomic_phased`.
+**Confidence: CONFIRMED** — reproduced against live NTFS.
+**Reported by the user during closure review; the §3/§4 fix did not close it.**
+
+### Current shape
+
+The validator tolerated any ACE with no write bits: *"a read-only grant to
+anyone is tolerated."* That reasoning holds for a directory in isolation — read
+access confers `FILE_LIST_DIRECTORY` and the authority file names are
+compile-time constants.
+
+It does not hold once inheritance is considered. `write_atomic_phased` sets
+`mode(0o600)` under `#[cfg(unix)]` **only**; there is no Windows
+explicit-DACL branch, so on NTFS every provisioned authority file gets whatever
+it INHERITS from the directory. An `OBJECT_INHERIT` ACE therefore propagates
+onto `owner-audience.key` — the raw owner discovery key, which decrypts every
+`OwnerScoped` announcement for the org.
+
+### Failure scenario
+
+A directory carrying `D:P(A;OICI;FA;;;<owner>)(A;OICI;FR;;;WD)` — owner full
+control plus **Everyone read**, both inheritable, no write bit for Everyone.
+Measured on Windows 11 before the fix:
+
+```
+validator_accepted=true  adopt_ok=true  everyone_can_read_audience_key=true
+```
+
+The `§3`/`§4` witnesses missed it because both used **write-capable** ACEs,
+which the write-mask check caught for unrelated reasons. The
+`adopt_windows_authority_dir_and_files_are_owner_only` test also missed it: it
+only ever inspects a directory `adopt` itself created, which is protected and
+owner-only by construction.
+
+This makes the plan's "owner-only authority directory" claim false, and it is a
+CONFIDENTIALITY break rather than an integrity one — the attacker never needs to
+write anything.
+
+### Fix
+
+Check inheritance FIRST, before any read/write distinction: any untrusted ACE
+carrying `OBJECT_INHERIT` or `CONTAINER_INHERIT` is refused whatever it grants.
+A non-inheriting read ACE stays tolerated, and the reason is now stated
+explicitly rather than assumed.
+
+### Residual (not closed here)
+
+Authority files still depend on **directory inheritance** for their ACL on
+Windows rather than being created with an explicit per-file security
+descriptor. With the owner check (§3) and this rule in place the chain holds —
+only a trusted principal has `WRITE_DAC` to change the directory ACL after
+validation — but the stronger fix is `CreateFileW` with an explicit
+`SECURITY_ATTRIBUTES` in `write_atomic_phased`. Deliberately not attempted in a
+closure pass: it is real `unsafe` FFI on the write path shared with the
+revocation store, and create-then-tighten is NOT an acceptable substitute (it
+leaves the bytes readable for a window, exactly the pattern the Unix side
+avoids).
 
 ---
 
