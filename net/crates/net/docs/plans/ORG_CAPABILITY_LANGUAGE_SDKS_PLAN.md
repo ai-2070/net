@@ -19,7 +19,9 @@ a discovery key in garbage-collected memory.
 Workstream R, X1, **Node (N)**, **Python (P)**, and **C + G (Go)** are all
 **IMPLEMENTED**. The consumer gate on C+G was lifted by an explicit direction:
 org auth is the load-bearing auth surface of the library, so it ships in every
-binding. X2 (the live cross-language matrix) remains the one owed item.
+binding. **X2 phase 1 — the scenario generator + manifest contract + the Rust
+from-disk cell — is done and locally verified**; the per-language cross-process
+harnesses that load the same manifest are the remaining CI-only work.
 
 | Workstream | State | Commits | Verified |
 |---|---|---|---|
@@ -811,7 +813,8 @@ and C cells still carry their planned slice ids.
 
 Go/C ✅ cells are **verified on CI** (Linux, the full cgo toolchain), plus the
 locally-run Rust FFI tests + the standalone parser validation described in
-§Status. `X2` (the live cross-language matrix) is the sole owed cell.
+§Status. `X2`'s generator + manifest + Rust from-disk cell are done and locally
+verified; its per-language cross-process cells are the one owed piece (§X2).
 
 **Not yet done in any shipped column:** the live cross-language call matrix
 (X2) — Node and Python are each verified in isolation and against the shared
@@ -1058,6 +1061,29 @@ passes.
   both access modes. Minimum coverage: Rust↔Go, Rust↔Node, Rust↔Python, and
   Go↔Node (proving no Rust-side coincidence). Env-gated like every other
   integration suite.
+  - **Phase 1 (DONE, locally verified).** A deterministic on-disk scenario
+    generator, `net_sdk::org::write_cross_org_scenario` (the doc-hidden fixtures
+    module + `examples/gen_org_scenario.rs`), mints the whole issuance chain —
+    org A caller, org B provider, a B→A DISCOVER|INVOKE grant — to a directory
+    with SEEDED identities (so any `NewMeshNode(seed)` reconstructs the exact
+    entity the certs were issued for) plus a `manifest.json` **contract** every
+    language harness loads. Generation is fully synchronous (no mesh). The Rust
+    test `live_cross_org_call_from_a_generated_scenario` builds two nodes FROM
+    the manifest, installs both authorities from the generated dirs, installs the
+    provider grant audience from the generated grant+secret files, serves
+    `Granted`, loads caller credentials via `from_parts` (secret by PATH), and
+    runs an admitted call with four-party attribution — proving the artifacts are
+    sufficient. This is the Rust↔Rust cell done from disk exactly as a
+    cross-language harness would, and it validates the generator every other cell
+    depends on.
+  - **Phase 2 (owed, CI-only).** Each language grows a manifest-driven harness
+    with a provider mode and a caller mode (build node from `seed_hex`, install
+    `authority_dir`, then either install the grant audience + `serveOrg`, or
+    `from_parts` + `call`). An orchestrator spawns an *X*-provider process and a
+    *Y*-caller process, coordinates addresses, and asserts the admitted response.
+    Deliberately NOT written blind here: it is multi-process and un-runnable in
+    a toolchain-less environment, so it lands where it can actually execute — CI.
+    The manifest is the whole contract it needs.
 - **X3 — drift guards.** Extend `abi_stability.test.ts` (synthetic Errors, no
   cdylib needed), `test_abi_stability.py`, Go's `header_parity_test.go`, and
   add `net_org_check_abi_version` pinning in Go's `init()`.
@@ -1084,10 +1110,11 @@ four languages as one program.
      the FFI crate are one artifact; Go is the only consumer that proves the C
      ABI is usable), starting with **G-prov** (the provenance fix N and P both
      needed).
-4. **X2** — starts once two independently implemented languages have adopted
-   authorities in one harness. Node and Python are each verified in isolation
-   and against the shared error fixture, but the live *X-serves-Y-calls* matrix
-   is **not yet built**; it lands with Go (three languages) or a consumer sooner.
+4. **X2** — phase 1 (the deterministic scenario generator, the `manifest.json`
+   contract, and the Rust from-disk cell) is **done and locally verified**. The
+   generator is the load-bearing prerequisite every language cell shares, so it
+   went first. Phase 2 — the per-language cross-process harnesses that load the
+   manifest (Rust↔Go, Rust↔Node, Rust↔Python, Go↔Node) — is CI-only and owed.
 5. **X3** — lands **per binding**. Node (`abi_stability` + the org vocabulary
    test) and Python (`test_stub_drift` + the vocabulary test) are done; Go's
    `header_parity_test.go` + ABI pin lands with G.
@@ -1201,8 +1228,9 @@ X1 ~1 day; X2 ~2 days once two languages exist; X3 rides each binding.
 - ✅ **C, G** gated on R + X1 (met). The named-consumer gate was **lifted by
   direction** (org auth is the load-bearing auth surface — it ships in every
   binding, not on demand). Done; the cgo suite is verified on CI.
-- **X2** gates on two non-Rust languages having adopted authorities in one
-  harness; owed (see §Rollout step 4).
+- **X2** phase 1 (generator + manifest + Rust from-disk cell) done and locally
+  verified; phase 2 (per-language cross-process harnesses over the manifest) is
+  CI-only and owed (see §Rollout step 4 and §X2).
 - The plan gates each remaining language on a **named consumer**. The Rust
   facade's exit gate says "no further org work without a named consumer or a
   measured failure," and that rule does not weaken by crossing a language
