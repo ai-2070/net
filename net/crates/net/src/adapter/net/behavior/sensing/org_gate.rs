@@ -283,6 +283,148 @@ enum Leg {
     },
 }
 
+/// An admitted sensing registration that CARRIES its authority evidence, so
+/// invalid combinations are unrepresentable: an org registration can never
+/// carry an independently-supplied entity root, and the legacy arm can never
+/// carry a relay/organization certificate. This is the only value the shared
+/// semantic operations act on after admission — the original frame is never
+/// read again, and the upstream continuation frame kind is chosen exhaustively
+/// from [`Self::authority`] (no org → legacy fallback).
+///
+/// Landed ahead of its consumer: the dispatch semantic-operation refactor that
+/// converts BOTH legacy and org intake into this wrapper lands in the same
+/// org-auth part-2 series (the `#[allow(dead_code)]` is removed then).
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdmittedSensingRegistration {
+    /// The re-derived, digest-validated interest spec.
+    pub(crate) spec: InterestSpec,
+    /// The leg-specific parameters.
+    pub(crate) leg: RegistrationLeg,
+    /// The authority the registration was admitted under (private — accessed
+    /// only through [`Self::proven_root`] / [`Self::authority`], so no caller
+    /// can pair an org id with a foreign proven root).
+    authority: RegistrationAuthority,
+}
+
+/// The authority under which a sensing registration was admitted.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegistrationAuthority {
+    /// Legacy entity/fleet-root admission — the session-proven root the legacy
+    /// dispatch computed.
+    Legacy {
+        /// The session-proven owner root.
+        proven_root: AudienceScopeCommitment,
+    },
+    /// Organization-authenticated admission — the verified organization. The
+    /// proven root is DERIVED from this id, never supplied.
+    Org {
+        /// The verified organization id.
+        org_id: OrgId,
+    },
+}
+
+/// The leg-specific parameters of an admitted registration.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistrationLeg {
+    /// A leader-addressed (provider-free) registration.
+    Capability {
+        /// The registering consumer's node id (the authenticated origin).
+        consumer: u64,
+        /// The delivery-continuity interval.
+        requested_sample_interval: Duration,
+        /// The per-downstream soft-state lifetime.
+        soft_state_ttl: Duration,
+    },
+    /// A provider-addressed registration.
+    Provider {
+        /// The provider this branch targets.
+        target: u64,
+        /// The (strictest) delivery-continuity interval.
+        requested_sample_interval: Duration,
+        /// The per-downstream soft-state lifetime.
+        soft_state_ttl: Duration,
+    },
+}
+
+#[allow(dead_code)]
+impl AdmittedSensingRegistration {
+    /// Admit a legacy registration (the legacy dispatch validated + converted
+    /// it once). The proven root is the session-proven root the legacy path
+    /// already computed.
+    pub(crate) fn from_validated_legacy(
+        spec: InterestSpec,
+        leg: RegistrationLeg,
+        proven_root: AudienceScopeCommitment,
+    ) -> Self {
+        Self {
+            spec,
+            leg,
+            authority: RegistrationAuthority::Legacy { proven_root },
+        }
+    }
+
+    /// Admit an organization registration from the authority gate's output.
+    /// The proven root is NOT accepted here — it is derived from the verified
+    /// organization id, so an org registration can never borrow a foreign or
+    /// entity root.
+    pub(crate) fn from_validated_org(value: ValidatedOrgSensingRegistration) -> Self {
+        match value {
+            ValidatedOrgSensingRegistration::Capability {
+                spec,
+                consumer,
+                requested_sample_interval,
+                soft_state_ttl,
+                org_id,
+                ..
+            } => Self {
+                spec,
+                leg: RegistrationLeg::Capability {
+                    consumer,
+                    requested_sample_interval,
+                    soft_state_ttl,
+                },
+                authority: RegistrationAuthority::Org { org_id },
+            },
+            ValidatedOrgSensingRegistration::Provider {
+                spec,
+                target,
+                requested_sample_interval,
+                soft_state_ttl,
+                org_id,
+                ..
+            } => Self {
+                spec,
+                leg: RegistrationLeg::Provider {
+                    target,
+                    requested_sample_interval,
+                    soft_state_ttl,
+                },
+                authority: RegistrationAuthority::Org { org_id },
+            },
+        }
+    }
+
+    /// The audience commitment this registration was proven under. For the org
+    /// arm it is DERIVED from the verified organization id — never a supplied
+    /// value — so the semantic operation cannot be handed a mismatched root.
+    pub(crate) fn proven_root(&self) -> AudienceScopeCommitment {
+        match &self.authority {
+            RegistrationAuthority::Legacy { proven_root } => *proven_root,
+            RegistrationAuthority::Org { org_id } => canonical_org_sensing_commitment(org_id),
+        }
+    }
+
+    /// The admitting authority — the dispatch matches this EXHAUSTIVELY to pick
+    /// the upstream continuation frame kind (org → a fresh org frame with the
+    /// relay's own membership; legacy → a legacy frame). There is no fallback.
+    pub(crate) fn authority(&self) -> &RegistrationAuthority {
+        &self.authority
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +693,53 @@ mod tests {
         assert!(matches!(
             run(&frame, &member(), Some(authority()), &empty_floors()),
             Err(OrgSensingRejection::CertInvalid(_))
+        ));
+    }
+
+    // ---- admitted wrapper provenance ----------------------------------
+    #[test]
+    fn org_admitted_wrapper_derives_proven_root_from_org_id() {
+        let validated = ValidatedOrgSensingRegistration::Capability {
+            spec: spec_with(org_commit()),
+            consumer: FROM_NODE,
+            requested_sample_interval: D,
+            soft_state_ttl: TTL,
+            subscriber: member(),
+            org_id: org_kp().org_id(),
+        };
+        let admitted = AdmittedSensingRegistration::from_validated_org(validated);
+        // Derived from the verified org id, never supplied.
+        assert_eq!(
+            admitted.proven_root(),
+            canonical_org_sensing_commitment(&org_kp().org_id())
+        );
+        // And never an entity root.
+        assert_ne!(
+            admitted.proven_root(),
+            AudienceScopeCommitment::owner_root(&member())
+        );
+        assert!(matches!(
+            admitted.authority(),
+            RegistrationAuthority::Org { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_admitted_wrapper_keeps_the_supplied_proven_root() {
+        let root = AudienceScopeCommitment::owner_root(&member());
+        let admitted = AdmittedSensingRegistration::from_validated_legacy(
+            spec_with(root),
+            RegistrationLeg::Capability {
+                consumer: FROM_NODE,
+                requested_sample_interval: D,
+                soft_state_ttl: TTL,
+            },
+            root,
+        );
+        assert_eq!(admitted.proven_root(), root);
+        assert!(matches!(
+            admitted.authority(),
+            RegistrationAuthority::Legacy { .. }
         ));
     }
 }
