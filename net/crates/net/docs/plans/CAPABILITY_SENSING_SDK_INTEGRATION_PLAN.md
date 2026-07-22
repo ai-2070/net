@@ -10,6 +10,8 @@
 
 **Companion:** [`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md) — the first named product consumer (same-organization sensed load balancing beneath `OrgClient::call`). Its OLB-0 prerequisite is this plan's S0 + S1 and additionally pins the node-global interest-lease witness.
 
+**Revision (2026-07-22, applies Kyra's OLB review ruling):** (1) organization sensing registration is authenticated by membership-cert-carrying registration variants — a narrow additive extension at registration intake; the earlier "no sensing-wire work" claim is withdrawn (§1.4, S0). (2) The node-global interest lease key has two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — and each entry aggregates cadence with token-indexed intervals, not a bare refcount (§4.3, S0). (3) Organization-private consumers use exact-provider leases derived from private authorized discovery, never provider-free rendezvous (§3.1, §3.6). (4) Pruning follows fresh-evidence viability, not raw `NotReady` status (§2 rule 3).
+
 ---
 
 ## 1. Repository audit and current state
@@ -109,6 +111,8 @@ local NodeAuthority.owner_org
 
 The SDK never accepts a caller-supplied leader for its common path.
 
+**Deriving the commitment from `OrgId` does not authenticate the session (Kyra, 2026-07-22).** The current registration frame carries interest fields, the audience commitment, and the consumer node ID — no membership proof; intake derives the proven root from the authenticated session `EntityId` or the configured fleet-root escape hatch. The digest separates audiences only after authorization; it does not supply authorization. Nor is the capability fold a membership registry: a sensing consumer need not announce any capability, owner-cert emission is separately gated, private organization records are audience-scoped, and membership validity and floors must be checked at intake, not inferred from historical presence. S0 therefore defines one real authenticated seam — organization registration variants carrying the registering hop's `OrgMembershipCert`, validated at every receiving hop, with each relay proving its **own** membership when re-registering upstream. This is a narrow, additive registration-intake extension (backward-compatible 0x0C02 variants or a versioned organization registration subprotocol, selected at S0 review); the 0x0C03 attestation transcript, continuity, and epoch semantics are unchanged. The earlier claim that S0 requires no sensing-wire work is withdrawn.
+
 Cross-organization sensing is deferred. `DISCOVER` or `INVOKE` authority does not silently become active readiness-surveillance authority. A later explicit authority relation may enable it without changing the v1 SDK shape.
 
 ---
@@ -145,7 +149,7 @@ Locked rules:
 
 1. Sensing is advisory and request-relative.
 2. `Unknown` is retained as potential capacity; absence of evidence never prunes.
-3. Only explicit `NotReady` for the exact interest may prune/deprioritize a candidate.
+3. Pruning follows viability derived from fresh exact evidence, never absence: `Unknown` never prunes; a candidate may be pruned/deprioritized only as `NonViable` — from a fresh exact provider `NotReady`, or from a fresh exact `Ready` whose signed start estimate plus the current consumer-local route estimate exceeds a hard budget. Stale evidence degrades to `Potential`/`Unknown`, never `NonViable`.
 4. A result for one interest never mutates capability-fold membership or affects another interest.
 5. The candidate population comes from verified discovery/authority. Sensing never expands visibility.
 6. Selection names one exact provider.
@@ -191,6 +195,8 @@ readiness.changed();
 
 Applications do not name leaders, construct interest keys, refresh rows, decode attestations, or manage continuity.
 
+The generic watch resolves providers through provider-free rendezvous **where discovery permits**: its population comes from the capability fold, which deliberately excludes locally private nRPC services (the private-capability existence-oracle guard). Consumers whose candidates are privately discovered — the organization client — use exact-provider leases instead (§3.6); the sensing leader never becomes a second private-discovery service.
+
 ### 3.2 Direct consumer: nRPC capability routing
 
 Add a sensed variant rather than changing existing `call_service` behavior:
@@ -209,7 +215,7 @@ find service candidates
 → apply existing health filter
 → apply existing caller authorization / exact org-proof binding
 → intersect with the watch's authorized population
-→ remove exact-interest NotReady only
+→ remove fresh-evidence NonViable only (§2 rule 3)
 → rank Ready by route + provider start
 → retain Unknown as fallback
 → apply the existing routing policy within equal sensed classes
@@ -238,7 +244,7 @@ static capability/placement eligibility
 ∩ caller-supplied sensed projection
 → viable first in sensed rank
 → potential fallback through existing placement score/tie-break
-→ exact-interest non-viable removed
+→ fresh-evidence non-viable removed (§2 rule 3)
 ```
 
 The orchestration layer owns any long-lived watch and passes a snapshot into the pure scheduler. Do not put Tokio tasks, network registration, or mutable sensing state inside `compute::Scheduler`.
@@ -288,7 +294,7 @@ Do not add sensing query, candidate, or policy types to `OrgClient`.
 
 Initial behavior:
 
-- `SameOrg`: may internally consume owner-scoped sensing after the owner-authority population and SDK lifecycle are proven.
+- `SameOrg`: may internally consume sensing after the owner-authority population and SDK lifecycle are proven — via **exact-provider leases** minted from its own private authorized discovery, never via provider-free rendezvous. The provider-free population deliberately excludes locally private nRPC services (the existence-oracle guard), so a rendezvous leader can never re-discover what private discovery already authorized; `resolved_population` is a projection-stage clamp, not a producer. See [`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md) §5.1a.
 - `Granted`: keeps deterministic eligible-provider selection and treats sensing as unavailable/Unknown until explicit cross-organization sensing authority exists.
 - protected calls still construct canonical `OrgProofIntent` and target exactly one provider;
 - discovery or readiness never grants invocation authority.
@@ -391,7 +397,38 @@ last close/drop
 → soft-state expiry remains the crash safety net
 ```
 
-**The registration refcount lives on `MeshNode`, never on SDK `Mesh`.** A sensing registration mutates node state, and multiple SDK/binding wrappers can share one node (`Mesh::from_node_arc` is public; every binding holds `Arc<MeshNode>`). The audience-lease regression (`71c2fbf71`) proved the SDK-local shape wrong: two wrappers over one node each thought they were the first installer, and the first to drop withdrew a live client's registration. Copy the rehomed template exactly — a node-owned refcount map keyed `(authority audience scope, interest digest)` with acquire/release methods on `MeshNode` (the `OrgAudienceLeases` pattern, `org_grant_registry.rs` + `mesh.rs` acquire/release), and an RAII drop-guard in the SDK (`AudienceLeaseGuard` pattern). `SensingWatch` holds the guard only. All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, and the node-side lock covers the transition, not only counter mutation, so a final drop racing a new watch leaves one live registration. Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
+**The registration refcount lives on `MeshNode`, never on SDK `Mesh`.** A sensing registration mutates node state, and multiple SDK/binding wrappers can share one node (`Mesh::from_node_arc` is public; every binding holds `Arc<MeshNode>`). The audience-lease regression (`71c2fbf71`) proved the SDK-local shape wrong: two wrappers over one node each thought they were the first installer, and the first to drop withdrew a live client's registration. Copy the rehomed ownership template — a node-owned lease map with acquire/release methods on `MeshNode` (the `OrgAudienceLeases` pattern, `org_grant_registry.rs` + `mesh.rs` acquire/release), and RAII drop-guards in the SDK (`AudienceLeaseGuard` pattern). `SensingWatch` (and the org client's routing state) hold guards only.
+
+**The lease key has two shapes** — exact-provider registrations are per-provider node state and cannot share a digest-only key:
+
+```text
+ProviderFree  { audience, interest_digest }
+ExactProvider { audience, interest_digest, provider }
+```
+
+Exact-provider watches follow the same lifecycle with the provider in the key.
+
+**Cadence aggregation is richer than a refcount.** A plain count cannot relax the wire cadence when the strictest watcher leaves. Each lease entry retains token-indexed live requests:
+
+```rust
+struct SensingInterestLeaseEntry {
+    registrations: HashMap<LeaseToken, Duration>, // requested intervals
+    installed_interval: Duration,
+    installed_token: RegistrationToken,
+}
+```
+
+Transitions:
+
+```text
+first watcher              → register at its interval
+stricter watcher joins     → re-register at the new minimum
+non-minimum watcher closes → no wire change
+minimum watcher closes     → recompute minimum → re-register relaxed
+last watcher closes        → exact deregistration
+```
+
+All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, the node-side lock covers the transition (not only counter mutation) so a final drop racing a new watch leaves one live registration, and a stale deregistration/re-registration token cannot remove a successor. Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
 
 `changed()` uses the existing unified generation receiver but always rereads exact current projection after waking. The wake alone is never evidence.
 
@@ -432,25 +469,28 @@ Same-organization scope derives from installed `NodeAuthority`; do not expose th
 
 ### S0 — Authority-derived owner scope and explicit lifecycle primitives
 
-**Objective:** Replace SDK dependence on the operator fleet-root assertion and add exact deregistration/ownership primitives without changing the sensing wire shape, attestation transcript, or continuity semantics. The meaning of the audience commitment deliberately moves from an entity/PSK fleet assertion to verified organization authority.
+**Objective:** Replace SDK dependence on the operator fleet-root assertion and add exact deregistration/ownership primitives. The 0x0C03 attestation transcript, continuity, and epoch semantics do not change; registration intake gains additive organization-authenticated variants (below). The meaning of the audience commitment deliberately moves from an entity/PSK fleet assertion to verified organization authority — and the registration, not the commitment, carries the proof.
 
 **Modify:**
 
 - `net/crates/net/src/adapter/net/behavior/sensing/scope.rs`
 - `net/crates/net/src/adapter/net/behavior/sensing/identity.rs`
 - `net/crates/net/src/adapter/net/behavior/sensing/rendezvous.rs`
+- `net/crates/net/src/adapter/net/behavior/sensing/frames.rs` (registration variants)
+- `net/crates/net/src/adapter/net/behavior/sensing/wire.rs` (registration intake only)
 - `net/crates/net/src/adapter/net/mesh.rs`
 - focused sensing authority tests
 
 **Work:**
 
 1. Build a verified same-organization member projection from installed node authority plus valid peer membership evidence.
-2. Derive the owner sensing audience from `OrgId`, preserving the existing 32-byte commitment/wire shape where possible.
-3. Make provider-free leader election consume only the verified, live member projection.
-4. Add exact local deregistration for provider-free and provider-targeted interests.
-5. Add the node-global interest lease: refcount map on `MeshNode` keyed `(audience scope, interest digest)`, acquire/release methods, RAII guard in the SDK — the `OrgAudienceLeases` template, never an SDK-wrapper-local count (§4.3).
-6. Add ownership-safe evaluator registration/removal.
-7. Keep the old explicit `sensing_owner_root` path low-level and opt-in; the SDK never uses it.
+2. Derive the owner sensing audience from `OrgId`, preserving the existing 32-byte commitment shape where possible. The commitment separates audiences; it does not authorize — authorization is item 3.
+3. Add organization-authenticated registration variants carrying the registering hop's membership certificate (`OrgCapabilityRegistration` / `OrgProviderRegistration` — additive 0x0C02 variants or a versioned registration subprotocol, selected at S0 review). Every receiving hop validates: authenticated sender `EntityId == membership.member`; `membership.org_id == local NodeAuthority.owner_org`; signature valid; time window current; generation meets the current floor; interest audience equals the canonical commitment for `membership.org_id`. A relay proves its **own** membership when re-registering upstream — it never forwards the original consumer's certificate as its own. The 0x0C03 attestation transcript is unchanged. Legacy entity/fleet-root variants remain low-level and opt-in; the SDK uses only the organization-authenticated variants.
+4. Make provider-free leader election consume only the verified, live member projection.
+5. Add exact local deregistration for provider-free and provider-targeted interests.
+6. Add the node-global interest lease on `MeshNode` (the `OrgAudienceLeases` ownership template, never an SDK-wrapper-local count — §4.3), keyed in two shapes — `ProviderFree { audience, interest_digest }` and `ExactProvider { audience, interest_digest, provider }` — with token-indexed cadence aggregation per entry (tighten on stricter join, relax on strictest drop, no wire change on non-strictest drop, exact deregistration on last drop, stale tokens inert).
+7. Add ownership-safe evaluator registration/removal.
+8. Keep the old explicit `sensing_owner_root` path low-level and opt-in; the SDK never uses it.
 
 **Gate:** No organization-auth implementation until its separate review is signed off at an exact commit.
 
@@ -545,7 +585,7 @@ This slice is optional for the first sensing SDK release. S0–S3 stand alone.
 
 1. Two distinct entity identities with valid membership in the same organization derive the same owner sensing scope and can rendezvous.
 2. A foreign organization member is refused even if connected under the same transport PSK.
-3. A forged/expired/revoked membership certificate cannot enter the rendezvous population.
+3. A forged/expired/revoked membership certificate can neither enter the rendezvous population nor register an interest — registration admission validates membership at every hop.
 4. Owner-private candidates appear only in the owner-authorized watch.
 5. A grant-audience secret or `DISCOVER`/`INVOKE` grant alone cannot activate cross-organization sensing.
 6. Sensing never adds a provider absent from the supplied verified discovery population.
@@ -585,13 +625,23 @@ This slice is optional for the first sensing SDK release. S0–S3 stand alone.
 28. Migration/member/promotion placement preserves existing placement vetoes and tie-breakers within sensed classes.
 29. The final gang claim may still fail after a Ready observation; readiness never appears as a reservation.
 
+### Registration authority, exact-provider leases, and cadence (S0)
+
+30. An interest registration carrying no membership certificate — or one whose member does not equal the authenticated session entity — is refused at intake.
+31. A relay re-registers upstream under its own membership; the original consumer's certificate never rides as the relay's proof.
+32. An org-private provider produces attestations under an exact-provider lease while remaining absent from the provider-free sensing population (the private-capability existence-oracle guard stays intact).
+33. A stricter watcher joining a shared lease tightens the registered cadence to the new minimum.
+34. Dropping the strictest watcher relaxes the registration to the recomputed minimum; dropping a non-strictest watcher causes no wire change.
+35. A final lease drop racing a new acquire leaves exactly one current registration.
+36. A stale deregistration/re-registration token cannot remove a successor registration.
+
 ---
 
 ## 7. Explicit non-goals
 
 Not in this plan:
 
-- changing sensing wire IDs, signed transcript, continuity, or epoch semantics;
+- changing the attestation transcript (0x0C03), continuity, or epoch semantics — registration intake gains only the additive organization-authenticated variants defined in S0;
 - a new capability registry, resolver, proxy, or control plane;
 - a public candidate/query/policy framework;
 - sensing-derived invocation authority;
