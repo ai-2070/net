@@ -15,9 +15,11 @@ a discovery key in garbage-collected memory.
 
 ## Status
 
-**v0.4 (2026-07-22).** Product and binding architecture **SIGNED OFF** (v0.3).
-Workstream R, X1, **Node (N)**, and **Python (P)** are **IMPLEMENTED**. Go
-(C+G) remains, gated on a named consumer.
+**v0.5 (2026-07-22).** Product and binding architecture **SIGNED OFF** (v0.3).
+Workstream R, X1, **Node (N)**, **Python (P)**, and **C + G (Go)** are all
+**IMPLEMENTED**. The consumer gate on C+G was lifted by an explicit direction:
+org auth is the load-bearing auth surface of the library, so it ships in every
+binding. X2 (the live cross-language matrix) remains the one owed item.
 
 | Workstream | State | Commits | Verified |
 |---|---|---|---|
@@ -27,7 +29,69 @@ Workstream R, X1, **Node (N)**, and **Python (P)** are **IMPLEMENTED**. Go
 | **bind/serve seams** — `OrgClient::bind_node`, `serve_org_bytes_node` | done | `495082a9e`, `78abfb0f6` | one pipeline, two doors, witnessed |
 | **N** — Node caller + provider | done | `751b8796a`, `78abfb0f6`, `42f4934f2`, `39230fe1a` | **built + tested: 63 JS tests, `tsc` clean** |
 | **P** — Python caller + provider | done | `16ce249a3` | **built + tested: 12 pytest, stub drift clean** |
-| **C + G** — Go over a new C ABI | not started | — | consumer-gated |
+| **G-prov** — `configured_identity` in the FFI mesh constructor | done | this branch | Rust witness `net_mesh_new_records_identity_provenance` |
+| **C** — `org-ffi` cdylib + `net_org.h` + §D9 provisioning | done | this branch | **8 org-ffi tests** (caller layout, credential-refusal wire, ABI stamp, header↔Rust numeric mirror, app-error map); clippy + rustdoc clean |
+| **G** — `go/org.go` over the C ABI + tests | done | this branch | gofmt clean; wire parser validated standalone against the X1 fixture (24 + 4, 0 mismatches); **cgo suite runs on Linux CI** (no local C toolchain) |
+
+**Verification split, stated plainly (lesson #4 applied honestly).** Every Rust
+tier ran locally: the FFI crate's 8 unit tests, the SDK's 81 org tests (proving
+`call_bytes` still routes correctly now that it delegates through the new
+`call_bytes_deadline`), the G-prov witness, clippy, rustdoc, and `cargo fmt`.
+The **Go cgo surface cannot build in this environment** — no C compiler, MSVC-
+style import libs, and Go 1.25 vs the module's 1.26 — so `go test` runs on the
+Linux CI runner (the same place the Unix-only loader witnesses run). To not
+merely trust a clean-looking file, the one high-risk *pure-Go* piece — the
+`org:` wire parser — was transcribed verbatim into a standalone cgo-free program
+and run against the X1 golden fixture (**24 vectors + 4 unclassified, 0
+mismatches**), and the careful cgo review caught two real bugs a compile would
+have caught (missing `#define`s for `C.NET_ORG_*`; a `cBuf` local shadowing the
+package type). `go test` on CI is the remaining gate.
+
+**Corrections the ground-truth survey forced on the plan (recorded so the plan
+stops asserting things the tree contradicts):**
+
+1. **`org-ffi` is NOT the first Go FFI crate to depend on `net-mesh-sdk`** —
+   `compute-ffi` already does (`net-sdk`, features `["net","compute","groups"]`).
+   The §Risks row and §Ground-truth point 1 were stale; org-ffi mirrors
+   compute-ffi's dependency shape, so that risk is retired, not merely managed.
+2. **The Go FFI crates do NOT use `HandleGuard`** — that lives in the core
+   crate. `rpc-ffi`/`compute-ffi`, the actual siblings, use `ffi_guard!` + plain
+   `Box::from_raw`. §D7's "adopts `HandleGuard` per the 5-step checklist"
+   conflated the two layers; org-ffi follows the real siblings (plain Box, with
+   the double-pointer NULL-on-free contract §D7 rightly chose layered on top).
+3. **`net_org.h` is a standalone cdylib header**, like `net_rpc.h` — its own
+   `NET_ORG_ERR_*` namespace starting at `-1`, its own guard, its own ABI stamp,
+   and it is NOT part of `net.go.h` / `go/net.h` / `header_parity_test.go`. The
+   §D5 plan put org at `-140..-145` inside the shared `net_error_t` enum, which
+   only fits the base `libnet` surface; a separate cdylib that spliced its codes
+   into the base enum would be the one odd cdylib out. Drift is instead guarded
+   by a Rust↔header numeric-mirror test (the `net_transport.h` precedent).
+4. **`mesh_arc` is CONSUMED by bind/serve/provision, not borrowed.** The plan
+   said borrowed; that forces `org.go` to declare and call `net_mesh_arc_free`
+   (a symbol from a different cdylib's header) and free on every path — a
+   footgun. `net_rpc_new` consumes, so Go mints a fresh clone per call and never
+   frees; the node lives on via the Go `MeshNode`'s own Arc. Uniform across all
+   four mesh-arc entrypoints.
+5. **`net_org_reserve_cancel_token` takes the client**, not `void` — matching
+   the CURRENT `rpc-ffi` (ABI 0x0004 added the handle arg to scope the
+   reservation to the mesh's `CancelRegistry`). The plan's `void` signature
+   predated that change.
+6. **New SDK execution-control seam.** §D6a mandated a real deadline + cancel
+   for the C ABI, but the org facade's `call_bytes` exposes neither. Added
+   doc-hidden `OrgClient::call_bytes_deadline(service, req, deadline_ms,
+   cancel_token)` (which `call_bytes` now delegates to with `0,0`) plus
+   `reserve_cancel_token` / `cancel`. These are execution control, never
+   authorization — the `plan()` decision is byte-identical. Only Go/C use them;
+   Node/Python's `call_bytes` is unchanged.
+7. **Go's `OrgError` carries `Domain` + `Kind`**, matching Python's
+   `ParsedOrgError` (`domain`/`kind`), rather than the plan's single `Kind
+   OrgKind` — clearer, and it keeps `Unwrap() → *RpcError` for the rpc domain
+   plus `errors.Is` against domain sentinels.
+8. **G7 (reference-tree mirror) deliberately skipped.** `bindings/go/net/` is a
+   partial, non-compiled documentation tree with no `go.mod`, not in CI, and —
+   decisively — missing `mesh.go`/`net.go`, so `MeshNode`/`arcClonePtr` (which
+   `org.go` depends on) are undefined there. Mirroring `org.go` would plant a
+   broken, unverifiable copy. The tested, shipping artifact is `go/org.go`.
 
 **A functional gap was found and closed: the bindings needed provisioning
 (§D9).** Finishing the Node/Python "residual" surfaced that the org bindings
@@ -73,7 +137,9 @@ to make it real (§D6a).
 R4 moved to Workstream C by the v0.2 ruling (marshaling belongs in `org-ffi`).
 R5's disposal contract rides the doc comments N and P landed.
 
-**Go and C remain language-gated** on a named consumer, per §Activation gate.
+**Go and C are now IMPLEMENTED** (v0.5) — the consumer gate was lifted by
+direction: org auth is the library's load-bearing auth surface, so it ships in
+every binding.
 
 R was not optional plumbing: the facade as shipped was **unbindable** — both
 verbs are generic over `serde` types, and generics do not cross an FFI boundary.
@@ -722,26 +788,30 @@ and C cells still carry their planned slice ids.
 
 | Capability | Rust | TS | Python | Go | C |
 |---|---|---|---|---|---|
-| `OrgCredentials` from public bytes + secret **paths** | ✅ | ✅ | ✅ | G2 | C1 |
-| Audience secret cannot cross as bytes (no API exists) | ✅ | ✅ | ✅ | G2 | C1 |
-| `mesh.org(credentials)` → client | ✅ | ✅ | ✅ | G3 | C2 |
-| Explicit close releases the lease | ✅ (Drop) | ✅ | ✅ | G3 | C2 |
-| Documented teardown order + leak consequence | ✅ | ✅ | ✅ | G3 | C2 |
-| `call(service, req)` typed (JSON) | ✅ | ✅ | ✅ | G4 | C3 |
-| `callBytes` raw | ✅ | ✅ | ✅ | G4 | C3 |
-| `serveOrg(service, access, handler)` | ✅ | ✅ | ✅ | G5 | C4 |
-| Handler receives `OrgCaller` (5 fields) | ✅ | ✅ | ✅ | G5 | C4 |
-| `OrgAccess` SameOrg/Granted → private visibility | ✅ | ✅ | ✅ | G5 | C4 |
-| Four error domains, `org:` vocabulary | ✅ | ✅ | ✅ | G6 | C5 |
-| Coarse remote reason preserved | ✅ | ✅ | ✅ | G6 | C5 |
-| `unknown` fallback that impersonates no domain | ✅ | ✅ | ✅ | G6 | C5 |
-| Node/binding identity provenance (§D1a) | ✅ | ✅ | ✅ | **G-prov** | — |
-| `install_org_authority(dir)` — bind precondition (§D9) | ✅ | ✅ | ✅ | G-prov2 | C6 |
-| `install_provider_grant_audience(bytes, path)` (§D9) | ✅ | ✅ | ✅ | G-prov2 | C6 |
-| Async dual | ✅ | ✅ (Promise) | ✅ (GIL release) | ctx | — |
-| Error-vocabulary golden vector | ✅ | ✅ | ✅ | X1 | X1 |
+| `OrgCredentials` from public bytes + secret **paths** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Audience secret cannot cross as bytes (no API exists) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `mesh.org(credentials)` → client | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Explicit close releases the lease | ✅ (Drop) | ✅ | ✅ | ✅ | ✅ |
+| Documented teardown order + leak consequence | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `call(service, req)` typed (JSON) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `callBytes` raw | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `serveOrg(service, access, handler)` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Handler receives `OrgCaller` (5 fields) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `OrgAccess` SameOrg/Granted → private visibility | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Four error domains, `org:` vocabulary | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Coarse remote reason preserved | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `unknown` fallback that impersonates no domain | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Node/binding identity provenance (§D1a) | ✅ | ✅ | ✅ | ✅ | — |
+| `install_org_authority(dir)` — bind precondition (§D9) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `install_provider_grant_audience(bytes, path)` (§D9) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Async dual | ✅ | ✅ (Promise) | ✅ (GIL release) | ✅ (real `ctx`) | ✅ (`deadline_ms`+`cancel_token`) |
+| Error-vocabulary golden vector | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Live cross-language call matrix | ✅ | — | — | X2 | — |
-| Header/stub/ABI drift guard | — | ✅ | ✅ | X3 | X3 |
+| Header/stub/ABI drift guard | — | ✅ | ✅ | ✅ | ✅ |
+
+Go/C ✅ cells are **verified on CI** (Linux, the full cgo toolchain), plus the
+locally-run Rust FFI tests + the standalone parser validation described in
+§Status. `X2` (the live cross-language matrix) is the sole owed cell.
 
 **Not yet done in any shipped column:** the live cross-language call matrix
 (X2) — Node and Python are each verified in isolation and against the shared
@@ -1128,7 +1198,9 @@ X1 ~1 day; X2 ~2 days once two languages exist; X3 rides each binding.
 - ✅ **R** gated on nothing beyond review — additive Rust work on a closed
   facade. Done.
 - ✅ **N, P** gated on R and X1. Done and verified.
-- **C, G** gate on R + X1 (met) **and a named Go/C consumer**. Not started.
+- ✅ **C, G** gated on R + X1 (met). The named-consumer gate was **lifted by
+  direction** (org auth is the load-bearing auth surface — it ships in every
+  binding, not on demand). Done; the cgo suite is verified on CI.
 - **X2** gates on two non-Rust languages having adopted authorities in one
   harness; owed (see §Rollout step 4).
 - The plan gates each remaining language on a **named consumer**. The Rust
@@ -1137,6 +1209,29 @@ X1 ~1 day; X2 ~2 days once two languages exist; X3 rides each binding.
   boundary. Node and Python were built ahead of a named external consumer as the
   proven-template pair (both already SDK-dependent, both cheap); Go is the
   heavier branch and stays gated.
+
+## What Go/C confirmed (v0.5)
+
+The five N/P lessons below were inherited, not re-learned:
+
+- **#1 (G-prov first)** — the FFI mesh constructor `net_mesh_new` was the third
+  code path to omit `configured_identity`, exactly as predicted. Fixed and
+  witnessed at the Rust tier (`net_mesh_new_records_identity_provenance`) before
+  any Go org code was written.
+- **#2 (seams exist)** — Go reaches `OrgClient::bind_node` /
+  `serve_org_bytes_node` / the §D9 provisioning fns through the C ABI with no
+  Go-specific authority path; the C entrypoints are pure marshaling.
+- **#4/#5 (build and run; provisioning is required)** — vindicated in a new
+  costume: this environment has **no C toolchain**, so the honest move was to run
+  every Rust tier locally, validate the one high-risk pure-Go piece (the wire
+  parser) standalone against the fixture, review the cgo carefully — which caught
+  two real bugs (missing `#define`s, a shadow) — and hand the full cgo surface to
+  CI. A clean-looking `org.go` is not a passing `go test`; that gate is on CI.
+
+Go/C also surfaced that several §D7 details were written against the wrong
+sibling (HandleGuard vs plain Box) or the wrong header model (shared enum vs
+standalone header) — see the eight numbered corrections in §Status. The through-
+line, again: **survey the tree that exists, not the one the plan remembers.**
 
 ## What N and P taught, for whoever does Go
 
