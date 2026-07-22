@@ -238,6 +238,7 @@ fn seed_gang_capability(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u
         allowed_subnets: Vec::new(),
         allowed_groups: Vec::new(),
         metadata: BTreeMap::new(),
+        owner: None,
     };
     let ann = SignedAnnouncement::sign(
         signer,

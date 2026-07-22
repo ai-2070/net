@@ -22,9 +22,48 @@
 
 use std::collections::BTreeMap;
 
+use super::org::OrgId;
 use super::org_revocation::OrgRevocationState;
 use super::org_scoped_ingest::{CapabilityAudienceScope, VerifiedScopedCapability};
 use crate::adapter::net::identity::EntityId;
+
+/// One verified private-discovery candidate (OSDK S1).
+///
+/// An owned projection of a [`VerifiedScopedCapability`] already admitted by
+/// [`verify_scoped_ingest`](super::org_scoped_ingest::verify_scoped_ingest) —
+/// the whole envelope chain (outer signature, owner certificate and
+/// currentness, audience selection, AEAD open, descriptor binding) ran before
+/// the record was stored, and the query that produced this additionally applied
+/// expiry and revocation-floor currentness.
+///
+/// Owned rather than borrowed so a caller never holds the discovery-store lock
+/// across an `await`. Carries no ciphertext, no descriptor bytes, and no
+/// audience material: discovery says WHERE a capability lives, never that you
+/// may invoke it — invocation authority is the separate per-call proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateCapabilityProvider {
+    /// The provider entity that announced the capability.
+    pub provider: EntityId,
+    /// The organization that owns the provider (proved by the provider's
+    /// membership certificate at ingest).
+    pub owner_org: OrgId,
+    /// Effective expiry — the minimum of the envelope, owner-certificate, and
+    /// (for granted records) grant windows.
+    pub expires_at: u64,
+    /// The announcement generation this candidate was learned from.
+    pub generation: u64,
+}
+
+impl PrivateCapabilityProvider {
+    pub(crate) fn from_verified(c: &VerifiedScopedCapability) -> Self {
+        Self {
+            provider: c.provider().clone(),
+            owner_org: *c.owner_org(),
+            expires_at: c.expires_at(),
+            generation: c.generation(),
+        }
+    }
+}
 
 /// Outcome of ingesting a verified scoped capability into the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

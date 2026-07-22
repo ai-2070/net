@@ -66,12 +66,29 @@ pub const MAX_CONSUMER_GRANT_AUDIENCES: usize = 256;
 pub struct GrantAudienceRecord {
     grant: OrgCapabilityGrant,
     secret: OrgAudienceSecret,
+    /// Monotonic per-node install sequence, stamped by the installing node
+    /// (never by the issuer, never on the wire). Identifies THIS installation
+    /// of THIS grant id, so a lease-holder can remove only the record it
+    /// installed — see [`ConsumerAudienceLease`]. Deliberately NOT part of
+    /// [`records_identical`]: an idempotent re-install must stay a no-op, so
+    /// the surviving record keeps its original sequence.
+    install_seq: u64,
 }
 
 impl GrantAudienceRecord {
     /// The signed grant.
     pub fn grant(&self) -> &OrgCapabilityGrant {
         &self.grant
+    }
+    /// The install sequence stamped when this record entered the registry.
+    pub fn install_seq(&self) -> u64 {
+        self.install_seq
+    }
+    /// Stamp the install sequence (installing node only, before the record is
+    /// wrapped in its `Arc` and published).
+    pub(crate) fn with_install_seq(mut self, install_seq: u64) -> Self {
+        self.install_seq = install_seq;
+        self
     }
     /// The out-of-band audience secret (borrowing accessor — the raw key is never
     /// copied out).
@@ -162,6 +179,147 @@ impl std::fmt::Display for GrantAudienceInstallError {
 }
 
 impl std::error::Error for GrantAudienceInstallError {}
+
+/// Ownership proof for one CONSUMER grant-audience installation (OSDK S0, Kyra
+/// v0.3 ruling §2 — "the lease must own a specific registry installation, not
+/// merely a grant ID").
+///
+/// A caller that installs a consumer audience and later wants to withdraw it
+/// cannot safely remove by `grant_id` alone: between install and removal, other
+/// code (the low-level operator API, another SDK client) may have removed that
+/// record and installed a DIFFERENT grant under the same id. Removing by id
+/// would then destroy an installation the holder never owned. The lease pins the
+/// exact installation via the node-local [`GrantAudienceRecord::install_seq`], and
+/// [`remove_consumer_grant_audience_if_current`] compares under the registry
+/// mutex, so replacement cannot race between the check and the removal.
+///
+/// Carries no secret bytes: a grant id (public, in the signed grant) and a
+/// node-local counter.
+///
+/// [`remove_consumer_grant_audience_if_current`]:
+///     crate::adapter::net::MeshNode::remove_consumer_grant_audience_if_current
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerAudienceLease {
+    grant_id: [u8; 32],
+    install_seq: u64,
+}
+
+impl ConsumerAudienceLease {
+    pub(crate) fn new(grant_id: [u8; 32], install_seq: u64) -> Self {
+        Self {
+            grant_id,
+            install_seq,
+        }
+    }
+    /// The grant id this lease covers.
+    pub fn grant_id(&self) -> &[u8; 32] {
+        &self.grant_id
+    }
+    /// The exact installation this lease owns.
+    pub fn install_seq(&self) -> u64 {
+        self.install_seq
+    }
+}
+
+/// The result of a CONSUMER grant-audience install through the leased API
+/// (OSDK S0). `Installed` hands back the ownership proof; `AlreadyPresent`
+/// deliberately does NOT — an identical record was already installed by someone
+/// else, so this caller owns nothing and must never remove it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerAudienceInstall {
+    /// A new record was installed; the lease owns it.
+    Installed(ConsumerAudienceLease),
+    /// An identical record was already present — idempotent no-op, non-owning.
+    AlreadyPresent,
+}
+
+/// Reference-counted consumer-audience leases for one NODE (OSDK S0, rehomed).
+///
+/// # Why this lives on the node
+///
+/// It originally sat on the SDK's `Mesh` wrapper, which was wrong in a way only
+/// a second wrapper exposes: the lease guards the NODE's consumer-audience
+/// registry, so its refcount must be keyed to the node. `Mesh::from_node_arc`
+/// is public, and the Node and Python bindings hold `Arc<MeshNode>` rather than
+/// an SDK `Mesh`, so "one `Mesh` per node" was never an invariant anyone
+/// enforced.
+///
+/// With a per-wrapper registry, two wrappers over one node each believed they
+/// were the first installer: the second's lease was marked non-owning, and the
+/// FIRST wrapper's drop then removed the audience out from under a client that
+/// was still live — silently breaking its private discovery with no error
+/// anywhere. Keyed to the node, that state is unrepresentable.
+#[derive(Default)]
+pub struct OrgAudienceLeases {
+    entries: parking_lot::Mutex<std::collections::HashMap<[u8; 32], LeaseEntry>>,
+}
+
+/// One grant id's shared installation state.
+pub(crate) struct LeaseEntry {
+    /// How many live holders reference this grant id.
+    count: usize,
+    /// `Some` iff THIS registry performed the install and may remove it.
+    /// `None` when the record was already present (installed by the low-level
+    /// operator API or another owner) — release must then remove nothing.
+    owned: Option<ConsumerAudienceLease>,
+}
+
+impl OrgAudienceLeases {
+    /// Test seam: how many grant ids are currently referenced.
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// Whether no grant id is referenced.
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Test seam: the refcount for one grant id, and whether the entry owns its
+    /// installation.
+    #[doc(hidden)]
+    pub fn entry_for_test(&self, grant_id: &[u8; 32]) -> Option<(usize, bool)> {
+        self.entries
+            .lock()
+            .get(grant_id)
+            .map(|e| (e.count, e.owned.is_some()))
+    }
+
+    pub(crate) fn lock_entries(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, std::collections::HashMap<[u8; 32], LeaseEntry>> {
+        self.entries.lock()
+    }
+}
+
+impl LeaseEntry {
+    pub(crate) fn new_owned(lease: ConsumerAudienceLease) -> Self {
+        Self {
+            count: 1,
+            owned: Some(lease),
+        }
+    }
+    pub(crate) fn new_borrowed() -> Self {
+        Self {
+            count: 1,
+            owned: None,
+        }
+    }
+    pub(crate) fn retain(&mut self) {
+        self.count += 1;
+    }
+    /// Decrement; returns the owned lease iff this was the last reference AND
+    /// this registry owns the installation.
+    pub(crate) fn release(&mut self) -> (bool, Option<ConsumerAudienceLease>) {
+        self.count = self.count.saturating_sub(1);
+        if self.count > 0 {
+            return (false, None);
+        }
+        (true, self.owned.take())
+    }
+}
 
 /// The result of a successful install (Kyra OA3-4b2 idempotency contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,7 +485,14 @@ fn validate_common(
     if !secret.matches_grant(&grant) {
         return Err(GrantAudienceInstallError::SecretMismatch);
     }
-    Ok(GrantAudienceRecord { grant, secret })
+    // `install_seq` is stamped by the installing node (`with_install_seq`)
+    // once the node-context invariants pass; validation itself is
+    // node-agnostic and cannot mint a sequence.
+    Ok(GrantAudienceRecord {
+        grant,
+        secret,
+        install_seq: 0,
+    })
 }
 
 /// Validate a PROVIDER-side record (Kyra OA3-4b2 slice 2): the common invariants
@@ -782,6 +947,7 @@ mod tests {
         let clashing = Arc::new(GrantAudienceRecord {
             grant: clashing_grant,
             secret: foreign_secret,
+            install_seq: 0,
         });
         assert_eq!(
             snap.with_record(clashing, now).unwrap_err(),

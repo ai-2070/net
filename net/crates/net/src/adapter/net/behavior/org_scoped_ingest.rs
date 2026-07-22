@@ -557,6 +557,26 @@ fn verify_granted_ingest(
 /// grant is a [`ScopedIngestError::DescriptorOutsideGrant`]. Canonicity is
 /// enforced by requiring the descriptor to equal its own re-encoding, so a
 /// non-canonical framing cannot slip a second logical form past the shape check.
+/// Whether an OWNER descriptor declares `capability` among its tags (OSDK S1).
+///
+/// Unlike the granted case below, an owner envelope legitimately carries EVERY
+/// owner-scoped tag its provider serves, so a stored owner record is not by
+/// itself an answer about one capability — the query decodes the descriptor and
+/// asks. Read-only over already-ingest-verified bytes: a descriptor that fails
+/// to decode simply declares nothing (it can no longer be a security decision,
+/// having already passed ingest).
+pub(crate) fn descriptor_declares_capability(
+    descriptor: &[u8],
+    capability: &CapabilityAuthorityId,
+) -> bool {
+    let Some(caps) = CapabilitySet::from_bytes(descriptor) else {
+        return false;
+    };
+    caps.tags
+        .iter()
+        .any(|tag| &CapabilityAuthorityId::for_tag(&tag.to_string()) == capability)
+}
+
 fn descriptor_binds_grant_capability(
     descriptor: &[u8],
     capability: &CapabilityAuthorityId,

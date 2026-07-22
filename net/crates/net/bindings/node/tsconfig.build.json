@@ -26,6 +26,7 @@
   // Source files only; tests stay under the base config.
   "include": [
     "errors.ts",
+    "org.ts",
     "mesh_rpc.ts",
     "meshdb.ts",
     "aggregator.ts",

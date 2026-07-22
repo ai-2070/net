@@ -13,6 +13,10 @@
       "types": "./errors.d.ts",
       "default": "./errors.js"
     },
+    "./org": {
+      "types": "./org.d.ts",
+      "default": "./org.js"
+    },
     "./mesh_rpc": {
       "types": "./mesh_rpc.d.ts",
       "default": "./mesh_rpc.js"
@@ -62,6 +66,8 @@
     "index.d.ts",
     "errors.js",
     "errors.d.ts",
+    "org.js",
+    "org.d.ts",
     "mesh_rpc.js",
     "mesh_rpc.d.ts",
     "meshdb.js",
@@ -80,9 +86,9 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a",
-    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a",
-    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,test-helpers",
+    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,org",
+    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,org",
+    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,org,test-helpers",
     "build:ts": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build:ts && napi prepublish -t npm",
     "test": "vitest run",

@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 
 use super::org::{current_timestamp, OrgError, OrgId, OrgMembershipCert, OrgRevocationBundle};
 use super::org_revocation::{
-    write_atomic, OrgRevocationError, OrgRevocationState, OrgRevocationStore,
-    ProvisioningExpectation,
+    open_regular_nofollow, write_atomic, OrgRevocationError, OrgRevocationState,
+    OrgRevocationStore, ProvisioningExpectation,
 };
 use crate::adapter::net::identity::EntityId;
 
@@ -1695,19 +1695,9 @@ fn read_object_security(path: &Path) -> std::io::Result<DaclView> {
     extern "system" {
         fn GetFileSecurityW(name: *const u16, info: u32, sd: Pv, len: u32, needed: *mut u32)
             -> i32;
-        fn GetSecurityDescriptorOwner(sd: Pv, owner: *mut Pv, defaulted: *mut i32) -> i32;
-        fn GetSecurityDescriptorControl(sd: Pv, control: *mut u16, revision: *mut u32) -> i32;
-        fn GetSecurityDescriptorDacl(
-            sd: Pv,
-            present: *mut i32,
-            dacl: *mut Pv,
-            defaulted: *mut i32,
-        ) -> i32;
-        fn GetAce(acl: Pv, index: u32, ace: *mut Pv) -> i32;
     }
     const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    const SE_DACL_PROTECTED: u16 = 0x1000;
     const INFO: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -1739,74 +1729,196 @@ fn read_object_security(path: &Path) -> std::io::Result<DaclView> {
             return Err(std::io::Error::last_os_error());
         }
 
-        let mut owner: Pv = std::ptr::null_mut();
-        let mut defaulted: i32 = 0;
-        if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let owner_sid = sid_to_string(owner)?;
+        dacl_view_from_descriptor(sd)
+    }
+}
 
-        let mut control: u16 = 0;
-        let mut revision: u32 = 0;
-        if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let protected = control & SE_DACL_PROTECTED != 0;
+/// Parse an in-memory Windows security descriptor into the security-relevant
+/// [`DaclView`]. Shared by the PATH reader ([`read_object_security`], which
+/// sizes and fills a buffer with `GetFileSecurityW`) and the HANDLE reader
+/// ([`read_object_security_handle`], which lets `GetSecurityInfo` allocate the
+/// descriptor). Every string is copied out before the descriptor's backing
+/// storage is released, so the returned `DaclView` owns everything it names.
+///
+/// # Safety
+///
+/// `sd` must point to a valid, initialized self-relative or absolute security
+/// descriptor that stays alive for the duration of the call.
+#[cfg(windows)]
+unsafe fn dacl_view_from_descriptor(sd: *mut std::ffi::c_void) -> std::io::Result<DaclView> {
+    type Pv = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetSecurityDescriptorOwner(sd: Pv, owner: *mut Pv, defaulted: *mut i32) -> i32;
+        fn GetSecurityDescriptorControl(sd: Pv, control: *mut u16, revision: *mut u32) -> i32;
+        fn GetSecurityDescriptorDacl(
+            sd: Pv,
+            present: *mut i32,
+            dacl: *mut Pv,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn GetAce(acl: Pv, index: u32, ace: *mut Pv) -> i32;
+    }
+    const SE_DACL_PROTECTED: u16 = 0x1000;
 
-        let mut present: i32 = 0;
-        let mut dacl: Pv = std::ptr::null_mut();
-        let mut dacl_defaulted: i32 = 0;
-        if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut dacl_defaulted) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // An absent (present == 0) or NULL DACL grants everyone full access.
-        if present == 0 || dacl.is_null() {
-            return Ok(DaclView {
-                owner_sid,
-                protected,
-                null_dacl: true,
-                aces: Vec::new(),
-            });
-        }
+    // SAFETY: the caller guarantees `sd` is a live descriptor. Owner/Control/Dacl
+    // return pointers INTO it, valid while it lives; each ACE is fetched by index
+    // in `[0, ace_count)` and its {type, flags, mask, SID} read at fixed offsets
+    // (SID at byte 8 for the simple ACE types). All strings are copied out before
+    // returning; every Win32 return value is checked.
+    let mut owner: Pv = std::ptr::null_mut();
+    let mut defaulted: i32 = 0;
+    if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let owner_sid = sid_to_string(owner)?;
 
-        // ACL header: { AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, .. }.
-        let ace_count = (dacl.cast::<u8>().add(4) as *const u16).read_unaligned();
-        let mut aces = Vec::with_capacity(ace_count as usize);
-        for i in 0..u32::from(ace_count) {
-            let mut ace: Pv = std::ptr::null_mut();
-            if GetAce(dacl, i, &mut ace) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let base = ace.cast::<u8>();
-            let ace_type = *base;
-            let flags = *base.add(1);
-            // Mask sits at byte 4 for every ACE_HEADER-prefixed ACE.
-            let mask = (base.add(4) as *const u32).read_unaligned();
-            // The SID begins at byte 8 for the SIMPLE ACE types only; other
-            // (e.g. object / callback) ACEs place it elsewhere, so record the
-            // sentinel and let the validator treat a write-capable one
-            // conservatively. `validate_existing_dir_dacl` honors that: it
-            // skips only DENY types, so a sentinel-SID grant reaches the
-            // trusted-principal check and — never matching one — refuses.
-            let sid = if ace_type == 0 || ace_type == 1 {
-                sid_to_string(base.add(8).cast())?
-            } else {
-                String::from(NON_SIMPLE_ACE_SID)
-            };
-            aces.push(AceInfo {
-                sid,
-                mask,
-                ace_type,
-                flags,
-            });
-        }
-        Ok(DaclView {
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
+
+    let mut present: i32 = 0;
+    let mut dacl: Pv = std::ptr::null_mut();
+    let mut dacl_defaulted: i32 = 0;
+    if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut dacl_defaulted) == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // An absent (present == 0) or NULL DACL grants everyone full access.
+    if present == 0 || dacl.is_null() {
+        return Ok(DaclView {
             owner_sid,
             protected,
-            null_dacl: false,
-            aces,
-        })
+            null_dacl: true,
+            aces: Vec::new(),
+        });
     }
+
+    // ACL header: { AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, .. }.
+    let ace_count = (dacl.cast::<u8>().add(4) as *const u16).read_unaligned();
+    let mut aces = Vec::with_capacity(ace_count as usize);
+    for i in 0..u32::from(ace_count) {
+        let mut ace: Pv = std::ptr::null_mut();
+        if GetAce(dacl, i, &mut ace) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = ace.cast::<u8>();
+        let ace_type = *base;
+        let flags = *base.add(1);
+        // Mask sits at byte 4 for every ACE_HEADER-prefixed ACE.
+        let mask = (base.add(4) as *const u32).read_unaligned();
+        // The SID begins at byte 8 for the SIMPLE ACE types only; other
+        // (e.g. object / callback) ACEs place it elsewhere, so record the
+        // sentinel and let the validator treat a write-capable one
+        // conservatively. `validate_existing_dir_dacl` honors that: it
+        // skips only DENY types, so a sentinel-SID grant reaches the
+        // trusted-principal check and — never matching one — refuses.
+        let sid = if ace_type == 0 || ace_type == 1 {
+            sid_to_string(base.add(8).cast())?
+        } else {
+            String::from(NON_SIMPLE_ACE_SID)
+        };
+        aces.push(AceInfo {
+            sid,
+            mask,
+            ace_type,
+            flags,
+        });
+    }
+    Ok(DaclView {
+        owner_sid,
+        protected,
+        null_dacl: false,
+        aces,
+    })
+}
+
+/// Read a filesystem object's security descriptor from an ALREADY-OPEN handle
+/// via `GetSecurityInfo(SE_FILE_OBJECT)`, rather than re-resolving a pathname
+/// with `GetFileSecurityW`.
+///
+/// This is what closes the audience-secret TOCTOU: the DACL validated is the
+/// DACL of the exact object the descriptor is bound to, so an attacker who
+/// swaps the pathname between open and check cannot make the check pass for a
+/// different file than the one actually read.
+#[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+fn read_object_security_handle(
+    handle: std::os::windows::io::RawHandle,
+) -> std::io::Result<DaclView> {
+    type Pv = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetSecurityInfo(
+            handle: Pv,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut Pv,
+            group: *mut Pv,
+            dacl: *mut Pv,
+            sacl: *mut Pv,
+            sd: *mut Pv,
+        ) -> u32;
+        fn LocalFree(mem: Pv) -> Pv;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const INFO: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+    // SAFETY: `handle` is a live file handle opened for reading (so it carries
+    // READ_CONTROL, implied by GENERIC_READ). `GetSecurityInfo` allocates a
+    // single descriptor block into `psd`; we parse it (copying all strings out)
+    // and then `LocalFree` it. The owner/dacl out-pointers alias into `psd` and
+    // are consumed only by the parser while `psd` is alive.
+    unsafe {
+        let mut psd: Pv = std::ptr::null_mut();
+        let mut owner: Pv = std::ptr::null_mut();
+        let mut dacl: Pv = std::ptr::null_mut();
+        let rc = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            INFO,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut psd,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        if psd.is_null() {
+            return Err(std::io::Error::other(
+                "GetSecurityInfo returned a NULL security descriptor",
+            ));
+        }
+        let view = dacl_view_from_descriptor(psd);
+        LocalFree(psd);
+        view
+    }
+}
+
+/// §11, on the OPEN descriptor — validate the audience key's OWN security
+/// descriptor via the handle we already hold, closing the pathname TOCTOU the
+/// path-based [`validate_audience_file_acl`] leaves open. Same verdict logic
+/// ([`validate_audience_acl_view`]); only the acquisition differs.
+#[cfg(windows)]
+fn validate_audience_file_acl_handle(
+    file: &std::fs::File,
+    path: &Path,
+) -> Result<(), OrgAuthorityError> {
+    use std::os::windows::io::AsRawHandle;
+    let view =
+        read_object_security_handle(file.as_raw_handle()).map_err(|e| OrgAuthorityError::Io {
+            path: path.display().to_string(),
+            reason: format!("read audience key security descriptor (open handle): {e}"),
+        })?;
+    let user_sid = current_process_sid_string().map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("resolve current user SID: {e}"),
+    })?;
+    validate_audience_acl_view(&view, &user_sid, path)
 }
 
 /// Create every missing component of `dir` (intermediate parents AND the final
@@ -2330,6 +2442,159 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
             reason: e.to_string(),
         })?;
     Ok(Some(bytes))
+}
+
+/// OSDK-L R2 — load a GRANT-side [`OrgAudienceSecret`] from an out-of-band
+/// 0600 file, validating the OPENED OBJECT rather than a pathname.
+///
+/// This is the loader `OrgAudienceSecret::decode_config`'s doc says does not
+/// exist, and says why one that "merely wrapped this call would imply a safety
+/// it does not provide". It exists now because the language SDKs need a way to
+/// supply audience material WITHOUT the raw discovery key crossing an FFI
+/// boundary into garbage-collected memory: the binding hands over a path, and
+/// the key's whole lifetime stays inside Rust.
+///
+/// Structurally mirrors `read_audience_checked`, which is the only correct
+/// model in this tree, and adds the two things a grant-side path needs that the
+/// authority directory got from `ensure_secure_authority_dir`:
+///
+/// 1. the ancestor chain is validated FIRST, because a grant secret may live
+///    anywhere the operator put it rather than inside an already-policed
+///    authority directory — an ancestor another account can write through lets
+///    that account swap the entry before we ever open it;
+/// 2. the read is EXACT and rejects trailing bytes, so a file that is a valid
+///    secret followed by anything else is refused rather than silently
+///    accepted.
+///
+/// Then, on the already-open descriptor: regular-file check, Unix mode from
+/// `File::metadata` (never `metadata(path)` then `open(path)` — that pair is
+/// the TOCTOU), and on Windows the file's OWN protected DACL (§11), because
+/// org-wide key distribution means this file may arrive from a share or a
+/// restore tool carrying an explicit ace the containing directory says nothing
+/// about.
+///
+/// # Platform asymmetry, inherited deliberately
+///
+/// The ancestor walk is Unix-only, matching `ensure_secure_authority_dir`: on
+/// Windows a pre-existing ancestor chain is not walked, because a writable
+/// ancestor's owner could replace the entry and no child DACL can prevent it —
+/// so the check would imply a guarantee it cannot make. Windows instead leans
+/// on the file's own protected DACL (§11), which is the stronger check for the
+/// object actually read. Operators placing grant secrets outside a
+/// protected directory on Windows must manage that chain out of band, exactly
+/// as the CLI already warns for custom authority paths.
+///
+/// # Secret handling
+///
+/// The file bytes land in a `ScrubbedBytes` that zeroes on EVERY exit —
+/// return, `?`, or unwind — so the key never lingers in freed heap where a core
+/// dump or swap could reach it. No error returned from here embeds file
+/// content, and the error `Display` renders only the path.
+///
+/// # Residual (inherited, not multiplied)
+///
+/// `decode_config` returns `Self` by value, and a Rust move is a memcpy that
+/// does not run `Drop` on the source, so that one hop strands a copy in a dead
+/// stack frame (`org_grant.rs` §27/§29). This loader adds no further by-value
+/// hop; closing the inherited one end to end needs an ownership refactor
+/// through `OrgCredentials` and the audience registry, which OSDK-L does not
+/// attempt.
+///
+/// [`OrgAudienceSecret`]: super::org_grant::OrgAudienceSecret
+pub fn load_grant_audience_secret(
+    path: &Path,
+) -> Result<super::org_grant::OrgAudienceSecret, OrgAuthorityError> {
+    use std::io::Read;
+
+    let encoded_size = super::org_grant::OrgAudienceSecret::ENCODED_SIZE;
+
+    // 1. Ancestor chain FIRST — establish the path is in a trusted location
+    //    before opening anything. A bare relative name has an empty parent, so
+    //    resolve against the current directory the way `normalize_authority_dir`
+    //    does, or the chain would go unchecked.
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::env::current_dir().map_err(|e| OrgAuthorityError::Io {
+                path: path.display().to_string(),
+                reason: format!("resolve audience secret parent: {e}"),
+            })?,
+        };
+        validate_unix_ancestor_chain(&parent)?;
+    }
+
+    // 2. Open without following symlinks / reparse points.
+    let mut file = open_regular_nofollow(path).map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("open audience secret: {e}"),
+    })?;
+
+    // 3-4. Validate the ALREADY-OPEN object: a regular file, owner-only.
+    let meta = file.metadata().map_err(|e| OrgAuthorityError::Io {
+        path: path.display().to_string(),
+        reason: format!("stat audience secret: {e}"),
+    })?;
+    if !meta.is_file() {
+        return Err(OrgAuthorityError::Io {
+            path: path.display().to_string(),
+            reason: "audience secret is not a regular file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(OrgAuthorityError::PermissiveAudienceFile {
+                path: path.display().to_string(),
+                mode,
+            });
+        }
+    }
+    // 5. Windows: the file's own descriptor via the OPEN HANDLE — not a
+    //    re-resolved pathname — so the DACL we check governs the exact object we
+    //    are about to read, with no swap window between the check and the read.
+    #[cfg(windows)]
+    {
+        validate_audience_file_acl_handle(&file, path)?;
+    }
+
+    // 6-7. Exact read into scrub-on-drop storage, then prove there is nothing
+    //      after it. Reading one extra byte is how "exactly N" is checked
+    //      without trusting the stat size, which can change under us.
+    let mut buf = ScrubbedBytes(vec![0u8; encoded_size]);
+    file.read_exact(&mut buf.0)
+        .map_err(|e| OrgAuthorityError::Io {
+            path: path.display().to_string(),
+            reason: format!("audience secret is shorter than {encoded_size} bytes: {e}"),
+        })?;
+    let mut trailing = [0u8; 1];
+    match file.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(_) => {
+            return Err(OrgAuthorityError::CorruptFile {
+                path: path.display().to_string(),
+                detail: format!("audience secret has trailing bytes after {encoded_size}"),
+            })
+        }
+        Err(e) => {
+            return Err(OrgAuthorityError::Io {
+                path: path.display().to_string(),
+                reason: format!("audience secret trailing-byte probe: {e}"),
+            })
+        }
+    }
+
+    // 8. Decode. `buf` scrubs on the way out of every branch below.
+    super::org_grant::OrgAudienceSecret::decode_config(buf.as_slice()).map_err(|_| {
+        // Deliberately does not forward the decode error's payload — nothing
+        // derived from key bytes reaches a message.
+        OrgAuthorityError::CorruptFile {
+            path: path.display().to_string(),
+            detail: "audience secret failed to decode".to_string(),
+        }
+    })
 }
 
 /// §11 — validate `owner-audience.key`'s OWN security descriptor on Windows.
@@ -3989,6 +4254,42 @@ mod tests {
         let e2 = NodeAuthority::adopt(&authority, cert_for(&kp, 2), kp.entity_id(), 0, None)
             .expect_err("retry must remain fail-closed");
         assert!(matches!(&e2, OrgAuthorityError::Io { .. }), "got: {e2}");
+    }
+
+    /// §4 — the audience-secret ACL check reads the file's security descriptor
+    /// from the OPEN HANDLE (`GetSecurityInfo`) rather than by re-resolving the
+    /// path (`GetFileSecurityW`), closing the swap window between open and check.
+    /// The handle read must be a faithful substitute: it sees the SAME
+    /// descriptor the path read does, and yields the SAME verdict — the fix
+    /// changes only how the descriptor is obtained, never the policy.
+    #[cfg(windows)]
+    #[test]
+    fn audience_acl_read_via_open_handle_matches_the_path_read() {
+        use std::os::windows::io::AsRawHandle;
+        let scratch = Scratch::new();
+        let path = scratch.dir().join("grant.audience");
+        std::fs::write(&path, b"raw-owner-discovery-key").expect("write secret");
+
+        let by_path = read_object_security(&path).expect("path read");
+        let file = std::fs::File::open(&path).expect("open");
+        let by_handle = read_object_security_handle(file.as_raw_handle()).expect("handle read");
+
+        // Same descriptor: the handle reader is a drop-in for the path reader.
+        assert_eq!(by_handle.owner_sid, by_path.owner_sid, "owner");
+        assert_eq!(by_handle.null_dacl, by_path.null_dacl, "null_dacl");
+        assert_eq!(by_handle.protected, by_path.protected, "protected");
+        assert_eq!(by_handle.aces.len(), by_path.aces.len(), "ace count");
+        for (h, p) in by_handle.aces.iter().zip(by_path.aces.iter()) {
+            assert_eq!((h.ace_type, h.mask, &h.sid), (p.ace_type, p.mask, &p.sid));
+        }
+
+        // Same verdict: whatever the path check decides for this file, the
+        // handle check decides identically.
+        assert_eq!(
+            validate_audience_file_acl_handle(&file, &path).is_ok(),
+            validate_audience_file_acl(&path).is_ok(),
+            "handle and path validators must agree",
+        );
     }
 
     #[test]

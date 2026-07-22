@@ -296,6 +296,10 @@ impl MeshBuilder {
             .with_session_timeout(self.session_timeout)
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
+        // OSDK-L N: record whether the CALLER supplied the identity. The org
+        // facade refuses to bind credentials to a generated fallback, and a
+        // binding holding only `Arc<MeshNode>` cannot otherwise tell.
+        config.configured_identity = sdk_identity.is_some();
         if let Some(id) = self.subnet {
             config = config.with_subnet(id);
         }
@@ -450,7 +454,6 @@ impl Mesh {
     /// combination as its sole consumer (`mesh_rpc` /
     /// `mesh_rpc_resilience`) so feature combinations that
     /// exclude either don't trip dead-code lints.
-    #[cfg(all(feature = "net", feature = "cortex"))]
     pub(crate) fn node(&self) -> &Arc<MeshNode> {
         &self.node
     }

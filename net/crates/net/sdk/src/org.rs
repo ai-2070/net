@@ -26,47 +26,84 @@
 //!    [`OrgRevocationStore::apply_bundle`] — monotone and
 //!    restart-durable (a lower floor never rolls back).
 
-pub use net::adapter::net::behavior::org::{
-    OrgError, OrgId, OrgKeypair, OrgMembershipCert, OrgRevocationBundle, MAX_ORG_CERT_TTL_SECS,
-    MAX_REVOCATION_FLOORS_PER_BUNDLE, ORG_CERT_SIG_DOMAIN, ORG_CERT_TTL_SECS_RECOMMENDED,
-    ORG_FLOORS_SIG_DOMAIN,
+//! # The verb facade (OSDK)
+//!
+//! Beyond the canonical re-exports, this module is a thin **verb layer** over
+//! the closed OA substrate — it never admits, and its local checks only ever
+//! refuse to send:
+//!
+//! ```ignore
+//! let org = mesh.org(credentials)?;                       // bind
+//! let customer: Customer = org.call("customer.read", &request).await?;
+//!
+//! mesh.serve_org("customer.read", OrgAccess::Granted, handler)?;
+//! ```
+//!
+//! Five top-level concepts: [`OrgCredentials`], [`OrgClient`], `OrgAccess`,
+//! `OrgCaller`, and [`OrgSdkError`] (whose public domain enums
+//! [`OrgCredentialError`] and [`OrgDiscoveryError`] accompany it). The
+//! canonical types live in [`types`]; the low-level
+//! [`OrgProofIntent`] seam stays available and unchanged
+//! for advanced callers.
+
+pub mod types;
+pub use types::*;
+
+mod credentials;
+mod error;
+mod lease;
+pub use credentials::OrgCredentials;
+pub use error::{
+    parse_org_wire, OrgCredentialError, OrgDiscoveryError, OrgErrorDomain, OrgSdkError,
+    ERR_ORG_PREFIX,
 };
 
-/// OA-2 admission grants (§2.1–2.2) — the offline-issued authorization
-/// credentials that back a protected call, so grant tooling imports from
-/// `net_sdk::org::*` instead of reaching into the core crate. A
-/// [`OrgDispatcherGrant`] (A→S) empowers a dispatcher entity to act for its org
-/// over a capability; a [`OrgCapabilityGrant`] (B→A) empowers a grantee org to
-/// discover and/or invoke a capability on B-owned providers, keyed by
-/// [`CapabilityAuthorityId`] and scoped by [`GrantRights`] / [`GrantTargetScope`].
-///
-/// A DISCOVER grant additionally mints a fresh [`OrgAudienceSecret`] — the raw
-/// discovery key — which NEVER transits the wire: the signed grant carries only
-/// its [`GrantedDiscoveryBinding`] (a 32-byte [`audience_key_commitment`]), and
-/// `OrgAudienceSecret` is deliberately non-serializable (stored 0600 out of
-/// band, delivered to B's publishers and A's consumers). None of these grant
-/// INVOCATION authority — that is the per-call proof the provider verifies.
-pub use net::adapter::net::behavior::org_grant::{
-    audience_key_commitment, CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
-    GrantedDiscoveryBinding, OrgAudienceSecret, OrgCapabilityGrant, OrgDispatcherGrant,
-    AUDIENCE_COMMIT_CONTEXT, CAPABILITY_AUTHORITY_CONTEXT, MAX_ORG_GRANT_TTL_SECS,
-    ORG_AUDIENCE_SECRET_VERSION, ORG_CAPABILITY_GRANT_SIG_DOMAIN, ORG_DISPATCHER_GRANT_SIG_DOMAIN,
+// Test/example scaffolding only — the cross-language scenario + error-vector
+// generators. Gated behind `fixtures` (and `test`) so it is NOT compiled into a
+// release binding library; the two `gen_org_*` examples enable the feature, and
+// the crate's own tests reach it through the `test` arm.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub mod fixtures;
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub use fixtures::render_error_vectors;
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub use fixtures::{
+    write_cross_org_scenario, CrossOrgScenarioManifest, ScenarioCaller, ScenarioProvider,
 };
 
-/// The clock-skew ceiling org certificate verification enforces
-/// (`OrgError::ClockSkewTooLarge` above it) — the token module's
-/// constant, re-exported beside the cert API it gates.
-pub use net::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+mod client;
+pub use client::OrgClient;
 
-pub use net::adapter::net::behavior::org_authority::{
-    authority_dir, NodeAuthority, NodeAuthorityConfig, OrgAuthorityError, OwnerAudienceCredential,
-    NODE_AUTHORITY_CONFIG_VERSION, OWNER_AUDIENCE_FILE, OWNER_MEMBERSHIP_FILE,
-    REVOCATION_STATE_FILE,
+/// The call and serve verbs ride the nRPC surface, so they need `cortex`;
+/// binding (`mesh.org`) does not and stays available without it.
+#[cfg(feature = "cortex")]
+mod call;
+#[cfg(feature = "cortex")]
+mod serve;
+#[cfg(feature = "cortex")]
+pub use serve::{serve_org_bytes_node, OrgAccess, OrgCaller, OrgHandlerError};
+#[cfg(feature = "cortex")]
+mod provision;
+#[cfg(feature = "cortex")]
+pub use provision::{
+    install_org_authority_node, install_provider_grant_audience_node, OrgProvisionError,
 };
 
-pub use net::adapter::net::behavior::org_revocation::{
-    OrgRevocationError, OrgRevocationState, OrgRevocationStore, ORG_REVOCATION_STATE_VERSION,
-};
+#[cfg(test)]
+mod tests;
+#[cfg(all(test, feature = "cortex"))]
+mod tests_call;
+#[cfg(test)]
+mod tests_fixture;
+#[cfg(all(test, feature = "cortex"))]
+mod tests_live;
+#[cfg(test)]
+mod tests_loader;
+#[cfg(all(test, feature = "cortex"))]
+mod tests_serve;
 
 #[cfg(test)]
 mod oa2_grant_sdk_reexport {

@@ -2956,6 +2956,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-org-ffi"
+version = "0.33.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "net-mesh",
+ "net-mesh-sdk",
+ "parking_lot 0.12.5",
+ "tokio",
+]
+
+[[package]]
 name = "net-payments"
 version = "0.33.0"
 dependencies = [
@@ -2992,6 +3004,7 @@ dependencies = [
 name = "net-python"
 version = "0.33.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "bytes",

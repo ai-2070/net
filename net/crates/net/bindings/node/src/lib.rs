@@ -42,6 +42,8 @@ mod cortex;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+#[cfg(feature = "org")]
+mod org;
 // Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
 // + the operator device-lifecycle facade. Thin wrappers over
 // `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
@@ -1532,6 +1534,13 @@ mod mesh_bindings {
             if options.auto_direct_upgrade == Some(true) {
                 config = config.with_auto_direct_upgrade(true);
             }
+
+            // OSDK-L N: an explicitly supplied seed IS a configured identity.
+            // The org facade refuses to bind credentials to a generated
+            // fallback, so this provenance must be recorded here exactly as
+            // `MeshBuilder::identity` records it on the Rust side — otherwise a
+            // Node caller who supplied a seed would be refused as ephemeral.
+            config.configured_identity = options.identity_seed.is_some();
 
             let identity = match options.identity_seed {
                 Some(seed) => {

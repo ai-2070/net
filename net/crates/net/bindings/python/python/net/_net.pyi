@@ -3473,3 +3473,103 @@ class PaymentProvider:
         ``owner_origin`` / ``allow_any_caller`` are as on
         ``NetMesh.publish_tools``. Hold the returned handle to keep serving."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Organization capability auth (OSDK-L Workstream P, the `org` feature)
+# ---------------------------------------------------------------------------
+
+class OrgError(Exception):
+    """Base for organization capability errors."""
+    ...
+
+class OrgCredentialsError(OrgError):
+    """Local: the credential set could not authorize this call."""
+    ...
+
+class OrgDiscoveryError(OrgError):
+    """Local: no provider this credential set may call was found."""
+    ...
+
+class OrgAdmissionDeniedError(OrgError):
+    """Remote: the provider's admission engine refused the call."""
+    ...
+
+class OrgUnclassifiedError(OrgError):
+    """The `org:` vocabulary could not be parsed — an internal compatibility
+    failure, not an admission result."""
+    ...
+
+class OrgCredentials:
+    """A validated organization credential set.
+
+    Public signed credentials cross as ``bytes``; audience secrets cross as
+    file **paths** and never as bytes, so the raw discovery key is never in
+    Python memory. Consumed by :meth:`OrgClient.bind`."""
+
+    def __init__(
+        self,
+        membership: bytes,
+        dispatcher: bytes,
+        grants: List[bytes],
+        audience_secret_paths: List[str],
+    ) -> None: ...
+
+class OrgClient:
+    """A credential set bound to a live mesh — the caller half of the facade.
+
+    Close it when done (context-manager supported): ``close()`` drops the
+    audience lease and the node reference. Teardown order:
+    ``org_client.close()`` -> ``serve_handle.close()`` -> ``mesh.shutdown()``."""
+
+    @staticmethod
+    def bind(mesh: Any, credentials: OrgCredentials) -> "OrgClient": ...
+    def call(self, service: str, request: bytes) -> bytes: ...
+    @property
+    def acting_org(self) -> bytes: ...
+    @property
+    def caller(self) -> bytes: ...
+    @property
+    def is_closed(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "OrgClient": ...
+    def __exit__(self, *exc: object) -> bool: ...
+
+class OrgServeHandle:
+    """Handle for a served organization service. ``close()`` unregisters."""
+
+    @property
+    def is_closed(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "OrgServeHandle": ...
+    def __exit__(self, *exc: object) -> bool: ...
+
+def serve_org(
+    mesh: Any,
+    service: str,
+    access: str,
+    handler: Callable[[dict, bytes], bytes],
+    handler_timeout_ms: Optional[int] = ...,
+) -> OrgServeHandle:
+    """Serve a protected, privately-discoverable service. ``access`` is
+    ``"same_org"`` or ``"granted"``. The handler is
+    ``handler(caller: dict, request: bytes) -> bytes`` and must be callable
+    (checked at registration).
+
+    ``handler_timeout_ms`` bounds how long the provider WAITS for the handler's
+    reply before returning an internal error to the caller; ``0`` means
+    effectively infinite (no bound). The handler runs on a blocking thread and
+    is not interrupted when the wait elapses (same as the nRPC handler)."""
+    ...
+
+def install_org_authority(mesh: Any, authority_dir: str) -> None:
+    """Install an adopted node authority from the directory ``net node adopt``
+    wrote. Required before ``OrgClient.bind`` or a ``"granted"`` ``serve_org``."""
+    ...
+
+def install_provider_grant_audience(
+    mesh: Any, grant: bytes, audience_secret_path: str
+) -> None:
+    """Install a provider grant audience (grant wire bytes + secret file PATH)
+    so a ``"granted"`` service can seal envelopes."""
+    ...

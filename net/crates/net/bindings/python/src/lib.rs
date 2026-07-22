@@ -56,6 +56,10 @@ mod payment_provider;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+#[cfg(feature = "org")]
+mod org;
+#[cfg(feature = "org")]
+mod org_serve;
 // Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
 // + the operator device-lifecycle facade. Thin wrappers over
 // `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
@@ -1338,6 +1342,13 @@ mod mesh_bindings {
             // seed when present — lets a caller-side `Identity.
             // from_seed(same_seed)` issue tokens whose `subject`
             // matches this mesh's entity id. Otherwise generate.
+            // OSDK-L P: an explicitly supplied seed IS a configured identity.
+            // The org facade refuses to bind credentials to a generated
+            // fallback, so this provenance must be recorded here exactly as the
+            // Rust `MeshBuilder::identity` records it — otherwise a Python
+            // caller who supplied a seed would be refused as ephemeral.
+            config.configured_identity = identity_seed.is_some();
+
             let identity = match identity_seed {
                 Some(seed) => {
                     if seed.len() != 32 {
@@ -3517,6 +3528,35 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<enrollment::PyEnrollmentServeHandle>()?;
         m.add_class::<enrollment::PyDeviceEnrollment>()?;
         m.add_function(wrap_pyfunction!(enrollment::fingerprint, m)?)?;
+    }
+    #[cfg(feature = "org")]
+    {
+        m.add_class::<org::PyOrgCredentials>()?;
+        m.add_class::<org::PyOrgClient>()?;
+        m.add_class::<org_serve::PyOrgServeHandle>()?;
+        m.add_function(wrap_pyfunction!(org_serve::serve_org, m)?)?;
+        m.add_function(wrap_pyfunction!(org_serve::install_org_authority, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            org_serve::install_provider_grant_audience,
+            m
+        )?)?;
+        m.add("OrgError", m.py().get_type::<org::OrgError>())?;
+        m.add(
+            "OrgCredentialsError",
+            m.py().get_type::<org::OrgCredentialsError>(),
+        )?;
+        m.add(
+            "OrgDiscoveryError",
+            m.py().get_type::<org::OrgDiscoveryError>(),
+        )?;
+        m.add(
+            "OrgAdmissionDeniedError",
+            m.py().get_type::<org::OrgAdmissionDeniedError>(),
+        )?;
+        m.add(
+            "OrgUnclassifiedError",
+            m.py().get_type::<org::OrgUnclassifiedError>(),
+        )?;
     }
     #[cfg(feature = "publish")]
     {

@@ -152,6 +152,7 @@ fn seed_host(node: &Arc<MeshNode>, signer: &EntityKeypair) {
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
+            owner: None,
         },
     )
     .expect("sign host capability");

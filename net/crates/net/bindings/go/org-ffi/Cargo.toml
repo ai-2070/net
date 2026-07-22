@@ -1,0 +1,57 @@
+[package]
+name = "net-org-ffi"
+version = "0.33.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C ABI organization-capability-auth surface for the Go binding of Net"
+# Distributed as a cdylib alongside the Go binding, not via crates.io.
+# Block accidental `cargo publish`.
+publish = false
+
+[lib]
+# `cdylib` for the shared object Go links against; `staticlib` for
+# platforms that prefer `.a` archives. `rlib` alongside lets any
+# in-crate `#[cfg(test)] mod tests` compile — cargo requires an rlib
+# to link the unit-test harness. The shipped artifact is the cdylib.
+name = "net_org"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+# Core mesh types — needed because we expose C-ABI handles that wrap
+# `Arc<MeshNode>` references handed in by the existing Go binding via
+# `net::ffi::mesh::net_mesh_arc_clone`.
+#
+# The feature list MUST match what the standalone `libnet.dylib` build
+# enables (see `compute-ffi/Cargo.toml`'s note on cfg-gated field
+# offsets). Every Go-binding cdylib (`libnet`, `libnet_compute`,
+# `libnet_rpc`, `libnet_org`, …) exports the same `#[no_mangle]` FFI
+# symbols from `net::ffi`; the Go test binary's link order resolves
+# them to one copy. If two crates compile `net` with different
+# features, cfg-gated fields on shared types (`CapabilitySet`,
+# `MeshNode`, etc.) shift offsets and shared paths read through the
+# wrong layout — a subtle UB. Kept identical to `compute-ffi`'s list.
+net = { package = "net-mesh", version = "0.33.0", path = "../../..", features = ["net", "netdb", "redex-disk", "tool"] }
+# SDK org surface — `OrgCredentials`, `OrgClient`, `OrgAccess`,
+# `OrgCaller`, `OrgSdkError`, and the provisioning entrypoints. The Go
+# FFI delegates to this layer so all four language bindings stay
+# behavior-aligned; the C ABI is pure marshaling over it. `cortex`
+# because the org call/serve/provision verbs ride the nRPC surface
+# (`net_sdk::org` gates them on it); `net` for the bind + credential
+# surface. `compute-ffi` already carries this same `net-mesh-sdk`
+# dependency, so org-ffi is not the first Go FFI crate to take it.
+net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../../../sdk", features = ["net", "cortex"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
+bytes = "1"
+parking_lot = "0.12"
+# `libc::free` for the Go-allocated handler-response buffers the
+# dispatcher hands us. Go side allocates via `C.malloc`; we release
+# via the matching `free` (mirrors rpc-ffi / compute-ffi).
+libc = "0.2"
+
+# `[profile.release]` intentionally omitted — cargo ignores non-root
+# profiles ("profiles for the non root package will be ignored"). The
+# workspace root governs release-profile settings (lto = true and
+# friends) for every member crate.

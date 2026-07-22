@@ -273,7 +273,7 @@ impl Mesh {
     /// SDK's `ChannelConfigRegistry`. Idempotent — repeated calls
     /// for the same service are no-ops (DashMap insert overwrites
     /// with the same default permissive config).
-    fn auto_register_rpc_channels(&self, service: &str) {
+    pub(crate) fn auto_register_rpc_channels(&self, service: &str) {
         use crate::ChannelConfig;
         use net::adapter::net::channel::{ChannelId, ChannelName};
         // Exact: `<service>.requests`.

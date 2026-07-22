@@ -1,0 +1,49 @@
+{
+  "description": "OSDK-L X1 — the canonical `org:` error vocabulary every language binding parses. Each vector's `wire` string is what Rust emits; a binding MUST recover `domain` and `kind` from it, and MUST use `is_local` to decide whether the request left the process. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures`.",
+  "version": 1,
+  "prefix": "org:",
+  "domains": [
+    { "token": "credentials", "is_local": true },
+    { "token": "discovery", "is_local": true },
+    { "token": "admission_denied", "is_local": false },
+    { "token": "rpc", "is_local": false },
+    { "token": "unknown", "is_local": false }
+  ],
+  "vectors": [
+    { "wire": "org:credentials:persistent_identity_required: org credentials: the mesh has no configured durable identity — build it with MeshBuilder::identity(..) before binding org credentials", "domain": "credentials", "kind": "persistent_identity_required", "is_local": true },
+    { "wire": "org:credentials:node_authority_required: org credentials: no node authority is installed — adopt this node before binding org credentials", "domain": "credentials", "kind": "node_authority_required", "is_local": true },
+    { "wire": "org:credentials:node_authority_org_mismatch: org credentials: node authority owner org OrgId(48075a597e721a15...) does not match the membership org OrgId(5e212c0980e4b39f...)", "domain": "credentials", "kind": "node_authority_org_mismatch", "is_local": true },
+    { "wire": "org:credentials:member_binding_mismatch: org credentials: membership names EntityId(2152f8d19b791d24...) but this mesh's identity is EntityId(db995fe25169d141...)", "domain": "credentials", "kind": "member_binding_mismatch", "is_local": true },
+    { "wire": "org:credentials:signature_invalid: org credentials: membership signature is invalid: certificate validity window exceeds MAX_ORG_CERT_TTL_SECS", "domain": "credentials", "kind": "signature_invalid", "is_local": true },
+    { "wire": "org:credentials:dispatcher_binding_mismatch: org credentials: dispatcher grant empowers EntityId(c050c5637a44fa86...) but the membership names EntityId(2012cb90ca60e8e5...)", "domain": "credentials", "kind": "dispatcher_binding_mismatch", "is_local": true },
+    { "wire": "org:credentials:acting_org_mismatch: org credentials: membership org OrgId(af06a3e3291714e4...) and dispatcher grant org OrgId(2df04125f0015afb...) disagree", "domain": "credentials", "kind": "acting_org_mismatch", "is_local": true },
+    { "wire": "org:credentials:grant_not_for_acting_org: org credentials: capability grant abababababababababababababababababababababababababababababababab is issued to OrgId(e2fe2a39b7326642...), not the acting org", "domain": "credentials", "kind": "grant_not_for_acting_org", "is_local": true },
+    { "wire": "org:credentials:duplicate_grant: org credentials: duplicate capability grant id abababababababababababababababababababababababababababababababab", "domain": "credentials", "kind": "duplicate_grant", "is_local": true },
+    { "wire": "org:credentials:audience_secret_mismatch: org credentials: audience secret for grant abababababababababababababababababababababababababababababababab matches no held grant", "domain": "credentials", "kind": "audience_secret_mismatch", "is_local": true },
+    { "wire": "org:credentials:audience_install_refused: org credentials: capability grant abababababababababababababababababababababababababababababababab is not installable: grant expired or not yet valid", "domain": "credentials", "kind": "audience_install_refused", "is_local": true },
+    { "wire": "org:credentials:audience_secret_file: org credentials: audience secret file /etc/net/grants/example.audience was refused: audience secret is not a regular file", "domain": "credentials", "kind": "audience_secret_file", "is_local": true },
+    { "wire": "org:credentials:not_currently_valid: org credentials: membership is not currently valid: invalid wire format", "domain": "credentials", "kind": "not_currently_valid", "is_local": true },
+    { "wire": "org:credentials:dispatcher_scope_excludes_capability: org credentials: the dispatcher grant does not cover capability abababababababababababababababababababababababababababababababab", "domain": "credentials", "kind": "dispatcher_scope_excludes_capability", "is_local": true },
+    { "wire": "org:credentials:missing_capability_grant: org credentials: no capability grant authorizes capability abababababababababababababababababababababababababababababababab on the selected provider", "domain": "credentials", "kind": "missing_capability_grant", "is_local": true },
+    { "wire": "org:credentials:ambiguous_capability_grant: org credentials: capability abababababababababababababababababababababababababababababababab is authorized by 2 overlapping grants ([\"abababababababababababababababababababababababababababababababab\", \"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"]) — remove the ambiguity or use the low-level OrgProofIntent seam", "domain": "credentials", "kind": "ambiguous_capability_grant", "is_local": true },
+    { "wire": "org:discovery:no_authorized_provider: org discovery: no authorized provider for capability abababababababababababababababababababababababababababababababab (3 private candidate(s) considered)", "domain": "discovery", "kind": "no_authorized_provider", "is_local": true },
+    { "wire": "org:discovery:provider_not_direct: org discovery: provider EntityId(93db9f2ee0f7e39e...) has no direct session — protected calls are direct-only", "domain": "discovery", "kind": "provider_not_direct", "is_local": true },
+    { "wire": "org:admission_denied:denied", "domain": "admission_denied", "kind": "denied", "is_local": false },
+    { "wire": "org:admission_denied:not_supported", "domain": "admission_denied", "kind": "not_supported", "is_local": false },
+    { "wire": "org:admission_denied:unavailable", "domain": "admission_denied", "kind": "unavailable", "is_local": false },
+    { "wire": "org:rpc:timeout: rpc: timeout after 5000ms", "domain": "rpc", "kind": "timeout", "is_local": false },
+    { "wire": "org:rpc:no_route: rpc: no route to target 0xdead: no path", "domain": "rpc", "kind": "no_route", "is_local": false },
+    { "wire": "org:rpc:cancelled: rpc: call cancelled by caller", "domain": "rpc", "kind": "cancelled", "is_local": false }
+  ],
+  "unclassified_cases": [
+    { "wire": "org:frobnicate:whatever: detail", "expect_domain": "unknown", "expect_is_local": false },
+    { "wire": "org:", "expect_domain": "unknown", "expect_is_local": false },
+    { "wire": "org:credentials", "expect_domain": "unknown", "expect_is_local": false },
+    { "wire": "not-an-org-error", "expect_domain": "unknown", "expect_is_local": false }
+  ],
+  "notes": [
+    "A binding MUST NOT report `admission_denied` for a string it could not parse: that asserts a request reached a provider and its admission engine evaluated it.",
+    "`admission_denied` vectors carry the coarse bucket and NOTHING else — a precise remote reason would be a credential oracle (OA2-E2).",
+    "`org:rpc:` reuses the frozen nRPC kind vocabulary rather than minting second names for the same conditions."
+  ]
+}

@@ -1596,6 +1596,22 @@ pub struct MeshNodeConfig {
     /// in-window broadcast is dropped as before). Rate-limits apps
     /// that re-announce in tight loops.
     pub min_announce_interval: Duration,
+
+    /// Whether the caller EXPLICITLY supplied this node's identity, as opposed
+    /// to the runtime generating an ephemeral fallback (OSDK-L N).
+    ///
+    /// Node metadata, not an authority decision: nothing here verifies a key,
+    /// and every membership/authority/admission check remains canonical. It
+    /// exists because the organization facade refuses to bind to a generated
+    /// ephemeral identity — org membership binds to a durable entity — and a
+    /// language binding holding only `Arc<MeshNode>` cannot otherwise tell the
+    /// two apart.
+    ///
+    /// Deliberately named `configured`, not "persistent" or "proven": a caller
+    /// may pass `Identity::generate()` explicitly. It records the SDK's existing
+    /// contract exactly — caller-supplied versus implicit fallback — and no
+    /// more.
+    pub configured_identity: bool,
     /// Debounce window for the change-driven announcer (RT-3,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). When a local
     /// capability mutation fires the RT-2 change signal — a
@@ -1890,6 +1906,7 @@ impl MeshNodeConfig {
             subnet_policy: None,
             default_visibility: Visibility::Global,
             min_announce_interval: Duration::from_secs(10),
+            configured_identity: false,
             announce_debounce: Duration::from_millis(100),
             event_pingwave_min_gap: Duration::from_millis(250),
             enable_route_withdraw: true,
@@ -4960,6 +4977,19 @@ pub struct MeshNode {
     /// Serializes consumer grant-audience install/remove (see
     /// `provider_grant_mu`).
     consumer_grant_mu: parking_lot::Mutex<()>,
+    /// Reference-counted consumer-audience leases (OSDK S0, rehomed here from
+    /// the SDK's `Mesh` wrapper). Keyed to the NODE because that is what the
+    /// consumer registry belongs to: two `Mesh` wrappers over one node share
+    /// this, so neither can withdraw an audience the other is still using.
+    org_audience_leases: Arc<super::behavior::org_grant_registry::OrgAudienceLeases>,
+    /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
+    /// Each accepted install claims the next value, so a
+    /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
+    /// names ONE installation rather than a grant id that a later
+    /// remove-then-install could silently rebind. Node-local and never on the
+    /// wire; monotone for the process lifetime (wrapping would take ~5.8e11
+    /// years at one install per nanosecond).
+    consumer_grant_install_seq: std::sync::atomic::AtomicU64,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -6353,6 +6383,10 @@ impl MeshNode {
             )),
             provider_grant_mu: parking_lot::Mutex::new(()),
             consumer_grant_mu: parking_lot::Mutex::new(()),
+            org_audience_leases: Arc::new(
+                super::behavior::org_grant_registry::OrgAudienceLeases::default(),
+            ),
+            consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
                 // The envelope was validated (and panicked on) above, so this
@@ -6583,6 +6617,16 @@ impl MeshNode {
     /// `compute::host` and `behavior::deck`.
     pub fn entity_keypair(&self) -> &EntityKeypair {
         &self.identity
+    }
+
+    /// The node's identity keypair as a shared handle (OSDK-L N).
+    ///
+    /// The organization facade signs proofs with the node's own identity and
+    /// needs to hold it for the client's lifetime, so it takes the `Arc` rather
+    /// than a borrow. Same key the `entity_keypair` borrow exposes — no new
+    /// material crosses any boundary, and bindings still never see it.
+    pub fn entity_keypair_arc(&self) -> Arc<EntityKeypair> {
+        self.identity.clone()
     }
 
     /// Look up a peer's pinned `entity_id`, if the TOFU binding
@@ -8233,7 +8277,45 @@ impl MeshNode {
         super::behavior::org_grant_registry::GrantAudienceInstallError,
     > {
         use super::behavior::org_grant_registry::{
-            validate_consumer_record, GrantAudienceInstallError, GrantAudienceInstalled,
+            ConsumerAudienceInstall, GrantAudienceInstalled,
+        };
+        // One implementation, two surface shapes: the unleased form discards the
+        // ownership proof, so a caller that does not track leases keeps the
+        // remove-by-grant-id semantics it has always had.
+        Ok(
+            match self.install_consumer_grant_audience_leased(grant, secret)? {
+                ConsumerAudienceInstall::Installed(_) => GrantAudienceInstalled::Installed,
+                ConsumerAudienceInstall::AlreadyPresent => GrantAudienceInstalled::AlreadyPresent,
+            },
+        )
+    }
+
+    /// OSDK S0: [`install_consumer_grant_audience`] returning an ownership proof.
+    ///
+    /// Identical validation, idempotency, conflict, and capacity semantics; the
+    /// difference is only what the caller learns. A fresh install returns
+    /// [`ConsumerAudienceInstall::Installed`] carrying a
+    /// [`ConsumerAudienceLease`] that names THIS installation; an idempotent
+    /// no-op returns `AlreadyPresent` and NO lease, because the record belongs to
+    /// whoever installed it first. Pair with
+    /// [`remove_consumer_grant_audience_if_current`] so a withdrawing holder can
+    /// never destroy an installation it does not own.
+    ///
+    /// [`install_consumer_grant_audience`]: Self::install_consumer_grant_audience
+    /// [`ConsumerAudienceInstall::Installed`]: super::behavior::org_grant_registry::ConsumerAudienceInstall::Installed
+    /// [`ConsumerAudienceLease`]: super::behavior::org_grant_registry::ConsumerAudienceLease
+    /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
+    pub fn install_consumer_grant_audience_leased(
+        &self,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+        secret: super::behavior::org_grant::OrgAudienceSecret,
+    ) -> Result<
+        super::behavior::org_grant_registry::ConsumerAudienceInstall,
+        super::behavior::org_grant_registry::GrantAudienceInstallError,
+    > {
+        use super::behavior::org_grant_registry::{
+            validate_consumer_record, ConsumerAudienceInstall, ConsumerAudienceLease,
+            GrantAudienceInstallError,
         };
         let authority = self
             .node_authority
@@ -8247,14 +8329,25 @@ impl MeshNode {
             now_secs,
             authority.config.verification_skew_secs,
         )?;
+        let grant_id = *record.grant_id();
+        // Claim the stamp before the store so the published record and the
+        // returned lease carry the same value; a claimed-but-unused stamp on the
+        // idempotent path is harmless (the counter is only ever compared for
+        // equality, never for density).
+        let install_seq = self
+            .consumer_grant_install_seq
+            .fetch_add(1, Ordering::Relaxed);
+        let record = record.with_install_seq(install_seq);
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
         match current.with_record(Arc::new(record), now_secs)? {
             Some(next) => {
                 self.consumer_grant_audiences.store(Arc::new(next));
-                Ok(GrantAudienceInstalled::Installed)
+                Ok(ConsumerAudienceInstall::Installed(
+                    ConsumerAudienceLease::new(grant_id, install_seq),
+                ))
             }
-            None => Ok(GrantAudienceInstalled::AlreadyPresent),
+            None => Ok(ConsumerAudienceInstall::AlreadyPresent),
         }
     }
 
@@ -8262,6 +8355,12 @@ impl MeshNode {
     /// `true` iff a record was removed. Once removed, no inbound envelope for the
     /// grant can be opened, and any already-stored record for it becomes
     /// non-queryable (OA3-4b2 slice 4 query-time consumer currentness).
+    ///
+    /// Unconditional: it removes whatever currently occupies `grant_id`. A holder
+    /// that installed one specific record and wants to withdraw only that one
+    /// must use [`remove_consumer_grant_audience_if_current`] instead.
+    ///
+    /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
@@ -8271,6 +8370,135 @@ impl MeshNode {
                 true
             }
             None => false,
+        }
+    }
+
+    /// OSDK S0: remove a CONSUMER grant-audience record ONLY if the currently
+    /// installed record is the exact one this lease owns. Returns `true` iff that
+    /// record was removed.
+    ///
+    /// The compare and the removal happen under one `consumer_grant_mu` hold, so
+    /// a concurrent remove-then-install cannot slip a different record in between
+    /// the two: a stale lease (its installation already replaced, or already
+    /// removed) removes NOTHING and reports `false`. This is what makes an SDK
+    /// credential lease safe to drop without auditing who else touched the
+    /// registry.
+    pub fn remove_consumer_grant_audience_if_current(
+        &self,
+        lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
+    ) -> bool {
+        let _guard = self.consumer_grant_mu.lock();
+        let current = self.consumer_grant_audiences.load_full();
+        match current.get(lease.grant_id()) {
+            // Same grant id, different installation — the lease is stale and owns
+            // nothing here.
+            Some(record) if record.install_seq() != lease.install_seq() => false,
+            Some(_) => match current.without(lease.grant_id()) {
+                Some(next) => {
+                    self.consumer_grant_audiences.store(Arc::new(next));
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Whether the caller explicitly supplied this node's identity (OSDK-L N).
+    ///
+    /// `false` means the runtime generated an ephemeral keypair, whose entity
+    /// id changes on every restart. The organization facade refuses to bind
+    /// credentials to such a node, because an org membership certificate names
+    /// a durable entity.
+    pub fn has_configured_identity(&self) -> bool {
+        self.config.configured_identity
+    }
+
+    /// The node's consumer-audience lease registry (OSDK S0).
+    pub fn org_audience_leases(
+        &self,
+    ) -> &Arc<super::behavior::org_grant_registry::OrgAudienceLeases> {
+        &self.org_audience_leases
+    }
+
+    /// Acquire reference-counted consumer-audience leases for `pairs`,
+    /// installing any not already leased on this NODE.
+    ///
+    /// All-or-nothing: if any install is refused, every reference taken so far
+    /// in this call is released before returning, so a failed bind leaves the
+    /// registry exactly as it found it. Returns the grant ids now referenced.
+    ///
+    /// The lock spans the "is it already leased?" read AND the install, so two
+    /// concurrent binds cannot both decide they are first; and it spans the
+    /// 1→0 removal in [`release_consumer_audience_leases`], so a final release
+    /// racing a fresh bind cannot leave the new holder without its audience.
+    ///
+    /// [`release_consumer_audience_leases`]: Self::release_consumer_audience_leases
+    pub fn acquire_consumer_audience_leases(
+        &self,
+        pairs: Vec<(
+            super::behavior::org_grant::OrgCapabilityGrant,
+            super::behavior::org_grant::OrgAudienceSecret,
+        )>,
+    ) -> Result<
+        Vec<[u8; 32]>,
+        (
+            [u8; 32],
+            super::behavior::org_grant_registry::GrantAudienceInstallError,
+        ),
+    > {
+        use super::behavior::org_grant_registry::{ConsumerAudienceInstall, LeaseEntry};
+        let mut taken: Vec<[u8; 32]> = Vec::with_capacity(pairs.len());
+        for (grant, secret) in pairs {
+            let grant_id = grant.grant_id;
+            let mut entries = self.org_audience_leases.lock_entries();
+            match entries.get_mut(&grant_id) {
+                Some(entry) => {
+                    entry.retain();
+                    // `secret` drops here (zeroized): the record it would have
+                    // installed is already live and identical by construction —
+                    // a differing secret for the same id would have been a
+                    // Conflict at the first install.
+                }
+                None => match self.install_consumer_grant_audience_leased(grant, secret) {
+                    Ok(ConsumerAudienceInstall::Installed(lease)) => {
+                        entries.insert(grant_id, LeaseEntry::new_owned(lease));
+                    }
+                    Ok(ConsumerAudienceInstall::AlreadyPresent) => {
+                        entries.insert(grant_id, LeaseEntry::new_borrowed());
+                    }
+                    Err(e) => {
+                        drop(entries);
+                        self.release_consumer_audience_leases(&taken);
+                        return Err((grant_id, e));
+                    }
+                },
+            }
+            drop(entries);
+            taken.push(grant_id);
+        }
+        Ok(taken)
+    }
+
+    /// Release one reference per id; the last reference to an OWNED
+    /// installation removes it. A non-owning entry (the record was already
+    /// present when first leased) removes nothing.
+    pub fn release_consumer_audience_leases(&self, grant_ids: &[[u8; 32]]) {
+        for grant_id in grant_ids {
+            let mut entries = self.org_audience_leases.lock_entries();
+            let Some(entry) = entries.get_mut(grant_id) else {
+                continue;
+            };
+            let (last, owned) = entry.release();
+            if !last {
+                continue;
+            }
+            entries.remove(grant_id);
+            // Still under the lock: the 1→0 transition and the registry removal
+            // are one step.
+            if let Some(lease) = owned {
+                self.remove_consumer_grant_audience_if_current(&lease);
+            }
         }
     }
 
@@ -8979,9 +9207,44 @@ impl MeshNode {
         self.scoped_relay_gate.len()
     }
 
-    #[doc(hidden)]
-    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+    /// OSDK S1: the verified OWNER-PRIVATE providers of `capability` — the
+    /// same-org private discovery plane.
+    ///
+    /// Every candidate was admitted by `verify_scoped_ingest` (outer signature,
+    /// owner certificate proving the provider is in THIS node's org, audience
+    /// selection under the owner audience, AEAD open, descriptor validation) and
+    /// is filtered here for expiry and revocation-floor currentness. The
+    /// descriptor is decoded and must actually carry `capability`: an owner
+    /// envelope announces every owner-scoped tag the provider serves, so
+    /// possession of a matching record is not by itself a match for the tag you
+    /// asked about.
+    ///
+    /// Discovery is NOT authority: a returned provider still admits the caller
+    /// only on a valid per-call organization proof.
+    pub fn owner_private_capability_providers(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+        self.owner_private_providers_at(Some(capability), super::behavior::org::current_timestamp())
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect()
+    }
+
+    /// Shared owner-plane query. `capability == None` returns every owner-private
+    /// record (the test seam's historical semantics); `Some` filters by decoded
+    /// descriptor tag. Returns each candidate with its provider entity so both
+    /// callers can project what they need.
+    fn owner_private_providers_at(
+        &self,
+        capability: Option<&super::behavior::org_grant::CapabilityAuthorityId>,
+        now_secs: u64,
+    ) -> Vec<(
+        super::behavior::org_scoped_store::PrivateCapabilityProvider,
+        EntityId,
+    )> {
         use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
         // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
         // node with no revocation store queries against an implicit empty floor
         // set), so the currentness filter reflects real node state.
@@ -8991,9 +9254,28 @@ impl MeshNode {
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
         self.scoped_discovery
             .lock()
-            .find_owner_private_capabilities(now_secs, floors, |_| true)
+            .find_owner_private_capabilities(now_secs, floors, |c| match capability {
+                None => true,
+                Some(want) => super::behavior::org_scoped_ingest::descriptor_declares_capability(
+                    c.descriptor(),
+                    want,
+                ),
+            })
             .into_iter()
-            .map(|c| c.provider().clone())
+            .map(|c| {
+                (
+                    PrivateCapabilityProvider::from_verified(c),
+                    c.provider().clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_owner_providers_for_test(&self, now_secs: u64) -> Vec<EntityId> {
+        self.owner_private_providers_at(None, now_secs)
+            .into_iter()
+            .map(|(_, provider)| provider)
             .collect()
     }
 
@@ -9010,12 +9292,38 @@ impl MeshNode {
     /// (the record stays physically stored; retraction is a read-time filter,
     /// mirroring the floor-currentness filter for owner records). Also expiry- and
     /// floor-currentness-safe, exactly as a real query would be.
-    #[doc(hidden)]
-    pub fn scoped_granted_providers_for_test(
+    /// OSDK S1: the verified GRANTED-audience providers discoverable under
+    /// `grant_id` — the cross-org private discovery plane.
+    ///
+    /// Applies the same query-time consumer currentness as the seam below:
+    /// visible only while this node still holds a consumer grant whose grant id,
+    /// audience handle, AND verified signature match the stored record, so
+    /// removing the credential retracts every record for that grant immediately,
+    /// and a DIFFERENT grant reusing the id never re-exposes the old one.
+    ///
+    /// Ingest already bound each record's descriptor to the grant's authorized
+    /// capability, so no descriptor filtering is needed here — the grant id
+    /// determines the capability.
+    ///
+    /// Discovery is NOT authority: DISCOVER rights got you this list; invoking
+    /// still requires INVOKE and a valid per-call proof.
+    pub fn granted_capability_providers(
+        &self,
+        grant_id: &[u8; 32],
+    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
+        self.granted_providers_at(grant_id, super::behavior::org::current_timestamp())
+            .iter()
+            .map(PrivateCapabilityProvider::from_verified)
+            .collect()
+    }
+
+    /// Shared granted-plane query at an explicit clock.
+    fn granted_providers_at(
         &self,
         grant_id: &[u8; 32],
         now_secs: u64,
-    ) -> Vec<EntityId> {
+    ) -> Vec<super::behavior::org_scoped_ingest::VerifiedScopedCapability> {
         use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Query-time consumer currentness: no installed consumer grant for this id
@@ -9043,6 +9351,18 @@ impl MeshNode {
                     )
             })
             .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_granted_providers_for_test(
+        &self,
+        grant_id: &[u8; 32],
+        now_secs: u64,
+    ) -> Vec<EntityId> {
+        self.granted_providers_at(grant_id, now_secs)
+            .iter()
             .map(|c| c.provider().clone())
             .collect()
     }

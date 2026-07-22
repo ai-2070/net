@@ -582,6 +582,14 @@ pub unsafe extern "C" fn net_mesh_new(
     #[cfg(not(feature = "nat-traversal"))]
     let _ = cfg.auto_direct_upgrade;
 
+    // Record identity provenance (§D1a of ORG_CAPABILITY_LANGUAGE_SDKS_PLAN):
+    // a caller-supplied seed is a durable, org-bindable identity; a generated
+    // fallback is ephemeral. The org facade reads this through
+    // `MeshNode::has_configured_identity()` to refuse binding on an ephemeral
+    // node. This is the third mesh constructor to need it — the napi and PyO3
+    // ones each silently omitted it and refused a seeded caller until fixed.
+    node_cfg.configured_identity = cfg.identity_seed_hex.is_some();
+
     let identity = match cfg.identity_seed_hex {
         Some(seed_hex) => {
             let bytes = match hex::decode(&seed_hex) {
@@ -4535,6 +4543,46 @@ mod tests {
         // Use the production _free; it drains via HandleGuard and
         // takes inner. The outer box is intentionally leaked
         // (small per-call leak; acceptable in tests).
+        unsafe { net_mesh_free(out) };
+    }
+
+    /// G-prov (§D1a): the FFI mesh constructor — the code path Go's
+    /// `NewMeshNode` rides — must record identity provenance so the org
+    /// facade can refuse to bind an ephemeral node. A caller-supplied
+    /// `identity_seed_hex` is a durable identity (`has_configured_identity()`
+    /// true); its absence is a generated ephemeral fallback (false). The napi
+    /// and PyO3 constructors each silently omitted this and refused a seeded
+    /// caller `persistent_identity_required` until fixed; this is the third
+    /// constructor and the witness that closes the same gap for Go.
+    #[test]
+    fn net_mesh_new_records_identity_provenance() {
+        // Seeded → configured.
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+            "identity_seed_hex": "7a".repeat(32),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut out) }, 0);
+        assert!(
+            unsafe { &*out }.inner.has_configured_identity(),
+            "a caller-supplied identity_seed_hex must set configured_identity"
+        );
+        unsafe { net_mesh_free(out) };
+
+        // No seed → ephemeral fallback, NOT configured.
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut out) }, 0);
+        assert!(
+            !unsafe { &*out }.inner.has_configured_identity(),
+            "a generated ephemeral fallback must leave configured_identity false"
+        );
         unsafe { net_mesh_free(out) };
     }
 
