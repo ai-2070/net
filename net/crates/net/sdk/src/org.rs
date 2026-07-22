@@ -43,7 +43,7 @@
 //! `OrgCaller`, and [`OrgSdkError`] (whose public domain enums
 //! [`OrgCredentialError`] and [`OrgDiscoveryError`] accompany it). The
 //! canonical types live in [`types`]; the low-level
-//! [`OrgProofIntent`](types::OrgProofIntent) seam stays available and unchanged
+//! [`OrgProofIntent`] seam stays available and unchanged
 //! for advanced callers.
 
 pub mod types;
