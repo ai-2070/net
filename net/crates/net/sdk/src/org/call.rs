@@ -31,6 +31,8 @@
 //! fresh call id and a fresh signature. Cross-call idempotency is the
 //! application's.
 
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -111,13 +113,46 @@ impl OrgClient {
     /// discovery, inferred admission mode, exact grant matching, deterministic
     /// selection, one canonical request-bound proof, and no retry.
     pub async fn call_bytes(&self, service: &str, request: Bytes) -> Result<Bytes, OrgSdkError> {
+        // `0` deadline = the facade's default; `0` token = uncancellable.
+        self.call_bytes_deadline(service, request, 0, 0).await
+    }
+
+    /// [`call_bytes`](Self::call_bytes) with execution control — a deadline and
+    /// a pre-reserved cancel token (OSDK-L §D6a).
+    ///
+    /// This is the seam the C ABI's `net_org_call` reaches so a Go `Call(ctx,
+    /// ..)` can carry a real deadline and cancel a call **in flight**, rather
+    /// than only abandoning its own wait while an authorized side effect keeps
+    /// executing. Neither argument is an authorization input: they select no
+    /// provider, no grant, and no authority — the `plan()` decision is byte-for-
+    /// byte identical to `call_bytes`. `deadline_ms == 0` means the facade
+    /// default; `cancel_token == 0` means uncancellable. Reserve the token with
+    /// [`reserve_cancel_token`](Self::reserve_cancel_token) BEFORE calling.
+    ///
+    /// `#[doc(hidden)]` — applications use `call`/`call_bytes`; execution control
+    /// is a binding concern, exposed for the cancellable C ABI only.
+    #[doc(hidden)]
+    pub async fn call_bytes_deadline(
+        &self,
+        service: &str,
+        request: Bytes,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<Bytes, OrgSdkError> {
         let intent = self.plan(service)?;
         let provider = intent.provider.clone();
 
-        let opts = CallOptions {
+        let mut opts = CallOptions {
             org_proof_intent: Some(intent),
             ..CallOptions::default()
         };
+        // Execution control only — never an authority input.
+        if deadline_ms > 0 {
+            opts.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
 
         // The core call mints the call id, computes the canonical request
         // digest, signs the proof, appends exactly one admission header, and
@@ -129,6 +164,32 @@ impl OrgClient {
             .map_err(map_rpc_error)?;
 
         Ok(reply.body)
+    }
+
+    /// Reserve a cancel token from this client's node for a subsequent
+    /// [`call_bytes_deadline`](Self::call_bytes_deadline) (OSDK-L §D6a).
+    ///
+    /// Reserve BEFORE the call so a cancel that races the call's registration is
+    /// still delivered — the doctrine [`MeshNode::reserve_cancel_token`] already
+    /// establishes. Scoped to this client's node so the substrate's per-mesh
+    /// `CancelRegistry` stays the single source of truth.
+    ///
+    /// `#[doc(hidden)]` — a binding-only execution-control seam.
+    ///
+    /// [`MeshNode::reserve_cancel_token`]: net::adapter::net::MeshNode::reserve_cancel_token
+    #[doc(hidden)]
+    pub fn reserve_cancel_token(&self) -> u64 {
+        self.node.reserve_cancel_token()
+    }
+
+    /// Cancel the one in-flight call bound to `token` (OSDK-L §D6a). Idempotent;
+    /// a no-op for `0` or a token no call reserved. It never launches a second
+    /// attempt — a signed proof is never resent (the facade's no-retry rule).
+    ///
+    /// `#[doc(hidden)]` — a binding-only execution-control seam.
+    #[doc(hidden)]
+    pub fn cancel(&self, token: u64) {
+        self.node.cancel(token);
     }
 
     /// Everything `call` does before touching the network: capability
