@@ -312,21 +312,48 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// A heap buffer that scrubs on drop, honoring `encode_config`'s §28 obligation
+/// so raw discovery-key bytes do not linger after they are written. Volatile so
+/// the zeroing is not optimized away, and it fires on EVERY exit — return, `?`,
+/// or unwind.
+struct ScrubbingBytes(Vec<u8>);
+
+impl std::ops::Deref for ScrubbingBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ScrubbingBytes {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            // SAFETY: `b` is a valid, aligned, writable byte for `self.0`'s life.
+            unsafe { std::ptr::write_volatile(b, 0u8) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Write a secret file the way a binding must supply one: exact bytes, and
 /// owner-only (0600 on Unix; on Windows the loader gates on the file's own
 /// protected DACL, which a freshly created file inherits acceptably — the same
 /// path the cross-platform from-files test uses).
+///
+/// The file is created with mode 0600 UP FRONT on Unix (not created then
+/// chmod'd), so it is never group/other-readable for even an instant.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -396,7 +423,10 @@ pub fn write_cross_org_scenario(outdir: &Path) -> std::io::Result<CrossOrgScenar
     .map_err(io_err)?;
     let secret = secret.ok_or_else(|| io_err("DISCOVER grant must mint an audience secret"))?;
     let grant_bytes = grant.to_bytes();
-    let secret_bytes = secret.encode_config();
+    // `encode_config` returns raw discovery-key bytes; scrub the buffer the
+    // file writes read from. (The moved-from stack array is the pre-existing,
+    // accepted §27/§29 by-value residual — this adds no new lingering copy.)
+    let secret_bytes = ScrubbingBytes(secret.encode_config().to_vec());
 
     // Caller credential files.
     std::fs::write(
