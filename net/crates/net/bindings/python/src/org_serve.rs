@@ -77,18 +77,33 @@ impl PyOrgServeHandle {
 /// how the service is announced — both ship only inside an encrypted audience.
 /// The handler is `handler(caller: dict, request: bytes) -> bytes`; `caller`
 /// carries the five verified fields plus `is_same_org`. Raising surfaces as an
-/// application error, never as an admission denial.
+/// application error, never as an admission denial. A non-callable `handler`
+/// is refused here, at registration, rather than per request.
+///
+/// `handler_timeout_ms` bounds how long the provider WAITS for the handler's
+/// reply (`0` = effectively infinite). The handler itself runs on a blocking
+/// thread and is not interrupted when the wait elapses — a hung handler holds
+/// its blocking-pool thread until it returns, the same behavior as the nRPC
+/// handler.
 ///
 /// Requires an installed node authority.
 #[pyfunction]
 #[pyo3(signature = (mesh, service, access, handler, handler_timeout_ms=None))]
 pub fn serve_org(
+    py: Python<'_>,
     mesh: &crate::mesh_bindings::NetMesh,
     service: String,
     access: &str,
     handler: Py<PyAny>,
     handler_timeout_ms: Option<u64>,
 ) -> PyResult<PyOrgServeHandle> {
+    // Fail fast: a non-callable handler is a caller bug, caught at registration
+    // rather than surfacing as an application error on the first request.
+    if !handler.bind(py).is_callable() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "serve_org handler must be callable: handler(caller: dict, request: bytes) -> bytes",
+        ));
+    }
     let node = mesh.node_arc_clone()?;
     let access = super::org::access_from_str(access)?;
     let timeout = match handler_timeout_ms {

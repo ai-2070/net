@@ -3548,12 +3548,18 @@ def serve_org(
     mesh: Any,
     service: str,
     access: str,
-    handler: Any,
+    handler: Callable[[dict, bytes], bytes],
     handler_timeout_ms: Optional[int] = ...,
 ) -> OrgServeHandle:
     """Serve a protected, privately-discoverable service. ``access`` is
     ``"same_org"`` or ``"granted"``. The handler is
-    ``handler(caller: dict, request: bytes) -> bytes``."""
+    ``handler(caller: dict, request: bytes) -> bytes`` and must be callable
+    (checked at registration).
+
+    ``handler_timeout_ms`` bounds how long the provider WAITS for the handler's
+    reply before returning an internal error to the caller; ``0`` means
+    effectively infinite (no bound). The handler runs on a blocking thread and
+    is not interrupted when the wait elapses (same as the nRPC handler)."""
     ...
 
 def install_org_authority(mesh: Any, authority_dir: str) -> None:

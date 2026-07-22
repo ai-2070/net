@@ -130,6 +130,17 @@ def test_provisioning_surface_exists_and_errors_on_bad_input() -> None:
         mesh.shutdown()
 
 
+def test_serve_org_rejects_a_non_callable_handler() -> None:
+    # §11 — a non-callable handler is a caller bug, refused at registration with
+    # a TypeError rather than surfacing as an application error per request.
+    mesh = net.NetMesh(_addr(), PSK, identity_seed=_seed(0x62))
+    try:
+        with pytest.raises(TypeError):
+            net.serve_org(mesh, "svc.read", "granted", 42, None)
+    finally:
+        mesh.shutdown()
+
+
 def test_classify_org_error_maps_domains_and_reaches_unclassified() -> None:
     # §8 — `classify_org_error` is the producer that makes `OrgUnclassifiedError`
     # reachable (a live in-version call always raises one of the four typed
