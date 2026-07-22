@@ -7,9 +7,12 @@
 //! - Late joiner: session-open push catches new peers up
 //! - Version skip: older announcements from the same peer are ignored
 //!
-//! Run: `cargo test --features net --test capability_broadcast`
+//! Run: `cargo test --features net,cortex,fixtures --test capability_broadcast`
 
-#![cfg(feature = "net")]
+// Uses the `fixtures`-gated `apply_legacy_announcement` helper and cortex
+// types, so it needs all three features — CI runs it under default features +
+// `fixtures`. Skips cleanly otherwise instead of failing to compile.
+#![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

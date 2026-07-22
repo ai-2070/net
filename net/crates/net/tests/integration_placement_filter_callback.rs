@@ -18,7 +18,10 @@
 //!   consumers via `global_placement_filter_registry()`. This
 //!   test pins it.
 
-#![cfg(feature = "net")]
+// Uses the `fixtures`-gated `apply_legacy_announcement` helper and cortex
+// types, so it needs all three features — CI runs it under default features +
+// `fixtures`. Skips cleanly otherwise instead of failing to compile.
+#![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
 use std::sync::Arc;
 

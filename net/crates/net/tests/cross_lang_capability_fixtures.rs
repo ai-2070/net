@@ -10,9 +10,13 @@
 //! Phase 5.B + 1 of `docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`.
 //! Surfaced through Phase 9 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 //!
-//! Run: `cargo test --features net --test cross_lang_capability_fixtures`
+//! Run: `cargo test --features net,cortex,fixtures --test cross_lang_capability_fixtures`
 
-#![cfg(feature = "net")]
+// Uses the `fixtures`-gated `apply_legacy_announcement` helper and cortex (nRPC)
+// types, so it compiles only with all three features — CI runs it under default
+// features + `fixtures`. Skips cleanly otherwise (e.g. a default build without
+// `fixtures`) instead of failing to compile with the helper "configured out".
+#![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
 use std::collections::BTreeMap;
 
