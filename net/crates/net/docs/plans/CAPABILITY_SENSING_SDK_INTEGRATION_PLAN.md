@@ -93,11 +93,13 @@ There is no SDK-level ownership or cleanup contract for either consumer watches 
 
 The current v1 sensing scope is an `AudienceScopeCommitment` derived from entity identity, with an operator-configured fleet-root escape hatch bounded by PSK + TOFU. The source explicitly says scoped capabilities should replace this temporary ownership assertion.
 
-The common SDK must not automate provider-free sensing on top of that escape hatch. SDK activation requires:
+The common SDK must not automate provider-free sensing on top of that escape hatch. SDK activation requires organization-authority review sign-off pinned to the executable authority substrate base:
 
 ```text
-organization-authority review sign-off at exact commit <approved-commit>
+07820a9de389b2252e6065ffe7319fbe9f8020aa
 ```
+
+This is the same base the organization SDK's own activation note records — an ancestor of both the merged organization-SDK work and this branch. (It is deliberately **not** the load-balancing plan sign-off commit, which pins the plan, not the authority implementation.)
 
 Then same-organization sensing derives its scope and rendezvous population from verified organization authority:
 
