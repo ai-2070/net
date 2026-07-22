@@ -150,6 +150,12 @@ port-mapping = ["nat-traversal", "net/port-mapping"]
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.
 cortex = ["net/netdb", "net/redex-disk"]
+# Test/example scaffolding — the cross-language org scenario + error-vector
+# generators (`net_sdk::org::fixtures`, behind `#[doc(hidden)]`). Off by
+# default so the generators are NOT compiled into a release binding library;
+# the `gen_org_*` examples enable it, and the crate's own tests reach the
+# module through `cfg(test)`.
+fixtures = ["net"]
 # Compute surface — `MeshDaemon` trait + `DaemonRuntime` for local
 # spawn / snapshot / stop. Requires `net` because daemons have a
 # mesh identity (ed25519 keypair + origin_hash) that rides on the
@@ -281,10 +287,19 @@ required-features = ["net", "macros"]
 # OSDK-L X2 — generate a live cross-org call scenario (adopted authorities,
 # credential bytes, 0600 audience-secret files, and a manifest.json) that a
 # harness in any language loads. Needs `net` for the issuance + adoption
-# primitives; no `cortex` (generation builds no mesh).
+# primitives (no `cortex` — generation builds no mesh) and `fixtures` for the
+# generator itself (gated out of release libraries).
 [[example]]
 name = "gen_org_scenario"
-required-features = ["net"]
+required-features = ["net", "fixtures"]
+
+# OSDK-L X1 — regenerate the canonical `org:` error-vocabulary fixture
+# (`tests/cross_lang_org/error_vectors.json`) every language binding parses.
+# Explicitly declared (not auto-discovered) so a build WITHOUT `fixtures`
+# cleanly SKIPS it rather than failing on the gated `render_error_vectors`.
+[[example]]
+name = "gen_org_error_fixtures"
+required-features = ["net", "cortex", "fixtures"]
 
 # ============================================================================
 # nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the

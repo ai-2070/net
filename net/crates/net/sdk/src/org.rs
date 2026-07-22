@@ -58,10 +58,17 @@ pub use error::{
     ERR_ORG_PREFIX,
 };
 
+// Test/example scaffolding only — the cross-language scenario + error-vector
+// generators. Gated behind `fixtures` (and `test`) so it is NOT compiled into a
+// release binding library; the two `gen_org_*` examples enable the feature, and
+// the crate's own tests reach it through the `test` arm.
+#[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub mod fixtures;
+#[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub use fixtures::render_error_vectors;
+#[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub use fixtures::{
     write_cross_org_scenario, CrossOrgScenarioManifest, ScenarioCaller, ScenarioProvider,

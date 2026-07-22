@@ -1,5 +1,5 @@
 {
-  "description": "OSDK-L X1 — the canonical `org:` error vocabulary every language binding parses. Each vector's `wire` string is what Rust emits; a binding MUST recover `domain` and `kind` from it, and MUST use `is_local` to decide whether the request left the process. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex --example gen_org_error_fixtures`.",
+  "description": "OSDK-L X1 — the canonical `org:` error vocabulary every language binding parses. Each vector's `wire` string is what Rust emits; a binding MUST recover `domain` and `kind` from it, and MUST use `is_local` to decide whether the request left the process. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures`.",
   "version": 1,
   "prefix": "org:",
   "domains": [

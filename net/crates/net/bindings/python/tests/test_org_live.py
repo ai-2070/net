@@ -50,7 +50,7 @@ def _free_addr() -> str:
 def _gen_scenario(outdir: str) -> dict:
     subprocess.run(
         [
-            "cargo", "run", "-q", "-p", "net-mesh-sdk", "--features", "net,cortex",
+            "cargo", "run", "-q", "-p", "net-mesh-sdk", "--features", "net,cortex,fixtures",
             "--example", "gen_org_scenario", "--", outdir,
         ],
         cwd=_CRATE_ROOT,

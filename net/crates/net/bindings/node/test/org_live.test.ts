@@ -89,7 +89,7 @@ describe.skipIf(!HAS_ORG)('X2 — live cross-org call through the Node binding',
     // Mint a fresh scenario (certs expire, so never a committed fixture).
     execFileSync(
       'cargo',
-      ['run', '-q', '-p', 'net-mesh-sdk', '--features', 'net,cortex', '--example', 'gen_org_scenario', '--', dir],
+      ['run', '-q', '-p', 'net-mesh-sdk', '--features', 'net,cortex,fixtures', '--example', 'gen_org_scenario', '--', dir],
       { cwd: crateRoot, stdio: 'inherit' },
     )
     manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as Manifest

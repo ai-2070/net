@@ -146,7 +146,7 @@ pub fn render_error_vectors() -> String {
          binding parses. Each vector's `wire` string is what Rust emits; a binding MUST recover \
          `domain` and `kind` from it, and MUST use `is_local` to decide whether the request left \
          the process. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features \
-         net,cortex --example gen_org_error_fixtures`.\",\n",
+         net,cortex,fixtures --example gen_org_error_fixtures`.\",\n",
     );
     out.push_str(&format!(
         "  \"version\": 1,\n  \"prefix\": {ERR_ORG_PREFIX:?},\n"
