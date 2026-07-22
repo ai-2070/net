@@ -471,6 +471,11 @@ pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
 }
 
 /// Hex-format a capability authority id.
+///
+/// Only the call verb (`call.rs`, `cortex`-gated) formats a capability id for an
+/// error message, so this is dead in a `net`-without-`cortex` build — the same
+/// conditional-use shape as `OrgClient::node`.
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
 pub(crate) fn hex_capability(capability: &CapabilityAuthorityId) -> String {
     hex32(capability.as_bytes())
 }
