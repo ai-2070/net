@@ -294,16 +294,18 @@ enum Leg {
 /// Landed ahead of its consumer: the dispatch semantic-operation refactor that
 /// converts BOTH legacy and org intake into this wrapper lands in the same
 /// org-auth part-2 series (the `#[allow(dead_code)]` is removed then).
+///
+/// **Immutable after construction.** All fields are private and exposed only
+/// through by-value/by-ref accessors: the complete spec AND the addressing leg
+/// were part of the admission decision, so no crate code may mutate the spec
+/// audience, retarget the leg, or otherwise desync the payload from the
+/// verified `authority`. There is deliberately no `*_mut`, no `into_parts`, and
+/// no field is `pub`/`pub(crate)`.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdmittedSensingRegistration {
-    /// The re-derived, digest-validated interest spec.
-    pub(crate) spec: InterestSpec,
-    /// The leg-specific parameters.
-    pub(crate) leg: RegistrationLeg,
-    /// The authority the registration was admitted under (private — accessed
-    /// only through [`Self::proven_root`] / [`Self::authority`], so no caller
-    /// can pair an org id with a foreign proven root).
+    spec: InterestSpec,
+    leg: RegistrationLeg,
     authority: RegistrationAuthority,
 }
 
@@ -405,6 +407,17 @@ impl AdmittedSensingRegistration {
                 authority: RegistrationAuthority::Org { org_id },
             },
         }
+    }
+
+    /// The re-derived, digest-validated interest spec (immutable).
+    pub(crate) fn spec(&self) -> &InterestSpec {
+        &self.spec
+    }
+
+    /// The leg-specific parameters (immutable; `Copy`, so a caller mutates only
+    /// its own copy).
+    pub(crate) fn leg(&self) -> RegistrationLeg {
+        self.leg
     }
 
     /// The audience commitment this registration was proven under. For the org
