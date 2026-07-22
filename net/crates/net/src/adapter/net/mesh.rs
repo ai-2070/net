@@ -30027,6 +30027,10 @@ mod sensing_authority_witness_tests {
         let node = build_node().await;
         let a = adopt(&node, &org(), "c5a");
         let a_ptr = Arc::as_ptr(&a);
+        // Reinstalling exact Arc<A> reinstalls A's store too, so BOTH pointer
+        // components return to A's — isolating the installation generation as
+        // the sole discriminator.
+        let a_store = a.revocation.clone();
         node.install_node_authority(a.clone()).expect("install A");
         let snap = node.capture_sensing_authority_snapshot().expect("capture");
         node.install_node_authority(adopt(&node, &org(), "c5b"))
@@ -30038,8 +30042,13 @@ mod sensing_authority_witness_tests {
             "the live authority pointer must equal A's original"
         );
         assert!(
+            Arc::ptr_eq(&node.org_revocation_store().expect("store"), &a_store),
+            "the live store must also return to A's original store"
+        );
+        assert!(
             !node.sensing_authority_snapshot_current(&snap),
-            "A->B->exact-A must be stale via the installation generation"
+            "A->B->exact-A must be stale via the installation generation ALONE \
+             (both pointers and the store generation returned to A's)"
         );
         let fresh = node
             .capture_sensing_authority_snapshot()
@@ -30059,8 +30068,16 @@ mod sensing_authority_witness_tests {
             OrgRevocationStore::init(scratch("c7store"), ProvisioningExpectation::MayBeFresh)
                 .expect("init store"),
         );
-        node.install_org_revocation_store(replacement)
+        node.install_org_revocation_store(replacement.clone())
             .expect("install dominating store");
+        // The NAMED replacement became live (not merely "some change").
+        assert!(
+            Arc::ptr_eq(
+                &node.org_revocation_store().expect("live store"),
+                &replacement
+            ),
+            "the intended replacement store must be the live one"
+        );
         assert!(
             !node.sensing_authority_snapshot_current(&snap),
             "store A->B must be stale"
@@ -30131,6 +30148,12 @@ mod sensing_authority_witness_tests {
     // complete authority/store/generation tuple; the returned snapshot is
     // coherent and current. Channels/barriers only — the org_install mutex
     // guarantees no result is available while the installer holds it.
+    //
+    // RED-coupled (verified locally, not committed): removing the
+    // `org_install.lock()` from `capture_sensing_authority_snapshot` makes the
+    // "capture completed while org_install held" assertion FAIL — the bounded
+    // `completed_rx.recv_timeout` returns `Ok` instead of `Timeout` because the
+    // lock-free capture races through. Production source restored after.
     #[tokio::test]
     async fn capture_blocks_until_install_publishes() {
         use std::sync::mpsc;
@@ -30142,11 +30165,12 @@ mod sensing_authority_witness_tests {
         let b = adopt(&node, &org(), "c9b");
 
         // `Barrier` is `Sync` (mpsc `Sender`/`Receiver` are not), so the pause
-        // closure coordinates via barriers; the channel only proves the capture
-        // started before release.
+        // closure coordinates via barriers; the channels prove capture started
+        // and did NOT complete while the installer held org_install.
         let paused = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (completed_tx, completed_rx) = mpsc::channel::<()>();
 
         let install_node = node.clone();
         let paused_i = paused.clone();
@@ -30167,12 +30191,28 @@ mod sensing_authority_witness_tests {
         let capture = std::thread::spawn(move || {
             started_tx.send(()).expect("started");
             // Blocks on org_install (held by the paused installer) until release.
-            capture_node.capture_sensing_authority_snapshot()
+            let result = capture_node.capture_sensing_authority_snapshot();
+            completed_tx.send(()).expect("completed");
+            result
         });
         started_rx.recv().expect("capture started before release");
 
+        // While publication exclusion is held, the capture MUST NOT complete.
+        // A bounded wait (not a sleep): it returns immediately on an incorrect
+        // early completion, and gives a finite bound in the correct blocked case.
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "capture completed while org_install was held"
+        );
+
         release.wait(); // installer publishes B, then drops org_install
         install.join().expect("install thread");
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture completes after publication");
         let snap = capture.join().expect("capture thread").expect("snapshot");
         assert!(
             node.sensing_authority_snapshot_current(&snap),
