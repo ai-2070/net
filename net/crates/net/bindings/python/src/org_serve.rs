@@ -98,16 +98,26 @@ pub fn serve_org(
     };
     let callable = Arc::new(handler);
 
-    let handle = net_sdk::org::serve_org_bytes_node(
-        node,
-        &service,
-        access,
-        move |caller: net_sdk::org::OrgCaller, body: bytes::Bytes| {
-            let callable = callable.clone();
-            async move { run_py_org_handler(callable, caller, body, timeout).await }
-        },
-    )
-    .map_err(|e| OrgError::new_err(org_serve_error(&e)))?;
+    // `serve_org_bytes_node` -> `serve_rpc_*` spawns an inbound-event bridge
+    // with a bare `tokio::spawn`, which needs an ambient runtime. This is a sync
+    // `#[pyfunction]` called on the Python thread with no runtime — enter the
+    // mesh's for the registration (the a2a binding does the same for the same
+    // reason). Without it, the first live serve panics "there is no reactor
+    // running"; the refusal-only tests never reached it.
+    let runtime = mesh.runtime_arc();
+    let handle = {
+        let _guard = runtime.enter();
+        net_sdk::org::serve_org_bytes_node(
+            node,
+            &service,
+            access,
+            move |caller: net_sdk::org::OrgCaller, body: bytes::Bytes| {
+                let callable = callable.clone();
+                async move { run_py_org_handler(callable, caller, body, timeout).await }
+            },
+        )
+        .map_err(|e| OrgError::new_err(org_serve_error(&e)))?
+    };
 
     Ok(PyOrgServeHandle {
         inner: parking_lot::Mutex::new(Some(handle)),

@@ -75,7 +75,19 @@ pub fn install_org_authority_node(
     let entity = node.entity_id().clone();
     let authority = NodeAuthority::open(dir, &entity).map_err(OrgProvisionError::Authority)?;
     node.install_node_authority(Arc::new(authority))
-        .map_err(OrgProvisionError::Authority)
+        .map_err(OrgProvisionError::Authority)?;
+    // Enable owner-cert (and scoped-envelope) emission. The core keeps this a
+    // separate toggle, but `owner_cert_under` — which derives BOTH the emission
+    // cert AND the scoped announcement's audience key — returns `None` while it
+    // is off, so a node with an installed authority but emission disabled emits
+    // NO scoped announcements (owner-scoped or granted) and is undiscoverable.
+    // A binding's single "install my org authority" startup step wants an
+    // org-ready node, so we enable it here; the in-process facade tests call it
+    // separately (idempotent). Without this, a binding provider is silently
+    // invisible — surfaced by the live Node cell (`org_live.test.ts`).
+    node.set_owner_cert_emission(true)
+        .map_err(OrgProvisionError::Authority)?;
+    Ok(())
 }
 
 /// Install a PROVIDER grant audience so a granted service can seal envelopes

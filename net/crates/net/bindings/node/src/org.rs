@@ -374,19 +374,47 @@ pub fn serve_org(
         OrgAccess::Granted => net_sdk::org::OrgAccess::Granted,
     };
 
-    let handle = net_sdk::org::serve_org_bytes_node(
-        node,
-        &service,
-        access,
-        move |caller: net_sdk::org::OrgCaller, body: bytes::Bytes| {
-            let tsfn = tsfn.clone();
-            async move { dispatch_to_js(tsfn, caller, body, timeout).await }
-        },
-    )
-    .map_err(|e| Error::from_reason(format!("org:serve_failed: {e}")))?;
+    // `serve_org_bytes_node` -> `serve_rpc_*` spawns an inbound-event bridge
+    // with a bare `tokio::spawn`, which needs an ambient runtime. This is a
+    // SYNC `#[napi]` method, so it runs on the JS thread with no runtime (napi's
+    // is only reachable via `env.spawn_future`). Enter our own for the
+    // registration; the bridge task then runs on it. Without this, the first
+    // live serve panics "there is no reactor running" — the refusal-only
+    // `org_binding.test.ts` never reached it; `org_live.test.ts` does.
+    let handle = {
+        let _rt_guard = org_serve_runtime().enter();
+        net_sdk::org::serve_org_bytes_node(
+            node,
+            &service,
+            access,
+            move |caller: net_sdk::org::OrgCaller, body: bytes::Bytes| {
+                let tsfn = tsfn.clone();
+                async move { dispatch_to_js(tsfn, caller, body, timeout).await }
+            },
+        )
+        .map_err(|e| Error::from_reason(format!("org:serve_failed: {e}")))?
+    };
 
     Ok(OrgServeHandle {
         inner: parking_lot::Mutex::new(Some(handle)),
+    })
+}
+
+/// A dedicated multi-thread runtime for the sync `serve_org` registration so the
+/// SDK's serve bridge (`serve_rpc_*` -> `tokio::spawn`) has an ambient runtime.
+/// napi's own runtime is only reachable from `env.spawn_future`, and org serve
+/// is documented as synchronous (a quick register), so a dedicated runtime — the
+/// same shape `org-ffi` uses on the C ABI — keeps the API sync. The bridge task
+/// lives here for the service's lifetime; the TSFN it calls is threadsafe, so
+/// cross-runtime dispatch to the JS thread is sound.
+fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("net-org-napi-serve")
+            .build()
+            .expect("build org-serve runtime")
     })
 }
 

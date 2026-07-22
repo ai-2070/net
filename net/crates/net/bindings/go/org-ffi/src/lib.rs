@@ -896,6 +896,12 @@ pub extern "C" fn net_org_serve(
             async move { org_dispatch(handler_id, caller_c, body, timeout).await }
         };
 
+        // `serve_org_bytes_node` -> `serve_rpc_*` spawns an inbound-event bridge
+        // task with a bare `tokio::spawn`, which needs an ambient runtime. This
+        // FFI entry point is called on a Go-owned C thread with no runtime, so
+        // enter ours for the registration (the bridge task then runs on it). The
+        // SDK tests never hit this because they serve inside `#[tokio::test]`.
+        let _rt_guard = runtime().enter();
         match net_sdk::org::serve_org_bytes_node(node, &service, access, handler) {
             Ok(inner) => {
                 unsafe {
