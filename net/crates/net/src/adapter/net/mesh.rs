@@ -4614,16 +4614,24 @@ fn spawn_sensing_frame_send(
         return;
     };
     let socket = socket.clone();
+    // Reserve the stream sequence and build the packet SYNCHRONOUSLY, before
+    // spawning the send. A caller serializing two sends (e.g. a lease
+    // deregister then a racing re-acquire, both under the lease apply mutex)
+    // thereby stamps their packets with stream sequences in call order; task
+    // scheduling can then reorder only the sends, and the receiving stream
+    // orders by sequence. (Allocating the sequence inside the spawned task —
+    // as this did before OLB-0.2's fix — let a later-created send win the
+    // sequence and invert the receiver's final state.)
+    let events = [Bytes::from(payload)];
+    // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
+    // carries the §4.4 continuity-bearing flag (see
+    // `sensing::SENSING_PROVISIONAL_STREAM`).
+    let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+    let packet = {
+        let mut builder = session.thread_local_pool().get();
+        builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
+    };
     tokio::spawn(async move {
-        let events = [Bytes::from(payload)];
-        // SI-4a: the stream id is the hop-authored ENVELOPE — for
-        // 0x0C03 it carries the §4.4 continuity-bearing flag (see
-        // `sensing::SENSING_PROVISIONAL_STREAM`).
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
-        let packet = {
-            let mut builder = session.thread_local_pool().get();
-            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
-        };
         let _ = socket.send_to(&packet, addr).await;
     });
 }
@@ -4739,6 +4747,19 @@ pub enum SensingRegistrationError {
     /// (existing-key refreshes stay admitted at capacity) — the
     /// retry-after-frees contract is identical.
     AtCapacity,
+    /// OLB-0: a lease (re-)registration hit the interest table's
+    /// `max_interests_per_peer` amplification bound
+    /// ([`sensing::RegisterOutcome::OverCap`]) — nothing was installed, so
+    /// the lease acquisition is rolled back. Retry after capacity frees.
+    OverCapacity,
+    /// OLB-0: a lease (re-)registration was refused locally against the
+    /// cached provider floor
+    /// ([`sensing::RegisterOutcome::RefusedByCachedFloor`]) — no row was
+    /// installed, so the lease acquisition is rolled back.
+    RefusedByFloor {
+        /// The cached minimum sample interval the request fell below.
+        minimum_supported: Duration,
+    },
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -4754,6 +4775,13 @@ impl std::fmt::Display for SensingRegistrationError {
             Self::AtCapacity => {
                 f.write_str("origin at live-stream capacity — registration rolled back")
             }
+            Self::OverCapacity => f.write_str(
+                "sensing interest table at max_interests_per_peer — lease acquisition rolled back",
+            ),
+            Self::RefusedByFloor { minimum_supported } => write!(
+                f,
+                "sensing registration refused against cached floor (min {minimum_supported:?}) — lease acquisition rolled back"
+            ),
         }
     }
 }
@@ -4988,9 +5016,13 @@ pub struct MeshNode {
     /// registering the same interest must share one wire registration,
     /// so neither's drop withdraws an interest the other still holds.
     sensing_interest_leases: sensing::SensingInterestLeases,
-    /// Serializes each sensing-lease decision with its wire apply
-    /// (register/deregister), so a final release racing a new acquire
-    /// leaves exactly one live registration (§4.3).
+    /// Serializes each sensing-lease decision with the synchronous
+    /// allocation of its wire packet's stream sequence
+    /// (`spawn_sensing_frame_send` reserves the sequence and builds the
+    /// packet before spawning the send), so a release racing a new acquire
+    /// produces packets whose stream sequences follow decision order rather
+    /// than task-scheduling order — the receiving stream orders by sequence,
+    /// so the live successor wins (§4.3).
     sensing_lease_apply_mu: parking_lot::Mutex<()>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
@@ -6918,80 +6950,100 @@ impl MeshNode {
     /// one refresh cadence (their minimum requested interval); the
     /// returned ticket must be released exactly once.
     ///
-    /// Errors exactly as
-    /// [`register_sensing_interest`](Self::register_sensing_interest)
-    /// would on the (re-)registering transition; on error the just-taken
-    /// lease reference is rolled back, so a failed acquire leaves no
-    /// dangling count.
+    /// The soft-state ttl is a single node-owned policy
+    /// ([`MeshNodeConfig::sensing_interest_ttl`]), never a caller input, so
+    /// there is no second per-holder aggregation to keep consistent.
+    ///
+    /// Fails (rolling the just-taken reference back, leaving no dangling
+    /// count) if the (re-)registration errors OR returns any non-installed
+    /// outcome — `OverCap` or `RefusedByCachedFloor` become
+    /// [`SensingRegistrationError::OverCapacity`] /
+    /// [`SensingRegistrationError::RefusedByFloor`], so the lease registry
+    /// never records an installation the interest table refused. The
+    /// organization-routing layer converts such a failure into `Potential`
+    /// and keeps routing deterministically; sensing failure is never
+    /// invocation failure.
     pub fn acquire_sensing_interest_lease(
         &self,
         spec: &sensing::InterestSpec,
         provider: u64,
         requested_sample_interval: Duration,
-        soft_state_ttl: Duration,
     ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
         let key = sensing::SensingLeaseKey::ExactProvider {
             audience: spec.audience,
             interest_digest: spec.interest_digest(),
             provider,
         };
-        // Serialize the decision with its wire apply, so a final release
-        // racing a new acquire leaves exactly one live registration.
+        // Serialize the decision with the synchronous allocation of its wire
+        // packet's stream sequence, so a release racing a new acquire stamps
+        // their packets in decision order (see `sensing_lease_apply_mu`).
         let _apply = self.sensing_lease_apply_mu.lock();
-        let (token, action) = self
-            .sensing_interest_leases
-            .acquire(key, requested_sample_interval);
-        if let Err(err) = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, action) {
+        let (token, action) =
+            self.sensing_interest_leases
+                .acquire(key, spec, requested_sample_interval);
+        let ticket = sensing::SensingLeaseTicket { key, token };
+        if let Err(err) = self.apply_sensing_lease_action(key, action) {
             // Roll the reference back and reconcile the wire to the
-            // post-release view. A failed first register left no row
-            // (register_sensing_interest rolls its own row back at
-            // capacity), so the resulting Deregister is a harmless no-op.
-            let rollback = self.sensing_interest_leases.release(key, token);
-            let _ = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, rollback);
+            // post-release view. A non-installed outcome left no row, so the
+            // resulting Deregister is a harmless no-op.
+            let rollback = self.sensing_interest_leases.release(ticket);
+            let _ = self.apply_sensing_lease_action(key, rollback);
             return Err(err);
         }
-        Ok(sensing::SensingLeaseTicket { key, token })
+        Ok(ticket)
     }
 
     /// Release a sensing-interest lease acquired via
     /// [`acquire_sensing_interest_lease`](Self::acquire_sensing_interest_lease).
-    /// Best-effort and idempotent: the last holder's release deregisters,
-    /// a strictest-holder release relaxes the cadence to the surviving
-    /// minimum, and an already-released ticket is a no-op.
-    pub fn release_sensing_interest_lease(
-        &self,
-        ticket: sensing::SensingLeaseTicket,
-        spec: &sensing::InterestSpec,
-        provider: u64,
-        soft_state_ttl: Duration,
-    ) {
+    /// Ticket-owned: all wire identity comes from the registry's stored
+    /// state, never from re-supplied arguments, so a ticket can never be
+    /// released against a different interest. Idempotent — the last holder's
+    /// release deregisters, a strictest-holder release relaxes the cadence
+    /// to the surviving minimum, and an already-released ticket is a no-op.
+    pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
         let _apply = self.sensing_lease_apply_mu.lock();
-        let action = self
-            .sensing_interest_leases
-            .release(ticket.key, ticket.token);
-        let _ = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, action);
+        let action = self.sensing_interest_leases.release(ticket);
+        let _ = self.apply_sensing_lease_action(ticket.key, action);
     }
 
     /// Execute the wire transition a lease mutation calls for. Called only
-    /// under `sensing_lease_apply_mu`.
+    /// under `sensing_lease_apply_mu`. The action carries the authoritative
+    /// spec; the provider comes from the key; the ttl is the node policy.
     fn apply_sensing_lease_action(
         &self,
-        spec: &sensing::InterestSpec,
-        provider: u64,
-        soft_state_ttl: Duration,
+        key: sensing::SensingLeaseKey,
         action: sensing::LeaseAction,
     ) -> Result<(), SensingRegistrationError> {
+        // Only exact-provider leases are wired in this slice; a provider-free
+        // key resolves through the rendezvous leader path, added later.
+        let sensing::SensingLeaseKey::ExactProvider { provider, .. } = key else {
+            return Ok(());
+        };
         match action {
-            sensing::LeaseAction::Register { interval, .. }
-            | sensing::LeaseAction::Reregister { interval, .. } => {
-                self.register_sensing_interest(spec, provider, interval, soft_state_ttl)?;
+            sensing::LeaseAction::Register { spec, interval }
+            | sensing::LeaseAction::Reregister { spec, interval } => {
+                match self.register_sensing_interest(
+                    &spec,
+                    provider,
+                    interval,
+                    self.config.sensing_interest_ttl,
+                )? {
+                    sensing::RegisterOutcome::Registered(_) => Ok(()),
+                    // The table installed nothing — do not let the lease claim
+                    // an installation. The caller rolls the reference back.
+                    sensing::RegisterOutcome::OverCap => {
+                        Err(SensingRegistrationError::OverCapacity)
+                    }
+                    sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
+                        Err(SensingRegistrationError::RefusedByFloor { minimum_supported })
+                    }
+                }
+            }
+            sensing::LeaseAction::Deregister { spec } => {
+                self.deregister_sensing_interest(&spec, provider);
                 Ok(())
             }
             sensing::LeaseAction::Unchanged => Ok(()),
-            sensing::LeaseAction::Deregister { .. } => {
-                self.deregister_sensing_interest(spec, provider);
-                Ok(())
-            }
         }
     }
 
@@ -7571,6 +7623,17 @@ impl MeshNode {
     /// node's own entity commitment by default.
     pub fn sensing_local_root(&self) -> sensing::AudienceScopeCommitment {
         self.sensing_local_root
+    }
+
+    /// Test seam (OLB-0 §4.3): the node-global sensing-interest lease's
+    /// live holder count and installed interval for one key — `None` when
+    /// no holder references it (e.g. after a rolled-back acquisition).
+    #[doc(hidden)]
+    pub fn sensing_lease_entry_for_test(
+        &self,
+        key: &sensing::SensingLeaseKey,
+    ) -> Option<(usize, Duration)> {
+        self.sensing_interest_leases.entry_for_test(key)
     }
 
     /// Install the sensing-leader role on this node (plan §4.1),
