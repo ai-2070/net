@@ -8,6 +8,8 @@
 
 **Tech stack:** Rust, `net` sensing/organization/capability folds, RedEX rendezvous, `net-sdk`, Tokio watch/tasks, existing nRPC and scheduler projections.
 
+**Companion:** [`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md) — the first named product consumer (same-organization sensed load balancing beneath `OrgClient::call`). Its OLB-0 prerequisite is this plan's S0 + S1 and additionally pins the node-global interest-lease witness.
+
 ---
 
 ## 1. Repository audit and current state
@@ -46,7 +48,7 @@ sensing_readiness_overlay(...)
 sensed_candidates(...)
 subscribe_sensing_overlay_changes(...)
 match_islands_sensed(...)
-claim_first_sensed(...)
+claim_island_sensed(...)
 ```
 
 The plane ships dark through `MeshNodeConfig::enable_sensing_coalescing = false`. An origin additionally requires a persisted `sensing_incarnation`.
@@ -256,7 +258,7 @@ Do not redesign the scheduler bridge. Re-export the existing low-level methods t
 
 ```rust
 mesh.match_islands_sensed(criteria, &watch)?;
-mesh.claim_first_sensed(criteria, &watch, claim_options).await?;
+mesh.claim_island_sensed(criteria, &watch, until).await?;
 ```
 
 The wrapper converts `watch.current()` to the existing `SensedCandidates` input and preserves the current claim semantics. Sensing ranks/prunes; the reservation fold and claim remain authoritative.
@@ -375,7 +377,7 @@ first watch for key
 → start ttl/2 refresh
 
 additional equivalent watch
-→ increment SDK-local reference count
+→ increment the node-global reference count
 
 leader/population/topology change
 → recompute leader/population
@@ -389,7 +391,7 @@ last close/drop
 → soft-state expiry remains the crash safety net
 ```
 
-All zero-to-one and one-to-zero transitions are serialized per `Mesh`. Add narrow core deregistration methods for provider-free and exact-provider local interests.
+**The registration refcount lives on `MeshNode`, never on SDK `Mesh`.** A sensing registration mutates node state, and multiple SDK/binding wrappers can share one node (`Mesh::from_node_arc` is public; every binding holds `Arc<MeshNode>`). The audience-lease regression (`71c2fbf71`) proved the SDK-local shape wrong: two wrappers over one node each thought they were the first installer, and the first to drop withdrew a live client's registration. Copy the rehomed template exactly — a node-owned refcount map keyed `(authority audience scope, interest digest)` with acquire/release methods on `MeshNode` (the `OrgAudienceLeases` pattern, `org_grant_registry.rs` + `mesh.rs` acquire/release), and an RAII drop-guard in the SDK (`AudienceLeaseGuard` pattern). `SensingWatch` holds the guard only. All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, and the node-side lock covers the transition, not only counter mutation, so a final drop racing a new watch leaves one live registration. Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
 
 `changed()` uses the existing unified generation receiver but always rereads exact current projection after waking. The wake alone is never evidence.
 
@@ -446,8 +448,9 @@ Same-organization scope derives from installed `NodeAuthority`; do not expose th
 2. Derive the owner sensing audience from `OrgId`, preserving the existing 32-byte commitment/wire shape where possible.
 3. Make provider-free leader election consume only the verified, live member projection.
 4. Add exact local deregistration for provider-free and provider-targeted interests.
-5. Add ownership-safe evaluator registration/removal.
-6. Keep the old explicit `sensing_owner_root` path low-level and opt-in; the SDK never uses it.
+5. Add the node-global interest lease: refcount map on `MeshNode` keyed `(audience scope, interest digest)`, acquire/release methods, RAII guard in the SDK — the `OrgAudienceLeases` template, never an SDK-wrapper-local count (§4.3).
+6. Add ownership-safe evaluator registration/removal.
+7. Keep the old explicit `sensing_owner_root` path low-level and opt-in; the SDK never uses it.
 
 **Gate:** No organization-auth implementation until its separate review is signed off at an exact commit.
 
@@ -466,7 +469,7 @@ Same-organization scope derives from installed `NodeAuthority`; do not expose th
 
 1. Add query validation and canonical conversion to `InterestSpec`.
 2. Add owner-authority candidate/leader resolution.
-3. Add reference-counted watch registration, ttl/2 refresh, explicit close, and drop cleanup.
+3. Add watch registration over the node-global interest lease (S0), ttl/2 refresh, explicit close, and drop cleanup.
 4. Add exact snapshot projection over the authorized population.
 5. Add missed-wakeup-safe `changed()`.
 6. Add ownership-safe provider registration and state-edge notification.
@@ -549,7 +552,7 @@ This slice is optional for the first sensing SDK release. S0–S3 stand alone.
 
 ### Watch lifecycle
 
-7. Two equivalent local watches produce one registration and one refresh loop.
+7. Two equivalent local watches — including watches opened through two different `Mesh` wrappers over one `MeshNode` — produce one registration and one refresh loop, and the first drop cannot deregister under the second live watch.
 8. Closing one clone retains the registration; closing the last emits deregistration.
 9. Drop stops refresh; missed cleanup still expires through soft state.
 10. Last-close racing a new watch leaves one live registration.
