@@ -129,18 +129,27 @@ impl PyOrgCredentials {
     #[new]
     #[pyo3(signature = (membership, dispatcher, grants, audience_secret_paths))]
     fn new(
+        py: Python<'_>,
         membership: &[u8],
         dispatcher: &[u8],
         grants: Vec<Vec<u8>>,
         audience_secret_paths: Vec<String>,
     ) -> PyResult<Self> {
+        // Copy the borrowed byte slices into owned buffers so the blocking
+        // loader (opens + validates each secret file, verifies every signature)
+        // can run with the GIL RELEASED without touching Python-owned memory
+        // off-thread. `grants` and the paths are already owned.
+        let membership = membership.to_vec();
+        let dispatcher = dispatcher.to_vec();
         let paths: Vec<std::path::PathBuf> = audience_secret_paths
             .iter()
             .map(std::path::PathBuf::from)
             .collect();
-        let inner =
-            net_sdk::org::OrgCredentials::from_parts(membership, dispatcher, &grants, &paths)
-                .map_err(|e| org_err_to_py(net_sdk::org::OrgSdkError::Credentials(e)))?;
+        let inner = py
+            .detach(|| {
+                net_sdk::org::OrgCredentials::from_parts(&membership, &dispatcher, &grants, &paths)
+            })
+            .map_err(|e| org_err_to_py(net_sdk::org::OrgSdkError::Credentials(e)))?;
         Ok(Self {
             inner: parking_lot::Mutex::new(Some(inner)),
         })

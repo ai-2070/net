@@ -189,12 +189,18 @@ async fn run_py_org_handler(
 /// created with the matching ``identity_seed``.
 #[pyfunction]
 pub fn install_org_authority(
+    py: Python<'_>,
     mesh: &crate::mesh_bindings::NetMesh,
     authority_dir: String,
 ) -> PyResult<()> {
     let node = mesh.node_arc_clone()?;
-    net_sdk::org::install_org_authority_node(&node, std::path::Path::new(&authority_dir))
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    // Blocking file I/O (opens + validates the adopted authority dir) — release
+    // the GIL so other Python threads keep running, matching the crate's
+    // convention for blocking work.
+    py.detach(|| {
+        net_sdk::org::install_org_authority_node(&node, std::path::Path::new(&authority_dir))
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Install a provider grant audience so a ``"granted"`` service can seal
@@ -204,15 +210,22 @@ pub fn install_org_authority(
 /// A ``"same_org"`` provider does NOT need this.
 #[pyfunction]
 pub fn install_provider_grant_audience(
+    py: Python<'_>,
     mesh: &crate::mesh_bindings::NetMesh,
     grant: &[u8],
     audience_secret_path: String,
 ) -> PyResult<()> {
     let node = mesh.node_arc_clone()?;
-    net_sdk::org::install_provider_grant_audience_node(
-        &node,
-        grant,
-        std::path::Path::new(&audience_secret_path),
-    )
+    // Copy the borrowed grant bytes so the blocking loader (opens + validates
+    // the secret file) can run with the GIL RELEASED without touching
+    // Python-owned memory off-thread.
+    let grant = grant.to_vec();
+    py.detach(|| {
+        net_sdk::org::install_provider_grant_audience_node(
+            &node,
+            &grant,
+            std::path::Path::new(&audience_secret_path),
+        )
+    })
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
