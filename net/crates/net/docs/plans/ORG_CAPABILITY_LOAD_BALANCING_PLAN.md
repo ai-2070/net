@@ -1,12 +1,44 @@
 # Org Capability Load Balancing Plan (OLB)
 
-**Version:** v0.1 draft (2026-07-22). **Status: DRAFT — not reviewed, not
-authorized.** No implementation slice may start before this plan and the
-sensing prerequisite below are signed off.
+**Version:** v0.2 — applies Kyra's review verdict (2026-07-22, read at
+clean master `447d0964`): product architecture **APPROVED** (the
+discovery → authority → sensing → selection → exact invocation →
+admission separation, the thin two-verb surface, Unknown-as-capacity,
+SameOrg-first rollout, granted-unsensed fallback, and node-global
+ownership doctrine); implementation was **BLOCKED** on two structural
+findings and four bounded corrections, all applied in this revision:
+
+1. **Private providers never entered the sensing producer path** —
+   org-private routing now uses **exact-provider, org-authenticated
+   sensing leases** derived from private authorized discovery, never
+   provider-free rendezvous (§5.1a, §7). The provider-free sensing
+   population deliberately excludes locally private nRPC services (the
+   private-capability existence-oracle guard), so a rendezvous leader
+   can never re-discover what private discovery already authorized;
+   `resolved_population` is a projection-stage clamp, not a producer.
+2. **Organization membership is now authenticated at sensing
+   registration** — membership-cert-carrying registration variants,
+   validated at every receiving hop; a narrow additive wire extension
+   at registration intake only (sensing plan S0; §5.1b). The
+   attestation transcript, continuity, and epoch semantics are
+   unchanged.
+3. **The lazy watch has a durable owner** — a bounded, clone-shared
+   `OrgRoutingState` retains the interest guards across calls (§7).
+4. **The node-global lease aggregates cadence** with token-indexed
+   intervals, not a bare refcount, and its key supports both
+   provider-free and exact-provider shapes (§7; sensing plan §4.3).
+5. **Provider evidence and consumer-relative viability are separated**
+   — `Unknown` never prunes; `NonViable` prunes only from fresh exact
+   evidence; the error field is `non_viable`, not `not_ready` (§8, §10).
+6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
+   non-stampeding) (§9).
+
+**Status: revised draft — awaiting re-review. Implementation remains
+unauthorized until the blockers' corrections are signed off.**
 
 **The sentence:** organization-aware load balancing is an internal
-composition of private authorized discovery, capability sensing, and exact
-protected invocation — **not** a new public `OrgLoadBalancer` API.
+composition of private authorized discovery, capability sensing, and
+exact protected invocation — **not** a new public `OrgLoadBalancer` API.
 
 The application still writes:
 
@@ -21,8 +53,8 @@ Internally:
 private verified discovery
 → per-provider authority matching
 → direct reachability
-→ authority-scoped sensing
-→ Ready / Unknown / NotReady
+→ exact-provider org-authenticated sensing
+→ fresh Viable / Potential / NonViable projection
 → sensed provider selection
 → one exact protected call
 → provider-local admission
@@ -36,7 +68,7 @@ language-binding surface is required.
 implemented two-verb facade this composes beneath),
 [`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)
 (the sensing SDK lifecycle this consumes — its S0/S1 are OLB-0's
-prerequisite),
+prerequisite, including the org-authenticated registration seam),
 [`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md) /
 [`OA2E_INTEGRATION_DESIGN.md`](OA2E_INTEGRATION_DESIGN.md) (the closed
 authority substrate — untouched here),
@@ -47,7 +79,7 @@ The OA plan's "Deliberately NOT in v1" list defers **live private
 sensing** to its own plan. This is that plan arriving with a named
 consumer, not new scope invented beside OA.
 
-Line references below are a snapshot at `master` `80e388ef5`.
+Line references below are a snapshot near master `80e388ef5`/`447d0964`.
 
 ---
 
@@ -92,7 +124,11 @@ This plan does not add:
 - a central service registry;
 - a proxy or sidecar;
 - retries after ambiguous execution;
-- sensing authority implied by membership, discovery, or invocation alone;
+- sensing authority inferred from transport identity, public discovery,
+  `DISCOVER`, or `INVOKE`. **SameOrg sensing is explicitly authorized**
+  by current verified membership in the provider-owner organization,
+  under the organization sensing-registration rule defined in sensing
+  S0 — an explicit authority decision, never an inference;
 - language-specific balancing implementations.
 
 Every language inherits the same behavior from Rust `OrgClient::call`.
@@ -141,6 +177,9 @@ The substrate under `src/adapter/net/behavior/sensing/` provides:
 - request-relative provider readiness: `ReadinessEvaluator`
   (`evaluator.rs:135`) → signed attestations (`wire.rs`), with
   `Ready { estimated_start }` (`evaluator.rs:61-64`);
+- **an exact-provider registration leg**:
+  `MeshNode::register_sensing_interest(spec, provider, ...)`
+  (`mesh.rs:6702`) — the leg org-private routing uses (§5.1a);
 - continuity and expiry: `ObservationCell` (`continuity.rs:183`),
   suspicion window `continuity_factor × max(cadence, D)`, stale
   attestations project to `Unknown`, never `NotReady`
@@ -149,8 +188,9 @@ The substrate under `src/adapter/net/behavior/sensing/` provides:
   route_estimate }` (`controller.rs:248-257`), joined by
   `classify_branch` (`controller.rs:294-308`) under
   `ConsumerLatencyBudget::admits` (`identity.rs:307-315`);
-- the three-way projection: `ProjectedReadiness::{Ready, NotReady,
-  Unknown}` (`continuity.rs:80-89`) and its budget-relative form
+- the two projection layers: provider evidence
+  `ProjectedReadiness::{Ready, NotReady, Unknown}`
+  (`continuity.rs:80-89`) and the budget-relative
   `BranchViability::{Viable(cost), Potential, NonViable}`
   (`controller.rs:279-290`);
 - sensed candidate ordering: `SensedCandidates { viable, potential,
@@ -158,26 +198,50 @@ The substrate under `src/adapter/net/behavior/sensing/` provides:
   (`scheduler_bridge/readiness.rs:41-63`);
 - unified change notifications:
   `subscribe_sensing_overlay_changes` (`mesh.rs:7310`);
-- **a population clamp:** `MeshNode::sensed_candidates(spec, budget,
-  resolved_population)` (`mesh.rs:7296`) takes the caller-resolved
-  population, so the consumer decides who may appear at all.
+- a projection-stage population clamp: `MeshNode::sensed_candidates(spec,
+  budget, resolved_population)` (`mesh.rs:7296`).
 
-The load-balancing work is a join between these two already-correct
-paths.
+**What the clamp is and is not.** `resolved_population` prevents
+unauthorized retained observations from appearing in a projection. It
+does **not** create sensing branches or observations — it is
+defense-in-depth at the consumer stage, never the producer path.
 
-### 3.3 What is missing (the OLB-0 prerequisite)
+### 3.3 The producer gap (why exact-provider leases)
+
+The provider-free rendezvous leg resolves providers from the ordinary
+capability fold (`snapshot.rs`), and production deliberately removes
+locally private nRPC services from that sensing population — otherwise
+a peer holding no grant could sense `nrpc:<granted-service>` and
+behaviorally confirm the private service exists (the existence-oracle
+guard). Owner/grant-private announcements do not become public
+capability-fold entries.
+
+So the naive composition fails silently:
+
+```text
+OrgClient privately discovers providers A and B
+→ provider-free sensing leader sees no private declarations
+→ no provider registrations → no attestations
+→ A and B remain Unknown forever
+```
+
+`resolved_population` cannot repair that after the fact. Organization
+routing therefore never asks the generic leader to rediscover providers
+the org client already discovered securely — it senses exactly those
+providers directly (§5.1a).
+
+### 3.4 What is missing (the OLB-0 prerequisite)
 
 - Interests today are TTL soft-state only: no public deregistration on
   `MeshNode`, and **no refcounting anywhere** (refresh at ttl/2, dropped
   after two missed refreshes — `mesh.rs:1670-1677`).
 - The sensing owner scope is the operator-configured
   `sensing_owner_root` commitment bounded by PSK + TOFU
-  (`mesh.rs:1726`, `scope.rs:85-109`) — the temporary fleet assertion
-  the sensing SDK plan's S0 replaces with verified organization
-  authority.
+  (`mesh.rs:1726`, `scope.rs:85-109`) — and the registration frame
+  carries **no organization membership proof** at all (§5.1b).
 
 Both are closed by the sensing plan's S0/S1; §13 OLB-0 pins the exact
-exit witness this plan additionally requires.
+exit witnesses this plan additionally requires.
 
 ---
 
@@ -197,15 +261,17 @@ OrgClient::call(service)
 → direct-session and health eligibility
 → authorized candidate set
 
-authorized candidate set
-→ matching authority-scoped sensing snapshot
-     (authorized candidates ARE the resolved_population — sensing can
-      rank or remove, never add)
+authorized candidate set (SameOrg subset)
+→ one exact-provider, org-authenticated sensing lease per authorized
+  same-org provider (retained in OrgRoutingState, §7)
+→ join resulting observations against the same authorized population
+  (resolved_population clamp as projection-stage defense in depth)
 → classify each candidate:
-     Ready(score) | Unknown | NotReady(exact interest)
+     evidence    Ready(estimated_start) | Unknown | NotReady
+     projection  Viable(cost) | Potential | NonViable
 
-Ready + Unknown
-→ shared sensed-provider selector
+Viable + Potential
+→ shared sensed-provider selector (pinned P2C contract, §9)
 → exact EntityId
 
 selected provider + selected authority relation
@@ -221,8 +287,11 @@ The ordering is load-bearing:
 authority filtering BEFORE sensing
 ```
 
-The SDK must never issue sensing interests for private providers the
-caller was not already authorized to discover, and must never pass a
+Private authority determines the providers; sensing may then observe
+**exactly those providers** — structurally, because the interests are
+exact-provider registrations minted from the authorized candidate set.
+The SDK never issues a sensing interest for a private provider the
+caller was not already authorized to discover, and never passes a
 provider into the sensing join that verified discovery did not produce.
 
 Likewise:
@@ -269,11 +338,63 @@ It is **not** derived from:
   automates it);
 - seeing a public capability announcement.
 
-The candidate population comes from the verified owner-private store
-(`owner_private_capability_providers`). The sensing rendezvous
-population comes from verified members of that same organization
-(`sensing_leader` election over the member projection,
-`rendezvous.rs:96-117`).
+#### 5.1a Exact-provider leases, not provider-free rendezvous
+
+The two sensing consumption paths are deliberately distinct:
+
+```text
+generic SensingWatch
+→ provider-free rendezvous where discovery permits
+
+internal OrgClient sensing
+→ exact-provider leases derived from private authorized discovery
+```
+
+For organization-private calls the client mints one exact-provider
+interest per authorized same-org provider, reusing the existing
+`MeshNode::register_sensing_interest(spec, provider, ...)` leg:
+
+```rust
+let candidates = self.authorized_candidates(service)?;
+
+for candidate in candidates.same_org() {
+    routing_state.acquire_exact_interest(&spec, candidate.provider.node_id());
+}
+
+let sensed = node.sensed_candidates(&spec, &budget, Some(&candidate_node_ids));
+```
+
+This preserves the confidentiality ordering structurally — private
+authority determines providers; sensing observes exactly those — and
+keeps the existence-oracle guard intact: the sensing leader never
+becomes a second private-discovery service, and locally private
+services stay out of the provider-free population.
+
+#### 5.1b Org-authenticated registration (the S0 seam)
+
+Changing the audience commitment from an entity root to an `OrgId`
+commitment separates audiences; it does not authenticate the session.
+The current registration frame carries no membership proof, so same-org
+sensing requires the sensing plan's S0 registration seam: registration
+variants carrying the registering hop's `OrgMembershipCert`, validated
+at every receiving hop —
+
+```text
+authenticated sender EntityId == membership.member
+membership.org_id == local NodeAuthority.owner_org
+membership signature valid
+membership time window current
+membership generation meets current floor
+interest audience == canonical commitment for membership.org_id
+```
+
+— with each relay proving its **own** membership when re-registering
+upstream. This is a narrow additive wire extension at registration
+intake only (0x0C02 variants or a versioned registration subprotocol,
+selected at S0 review); the 0x0C03 attestation transcript, continuity,
+and epoch semantics are unchanged. The candidate population comes from
+the verified owner-private store; the sensing counterparties are
+verified members of that same organization.
 
 This is the first product proof because it needs no cross-organization
 sensing grant:
@@ -303,8 +424,9 @@ SENSE → may actively monitor dynamic provider readiness
 
 Therefore, during the first slice:
 
-- same-org providers may produce Ready/NotReady;
-- granted foreign providers remain Unknown;
+- same-org providers may produce Ready/NotReady evidence and
+  Viable/NonViable projections;
+- granted foreign providers remain Unknown/Potential;
 - they remain eligible;
 - the existing deterministic fallback selects among them.
 
@@ -396,11 +518,11 @@ mesh.serve_org("customer.read", OrgAccess::SameOrg, handler)?;
 ```
 
 A provider with no evaluator streams `ProviderUnknown`
-(`mesh.rs:7019-7025` doc) and therefore projects Unknown — eligible,
-never preferred, never pruned. Applications with request-specific
-constraints — model name, VRAM, batch size, locality — use the low-level
-sensing and `OrgProofIntent` seams. Those requirements do not justify
-expanding the common `org.call` signature.
+(`mesh.rs:7019-7025` doc) and therefore projects Unknown/Potential —
+eligible, never preferred, never pruned. Applications with
+request-specific constraints — model name, VRAM, batch size, locality —
+use the low-level sensing and `OrgProofIntent` seams. Those requirements
+do not justify expanding the common `org.call` signature.
 
 ---
 
@@ -411,14 +533,61 @@ latency and destroy coalescing. Use lazy, shared warming:
 
 ```text
 first call for capability C
-→ acquire node-global sensing-interest lease for C
+→ install exact-provider interest guards for C's authorized
+  same-org providers (node-global lease acquire)
 → use any immediately available snapshot
 → missing observation is Unknown
 → call proceeds without waiting
 
 later calls for C
-→ use warmed fresh snapshot
+→ reuse warmed observations
 ```
+
+### The durable owner: `OrgRoutingState`
+
+A guard that lives only inside one call would drop at call end,
+deregister, and leave every call cold. The guards need a clone-shared
+owner with client lifetime:
+
+```rust
+struct OrgRoutingState {
+    watches: Mutex<BoundedMap<OrgInterestKey, ExactInterestSet>>,
+    selector: SensedSelectorState,
+}
+
+pub struct OrgClient {
+    // existing fields
+    routing: Arc<OrgRoutingState>,
+}
+```
+
+Semantics:
+
+```text
+all OrgClient clones            → share routing state
+first call to service C         → install exact-provider interest guards
+later call to C                 → reuse warmed observations
+authorized provider set changes → acquire new exact interests,
+                                  release removed interests
+last client clone drops/closes  → release all guards
+```
+
+The actual registration refcount remains node-global (below).
+`OrgRoutingState` owns only RAII guards and selector state — the
+`AudienceLeaseGuard` ownership shape, one level up.
+
+**Bound the cache.** Service names are caller-controlled, so the watch
+map has a fixed bound (64 or 128 distinct active capabilities per client
+state, pinned in OLB-2). At the bound:
+
+```text
+organization call still proceeds
+→ sensing is treated as unavailable
+→ deterministic fallback
+→ capacity metric increments
+```
+
+Never an unbounded per-client service/watch cache.
 
 ### Why node-global (the lease lesson)
 
@@ -434,14 +603,14 @@ client's audience. It was rehomed to `MeshNode` as `OrgAudienceLeases`
 (`mesh.rs:8437` / `:8486`) and an SDK RAII `AudienceLeaseGuard`
 (`sdk/src/org/lease.rs:27`).
 
-The sensing-interest lease copies that template exactly:
+The sensing-interest lease copies that ownership template:
 
 ```text
 sensing-interest refcount → MeshNode
-SensingWatch / OrgClient  → RAII guard only
+SensingWatch / OrgRoutingState → RAII guards only
 ```
 
-Two wrappers acquiring the same interest must produce:
+Two owners acquiring the same interest must produce:
 
 ```text
 first acquire  → register
@@ -450,33 +619,51 @@ first drop     → refcount 1, registration remains
 last drop      → deregister
 ```
 
-### The lease key
+### The lease key — two shapes
 
 ```text
-(authority audience scope, interest digest)
+ProviderFree  { audience, interest_digest }
+ExactProvider { audience, interest_digest, provider }
 ```
 
-The interest digest already binds every identity dimension: capability,
-canonical constraints, work-latency envelope, provider selector, result
-mode, disclosure class, and the audience commitment
-(`identity.rs:763-779`). Two consumer-local dimensions deliberately do
-not fork the lease, because they are not interest identity
-(`identity.rs:863-878`):
-
-- the end-to-end `ConsumerLatencyBudget` — a per-watch projection input,
-  applied at snapshot time, never on the wire;
-- `requested_sample_interval` — the lease registers the minimum across
-  live watchers and re-registers on change.
+A key of only `(audience, interest_digest)` is insufficient: the
+exact-provider registrations §5.1a mints are per-provider node state
+and must be acquired, counted, and released per provider. The interest
+digest already binds every identity dimension — capability, canonical
+constraints, work-latency envelope, provider selector, result mode,
+disclosure class, and the audience commitment (`identity.rs:763-779`).
+Two consumer-local dimensions deliberately do not fork the lease,
+because they are not interest identity (`identity.rs:863-878`): the
+end-to-end `ConsumerLatencyBudget` (a per-watch projection input) and
+`requested_sample_interval` (aggregated below).
 
 Same digest but different authority audiences never share private
 observations — enforced structurally, since the audience is inside the
 digest.
 
+### Cadence aggregation — richer than a refcount
+
+A bare count cannot relax the wire cadence when the strictest watcher
+leaves. Each node-global lease entry retains token-indexed live
+requests (full contract and witnesses in the sensing plan §4.3/S0):
+
+```text
+watch A requests 100 ms, watch B requests 500 ms
+→ registered at 100 ms
+A closes
+→ recompute minimum → re-register at 500 ms
+B closes
+→ exact deregistration
+```
+
+Stale deregistration/re-registration tokens cannot remove a successor
+registration.
+
 ### Capacity behavior
 
 Sensing is an optimization. If the node cannot install another interest
 (`max_interests_per_peer` 512, emitter `AtCapacity` rollback,
-`mesh.rs:6786`):
+`mesh.rs:6786`) or the client-side watch bound is hit:
 
 ```text
 authorized call remains available
@@ -503,28 +690,48 @@ This fallback must be observable, not silent.
 
 ## 8. Candidate classification
 
-For each already-authorized and reachable provider, the join produces:
+Two layers, never conflated:
+
+**Provider evidence** (what the provider signed, continuity-gated —
+`ProjectedReadiness`, `continuity.rs:80-89`):
 
 ```text
-Ready { provider_start, estimated_e2e }   — fresh exact attestation,
-                                             within budget
-Unknown                                   — no usable evidence
-NotReady                                  — fresh exact attestation says
-                                             cannot begin
+Ready { estimated_start } | Unknown | NotReady
 ```
 
-**Reuse the generic projection; do not define an org-specific public
-type.** `ProjectedReadiness` (`continuity.rs:80-89`) is the
-continuity-gated status; `classify_branch` (`controller.rs:294-308`)
-already produces the budget-relative `Viable(route + start cost) /
-Potential / NonViable` split this table describes, and
-`project_sensed_candidates` (`scheduler_bridge/readiness.rs:69-87`)
-already ranks it. Whatever thin internal enum `OrgClient` carries is a
-private projection of those, never exported.
+**Consumer-relative projection** (evidence joined with this consumer's
+route estimate under its budget — `BranchViability` via
+`classify_branch`, `controller.rs:294-308`):
+
+```text
+Viable(cost = route_estimate + estimated_start)
+Potential
+NonViable
+```
+
+A provider can sign `Ready` and still project `NonViable` when its
+signed start estimate plus the current consumer-local route estimate
+exceeds a hard budget. Selection consumes the projection layer;
+`OrgClient` carries no new public type for either — whatever thin
+internal enum it holds is a private projection of the generic types,
+never exported.
+
+### The pruning rule (locked)
+
+```text
+Unknown never prunes.
+
+NonViable may prune only when derived from fresh exact evidence:
+- a fresh exact provider NotReady; or
+- a fresh exact Ready whose signed start estimate plus the current
+  consumer-local route estimate exceeds a hard budget.
+
+Stale evidence becomes Potential/Unknown, never NonViable.
+```
 
 ### Freshness rules
 
-An observation contributes only if:
+An observation contributes as evidence only if:
 
 - its signature verifies;
 - its provider identity matches the candidate;
@@ -537,22 +744,10 @@ An observation contributes only if:
 - the provider remains in authorized discovery;
 - the route estimate is current.
 
-Any stale or invalid observation becomes:
-
-```text
-Unknown
-```
-
-Never:
-
-```text
-NotReady
-```
-
-Only a fresh, exact-interest provider observation may produce NotReady.
-This is already the substrate's projection law ("optimism must be
-earned; pessimism is safe", `continuity.rs:1-17`); the org join inherits
-it rather than re-deriving it.
+Any stale or invalid observation degrades to Unknown/Potential. This is
+already the substrate's projection law ("optimism must be earned;
+pessimism is safe", `continuity.rs:1-17`); the org join inherits it
+rather than re-deriving it.
 
 ---
 
@@ -565,37 +760,59 @@ load-balancing framework.
 ### Eligibility
 
 ```text
-unauthorized       → excluded before sensing
-not directly bound → excluded (E0.3 unchanged)
-unhealthy          → excluded
-fresh NotReady     → excluded
-Ready              → preferred
-Unknown            → retained as potential capacity
+unauthorized              → excluded before sensing
+not directly bound        → excluded (E0.3 unchanged)
+unhealthy                 → excluded
+fresh-evidence NonViable  → excluded (§8 pruning rule)
+Viable                    → preferred
+Potential/Unknown         → retained as potential capacity
 ```
 
 ### Ordering
 
-1. Ready candidates
-2. Unknown candidates
+1. Viable candidates
+2. Potential candidates
 
-Among Ready, use power-of-two choices over the estimated end-to-end
-score — the exact `Viable` cost `classify_branch` already computes
-(`route_estimate + estimated_start`):
+Among Viable, use power-of-two choices over the estimated end-to-end
+cost — the exact `Viable` cost `classify_branch` already computes.
+
+### The pinned sampler contract
+
+"Sample two" is not implementable or reproducible without naming the
+entropy/state seam. One internal shared selector:
+
+```rust
+fn select_sensed_provider(
+    ready: &[SensedCandidate],
+    selection_nonce: u64,
+    process_seed: [u8; 32],
+) -> Option<EntityId>;
+```
+
+Behavior:
 
 ```text
-sample two Ready candidates
-→ compare provider_start + route estimate
-→ choose lower estimate
+process/node-local random seed
++ monotonic selection counter
++ capability ID
+→ derive two distinct candidate indices
+→ compare E2E cost
+→ choose lower
 → EntityId breaks exact ties
 ```
 
-P2C avoids making every caller stampede onto the globally lowest
-advertised score.
+Properties:
 
-If there are no Ready candidates:
+- no public configuration;
+- concurrent callers do not all start at candidate zero;
+- separate nodes do not synchronize into the same P2C pair;
+- deterministic tests inject a fixed seed and nonce;
+- the selector is pure once seed and nonce are supplied.
+
+If there are no Viable candidates:
 
 ```text
-Unknown candidates
+Potential candidates
 → preserve the current deterministic fallback exactly:
     EntityId-byte sort → first directly-connected
     → ProviderNotDirect if candidates exist but none are direct
@@ -611,9 +828,9 @@ No public policy knob is needed in v1.
 
 ## 10. No-viable-provider result
 
-If all authorized candidates have a fresh exact NotReady, the SDK must
-not pretend there was no authority and must not issue a call known to
-miss its readiness budget.
+If every authorized candidate is NonViable on fresh exact evidence, the
+SDK must not pretend there was no authority and must not issue a call
+known to miss its readiness budget.
 
 Add a variant to the local discovery domain
 (`sdk/src/org/error.rs:398-424`, currently exactly
@@ -623,9 +840,14 @@ Add a variant to the local discovery domain
 OrgDiscoveryError::NoViableProvider {
     capability: String,
     considered: usize,
-    not_ready: usize,
+    non_viable: usize,
 }
 ```
+
+The count field is `non_viable`, not `not_ready`: a fresh `Ready` that
+misses the consumer's end-to-end budget is non-viable without the
+provider ever declaring NotReady, and the error must not misreport it
+as a provider declaration.
 
 Wire vocabulary (via the existing `wire_kind()` / `to_wire()` emitters,
 `error.rs:454` / `:188`):
@@ -639,7 +861,7 @@ This means:
 ```text
 authorized providers exist
 + sensing is fresh
-+ none can satisfy the current default interest
++ none is viable under the current default interest and budget
 + nothing was sent
 ```
 
@@ -663,7 +885,7 @@ v0.5), so land the new kind before any external consumer freezes on the
 old discovery-kind list.
 
 If sensing is cold, unavailable, disabled, expired, or unauthorized,
-candidates are Unknown; this error is not returned.
+candidates are Unknown/Potential; this error is not returned.
 
 ---
 
@@ -713,14 +935,18 @@ No new common verb:
 org.call("customer.read", &request).await?;
 ```
 
-The sensed-routing machinery is internal to `OrgClient`. Provider
-readiness remains part of the generic sensing SDK, not `serve_org`.
+The sensed-routing machinery (`OrgRoutingState`, the exact-provider
+leases, the selector) is internal to `OrgClient`. Provider readiness
+remains part of the generic sensing SDK, not `serve_org`.
 
 ### Node, Python, Go, C
 
 No language-specific load-balancing work. Once the Rust behavior lands,
 every binding's `org.call` inherits the same provider decision through
-`call_bytes` / `call_bytes_deadline`.
+`call_bytes` / `call_bytes_deadline`. A leaked binding `OrgClient` now
+additionally holds sensing leases until closed — the existing
+documented teardown order and leak consequence extend to cover this;
+no new disposal API.
 
 The generated error vocabulary gains only:
 
@@ -738,30 +964,36 @@ controls through the organization facade.
 Each slice is one bounded commit with its own witnesses; stop-and-review
 cadence per the OA/OSDK precedent.
 
-### OLB-0 — prerequisite: node-global sensing lifecycle
+### OLB-0 — prerequisite: node-global sensing lifecycle + org-authenticated registration
 
 This is the sensing plan's S0 + S1
 ([`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)),
-with one requirement this plan pins explicitly because the current tree
-has neither piece: interests today have **no public deregistration and
-no refcount anywhere** (TTL soft-state only, `mesh.rs:1670-1677`).
+which this plan additionally pins because the current tree has none of
+it: interests have **no public deregistration and no refcount anywhere**
+(TTL soft-state only, `mesh.rs:1670-1677`), and the registration frame
+carries **no membership proof**.
 
 Deliver:
 
-- authority-derived same-org sensing scope (replacing SDK reliance on
-  `sensing_owner_root`);
-- node-global interest lease: refcount map on `MeshNode` keyed
-  `(audience scope, interest digest)`, acquire/release methods, RAII
-  guard in the SDK — the `OrgAudienceLeases` template
+- org-authenticated registration variants carrying the registering
+  hop's `OrgMembershipCert`, validated per hop, relay re-registering
+  under its own membership (§5.1b) — an additive registration-intake
+  extension; 0x0C03 attestation transcript unchanged;
+- node-global interest lease on `MeshNode` with the **two-shape key**
+  (`ProviderFree` / `ExactProvider`, §7), acquire/release methods, RAII
+  guards in the SDK — the `OrgAudienceLeases` ownership template
   (`org_grant_registry.rs:253`, `mesh.rs:8437/8486`,
   `sdk/src/org/lease.rs:27`);
-- ownership-safe register/deregister token for interests and
-  evaluators;
+- token-indexed cadence aggregation per lease entry (tighten on
+  stricter join, relax on strictest drop, no wire change on
+  non-strictest drop, stale tokens inert);
+- exact local deregistration for provider-free and provider-targeted
+  interests; ownership-safe evaluator registration/removal;
 - watch freshness and change notification
   (`subscribe_sensing_overlay_changes` + exact-state reread);
 - no SDK-wrapper-local registration ownership anywhere.
 
-Exit witness:
+Exit witnesses:
 
 ```text
 two Mesh wrappers over one MeshNode
@@ -769,8 +1001,12 @@ two Mesh wrappers over one MeshNode
 → first drop cannot deregister under second live watch
 ```
 
-This is the sensing equivalent of the audience-lease regression, proven
-before any org consumer exists.
+plus the sensing plan's registration-authority and cadence witnesses
+(§6 there): unauthenticated/foreign/expired/floored membership refused
+at intake; relay self-membership enforced; tighten/relax/no-op/race/
+stale-token cadence transitions; and the producer-path witness — an
+org-private provider produces attestations under an exact-provider
+lease while remaining absent from the provider-free population.
 
 ### OLB-1 — factor organization candidates from selection
 
@@ -798,24 +1034,29 @@ including `ProviderNotDirect` and considered-count semantics).
 
 For same-org candidates:
 
-- acquire the lazy node-global watch for the service-level default
-  interest (§6);
-- pass the authorized candidate population as `resolved_population`
-  into the snapshot join (`sensed_candidates`, `mesh.rs:7296`) — the
-  clamp that makes "sensing never expands visibility" structural;
-- classify Ready/Unknown/NotReady per §8;
-- make granted candidates Unknown unconditionally;
-- respond to route and sensing changes on later calls.
-
-Pin the tag↔CapabilityId mapping for `nrpc:<service>` here.
+- add the clone-shared, **bounded** `OrgRoutingState` (§7; pin the
+  bound here — 64 or 128 distinct active capabilities);
+- on first call per service, acquire one exact-provider lease per
+  authorized same-org provider; on provider-set change, acquire new /
+  release removed; on last client drop, release all;
+- join observations via `sensed_candidates` with the authorized
+  population as `resolved_population` (projection-stage clamp);
+- classify per §8 (evidence layer + projection layer);
+- make granted candidates Unknown/Potential unconditionally;
+- pin the tag↔CapabilityId mapping for `nrpc:<service>`.
 
 Exit witnesses:
 
-- Ready beats Unknown;
-- Unknown remains eligible;
-- exact NotReady prunes;
-- stale NotReady becomes Unknown;
+- Viable beats Potential;
+- Potential remains eligible;
+- fresh exact NotReady prunes;
+- fresh Ready that exceeds the hard E2E budget prunes as NonViable;
+- stale NotReady becomes Unknown/Potential — never NonViable;
 - foreign/granted candidate exposes no readiness;
+- a second call reuses the warmed watch (no cold re-registration);
+- an authorized-set change acquires/releases exactly the delta;
+- at the watch-map bound, calls proceed unsensed with the capacity
+  metric incremented;
 - private providers never enter a sensing scope other than their own
   authority audience;
 - a provider present in sensing but absent from authorized discovery
@@ -823,11 +1064,11 @@ Exit witnesses:
 
 ### OLB-3 — shared sensed selector
 
-Apply generic P2C selection over the `Viable` cost:
+Apply the pinned P2C contract (§9) over the `Viable` cost:
 
 ```text
-Ready P2C by estimated E2E
-→ Unknown deterministic fallback (sort + first-direct, unchanged)
+Viable P2C by estimated E2E
+→ Potential deterministic fallback (sort + first-direct, unchanged)
 ```
 
 One selector, shared with the sensing plan's S2 nRPC path — not an org
@@ -835,8 +1076,12 @@ copy.
 
 Exit witnesses:
 
-- lower score wins the sampled comparison;
+- one candidate; two candidates; more than two candidates;
+- the two sampled indices are distinct;
+- lower cost wins the sampled comparison;
 - ties resolve by EntityId;
+- fixed seed + nonce reproduce the selection exactly;
+- concurrent callers draw unique selection nonces;
 - repeated calls do not all select one global minimum;
 - cold sensing reproduces existing behavior byte-for-byte (selection
   AND errors);
@@ -844,10 +1089,13 @@ Exit witnesses:
 
 ### OLB-4 — exact invocation and error closure
 
-Add `NoViableProvider`, regenerate the X1 fixture, update the four
-binding classifiers plus the `net_org.h` vocabulary comment, and prove:
+Add `NoViableProvider` (with the `non_viable` count field), regenerate
+the X1 fixture, update the four binding classifiers plus the
+`net_org.h` vocabulary comment, and prove:
 
 - no-viable is local and sends nothing;
+- the count reflects NonViable projections, not provider NotReady
+  declarations;
 - admission denial remains remote;
 - sensing never changes any `OrgProofIntent` field;
 - one call means one call id and one signature;
@@ -864,15 +1112,18 @@ register readiness evaluators.
 Witness:
 
 1. caller discovers both only through owner-private state;
-2. A reports Ready with worse predicted start;
-3. B reports Ready with better predicted start;
-4. `org.call` invokes B;
-5. B changes to NotReady (`notify_sensing_state_changed`);
-6. next `org.call` invokes A;
-7. A's provider-local admission still verifies the proof;
-8. removing/revoking A leaves no viable provider →
+2. exact-provider leases produce live attestations from A and B (the
+   producer path, witnessed at the org layer);
+3. A reports Ready with worse predicted start;
+4. B reports Ready with better predicted start;
+5. `org.call` invokes B;
+6. B changes to NotReady (`notify_sensing_state_changed`);
+7. next `org.call` invokes A;
+8. A's provider-local admission still verifies the proof;
+9. removing/revoking A leaves no viable provider →
    `NoViableProvider`, nothing sent;
-9. no plaintext capability announcement leaks the service.
+10. no plaintext capability announcement leaks the service, and the
+    provider-free sensing population never contains it.
 
 Observable boundary:
 
@@ -907,22 +1158,37 @@ This slice does not block same-org load balancing.
 
 The plan is complete when all are true:
 
-- [ ] Audience and sensing leases are node-global.
+- [ ] Audience and sensing leases are node-global; the lease key
+      supports both `ProviderFree` and `ExactProvider` shapes.
 - [ ] Organization candidates are authorized before sensing.
+- [ ] Org-private sensing is produced by exact-provider leases; the
+      provider-free population never contains locally private services
+      (existence-oracle guard witnessed at the org layer).
+- [ ] Sensing registration is organization-authenticated
+      (membership-carrying variants; forged/expired/floored/foreign
+      membership refused; relays prove their own membership).
 - [ ] Sensing consumes only the authorized population
-      (`resolved_population` clamp witnessed).
-- [ ] Same-org sensing derives from verified organization authority.
-- [ ] Granted providers remain Unknown without explicit sensing
-      authority.
-- [ ] Ready is preferred over Unknown.
-- [ ] Unknown remains eligible.
-- [ ] Only fresh exact NotReady prunes.
+      (`resolved_population` clamp witnessed as defense-in-depth).
+- [ ] Granted providers remain Unknown/Potential without explicit
+      sensing authority.
+- [ ] Lazy watches are retained in a bounded, clone-shared
+      `OrgRoutingState`; a second call is warm; the last client drop
+      releases every guard.
+- [ ] Cadence relaxes when the strictest watcher drops; stale lease
+      tokens cannot remove a successor registration.
+- [ ] Viable is preferred over Potential; Potential remains eligible.
+- [ ] Unknown never prunes; NonViable prunes only from fresh exact
+      evidence (NotReady, or Ready exceeding the hard E2E budget);
+      stale evidence never becomes NonViable.
 - [ ] Cold/unavailable sensing preserves the current call path
       byte-for-byte, including `ProviderNotDirect`.
 - [ ] Sensing capacity fallback is observable
       (`org_sensing_fallback_total`).
-- [ ] No-viable is distinct from no-authority, local-only, and pinned
-      in the regenerated X1 fixture across all four binding suites.
+- [ ] No-viable is distinct from no-authority, local-only, counts
+      `non_viable`, and is pinned in the regenerated X1 fixture across
+      all four binding suites.
+- [ ] The P2C sampler contract (seed + nonce) is pinned, reproducible
+      under a fixed seed, and non-stampeding.
 - [ ] Selection produces one exact provider.
 - [ ] Invocation still constructs canonical `OrgProofIntent`
       (nine fields unchanged).
@@ -936,15 +1202,31 @@ The plan is complete when all are true:
 
 ## Bottom line
 
-The first product is:
+The bounded first release is:
 
 ```text
-private same-organization capability pool
-+ authority-scoped sensing
-+ P2C exact-provider selection
-+ protected nRPC invocation
-+ provider-local admission
+OrgClient private discovery
+→ owner-private verified providers
+→ current SameOrg authority match
+→ exact-provider org-authenticated sensing leases
+→ fresh Viable / Potential / NonViable projection
+→ Viable P2C
+→ Potential deterministic fallback
+→ one exact OrgProofIntent call
+→ provider-local OrgAdmission
 ```
+
+Granted calls remain:
+
+```text
+grant-audience private discovery
+→ exact DISCOVER/INVOKE matching
+→ sensing unavailable / Potential
+→ existing deterministic EntityId selection
+→ one exact protected call
+```
+
+until explicit cross-organization sensing authority exists.
 
 That is already the enterprise story:
 
@@ -958,4 +1240,7 @@ several company-owned agent/GPU/service nodes
 ```
 
 Cross-org sensing becomes the federation extension — not a prerequisite
-for proving the architecture.
+for proving the architecture. The fix Kyra's review required is not
+another framework: one authenticated organization sensing registration
+seam, exact-provider leases for private providers, one bounded
+clone-shared routing state, and one internal selector.
