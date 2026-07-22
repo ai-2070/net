@@ -94,6 +94,13 @@ impl OrgRevocationState {
         Self::default()
     }
 
+    /// Test seam: a state with explicit floors, as a merged bundle would
+    /// leave it, without constructing and signing a bundle.
+    #[doc(hidden)]
+    pub fn from_floors_for_test(floors: BTreeMap<(OrgId, EntityId), u32>) -> Self {
+        Self { floors }
+    }
+
     /// The current floor for `(org, member)`. Absent keys floor at
     /// 0 — every generation is admissible until a bundle says
     /// otherwise.

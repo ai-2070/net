@@ -53,6 +53,10 @@ pub mod incarnation;
 // performs the register/deregister the actions describe.
 pub mod lease;
 pub mod negotiation;
+// OLB org-auth slice (commit 2): the organization-authenticated sensing
+// registration authority gate — one transaction, attacker-controlled frame →
+// narrow validated object → validated-object-only mutation.
+pub mod org_gate;
 // The rendezvous REUSES the RedEX election (plan §4.1, review 6) —
 // the reuse is real, not copied, so the module rides the `redex`
 // feature. SI-2 revisits the final layering.
@@ -71,6 +75,10 @@ pub use lease::{
     LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey, SensingLeaseTicket,
 };
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
+pub use org_gate::{
+    canonical_org_sensing_commitment, verify_org_sensing_registration, OrgSensingRejection,
+    ValidatedOrgSensingRegistration,
+};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
     closeness_score, sensing_leader, FrameRejection, LeaderReconciliation, LeaderRefusalPartition,
