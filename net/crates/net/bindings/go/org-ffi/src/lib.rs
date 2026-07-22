@@ -684,6 +684,10 @@ pub extern "C" fn net_org_bind(
         if mesh_arc.is_null() || credentials.is_null() || out_client.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Take ownership of the mesh arc IMMEDIATELY (Go does not free it), so
+        // any validation early-return below drops the node rather than leaking
+        // the whole handle. Mirrors `net_rpc_new`.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         let creds_ptr = unsafe { *credentials };
         if creds_ptr.is_null() {
             write_err(out_err, "credentials handle is NULL".into());
@@ -695,8 +699,6 @@ pub extern "C" fn net_org_bind(
         unsafe {
             *credentials = std::ptr::null_mut();
         }
-        // Take ownership of the mesh arc (Go does not free it).
-        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
 
         match OrgClient::bind_node(node, creds_box.inner) {
             Ok(client) => {
@@ -862,6 +864,9 @@ pub extern "C" fn net_org_serve(
         if mesh_arc.is_null() || out_handle.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Own the mesh arc immediately (Go does not free it) so the validation
+        // early-returns below drop the node rather than leaking it.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         let Some(service) = cstr_to_string(service_ptr, service_len) else {
             write_err(out_err, "service name is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
@@ -889,7 +894,6 @@ pub extern "C" fn net_org_serve(
             }
         };
 
-        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
         let handler = move |caller: OrgCaller, body: Bytes| {
             let caller_c = NetOrgCaller::from(&caller);
@@ -992,11 +996,13 @@ pub extern "C" fn net_org_install_authority(
         if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Own the mesh arc immediately (Go does not free it) so a non-UTF-8 dir
+        // early-return drops the node rather than leaking it.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         let Some(dir) = cstr_to_string(dir_ptr, dir_len) else {
             write_err(out_err, "authority dir is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
         };
-        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         match install_org_authority_node(&node, std::path::Path::new(&dir)) {
             Ok(()) => NET_ORG_OK,
             Err(e) => {
@@ -1029,6 +1035,9 @@ pub extern "C" fn net_org_install_provider_grant_audience(
         if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Own the mesh arc immediately (Go does not free it) so the grant/secret
+        // validation early-returns below drop the node rather than leaking it.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         let Some(grant) = (unsafe { copy_bytes_required(grant_ptr, grant_len) }) else {
             write_err(out_err, "grant bytes are NULL or oversized".into());
             return NET_ORG_ERR_NULL;
@@ -1037,7 +1046,6 @@ pub extern "C" fn net_org_install_provider_grant_audience(
             write_err(out_err, "secret path is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
         };
-        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
         match install_provider_grant_audience_node(
             &node,
             &grant,
@@ -1250,5 +1258,51 @@ mod tests {
             OrgHandlerError::Internal(m) => assert_eq!(m, "boom"),
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    /// §1 regression — the `mesh_arc` handed to a provisioning/serve entry point
+    /// is documented as **consumed**, so a validation early-return MUST drop the
+    /// owned `Arc<MeshNode>` rather than strand it. We hand a fresh clone (exactly
+    /// what `net_mesh_arc_clone` produces) to `net_org_install_provider_grant_audience`
+    /// with NULL grant bytes — the earliest refusal reachable from ordinary Go
+    /// (`InstallProviderGrantAudience(node, nil, path)`) — and prove the node's
+    /// strong count returns to baseline. Before the fix (consume AFTER the
+    /// validation returns), this leaked one whole node per bad call.
+    #[test]
+    fn provisioning_entry_does_not_leak_the_mesh_arc_on_bad_input() {
+        let identity = net_sdk::identity::Identity::generate();
+        let cfg =
+            net::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32]);
+        let node = Arc::new(
+            runtime()
+                .block_on(MeshNode::new((**identity.keypair()).clone(), cfg))
+                .expect("MeshNode::new"),
+        );
+        let baseline = Arc::strong_count(&node);
+
+        // A fresh clone, boxed the way `net_mesh_arc_clone` hands it over.
+        let arc_box: *mut Arc<MeshNode> = Box::into_raw(Box::new(node.clone()));
+        assert_eq!(Arc::strong_count(&node), baseline + 1);
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = net_org_install_provider_grant_audience(
+            arc_box,
+            std::ptr::null(), // NULL grant bytes → refused before the consume line
+            0,
+            std::ptr::null(),
+            0,
+            &mut err,
+        );
+        assert_eq!(rc, NET_ORG_ERR_NULL, "NULL grant bytes must be refused");
+        if !err.is_null() {
+            net_org_free_cstring(err);
+        }
+
+        // The consumed clone must have been dropped on the early return.
+        assert_eq!(
+            Arc::strong_count(&node),
+            baseline,
+            "mesh_arc leaked on the input-validation error path"
+        );
     }
 }
