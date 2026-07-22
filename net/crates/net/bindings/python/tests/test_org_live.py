@@ -89,6 +89,15 @@ def _handshake(connector, acceptor) -> None:
         raise errors[0]
 
 
+# This cell shells out to `cargo run --example gen_org_scenario`, which
+# recompiles net-mesh with the example's feature set (distinct from the wheel's,
+# so it is a cold build inside the test), then drives a live cross-org call whose
+# scoped discovery is throttled to a 45 s convergence loop. The CI-wide 60 s
+# per-test pytest timeout is generous for unit/integration tests but far too
+# short here — the Node twin budgets 300 s for the same generate step plus 120 s
+# for the call. Match that with a per-test override so the in-test compile does
+# not trip the default.
+@pytest.mark.timeout(600)
 def test_live_cross_org_call_from_a_generated_scenario() -> None:
     # `os.makedirs` under the system temp dir — NOT `tempfile.mkdtemp`, which on
     # Windows stamps an owner-only S-1-3-4 (Owner Rights) full-access ACE that
