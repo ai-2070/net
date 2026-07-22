@@ -935,7 +935,7 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-v2-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against SEVEN cdylibs via cgo:
+      # The Go bindings link against EIGHT cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
@@ -952,7 +952,10 @@ jobs:
       #     typed/streaming/tool tests fail at link.
       #   - `-lnet_mcp` (libnet_mcp_ffi.so, the `net-mcp-ffi`
       #     workspace member at bindings/go/mcp-ffi) from mcp.go
-      # All seven end up in `net/crates/net/target/release/`.
+      #   - `-lnet_org` (libnet_org.so, the `net-org-ffi`
+      #     workspace member at bindings/go/org-ffi) from org.go.
+      #     The organization capability-auth verb facade (OSDK-L).
+      # All eight end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -964,16 +967,16 @@ jobs:
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
       #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
-      #     `net-rpc-ffi`, `net-mcp-ffi` have no extra features beyond
-      #     their defaults.
+      #     `net-rpc-ffi`, `net-mcp-ffi`, `net-org-ffi` have no extra
+      #     features beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc + net_mcp cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc + net_mcp + net_org cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi
+          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi -p net-mcp-ffi -p net-org-ffi
           --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
@@ -1198,6 +1201,11 @@ jobs:
             # `go/mcp.go` (MCP_BRIDGE_SDK_PLAN P3). Default features only.
             path: net/crates/net/bindings/go/mcp-ffi
             features: ""
+          - name: go-org-ffi
+            # Organization capability-auth verb facade C ABI, consumed
+            # by `go/org.go` (OSDK-L Workstream C). Default features only.
+            path: net/crates/net/bindings/go/org-ffi
+            features: ""
           - name: sdk-macros
             # `net-mesh-sdk-macros` ships the `#[tool]` attribute
             # proc-macro. Linted separately from the SDK because the
@@ -1307,6 +1315,12 @@ jobs:
             # net_mcp_* symbols directly (classify/lower parity, secret-
             # negative, pin-store round-trip + concurrent mutations).
             path: net/crates/net/bindings/go/mcp-ffi
+            features: ""
+          - name: go-org-ffi
+            # Organization capability-auth C ABI — its #[cfg(test)] mod
+            # tests drive net_org_* directly (caller layout, credential
+            # refusal wire, ABI stamp, header↔Rust numeric mirror).
+            path: net/crates/net/bindings/go/org-ffi
             features: ""
     steps:
       - uses: actions/checkout@v7
@@ -1891,6 +1905,16 @@ jobs:
       # contract notes stay buildable.
       - name: Build net-rpc-ffi documentation
         run: cargo doc -p net-rpc-ffi --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-org-ffi` is the cgo-facing organization capability-auth
+      # shim (OSDK-L Workstream C). Its public surface (extern "C" fn
+      # signatures + NET_ORG_* constants + handle types + the secret-
+      # asymmetry doctrine) is what `go/org.go` and `include/net_org.h`
+      # document against; keep its rustdoc warning-free.
+      - name: Build net-org-ffi documentation
+        run: cargo doc -p net-org-ffi --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 

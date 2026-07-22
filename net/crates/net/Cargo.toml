@@ -12,6 +12,7 @@ members = [
     "bindings/python",
     "bindings/go/compute-ffi",
     "bindings/go/rpc-ffi",
+    "bindings/go/org-ffi",
     "bindings/go/meshdb-ffi",
     "bindings/go/meshos-ffi",
     "bindings/go/deck-ffi",
