@@ -1,8 +1,23 @@
 # CODE REVIEW 2026-07-22 — Organization Capability SDK / language bindings (`org-capability-sdk`)
 
-> **Status: REVIEW COMPLETE — findings OPEN, no remediation performed.**
+> **Status: ALL FINDINGS REMEDIATED — awaiting independent review.**
 >
-> This is a first review pass of `org-capability-sdk` at head `20572959b`,
+> Every finding below is fixed, in eleven commits (`308e65fe9` records this
+> document; `772a67489` … `d8df0a3ec` are the fixes). Each fix was compiled and,
+> where a test was reasonable, covered by one — the §1 arc leak was
+> red-witnessed (strong-count 2→1), and the §4 handle/path equivalence, §6/§8
+> classification, §10 bound, and §11 callable check all landed with tests.
+> Verification ran on this Windows host: 8 org-ffi tests, 82 SDK org tests, 36
+> `org_authority` tests (incl. the new Windows-ACL equivalence), 9 native-free
+> Node vocabulary tests; `clippy -D warnings` clean on every touched crate;
+> `cargo check` clean for `net-node` / `net-python`; `py_compile` clean. The
+> Node/Python *native* tests (org_binding / org_live) run on CI — this
+> environment has no napi/maturin build.
+>
+> **What still needs doing is REVIEW, not remediation.** The remediation table
+> below carries each finding's disposition and commit.
+>
+> The original review of `org-capability-sdk` at head `20572959b`,
 > diffed against `master` at `07820a9de` (merge-base `07820a9de`): 63 files,
 > ~14,897 insertions, 33 commits. The branch is the **language-SDK / bindings**
 > layer over the closed OA admission substrate — the verb facade (`mesh.org()`
@@ -26,26 +41,42 @@
 > the package's own build scripts). One MEDIUM (Node handler timeout does not
 > bound async work). The rest are LOW / informational.
 >
-> **Nothing here has been remediated or independently re-checked.** Line numbers
-> are as of `20572959b`.
+> Line numbers in the finding bodies are as of the reviewed head `20572959b`,
+> before remediation.
 >
 > ---
 >
-> ## Findings summary
+> ## Remediation status
+>
+> Every finding is **FIXED**. `§6` and the two `§6`-shaped Python defects the fix
+> surfaced (`org:closed` / `org:serve_failed` also present in the PyO3 binding)
+> were closed together with `§8`.
 >
 > | § | Sev | Area | Finding | Disposition |
 > |---|---|---|---|---|
-> | §1 | **High** | Go FFI | `mesh_arc` (`Box<Arc<MeshNode>>`) leaked on input-validation early returns | OPEN |
-> | §2 | **High** | Node build | `org` feature enabled in no package script; committed test hard-fails locally | OPEN |
-> | §3 | **Med** | Node napi | `handlerTimeoutMs` does not bound async handler execution (stage-2 unbounded) | OPEN |
-> | §4 | Low | Rust core | Windows secret loader validates by path, not the open handle (TOCTOU) | OPEN |
-> | §5 | Low | Rust fixtures | Scenario generator: chmod-after-create race, unscrubbed key buffer, ships in release | OPEN |
-> | §6 | Low | Node napi | `org:closed` / `org:serve_failed` misclassify as `Unclassified` (`isLocal=false`) | OPEN |
-> | §7 | Low | Python | Blocking file I/O + signature verification under the GIL | OPEN |
-> | §8 | Low | Python | `OrgUnclassifiedError` exported but never raised by native code | OPEN |
-> | §9 | Info | Python | Handler timeout can't cancel the blocking call (shared w/ vetted `PyRpcHandler`) | OPEN |
-> | §10 | Info | Go FFI | `from_raw_parts` array counts not bounds-checked vs `isize::MAX` (raw-C only) | OPEN |
-> | §11 | Info | Python | Provisioning errors bypass `org:` vocabulary; `serve_org` doesn't validate callable; surface reachability | OPEN |
+> | §1 | **High** | Go FFI | `mesh_arc` (`Box<Arc<MeshNode>>`) leaked on input-validation early returns | **FIXED** `772a67489` |
+> | §2 | **High** | Node build | `org` feature enabled in no package script; committed test hard-fails locally | **FIXED** `8f9af1c14` |
+> | §3 | **Med** | Node napi | `handlerTimeoutMs` does not bound async handler execution (stage-2 unbounded) | **FIXED** `52c124fe0` |
+> | §4 | Low | Rust core | Windows secret loader validates by path, not the open handle (TOCTOU) | **FIXED** `af18027c2` |
+> | §5 | Low | Rust fixtures | Scenario generator: chmod-after-create race, unscrubbed key buffer, ships in release | **FIXED** `3668bda4d`, `2402f36a5` |
+> | §6 | Low | Node/PyO3 | `org:closed` / `org:serve_failed` misclassify as `Unclassified` (`isLocal=false`) | **FIXED** `259412f07`, `b8f4c4d74` |
+> | §7 | Low | Python | Blocking file I/O + signature verification under the GIL | **FIXED** `b54dfb152` |
+> | §8 | Low | Python | `OrgUnclassifiedError` exported but never raised by native code | **FIXED** `b8f4c4d74` |
+> | §9 | Info | Python | Handler timeout can't cancel the blocking call (shared w/ vetted `PyRpcHandler`) | **FIXED (documented)** `d8df0a3ec` |
+> | §10 | Info | Go FFI | `from_raw_parts` array counts not bounds-checked vs `isize::MAX` (raw-C only) | **FIXED** `ad40a4021` |
+> | §11 | Info | Python | Provisioning errors bypass `org:` vocabulary; `serve_org` doesn't validate callable; surface reachability | **FIXED** `d8df0a3ec` |
+>
+> **Fix notes.**
+> - **§8** added `net.org.classify_org_error` — the classifier the native
+>   `org_err_to_py` comment already referenced — as the sole producer of
+>   `OrgUnclassifiedError` (a live in-version call always raises one of the four
+>   typed domains).
+> - **§9** is not code-fixable (the timeout can't interrupt arbitrary running
+>   Python); resolved by correcting the docstring/stub to state the timeout
+>   bounds the *wait*, not the handler — matching the vetted nRPC handler.
+> - **§11** "provisioning errors bypass `org:` vocabulary" is **kept by design**
+>   (operator setup is not a call-taxonomy outcome); `serve_org`'s serve failure
+>   now matches it as a plain error, and the callable check + stub docs landed.
 
 ---
 
@@ -364,7 +395,10 @@ a re-reviewer can spot-check rather than re-derive.
 
 ## Recommendation
 
-Merge-ready on the authorization core. Gate release on §1 (Go arc leak), §2
-(Node feature/build gap), and §3 (Node handler timeout) — all three are
-reachable from ordinary use of the shipped bindings. §4–§11 are good
-follow-ups and none blocks correctness of the auth path.
+The authorization core was clean at review time and untouched by the fixes.
+All eleven findings — the two HIGHs (§1 Go arc leak, §2 Node feature/build gap)
+and the MEDIUM (§3 Node handler timeout) that gated release, plus §4–§11 — are
+now remediated (see the [remediation table](#remediation-status)) and covered by
+tests where reasonable. Remaining action is independent review, plus the CI runs
+of the Node/Python *native* suites (org_binding / org_live), which this
+review host could not build (no napi/maturin toolchain).
