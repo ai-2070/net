@@ -48,6 +48,7 @@ default = [
     "payments",
     "delegation",
     "a2a",
+    "org",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
