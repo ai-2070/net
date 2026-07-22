@@ -160,10 +160,9 @@ impl OrgClient {
     pub async fn call_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
         // Snapshot first: if `close()` lands after this line, the clone keeps
         // the lease and node reference alive until the call completes.
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| Error::from_reason("org:closed: this OrgClient has been closed"))?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
         let body = bytes::Bytes::from(request.to_vec());
         let reply = client.call_bytes(&service, body).await.map_err(org_error)?;
         Ok(Buffer::from(reply.to_vec()))
@@ -172,20 +171,18 @@ impl OrgClient {
     /// The organization this client acts for, as 32 raw bytes.
     #[napi(getter)]
     pub fn acting_org(&self) -> Result<Buffer> {
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| Error::from_reason("org:closed: this OrgClient has been closed"))?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
         Ok(Buffer::from(client.acting_org().as_bytes().to_vec()))
     }
 
     /// The entity this client calls as, as 32 raw bytes.
     #[napi(getter)]
     pub fn caller(&self) -> Result<Buffer> {
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| Error::from_reason("org:closed: this OrgClient has been closed"))?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
         Ok(Buffer::from(client.caller().as_bytes().to_vec()))
     }
 
@@ -194,7 +191,8 @@ impl OrgClient {
     ///
     /// Call this before `mesh.shutdown()` — see the module docs. In-flight
     /// calls that already snapshotted the client complete normally; calls
-    /// started after this return `org:closed`.
+    /// started after this reject with `org:credentials:closed` (a LOCAL error —
+    /// nothing was sent).
     #[napi]
     pub fn close(&self) {
         let _ = self.inner.swap(None);
@@ -392,7 +390,11 @@ pub fn serve_org(
                 async move { dispatch_to_js(tsfn, caller, body, timeout).await }
             },
         )
-        .map_err(|e| Error::from_reason(format!("org:serve_failed: {e}")))?
+        // A serve REGISTRATION failure is a local provider-setup error, not one
+        // of the four org CALL domains — surface it plain (no `org:` prefix), the
+        // same convention `install_org_authority` / `install_provider_grant_audience`
+        // use, so it never misclassifies as an `unknown`-domain org error.
+        .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
 
     Ok(OrgServeHandle {

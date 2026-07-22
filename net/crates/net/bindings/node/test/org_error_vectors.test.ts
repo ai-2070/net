@@ -112,6 +112,28 @@ describe('org error vocabulary (cross-language fixture)', () => {
   })
 
   /**
+   * §6 — binding-local lifecycle errors must read as LOCAL, never as the
+   * `unknown`/vocabulary-mismatch class (whose `isLocal` is false, implying the
+   * request may have reached a provider). A closed client rides the local
+   * `credentials` domain (like `already_consumed`); a serve-registration failure
+   * is a plain non-`org:` error (like provisioning), passed through untouched.
+   */
+  it('classifies binding-local lifecycle errors as local, not unclassified', () => {
+    const closed = classifyOrgError(
+      new Error('org:credentials:closed: this OrgClient has been closed'),
+    )
+    expect(closed).toBeInstanceOf(OrgCredentialsError)
+    expect(closed).not.toBeInstanceOf(OrgUnclassifiedError)
+    expect((closed as OrgError).kind).toBe('closed')
+    expect((closed as OrgError).isLocal).toBe(true)
+
+    // A serve-registration failure is not an org call-taxonomy event: a plain
+    // error, returned untouched rather than coerced into `unknown`.
+    const serveErr = new Error('org serve registration failed: already serving')
+    expect(classifyOrgError(serveErr)).toBe(serveErr)
+  })
+
+  /**
    * A remote denial exposes its coarse bucket and nothing finer — asserted on
    * the fixture so this binding cannot quietly start inferring a richer reason.
    */
