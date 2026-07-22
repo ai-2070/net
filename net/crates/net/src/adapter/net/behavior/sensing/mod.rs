@@ -67,7 +67,9 @@ pub mod table;
 pub mod wire;
 
 pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
-pub use lease::{LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey};
+pub use lease::{
+    LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey, SensingLeaseTicket,
+};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 #[cfg(feature = "redex")]
 pub use rendezvous::{

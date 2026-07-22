@@ -117,6 +117,21 @@ impl LeaseAction {
     }
 }
 
+/// A held sensing-interest lease reference (OLB-0). Returned by
+/// [`MeshNode::acquire_sensing_interest_lease`]; hand it back to
+/// [`MeshNode::release_sensing_interest_lease`] exactly once (an SDK RAII
+/// guard does that on drop). Opaque outside the crate.
+///
+/// [`MeshNode::acquire_sensing_interest_lease`]:
+///     crate::adapter::net::MeshNode::acquire_sensing_interest_lease
+/// [`MeshNode::release_sensing_interest_lease`]:
+///     crate::adapter::net::MeshNode::release_sensing_interest_lease
+#[derive(Debug, Clone, Copy)]
+pub struct SensingLeaseTicket {
+    pub(crate) key: SensingLeaseKey,
+    pub(crate) token: LeaseToken,
+}
+
 /// One key's shared registration state.
 struct LeaseEntry {
     /// Requested interval per live holder token.

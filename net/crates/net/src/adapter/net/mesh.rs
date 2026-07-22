@@ -4982,6 +4982,16 @@ pub struct MeshNode {
     /// consumer registry belongs to: two `Mesh` wrappers over one node share
     /// this, so neither can withdraw an audience the other is still using.
     org_audience_leases: Arc<super::behavior::org_grant_registry::OrgAudienceLeases>,
+    /// OLB-0 §4.3: node-global sensing-interest leases — refcount +
+    /// cadence aggregation, keyed to the NODE for the same reason as
+    /// `org_audience_leases`: two `Mesh`/binding wrappers over one node
+    /// registering the same interest must share one wire registration,
+    /// so neither's drop withdraws an interest the other still holds.
+    sensing_interest_leases: sensing::SensingInterestLeases,
+    /// Serializes each sensing-lease decision with its wire apply
+    /// (register/deregister), so a final release racing a new acquire
+    /// leaves exactly one live registration (§4.3).
+    sensing_lease_apply_mu: parking_lot::Mutex<()>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
@@ -6386,6 +6396,8 @@ impl MeshNode {
             org_audience_leases: Arc::new(
                 super::behavior::org_grant_registry::OrgAudienceLeases::default(),
             ),
+            sensing_interest_leases: sensing::SensingInterestLeases::default(),
+            sensing_lease_apply_mu: parking_lot::Mutex::new(()),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
@@ -6897,6 +6909,169 @@ impl MeshNode {
             }
         }
         Ok(outcome)
+    }
+
+    /// OLB-0 §4.3: acquire a node-global lease on an EXACT-provider
+    /// sensing interest, (re-)registering it on the wire only when this
+    /// acquisition changes what must be installed. Equivalent interests
+    /// from other wrappers over this node share one wire registration and
+    /// one refresh cadence (their minimum requested interval); the
+    /// returned ticket must be released exactly once.
+    ///
+    /// Errors exactly as
+    /// [`register_sensing_interest`](Self::register_sensing_interest)
+    /// would on the (re-)registering transition; on error the just-taken
+    /// lease reference is rolled back, so a failed acquire leaves no
+    /// dangling count.
+    pub fn acquire_sensing_interest_lease(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
+        let key = sensing::SensingLeaseKey::ExactProvider {
+            audience: spec.audience,
+            interest_digest: spec.interest_digest(),
+            provider,
+        };
+        // Serialize the decision with its wire apply, so a final release
+        // racing a new acquire leaves exactly one live registration.
+        let _apply = self.sensing_lease_apply_mu.lock();
+        let (token, action) = self
+            .sensing_interest_leases
+            .acquire(key, requested_sample_interval);
+        if let Err(err) = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, action) {
+            // Roll the reference back and reconcile the wire to the
+            // post-release view. A failed first register left no row
+            // (register_sensing_interest rolls its own row back at
+            // capacity), so the resulting Deregister is a harmless no-op.
+            let rollback = self.sensing_interest_leases.release(key, token);
+            let _ = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, rollback);
+            return Err(err);
+        }
+        Ok(sensing::SensingLeaseTicket { key, token })
+    }
+
+    /// Release a sensing-interest lease acquired via
+    /// [`acquire_sensing_interest_lease`](Self::acquire_sensing_interest_lease).
+    /// Best-effort and idempotent: the last holder's release deregisters,
+    /// a strictest-holder release relaxes the cadence to the surviving
+    /// minimum, and an already-released ticket is a no-op.
+    pub fn release_sensing_interest_lease(
+        &self,
+        ticket: sensing::SensingLeaseTicket,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        soft_state_ttl: Duration,
+    ) {
+        let _apply = self.sensing_lease_apply_mu.lock();
+        let action = self
+            .sensing_interest_leases
+            .release(ticket.key, ticket.token);
+        let _ = self.apply_sensing_lease_action(spec, provider, soft_state_ttl, action);
+    }
+
+    /// Execute the wire transition a lease mutation calls for. Called only
+    /// under `sensing_lease_apply_mu`.
+    fn apply_sensing_lease_action(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        soft_state_ttl: Duration,
+        action: sensing::LeaseAction,
+    ) -> Result<(), SensingRegistrationError> {
+        match action {
+            sensing::LeaseAction::Register { interval, .. }
+            | sensing::LeaseAction::Reregister { interval, .. } => {
+                self.register_sensing_interest(spec, provider, interval, soft_state_ttl)?;
+                Ok(())
+            }
+            sensing::LeaseAction::Unchanged => Ok(()),
+            sensing::LeaseAction::Deregister { .. } => {
+                self.deregister_sensing_interest(spec, provider);
+                Ok(())
+            }
+        }
+    }
+
+    /// OLB-0: exact local deregistration of a previously registered
+    /// sensing interest for `provider` — the teardown the soft-state
+    /// sweep otherwise performs on expiry, made explicit for the lease.
+    /// Mirrors the peer `Deregister` frame arm for the LOCAL downstream:
+    /// reclaim a dead branch's observations, retire the origin emission
+    /// stream when this node is itself the provider, and route the
+    /// deregister upstream otherwise. A no-op when the plane is disabled
+    /// or no such row exists.
+    pub fn deregister_sensing_interest(&self, spec: &sensing::InterestSpec, provider: u64) {
+        if !self.config.enable_sensing_coalescing {
+            return;
+        }
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        let now = Instant::now();
+        // Closure item 7: stamp snapshot BEFORE the table mutation the
+        // retire decision rests on.
+        let emitter_stamp = self.sensing_emitter.lock().as_ref().map(|e| e.stamp());
+        let actions = self.sensing_interest_table.lock().deregister(
+            &key.interest.interest_digest,
+            Some(provider),
+            sensing::DownstreamId::Local,
+            now,
+        );
+        for (branch_key, action) in actions {
+            // A dead branch reclaims its observations with the table.
+            if action == sensing::UpstreamAction::Deregister {
+                self.sensing_observations.lock().reclaim_branch(&branch_key);
+            }
+            // A loosened aggregate re-anchors the surviving branch's
+            // continuity window immediately.
+            if let sensing::UpstreamAction::Register { strictest } = action {
+                self.sensing_observations
+                    .lock()
+                    .update_upstream_interval(&branch_key, Some(strictest));
+            }
+            if branch_key.provider == self.node_id {
+                // This node is the origin — the last downstream's death
+                // retires the emission stream unless a registration raced
+                // in after the snapshot.
+                if action == sensing::UpstreamAction::Deregister {
+                    if let (Some(emitter), Some(stamp)) =
+                        (self.sensing_emitter.lock().as_mut(), emitter_stamp)
+                    {
+                        emitter.retire_if_stale(&branch_key.interest.interest_digest, stamp);
+                    }
+                }
+                continue;
+            }
+            if action == sensing::UpstreamAction::Deregister {
+                self.send_sensing_deregister_upstream_direct(&branch_key);
+            }
+        }
+    }
+
+    /// The `&self` counterpart of
+    /// [`send_sensing_deregister_upstream`](Self::send_sensing_deregister_upstream)
+    /// (which routes off a `DispatchCtx`): encode and route one
+    /// `Deregister` frame toward the branch's provider.
+    fn send_sensing_deregister_upstream_direct(&self, key: &sensing::ProviderInterestKey) {
+        let frame = sensing::SensingInterestFrame::Deregister {
+            interest_digest: key.interest.interest_digest,
+            target: Some(key.provider),
+        };
+        if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+            spawn_sensing_frame_send(
+                &self.socket,
+                &self.peers,
+                &self.addr_to_node,
+                &self.router,
+                &self.partition_filter,
+                self.node_id,
+                key.provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
+            );
+        }
     }
 
     /// SI-4 review P0: register (or refresh) a PROVIDER-FREE
