@@ -1,6 +1,28 @@
 # Org Capability Load Balancing Plan (OLB)
 
-**Version:** v0.2 — applies Kyra's review verdict (2026-07-22, read at
+**Version:** v0.3 — applies Kyra's performance ruling (2026-07-22):
+the public product shape was confirmed simple enough; the
+implementation is now pinned so a warmed `org.call` is **two
+comparisons, not a recomputation of the network** —
+
+7. the hot path is an `ArcSwap` load of a **change-driven immutable
+   `OrgRouteSet`** — no rediscovery, no candidate revalidation scans,
+   no observation scans, no sorting, no interest reconciliation, and no
+   registration waits on the request path (§7);
+8. a per-call complexity contract: route-set load, temporal recheck,
+   P2C sample, proof, dispatch — all O(1) (§7);
+9. per-request sorting of Ready candidates is prohibited; the fallback
+   vector is sorted once at rebuild (§9);
+10. exact-provider fan-out is hard-bounded (32 sensed providers per
+    capability, 64 warmed capabilities per client state) with
+    deterministic truncation and `org_sensing_truncated_total` (§7);
+11. `OrgClient`'s internals are pinned to four operations — maintain
+    candidates, maintain leases, project route sets, select — never a
+    mini scheduler (§2, §7);
+12. the release sequence is decoupled from the broader sensing roadmap
+    (§13 scope note).
+
+v0.2 applied Kyra's architecture review verdict (2026-07-22, read at
 clean master `447d0964`): product architecture **APPROVED** (the
 discovery → authority → sensing → selection → exact invocation →
 admission separation, the thin two-verb surface, Unknown-as-capacity,
@@ -129,7 +151,13 @@ This plan does not add:
   by current verified membership in the provider-owner organization,
   under the organization sensing-registration rule defined in sensing
   S0 — an explicit authority decision, never an inference;
-- language-specific balancing implementations.
+- language-specific balancing implementations;
+- a mini scheduler inside `OrgClient`: no retry queues, no adaptive
+  weights, no EWMA outcome scoring, no circuit breakers (endpoint
+  outcome health and breakers stay in the existing lower layers), no
+  sticky sessions, no background probing, no dynamic policy
+  configuration, no per-service user options. Org sensing contributes
+  only readiness and route cost.
 
 Every language inherits the same behavior from Rust `OrgClient::call`.
 An OLB PR touching `bindings/` or `go/` may contain the one new error
@@ -552,7 +580,9 @@ owner with client lifetime:
 ```rust
 struct OrgRoutingState {
     watches: Mutex<BoundedMap<OrgInterestKey, ExactInterestSet>>,
+    routes:  BoundedMap<CapabilityKey, ArcSwap<OrgRouteSet>>,
     selector: SensedSelectorState,
+    // one wake-driven reconciler task per clone family
 }
 
 pub struct OrgClient {
@@ -566,19 +596,30 @@ Semantics:
 ```text
 all OrgClient clones            → share routing state
 first call to service C         → install exact-provider interest guards
-later call to C                 → reuse warmed observations
+later call to C                 → reuse the warmed route set
 authorized provider set changes → acquire new exact interests,
                                   release removed interests
-last client clone drops/closes  → release all guards
+input change                    → reconciler rebuilds the route set;
+                                  calls only ever read
+last client clone drops/closes  → release all guards, stop reconciler
 ```
 
 The actual registration refcount remains node-global (below).
-`OrgRoutingState` owns only RAII guards and selector state — the
-`AudienceLeaseGuard` ownership shape, one level up.
+`OrgRoutingState` owns only RAII guards, the route snapshots, and
+selector state — the `AudienceLeaseGuard` ownership shape, one level up.
+The internal machinery is exactly four operations and stays that way:
+
+```text
+maintain candidate set
+maintain exact sensing leases
+project immutable route set
+select one provider
+```
 
 **Bound the cache.** Service names are caller-controlled, so the watch
-map has a fixed bound (64 or 128 distinct active capabilities per client
-state, pinned in OLB-2). At the bound:
+and route maps share a fixed bound: **64 distinct warmed capabilities
+per client state** (implementation default, not a public option). At
+the bound:
 
 ```text
 organization call still proceeds
@@ -588,6 +629,117 @@ organization call still proceeds
 ```
 
 Never an unbounded per-client service/watch cache.
+
+### The hot path: a change-driven immutable route set
+
+The warmed request path is:
+
+```text
+ArcSwap load of the precomputed route set
+→ choose two Ready candidates
+→ compare two scores
+→ construct proof
+→ send
+```
+
+never:
+
+```text
+query private stores
+→ validate every candidate
+→ scan sensing observations
+→ sort providers
+→ reconcile interests
+→ select
+→ send
+```
+
+Each warmed capability slot holds an immutable snapshot:
+
+```rust
+struct OrgRouteSet {
+    ready: Arc<[ReadyRoute]>,        // score-carrying; P2C samples it
+    unknown: Arc<[AuthorizedRoute]>, // pre-sorted deterministic fallback
+    non_viable_count: usize,
+    generation: u64,
+}
+```
+
+The reconciler rebuilds a capability's route set when — and only when —
+an input changes:
+
+- private discovery generation;
+- membership/dispatcher/grant validity edges;
+- direct-session state;
+- sensing generation (`subscribe_sensing_overlay_changes`);
+- route topology;
+- capability watch population.
+
+It is wake-driven off the existing unified change signals, never a poll
+loop; bursts of wakes coalesce into one rebuild; rebuilds are
+single-flighted and generation-stamped; `ArcSwap` publish is
+last-writer-wins. `org.call` reads the latest snapshot and never
+blocks on, waits for, or performs a rebuild — a staleness observation
+on the read path may enqueue a rebuild, never perform one inline.
+
+Per-call complexity (warmed):
+
+```text
+route-set load             O(1)
+per-call temporal recheck  O(1)   (clock math — below)
+P2C sampling               O(1)
+proof construction         O(1)
+exact dispatch             O(1), excluding network
+```
+
+**What the route set caches — and what it never caches.** Cached: the
+discovery → authority-match → session → sensing join, the fallback
+ordering, and the Viable scores. Never cached: the **locked per-call
+temporal recheck** of membership, dispatcher, and the selected grant
+(the facade's three-stage validity contract — cheap window comparisons
+against already-validated structures, kept on the hot path by design);
+the call id, digest, signature, and proof (minted fresh per call);
+admission (provider-local, always). The route cache accelerates
+ranking; it is never an authority cache.
+
+**Lifecycle stays off the request path:**
+
+```text
+sensing registration is never in the invocation latency budget
+```
+
+A first cold call performs the full computation inline once and selects
+deterministically; it enqueues lease acquisition and the route-set
+build, and awaits none of: leader election, a registration
+acknowledgment, an attestation, watch refresh, route-set
+reconciliation. If acquiring the node-global lease would contend or
+emit, it is enqueued to the reconciler and the call proceeds with
+Unknown.
+
+### Bounded sensed fan-out
+
+Exact-provider sensing is one interest per authorized provider, so it
+needs a hard internal bound (implementation defaults, not public SDK
+options):
+
+```text
+max sensed providers per capability: 32
+max warmed capabilities per OrgClient state: 64
+```
+
+If a pool exceeds the provider bound:
+
+```text
+deterministically retain 32 direct authorized providers
+  (EntityId-byte order — the existing deterministic order)
+→ sense those
+→ keep remaining authorized providers as Unknown fallback
+→ increment org_sensing_truncated_total
+```
+
+Excess authorized providers never disappear and never fail the call.
+This keeps `services × providers` from becoming unbounded interest and
+refresh state.
 
 ### Why node-global (the lease lesson)
 
@@ -775,6 +927,16 @@ Potential/Unknown         → retained as potential capacity
 
 Among Viable, use power-of-two choices over the estimated end-to-end
 cost — the exact `Viable` cost `classify_branch` already computes.
+
+**Never sort Ready candidates per request.** P2C needs only: two
+distinct indices, two cost comparisons, and EntityId on an exact tie.
+The Ready slice keeps whatever order the route-set rebuild produced;
+the Potential fallback vector is deterministically sorted **once at
+rebuild**, not per call. Explicitly prohibited:
+
+```text
+sort all Ready providers by E2E score per request
+```
 
 ### The pinned sampler contract
 
@@ -964,14 +1126,36 @@ controls through the organization facade.
 Each slice is one bounded commit with its own witnesses; stop-and-review
 cadence per the OA/OSDK precedent.
 
+**Scope note (Kyra, 2026-07-22).** The paired sensing plan is a broader
+roadmap — generic watch surface, sensed nRPC, compute placement, gang
+wrappers, eventual cross-org SENSE. The org load-balancing release does
+not wait for it. The minimal org-specific sequence is:
+
+```text
+1. authenticated same-org sensing registration   (sensing S0 subset)
+2. node-global exact-interest leases             (sensing S0 subset)
+3. provider evaluator lifecycle                  (sensing S0/S1 subset)
+4. clone-shared bounded OrgRoutingState          (OLB-2)
+5. immutable route-set projection                (OLB-2)
+6. O(1) P2C selection                            (OLB-3)
+7. live three-node witness                       (OLB-5)
+```
+
+Generic provider-free sensing, ordinary nRPC sensed routing, compute
+placement, language sensing bindings, and cross-org SENSE land
+separately and do not gate this release.
+
 ### OLB-0 — prerequisite: node-global sensing lifecycle + org-authenticated registration
 
-This is the sensing plan's S0 + S1
-([`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)),
-which this plan additionally pins because the current tree has none of
-it: interests have **no public deregistration and no refcount anywhere**
-(TTL soft-state only, `mesh.rs:1670-1677`), and the registration frame
-carries **no membership proof**.
+This is the **org-required subset** of the sensing plan's S0 + S1
+([`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)) —
+registration authority, exact-provider leases, deregistration,
+evaluator ownership, and the provider `provide()` lifecycle; **not**
+the generic consumer watch surface. This plan additionally pins it
+because the current tree has none of it: interests have **no public
+deregistration and no refcount anywhere** (TTL soft-state only,
+`mesh.rs:1670-1677`), and the registration frame carries **no
+membership proof**.
 
 Deliver:
 
@@ -1034,13 +1218,19 @@ including `ProviderNotDirect` and considered-count semantics).
 
 For same-org candidates:
 
-- add the clone-shared, **bounded** `OrgRoutingState` (§7; pin the
-  bound here — 64 or 128 distinct active capabilities);
+- add the clone-shared, **bounded** `OrgRoutingState` (§7; bounds
+  pinned: 64 warmed capabilities per client state, 32 sensed providers
+  per capability, deterministic truncation + metric);
+- add the wake-driven reconciler and immutable `OrgRouteSet`
+  projection (§7): single-flight, generation-stamped, `ArcSwap`
+  published; calls only read;
 - on first call per service, acquire one exact-provider lease per
-  authorized same-org provider; on provider-set change, acquire new /
-  release removed; on last client drop, release all;
+  authorized same-org provider (enqueued, never awaited); on
+  provider-set change, acquire new / release removed; on last client
+  drop, release all;
 - join observations via `sensed_candidates` with the authorized
-  population as `resolved_population` (projection-stage clamp);
+  population as `resolved_population` (projection-stage clamp) —
+  inside the reconciler, never on the request path;
 - classify per §8 (evidence layer + projection layer);
 - make granted candidates Unknown/Potential unconditionally;
 - pin the tag↔CapabilityId mapping for `nrpc:<service>`.
@@ -1053,10 +1243,21 @@ Exit witnesses:
 - fresh Ready that exceeds the hard E2E budget prunes as NonViable;
 - stale NotReady becomes Unknown/Potential — never NonViable;
 - foreign/granted candidate exposes no readiness;
-- a second call reuses the warmed watch (no cold re-registration);
+- a second call reuses the warmed route set (no cold re-registration);
+- **a warmed call issues no scoped-store query, no observation-map
+  scan, no sort, and no registration emission** (instrumented
+  witness);
+- a burst of change wakes coalesces into one rebuild; calls during a
+  rebuild read the prior snapshot;
 - an authorized-set change acquires/releases exactly the delta;
+- a pool of 33+ providers: deterministic 32 sensed (EntityId-byte
+  order), remainder Unknown fallback, `org_sensing_truncated_total`
+  incremented, the call succeeds;
 - at the watch-map bound, calls proceed unsensed with the capacity
   metric incremented;
+- the per-call temporal recheck still refuses an
+  expired-since-rebuild credential (the route cache is not an
+  authority cache);
 - private providers never enter a sensing scope other than their own
   authority audience;
 - a provider present in sensing but absent from authorized discovery
@@ -1078,6 +1279,8 @@ Exit witnesses:
 
 - one candidate; two candidates; more than two candidates;
 - the two sampled indices are distinct;
+- the warmed selection performs exactly two cost comparisons and no
+  sort (instrumented witness);
 - lower cost wins the sampled comparison;
 - ties resolve by EntityId;
 - fixed seed + nonce reproduce the selection exactly;
@@ -1176,6 +1379,23 @@ The plan is complete when all are true:
       releases every guard.
 - [ ] Cadence relaxes when the strictest watcher drops; stale lease
       tokens cannot remove a successor registration.
+- [ ] The warmed org.call path is: ArcSwap route-set load → two-index
+      P2C → proof → send — no rediscovery, no candidate revalidation
+      scan, no observation scan, no sorting, no interest
+      reconciliation, no registration wait.
+- [ ] Route sets are immutable, change-driven, and single-flight
+      rebuilt; staleness on read enqueues a rebuild, never performs
+      one inline.
+- [ ] The per-call temporal recheck of membership/dispatcher/grant
+      remains on the hot path — the route cache is never an authority
+      cache.
+- [ ] Sensed fan-out is bounded (32 providers / 64 capabilities) with
+      deterministic truncation observable via
+      `org_sensing_truncated_total`.
+- [ ] `OrgClient`'s internals are exactly: maintain candidates,
+      maintain leases, project route sets, select — no retry queues,
+      weights, EWMA, breakers, sticky sessions, probing, or policy
+      configuration.
 - [ ] Viable is preferred over Potential; Potential remains eligible.
 - [ ] Unknown never prunes; NonViable prunes only from fresh exact
       evidence (NotReady, or Ready exceeding the hard E2E budget);
@@ -1244,3 +1464,16 @@ for proving the architecture. The fix Kyra's review required is not
 another framework: one authenticated organization sensing registration
 seam, exact-provider leases for private providers, one bounded
 clone-shared routing state, and one internal selector.
+
+The performance contract, in one line:
+
+```text
+complexity on state changes
+→ two comparisons on each call
+```
+
+never:
+
+```text
+recompute the network on each call
+```
