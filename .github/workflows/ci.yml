@@ -315,6 +315,7 @@ jobs:
         run: >
           cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test sensing_dispatch
+          --test sensing_lease
           --test sensing_failure_plane
           --test sensing_fallback
           --test sensing_origin_emitter
