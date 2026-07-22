@@ -48,6 +48,10 @@ pub mod evaluator;
 pub mod frames;
 pub mod identity;
 pub mod incarnation;
+// OLB-0 / S0 §4.3: the node-global sensing-interest lease registry
+// (refcount + cadence aggregation + generation guard). Pure — the node
+// performs the register/deregister the actions describe.
+pub mod lease;
 pub mod negotiation;
 // The rendezvous REUSES the RedEX election (plan §4.1, review 6) —
 // the reuse is real, not copied, so the module rides the `redex`
@@ -63,6 +67,7 @@ pub mod table;
 pub mod wire;
 
 pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
+pub use lease::{LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
