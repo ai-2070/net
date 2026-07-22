@@ -17058,25 +17058,45 @@ impl MeshNode {
                         ) {
                             return;
                         }
-                        let upstream = sensing::SensingInterestFrame::provider_registration(
-                            &validated.spec,
+                        // Piece-3 authority-aware provider continuation: the
+                        // legacy relay re-authoring goes through the SAME semantic
+                        // operation the org path will (piece 4). Build the admitted
+                        // wrapper from this hop's validated evidence, then let
+                        // `plan_provider_continuation` pick the upstream frame by
+                        // authority. Org intake is dark here, so the capture
+                        // closure is fail-closed `|_| None`: never invoked for a
+                        // legacy admission, and an org admission arriving at this
+                        // not-yet-live seam emits nothing rather than downgrading.
+                        let admitted = sensing::AdmittedSensingRegistration::from_validated_legacy(
+                            validated.spec.clone(),
+                            sensing::RegistrationLeg::Provider {
+                                target: validated.target,
+                                requested_sample_interval: validated.requested_sample_interval,
+                                soft_state_ttl: ttl,
+                            },
+                            proven_root,
+                        );
+                        if let Some(upstream) = sensing::plan_provider_continuation(
+                            &admitted,
                             validated.target,
                             strictest,
                             ttl,
-                        );
-                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                            spawn_sensing_frame_send(
-                                &ctx.socket,
-                                &ctx.peers,
-                                &ctx.addr_to_node,
-                                &ctx.router,
-                                &ctx.partition_filter,
-                                ctx.local_node_id,
-                                validated.target,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                                bytes,
-                            );
+                            |_org| None,
+                        ) {
+                            if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                                spawn_sensing_frame_send(
+                                    &ctx.socket,
+                                    &ctx.peers,
+                                    &ctx.addr_to_node,
+                                    &ctx.router,
+                                    &ctx.partition_filter,
+                                    ctx.local_node_id,
+                                    validated.target,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                    bytes,
+                                );
+                            }
                         }
                     }
                     sensing::RegisterOutcome::OverCap => {

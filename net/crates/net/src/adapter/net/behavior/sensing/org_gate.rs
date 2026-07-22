@@ -296,9 +296,12 @@ enum Leg {
 /// read again, and the upstream continuation frame kind is chosen exhaustively
 /// from [`Self::authority`] (no org → legacy fallback).
 ///
-/// Landed ahead of its consumer: the dispatch semantic-operation refactor that
-/// converts BOTH legacy and org intake into this wrapper lands in the same
-/// org-auth part-2 series (the `#[allow(dead_code)]` is removed then).
+/// Consumed incrementally across the org-auth part-2 series: the provider
+/// continuation ([`plan_provider_continuation`]) drives the legacy relay
+/// re-authoring seam through this wrapper today; the leader operation and the
+/// live org intake (which exercise `from_validated_org`, [`Self::leg`], and
+/// [`Self::proven_root`]) land next, at which point the residual
+/// `#[allow(dead_code)]` is removed.
 ///
 /// **Immutable after construction.** All fields are private and exposed only
 /// through by-value/by-ref accessors: the complete spec AND the addressing leg
@@ -661,11 +664,13 @@ pub(crate) enum RelayMembershipUnavailable {
     /// This node's own certificate generation is below the current revocation
     /// floor for its `(org, member)` — its membership has been revoked.
     BelowFloor,
-    /// The store's floor view moved (a revocation published, or the store
-    /// poisoned) between the coherent floor snapshot the verdict was computed
-    /// against and the final currency recheck — so the verdict is stale. Refused
-    /// advisorily rather than returning a membership proven against a floor view
-    /// that is no longer live; the soft-state refresh retries naturally.
+    /// A revocation published — moving the store's floor generation — between
+    /// the coherent floor snapshot the verdict was computed against and the final
+    /// currency recheck, so the verdict is stale. Refused advisorily rather than
+    /// returning a membership (or a floor verdict) proven against a floor view
+    /// that is no longer live; the soft-state refresh retries naturally. (A store
+    /// that POISONS mid-capture is caught first as `Poisoned` — poison does not
+    /// move the generation, so the final live poison check is what catches it.)
     ViewChanged,
 }
 
@@ -794,6 +799,65 @@ fn map_self_verify_error(e: OrgAuthorityError) -> RelayMembershipUnavailable {
         OrgAuthorityError::CertBelowFloor { .. } => RelayMembershipUnavailable::BelowFloor,
         OrgAuthorityError::CertNotForThisNode { .. } => RelayMembershipUnavailable::NotForThisNode,
         _ => RelayMembershipUnavailable::CertInvalid,
+    }
+}
+
+/// The authority-aware sensing PROVIDER continuation: given an admitted
+/// registration and the resolved upstream `target` + coalesced `strictest`
+/// interval + bounded `ttl`, produce the fresh upstream frame — or `None` (emit
+/// nothing). This is the single place the legacy-vs-org emission split is
+/// decided, and it matches EXHAUSTIVELY on
+/// [`AdmittedSensingRegistration::authority`] with NO wildcard, so adding a
+/// future authority mode breaks compilation here rather than silently defaulting
+/// to a legacy egress.
+///
+/// - Legacy → the existing [`SensingInterestFrame::provider_registration`] shape.
+/// - Org → a FRESH [`SensingInterestFrame::org_provider_registration`] carrying
+///   THIS relay's own certificate, captured late via `capture_membership`. The
+///   certificate is sourced ONLY from the captured membership — never from the
+///   downstream frame (the admitted wrapper does not even retain a downstream
+///   cert) — and if the relay's live membership is unavailable
+///   (`capture_membership` returns `None`) the result is `None`: no frame, and
+///   specifically NO legacy fallback. A relay that cannot vouch under its own
+///   live org membership forwards nothing.
+///
+/// `capture_membership` is invoked ONLY in the org arm, at the point of frame
+/// construction, so it is the latest synchronous capture point — no work
+/// intervenes between the membership capture and the frame it is bound into.
+/// Legacy callers pass a fail-closed `|_| None`: it is never invoked for a legacy
+/// admission, and an org admission arriving at a not-yet-live legacy seam emits
+/// nothing rather than downgrading.
+///
+/// The org/legacy split is safe to drive off `authority()` alone because org and
+/// legacy interests cannot coalesce under one `ProviderInterestKey` (the interest
+/// digest binds the audience, and the org-commitment and entity-owner-root
+/// audience families are cryptographically disjoint under BLAKE3/Ed25519
+/// preimage assumptions). Authority mode is taken from the admitted evidence,
+/// never inferred from the audience bytes.
+pub(crate) fn plan_provider_continuation(
+    admitted: &AdmittedSensingRegistration,
+    target: u64,
+    strictest: Duration,
+    ttl: Duration,
+    capture_membership: impl FnOnce(OrgId) -> Option<LiveOrgRelayMembership>,
+) -> Option<SensingInterestFrame> {
+    match admitted.authority() {
+        RegistrationAuthority::Legacy { .. } => Some(SensingInterestFrame::provider_registration(
+            admitted.spec(),
+            target,
+            strictest,
+            ttl,
+        )),
+        RegistrationAuthority::Org { org_id } => {
+            let membership = capture_membership(*org_id)?;
+            Some(SensingInterestFrame::org_provider_registration(
+                admitted.spec(),
+                target,
+                strictest,
+                ttl,
+                membership.owner_cert().clone(),
+            ))
+        }
     }
 }
 
@@ -1519,5 +1583,130 @@ mod tests {
             let result = gate.join().expect("gate thread");
             assert_eq!(result.err(), Some(RelayMembershipUnavailable::Poisoned));
         });
+    }
+
+    // ---- piece-3: authority-aware provider continuation ---------------
+    //
+    // The `plan_provider_continuation` semantic operation, exercised in-process.
+    // The match is wildcard-free, so both authority variants are covered here by
+    // construction (a future mode would fail to compile). Dispatch stays dark.
+    use crate::adapter::net::behavior::sensing::identity::ProviderInterestKey;
+
+    /// A legacy admitted registration (authority = Legacy) with the given
+    /// audience — the provider leg parameters are placeholders the planner
+    /// ignores (it takes target/interval/ttl as explicit arguments).
+    fn legacy_admitted(audience: AudienceScopeCommitment) -> AdmittedSensingRegistration {
+        AdmittedSensingRegistration::from_validated_legacy(
+            spec_with(audience),
+            RegistrationLeg::Provider {
+                target: 0x77,
+                requested_sample_interval: D,
+                soft_state_ttl: TTL,
+            },
+            audience,
+        )
+    }
+
+    /// An org admitted registration (authority = Org), conceptually derived from
+    /// consumer `consumer`'s org registration. `from_validated_org` DROPS the
+    /// subscriber cert and keeps only the verified org id, so no downstream cert
+    /// can survive into the continuation.
+    fn org_admitted(consumer: EntityId) -> AdmittedSensingRegistration {
+        AdmittedSensingRegistration::from_validated_org(
+            ValidatedOrgSensingRegistration::Capability {
+                spec: spec_with(org_commit()),
+                consumer: FROM_NODE,
+                requested_sample_interval: D,
+                soft_state_ttl: TTL,
+                subscriber: consumer,
+                org_id: org_kp().org_id(),
+            },
+        )
+    }
+
+    #[test]
+    fn legacy_provider_continuation_emits_legacy_frame() {
+        let admitted = legacy_admitted(AudienceScopeCommitment::owner_root(&member()));
+        // The fail-closed capture is never invoked for a legacy admission.
+        let frame = plan_provider_continuation(&admitted, 0x77, D, TTL, |_| {
+            panic!("capture must not run for a legacy admission")
+        })
+        .expect("legacy continuation frame");
+        assert!(matches!(
+            frame,
+            SensingInterestFrame::ProviderRegistration { .. }
+        ));
+    }
+
+    #[test]
+    fn org_provider_continuation_carries_the_relays_own_cert() {
+        // Cert-source witness: consumer entity C, relay entity R. The emitted org
+        // frame's certificate MUST be R's (from the captured membership), never C.
+        let consumer = EntityId::from_bytes([0xCCu8; 32]);
+        let admitted = org_admitted(consumer.clone());
+        let (relay_entity, authority, store) = adopt_relay("continuation", 1);
+        let membership = capture_relay(
+            Some(authority),
+            Some(store),
+            &relay_entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        let frame = plan_provider_continuation(&admitted, 0x77, D, TTL, |org| {
+            assert_eq!(org, org_kp().org_id(), "captured for the admitted org");
+            Some(membership)
+        })
+        .expect("org continuation frame");
+        match frame {
+            SensingInterestFrame::OrgProviderRegistration {
+                subscriber_membership,
+                target,
+                ..
+            } => {
+                assert_eq!(target, 0x77);
+                assert_eq!(
+                    subscriber_membership.member, relay_entity,
+                    "the continuation carries the relay's own cert"
+                );
+                assert_ne!(
+                    subscriber_membership.member, consumer,
+                    "never the downstream consumer's cert"
+                );
+            }
+            _ => panic!("expected OrgProviderRegistration"),
+        }
+    }
+
+    #[test]
+    fn org_continuation_without_membership_emits_nothing_and_no_fallback() {
+        // Relay membership unavailable → NO frame, and specifically NO legacy
+        // ProviderRegistration fallback.
+        let admitted = org_admitted(EntityId::from_bytes([0xCCu8; 32]));
+        let planned = plan_provider_continuation(&admitted, 0x77, D, TTL, |_| None);
+        assert!(
+            planned.is_none(),
+            "an org admission with no live membership emits nothing (no legacy fallback)"
+        );
+    }
+
+    #[test]
+    fn org_and_legacy_specs_cannot_share_a_provider_key() {
+        // Mixed-authority key-separation proof (Kyra option 1): two specs
+        // identical in every predicate field but scoped to an org audience vs an
+        // entity owner-root audience derive DIFFERENT ProviderInterestKeys, so no
+        // aggregate can ever coalesce an org row with a legacy row — hence a
+        // legacy refresh cannot carry an org demand upstream. Cryptographic
+        // separation under BLAKE3/Ed25519 preimage assumptions (both audiences
+        // share one untagged [u8; 32]); authority mode is taken from admitted
+        // evidence, never inferred from these bytes.
+        let org_spec = spec_with(org_commit());
+        let legacy_spec = spec_with(AudienceScopeCommitment::owner_root(&member()));
+        let org_key = ProviderInterestKey::new(org_spec.key(), 0x77);
+        let legacy_key = ProviderInterestKey::new(legacy_spec.key(), 0x77);
+        assert_ne!(
+            org_key, legacy_key,
+            "org and legacy audiences must not collide on the aggregate key"
+        );
     }
 }

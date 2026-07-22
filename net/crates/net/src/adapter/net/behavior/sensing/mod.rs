@@ -81,8 +81,9 @@ pub use org_gate::{
 };
 pub(crate) use org_gate::{
     capture_current_sensing_stamp, capture_live_org_relay_membership,
-    capture_sensing_authority_snapshot, LiveOrgRelayMembership, RelayMembershipUnavailable,
-    SensingAuthoritySnapshot, SensingAuthorityUnavailable,
+    capture_sensing_authority_snapshot, plan_provider_continuation, AdmittedSensingRegistration,
+    LiveOrgRelayMembership, RegistrationLeg, RelayMembershipUnavailable, SensingAuthoritySnapshot,
+    SensingAuthorityUnavailable,
 };
 #[cfg(feature = "redex")]
 pub use rendezvous::{
