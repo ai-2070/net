@@ -573,6 +573,13 @@ pub extern "C" fn net_org_credentials_new(
                 write_err(out_err, "grant array pointers are NULL".into());
                 return NET_ORG_ERR_NULL;
             }
+            // `from_raw_parts` requires `count * size_of::<elem>() <= isize::MAX`;
+            // the elements here are pointer-sized. Go bounds this via `len(..)`,
+            // but a raw-C caller must not overflow it.
+            if grant_count > isize::MAX as usize / std::mem::size_of::<*const u8>() {
+                write_err(out_err, "grant array count exceeds isize::MAX".into());
+                return NET_ORG_ERR_NULL;
+            }
             let ptrs = unsafe { std::slice::from_raw_parts(grant_ptrs, grant_count) };
             let lens = unsafe { std::slice::from_raw_parts(grant_lens, grant_count) };
             for (p, l) in ptrs.iter().zip(lens.iter()) {
@@ -589,6 +596,11 @@ pub extern "C" fn net_org_credentials_new(
         if audience_secret_count > 0 {
             if audience_secret_paths.is_null() {
                 write_err(out_err, "audience-secret path array is NULL".into());
+                return NET_ORG_ERR_NULL;
+            }
+            // See the grant-array bound above — pointer-sized elements.
+            if audience_secret_count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+                write_err(out_err, "audience-secret path count exceeds isize::MAX".into());
                 return NET_ORG_ERR_NULL;
             }
             let path_ptrs =
