@@ -8302,6 +8302,7 @@ impl MeshNode {
     /// never destroy an installation it does not own.
     ///
     /// [`install_consumer_grant_audience`]: Self::install_consumer_grant_audience
+    /// [`ConsumerAudienceInstall::Installed`]: super::behavior::org_grant_registry::ConsumerAudienceInstall::Installed
     /// [`ConsumerAudienceLease`]: super::behavior::org_grant_registry::ConsumerAudienceLease
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn install_consumer_grant_audience_leased(
@@ -8431,6 +8432,8 @@ impl MeshNode {
     /// concurrent binds cannot both decide they are first; and it spans the
     /// 1→0 removal in [`release_consumer_audience_leases`], so a final release
     /// racing a fresh bind cannot leave the new holder without its audience.
+    ///
+    /// [`release_consumer_audience_leases`]: Self::release_consumer_audience_leases
     pub fn acquire_consumer_audience_leases(
         &self,
         pairs: Vec<(

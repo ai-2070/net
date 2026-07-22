@@ -2342,7 +2342,7 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
 /// boundary into garbage-collected memory: the binding hands over a path, and
 /// the key's whole lifetime stays inside Rust.
 ///
-/// Structurally mirrors [`read_audience_checked`], which is the only correct
+/// Structurally mirrors `read_audience_checked`, which is the only correct
 /// model in this tree, and adds the two things a grant-side path needs that the
 /// authority directory got from `ensure_secure_authority_dir`:
 ///
@@ -2374,7 +2374,7 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
 ///
 /// # Secret handling
 ///
-/// The file bytes land in a [`ScrubbedBytes`] that zeroes on EVERY exit —
+/// The file bytes land in a `ScrubbedBytes` that zeroes on EVERY exit —
 /// return, `?`, or unwind — so the key never lingers in freed heap where a core
 /// dump or swap could reach it. No error returned from here embeds file
 /// content, and the error `Display` renders only the path.
@@ -2387,6 +2387,8 @@ fn read_audience_checked(path: &Path) -> Result<Option<Vec<u8>>, OrgAuthorityErr
 /// hop; closing the inherited one end to end needs an ownership refactor
 /// through `OrgCredentials` and the audience registry, which OSDK-L does not
 /// attempt.
+///
+/// [`OrgAudienceSecret`]: super::org_grant::OrgAudienceSecret
 pub fn load_grant_audience_secret(
     path: &Path,
 ) -> Result<super::org_grant::OrgAudienceSecret, OrgAuthorityError> {
