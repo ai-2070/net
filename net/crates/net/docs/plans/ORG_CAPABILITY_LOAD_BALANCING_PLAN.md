@@ -885,8 +885,18 @@ B closes
 → exact deregistration
 ```
 
-Stale deregistration/re-registration tokens cannot remove a successor
-registration.
+A stale lease ticket cannot remove a successor holder from the
+node-global lease **registry** (the local invariant). The **remote**
+provider row is a different matter: the sensing intake applies interest
+frames in arrival order (it does not reorder by sequence), so a reordered
+stale `Deregister` may transiently remove the remote row. Sensing is
+advisory soft state — the surviving node-global lease re-registers at
+ttl/2 and the observation is `Unknown`/`Potential` until repair, so
+deterministic authorized routing continues and no `org.call` fails. The
+ttl/2 refresh owner is the node-global lease lifecycle (one owner per
+installed key: first holder arms, last disarms), not a per-clone-family
+task; it and the reordered-deregister→refresh-recovery witness are the
+OLB-2 exit gate (sensing plan §4.3/S0, §6 witness 36).
 
 ### Capacity behavior
 
@@ -1307,6 +1317,16 @@ For same-org candidates:
   authorized same-org provider (enqueued, never awaited); on
   provider-set change, acquire new / release removed; on last client
   drop, release all;
+- add the **node-global sensing-interest ttl/2 refresh owner** — the
+  convergence backstop for a reordered stale deregister (§7). This is
+  owned by the node-global lease lifecycle, NOT the per-clone-family
+  route reconciler: one refresh owner per installed key (first holder
+  arms, later holders share, last holder disarms), a bounded node-owned
+  due-time/timer actor rather than one task per lease. The per-family
+  reconciler rebuilds the immutable `OrgRouteSet`; the node-global
+  refresh keeps the underlying wire registration alive. Do not give each
+  clone family its own refresh loop (that reintroduces the very
+  node-global ownership bug the lease refcount exists to prevent);
 - join observations via `sensed_candidates` with the authorized
   population as `resolved_population` (projection-stage clamp) —
   inside the reconciler, never on the request path;
@@ -1337,6 +1357,11 @@ Exit witnesses:
 - the per-call temporal recheck still refuses an
   expired-since-rebuild credential (the route cache is not an
   authority cache);
+- **(convergence)** a reordered stale `Deregister` that transiently
+  removes the remote provider row is repaired by the node-global
+  ttl/2 refresh — the observation is `Unknown`/`Potential` until repair
+  and no `org.call` fails; and a last-holder close disarms the refresh
+  owner so no later refresh resurrects the retired row (no ghost demand);
 - a rebuild whose source generations changed during computation
   discards its result and re-enqueues; the stale result never
   publishes (publish-if-current);
@@ -1467,8 +1492,14 @@ The plan is complete when all are true:
 - [ ] Lazy watches are retained in a bounded, clone-shared
       `OrgRoutingState`; a second call is warm; the last client drop
       releases every guard.
-- [ ] Cadence relaxes when the strictest watcher drops; stale lease
-      tokens cannot remove a successor registration.
+- [ ] Cadence relaxes when the strictest watcher drops; a stale lease
+      ticket cannot remove a successor holder from the node-global
+      registry (local invariant).
+- [ ] (OLB-2 exit) A reordered stale `Deregister` that transiently
+      removes the remote row is repaired by the node-global lease's
+      ttl/2 refresh; the observation is `Unknown`/`Potential` until
+      repair and no `org.call` fails; a last-holder close disarms the
+      refresh owner (no ghost demand).
 - [ ] The warmed org.call path is: ArcSwap route-set load → two-index
       P2C → proof → send — no rediscovery, no candidate revalidation
       scan, no observation scan, no sorting, no interest

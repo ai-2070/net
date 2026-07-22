@@ -430,7 +430,14 @@ minimum watcher closes     → recompute minimum → re-register relaxed
 last watcher closes        → exact deregistration
 ```
 
-All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, the node-side lock covers the transition (not only counter mutation) so a final drop racing a new watch leaves one live registration, and a stale deregistration/re-registration token cannot remove a successor. Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
+All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, and the node-side lock covers the transition (not only counter mutation). **Two invariants at different layers (Kyra ruling, 2026-07-22):**
+
+- **local/node (guaranteed):** a stale lease ticket cannot remove a successor holder from the node-global lease registry — the registry mutation is serialized and ticket-owned.
+- **distributed/wire (soft-state convergence, not linearizable):** the lease serializes *outbound frame construction* (synchronous stream-sequence allocation under the apply lock), but network delivery may still reorder, and the sensing intake applies interest frames in arrival order — it does not reorder or reject by sequence. So a reordered stale `Deregister` may transiently remove the remote provider row. Because sensing is advisory soft state, this is honest and sufficient: until the node-global lease's ttl/2 refresh restores the registration, the observation is `Unknown`/`Potential`, deterministic authorized routing continues, and no invocation fails. The lease deliberately does not attempt linearizable installation ownership across the wire (rejected: receiver-side installation generations — a larger sensing-protocol change deferred to a measured need; and sender debounce — probabilistic mitigation, not correctness).
+
+**Refresh ownership (OLB-2/S1).** The ttl/2 refresh that provides convergence is owned by the **node-global lease lifecycle**, not by an arbitrary `OrgRoutingState`/`SensingWatch` clone family: multiple client families share one coalesced registration, so the refresh owner must be node-global too (the first holder arms exactly one refresh owner per installed key, later holders share it, the last holder disarms it — the same node-global ownership lesson as the lease refcount itself). Prefer one bounded node-owned due-time/timer actor (wake at the earliest `next_refresh`, refresh live entries, re-arm at ttl/2, ignore entries removed or replaced before firing) over one Tokio task per lease. This slice (S0) delivers the lease primitive + node wiring and the local invariant; the refresh owner and the distributed-convergence witness (§6 witness 36) are the OLB-2/S1 exit gate.
+
+Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
 
 **Acquisition is consumer-non-blocking.** The node-side count mutation is a local lock; wire registration and refresh emission are asynchronous. Acquiring a lease never waits on leader election, emission, or an acknowledgment — observations are simply Unknown until the stream establishes. Consumers with an invocation latency budget (the org client) enqueue acquisition and proceed unsensed.
 
@@ -652,7 +659,7 @@ This slice is optional for the generic sensing SDK release and gates only on the
 7. Two equivalent local watches — including watches opened through two different `Mesh` wrappers over one `MeshNode` — produce one registration and one refresh loop, and the first drop cannot deregister under the second live watch.
 8. Closing one clone retains the registration; closing the last emits deregistration.
 9. Drop stops refresh; missed cleanup still expires through soft state.
-10. Last-close racing a new watch leaves one live registration.
+10. Last-close racing a new watch leaves one live holder in the node-global registry (the local invariant); remote-row convergence after a reordered stale deregister is the ttl/2-refresh soft-state guarantee of §6 witness 36, not an immediate one.
 11. Leader failure elects the next healthy verified member and re-registers without projecting false NotReady.
 12. Capability-fold membership and route/failure changes wake the watch, and the post-wake exact snapshot reflects the change.
 13. A stale retained observation outside the current resolved population is excluded.
@@ -689,8 +696,8 @@ This slice is optional for the generic sensing SDK release and gates only on the
 32. An org-private provider produces attestations under an exact-provider lease while remaining absent from the provider-free sensing population (the private-capability existence-oracle guard stays intact).
 33. A stricter watcher joining a shared lease tightens the registered cadence to the new minimum.
 34. Dropping the strictest watcher relaxes the registration to the recomputed minimum; dropping a non-strictest watcher causes no wire change.
-35. A final lease drop racing a new acquire leaves exactly one current registration.
-36. A stale deregistration/re-registration token cannot remove a successor registration.
+35. **(local/node — this slice)** A final lease drop racing a new acquire leaves exactly one holder in the node-global lease registry; a stale lease ticket removes no successor holder from the registry.
+36. **(distributed/wire — OLB-2/S1 exit gate, NOT this slice)** Network delivery may reorder, so an adversarially-delivered stale `Deregister` may transiently remove the remote provider row. The surviving node-global lease re-registers at ttl/2; the observation is `Unknown`/`Potential` until repair and no protected invocation fails because sensing was absent; and a last-holder close cancels the refresh owner so no later refresh resurrects the retired row. This slice orders outbound frame construction only — it does not attempt linearizable installation ownership across the wire (see §4.3).
 37. A legacy (non-organization) registration variant cannot enter an organization-derived audience; an old node receiving an organization variant refuses cleanly, and the affected consumer degrades to Unknown plus deterministic routing — never an invocation failure.
 
 ---
