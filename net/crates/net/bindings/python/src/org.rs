@@ -233,14 +233,9 @@ impl PyOrgClient {
     ) -> PyResult<Bound<'py, PyBytes>> {
         // Snapshot first: a concurrent close() cannot pull the lease/node out
         // from under a call that already started.
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| {
-                OrgCredentialsError::new_err(
-                    "org:credentials:closed: this OrgClient has been closed",
-                )
-            })?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            OrgCredentialsError::new_err("org:credentials:closed: this OrgClient has been closed")
+        })?;
         let runtime = self.runtime.clone();
         let body = bytes::Bytes::copy_from_slice(request);
         let reply = py.detach(move || {
@@ -253,28 +248,18 @@ impl PyOrgClient {
     /// The organization this client acts for, as 32 raw bytes.
     #[getter]
     fn acting_org<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| {
-                OrgCredentialsError::new_err(
-                    "org:credentials:closed: this OrgClient has been closed",
-                )
-            })?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            OrgCredentialsError::new_err("org:credentials:closed: this OrgClient has been closed")
+        })?;
         Ok(PyBytes::new(py, client.acting_org().as_bytes()))
     }
 
     /// The entity this client calls as, as 32 raw bytes.
     #[getter]
     fn caller<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let client = self
-            .inner
-            .load_full()
-            .ok_or_else(|| {
-                OrgCredentialsError::new_err(
-                    "org:credentials:closed: this OrgClient has been closed",
-                )
-            })?;
+        let client = self.inner.load_full().ok_or_else(|| {
+            OrgCredentialsError::new_err("org:credentials:closed: this OrgClient has been closed")
+        })?;
         Ok(PyBytes::new(py, client.caller().as_bytes()))
     }
 

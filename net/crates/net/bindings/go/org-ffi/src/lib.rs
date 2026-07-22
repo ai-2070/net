@@ -600,7 +600,10 @@ pub extern "C" fn net_org_credentials_new(
             }
             // See the grant-array bound above — pointer-sized elements.
             if audience_secret_count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
-                write_err(out_err, "audience-secret path count exceeds isize::MAX".into());
+                write_err(
+                    out_err,
+                    "audience-secret path count exceeds isize::MAX".into(),
+                );
                 return NET_ORG_ERR_NULL;
             }
             let path_ptrs =
