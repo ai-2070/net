@@ -1,6 +1,6 @@
 {
   "name": "@net-mesh/deck",
-  "version": "0.33.0",
+  "version": "0.34.0",
   "description": "net-deck — operator cyberdeck (terminal UI) for the Net mesh",
   "license": "Apache-2.0",
   "repository": {
@@ -27,13 +27,13 @@
   },
   "//": "Per-platform binary packages are listed as optionalDependencies. npm fetches only the one whose `os`/`cpu`/`libc` constraints match the install host; bin/net-deck.js resolves whichever landed at runtime and execs the bundled binary.",
   "optionalDependencies": {
-    "@net-mesh/deck-linux-x64-gnu": "0.33.0",
-    "@net-mesh/deck-linux-x64-musl": "0.33.0",
-    "@net-mesh/deck-linux-arm64-gnu": "0.33.0",
-    "@net-mesh/deck-linux-arm64-musl": "0.33.0",
-    "@net-mesh/deck-darwin-x64": "0.33.0",
-    "@net-mesh/deck-darwin-arm64": "0.33.0",
-    "@net-mesh/deck-win32-x64": "0.33.0",
-    "@net-mesh/deck-win32-arm64": "0.33.0"
+    "@net-mesh/deck-linux-x64-gnu": "0.34.0",
+    "@net-mesh/deck-linux-x64-musl": "0.34.0",
+    "@net-mesh/deck-linux-arm64-gnu": "0.34.0",
+    "@net-mesh/deck-linux-arm64-musl": "0.34.0",
+    "@net-mesh/deck-darwin-x64": "0.34.0",
+    "@net-mesh/deck-darwin-arm64": "0.34.0",
+    "@net-mesh/deck-win32-x64": "0.34.0",
+    "@net-mesh/deck-win32-arm64": "0.34.0"
   }
 }
