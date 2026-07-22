@@ -72,13 +72,20 @@ pyo3::create_exception!(
     OrgError,
     "The `org:` vocabulary could not be parsed — this build and the SDK disagree \
      about the contract. An internal compatibility failure, NOT an admission \
-     result: it deliberately does not impersonate one of the four domains."
+     result: it deliberately does not impersonate one of the four domains. A \
+     live in-version call never raises this; it is produced by \
+     `net.org.classify_org_error(..)` when classifying a foreign or \
+     version-skewed `org:` string."
 );
 
 /// Format a `ServeError` for the provider verb — serve failures are local
-/// registration problems, not the four call-time domains.
+/// registration problems, NOT the four call-time domains, so they carry no
+/// `org:` prefix (they surface as a plain `RuntimeError`, the same way the
+/// `install_*` provisioning functions do). Prefixing them `org:` made
+/// `parse_org_error` classify them as the `unknown` domain (`is_local=False`),
+/// implying a request may have reached a provider.
 pub(crate) fn org_serve_error(e: &net_sdk::mesh_rpc::ServeError) -> String {
-    format!("org:serve_failed: {e}")
+    format!("org serve registration failed: {e}")
 }
 
 /// Map an `OrgSdkError` onto the right Python exception, carrying the `org:`
@@ -229,7 +236,11 @@ impl PyOrgClient {
         let client = self
             .inner
             .load_full()
-            .ok_or_else(|| OrgError::new_err("org:closed: this OrgClient has been closed"))?;
+            .ok_or_else(|| {
+                OrgCredentialsError::new_err(
+                    "org:credentials:closed: this OrgClient has been closed",
+                )
+            })?;
         let runtime = self.runtime.clone();
         let body = bytes::Bytes::copy_from_slice(request);
         let reply = py.detach(move || {
@@ -245,7 +256,11 @@ impl PyOrgClient {
         let client = self
             .inner
             .load_full()
-            .ok_or_else(|| OrgError::new_err("org:closed: this OrgClient has been closed"))?;
+            .ok_or_else(|| {
+                OrgCredentialsError::new_err(
+                    "org:credentials:closed: this OrgClient has been closed",
+                )
+            })?;
         Ok(PyBytes::new(py, client.acting_org().as_bytes()))
     }
 
@@ -255,7 +270,11 @@ impl PyOrgClient {
         let client = self
             .inner
             .load_full()
-            .ok_or_else(|| OrgError::new_err("org:closed: this OrgClient has been closed"))?;
+            .ok_or_else(|| {
+                OrgCredentialsError::new_err(
+                    "org:credentials:closed: this OrgClient has been closed",
+                )
+            })?;
         Ok(PyBytes::new(py, client.caller().as_bytes()))
     }
 

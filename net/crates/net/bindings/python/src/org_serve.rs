@@ -11,7 +11,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 
-use super::org::{org_serve_error, OrgError};
+use super::org::org_serve_error;
 
 /// Application status for a handler that raised — the same value the typed nRPC
 /// layer uses. A handler cannot counterfeit an admission denial (0x0009).
@@ -116,7 +116,7 @@ pub fn serve_org(
                 async move { run_py_org_handler(callable, caller, body, timeout).await }
             },
         )
-        .map_err(|e| OrgError::new_err(org_serve_error(&e)))?
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(org_serve_error(&e)))?
     };
 
     Ok(PyOrgServeHandle {

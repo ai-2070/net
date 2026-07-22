@@ -81,6 +81,42 @@ def parse_org_error(exc_or_message: Any) -> ParsedOrgError:
     return ParsedOrgError("unknown", None, message)
 
 
+def classify_org_error(exc_or_message: Any) -> Any:
+    """Return the typed org exception for an ``org:`` wire string or exception.
+
+    Mirrors the Node binding's ``classifyOrgError`` and the native
+    ``org_err_to_py`` domain→exception mapping; the returned instance is ready to
+    ``raise``. An unparseable or unknown-vocabulary string becomes
+    :class:`OrgUnclassifiedError`, which deliberately never impersonates one of
+    the four domains.
+
+    This is the ONLY producer of :class:`OrgUnclassifiedError`: a live,
+    in-version native call always raises one of the four typed domains directly,
+    so you meet ``OrgUnclassifiedError`` only when you classify a foreign or
+    version-skewed ``org:`` string yourself.
+    """
+    from ._net import (  # local import: native module
+        OrgAdmissionDeniedError,
+        OrgCredentialsError,
+        OrgDiscoveryError,
+        OrgError,
+        OrgUnclassifiedError,
+    )
+
+    parsed = parse_org_error(exc_or_message)
+    if parsed.domain == "credentials":
+        return OrgCredentialsError(parsed.message)
+    if parsed.domain == "discovery":
+        return OrgDiscoveryError(parsed.message)
+    if parsed.domain == "admission_denied":
+        return OrgAdmissionDeniedError(parsed.message)
+    if parsed.domain == "rpc":
+        # `org:rpc:` reuses the frozen nRPC vocabulary; surface it under the base
+        # class, exactly as the native `org_err_to_py` does.
+        return OrgError(parsed.message)
+    return OrgUnclassifiedError(parsed.message)
+
+
 def _encode(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 

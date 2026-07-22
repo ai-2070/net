@@ -128,3 +128,35 @@ def test_provisioning_surface_exists_and_errors_on_bad_input() -> None:
             net.install_provider_grant_audience(mesh, bytes(318), "/no/such/secret")
     finally:
         mesh.shutdown()
+
+
+def test_classify_org_error_maps_domains_and_reaches_unclassified() -> None:
+    # §8 — `classify_org_error` is the producer that makes `OrgUnclassifiedError`
+    # reachable (a live in-version call always raises one of the four typed
+    # domains directly). Each domain maps to its typed exception; an unknown or
+    # unparseable `org:` string becomes `OrgUnclassifiedError`, never one of the
+    # four canonical domains.
+    from net.org import classify_org_error
+
+    assert isinstance(
+        classify_org_error("org:credentials:signature_invalid: x"),
+        net.OrgCredentialsError,
+    )
+    assert isinstance(
+        classify_org_error("org:discovery:no_authorized_provider: x"),
+        net.OrgDiscoveryError,
+    )
+    assert isinstance(
+        classify_org_error("org:admission_denied:denied"),
+        net.OrgAdmissionDeniedError,
+    )
+    # `org:rpc:` rides the base class, matching the native `org_err_to_py`.
+    rpc = classify_org_error("org:rpc:timeout: x")
+    assert isinstance(rpc, net.OrgError)
+    assert not isinstance(rpc, net.OrgUnclassifiedError)
+
+    for wire in ("org:frobnicate:whatever: x", "not-an-org-error", "org:"):
+        err = classify_org_error(wire)
+        assert isinstance(err, net.OrgUnclassifiedError), wire
+        # Still an OrgError, so a broad `except OrgError` catches it too.
+        assert isinstance(err, net.OrgError), wire
