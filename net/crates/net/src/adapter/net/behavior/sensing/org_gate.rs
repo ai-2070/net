@@ -56,14 +56,17 @@ pub struct OrgAuthorityView {
 }
 
 /// Domain separation for the canonical organization sensing audience
-/// commitment — distinct from the entity `owner_root` commitment so an
-/// organization audience can never collide with a single entity's root.
+/// commitment — a distinct BLAKE3 derive-key domain from the entity
+/// `owner_root` commitment, so an organization audience colliding with a
+/// single entity's root is cryptographically infeasible (domain-separated, not
+/// literally injective).
 const ORG_SENSING_AUDIENCE_DOMAIN: &str = "net.sensing.org-audience.v1";
 
 /// The canonical sensing audience commitment for an organization: a
-/// domain-separated hash of the `OrgId`. Every same-org member derives the
-/// identical 32-byte commitment, and it is bound into the interest digest, so
-/// two different organizations' interests can never coalesce.
+/// domain-separated BLAKE3 derivation over the `OrgId`. Every same-org member
+/// derives the identical 32-byte commitment, and it is bound into the interest
+/// digest, so two different organizations' interests coalescing is
+/// cryptographically infeasible (domain-separated, not literal injectivity).
 pub fn canonical_org_sensing_commitment(org_id: &OrgId) -> AudienceScopeCommitment {
     let mut hasher = blake3::Hasher::new_derive_key(ORG_SENSING_AUDIENCE_DOMAIN);
     hasher.update(org_id.as_bytes());

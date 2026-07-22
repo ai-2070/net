@@ -95,9 +95,10 @@ impl OrgRevocationState {
     }
 
     /// Test seam: a state with explicit floors, as a merged bundle would
-    /// leave it, without constructing and signing a bundle.
-    #[doc(hidden)]
-    pub fn from_floors_for_test(floors: BTreeMap<(OrgId, EntityId), u32>) -> Self {
+    /// leave it, without constructing and signing a bundle. Test-only — never
+    /// a supported downstream constructor for synthetic authority state.
+    #[cfg(test)]
+    pub(crate) fn from_floors_for_test(floors: BTreeMap<(OrgId, EntityId), u32>) -> Self {
         Self { floors }
     }
 
