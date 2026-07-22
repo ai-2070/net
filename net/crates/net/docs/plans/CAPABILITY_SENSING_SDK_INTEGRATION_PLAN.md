@@ -430,6 +430,8 @@ last watcher closes        → exact deregistration
 
 All zero-to-one and one-to-zero transitions are serialized per `MeshNode`, the node-side lock covers the transition (not only counter mutation) so a final drop racing a new watch leaves one live registration, and a stale deregistration/re-registration token cannot remove a successor. Add narrow core deregistration methods for provider-free and exact-provider local interests (today interests are TTL soft-state only, with no public deregistration and no refcount anywhere).
 
+**Acquisition is consumer-non-blocking.** The node-side count mutation is a local lock; wire registration and refresh emission are asynchronous. Acquiring a lease never waits on leader election, emission, or an acknowledgment — observations are simply Unknown until the stream establishes. Consumers with an invocation latency budget (the org client) enqueue acquisition and proceed unsensed.
+
 `changed()` uses the existing unified generation receiver but always rereads exact current projection after waking. The wake alone is never evidence.
 
 ### 4.4 Provider lifecycle
@@ -466,6 +468,14 @@ Same-organization scope derives from installed `NodeAuthority`; do not expose th
 ---
 
 ## 5. Implementation slices
+
+**Consumer scoping (Kyra, 2026-07-22).** The org load-balancing release
+([`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md))
+consumes only S0's registration-authority + exact-provider lease +
+evaluator-ownership subset plus the S1 provider `provide()` lifecycle.
+It does not wait for the generic consumer watch surface, S2 sensed
+nRPC, or S3 compute/gang adapters — sequence S0 so that subset is
+separable and landable first.
 
 ### S0 — Authority-derived owner scope and explicit lifecycle primitives
 
