@@ -35,8 +35,8 @@
 //! no invocation authority. This gate authorizes *sensing registration*, an
 //! advisory optimization — a refusal leaves the caller `Unknown`/`Potential`.
 
-use super::super::org::{OrgError, OrgId};
-use super::super::org_authority::NodeAuthority;
+use super::super::org::{OrgError, OrgId, OrgMembershipCert};
+use super::super::org_authority::{NodeAuthority, OrgAuthorityError};
 use super::super::org_revocation::{OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{AudienceScopeCommitment, InterestSpec};
@@ -576,6 +576,168 @@ pub(crate) fn capture_current_sensing_stamp(
     })
 }
 
+/// A pinned, live proof of THIS node's own organization membership, captured so
+/// a relay may re-author an organization sensing registration upstream under
+/// its OWN certificate.
+///
+/// The org sensing plane forwards a downstream interest as a FRESH
+/// `OrgProviderRegistration` at every hop, and each hop must vouch with the
+/// membership it can prove RIGHT NOW — never the downstream consumer's
+/// certificate, and never one that verified only at startup. This is the
+/// late-bound relay authority: [`capture_live_org_relay_membership`] re-runs the
+/// EXACT startup ownership check (`NodeAuthorityConfig::self_verify_at`) against
+/// the LIVE revocation floors at an explicit `now_secs`, so a relay whose own
+/// membership has since expired or been revoked re-authors NOTHING — the branch
+/// stays advisory (`Unknown`/`Potential`) rather than forwarding under a stale
+/// certificate.
+///
+/// **Independent of the OA `owner_cert_emission_enabled` toggle.** That flag
+/// governs whether this node advertises its owner certificate on the OA
+/// discovery/announcement surface. Sensing relay re-authoring is a DISTINCT
+/// authorization: the sensing plane runs its own organization-authority gate
+/// ([`verify_org_sensing_registration`]), so a relay forwarding an org sensing
+/// interest vouches under its live membership regardless of the announcement
+/// surface's emission policy. The two must not be coupled — silencing OA
+/// announcements must not silence in-mesh sensing relay, and vice versa.
+///
+/// The retained `Arc`s pin the exact authority + store the membership was
+/// proven against, alive from capture through the upstream re-authoring emit.
+///
+/// The accessors land ahead of their consumer (the dispatch re-authoring emit,
+/// org-auth part-2 piece 4), so the `#[allow(dead_code)]` is removed then.
+#[allow(dead_code)]
+pub(crate) struct LiveOrgRelayMembership {
+    owner_cert: OrgMembershipCert,
+    org_id: OrgId,
+    // Pins — held to keep the exact authority + store alive from capture
+    // through the upstream re-authoring emit.
+    _authority: Arc<NodeAuthority>,
+    _store: Arc<OrgRevocationStore>,
+}
+
+#[allow(dead_code)]
+impl LiveOrgRelayMembership {
+    /// This relay's OWN membership certificate — the value attached to the fresh
+    /// `OrgProviderRegistration` emitted upstream. It is the node's live,
+    /// self-verified owner certificate, never a value copied from the downstream
+    /// frame.
+    pub(crate) fn owner_cert(&self) -> &OrgMembershipCert {
+        &self.owner_cert
+    }
+
+    /// The relay's verified organization — equal to the incoming registration's
+    /// org (the capture refuses a foreign org) and to the certificate's issuer.
+    pub(crate) fn org_id(&self) -> OrgId {
+        self.org_id
+    }
+}
+
+/// Why THIS relay cannot vouch for an organization sensing re-authoring right
+/// now. Every variant leaves the branch advisory (`Unknown`/`Potential`): a
+/// relay that cannot prove its OWN live membership forwards nothing — it never
+/// downgrades to a legacy frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayMembershipUnavailable {
+    /// No [`NodeAuthority`] is installed — this node has no membership to vouch
+    /// with.
+    NoAuthority,
+    /// No [`OrgRevocationStore`] is installed — the revocation floor cannot be
+    /// evaluated, so membership cannot be proven current.
+    NoStore,
+    /// The installed store is poisoned.
+    Poisoned,
+    /// The incoming registration's organization is not this node's owner
+    /// organization — a relay only re-authors within its OWN organization. This
+    /// is also the late-bound guard against the authority having rotated to a
+    /// different org between the incoming validation and this capture.
+    ForeignOrg,
+    /// This node's own certificate names a different entity than the supplied
+    /// local entity — a mis-installed authority (defense in depth; a loaded
+    /// [`NodeAuthority`] proved this binding at `open()`).
+    NotForThisNode,
+    /// This node's own certificate failed signature or time-window validation at
+    /// `now_secs` under the persisted skew.
+    CertInvalid,
+    /// This node's own certificate generation is below the current revocation
+    /// floor for its `(org, member)` — its membership has been revoked.
+    BelowFloor,
+}
+
+/// Capture a pinned, live proof of THIS relay's own organization membership for
+/// re-authoring an org sensing registration whose (already-validated)
+/// organization is `expected_org`, at an explicit `now_secs`.
+///
+/// Held under the `org_install` publication lock so the authority and the live
+/// store are read as one coherent pair (the same barrier
+/// [`capture_sensing_authority_snapshot`] uses). The relay's membership is
+/// re-verified with the SAME check the node passed at startup
+/// (`NodeAuthorityConfig::self_verify_at`) — binding, signature, window at
+/// `now_secs` + persisted skew, and revocation floor — against the LIVE store's
+/// coherent floors, so an expired or revoked relay proves nothing. On success
+/// the relay's own `owner_cert` is returned for the caller to attach to the
+/// fresh upstream `OrgProviderRegistration`; the exact authority + store are
+/// pinned so the emit runs against the objects the proof was taken against.
+///
+/// Free-standing over the raw node fields (mirroring the piece-1 captures) so
+/// both `MeshNode` and the dispatch context can call it.
+pub(crate) fn capture_live_org_relay_membership(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    local_entity: &EntityId,
+    expected_org: OrgId,
+    now_secs: u64,
+) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
+    let _install = org_install.lock();
+    let authority = node_authority
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::NoAuthority)?;
+    let store = org_revocation
+        .load_full()
+        .ok_or(RelayMembershipUnavailable::NoStore)?;
+    if store.is_poisoned() {
+        return Err(RelayMembershipUnavailable::Poisoned);
+    }
+    // A relay only re-authors within its OWN organization. Checked before the
+    // membership self-verify: a foreign-org interest is refused as such even if
+    // this node's own certificate is momentarily invalid, and this is the
+    // late-bound guard against an authority rotation to a different org between
+    // the incoming validation and this capture.
+    if authority.owner_org() != expected_org {
+        return Err(RelayMembershipUnavailable::ForeignOrg);
+    }
+    // Coherent floors, barrier-paired with the store's publication generation.
+    let (floors, _generation) = store.snapshot_with_generation();
+    // The relay's live membership bar is IDENTICAL to the startup ownership bar,
+    // re-run late at explicit `now_secs` against the LIVE floors — an expired or
+    // revoked relay proves nothing.
+    authority
+        .config
+        .self_verify_at(local_entity, &floors, now_secs)
+        .map_err(map_self_verify_error)?;
+    Ok(LiveOrgRelayMembership {
+        owner_cert: authority.config.owner_cert.clone(),
+        org_id: authority.owner_org(),
+        _authority: authority,
+        _store: store,
+    })
+}
+
+/// Narrow the startup self-verify error onto the relay-membership refusal. A
+/// loaded [`NodeAuthority`] already passed the structural binding and version
+/// checks at `open()`, so the reachable LIVE failures are a signature/window
+/// lapse (`CertInvalid`) and a revocation floor raised since boot (`BelowFloor`);
+/// a supplied local entity that does not match the certificate surfaces as
+/// `NotForThisNode`. Any residual structural variant a loaded authority cannot
+/// exhibit collapses to `CertInvalid`.
+fn map_self_verify_error(e: OrgAuthorityError) -> RelayMembershipUnavailable {
+    match e {
+        OrgAuthorityError::CertBelowFloor { .. } => RelayMembershipUnavailable::BelowFloor,
+        OrgAuthorityError::CertNotForThisNode { .. } => RelayMembershipUnavailable::NotForThisNode,
+        _ => RelayMembershipUnavailable::CertInvalid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,5 +1107,268 @@ mod tests {
         // A store may poison without changing any pointer or generation.
         let captured = stamp(1, 2, 3, 4, false);
         assert!(!captured.is_current(&stamp(1, 2, 3, 4, true)));
+    }
+
+    // ---- piece-2: live relay re-authoring membership ------------------
+    //
+    // `capture_live_org_relay_membership` against a REAL adopted authority + its
+    // live store. Two cells are behavioral RED-couplings, not mere refusals:
+    // `relay_expired_at_future_now_is_cert_invalid` fails if the gate reads
+    // `current_timestamp()` instead of the explicit `now_secs`, and
+    // `relay_below_live_floor_is_refused` fails if it verifies against the
+    // authority's startup floors instead of the LIVE store's floors.
+    use crate::adapter::net::behavior::org::OrgRevocationBundle;
+    use crate::adapter::net::behavior::org_revocation::ProvisioningExpectation;
+    use crate::adapter::net::identity::EntityKeypair;
+    use std::sync::atomic::AtomicUsize;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "net-relay-membership-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn foreign_org() -> OrgId {
+        OrgKeypair::from_bytes([0x99u8; 32]).org_id()
+    }
+
+    /// Adopt a real authority for a freshly-generated entity under `org_kp()` at
+    /// cert generation `generation`, returning the entity, the authority, and
+    /// the live revocation store the ceremony created.
+    fn adopt_relay(
+        tag: &str,
+        generation: u32,
+    ) -> (EntityId, Arc<NodeAuthority>, Arc<OrgRevocationStore>) {
+        let kp = EntityKeypair::generate();
+        let entity = kp.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(
+            &org_kp(),
+            entity.clone(),
+            generation,
+            ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("issue relay cert");
+        let authority = Arc::new(
+            NodeAuthority::adopt(&scratch(tag), cert, &entity, 60, None)
+                .expect("adopt relay authority"),
+        );
+        let store = authority.revocation.clone();
+        (entity, authority, store)
+    }
+
+    fn capture_relay(
+        authority: Option<Arc<NodeAuthority>>,
+        store: Option<Arc<OrgRevocationStore>>,
+        local_entity: &EntityId,
+        expected_org: OrgId,
+        now: u64,
+    ) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
+        let na = ArcSwapOption::from(authority);
+        let rev = ArcSwapOption::from(store);
+        let lock = Mutex::new(());
+        capture_live_org_relay_membership(&lock, &na, &rev, local_entity, expected_org, now)
+    }
+
+    #[test]
+    fn live_relay_membership_returns_this_nodes_own_cert() {
+        let (entity, authority, store) = adopt_relay("ok", 3);
+        let membership = capture_relay(
+            Some(authority),
+            Some(store),
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .expect("relay membership");
+        // The returned cert is THIS node's own membership — its own entity, its
+        // own org, the adopted generation — never a downstream value.
+        assert_eq!(membership.owner_cert().member, entity);
+        assert_eq!(membership.owner_cert().org_id, org_kp().org_id());
+        assert_eq!(membership.owner_cert().generation, 3);
+        assert_eq!(membership.org_id(), org_kp().org_id());
+    }
+
+    #[test]
+    fn no_authority_installed_is_refused() {
+        let (entity, _authority, store) = adopt_relay("noauth", 1);
+        assert_eq!(
+            capture_relay(None, Some(store), &entity, org_kp().org_id(), now_secs()).err(),
+            Some(RelayMembershipUnavailable::NoAuthority)
+        );
+    }
+
+    #[test]
+    fn no_store_installed_is_refused() {
+        let (entity, authority, _store) = adopt_relay("nostore", 1);
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                None,
+                &entity,
+                org_kp().org_id(),
+                now_secs()
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::NoStore)
+        );
+    }
+
+    #[test]
+    fn poisoned_store_is_refused() {
+        let (entity, authority, store) = adopt_relay("poison", 1);
+        store.mark_poisoned_for_test();
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(store),
+                &entity,
+                org_kp().org_id(),
+                now_secs()
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::Poisoned)
+        );
+    }
+
+    #[test]
+    fn foreign_org_registration_is_refused() {
+        // A perfectly valid relay membership, but the incoming registration
+        // names a different organization — a relay never re-authors outside its
+        // own org.
+        let (entity, authority, store) = adopt_relay("foreign", 1);
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(store),
+                &entity,
+                foreign_org(),
+                now_secs()
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::ForeignOrg)
+        );
+    }
+
+    #[test]
+    fn wrong_local_entity_is_not_for_this_node() {
+        // Defense in depth: the supplied local entity is not the one the
+        // authority's certificate names.
+        let (_entity, authority, store) = adopt_relay("wrongentity", 1);
+        let other = EntityId::from_bytes([0xEEu8; 32]);
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(store),
+                &other,
+                org_kp().org_id(),
+                now_secs()
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::NotForThisNode)
+        );
+    }
+
+    #[test]
+    fn relay_expired_at_future_now_is_cert_invalid() {
+        // RED coupling for the explicit-time thread: the SAME authority is
+        // admitted at the present instant and refused at a `now_secs` past its
+        // window + skew. A gate that read `current_timestamp()` instead of
+        // `now_secs` would admit both.
+        let (entity, authority, store) = adopt_relay("expired", 1);
+        assert!(capture_relay(
+            Some(authority.clone()),
+            Some(store.clone()),
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .is_ok());
+        let far_future = now_secs() + ORG_CERT_TTL_SECS_RECOMMENDED + 1_000;
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(store),
+                &entity,
+                org_kp().org_id(),
+                far_future
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::CertInvalid)
+        );
+    }
+
+    #[test]
+    fn relay_below_live_floor_is_refused() {
+        // RED coupling for the LIVE-store floor read: the relay's own
+        // generation-1 cert is verified against the store PASSED to the gate
+        // (the live installed store), NOT the authority's embedded startup
+        // store. A DISTINCT live store carrying a floor that revokes generation 1
+        // refuses the cert; a gate reading `authority.revocation` (empty) would
+        // wrongly admit it. Using the authority's own store here would make the
+        // two indistinguishable — they must be different objects.
+        let (entity, authority, _embedded) = adopt_relay("floored", 1);
+        let live = Arc::new(
+            OrgRevocationStore::init(scratch("floored-live"), ProvisioningExpectation::MayBeFresh)
+                .expect("init live store"),
+        );
+        let mut floors = BTreeMap::new();
+        floors.insert(entity.clone(), 2u32);
+        let bundle = OrgRevocationBundle::try_issue(&org_kp(), &floors).expect("bundle");
+        live.apply_bundle(&bundle).expect("apply floor raise");
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(live),
+                &entity,
+                org_kp().org_id(),
+                now_secs()
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::BelowFloor)
+        );
+    }
+
+    #[test]
+    fn relay_at_live_floor_is_admitted() {
+        // The floor check is `>=`: a generation exactly at the live floor still
+        // vouches.
+        let (entity, authority, store) = adopt_relay("atfloor", 2);
+        let mut floors = BTreeMap::new();
+        floors.insert(entity.clone(), 2u32);
+        let bundle = OrgRevocationBundle::try_issue(&org_kp(), &floors).expect("bundle");
+        store.apply_bundle(&bundle).expect("apply floor raise");
+        assert!(capture_relay(
+            Some(authority),
+            Some(store),
+            &entity,
+            org_kp().org_id(),
+            now_secs(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn foreign_org_precedes_cert_validity() {
+        // Ordering: a foreign-org interest is refused as ForeignOrg even when
+        // this node's own certificate is ALSO invalid at the supplied instant —
+        // the relay simply does not serve that org.
+        let (entity, authority, store) = adopt_relay("orderfirst", 1);
+        let far_future = now_secs() + ORG_CERT_TTL_SECS_RECOMMENDED + 1_000;
+        assert_eq!(
+            capture_relay(
+                Some(authority),
+                Some(store),
+                &entity,
+                foreign_org(),
+                far_future
+            )
+            .err(),
+            Some(RelayMembershipUnavailable::ForeignOrg)
+        );
     }
 }

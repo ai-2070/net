@@ -8498,6 +8498,31 @@ impl MeshNode {
         .is_some_and(|current| snapshot.stamp().is_current(&current))
     }
 
+    /// OLB org-auth (piece 2): capture a pinned, live proof of THIS node's own
+    /// organization membership for re-authoring an org sensing registration whose
+    /// already-validated organization is `org_id`, at `now_secs`. Threads the
+    /// node's own entity as the local entity, so the returned certificate is
+    /// always this relay's own — the value a fresh upstream `OrgProviderRegistration`
+    /// carries. Deliberately independent of `owner_cert_emission_enabled`: sensing
+    /// relay re-authoring is a distinct authorization from the OA announcement
+    /// surface. Consumed by the dispatch re-authoring path (org-auth part-2 piece
+    /// 4); `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
+    pub(crate) fn capture_live_org_relay_membership(
+        &self,
+        org_id: super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> Result<sensing::LiveOrgRelayMembership, sensing::RelayMembershipUnavailable> {
+        sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            self.entity_id(),
+            org_id,
+            now_secs,
+        )
+    }
+
     /// Best-effort wake of a current-baseline re-announce (OA3-4b2): a provider
     /// grant mutation changes the granted-envelope projection, so republish a
     /// fresh, coherent emission (public + owner + granted). Rebuilds from the
@@ -30218,5 +30243,24 @@ mod sensing_authority_witness_tests {
             node.sensing_authority_snapshot_current(&snap),
             "the post-install snapshot must be coherent and current"
         );
+    }
+
+    // 10 — piece-2 wrapper wiring: the live relay membership capture threads
+    // THIS node's own entity and returns THIS node's own certificate (the value
+    // a fresh upstream OrgProviderRegistration would carry). The exhaustive
+    // refusal matrix lives with the free function in `org_gate`; this proves the
+    // MeshNode wrapper wires the right fields.
+    #[tokio::test]
+    async fn live_relay_membership_returns_this_nodes_own_cert() {
+        use crate::adapter::net::behavior::org::current_timestamp;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c10"))
+            .expect("install A");
+        let membership = node
+            .capture_live_org_relay_membership(org().org_id(), current_timestamp())
+            .expect("relay membership");
+        assert_eq!(membership.owner_cert().member, *node.entity_id());
+        assert_eq!(membership.org_id(), org().org_id());
     }
 }

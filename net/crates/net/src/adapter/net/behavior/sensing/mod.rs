@@ -80,8 +80,9 @@ pub use org_gate::{
     ValidatedOrgSensingRegistration,
 };
 pub(crate) use org_gate::{
-    capture_current_sensing_stamp, capture_sensing_authority_snapshot, SensingAuthoritySnapshot,
-    SensingAuthorityUnavailable,
+    capture_current_sensing_stamp, capture_live_org_relay_membership,
+    capture_sensing_authority_snapshot, LiveOrgRelayMembership, RelayMembershipUnavailable,
+    SensingAuthoritySnapshot, SensingAuthorityUnavailable,
 };
 #[cfg(feature = "redex")]
 pub use rendezvous::{
