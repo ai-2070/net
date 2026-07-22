@@ -418,10 +418,15 @@ fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// The two-stage TSFN bridge, following `mesh_rpc.rs`'s RPC handler exactly:
-/// stage 1 waits for JS to return a Promise, stage 2 awaits it. Both are
-/// bounded, `NonBlocking` is always used, and a dropped receiver is swallowed
-/// (napi-rs escalates an unhandled one to a fatal process exit).
+/// The two-stage TSFN bridge, following `mesh_rpc.rs`'s streaming handler
+/// exactly: stage 1 waits for JS to return a Promise, stage 2 awaits it. BOTH
+/// stages share ONE `timeout_at` deadline, so the total handler time can never
+/// exceed `handlerTimeoutMs` — a handler that returns a never-resolving promise
+/// can no longer wedge a serve-runtime worker forever (an unbounded stage-2
+/// `promise.await` previously made the timeout a no-op, since org handlers are
+/// always async and all latency lives in stage 2). `NonBlocking` is always
+/// used, and a dropped receiver is swallowed (napi-rs escalates an unhandled
+/// one to a fatal process exit).
 async fn dispatch_to_js(
     tsfn: Arc<OrgHandlerTsfn>,
     caller: net_sdk::org::OrgCaller,
@@ -457,8 +462,11 @@ async fn dispatch_to_js(
         )));
     }
 
+    // One deadline for BOTH stages, so a hung promise is bounded too.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     // Stage 1 — JS returns a Promise.
-    let promise = match tokio::time::timeout(timeout, rx).await {
+    let promise = match tokio::time::timeout_at(deadline, rx).await {
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => {
             return Err(net_sdk::org::OrgHandlerError::Internal(format!(
@@ -478,12 +486,17 @@ async fn dispatch_to_js(
         }
     };
 
-    // Stage 2 — await it.
-    match promise.await {
-        Ok(buf) => Ok(bytes::Bytes::from(buf.to_vec())),
-        Err(e) => Err(net_sdk::org::OrgHandlerError::Application {
+    // Stage 2 — await the promise under the SAME deadline, so a never-resolving
+    // handler promise cannot hold the request (and its worker) open forever.
+    match tokio::time::timeout_at(deadline, promise).await {
+        Ok(Ok(buf)) => Ok(bytes::Bytes::from(buf.to_vec())),
+        Ok(Err(e)) => Err(net_sdk::org::OrgHandlerError::Application {
             code: ORG_HANDLER_ERROR,
             message: format!("org handler rejected: {e}"),
         }),
+        Err(_) => Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "JS org handler promise did not resolve within {} ms",
+            timeout.as_millis()
+        ))),
     }
 }
