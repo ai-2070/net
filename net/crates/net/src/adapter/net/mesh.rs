@@ -29908,3 +29908,275 @@ mod oa34b2_query_currentness_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod sensing_authority_witness_tests {
+    //! OLB org-auth piece-1 real-install witness matrix: the installation
+    //! generation + sensing authority stamp against REAL adopted authorities
+    //! and stores on a live `MeshNode`. In-crate so the snapshot/stamp APIs
+    //! stay `pub(crate)`; no shipping generation accessor.
+    use super::*;
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::behavior::org_revocation::{
+        OrgRevocationStore, ProvisioningExpectation,
+    };
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x42u8; 32])
+    }
+
+    async fn build_node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x31u8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "net-sensing-stamp-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Adopt a distinct authority `Arc` for this node under `org` (a real
+    /// ceremony into a fresh tempdir).
+    fn adopt(node: &MeshNode, org: &OrgKeypair, tag: &str) -> Arc<NodeAuthority> {
+        let entity = node.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        Arc::new(NodeAuthority::adopt(&scratch(tag), cert, &entity, 0, None).expect("adopt"))
+    }
+
+    // 1 — initial installation yields a constructible, current snapshot.
+    #[tokio::test]
+    async fn initial_install_snapshot_is_current() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c1"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        assert!(node.sensing_authority_snapshot_current(&snap));
+    }
+
+    // 2 — reinstalling the EXACT same Arc is a no-op: no generation bump.
+    #[tokio::test]
+    async fn exact_arc_no_op_reinstall_stays_current() {
+        let node = build_node().await;
+        let a = adopt(&node, &org(), "c2");
+        node.install_node_authority(a.clone()).expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(a).expect("reinstall exact A");
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "exact no-op must not bump the installation generation"
+        );
+    }
+
+    // 3 — a failed installation (reaches real preflight) does not bump.
+    #[tokio::test]
+    async fn failed_foreign_install_does_not_bump() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c3a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        let foreign = adopt(&node, &OrgKeypair::from_bytes([0x99u8; 32]), "c3f");
+        assert!(
+            node.install_node_authority(foreign).is_err(),
+            "foreign-org install must fail at the one-owner preflight"
+        );
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "a failed install must not bump the generation"
+        );
+    }
+
+    // 4 — authority A -> B (same org, distinct Arc) makes the snapshot stale.
+    #[tokio::test]
+    async fn authority_replacement_makes_snapshot_stale() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c4a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(adopt(&node, &org(), "c4b"))
+            .expect("install B");
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "A->B must be stale"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+    }
+
+    // 5 — the load-bearing ABA: A -> B -> exact Arc<A>. The live authority
+    // pointer returns to A's, but the installation generation advanced.
+    #[tokio::test]
+    async fn a_b_a_rotation_is_stale_via_installation_generation() {
+        let node = build_node().await;
+        let a = adopt(&node, &org(), "c5a");
+        let a_ptr = Arc::as_ptr(&a);
+        node.install_node_authority(a.clone()).expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(adopt(&node, &org(), "c5b"))
+            .expect("install B");
+        node.install_node_authority(a).expect("reinstall exact A");
+        assert_eq!(
+            Arc::as_ptr(&node.node_authority().expect("authority")),
+            a_ptr,
+            "the live authority pointer must equal A's original"
+        );
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "A->B->exact-A must be stale via the installation generation"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+    }
+
+    // 7 — a dominating store replacement makes the snapshot stale and the
+    // fresh snapshot pins the new store.
+    #[tokio::test]
+    async fn store_replacement_makes_snapshot_stale() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c7a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        let replacement = Arc::new(
+            OrgRevocationStore::init(scratch("c7store"), ProvisioningExpectation::MayBeFresh)
+                .expect("init store"),
+        );
+        node.install_org_revocation_store(replacement)
+            .expect("install dominating store");
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "store A->B must be stale"
+        );
+        assert!(node
+            .capture_sensing_authority_snapshot()
+            .is_ok_and(|fresh| node.sensing_authority_snapshot_current(&fresh)));
+    }
+
+    // 8 — real store poison reaches the recheck and the fresh capture.
+    #[tokio::test]
+    async fn store_poison_is_stale_and_capture_returns_poisoned() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c8"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.org_revocation_store()
+            .expect("store installed")
+            .mark_poisoned_for_test();
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "a poison transition must make the snapshot stale"
+        );
+        assert_eq!(
+            node.capture_sensing_authority_snapshot().err(),
+            Some(sensing::SensingAuthorityUnavailable::Poisoned)
+        );
+    }
+
+    // 6 — a same-store floor raise through the real publication path makes the
+    // snapshot stale; the fresh snapshot OBSERVES the raised floor.
+    #[tokio::test]
+    async fn same_store_floor_raise_is_stale_and_observed() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use crate::adapter::net::identity::EntityId;
+        use std::collections::BTreeMap;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c6"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+
+        let floored = EntityId::from_bytes([0x77u8; 32]);
+        let mut floors = BTreeMap::new();
+        floors.insert(floored.clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply floor raise");
+
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "a floor raise on the same store must be stale"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+        assert_eq!(
+            fresh.floors().floor_for(&org().org_id(), &floored),
+            5,
+            "the fresh snapshot must observe the raised floor"
+        );
+    }
+
+    // 9 — capture blocks under org_install until the install publishes the
+    // complete authority/store/generation tuple; the returned snapshot is
+    // coherent and current. Channels/barriers only — the org_install mutex
+    // guarantees no result is available while the installer holds it.
+    #[tokio::test]
+    async fn capture_blocks_until_install_publishes() {
+        use std::sync::mpsc;
+        use std::sync::Barrier;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c9a"))
+            .expect("install A");
+        let b = adopt(&node, &org(), "c9b");
+
+        // `Barrier` is `Sync` (mpsc `Sender`/`Receiver` are not), so the pause
+        // closure coordinates via barriers; the channel only proves the capture
+        // started before release.
+        let paused = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+
+        let install_node = node.clone();
+        let paused_i = paused.clone();
+        let release_i = release.clone();
+        let install = std::thread::spawn(move || {
+            install_node
+                .install_node_authority_paused_for_test(b, &|| {
+                    // org_install is held throughout this pause.
+                    paused_i.wait();
+                    release_i.wait();
+                })
+                .expect("install B");
+        });
+
+        paused.wait(); // the installer is paused with org_install held
+
+        let capture_node = node.clone();
+        let capture = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            // Blocks on org_install (held by the paused installer) until release.
+            capture_node.capture_sensing_authority_snapshot()
+        });
+        started_rx.recv().expect("capture started before release");
+
+        release.wait(); // installer publishes B, then drops org_install
+        install.join().expect("install thread");
+        let snap = capture.join().expect("capture thread").expect("snapshot");
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "the post-install snapshot must be coherent and current"
+        );
+    }
+}
