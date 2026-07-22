@@ -661,22 +661,39 @@ pub(crate) enum RelayMembershipUnavailable {
     /// This node's own certificate generation is below the current revocation
     /// floor for its `(org, member)` — its membership has been revoked.
     BelowFloor,
+    /// The store's floor view moved (a revocation published, or the store
+    /// poisoned) between the coherent floor snapshot the verdict was computed
+    /// against and the final currency recheck — so the verdict is stale. Refused
+    /// advisorily rather than returning a membership proven against a floor view
+    /// that is no longer live; the soft-state refresh retries naturally.
+    ViewChanged,
 }
 
 /// Capture a pinned, live proof of THIS relay's own organization membership for
 /// re-authoring an org sensing registration whose (already-validated)
 /// organization is `expected_org`, at an explicit `now_secs`.
 ///
-/// Held under the `org_install` publication lock so the authority and the live
-/// store are read as one coherent pair (the same barrier
-/// [`capture_sensing_authority_snapshot`] uses). The relay's membership is
-/// re-verified with the SAME check the node passed at startup
+/// `org_install` is held throughout so the authority and store IDENTITY cannot
+/// be replaced mid-gate (the same lock the piece-1 captures use). It does NOT,
+/// however, gate floor publication: a concurrent `apply_bundle` raises the floor
+/// through the store's OWN publication path, so a coherent floor snapshot alone
+/// is not a currency proof. The gate therefore captures the floor snapshot
+/// paired with its publication generation, runs the membership self-verify with
+/// no store publish guard held across the signature check, and makes the END of
+/// the gate the explicit linearization point: it crosses the store publication
+/// barrier and re-checks poison, and gates BOTH the success and the
+/// snapshot-dependent failure result behind that currency check. A floor raise
+/// or poison that publishes between the snapshot and the recheck yields an
+/// advisory `ViewChanged` — never a membership (or a specific floor verdict)
+/// computed against a floor view that is no longer live.
+///
+/// The relay's membership bar is IDENTICAL to the startup ownership bar
 /// (`NodeAuthorityConfig::self_verify_at`) — binding, signature, window at
-/// `now_secs` + persisted skew, and revocation floor — against the LIVE store's
-/// coherent floors, so an expired or revoked relay proves nothing. On success
-/// the relay's own `owner_cert` is returned for the caller to attach to the
-/// fresh upstream `OrgProviderRegistration`; the exact authority + store are
-/// pinned so the emit runs against the objects the proof was taken against.
+/// `now_secs` + persisted skew, and revocation floor — so an expired or revoked
+/// relay proves nothing. On success the relay's own `owner_cert` is returned for
+/// the caller to attach to the fresh upstream `OrgProviderRegistration`; the
+/// exact authority + store are pinned so the emit runs against the objects the
+/// proof was taken against.
 ///
 /// Free-standing over the raw node fields (mirroring the piece-1 captures) so
 /// both `MeshNode` and the dispatch context can call it.
@@ -687,6 +704,31 @@ pub(crate) fn capture_live_org_relay_membership(
     local_entity: &EntityId,
     expected_org: OrgId,
     now_secs: u64,
+) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
+    capture_live_org_relay_membership_seamed(
+        org_install,
+        node_authority,
+        org_revocation,
+        local_entity,
+        expected_org,
+        now_secs,
+        || {},
+    )
+}
+
+/// [`capture_live_org_relay_membership`] with a test seam invoked exactly once
+/// AFTER the coherent floor snapshot and BEFORE the final currency recheck. In
+/// production the seam is `|| {}` (inlined away); the in-crate race witnesses
+/// pass a pause closure to publish a floor raise / poison the store while the
+/// gate is parked between the snapshot and the recheck.
+fn capture_live_org_relay_membership_seamed(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    local_entity: &EntityId,
+    expected_org: OrgId,
+    now_secs: u64,
+    after_floor_snapshot: impl FnOnce(),
 ) -> Result<LiveOrgRelayMembership, RelayMembershipUnavailable> {
     let _install = org_install.lock();
     let authority = node_authority
@@ -699,22 +741,39 @@ pub(crate) fn capture_live_org_relay_membership(
         return Err(RelayMembershipUnavailable::Poisoned);
     }
     // A relay only re-authors within its OWN organization. Checked before the
-    // membership self-verify: a foreign-org interest is refused as such even if
-    // this node's own certificate is momentarily invalid, and this is the
+    // floor snapshot — so ForeignOrg ordering is preserved — and doubling as the
     // late-bound guard against an authority rotation to a different org between
     // the incoming validation and this capture.
     if authority.owner_org() != expected_org {
         return Err(RelayMembershipUnavailable::ForeignOrg);
     }
-    // Coherent floors, barrier-paired with the store's publication generation.
-    let (floors, _generation) = store.snapshot_with_generation();
-    // The relay's live membership bar is IDENTICAL to the startup ownership bar,
-    // re-run late at explicit `now_secs` against the LIVE floors — an expired or
-    // revoked relay proves nothing.
-    authority
+
+    // Capture a coherent floor snapshot paired with its publication generation,
+    // then run the membership self-verify WITHOUT holding any store publish guard
+    // across the signature check.
+    let (floors, captured_generation) = store.snapshot_with_generation();
+    after_floor_snapshot();
+    let verification = authority
         .config
-        .self_verify_at(local_entity, &floors, now_secs)
-        .map_err(map_self_verify_error)?;
+        .self_verify_at(local_entity, &floors, now_secs);
+
+    // The END of the gate is the explicit linearization point. Cross the store
+    // publication barrier and re-check poison, then gate BOTH the success and the
+    // (snapshot-dependent) verification verdict behind currency: a floor raise or
+    // poison that published between the snapshot and here makes the verdict
+    // stale, so refuse with an advisory `ViewChanged` rather than returning a
+    // membership — or a specific floor verdict — proven against a floor view that
+    // is no longer live. An early `?` on `verification` would bypass this, so the
+    // Result is held, not propagated, until currency is established.
+    let current_generation = store.barriered_generation();
+    if store.is_poisoned() {
+        return Err(RelayMembershipUnavailable::Poisoned);
+    }
+    if current_generation != captured_generation {
+        return Err(RelayMembershipUnavailable::ViewChanged);
+    }
+    verification.map_err(map_self_verify_error)?;
+
     Ok(LiveOrgRelayMembership {
         owner_cert: authority.config.owner_cert.clone(),
         org_id: authority.owner_org(),
@@ -1370,5 +1429,95 @@ mod tests {
             .err(),
             Some(RelayMembershipUnavailable::ForeignOrg)
         );
+    }
+
+    #[test]
+    fn floor_raise_during_capture_is_view_changed() {
+        // Deterministic TOCTOU witness: the gate captures the coherent floor
+        // snapshot, then parks (the test seam) while another thread publishes a
+        // real signed floor raise through `apply_bundle`. On resume the gate
+        // crosses the publication barrier, observes the generation moved, and
+        // returns ViewChanged — never a membership proven against the stale
+        // floor. `org_install` is held throughout and floor publication does NOT
+        // take it, so the raise proceeds concurrently (no deadlock).
+        //
+        // RED coupling (verified, not committed): removing the final
+        // `current_generation != captured_generation` comparison makes this
+        // return Ok — the generation-1 cert verifies against the captured floor.
+        use std::sync::Barrier;
+
+        let (entity, authority, store) = adopt_relay("viewchange", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+
+        std::thread::scope(|s| {
+            let gate = s.spawn(|| {
+                capture_live_org_relay_membership_seamed(
+                    &lock,
+                    &na,
+                    &rev,
+                    &entity,
+                    org_kp().org_id(),
+                    now_secs(),
+                    || {
+                        paused.wait();
+                        release.wait();
+                    },
+                )
+            });
+            paused.wait(); // the gate is parked after the coherent floor snapshot
+            let mut floors = BTreeMap::new();
+            floors.insert(entity.clone(), 2u32);
+            let bundle = OrgRevocationBundle::try_issue(&org_kp(), &floors).expect("bundle");
+            store.apply_bundle(&bundle).expect("apply floor raise");
+            release.wait(); // let the gate cross the barrier and recheck currency
+            let result = gate.join().expect("gate thread");
+            assert_eq!(result.err(), Some(RelayMembershipUnavailable::ViewChanged));
+        });
+    }
+
+    #[test]
+    fn poison_during_capture_is_refused() {
+        // Companion to the floor-raise witness, pinning the FINAL poison check
+        // (not just the initial refusal branch): the gate snapshots a clean
+        // store, parks, the store is poisoned, and on resume the gate refuses
+        // with Poisoned. Poison does not move the generation, so the final live
+        // poison check is what catches it.
+        //
+        // RED coupling (verified, not committed): removing the final
+        // `store.is_poisoned()` check makes this return Ok.
+        use std::sync::Barrier;
+
+        let (entity, authority, store) = adopt_relay("poison-mid", 1);
+        let na = ArcSwapOption::from(Some(authority));
+        let rev = ArcSwapOption::from(Some(store.clone()));
+        let lock = Mutex::new(());
+        let paused = Barrier::new(2);
+        let release = Barrier::new(2);
+
+        std::thread::scope(|s| {
+            let gate = s.spawn(|| {
+                capture_live_org_relay_membership_seamed(
+                    &lock,
+                    &na,
+                    &rev,
+                    &entity,
+                    org_kp().org_id(),
+                    now_secs(),
+                    || {
+                        paused.wait();
+                        release.wait();
+                    },
+                )
+            });
+            paused.wait(); // parked after the (clean) floor snapshot
+            store.mark_poisoned_for_test();
+            release.wait();
+            let result = gate.join().expect("gate thread");
+            assert_eq!(result.err(), Some(RelayMembershipUnavailable::Poisoned));
+        });
     }
 }
