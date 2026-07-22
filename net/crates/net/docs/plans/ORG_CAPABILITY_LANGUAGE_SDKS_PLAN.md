@@ -19,9 +19,32 @@ a discovery key in garbage-collected memory.
 Workstream R, X1, **Node (N)**, **Python (P)**, and **C + G (Go)** are all
 **IMPLEMENTED**. The consumer gate on C+G was lifted by an explicit direction:
 org auth is the load-bearing auth surface of the library, so it ships in every
-binding. **X2 phase 1 — the scenario generator + manifest contract + the Rust
-from-disk cell — is done and locally verified**; the per-language cross-process
-harnesses that load the same manifest are the remaining CI-only work.
+binding. **X2 phase 1 (the scenario generator + manifest contract + the Rust
+from-disk cell) AND the in-process Node and Python live cells are done and
+locally verified** — the first live admitted org calls through those bindings,
+each consuming the Rust-generated manifest (`org_live.test.ts` via napi build +
+vitest; `test_org_live.py` via maturin develop + pytest). The full cross-process
+cross-language matrix and the Go cell remain (CI).
+
+**Building and running those two cells surfaced two more real binding bugs** —
+both making a binding org *provider* silently non-functional, and both invisible
+to the refusal-only tests (the recurring lesson, a fourth time):
+
+1. **Serve without a runtime.** `serve_org_bytes_node → serve_rpc_*` spawns an
+   inbound-event bridge with a bare `tokio::spawn`, needing an ambient runtime.
+   The sync napi `serveOrg`, the PyO3 `serve_org`, and the Go C-ABI
+   `net_org_serve` all ran with none and panicked "there is no reactor running"
+   on the first live serve. Fixed by entering a runtime for the registration in
+   each — the shape the a2a bindings already use for the same reason.
+2. **Provider invisible.** `install_org_authority` didn't enable owner-cert
+   emission, and `owner_cert_under` (which derives BOTH the emission cert AND the
+   scoped announcement's audience key) returns `None` while emission is off — so
+   a binding provider emitted no scoped announcements and was undiscoverable
+   (`org:discovery:no_authorized_provider`, 0 candidates). Fixed in
+   `install_org_authority_node`, shared by every binding.
+
+Both fixes benefit Go/C too (the emission fix is shared; the serve-runtime fix
+is applied to `org-ffi`), so the Go cell inherits a working serve path.
 
 | Workstream | State | Commits | Verified |
 |---|---|---|---|
@@ -910,15 +933,16 @@ caller was refused as ephemeral. Fixed at the constructor.
   are in `index.d.ts`, `tsc` clean, and `org_binding.test.ts` exercises them
   through the real napi boundary (bad dir refused, grant+path both cross).
 
-**Acceptance (live admitted call owed with X2):** a Node service serving a
-private cross-org capability that a Node client calls, with the handler reading
-`caller.actingOrg`, still needs the full issuance chain (org keys, cert, grant)
-generated in the JS harness — that is X2 territory. The exact binding-shaped
-path (`install_org_authority` + `install_provider_grant_audience` + `from_parts`
-+ `call`) IS proven end-to-end at the Rust tier
-(`live_cross_org_call_through_the_provisioning_methods`), and the Node functions
-are thin marshaling over the same SDK calls, so the remaining delta is issuance
-artifacts, not the org path.
+**Acceptance (live admitted call — DONE via X2's Node cell):** a Node service
+serving a private cross-org capability that a Node client calls, with the
+handler reading `caller.actingOrg`, is now proven live in `org_live.test.ts`:
+the issuance chain comes from `gen_org_scenario` (the manifest), the provider
+installs its authority + grant audience and `serveOrg`s Granted, and the caller
+`from_parts` + `call`s — an admitted call with four-party attribution, run
+locally via napi build + vitest. Getting it green is what surfaced the two
+serve-path bugs (§Status). The exact path was already proven at the Rust tier
+(`live_cross_org_call_through_the_provisioning_methods`); the Node cell closes
+the binding-tier gap.
 
 The disposal contract asserts what `NetMesh.shutdown()` actually does, which is
 **reject, not hang** — it drains `Arc::try_unwrap` for ~250 ms (50 x 5 ms),
@@ -983,9 +1007,12 @@ meshes stable / ephemeral not); `test_stub_drift.py` clean on all org classes.
 PyO3 `NetMesh.__new__` — the SECOND non-SDK constructor to omit it. Fixed. And
 the §D9 provisioning gap, which made the surface inert until closed.
 
-**Acceptance (live admitted call owed with X2, as for Node):** the binding-
-shaped path is proven end-to-end at the Rust tier; the Python delta is the
-issuance artifacts a live call needs, not the org path.
+**Acceptance (live admitted call — DONE via X2's Python cell):** proven live in
+`test_org_live.py` — a Python provider serves a Granted capability a Python
+caller invokes, from the `gen_org_scenario` manifest, with four-party
+attribution; run locally via maturin develop + pytest. Same shape as the Node
+cell, and it independently confirmed the shared emission fix and the PyO3
+serve-runtime fix.
 
 ### Workstream C — C: the header IS the SDK
 
