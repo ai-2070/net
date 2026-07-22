@@ -16484,6 +16484,12 @@ impl MeshNode {
                 Some(*audience_scope)
             }
             sensing::SensingInterestFrame::Deregister { .. } => None,
+            // Organization-authenticated variants are structurally dark until
+            // the membership authority gate lands (org-auth slice, commit 2):
+            // no scope is derived and the main match below drops them before
+            // any table mutation.
+            sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
+            | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => None,
         };
         let session_root =
             if ctx.sensing_fleet_scope && claimed_scope == Some(ctx.sensing_local_root) {
@@ -17060,6 +17066,19 @@ impl MeshNode {
                     // re-send stays skipped in SI-2a — see the
                     // method docs.
                 }
+            }
+            // Structurally dark until the membership authority gate lands
+            // (org-auth slice, commit 2): an organization-authenticated
+            // registration is decoded and can be semantically validated, but
+            // it MUST NOT reach any interest-table, relay, or emitter path
+            // before its membership certificate is verified at this hop.
+            // Commit 2 replaces this drop with `verify_org_sensing_registration`.
+            sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
+            | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => {
+                tracing::debug!(
+                    "sensing: organization-authenticated registration dropped \
+                     (authority gate not yet installed)"
+                );
             }
         }
     }

@@ -52,6 +52,7 @@ use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use super::super::org::OrgMembershipCert;
 use super::evaluator::{validate_interest_constraints, SensingCounters};
 use super::identity::{
     AudienceScopeCommitment, CanonicalConstraints, CapabilityId, ConstraintError, Digest256,
@@ -152,6 +153,84 @@ pub enum SensingInterestFrame {
         /// leader-addressed (whole-interest) withdrawal.
         target: Option<u64>,
     },
+    /// **Organization-authenticated** leader-addressed registration
+    /// (OLB org-auth slice) — the [`Self::CapabilityRegistration`]
+    /// semantic fields plus the registering hop's membership
+    /// certificate. Postcard variant index **3** (appended; the
+    /// legacy indices 0/1/2 are frozen). The membership is validated
+    /// at every receiving hop BEFORE any table mutation
+    /// (`verify_org_sensing_registration`, commit 2); this variant is
+    /// structurally dark until that gate exists.
+    OrgCapabilityRegistration {
+        /// Capability the predicate targets.
+        capability_id: CapabilityId,
+        /// Inline canonical constraint bytes C.
+        constraints: Vec<u8>,
+        /// Digest the inline bytes must hash to.
+        constraints_digest: Digest256,
+        /// Provider-evaluated latency envelope L.
+        work_latency: WorkLatencyEnvelope,
+        /// The provider population — the leader needs it to resolve.
+        providers: ProviderSelector,
+        /// The result cardinality — the leader needs it to bound
+        /// exploration.
+        result_mode: ResultMode,
+        /// The sender's claimed interest identity (re-derived + cross
+        /// checked; never the coalescing identity by itself).
+        interest_digest: Digest256,
+        /// D — the delivery-continuity interval (not identity).
+        requested_sample_interval: Duration,
+        /// Per-downstream soft-state lifetime.
+        soft_state_ttl: Duration,
+        /// Wire scope claim — the owner-root/organization commitment;
+        /// cross-checked against `subscriber_membership.org_id`'s
+        /// canonical sensing commitment, never load-bearing alone.
+        audience_scope: AudienceScopeCommitment,
+        /// The registering consumer's node id (bound to the
+        /// authenticated origin at intake, never trusted alone).
+        consumer: u64,
+        /// The registering hop's organization membership certificate.
+        /// Rides the wire as its canonical 156-byte encoding (the
+        /// type's manual serde); verified at every receiving hop.
+        subscriber_membership: OrgMembershipCert,
+    },
+    /// **Organization-authenticated** provider-addressed registration
+    /// (OLB org-auth slice) — the [`Self::ProviderRegistration`]
+    /// semantic fields plus the re-registering hop's membership
+    /// certificate. Postcard variant index **4** (appended). A relay
+    /// re-authors this with its OWN membership; it never forwards the
+    /// downstream consumer's certificate (commit 3). Structurally
+    /// dark until the membership gate exists (commit 2).
+    OrgProviderRegistration {
+        /// The provider this branch targets.
+        target: u64,
+        /// Capability the predicate targets.
+        capability_id: CapabilityId,
+        /// Inline canonical constraint bytes C.
+        constraints: Vec<u8>,
+        /// Digest the inline bytes must hash to.
+        constraints_digest: Digest256,
+        /// Provider-evaluated latency envelope L.
+        work_latency: WorkLatencyEnvelope,
+        /// The provider population (carried for digest verification).
+        providers: ProviderSelector,
+        /// The result cardinality (carried for digest verification).
+        result_mode: ResultMode,
+        /// The disclosure class (carried for digest verification).
+        disclosure_class: DisclosureClass,
+        /// Wire scope claim (cross-checked; also digest-bound).
+        audience_scope: AudienceScopeCommitment,
+        /// The capability-interest identity this branch serves.
+        interest_digest: Digest256,
+        /// Aggregated (strictest) D for the branch.
+        requested_sample_interval: Duration,
+        /// Soft-state lifetime of the branch registration.
+        soft_state_ttl: Duration,
+        /// The re-registering hop's own organization membership
+        /// certificate (never the consumer's). Canonical 156-byte
+        /// encoding; verified at every receiving hop.
+        subscriber_membership: OrgMembershipCert,
+    },
 }
 
 impl SensingInterestFrame {
@@ -206,6 +285,61 @@ impl SensingInterestFrame {
         }
     }
 
+    /// Build the organization-authenticated leader-addressed
+    /// registration for a spec, carrying the registering hop's
+    /// membership certificate (OLB org-auth slice). Same semantic
+    /// derivation as [`Self::capability_registration`].
+    pub fn org_capability_registration(
+        spec: &InterestSpec,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        consumer: u64,
+        subscriber_membership: OrgMembershipCert,
+    ) -> Self {
+        Self::OrgCapabilityRegistration {
+            capability_id: spec.capability_id.clone(),
+            constraints: spec.constraints.canonical_bytes(),
+            constraints_digest: spec.constraints.constraints_digest(),
+            work_latency: spec.work_latency,
+            providers: spec.providers.clone(),
+            result_mode: spec.result_mode,
+            interest_digest: spec.interest_digest(),
+            requested_sample_interval,
+            soft_state_ttl,
+            audience_scope: spec.audience,
+            consumer,
+            subscriber_membership,
+        }
+    }
+
+    /// Build the organization-authenticated provider-addressed
+    /// registration for a resolved branch, carrying the re-registering
+    /// hop's OWN membership certificate (OLB org-auth slice). Same
+    /// semantic derivation as [`Self::provider_registration`].
+    pub fn org_provider_registration(
+        spec: &InterestSpec,
+        target: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        subscriber_membership: OrgMembershipCert,
+    ) -> Self {
+        Self::OrgProviderRegistration {
+            target,
+            capability_id: spec.capability_id.clone(),
+            constraints: spec.constraints.canonical_bytes(),
+            constraints_digest: spec.constraints.constraints_digest(),
+            work_latency: spec.work_latency,
+            providers: spec.providers.clone(),
+            result_mode: spec.result_mode,
+            disclosure_class: spec.disclosure_class,
+            audience_scope: spec.audience,
+            interest_digest: spec.interest_digest(),
+            requested_sample_interval,
+            soft_state_ttl,
+            subscriber_membership,
+        }
+    }
+
     /// Rebuild the COMPLETE [`InterestSpec`] a registration frame
     /// carries, given the already-validated parse of its inline
     /// constraint bytes. `None` for [`Self::Deregister`] (it carries
@@ -246,6 +380,15 @@ impl SensingInterestFrame {
                 disclosure_class,
                 audience_scope,
                 ..
+            }
+            | Self::OrgProviderRegistration {
+                capability_id,
+                work_latency,
+                providers,
+                result_mode,
+                disclosure_class,
+                audience_scope,
+                ..
             } => Some(InterestSpec {
                 capability_id: capability_id.clone(),
                 constraints,
@@ -253,6 +396,25 @@ impl SensingInterestFrame {
                 providers: providers.clone(),
                 result_mode: *result_mode,
                 disclosure_class: *disclosure_class,
+                audience: *audience_scope,
+            }),
+            // The org leader-addressed leg reconstructs like the legacy
+            // leader leg (owner-root disclosure class); its membership is
+            // validated at intake, not here.
+            Self::OrgCapabilityRegistration {
+                capability_id,
+                work_latency,
+                providers,
+                result_mode,
+                audience_scope,
+                ..
+            } => Some(InterestSpec {
+                capability_id: capability_id.clone(),
+                constraints,
+                work_latency: *work_latency,
+                providers: providers.clone(),
+                result_mode: *result_mode,
+                disclosure_class: DisclosureClass::Owner,
                 audience: *audience_scope,
             }),
             Self::Deregister { .. } => None,
@@ -286,6 +448,18 @@ impl SensingInterestFrame {
                 ..
             }
             | Self::ProviderRegistration {
+                constraints,
+                constraints_digest,
+                interest_digest,
+                ..
+            }
+            | Self::OrgCapabilityRegistration {
+                constraints,
+                constraints_digest,
+                interest_digest,
+                ..
+            }
+            | Self::OrgProviderRegistration {
                 constraints,
                 constraints_digest,
                 interest_digest,
@@ -477,6 +651,91 @@ mod tests {
         assert_eq!(encode_interest_frame(&cap).unwrap()[0], 0);
         assert_eq!(encode_interest_frame(&prov).unwrap()[0], 1);
         assert_eq!(encode_interest_frame(&dereg).unwrap()[0], 2);
+    }
+
+    // ---- Organization-authenticated variant composition (org-auth) -----
+    fn cert() -> OrgMembershipCert {
+        OrgMembershipCert::try_issue(
+            &crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x42u8; 32]),
+            crate::adapter::net::identity::EntityId::from_bytes([0x24u8; 32]),
+            5,
+            crate::adapter::net::behavior::org::ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("issue cert")
+    }
+
+    fn org_cap_frame() -> SensingInterestFrame {
+        SensingInterestFrame::org_capability_registration(
+            &spec(),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            0xA11CE,
+            cert(),
+        )
+    }
+
+    fn org_prov_frame() -> SensingInterestFrame {
+        SensingInterestFrame::org_provider_registration(
+            &spec(),
+            0x77,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            cert(),
+        )
+    }
+
+    #[test]
+    fn org_variants_land_at_postcard_indices_3_and_4() {
+        use crate::adapter::net::behavior::sensing::encode_interest_frame;
+        // Appended AFTER the frozen 0/1/2; the discriminant is the first byte.
+        assert_eq!(encode_interest_frame(&org_cap_frame()).unwrap()[0], 3);
+        assert_eq!(encode_interest_frame(&org_prov_frame()).unwrap()[0], 4);
+    }
+
+    #[test]
+    fn org_frames_round_trip_and_preserve_the_embedded_cert() {
+        use crate::adapter::net::behavior::sensing::{
+            decode_interest_frame, encode_interest_frame,
+        };
+        for frame in [org_cap_frame(), org_prov_frame()] {
+            let bytes = encode_interest_frame(&frame).unwrap();
+            let back = decode_interest_frame(&bytes).expect("strict decode");
+            // Full equality includes subscriber_membership — the embedded
+            // 156-byte canonical cert survived the postcard round-trip.
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn a_truncated_embedded_cert_fails_frame_decode() {
+        use crate::adapter::net::behavior::sensing::{
+            decode_interest_frame, encode_interest_frame,
+        };
+        let mut bytes = encode_interest_frame(&org_cap_frame()).unwrap();
+        // Cut into the trailing certificate bytes: the cert's manual
+        // Deserialize requires exactly WIRE_SIZE, so the frame fails to decode
+        // rather than surviving as an unvalidated byte bag.
+        bytes.truncate(bytes.len() - 10);
+        assert!(decode_interest_frame(&bytes).is_err());
+    }
+
+    #[test]
+    fn org_frame_trailing_bytes_fail_strict_decode() {
+        use crate::adapter::net::behavior::sensing::{
+            decode_interest_frame, encode_interest_frame,
+        };
+        let mut bytes = encode_interest_frame(&org_prov_frame()).unwrap();
+        bytes.push(0x00);
+        assert!(decode_interest_frame(&bytes).is_err());
+    }
+
+    #[test]
+    fn validated_spec_reconstructs_org_variants() {
+        let counters = SensingCounters::default();
+        // Semantic reconstruction works (digest cross-check passes) — this is
+        // NOT organization-authority validation, which the intake gate owns.
+        assert_eq!(org_cap_frame().validated_spec(&counters).unwrap(), spec());
+        assert_eq!(org_prov_frame().validated_spec(&counters).unwrap(), spec());
     }
 
     #[test]
