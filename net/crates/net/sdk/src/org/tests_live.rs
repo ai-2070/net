@@ -816,6 +816,174 @@ async fn live_binding_rehearsal_from_files_through_the_raw_seams() {
 }
 
 // ---------------------------------------------------------------------------
+// X2 — the live cross-language scenario, driven from generated on-disk artifacts
+// ---------------------------------------------------------------------------
+
+/// Decode a 64-char hex string into a 32-byte seed/psk.
+fn seed32(hex: &str) -> [u8; 32] {
+    assert_eq!(hex.len(), 64, "expected 64 hex chars");
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex byte");
+    }
+    out
+}
+
+/// Build a mesh EXACTLY as a language binding would from a manifest role: a
+/// seeded identity (so the entity matches the certs the generator issued) and
+/// an adopted authority loaded from the generated directory through the same
+/// `install_org_authority(dir)` a binding calls. Short announce interval only
+/// so the test converges promptly.
+async fn mesh_from_manifest_role(
+    seed_hex: &str,
+    psk_hex: &str,
+    authority_dir: &std::path::Path,
+) -> Mesh {
+    let identity = Identity::from_seed(seed32(seed_hex));
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), seed32(psk_hex))
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    let node = Arc::new(node);
+    let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity));
+    mesh.install_org_authority(authority_dir)
+        .expect("install_org_authority from the generated directory");
+    mesh.node()
+        .set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+    mesh
+}
+
+/// The strongest parity witness the Rust tier can carry alone (OSDK-L X2): the
+/// deterministic scenario generator (`write_cross_org_scenario`) mints the whole
+/// cross-org issuance chain to disk, and a two-node live call runs from those
+/// files ALONE — the exact bytes-and-paths a Go / Node / Python harness loads.
+///
+/// The provider builds from `provider.seed_hex`, installs its authority from
+/// `provider.authority_dir`, installs the grant audience from
+/// `provider.grant_path` + `provider.grant_secret_path`, and serves `Granted`.
+/// The caller builds from `caller.seed_hex`, installs its authority, assembles
+/// credentials via `from_parts` from the caller files (the secret by PATH), and
+/// calls. Admission + four-party attribution prove the manifest is sufficient;
+/// each language binding then loads the SAME manifest on CI to close the matrix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_cross_org_call_from_a_generated_scenario() {
+    // ---- generate the scenario to a fresh temp dir ----
+    let dir = std::env::temp_dir().join(format!(
+        "net-osdk-x2-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scenario dir");
+    let manifest = super::fixtures::write_cross_org_scenario(&dir).expect("generate scenario");
+    let read = |rel: &str| std::fs::read(dir.join(rel)).expect("read generated file");
+
+    // ---- provider: build from the manifest, install the grant audience, serve ----
+    let provider = mesh_from_manifest_role(
+        &manifest.provider.seed_hex,
+        &manifest.psk_hex,
+        &dir.join(&manifest.provider.authority_dir),
+    )
+    .await;
+    provider
+        .install_provider_grant_audience(
+            &read(&manifest.provider.grant_path),
+            &dir.join(&manifest.provider.grant_secret_path),
+        )
+        .expect("install provider grant audience from generated files");
+
+    let facts = Facts::new();
+    let ran = facts.ran.clone();
+    let ok = facts.attribution_ok.clone();
+    let expected_caller = Identity::from_seed(seed32(&manifest.caller.seed_hex))
+        .entity_id()
+        .clone();
+    let expected_provider = provider.node().entity_id().clone();
+    let (a_id, b_id) = (org_a().org_id(), org_b().org_id());
+    let _serve = provider
+        .serve_org(
+            "customer.read",
+            OrgAccess::Granted,
+            move |c: OrgCaller, req: Ping| {
+                let (ran, ok) = (ran.clone(), ok.clone());
+                let (expected_caller, expected_provider) =
+                    (expected_caller.clone(), expected_provider.clone());
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    ok.store(
+                        c.entity == expected_caller
+                            && c.acting_org == a_id
+                            && c.provider_org == b_id
+                            && c.provider == expected_provider
+                            && c.capability == cap("nrpc:customer.read")
+                            && !c.is_same_org(),
+                        Ordering::SeqCst,
+                    );
+                    Ok(Pong {
+                        n: req.n + 1,
+                        served_by: "x2-provider".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("serve_org");
+
+    // ---- caller: build from the manifest, credentials from files, call ----
+    let caller = mesh_from_manifest_role(
+        &manifest.caller.seed_hex,
+        &manifest.psk_hex,
+        &dir.join(&manifest.caller.authority_dir),
+    )
+    .await;
+    bring_up(&caller, &provider).await;
+
+    let credentials = OrgCredentials::from_parts(
+        &read(&manifest.caller.membership_path),
+        &read(&manifest.caller.dispatcher_path),
+        &[read(&manifest.caller.grant_path)],
+        &[dir.join(&manifest.caller.grant_secret_path)],
+    )
+    .expect("credentials from generated files + a secret PATH");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        converge_discovery(&provider, &org, &cap("nrpc:customer.read")).await,
+        "the file-loaded audience secret enabled private discovery of the B-owned provider"
+    );
+    let pong: Pong = org
+        .call("customer.read", &Ping { n: 7 })
+        .await
+        .expect("the cross-org protected call is admitted from generated artifacts");
+
+    assert_eq!(
+        pong,
+        Pong {
+            n: 8,
+            served_by: "x2-provider".to_string()
+        }
+    );
+    assert_eq!(
+        facts.ran.load(Ordering::SeqCst),
+        1,
+        "handler ran exactly once"
+    );
+    assert!(
+        facts.attribution_ok.load(Ordering::SeqCst),
+        "four-party attribution reached the handler — the generated scenario drives real admission"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // §7 provisioning — the methods that make the org surface usable from a binding
 // ---------------------------------------------------------------------------
 

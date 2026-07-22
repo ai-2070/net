@@ -278,6 +278,14 @@ required-features = ["net", "cortex"]
 name = "tool_calling"
 required-features = ["net", "macros"]
 
+# OSDK-L X2 — generate a live cross-org call scenario (adopted authorities,
+# credential bytes, 0600 audience-secret files, and a manifest.json) that a
+# harness in any language loads. Needs `net` for the issuance + adoption
+# primitives; no `cortex` (generation builds no mesh).
+[[example]]
+name = "gen_org_scenario"
+required-features = ["net"]
+
 # ============================================================================
 # nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the
 # shared in-process two-node harness, payload generators, and codec

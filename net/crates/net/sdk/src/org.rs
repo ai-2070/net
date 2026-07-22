@@ -62,6 +62,10 @@ pub use error::{
 pub mod fixtures;
 #[doc(hidden)]
 pub use fixtures::render_error_vectors;
+#[doc(hidden)]
+pub use fixtures::{
+    write_cross_org_scenario, CrossOrgScenarioManifest, ScenarioCaller, ScenarioProvider,
+};
 
 mod client;
 pub use client::OrgClient;
