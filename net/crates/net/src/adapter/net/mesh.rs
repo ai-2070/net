@@ -5062,6 +5062,14 @@ pub struct MeshNode {
     /// not both validate against the same older view and publish
     /// in reverse order.
     org_install: Arc<parking_lot::Mutex<()>>,
+    /// OLB org-auth: a monotonic generation advanced under `org_install`
+    /// exactly once per COMPLETE authority/store installation transaction that
+    /// changes the visible security view (`None`→X, A→B, or A→B→exact-Arc-A).
+    /// The sensing authority stamp includes it so an `A → B → A` rotation is
+    /// detected even though the authority `Arc` pointer returns to its original
+    /// value (a bare pointer/generation stamp cannot). Not bumped for a failed
+    /// install or an exact no-op re-install.
+    org_install_generation: Arc<std::sync::atomic::AtomicU64>,
     /// OA-1: whether self-announcements attach the installed
     /// authority's owner certificate. `false` (the default) keeps
     /// the announcement byte-identical to the pre-OA-1 shape;
@@ -6461,6 +6469,7 @@ impl MeshNode {
                 ),
             ),
             org_install: Arc::new(parking_lot::Mutex::new(())),
+            org_install_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -8040,7 +8049,11 @@ impl MeshNode {
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        self.install_org_revocation_store_locked(store, false, None)
+        if self.install_org_revocation_store_locked(store, false, None)? {
+            self.org_install_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Deterministic-witness seam: run a store installation that
@@ -8056,7 +8069,11 @@ impl MeshNode {
         pause: &(dyn Fn() + Sync),
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        self.install_org_revocation_store_locked(store, false, Some(pause))
+        if self.install_org_revocation_store_locked(store, false, Some(pause))? {
+            self.org_install_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Body of [`Self::install_org_revocation_store`], called with
@@ -8070,12 +8087,19 @@ impl MeshNode {
     /// verification): re-acquiring the same non-reentrant reload
     /// guard here would deadlock, and the caller's pin already
     /// froze both live views.
+    ///
+    /// Returns whether the VISIBLE store changed: `Ok(false)` when the exact
+    /// same store `Arc` was already installed (no publication), `Ok(true)` when
+    /// a `None`→store or A→B publication occurred. The caller owns the
+    /// `org_install_generation` bump at the complete transaction boundary — the
+    /// helper never bumps, so an authority+store transaction publishes one
+    /// generation change, not an intermediate store bump then an authority bump.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
         pin_held: bool,
         pause_before_swap: Option<&(dyn Fn() + Sync)>,
-    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+    ) -> Result<bool, super::behavior::org_revocation::OrgRevocationError> {
         // Fast poison reject (rechecked UNDER the pin below — a
         // candidate can be poisoned between here and the swap).
         if store.is_poisoned() {
@@ -8088,7 +8112,8 @@ impl MeshNode {
         let current = self.org_revocation.load_full();
         if let Some(cur) = &current {
             if Arc::ptr_eq(cur, &store) {
-                return Ok(());
+                // Exact same installed store — no visible change, no bump.
+                return Ok(false);
             }
         }
 
@@ -8237,7 +8262,8 @@ impl MeshNode {
                 );
             }
         }
-        Ok(())
+        // A visible store publication occurred (None→store or A→B).
+        Ok(true)
     }
 
     /// OA-1: the installed org revocation store, if any.
@@ -8353,7 +8379,10 @@ impl MeshNode {
             pause();
         }
 
-        if let Some(existing) = self.node_authority.load_full() {
+        // Load the currently-installed authority ONCE (under `org_install`) for
+        // both the one-owner check and the change decision below.
+        let existing_authority = self.node_authority.load_full();
+        if let Some(existing) = &existing_authority {
             if existing.owner_org() != authority.owner_org() {
                 return Err(
                     super::behavior::org_authority::OrgAuthorityError::AlreadyOwned {
@@ -8363,10 +8392,27 @@ impl MeshNode {
                 );
             }
         }
+        // The immediate change decision is IDENTITY-based (`Arc::ptr_eq`), not
+        // org/cert equality: a same-org renewal or key rotation is still a
+        // distinct installed security view. Historical `A → B → A` is caught by
+        // the installation generation, not this pointer compare.
+        let authority_changed = existing_authority
+            .as_ref()
+            .map(|current| !Arc::ptr_eq(current, &authority))
+            .unwrap_or(true);
         // The pin is already held over both cores → `pin_held = true`.
-        self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
+        let store_changed = self
+            .install_org_revocation_store_locked(candidate_store.clone(), true, None)
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
-        self.node_authority.store(Some(authority));
+        if authority_changed {
+            self.node_authority.store(Some(authority));
+        }
+        // One generation transition for the COMPLETE authority+store
+        // transaction (never one for the store then one for the authority).
+        if authority_changed || store_changed {
+            self.org_install_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
         // (review-11 P1).
@@ -8415,6 +8461,41 @@ impl MeshNode {
     /// OA-1: the installed node authority, if any.
     pub fn node_authority(&self) -> Option<Arc<super::behavior::org_authority::NodeAuthority>> {
         self.node_authority.load_full()
+    }
+
+    /// OLB org-auth: capture a coherent, pinned snapshot of this node's sensing
+    /// authority view under the `org_install` publication lock — the org
+    /// registration gate validates against it and rechecks its stamp before
+    /// mutation ([`Self::sensing_authority_snapshot_current`]).
+    #[allow(dead_code)]
+    pub(crate) fn capture_sensing_authority_snapshot(
+        &self,
+    ) -> Result<sensing::SensingAuthoritySnapshot, sensing::SensingAuthorityUnavailable> {
+        sensing::capture_sensing_authority_snapshot(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+        )
+    }
+
+    /// OLB org-auth: whether a previously-captured sensing authority snapshot is
+    /// still the live view (the admission linearization recheck). Recaptures
+    /// the current stamp under `org_install` and compares — a floor raise,
+    /// authority/store swap, `A → B → A` rotation, or poison transition all
+    /// make it stale.
+    #[allow(dead_code)]
+    pub(crate) fn sensing_authority_snapshot_current(
+        &self,
+        snapshot: &sensing::SensingAuthoritySnapshot,
+    ) -> bool {
+        sensing::capture_current_sensing_stamp(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+        )
+        .is_some_and(|current| snapshot.stamp().is_current(&current))
     }
 
     /// Best-effort wake of a current-baseline re-announce (OA3-4b2): a provider

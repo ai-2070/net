@@ -36,11 +36,16 @@
 //! advisory optimization — a refusal leaves the caller `Unknown`/`Potential`.
 
 use super::super::org::{OrgError, OrgId};
-use super::super::org_revocation::OrgRevocationState;
+use super::super::org_authority::NodeAuthority;
+use super::super::org_revocation::{OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{AudienceScopeCommitment, InterestSpec};
 use super::SensingCounters;
 use crate::adapter::net::identity::EntityId;
+use arc_swap::ArcSwapOption;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The two values the gate needs from the installed
@@ -438,6 +443,139 @@ impl AdmittedSensingRegistration {
     }
 }
 
+/// A monotonic, allocator-reuse-safe stamp of the node's sensing authority
+/// security view, captured under the `org_install` publication lock. Equality
+/// is the admission linearization currency check: the store publish generation
+/// catches a floor raise on the same store, the pointers catch identity swaps,
+/// and the **installation generation** catches an `A → B → exact-Arc-A`
+/// rotation the pointer alone cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SensingAuthorityStamp {
+    authority_ptr: usize,
+    store_ptr: usize,
+    store_generation: u64,
+    installation_generation: u64,
+    poisoned: bool,
+}
+
+impl SensingAuthorityStamp {
+    /// `true` iff `self` (captured before validation) still equals the live
+    /// `current` stamp AND the store is not now poisoned — i.e. the security
+    /// view the registration was validated against is still live. A poison
+    /// transition makes the stamp non-current even with every numeric field
+    /// equal.
+    pub(crate) fn is_current(&self, current: &SensingAuthorityStamp) -> bool {
+        self == current && !current.poisoned
+    }
+}
+
+/// A pinned snapshot of the sensing authority view for one org-registration
+/// admission. The retained `Arc`s prevent allocator-address reuse between
+/// validation and the pre-mutation recheck; the installation generation
+/// separately closes exact-`Arc` `A → B → A`.
+pub(crate) struct SensingAuthoritySnapshot {
+    stamp: SensingAuthorityStamp,
+    authority_view: OrgAuthorityView,
+    floors: Arc<OrgRevocationState>,
+    // Pins — held only to keep the exact objects alive across validation.
+    _authority: Arc<NodeAuthority>,
+    _store: Arc<OrgRevocationStore>,
+}
+
+#[allow(dead_code)]
+impl SensingAuthoritySnapshot {
+    /// The stamp to recheck against live state before mutation.
+    pub(crate) fn stamp(&self) -> &SensingAuthorityStamp {
+        &self.stamp
+    }
+
+    /// The pinned authority view (owner org + skew) the gate validates against.
+    pub(crate) fn authority_view(&self) -> OrgAuthorityView {
+        self.authority_view
+    }
+
+    /// The pinned, coherent revocation floors the gate validates against.
+    pub(crate) fn floors(&self) -> &OrgRevocationState {
+        &self.floors
+    }
+}
+
+/// Why the sensing authority view could not be captured — each leaves the
+/// registration `Unknown`/`Potential` (advisory), never a legacy downgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SensingAuthorityUnavailable {
+    /// No `NodeAuthority` is installed.
+    NoAuthority,
+    /// No `OrgRevocationStore` is installed.
+    NoStore,
+    /// The installed store is poisoned.
+    Poisoned,
+}
+
+/// Capture a coherent, pinned snapshot of the sensing authority view under the
+/// `org_install` publication lock (so no reader observes a published store
+/// before its matching installation generation). Free-standing over the raw
+/// node fields so both `MeshNode` and the dispatch context can call it.
+pub(crate) fn capture_sensing_authority_snapshot(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
+) -> Result<SensingAuthoritySnapshot, SensingAuthorityUnavailable> {
+    let _install = org_install.lock();
+    let authority = node_authority
+        .load_full()
+        .ok_or(SensingAuthorityUnavailable::NoAuthority)?;
+    let store = org_revocation
+        .load_full()
+        .ok_or(SensingAuthorityUnavailable::NoStore)?;
+    if store.is_poisoned() {
+        return Err(SensingAuthorityUnavailable::Poisoned);
+    }
+    // Coherent floors + barriered store generation as one pair.
+    let (floors, store_generation) = store.snapshot_with_generation();
+    let stamp = SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store) as *const () as usize,
+        store_generation,
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: false,
+    };
+    let authority_view = OrgAuthorityView {
+        owner_org: authority.owner_org(),
+        verification_skew_secs: authority.config.verification_skew_secs,
+    };
+    Ok(SensingAuthoritySnapshot {
+        stamp,
+        authority_view,
+        floors,
+        _authority: authority,
+        _store: store,
+    })
+}
+
+/// Capture just the current stamp under `org_install` for the pre-mutation
+/// recheck — it crosses the store publication barrier (`barriered_generation`),
+/// never a bare `publish_generation`. `None` when authority/store is absent
+/// (also a stale view relative to any prior successful capture).
+pub(crate) fn capture_current_sensing_stamp(
+    org_install: &Mutex<()>,
+    node_authority: &ArcSwapOption<NodeAuthority>,
+    org_revocation: &ArcSwapOption<OrgRevocationStore>,
+    org_install_generation: &AtomicU64,
+) -> Option<SensingAuthorityStamp> {
+    let _install = org_install.lock();
+    let authority = node_authority.load_full()?;
+    let store = org_revocation.load_full()?;
+    Some(SensingAuthorityStamp {
+        authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
+        store_ptr: Arc::as_ptr(&store) as *const () as usize,
+        store_generation: store.barriered_generation(),
+        installation_generation: org_install_generation.load(Ordering::Acquire),
+        poisoned: store.is_poisoned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,5 +892,58 @@ mod tests {
             admitted.authority(),
             RegistrationAuthority::Legacy { .. }
         ));
+    }
+
+    // ---- authority stamp currency discrimination ----------------------
+    fn stamp(
+        authority_ptr: usize,
+        store_ptr: usize,
+        store_generation: u64,
+        installation_generation: u64,
+        poisoned: bool,
+    ) -> SensingAuthorityStamp {
+        SensingAuthorityStamp {
+            authority_ptr,
+            store_ptr,
+            store_generation,
+            installation_generation,
+            poisoned,
+        }
+    }
+
+    #[test]
+    fn identical_stamp_is_current() {
+        let captured = stamp(1, 2, 3, 4, false);
+        assert!(captured.is_current(&stamp(1, 2, 3, 4, false)));
+    }
+
+    #[test]
+    fn a_b_a_rotation_is_stale_via_installation_generation() {
+        // The authority Arc pointer returns to its original value (authority_ptr
+        // and store_ptr unchanged) but two installs advanced the installation
+        // generation — the pointer alone would falsely match.
+        let captured = stamp(1, 2, 3, 4, false);
+        let after_a_b_a = stamp(1, 2, 3, 6, false);
+        assert!(!captured.is_current(&after_a_b_a));
+    }
+
+    #[test]
+    fn floor_raise_on_same_store_is_stale() {
+        let captured = stamp(1, 2, 3, 4, false);
+        assert!(!captured.is_current(&stamp(1, 2, 4, 4, false)));
+    }
+
+    #[test]
+    fn authority_or_store_pointer_change_is_stale() {
+        let captured = stamp(1, 2, 3, 4, false);
+        assert!(!captured.is_current(&stamp(9, 2, 3, 4, false)));
+        assert!(!captured.is_current(&stamp(1, 9, 3, 4, false)));
+    }
+
+    #[test]
+    fn poison_transition_is_stale_even_with_equal_numeric_fields() {
+        // A store may poison without changing any pointer or generation.
+        let captured = stamp(1, 2, 3, 4, false);
+        assert!(!captured.is_current(&stamp(1, 2, 3, 4, true)));
     }
 }

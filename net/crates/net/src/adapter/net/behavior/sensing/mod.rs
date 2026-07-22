@@ -79,6 +79,10 @@ pub use org_gate::{
     canonical_org_sensing_commitment, verify_org_sensing_registration, OrgSensingRejection,
     ValidatedOrgSensingRegistration,
 };
+pub(crate) use org_gate::{
+    capture_current_sensing_stamp, capture_sensing_authority_snapshot, SensingAuthoritySnapshot,
+    SensingAuthorityUnavailable,
+};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
     closeness_score, sensing_leader, FrameRejection, LeaderReconciliation, LeaderRefusalPartition,
