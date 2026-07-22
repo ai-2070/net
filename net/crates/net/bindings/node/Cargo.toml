@@ -1,6 +1,6 @@
 [package]
 name = "net-node"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Node.js bindings for Net event bus"
@@ -202,15 +202,15 @@ a2a = ["delegation", "cortex"]
 payments-http = ["payments", "net-payments/http-facilitator", "dep:base64"]
 
 [dependencies]
-net = { package = "net-mesh", version = "0.33.0", path = "../..", default-features = false }
-net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.34.0", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../../sdk", default-features = false, optional = true }
 # The MCP bridge adapter, for the two pure helpers only (feature `mcp`).
-net-mcp = { package = "net-mesh-mcp", version = "0.33.0", path = "../../adapters/mcp", optional = true }
+net-mcp = { package = "net-mesh-mcp", version = "0.34.0", path = "../../adapters/mcp", optional = true }
 # The payments caller flow (feature `payments`): the spend engine + gateway
 # payment gate paid capabilities clear through. `mesh` brings the SDK mesh
 # surface (`MeshPaymentChannel`, `net-sdk/net`+`cortex`); `mcp-gate` the
 # `gated_invoke` payment seam.
-net-payments = { version = "0.33.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
+net-payments = { version = "0.34.0", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
 # The outbound HTTP-402 client base64-encodes the byte-preserved settlement
 # response for audit. Optional + `payments-http`-gated (already in the lock via
 # net-payments).

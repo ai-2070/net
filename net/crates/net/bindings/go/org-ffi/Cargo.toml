@@ -1,6 +1,6 @@
 [package]
 name = "net-org-ffi"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI organization-capability-auth surface for the Go binding of Net"
@@ -33,7 +33,7 @@ default = []
 # features, cfg-gated fields on shared types (`CapabilitySet`,
 # `MeshNode`, etc.) shift offsets and shared paths read through the
 # wrong layout — a subtle UB. Kept identical to `compute-ffi`'s list.
-net = { package = "net-mesh", version = "0.33.0", path = "../../..", features = ["net", "netdb", "redex-disk", "tool"] }
+net = { package = "net-mesh", version = "0.34.0", path = "../../..", features = ["net", "netdb", "redex-disk", "tool"] }
 # SDK org surface — `OrgCredentials`, `OrgClient`, `OrgAccess`,
 # `OrgCaller`, `OrgSdkError`, and the provisioning entrypoints. The Go
 # FFI delegates to this layer so all four language bindings stay
@@ -42,7 +42,7 @@ net = { package = "net-mesh", version = "0.33.0", path = "../../..", features = 
 # (`net_sdk::org` gates them on it); `net` for the bind + credential
 # surface. `compute-ffi` already carries this same `net-mesh-sdk`
 # dependency, so org-ffi is not the first Go FFI crate to take it.
-net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../../../sdk", features = ["net", "cortex"] }
+net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../../../sdk", features = ["net", "cortex"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
 parking_lot = "0.12"

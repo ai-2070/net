@@ -1,6 +1,6 @@
 [package]
 name = "net-payments"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 # Benches are registered explicitly with `[[bench]]` (see the bottom of
 # this file). `autobenches = false` keeps Cargo from auto-discovering
@@ -35,16 +35,16 @@ multiple_unsafe_ops_per_block = "warn"
 # verify_strict). Provider identity on a quote IS the mesh entity
 # identity — x402 wallet identity is a payment credential, not a
 # participant identity.
-net = { package = "net-mesh", version = "0.33.0", path = "..", default-features = false, features = ["net"] }
+net = { package = "net-mesh", version = "0.34.0", path = "..", default-features = false, features = ["net"] }
 # The SDK supplies the consent/pins vocabulary the payment policy
 # store mirrors (`CapabilityId`, the locked-store pattern) and is the
 # surface WS4 composes against (gateway / publish options).
-net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../sdk", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../sdk", default-features = false }
 # The MCP demand-side gate seam (`net_mcp::serve::PaymentFlow`).
 # Optional, behind `mcp-gate`: only payment-aware gateway hosts (the
 # Python binding, agent runtimes) pull the adapter; the payments core
 # stays adapter-free. The adapter never depends back on this crate.
-net-mcp = { package = "net-mesh-mcp", version = "0.33.0", path = "../adapters/mcp", optional = true }
+net-mcp = { package = "net-mesh-mcp", version = "0.34.0", path = "../adapters/mcp", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -147,7 +147,7 @@ async-trait = "0.1"
 # `serve_tool_paid` + `metadata_for` (the native paid-serve path,
 # driven against the real `EngineToolPaymentGate`) — dev-only, so the
 # shipped `mesh` feature keeps its narrower surface.
-net-sdk = { package = "net-mesh-sdk", version = "0.33.0", path = "../sdk", default-features = false, features = ["net", "cortex", "tool"] }
+net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../sdk", default-features = false, features = ["net", "cortex", "tool"] }
 # `JsonSchema` for the mega-e2e's tool request/response types (the
 # `serve_tool_paid` descriptor derives its schema from them).
 schemars = "1"
