@@ -4615,13 +4615,16 @@ fn spawn_sensing_frame_send(
     };
     let socket = socket.clone();
     // Reserve the stream sequence and build the packet SYNCHRONOUSLY, before
-    // spawning the send. A caller serializing two sends (e.g. a lease
-    // deregister then a racing re-acquire, both under the lease apply mutex)
-    // thereby stamps their packets with stream sequences in call order; task
-    // scheduling can then reorder only the sends, and the receiving stream
-    // orders by sequence. (Allocating the sequence inside the spawned task —
-    // as this did before OLB-0.2's fix — let a later-created send win the
-    // sequence and invert the receiver's final state.)
+    // spawning the send. A caller serializing two sends (e.g. under the lease
+    // apply mutex) thereby stamps their packets with stream sequences in call
+    // order rather than in racing-task order. (Allocating the sequence inside
+    // the spawned task — as this did before OLB-0.2's fix — let a
+    // later-created send take an earlier sequence.)
+    //
+    // NOTE: this orders the SENDS; the sensing intake applies interest frames
+    // in arrival order and does not currently reorder or reject by sequence,
+    // so it does not by itself resolve a deregister vs. re-acquire race at the
+    // receiver — soft-state ttl/2 refresh (holder-owned) does.
     let events = [Bytes::from(payload)];
     // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
     // carries the §4.4 continuity-bearing flag (see
@@ -5019,10 +5022,18 @@ pub struct MeshNode {
     /// Serializes each sensing-lease decision with the synchronous
     /// allocation of its wire packet's stream sequence
     /// (`spawn_sensing_frame_send` reserves the sequence and builds the
-    /// packet before spawning the send), so a release racing a new acquire
-    /// produces packets whose stream sequences follow decision order rather
-    /// than task-scheduling order — the receiving stream orders by sequence,
-    /// so the live successor wins (§4.3).
+    /// packet before spawning the send), so racing sends carry stream
+    /// sequences in decision order rather than task-scheduling order.
+    ///
+    /// This orders the SENDS. It does NOT by itself resolve a deregister
+    /// racing a re-acquire at the receiver: the sensing intake applies
+    /// interest frames in arrival order and does not currently reorder or
+    /// reject by sequence, so a late-arriving stale deregister can still
+    /// remove a live successor. Full convergence relies on the holder's
+    /// ttl/2 soft-state refresh — owned by the lease consumer (the SDK
+    /// watch / org routing reconciler), not this slice. A receiver-enforced
+    /// installation generation would close it at the wire, but that is a
+    /// deferred sensing-wire change (§4.3).
     sensing_lease_apply_mu: parking_lot::Mutex<()>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
@@ -6975,8 +6986,8 @@ impl MeshNode {
             provider,
         };
         // Serialize the decision with the synchronous allocation of its wire
-        // packet's stream sequence, so a release racing a new acquire stamps
-        // their packets in decision order (see `sensing_lease_apply_mu`).
+        // packet's stream sequence (see `sensing_lease_apply_mu` for the exact
+        // ordering guarantee and its limits).
         let _apply = self.sensing_lease_apply_mu.lock();
         let (token, action) =
             self.sensing_interest_leases
