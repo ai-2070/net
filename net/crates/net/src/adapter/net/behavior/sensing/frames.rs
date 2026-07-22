@@ -432,6 +432,53 @@ mod tests {
         }
     }
 
+    // ---- Frozen-wire golden fixtures (OLB org-auth slice) --------------
+    // The exact postcard encoding of each existing variant, captured BEFORE
+    // the organization-authenticated variants are appended at indices 3/4.
+    // Appending must not perturb these bytes (postcard encodes the variant
+    // index; index 0/1/2 must stay 0/1/2). Regenerate ONLY with a deliberate,
+    // reviewed wire change.
+    const CAP_HEX: &str = "000e7072696e742e646f63756d656e74240200000005000000636f6c6f720400000074727565050000006d6564696102000000613420d02d423654096a867b66a506b433528db701e41818066eec51e186c3724be398010500000000204f9d6f145f2df01fa70c8155e7e9c55fe5571d6df47b631749ce35edc0b250fd0080c2d72f1e0020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaacea328";
+    const PROV_HEX: &str = "01770e7072696e742e646f63756d656e74240200000005000000636f6c6f720400000074727565050000006d6564696102000000613420d02d423654096a867b66a506b433528db701e41818066eec51e186c3724be3980105000000000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa204f9d6f145f2df01fa70c8155e7e9c55fe5571d6df47b631749ce35edc0b250fd0080c2d72f1e00";
+    const DEREG_HEX: &str =
+        "0220bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb019901";
+
+    fn golden_dereg() -> SensingInterestFrame {
+        SensingInterestFrame::Deregister {
+            interest_digest: Digest256::from_bytes([0xBB; 32]),
+            target: Some(0x99),
+        }
+    }
+
+    #[test]
+    fn existing_variants_have_frozen_postcard_encodings() {
+        use crate::adapter::net::behavior::sensing::encode_interest_frame;
+        let cap = SensingInterestFrame::capability_registration(
+            &spec(),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            0xA11CE,
+        );
+        let prov = SensingInterestFrame::provider_registration(
+            &spec(),
+            0x77,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+        );
+        let dereg = golden_dereg();
+        assert_eq!(hex::encode(encode_interest_frame(&cap).unwrap()), CAP_HEX);
+        assert_eq!(hex::encode(encode_interest_frame(&prov).unwrap()), PROV_HEX);
+        assert_eq!(
+            hex::encode(encode_interest_frame(&dereg).unwrap()),
+            DEREG_HEX
+        );
+        // Postcard variant indices: CapabilityRegistration=0, Provider=1,
+        // Deregister=2 — the first byte is the variant discriminant.
+        assert_eq!(encode_interest_frame(&cap).unwrap()[0], 0);
+        assert_eq!(encode_interest_frame(&prov).unwrap()[0], 1);
+        assert_eq!(encode_interest_frame(&dereg).unwrap()[0], 2);
+    }
+
     #[test]
     fn capability_registration_round_trips_through_json() {
         let frame = SensingInterestFrame::capability_registration(
