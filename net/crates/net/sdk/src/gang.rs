@@ -46,6 +46,13 @@
 //! # let _ = criteria;
 //! ```
 
+// The module doc links to `crate::cortex::workflow` (the task-lifecycle layer),
+// which only exists under `cortex`. `gang` itself is `net`-gated, so a
+// `net`-without-`cortex` doc build has a live but unresolvable link. Relax the
+// check ONLY in that config — a `cortex` build (CI's `--features full`, and the
+// default) still resolves and fully checks the link.
+#![cfg_attr(not(feature = "cortex"), allow(rustdoc::broken_intra_doc_links))]
+
 pub use ::net::adapter::net::behavior::gang::{
     ClaimError, ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
 };

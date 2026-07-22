@@ -70,6 +70,11 @@ pub use net::adapter::net::behavior::org_revocation::{
 /// [`AdmissionDenied`](net::adapter::net::behavior::org_admission::AdmissionDenied)
 /// stays provider-side audit only, deliberately, so denials are not a credential
 /// oracle.
+// `OrgAccess` / `OrgCaller` are the `cortex`-gated serve-verb facade names; this
+// doc is always compiled, so the links are live-but-unresolvable in a
+// `net`-without-`cortex` build. Relax the check ONLY there — a `cortex` build
+// (the default and CI's `--features full`) resolves and fully checks them.
+#[cfg_attr(not(feature = "cortex"), allow(rustdoc::broken_intra_doc_links))]
 pub use net::adapter::net::behavior::org_admission::{
     Admitted, CoarseAdmissionReason, OrgAdmission,
 };
@@ -78,6 +83,9 @@ pub use net::adapter::net::behavior::org_admission::{
 /// private forms. [`OrgAccess`](super::OrgAccess) selects the private form
 /// implicitly (access implies visibility); this enum is the canonical name the
 /// low-level serve APIs take.
+// `super::OrgAccess` is `cortex`-gated (see above); relax the link check only in
+// a `net`-without-`cortex` doc build.
+#[cfg_attr(not(feature = "cortex"), allow(rustdoc::broken_intra_doc_links))]
 pub use net::adapter::net::org_admission_gate::CapabilityVisibility;
 
 /// Why installing a grant audience was refused — surfaced by the facade when a
