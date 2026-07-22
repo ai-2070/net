@@ -1,6 +1,28 @@
 # Org Capability Load Balancing Plan (OLB)
 
-**Version:** v0.3 — applies Kyra's performance ruling (2026-07-22):
+**Version:** v0.4 — applies Kyra's re-review verdict (2026-07-22, read
+at master `6e9d686ee`): every architecture dimension **APPROVED**
+(product surface, private-provider sensing path, organization sensing
+authority, node-global lifecycle ownership, cadence aggregation,
+viability semantics, hot-path performance, bounded SameOrg-first
+rollout); three narrow implementation points pinned here —
+
+13. the registration wire choice is **pinned**: organization-
+    authenticated variants APPENDED to `SensingInterestFrame` under the
+    existing 0x0C02 subprotocol, eight locked requirements (§5.1b;
+    sensing plan S0);
+14. route-set publication is **publish-if-current** over a full
+    `RouteSourceGeneration` source vector — never last-writer-wins
+    (§7);
+15. authority validity edges arm **deadline timers**
+    (`next_authority_deadline` + one reconciler timer per capability),
+    with the per-call temporal recheck retained as defense in depth
+    (§7; OLB-2 witnesses).
+
+Per the verdict, once these are confirmed: **OLB-0 → OLB-1 → bounded
+stop-and-review**, with no further architecture review before OLB-0.
+
+v0.3 applied Kyra's performance ruling (2026-07-22):
 the public product shape was confirmed simple enough; the
 implementation is now pinned so a warmed `org.call` is **two
 comparisons, not a recomputation of the network** —
@@ -55,8 +77,9 @@ findings and four bounded corrections, all applied in this revision:
 6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
    non-stampeding) (§9).
 
-**Status: revised draft — awaiting re-review. Implementation remains
-unauthorized until the blockers' corrections are signed off.**
+**Status: the three re-review pins are applied. Pending Kyra's
+confirmation of them, implementation proceeds OLB-0 → OLB-1 → bounded
+stop-and-review with no further architecture review before OLB-0.**
 
 **The sentence:** organization-aware load balancing is an internal
 composition of private authorized discovery, capability sensing, and
@@ -417,10 +440,16 @@ interest audience == canonical commitment for membership.org_id
 ```
 
 — with each relay proving its **own** membership when re-registering
-upstream. This is a narrow additive wire extension at registration
-intake only (0x0C02 variants or a versioned registration subprotocol,
-selected at S0 review); the 0x0C03 attestation transcript, continuity,
-and epoch semantics are unchanged. The candidate population comes from
+upstream. The wire shape is **pinned (re-review 2026-07-22)**: the
+organization variants are APPENDED to `SensingInterestFrame` under the
+existing 0x0C02 subprotocol — never a new subprotocol — with eight
+locked requirements (sensing plan S0), notably: SDK organization
+sensing emits only organization variants; intake validates membership
+before creating table state; legacy entity/fleet-root variants cannot
+enter an organization-derived audience; and mixed-version refusal
+degrades to Unknown and deterministic routing, never an invocation
+failure. The 0x0C03 attestation transcript, continuity, and epoch
+semantics are unchanged. The candidate population comes from
 the verified owner-private store; the sensing counterparties are
 verified members of that same organization.
 
@@ -661,7 +690,17 @@ struct OrgRouteSet {
     ready: Arc<[ReadyRoute]>,        // score-carrying; P2C samples it
     unknown: Arc<[AuthorizedRoute]>, // pre-sorted deterministic fallback
     non_viable_count: usize,
-    generation: u64,
+    sources: RouteSourceGeneration,  // full source vector (internal)
+    next_authority_deadline: Option<SystemTime>,
+}
+
+struct RouteSourceGeneration {
+    private_discovery: u64,
+    authority: u64,
+    sessions: u64,
+    sensing: u64,
+    topology: u64,
+    watch_population: u64,
 }
 ```
 
@@ -673,14 +712,52 @@ an input changes:
 - direct-session state;
 - sensing generation (`subscribe_sensing_overlay_changes`);
 - route topology;
-- capability watch population.
+- capability watch population;
+- the earliest authority validity deadline (a wall-clock timer —
+  below).
 
 It is wake-driven off the existing unified change signals, never a poll
-loop; bursts of wakes coalesce into one rebuild; rebuilds are
-single-flighted and generation-stamped; `ArcSwap` publish is
-last-writer-wins. `org.call` reads the latest snapshot and never
-blocks on, waits for, or performs a rebuild — a staleness observation
-on the read path may enqueue a rebuild, never perform one inline.
+loop; bursts of wakes coalesce into one rebuild; only one rebuild per
+capability is active at a time. Publication is
+**publish-if-current, never last-writer-wins** — an older computation
+must never publish after a newer source generation:
+
+```text
+1. capture all relevant source generations (RouteSourceGeneration)
+2. build the route set off-path
+3. reread source generations before publish
+4. any changed → discard the result, enqueue one coalesced rebuild
+5. otherwise publish through ArcSwap
+6. one active rebuild per capability at a time
+```
+
+This holds even if future refactoring weakens the single-flight
+implementation: a generation-12 rebuild that finishes after
+generation 13 arrived discards itself rather than publishing stale
+routes. `org.call` reads the latest snapshot and never blocks on,
+waits for, or performs a rebuild — a staleness observation on the read
+path may enqueue a rebuild, never perform one inline.
+
+**Authority validity edges arm timers.** Certificate and grant expiry
+are wall-clock transitions that emit no network or sensing event.
+Without a timer, a route set preferring a grant that expires at T keeps
+preferring it after T: every call selects it, the per-call recheck
+refuses, and calls can keep failing until an unrelated event rebuilds —
+the recheck preserves security but not availability. Each route set
+therefore records `next_authority_deadline`, computed from the earliest
+relevant membership `not_after`, dispatcher `not_after`,
+selected/candidate grant `not_after`, and any other canonical authority
+validity boundary the route set consumed. The reconciler schedules one
+timer per capability for that deadline:
+
+```text
+deadline reached
+→ enqueue capability rebuild
+→ reselect from currently valid candidates
+```
+
+The per-call temporal recheck remains mandatory as defense in depth;
+the timer improves availability, it does not replace validation.
 
 Per-call complexity (warmed):
 
@@ -929,7 +1006,8 @@ Among Viable, use power-of-two choices over the estimated end-to-end
 cost — the exact `Viable` cost `classify_branch` already computes.
 
 **Never sort Ready candidates per request.** P2C needs only: two
-distinct indices, two cost comparisons, and EntityId on an exact tie.
+distinct indices, two candidate cost loads, one ordering comparison,
+and an EntityId comparison only on an exact tie.
 The Ready slice keeps whatever order the route-set rebuild produced;
 the Potential fallback vector is deterministically sorted **once at
 rebuild**, not per call. Explicitly prohibited:
@@ -1159,10 +1237,11 @@ membership proof**.
 
 Deliver:
 
-- org-authenticated registration variants carrying the registering
-  hop's `OrgMembershipCert`, validated per hop, relay re-registering
-  under its own membership (§5.1b) — an additive registration-intake
-  extension; 0x0C03 attestation transcript unchanged;
+- the pinned appended 0x0C02 organization registration variants
+  (`OrgCapabilityRegistration` / `OrgProviderRegistration`) carrying
+  the registering hop's `OrgMembershipCert`, validated per hop, relay
+  re-registering under its own membership, eight locked requirements
+  (§5.1b; sensing plan S0); 0x0C03 attestation transcript unchanged;
 - node-global interest lease on `MeshNode` with the **two-shape key**
   (`ProviderFree` / `ExactProvider`, §7), acquire/release methods, RAII
   guards in the SDK — the `OrgAudienceLeases` ownership template
@@ -1258,6 +1337,16 @@ Exit witnesses:
 - the per-call temporal recheck still refuses an
   expired-since-rebuild credential (the route cache is not an
   authority cache);
+- a rebuild whose source generations changed during computation
+  discards its result and re-enqueues; the stale result never
+  publishes (publish-if-current);
+- a grant expires with no network or sensing event;
+- the route set rebuilds at the recorded `next_authority_deadline`;
+- another valid provider becomes selectable after the deadline
+  rebuild;
+- a call racing the deadline either uses a still-current proof or
+  fails the temporal recheck without sending;
+- no expired credential ever enters `OrgProofIntent`;
 - private providers never enter a sensing scope other than their own
   authority audience;
 - a provider present in sensing but absent from authorized discovery
@@ -1279,8 +1368,9 @@ Exit witnesses:
 
 - one candidate; two candidates; more than two candidates;
 - the two sampled indices are distinct;
-- the warmed selection performs exactly two cost comparisons and no
-  sort (instrumented witness);
+- the warmed selection performs exactly two candidate cost loads and
+  one cost comparison — plus an EntityId comparison only on an exact
+  tie — and no sort (instrumented witness);
 - lower cost wins the sampled comparison;
 - ties resolve by EntityId;
 - fixed seed + nonce reproduce the selection exactly;
@@ -1383,9 +1473,17 @@ The plan is complete when all are true:
       P2C → proof → send — no rediscovery, no candidate revalidation
       scan, no observation scan, no sorting, no interest
       reconciliation, no registration wait.
-- [ ] Route sets are immutable, change-driven, and single-flight
-      rebuilt; staleness on read enqueues a rebuild, never performs
-      one inline.
+- [ ] Route sets are immutable, change-driven, single-flight rebuilt,
+      and published **publish-if-current** over the full
+      source-generation vector — a stale computation never publishes;
+      staleness on read enqueues a rebuild, never performs one inline.
+- [ ] Authority validity deadlines arm a reconciler timer; expiry
+      rebuilds and reselects without waiting for an external event;
+      no expired credential enters `OrgProofIntent`.
+- [ ] The registration wire is the pinned appended 0x0C02 organization
+      variants; legacy variants never enter an organization-derived
+      audience; mixed-version refusal degrades to Unknown and
+      deterministic routing, never an invocation failure.
 - [ ] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
