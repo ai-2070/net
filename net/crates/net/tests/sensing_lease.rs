@@ -209,6 +209,54 @@ async fn overcap_rolls_back_and_does_not_wedge_the_lease() {
         .contains(&DownstreamId::Local));
 }
 
+/// A registration refused against a cached provider floor (the distinct
+/// `RegisterOutcome::RefusedByCachedFloor` branch, not `OverCap`) fails the
+/// acquisition, rolls the holder back leaving no lease entry, and — once the
+/// floor relaxes — the same key registers cleanly.
+#[tokio::test]
+async fn below_floor_acquire_is_refused_rolled_back_and_recovers() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+    let lease_key = SensingLeaseKey::ExactProvider {
+        audience: spec.audience,
+        interest_digest: spec.interest_digest(),
+        provider: PROVIDER,
+    };
+    let floor = Duration::from_millis(150);
+
+    // A cached provider floor is in place (as a live refusal would leave it).
+    node.install_sensing_cached_floor_for_test(&spec, PROVIDER, floor);
+
+    // Acquiring below the floor is refused; the acquisition rolls back and
+    // leaves no lease entry — a refused registration never counts as
+    // installed.
+    let err = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect_err("below the cached floor");
+    assert!(
+        matches!(
+            err,
+            SensingRegistrationError::RefusedByFloor { minimum_supported } if minimum_supported == floor
+        ),
+        "got {err:?}"
+    );
+    assert!(
+        node.sensing_lease_entry_for_test(&lease_key).is_none(),
+        "the refused acquire left no lease entry"
+    );
+
+    // Relax the floor; the same acquire now installs a real registration.
+    node.clear_sensing_cached_floor_for_test(&spec, PROVIDER);
+    let _t = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("recovers once the floor relaxes");
+    assert!(node
+        .sensing_downstreams(&key)
+        .contains(&DownstreamId::Local));
+    assert!(node.sensing_lease_entry_for_test(&lease_key).is_some());
+}
+
 /// Releasing a ticket twice is a harmless no-op (the SDK guard's drop
 /// must be idempotent against an explicit close).
 #[tokio::test]

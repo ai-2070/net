@@ -7647,6 +7647,34 @@ impl MeshNode {
         self.sensing_interest_leases.entry_for_test(key)
     }
 
+    /// Test seam (OLB-0 §4.3): install a cached provider floor for an exact
+    /// interest, as a live provider refusal would, so a lease acquire below
+    /// the floor is refused with
+    /// [`sensing::RegisterOutcome::RefusedByCachedFloor`] without driving the
+    /// refusal protocol.
+    #[doc(hidden)]
+    pub fn install_sensing_cached_floor_for_test(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        floor: Duration,
+    ) {
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        self.sensing_interest_table
+            .lock()
+            .set_cached_floor_for_test(&key, floor);
+    }
+
+    /// Test seam (OLB-0 §4.3): clear a cached provider floor for an exact
+    /// interest (as a floor relaxation would).
+    #[doc(hidden)]
+    pub fn clear_sensing_cached_floor_for_test(&self, spec: &sensing::InterestSpec, provider: u64) {
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        self.sensing_interest_table
+            .lock()
+            .clear_cached_floor_for_test(&key);
+    }
+
     /// Install the sensing-leader role on this node (plan §4.1),
     /// enabling the leader-addressed `CapabilityRegistration` intake
     /// on the 0x0C02 dispatch arm. Built from this node's config

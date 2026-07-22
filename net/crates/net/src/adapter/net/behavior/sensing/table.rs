@@ -447,6 +447,33 @@ impl InterestTable {
             .and_then(|entry| entry.refused_minimum)
     }
 
+    /// Test seam: install a cached provider floor for `key` (as a live
+    /// provider refusal would), creating a floor-only entry if none exists —
+    /// so a late joiner below `floor` is refused
+    /// ([`RegisterOutcome::RefusedByCachedFloor`]) without driving the real
+    /// provider-refusal protocol.
+    #[doc(hidden)]
+    pub fn set_cached_floor_for_test(&mut self, key: &ProviderInterestKey, floor: Duration) {
+        self.entries
+            .entry(key.clone())
+            .or_insert_with(|| InterestEntry {
+                upstream_continuity: Continuity::Unestablished,
+                refused_minimum: None,
+                last_advertised: None,
+                downstreams: HashMap::new(),
+            })
+            .refused_minimum = Some(floor);
+    }
+
+    /// Test seam: clear a cached provider floor for `key` (as a floor
+    /// relaxation / provider incarnation change would), leaving the entry.
+    #[doc(hidden)]
+    pub fn clear_cached_floor_for_test(&mut self, key: &ProviderInterestKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.refused_minimum = None;
+        }
+    }
+
     /// Live downstream ids for a key (delivery fan-out, SI-0f).
     pub fn downstreams(&self, key: &ProviderInterestKey, now: Instant) -> Vec<DownstreamId> {
         self.entries
