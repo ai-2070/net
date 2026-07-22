@@ -204,6 +204,7 @@ fn seed_host(
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
             metadata: BTreeMap::new(),
+            owner: None,
         },
     )
     .expect("sign host capability");
