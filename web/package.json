@@ -64,7 +64,7 @@
     "@types/mdx": "2.0.14",
     "axios": "1.18.1",
     "axios-retry": "4.5.0",
-    "better-auth": "1.6.23",
+    "better-auth": "1.6.24",
     "cache-manager": "7.2.9",
     "cacheable": "2.5.0",
     "class-variance-authority": "0.7.1",
