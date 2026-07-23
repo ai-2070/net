@@ -248,7 +248,7 @@ bytes = "1"
 quanta = "0.12"
 
 # Base64 encoding for cursors
-base64 = "0.22"
+base64 = "0.23"
 
 # Async utilities
 async-trait = "0.1"

@@ -52,7 +52,7 @@ thiserror = "2"
 # x402 carries are byte-preserved originals; envelopes transport them
 # base64-encoded so no binding can accidentally re-serialize JSON
 # through its own encoder (the envelope-drift bug class).
-base64 = "0.22"
+base64 = "0.23"
 # terms_hash / verification-chain links / idempotency keys — blake3
 # is the established content hash in this workspace (dataforts,
 # delegation child-seed KDF).

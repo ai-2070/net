@@ -214,7 +214,7 @@ net-payments = { version = "0.34.0", path = "../../payments", optional = true, f
 # The outbound HTTP-402 client base64-encodes the byte-preserved settlement
 # response for audit. Optional + `payments-http`-gated (already in the lock via
 # net-payments).
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 # `napi` (runtime) and `napi-derive` MUST move in lockstep: napi-derive
