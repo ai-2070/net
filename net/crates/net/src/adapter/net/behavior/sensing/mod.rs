@@ -48,7 +48,18 @@ pub mod evaluator;
 pub mod frames;
 pub mod identity;
 pub mod incarnation;
+// OLB-0 / S0 §4.3: the node-global sensing-interest lease registry
+// (refcount + cadence aggregation). Pure — the node performs the
+// register/deregister the actions describe. Stale/foreign-token releases are
+// no-ops by the node-global monotonic token mint, NOT a receiver-enforced
+// installation-generation guard — that guard is explicitly deferred (see the
+// `sensing_lease_apply_mu` field docs on `MeshNode`).
+pub mod lease;
 pub mod negotiation;
+// OLB org-auth slice (commit 2): the organization-authenticated sensing
+// registration authority gate — one transaction, attacker-controlled frame →
+// narrow validated object → validated-object-only mutation.
+pub mod org_gate;
 // The rendezvous REUSES the RedEX election (plan §4.1, review 6) —
 // the reuse is real, not copied, so the module rides the `redex`
 // feature. SI-2 revisits the final layering.
@@ -63,7 +74,20 @@ pub mod table;
 pub mod wire;
 
 pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
+pub use lease::{
+    LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey, SensingLeaseTicket,
+};
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
+pub use org_gate::{
+    canonical_org_sensing_commitment, verify_org_sensing_registration, OrgSensingRejection,
+    ValidatedOrgSensingRegistration,
+};
+pub(crate) use org_gate::{
+    capture_current_sensing_stamp, capture_live_org_relay_membership,
+    capture_sensing_authority_snapshot, plan_provider_continuation, AdmittedSensingRegistration,
+    LiveOrgRelayMembership, RegistrationAuthority, RegistrationLeg, RelayMembershipUnavailable,
+    SensingAuthoritySnapshot, SensingAuthorityUnavailable,
+};
 #[cfg(feature = "redex")]
 pub use rendezvous::{
     closeness_score, sensing_leader, FrameRejection, LeaderReconciliation, LeaderRefusalPartition,

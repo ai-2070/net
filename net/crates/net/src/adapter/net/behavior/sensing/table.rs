@@ -46,7 +46,20 @@ use super::identity::{AudienceScopeCommitment, Digest256, ProviderInterestKey};
 pub enum DownstreamId {
     /// This node's own application-level interest (the `LOCAL` row
     /// in plan §4.3) — deliveries feed the node's consumer overlay.
+    /// Installed by the DIRECT
+    /// [`register_sensing_interest`](crate::adapter::net::MeshNode::register_sensing_interest)
+    /// API only.
     Local,
+    /// A node-global interest-LEASE row (OLB-0): the coalesced demand of the
+    /// node's lease holders, installed exclusively through
+    /// [`acquire_sensing_interest_lease`](crate::adapter::net::MeshNode::acquire_sensing_interest_lease).
+    /// Behaves identically to [`Self::Local`] for delivery/overlay/refusal —
+    /// it is a node-local interest — but is a DISTINCT table slot so the lease
+    /// lifecycle (acquire / release / acquire-failure rollback) can only ever
+    /// touch lease-owned rows. Without this separation a rolled-back lease
+    /// acquire would deregister a `Local` row a direct registration installed
+    /// for the same `(interest, provider)` (review §1).
+    LeasedLocal,
     /// The node's OWN sensing-leader role's coalesced demand (SI-4
     /// review P0): deliveries feed `SensingLeader::on_attestation`,
     /// which fans the proof to the leader's real consumer rows.
@@ -175,6 +188,31 @@ impl InterestTable {
                 .values()
                 .filter(|row| row.expires_at > now)
                 .map(|row| row.requested_sample_interval)
+                .min()
+        })
+    }
+
+    /// The single authoritative LOCAL-consumer demand projection for a branch:
+    /// the strictest (minimum) sample interval across this node's live
+    /// node-local rows — the direct [`DownstreamId::Local`] and the leased
+    /// [`DownstreamId::LeasedLocal`]. The shared consumer overlay cell must
+    /// re-anchor to THIS aggregate on every mutation, never to the latest
+    /// registering/delivering row's own interval (review L1 follow-up): the two
+    /// ownership rows are distinct table slots but feed ONE consumer cell.
+    /// `None` when no live node-local row exists (the branch may still be kept
+    /// alive by a peer or leader row, which must not leave a ghost consumer cell).
+    pub fn local_consumer_interval(
+        &self,
+        key: &ProviderInterestKey,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.entries.get(key).and_then(|entry| {
+            entry
+                .downstreams
+                .iter()
+                .filter(|(id, _)| matches!(id, DownstreamId::Local | DownstreamId::LeasedLocal))
+                .filter(|(_, row)| row.expires_at > now)
+                .map(|(_, row)| row.requested_sample_interval)
                 .min()
         })
     }
@@ -445,6 +483,33 @@ impl InterestTable {
         self.entries
             .get(key)
             .and_then(|entry| entry.refused_minimum)
+    }
+
+    /// Test seam: install a cached provider floor for `key` (as a live
+    /// provider refusal would), creating a floor-only entry if none exists —
+    /// so a late joiner below `floor` is refused
+    /// ([`RegisterOutcome::RefusedByCachedFloor`]) without driving the real
+    /// provider-refusal protocol.
+    #[doc(hidden)]
+    pub fn set_cached_floor_for_test(&mut self, key: &ProviderInterestKey, floor: Duration) {
+        self.entries
+            .entry(key.clone())
+            .or_insert_with(|| InterestEntry {
+                upstream_continuity: Continuity::Unestablished,
+                refused_minimum: None,
+                last_advertised: None,
+                downstreams: HashMap::new(),
+            })
+            .refused_minimum = Some(floor);
+    }
+
+    /// Test seam: clear a cached provider floor for `key` (as a floor
+    /// relaxation / provider incarnation change would), leaving the entry.
+    #[doc(hidden)]
+    pub fn clear_cached_floor_for_test(&mut self, key: &ProviderInterestKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.refused_minimum = None;
+        }
     }
 
     /// Live downstream ids for a key (delivery fan-out, SI-0f).
