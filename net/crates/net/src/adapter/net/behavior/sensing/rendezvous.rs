@@ -408,12 +408,8 @@ impl SensingLeader {
     /// resolution or table mutation ([`ResolutionRefusal::AdmittedLegMismatch`]),
     /// so a caller can never admit one leg then register under a different
     /// downstream or table timing. The seed's authority provenance (org vs legacy)
-    /// is preserved into the [`LeaderInterest`].
-    ///
-    /// Piece 4 consumes this method when organization dispatch is lit atomically;
-    /// until then only the in-crate witnesses exercise it, hence the
-    /// `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// is preserved into the [`LeaderInterest`]. The org `OrgCapabilityRegistration`
+    /// dispatch (piece 4) is the live consumer.
     pub(crate) fn register_admitted_capability_interest(
         &mut self,
         admitted: &AdmittedSensingRegistration,
