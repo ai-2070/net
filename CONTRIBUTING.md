@@ -13,6 +13,12 @@ the [Apache License 2.0](LICENSE) without ambiguity about provenance.
 license grant, not an assignment — you may reuse your own work anywhere else,
 for any purpose.
 
+**Code released under Apache-2.0 stays under Apache-2.0, permanently.** That
+grant is irrevocable: every published version remains available under those
+terms, and anyone may fork from the last released commit at any time. A change
+of license affecting future development could not reach back and withdraw what
+has already shipped.
+
 | You are… | Sign |
 | --- | --- |
 | An individual contributing on your own behalf | [Individual CLA](CLA/individual-cla.md) |
