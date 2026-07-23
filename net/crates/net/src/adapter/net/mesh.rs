@@ -3772,6 +3772,93 @@ const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// SI-4 review P0: fan one batch of leader-relay deliveries out to
 /// the REAL destinations. The leader's relay works on semantic
+/// Review L1 narrow-hold: reconcile a branch's shared LOCAL consumer cell to the
+/// authoritative local-demand projection
+/// ([`sensing::InterestTable::local_consumer_interval`]) after ANY table mutation
+/// that can remove or partition a node-local row — re-anchor a surviving cell to
+/// the strictest survivor (`Some`), or drop it when no live local row remains
+/// (`None`). This projection is the SOLE local-liveness classifier; no call site
+/// re-derives `Local`/`LeasedLocal` ownership, so the two rows can never drift.
+fn reconcile_local_consumer_cell(
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    overlay: &tokio::sync::watch::Sender<u64>,
+    key: &sensing::ProviderInterestKey,
+    now: Instant,
+) {
+    let aggregate = table.lock().local_consumer_interval(key, now);
+    if observations
+        .lock()
+        .reconcile_consumer_interval(key, aggregate)
+    {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+/// Review L1 narrow-hold: the PERIODIC materialized-branch reconciliation. For
+/// every branch the observation store tracks that is not backed by a live
+/// (solicited) capability interest: drop the whole branch if no downstream row
+/// remains, else reconcile its shared consumer cell to the authoritative local
+/// projection ([`sensing::InterestTable::local_consumer_interval`]) — re-anchor a
+/// surviving cell to the strictest live local row (Local OR LeasedLocal), or drop
+/// a cell with no live local row. This is the SOLE local-liveness classifier in
+/// the sweep; it never re-derives Local-only liveness (which deleted lease-only
+/// cells and never relaxed a survivor). Also picks up expiry: an expired local
+/// row is excluded from `local_consumer_interval`, so the surviving aggregate
+/// relaxes here on the next tick.
+fn reconcile_materialized_consumer_cells(
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    overlay: &tokio::sync::watch::Sender<u64>,
+    live_interests: &std::collections::HashSet<sensing::CapabilityInterestKey>,
+    now: Instant,
+) {
+    let branch_keys: std::collections::HashSet<sensing::ProviderInterestKey> = {
+        let observations = observations.lock();
+        observations
+            .latest
+            .keys()
+            .chain(observations.upstream.keys())
+            .chain(observations.consumer_cells.keys())
+            .chain(observations.slots.keys().map(|(branch, _)| branch))
+            .cloned()
+            .collect()
+    };
+    let mut dead_branches = Vec::new();
+    let mut reconcile: Vec<(sensing::ProviderInterestKey, Option<Duration>)> = Vec::new();
+    {
+        let table = table.lock();
+        for key in branch_keys {
+            if live_interests.contains(&key.interest) {
+                continue;
+            }
+            if table.downstreams(&key, now).is_empty() {
+                // No watch, no rows: nothing justifies ANY of the branch's state.
+                dead_branches.push(key);
+                continue;
+            }
+            reconcile.push((key.clone(), table.local_consumer_interval(&key, now)));
+        }
+    }
+    if dead_branches.is_empty() && reconcile.is_empty() {
+        return;
+    }
+    let mut overlay_moved = false;
+    {
+        let mut observations = observations.lock();
+        for key in dead_branches {
+            overlay_moved |= observations.consumer_cells.contains_key(&key);
+            observations.reclaim_branch(&key);
+        }
+        for (key, aggregate) in reconcile {
+            overlay_moved |= observations.reconcile_consumer_interval(&key, aggregate);
+        }
+    }
+    if overlay_moved {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
 /// attestations; the wire form is this hop's latest cache — matched
 /// on (incarnation, seq) so a torn race skips (the next beat
 /// repairs) and "relays forward identical signed bytes" holds for
@@ -6927,6 +7014,16 @@ impl MeshNode {
                             downstream,
                             now,
                         );
+                        // Review L1 narrow-hold: the rollback removed the row this
+                        // registration eagerly anchored a consumer cell for —
+                        // reconcile the cell (dropped when no local row survives).
+                        reconcile_local_consumer_cell(
+                            &self.sensing_interest_table,
+                            &self.sensing_observations,
+                            &self.sensing_overlay_changed,
+                            &key,
+                            now,
+                        );
                         return Err(SensingRegistrationError::AtCapacity);
                     }
                     Some(sensing::StreamRefusal::Cadence(refusal)) => {
@@ -6965,6 +7062,16 @@ impl MeshNode {
                             }
                         }
                         self.sensing_emitter_notify.notify_one();
+                        // Review L1 narrow-hold: the refusal partition may have
+                        // removed a local row — reconcile the shared consumer cell
+                        // to the surviving aggregate (or drop it).
+                        reconcile_local_consumer_cell(
+                            &self.sensing_interest_table,
+                            &self.sensing_observations,
+                            &self.sensing_overlay_changed,
+                            &key,
+                            now,
+                        );
                         return Ok(sensing::RegisterOutcome::RefusedByCachedFloor {
                             minimum_supported: refusal.minimum_supported,
                         });
@@ -7819,6 +7926,28 @@ impl MeshNode {
             .consumer_cells
             .get(key)
             .map(|cell| cell.own_interval())
+    }
+
+    /// Test seam (review L1 narrow-hold): run ONE periodic materialized-branch
+    /// consumer-cell reconciliation at `now` — the production maintenance sweep's
+    /// cell-lifecycle pass, in isolation. Witnesses drive lease-only survival and
+    /// expiry relax-back deterministically by passing a synthetic `now` past a
+    /// row's expiry, without racing the real maintenance cadence.
+    #[doc(hidden)]
+    pub fn run_sensing_consumer_cell_sweep_for_test(&self, now: Instant) {
+        let live_interests: std::collections::HashSet<sensing::CapabilityInterestKey> = self
+            .sensing_capability_interests
+            .lock()
+            .keys()
+            .cloned()
+            .collect();
+        reconcile_materialized_consumer_cells(
+            &self.sensing_interest_table,
+            &self.sensing_observations,
+            &self.sensing_overlay_changed,
+            &live_interests,
+            now,
+        );
     }
 
     /// Install the sensing-leader role on this node (plan §4.1),
@@ -14702,77 +14831,13 @@ impl MeshNode {
                                     });
                                 interests.keys().cloned().collect()
                             };
-                            let branch_keys: std::collections::HashSet<
-                                sensing::ProviderInterestKey,
-                            > = {
-                                let observations = sensing_observations.lock();
-                                observations
-                                    .latest
-                                    .keys()
-                                    .chain(observations.upstream.keys())
-                                    .chain(observations.consumer_cells.keys())
-                                    .chain(
-                                        observations
-                                            .slots
-                                            .keys()
-                                            .map(|(branch, _)| branch),
-                                    )
-                                    .cloned()
-                                    .collect()
-                            };
-                            let mut dead_branches = Vec::new();
-                            let mut dead_cells = Vec::new();
-                            {
-                                let table = sensing_interest_table.lock();
-                                for key in branch_keys {
-                                    if live_interests.contains(&key.interest) {
-                                        continue;
-                                    }
-                                    if table.downstreams(&key, poll_now).is_empty() {
-                                        // No watch, no rows: nothing
-                                        // justifies ANY of the
-                                        // branch's state.
-                                        dead_branches.push(key);
-                                        continue;
-                                    }
-                                    let local_live = table
-                                        .downstream_entry(
-                                            &key,
-                                            sensing::DownstreamId::Local,
-                                        )
-                                        .is_some_and(|row| {
-                                            row.expires_at > poll_now
-                                        });
-                                    if !local_live {
-                                        // Relay duty continues; only
-                                        // the local consumer view
-                                        // lost its justification.
-                                        dead_cells.push(key);
-                                    }
-                                }
-                            }
-                            if !dead_branches.is_empty() || !dead_cells.is_empty() {
-                                let mut projection_dropped = false;
-                                let mut observations = sensing_observations.lock();
-                                for key in dead_branches {
-                                    projection_dropped |= observations
-                                        .consumer_cells
-                                        .contains_key(&key);
-                                    observations.reclaim_branch(&key);
-                                }
-                                for key in dead_cells {
-                                    projection_dropped |= observations
-                                        .consumer_cells
-                                        .remove(&key)
-                                        .is_some();
-                                }
-                                drop(observations);
-                                if projection_dropped {
-                                    sensing_overlay_changed.send_modify(|generation| {
-                                        *generation = generation.wrapping_add(1);
-                                    });
-                                }
-                            }
+                            reconcile_materialized_consumer_cells(
+                                &sensing_interest_table,
+                                &sensing_observations,
+                                &sensing_overlay_changed,
+                                &live_interests,
+                                poll_now,
+                            );
                         }
 
                         // Bound the ack-ranges capability-gate cache
@@ -17674,6 +17739,15 @@ impl MeshNode {
                     downstream,
                     now,
                 );
+                // Review L1 narrow-hold: reconcile the shared consumer cell after
+                // the capacity rollback removed the row.
+                reconcile_local_consumer_cell(
+                    &ctx.sensing_interest_table,
+                    &ctx.sensing_observations,
+                    &ctx.sensing_overlay_changed,
+                    key,
+                    now,
+                );
                 tracing::debug!(
                     digest = ?key.interest.interest_digest,
                     "sensing: origin at live-stream capacity, registration rolled back"
@@ -17745,6 +17819,16 @@ impl MeshNode {
         }
         #[cfg(not(feature = "redex"))]
         let _ = signed_refusal;
+        // Review L1 narrow-hold: the origin-hop refusal partition may have removed
+        // a local row — reconcile the shared consumer cell to the surviving
+        // aggregate (or drop it).
+        reconcile_local_consumer_cell(
+            &ctx.sensing_interest_table,
+            &ctx.sensing_observations,
+            &ctx.sensing_overlay_changed,
+            key,
+            now,
+        );
     }
 
     /// SI-3c: the 0x0C03 verified intake (plan §4.2/§4.6) — the
@@ -18152,6 +18236,16 @@ impl MeshNode {
             ctx.sensing_observations
                 .lock()
                 .update_upstream_interval(&branch, aggregate);
+            // Review L1 narrow-hold: the refusal partition may have removed a
+            // local row while the branch survives — reconcile the shared consumer
+            // cell to the surviving local aggregate (or drop it).
+            reconcile_local_consumer_cell(
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                &branch,
+                now,
+            );
             return;
         }
         // SI-4a: the frozen SI-0f relay semantics on real sessions.

@@ -16,11 +16,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use net::adapter::net::behavior::sensing::{
     AudienceScopeCommitment, CanonicalConstraints, CapabilityId, DisclosureClass, DownstreamId,
-    InterestSpec, ProviderInterestKey, ProviderSelector, ResultMode, SensingLeaseKey,
+    Incarnation, InterestSpec, ProviderInterestKey, ProviderSelector, ResultMode, SensingLeaseKey,
     WorkLatencyEnvelope,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SensingRegistrationError};
@@ -531,4 +531,125 @@ async fn shared_consumer_cadence_is_order_independent() {
     node.release_sensing_interest_lease(lease);
     node.deregister_sensing_interest(&spec, PROVIDER);
     assert!(node.sensing_table_is_empty());
+}
+
+/// L1 narrow-hold Finding 1: a LEASE-ONLY consumer cell (no direct `Local` row)
+/// SURVIVES the periodic materialized-branch sweep and keeps its lease cadence —
+/// the normal org-routing shape. RED-coupled: the prior `Local`-only liveness
+/// check in the sweep deleted this cell.
+#[tokio::test]
+async fn lease_only_consumer_cell_survives_the_sweep() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    let _lease = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("lease acquire");
+    assert_eq!(
+        node.sensing_downstreams(&key),
+        vec![DownstreamId::LeasedLocal],
+        "only the leased row exists — no direct Local row"
+    );
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT)
+    );
+
+    // Drive one production materialized-branch sweep.
+    node.run_sensing_consumer_cell_sweep_for_test(Instant::now());
+
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "the lease-only consumer cell survives the sweep at the lease cadence"
+    );
+}
+
+/// L1 narrow-hold: when a stricter `LeasedLocal` row EXPIRES while a looser
+/// direct `Local` row survives, the periodic sweep relaxes the shared consumer
+/// cell to the survivor's cadence — `local_consumer_interval` excludes the
+/// expired row — never leaving it at the stale strict cadence. Driven with a
+/// synthetic sweep instant to avoid racing real time.
+#[tokio::test]
+async fn expired_lease_row_relaxes_consumer_cell_to_surviving_direct() {
+    let ttl = Duration::from_millis(200);
+    let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), PSK)
+        .with_sensing_coalescing(true)
+        .with_sensing_interest_ttl(ttl);
+    let node = node_with(cfg).await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    let t = Instant::now();
+    // Lease (50 ms) acquired FIRST → LeasedLocal expires ≈ t + ttl.
+    let _lease = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("lease acquire");
+    // A real gap, then the direct row (100 ms) → Local expires ≈ t + gap + ttl,
+    // OUTLIVING the lease row.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    node.register_sensing_interest(&spec, PROVIDER, D, ttl)
+        .expect("direct registration");
+    // Both live now → the cell carries the aggregate (50 ms).
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT)
+    );
+
+    // Sweep at a synthetic `now` AFTER the lease expiry (≈ t+200 ms) but BEFORE
+    // the direct's (≈ t+230 ms): the lease row is excluded from the projection,
+    // so the cell relaxes to the direct row's 100 ms.
+    node.run_sensing_consumer_cell_sweep_for_test(t + ttl + Duration::from_millis(15));
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(D),
+        "the surviving direct row relaxes the consumer cell to 100 ms after the lease row expires"
+    );
+}
+
+/// L1 narrow-hold: a REFUSAL PARTITION that removes the stricter local row while
+/// a looser one survives re-anchors the shared consumer cell to the survivor —
+/// the origin-refusal path is reconciled like every other local-row-removing
+/// mutation. A self-provider branch, an origin cadence floor of 75 ms: the direct
+/// 100 ms row is above it, the 50 ms lease is below → the partition removes the
+/// lease row, keeps the direct row, and the cell re-anchors to 100 ms.
+#[tokio::test]
+async fn refusal_partition_reanchors_consumer_cell_to_surviving_direct() {
+    let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), PSK)
+        .with_sensing_coalescing(true)
+        .with_sensing_incarnation(Incarnation::new(1))
+        .with_attestation_cadence_floor(Duration::from_millis(75))
+        .with_max_interests_per_peer(1024);
+    let node = node_with(cfg).await;
+    let self_id = node.node_id(); // self-provider → the origin emitter gates cadence
+    let spec = spec_for(node.sensing_local_root(), self_id);
+    let key = ProviderInterestKey::new(spec.key(), self_id);
+
+    // Direct Local at 100 ms ≥ the 75 ms floor → accepted, cell at 100 ms.
+    node.register_sensing_interest(&spec, self_id, D, Duration::from_secs(30))
+        .expect("direct 100ms is above the cadence floor");
+    assert_eq!(node.sensing_consumer_cell_interval_for_test(&key), Some(D));
+
+    // A lease at 50 ms drops the aggregate below the floor; the origin refusal
+    // partitions the branch — removing the 50 ms lease row, keeping the 100 ms
+    // direct row.
+    let err = node
+        .acquire_sensing_interest_lease(&spec, self_id, STRICT)
+        .expect_err("50ms is below the cadence floor");
+    assert!(
+        matches!(err, SensingRegistrationError::RefusedByFloor { .. }),
+        "got {err:?}"
+    );
+
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::Local),
+        "the direct row survives the refusal partition"
+    );
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(D),
+        "the refusal partition removed the lease row; the cell re-anchored to the surviving direct 100 ms"
+    );
 }
