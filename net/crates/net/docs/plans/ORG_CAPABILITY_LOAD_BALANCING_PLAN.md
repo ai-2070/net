@@ -36,9 +36,12 @@ The slice closes the explicit-fleet-root cross-authority coalescence class:
 legacy sensing intake rejects an organization-derived audience when authority is
 installed, and authority installation (runtime and configured startup) is
 refused over an explicit fleet root equal to the org's canonical sensing
-commitment. Three-node transport witnesses (consumer → relay → provider, relay
-emits under its own live cert, no legacy fallback) remain the next slice; the
-reserved full-range ultrareview waits until that transport proof lands.
+commitment. The three-node transport witness (consumer → relay → provider, relay
+emits under its own live cert, no legacy fallback) **landed** as Piece 5
+(`tests/sensing_org_three_node.rs`, `9865aa40e` + CI-integration closure). The
+reserved full-range ultrareview is **ready after Piece 5 review closure**. The
+global `SAFE_LIVE_HEAD` stays reserved because `OrgCapabilityRegistration`
+remains dark.
 
 v0.3 applied Kyra's performance ruling (2026-07-22):
 the public product shape was confirmed simple enough; the

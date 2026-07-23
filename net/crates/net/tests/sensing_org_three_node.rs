@@ -13,10 +13,10 @@
 //! so a `Peer(B)` row carrying `owner_root == canonical_org_sensing_commitment`
 //! can exist ONLY if B sent a fresh org frame vouched by B's own certificate:
 //!
-//!   * B forwards A's cert            → C: SenderMemberMismatch → no row
+//!   * B forwards A's cert → C: SenderMemberMismatch → no row
 //!   * B downgrades to a legacy frame → C: an entity/fleet root, never the org
-//!                                      commitment (domain-separated) → assert fails
-//!   * B's membership is unprovable   → B emits nothing (no fallback) → no row
+//!     commitment (domain-separated) → assert fails
+//!   * B's membership is unprovable → B emits nothing (no fallback) → no row
 //!
 //! The B-side row (`Peer(A)`, same org root) additionally shows A's leg was
 //! admitted under A's cert and B's upstream leg is a distinct re-authoring, not
@@ -71,23 +71,38 @@ fn org() -> OrgKeypair {
     OrgKeypair::from_bytes([0x42u8; 32])
 }
 
-fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("net-olb-piece5-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// An RAII scratch authority directory: created on construction, removed on
+/// drop. The live `OrgRevocationStore` is backed by this dir, so the guard is
+/// held for the whole test and cleaned up afterward (no PID-named residue).
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("net-olb-piece5-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Adopt `node` into `org()` (real ceremony, tempdir authority) and install the
 /// authority as the production object — so this node can VERIFY inbound org
-/// registrations AND vouch for its own re-authoring.
-async fn adopt_and_install(node: &Arc<MeshNode>, tag: &str) {
+/// registrations AND vouch for its own re-authoring. Returns the RAII directory
+/// guard; the caller holds it for the test's lifetime.
+async fn adopt_and_install(node: &Arc<MeshNode>, tag: &str) -> ScratchDir {
+    let dir = ScratchDir::new(tag);
     let cert = OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600)
         .expect("issue cert");
-    let authority =
-        NodeAuthority::adopt(&scratch_dir(tag), cert, node.entity_id(), 0, None).expect("adopt");
+    let authority = NodeAuthority::adopt(&dir.0, cert, node.entity_id(), 0, None).expect("adopt");
     node.install_node_authority(Arc::new(authority))
         .expect("install authority");
+    dir
 }
 
 /// A node-targeted org interest whose audience is the canonical org commitment
@@ -153,8 +168,10 @@ async fn relay_reauthors_org_provider_under_its_own_membership() {
         .await
         .expect("MeshNode::new C"),
     );
-    adopt_and_install(&b, "relay").await;
-    adopt_and_install(&c, "provider").await;
+    // Held for the whole test: the live revocation stores are backed by these
+    // dirs, and dropping the guards at the end removes them.
+    let _b_dir = adopt_and_install(&b, "relay").await;
+    let _c_dir = adopt_and_install(&c, "provider").await;
 
     // Line links only: A—B and B—C. A never touches C.
     connect_pair(&a, &b).await;
@@ -242,5 +259,8 @@ async fn relay_reauthors_org_provider_under_its_own_membership() {
         "C counts no scope refusals — the org frame never took the legacy scope path",
     );
 
+    // Stop the refresh loop and await the cancellation so the task is fully
+    // torn down before the nodes (and the RAII authority dirs) drop.
     refresh_a.abort();
+    let _ = refresh_a.await;
 }
