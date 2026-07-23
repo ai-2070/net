@@ -654,21 +654,47 @@ async fn refusal_partition_reanchors_consumer_cell_to_surviving_direct() {
     );
 }
 
+/// Bounded deterministic wait for the projection-contention signal: the flag is
+/// set ONLY by the production `try_lock` observing the mutex held, so waiting
+/// for it proves the rival's actual lock attempt hit the open transaction —
+/// never a scheduler-dependent timeout inference (review round 4).
+#[cfg(feature = "fixtures")]
+fn await_contention(flag: &std::sync::atomic::AtomicBool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the rival never observed projection-mutex contention"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// L1 linearization (review round 3, interleaving 1): a concurrent direct
 /// registration and lease acquire cannot last-writer the shared consumer cell.
 /// A installs Direct 100 ms and PAUSES inside its projection transaction (table
 /// mutated, aggregate captured, apply pending); B's LeasedLocal 50 ms acquire
-/// must serialize BEHIND the transaction — it provably blocks — and the final
-/// state is the true aggregate. RED-coupled: without the projection mutex, B
-/// completes during A's pause and A's resumed apply overwrites the cell with
-/// its stale 100 ms capture.
+/// OBSERVES the held mutex (the production `try_lock` contention signal — not a
+/// timeout inference) and serializes behind it; the final state is the true
+/// aggregate. RED-coupled: without the projection mutex the contention signal
+/// never fires (B's `try_lock` succeeds) and the witness fails.
+#[cfg(feature = "fixtures")]
 #[tokio::test]
 async fn concurrent_direct_and_lease_registration_linearizes_the_consumer_cadence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Barrier};
 
     let node = sensing_node().await;
     let spec = spec_for(node.sensing_local_root(), PROVIDER);
     let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // The production-side contention observer: set ONLY when a registration's
+    // try_lock finds the projection mutex held.
+    let contended = Arc::new(AtomicBool::new(false));
+    let hook_flag = contended.clone();
+    node.set_sensing_projection_contention_hook_for_test(Some(Arc::new(move || {
+        hook_flag.store(true, Ordering::SeqCst);
+    })));
 
     let paused = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
@@ -694,6 +720,8 @@ async fn concurrent_direct_and_lease_registration_linearizes_the_consumer_cadenc
             .expect("direct registration");
     });
     paused.wait(); // A's transaction is open: mutation done, apply pending.
+                   // A's own (uncontended) acquisition must not have fired the signal.
+    assert!(!contended.load(Ordering::SeqCst));
 
     // B: a stricter lease acquire racing A.
     let b_node = node.clone();
@@ -705,13 +733,12 @@ async fn concurrent_direct_and_lease_registration_linearizes_the_consumer_cadenc
         b_done_tx.send(()).expect("send done");
         ticket
     });
-    // B must NOT complete inside A's open transaction (bounded wait, not sleep).
+    // Deterministic: B's ACTUAL lock attempt observed A's open transaction…
+    await_contention(&contended, "registration race");
+    // …and with A still paused (the mutex still held), B cannot have completed.
     assert!(
-        matches!(
-            b_done_rx.recv_timeout(Duration::from_millis(150)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "the rival lease acquire completed inside A's projection transaction"
+        matches!(b_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "the rival lease acquire completed despite observing the held transaction"
     );
 
     release.wait(); // A applies its captured aggregate and returns.
@@ -746,13 +773,15 @@ async fn concurrent_direct_and_lease_registration_linearizes_the_consumer_cadenc
 /// L1 linearization (review round 3, interleaving 2): the maintenance sweep
 /// cannot apply a stale "no live local row" snapshot over a lease the rival
 /// refreshed concurrently. The sweep pauses inside its projection transaction
-/// with a stale verdict pending; the refresh acquire provably blocks behind it;
-/// after both complete, the refreshed row is live AND its consumer cell exists
-/// at the refreshed cadence. RED-coupled: without the mutex the refresh
-/// completes during the pause and the sweep's stale application erases the
-/// fresh cell (live row, no consumer projection — the org-routing shape).
+/// with a stale verdict pending; the refresh acquire's ACTUAL lock attempt (the
+/// lease registration path's own `try_lock`, not an adjacent probe) observes the
+/// held mutex and serializes behind it; after both complete, the refreshed row
+/// is live AND its consumer cell exists at the refreshed cadence. RED-coupled:
+/// without the mutex the contention signal never fires and the witness fails.
+#[cfg(feature = "fixtures")]
 #[tokio::test]
 async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Barrier};
 
     let ttl = Duration::from_millis(200);
@@ -769,6 +798,15 @@ async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
         .acquire_sensing_interest_lease(&spec, PROVIDER, D)
         .expect("first acquire");
     assert_eq!(node.sensing_consumer_cell_interval_for_test(&key), Some(D));
+
+    // The production-side contention observer, threaded through the LEASE
+    // registration path: it fires only when R's own registration hits the held
+    // projection mutex.
+    let contended = Arc::new(AtomicBool::new(false));
+    let hook_flag = contended.clone();
+    node.set_sensing_projection_contention_hook_for_test(Some(Arc::new(move || {
+        hook_flag.store(true, Ordering::SeqCst);
+    })));
 
     let paused = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
@@ -789,6 +827,7 @@ async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
         );
     });
     paused.wait(); // the sweep's stale snapshot is pending application.
+    assert!(!contended.load(Ordering::SeqCst));
 
     // R: a stricter refresh acquire racing the sweep.
     let r_node = node.clone();
@@ -800,12 +839,13 @@ async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
         r_done_tx.send(()).expect("send done");
         ticket
     });
+    // Deterministic: R's lease registration observed the sweep's open
+    // transaction…
+    await_contention(&contended, "sweep/refresh race");
+    // …and with the sweep still paused, R cannot have completed.
     assert!(
-        matches!(
-            r_done_rx.recv_timeout(Duration::from_millis(150)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "the lease refresh completed inside the sweep's projection transaction"
+        matches!(r_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "the lease refresh completed despite observing the held transaction"
     );
 
     release.wait(); // the sweep applies its verdict FIRST, then R proceeds.

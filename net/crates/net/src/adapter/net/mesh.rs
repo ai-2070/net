@@ -5205,6 +5205,15 @@ pub struct MeshNode {
     /// never nested with the table). Never acquire in reverse. Shared `Arc` with
     /// the dispatch context and the maintenance task.
     sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
+    /// Fixtures-only contention observer (review L1 round 4): invoked by the
+    /// node-local registration core when its `try_lock` on
+    /// `sensing_local_projection_mu` observes the mutex HELD, before falling
+    /// back to the blocking `lock()`. The concurrency witnesses wait on this
+    /// signal, so "the rival blocked behind the open transaction" is proved by
+    /// actual observed contention rather than a scheduler-dependent timeout.
+    /// Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    sensing_projection_contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
@@ -6620,6 +6629,8 @@ impl MeshNode {
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
             sensing_local_projection_mu: Arc::new(parking_lot::Mutex::new(())),
+            #[cfg(feature = "fixtures")]
+            sensing_projection_contention_hook: parking_lot::Mutex::new(None),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
@@ -6952,13 +6963,15 @@ impl MeshNode {
         )
     }
 
-    /// Deterministic-witness seam (review L1 linearization): run a direct
+    /// Fixtures-only witness seam (review L1 linearization): run a direct
     /// registration that invokes `pause` INSIDE the local-projection
     /// transaction — after the table mutation + aggregate capture, before the
-    /// consumer-cell apply. Exposed `pub` only so the concurrent-registration
-    /// race witness in `tests/sensing_lease.rs` can hold the transaction open
-    /// while a rival lease acquire attempts to interleave; not for production
-    /// use.
+    /// consumer-cell apply — so the concurrent-registration race witness in
+    /// `tests/sensing_lease.rs` can hold the transaction open while a rival
+    /// lease acquire attempts to interleave. Gated behind `fixtures` (round 4):
+    /// the callback executes while `sensing_local_projection_mu` is held, so it
+    /// must not be part of the installed production API.
+    #[cfg(feature = "fixtures")]
     #[doc(hidden)]
     pub fn register_sensing_interest_paused_for_test(
         &self,
@@ -7030,8 +7043,20 @@ impl MeshNode {
         // Review L1 linearization: mutation → aggregate snapshot → consumer-cell
         // apply is ONE transaction under the projection mutex (held to the end of
         // this function — the self-provider refusal partition and capacity
-        // rollback below also mutate the projection).
-        let _projection = self.sensing_local_projection_mu.lock();
+        // rollback below also mutate the projection). Acquired try-then-block so
+        // the fixtures-only contention observer can signal ACTUAL observed
+        // contention (round 4): the hook fires only after `try_lock` found the
+        // mutex held, never on the uncontended fast path.
+        let _projection = match self.sensing_local_projection_mu.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "fixtures")]
+                if let Some(hook) = self.sensing_projection_contention_hook.lock().clone() {
+                    hook();
+                }
+                self.sensing_local_projection_mu.lock()
+            }
+        };
         let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
             let outcome = table.register(
@@ -8025,10 +8050,13 @@ impl MeshNode {
         self.run_sensing_consumer_cell_sweep_inner(now, None);
     }
 
-    /// Deterministic-witness seam (review L1 linearization): the sweep with a
+    /// Fixtures-only witness seam (review L1 linearization): the sweep with a
     /// `pause` fired INSIDE its projection transaction — after the snapshot,
     /// before the apply — so the sweep/refresh race witness can hold the
     /// transaction open while a rival lease acquire attempts to interleave.
+    /// Gated behind `fixtures` (round 4): the callback executes while
+    /// `sensing_local_projection_mu` is held.
+    #[cfg(feature = "fixtures")]
     #[doc(hidden)]
     pub fn run_sensing_consumer_cell_sweep_paused_for_test(
         &self,
@@ -8036,6 +8064,18 @@ impl MeshNode {
         pause: &(dyn Fn() + Sync),
     ) {
         self.run_sensing_consumer_cell_sweep_inner(now, Some(pause));
+    }
+
+    /// Fixtures-only witness seam (review L1 round 4): install (or clear) the
+    /// projection-contention observer the registration core fires when its
+    /// `try_lock` on `sensing_local_projection_mu` observes the mutex held.
+    #[cfg(feature = "fixtures")]
+    #[doc(hidden)]
+    pub fn set_sensing_projection_contention_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.sensing_projection_contention_hook.lock() = hook;
     }
 
     fn run_sensing_consumer_cell_sweep_inner(
@@ -14568,16 +14608,19 @@ impl MeshNode {
                             // decisions rest on.
                             let emitter_stamp =
                                 sensing_emitter.lock().as_ref().map(|e| e.stamp());
-                            // Review L1 linearization: the expiry sweep's
-                            // row removals and their branch-death
-                            // applications are one projection transaction —
-                            // a lease/direct registration cannot interleave
-                            // between `expire` computing an action and
-                            // `reclaim_branch` applying it. Surviving
-                            // branches' consumer cells relax in the
-                            // same-tick materialized reconciliation below
-                            // (itself atomic under this mutex — hence the
-                            // explicit scope: the guard MUST drop before it).
+                            // Review L1 linearization: expiry runs as TWO
+                            // separate projection transactions. Transaction 1
+                            // (this scope): `expire` computes actions and the
+                            // loop applies the branch-death consequences — a
+                            // lease/direct registration cannot interleave
+                            // between the two. Transaction 2 (the materialized
+                            // reconciliation later this tick) takes a FRESH
+                            // snapshot under the same mutex and relaxes the
+                            // surviving branches' consumer cells; the gap
+                            // between the transactions is race-safe precisely
+                            // because transaction 2 re-snapshots — it never
+                            // applies state captured here. Hence the explicit
+                            // scope: the guard MUST drop before it.
                             {
                             let _projection = sensing_local_projection_mu.lock();
                             let actions =
