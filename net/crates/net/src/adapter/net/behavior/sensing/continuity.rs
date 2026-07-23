@@ -358,6 +358,13 @@ impl ObservationCell {
         }
     }
 
+    /// The cell's current own-D (the interval its deadline window is anchored
+    /// to). Observability / test seam — the shared local-consumer cell must
+    /// carry the derived local aggregate (review L1 follow-up).
+    pub fn own_interval(&self) -> Duration {
+        self.own_interval
+    }
+
     /// Current projection (no observation yet → Unknown).
     pub fn projected(&self) -> ProjectedReadiness {
         match &self.observation {

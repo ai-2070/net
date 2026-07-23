@@ -4067,16 +4067,50 @@ impl SensingObservations {
         }
     }
 
-    /// SI-4 re-review item 5, consumer half: the LOCAL watch's own D
-    /// changed (Local re-registration or a provider-free expectation
-    /// refresh at a different D) — re-anchor the overlay cell now.
-    fn update_consumer_interval(
+    /// Review L1 follow-up: create-or-re-anchor the shared LOCAL consumer cell
+    /// for a branch to the derived local aggregate. A node-local REGISTRATION
+    /// establishes the watch immediately (projection `Unknown` until the first
+    /// delivery), so the cell exists and carries the aggregate cadence from
+    /// registration — not only after a delivery lazily creates it — and the
+    /// cadence is the min across Local + LeasedLocal, never one registering row.
+    fn anchor_consumer_cell(
         &mut self,
         branch: &sensing::ProviderInterestKey,
         interval: Duration,
+        factor: u32,
+        now: Instant,
     ) {
-        if let Some(cell) = self.consumer_cells.get_mut(branch) {
-            cell.update_interval(interval);
+        self.consumer_cells
+            .entry(branch.clone())
+            .and_modify(|cell| cell.update_interval(interval))
+            .or_insert_with(|| sensing::ObservationCell::register(now, interval, factor));
+    }
+
+    /// Review L1 follow-up: the shared consumer cell must be reconciled to the
+    /// surviving local-consumer aggregate after either node-local row changes.
+    /// `Some(interval)` re-anchors the cell (creating none — delivery lazily
+    /// registers it); `None` (no live local row remains) DROPS the cell so a
+    /// branch kept alive only by a peer/leader row leaves no ghost local
+    /// consumer overlay. Returns whether the branch's projection moved (the
+    /// overlay-change signal input).
+    fn reconcile_consumer_interval(
+        &mut self,
+        branch: &sensing::ProviderInterestKey,
+        local_aggregate: Option<Duration>,
+    ) -> bool {
+        match local_aggregate {
+            Some(interval) => {
+                if let Some(cell) = self.consumer_cells.get_mut(branch) {
+                    let before = cell.projected();
+                    cell.update_interval(interval);
+                    return cell.projected() != before;
+                }
+                false
+            }
+            // No live local row remains — drop the cell (a peer/leader row may
+            // still keep the transport branch alive). Removing a live cell is an
+            // overlay change; report it conservatively.
+            None => self.consumer_cells.remove(branch).is_some(),
         }
     }
 
@@ -6833,7 +6867,7 @@ impl MeshNode {
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let now = Instant::now();
-        let (outcome, aggregate) = {
+        let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
             let outcome = table.register(
                 &key,
@@ -6843,17 +6877,25 @@ impl MeshNode {
                 proven_root,
                 now,
             );
-            (outcome, table.aggregate(&key, now))
+            (
+                outcome,
+                table.aggregate(&key, now),
+                table.local_consumer_interval(&key, now),
+            )
         };
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
             // SI-4 re-review item 5: a (re-)registration can move
             // both the branch aggregate (this hop's continuity
-            // window) and the Local watch's own D (the overlay
-            // cell's window) — re-anchor both immediately, never at
-            // the next beat.
+            // window) and the local consumer overlay's window —
+            // re-anchor both immediately, never at the next beat.
+            // Review L1 follow-up: the shared consumer cell re-anchors to the
+            // DERIVED local aggregate (min across Local + LeasedLocal), never
+            // this one registering row's interval.
             let mut observations = self.sensing_observations.lock();
             observations.update_upstream_interval(&key, aggregate);
-            observations.update_consumer_interval(&key, requested_sample_interval);
+            if let Some(local) = local_aggregate {
+                observations.anchor_consumer_cell(&key, local, self.config.continuity_factor, now);
+            }
         }
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) && provider == self.node_id {
             // SI-3: the node registered interest in ITSELF — feed
@@ -6948,11 +6990,15 @@ impl MeshNode {
                                 pending: false,
                             },
                         );
+                        // Review L1 follow-up: warm the shared consumer cell at
+                        // the DERIVED local aggregate (min across Local +
+                        // LeasedLocal), so a second local owner joining a cached
+                        // branch does not warm it at its own (possibly looser) D.
                         let moved = observations.feed_consumer_cell(
                             &key,
                             &cached,
                             false,
-                            requested_sample_interval,
+                            local_aggregate.unwrap_or(requested_sample_interval),
                             self.config.continuity_factor,
                             now,
                         );
@@ -7147,6 +7193,24 @@ impl MeshNode {
             now,
         );
         for (branch_key, action) in actions {
+            // Review L1 follow-up: reconcile the shared consumer cell to the
+            // SURVIVING local aggregate (min across Local + LeasedLocal). A
+            // surviving local row re-anchors the cell to the strictest survivor
+            // (never leaving it at the removed row's cadence); no surviving local
+            // row drops the cell, so a branch kept alive only by a peer/leader
+            // row leaves no ghost local consumer overlay.
+            let local_aggregate = self
+                .sensing_interest_table
+                .lock()
+                .local_consumer_interval(&branch_key, now);
+            if self
+                .sensing_observations
+                .lock()
+                .reconcile_consumer_interval(&branch_key, local_aggregate)
+            {
+                self.sensing_overlay_changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
             // A dead branch reclaims its observations with the table.
             if action == sensing::UpstreamAction::Deregister {
                 self.sensing_observations.lock().reclaim_branch(&branch_key);
@@ -7738,6 +7802,23 @@ impl MeshNode {
         self.sensing_interest_table
             .lock()
             .clear_cached_floor_for_test(&key);
+    }
+
+    /// Test seam (review L1 follow-up): the shared LOCAL consumer overlay cell's
+    /// current interval for a branch — the derived local aggregate (min across
+    /// the direct `Local` and leased `LeasedLocal` rows). `None` when no consumer
+    /// cell exists for the branch. Lets the coexistence witness assert the
+    /// aggregate-derived cadence without racing behavioral timing.
+    #[doc(hidden)]
+    pub fn sensing_consumer_cell_interval_for_test(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<Duration> {
+        self.sensing_observations
+            .lock()
+            .consumer_cells
+            .get(key)
+            .map(|cell| cell.own_interval())
     }
 
     /// Install the sensing-leader role on this node (plan §4.1),
@@ -14394,6 +14475,14 @@ impl MeshNode {
                             };
                             let mut live_pending = Vec::new();
                             let mut dead_slots = Vec::new();
+                            // Review L1 follow-up: the shared consumer cell is fed
+                            // at the branch's derived local aggregate (min across
+                            // Local + LeasedLocal), precomputed once here under the
+                            // table lock, never at the per-row catch-up interval.
+                            let mut local_aggregates: HashMap<
+                                sensing::ProviderInterestKey,
+                                Duration,
+                            > = HashMap::new();
                             {
                                 let mut table = sensing_interest_table.lock();
                                 for (branch, continuity) in continuities {
@@ -14402,6 +14491,18 @@ impl MeshNode {
                                 for ((branch, downstream), pending) in pending {
                                     match table.downstream_entry(&branch, downstream) {
                                         Some(row) if row.expires_at > poll_now => {
+                                            if matches!(
+                                                downstream,
+                                                sensing::DownstreamId::Local
+                                                    | sensing::DownstreamId::LeasedLocal
+                                            ) && !local_aggregates.contains_key(&branch)
+                                            {
+                                                if let Some(agg) =
+                                                    table.local_consumer_interval(&branch, poll_now)
+                                                {
+                                                    local_aggregates.insert(branch.clone(), agg);
+                                                }
+                                            }
                                             if pending {
                                                 live_pending.push((
                                                     branch,
@@ -14430,6 +14531,11 @@ impl MeshNode {
                                 for key in dead_slots {
                                     observations.slots.remove(&key);
                                 }
+                                // Review L1 follow-up: feed each branch's shared
+                                // consumer cell at most once per sweep.
+                                let mut fed_local: std::collections::HashSet<
+                                    sensing::ProviderInterestKey,
+                                > = std::collections::HashSet::new();
                                 for (branch, downstream, interval) in live_pending {
                                     let bearing = observations
                                         .upstream
@@ -14473,15 +14579,24 @@ impl MeshNode {
                                             // or leased node-local row).
                                             sensing::DownstreamId::Local
                                             | sensing::DownstreamId::LeasedLocal => {
-                                                overlay_moved |= observations
-                                                    .feed_consumer_cell(
-                                                        &branch,
-                                                        &cached,
-                                                        bearing,
-                                                        interval,
-                                                        continuity_factor,
-                                                        poll_now,
-                                                    );
+                                                // Feed the ONE shared consumer
+                                                // cell once per branch, at the
+                                                // derived local aggregate.
+                                                if fed_local.insert(branch.clone()) {
+                                                    let agg = local_aggregates
+                                                        .get(&branch)
+                                                        .copied()
+                                                        .unwrap_or(interval);
+                                                    overlay_moved |= observations
+                                                        .feed_consumer_cell(
+                                                            &branch,
+                                                            &cached,
+                                                            bearing,
+                                                            agg,
+                                                            continuity_factor,
+                                                            poll_now,
+                                                        );
+                                                }
                                             }
                                             // SI-4 review P0: the
                                             // leader row's catch-up
@@ -18160,9 +18275,24 @@ impl MeshNode {
                 })
                 .collect()
         };
+        // Review L1 follow-up: the single authoritative local-consumer demand
+        // for this branch — the strictest interval across the live node-local
+        // rows (Local + LeasedLocal). The shared consumer cell is fed at THIS
+        // aggregate, at most once per beat, never once per row.
+        let local_interval = rows
+            .iter()
+            .filter(|(d, _)| {
+                matches!(
+                    d,
+                    sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal
+                )
+            })
+            .map(|(_, interval)| *interval)
+            .min();
         let mut forwards: Vec<u64> = Vec::new();
         let mut overlay_moved = false;
         let mut feed_leader = false;
+        let mut local_fed = false;
         {
             let mut observations = ctx.sensing_observations.lock();
             for (downstream, interval) in rows {
@@ -18184,20 +18314,24 @@ impl MeshNode {
                     slot.pending = false;
                     match downstream {
                         sensing::DownstreamId::Peer(node) => forwards.push(node),
-                        // SI-4b: the Local row IS this node's own
-                        // consumer — its delivery point feeds the
-                        // overlay cell with the hop's OUTGOING
-                        // bearing (the same §4.4 rule any peer
-                        // gets) — direct or leased node-local row.
+                        // SI-4b: a node-local row (direct Local or leased
+                        // LeasedLocal) IS this node's own consumer — its
+                        // delivery point feeds the overlay cell with the hop's
+                        // OUTGOING bearing (the same §4.4 rule any peer gets).
+                        // Both ownership rows share ONE consumer cell, so feed it
+                        // at most once per beat, at the derived local aggregate.
                         sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
-                            overlay_moved |= observations.feed_consumer_cell(
-                                branch,
-                                attestation,
-                                bearing,
-                                interval,
-                                ctx.sensing_continuity_factor,
-                                now,
-                            );
+                            if !local_fed {
+                                overlay_moved |= observations.feed_consumer_cell(
+                                    branch,
+                                    attestation,
+                                    bearing,
+                                    local_interval.unwrap_or(interval),
+                                    ctx.sensing_continuity_factor,
+                                    now,
+                                );
+                                local_fed = true;
+                            }
                         }
                         // SI-4 review P0: the leader row's delivery
                         // point hands the beat to the leader relay,

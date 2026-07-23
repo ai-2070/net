@@ -447,3 +447,88 @@ async fn refused_non_first_holder_tighten_relaxes_back_to_survivor() {
     node.release_sensing_interest_lease(loose);
     assert!(node.sensing_table_is_empty(), "final release deregisters");
 }
+
+/// L1 follow-up (review NARROW HOLD): the direct `Local` row and the lease's
+/// `LeasedLocal` row are distinct table slots but feed ONE shared consumer cell,
+/// whose cadence must be the DERIVED aggregate (min across both) at every
+/// mutation. Coexistence + relax-back + removal, asserted via the cell-interval
+/// seam. RED-coupled: re-anchoring the cell to the registering/deregistering
+/// row's own interval (last-writer) instead of the aggregate fails the 50 ms
+/// coexistence and the 100 ms relax-back assertions.
+#[tokio::test]
+async fn local_and_leased_share_one_aggregate_consumer_cadence() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // Direct Local at 100 ms, then a lease at 50 ms.
+    node.register_sensing_interest(&spec, PROVIDER, D, Duration::from_secs(30))
+        .expect("direct registration");
+    let lease = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("lease acquire");
+
+    // Both ownership rows exist as distinct slots.
+    let rows = node.sensing_downstreams(&key);
+    assert!(
+        rows.contains(&DownstreamId::Local) && rows.contains(&DownstreamId::LeasedLocal),
+        "both the direct and leased local rows exist: {rows:?}"
+    );
+    // The shared consumer cell carries the aggregate: min(100, 50) = 50 ms.
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "the shared consumer cadence is the derived aggregate (50 ms)"
+    );
+
+    // Releasing the lease leaves the direct row and relaxes the shared cell to
+    // 100 ms — and, because the direct row survives, sends no upstream Deregister.
+    node.release_sensing_interest_lease(lease);
+    assert_eq!(
+        node.sensing_downstreams(&key),
+        vec![DownstreamId::Local],
+        "only the direct row survives — the branch is not deregistered upstream"
+    );
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(D),
+        "the shared consumer cadence relaxes to the surviving direct row's 100 ms"
+    );
+
+    // Deregistering the direct row removes the local consumer cell entirely.
+    node.deregister_sensing_interest(&spec, PROVIDER);
+    assert!(node.sensing_table_is_empty(), "no rows remain");
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        None,
+        "no live local row remains → the consumer cell is removed (no ghost)"
+    );
+}
+
+/// L1 follow-up: reversing the registration order proves the shared cadence is
+/// aggregate-derived, not last-writer-selected.
+#[tokio::test]
+async fn shared_consumer_cadence_is_order_independent() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // Lease at 50 ms FIRST, then a looser direct watch at 100 ms.
+    let lease = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect("lease acquire");
+    node.register_sensing_interest(&spec, PROVIDER, D, Duration::from_secs(30))
+        .expect("direct registration");
+
+    // The shared cadence stays at the strictest (50 ms) — the later, looser
+    // registration did not overwrite it.
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "the shared cadence is min(50, 100), not the last-registered 100 ms"
+    );
+
+    node.release_sensing_interest_lease(lease);
+    node.deregister_sensing_interest(&spec, PROVIDER);
+    assert!(node.sensing_table_is_empty());
+}

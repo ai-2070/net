@@ -192,6 +192,31 @@ impl InterestTable {
         })
     }
 
+    /// The single authoritative LOCAL-consumer demand projection for a branch:
+    /// the strictest (minimum) sample interval across this node's live
+    /// node-local rows — the direct [`DownstreamId::Local`] and the leased
+    /// [`DownstreamId::LeasedLocal`]. The shared consumer overlay cell must
+    /// re-anchor to THIS aggregate on every mutation, never to the latest
+    /// registering/delivering row's own interval (review L1 follow-up): the two
+    /// ownership rows are distinct table slots but feed ONE consumer cell.
+    /// `None` when no live node-local row exists (the branch may still be kept
+    /// alive by a peer or leader row, which must not leave a ghost consumer cell).
+    pub fn local_consumer_interval(
+        &self,
+        key: &ProviderInterestKey,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.entries.get(key).and_then(|entry| {
+            entry
+                .downstreams
+                .iter()
+                .filter(|(id, _)| matches!(id, DownstreamId::Local | DownstreamId::LeasedLocal))
+                .filter(|(_, row)| row.expires_at > now)
+                .map(|(_, row)| row.requested_sample_interval)
+                .min()
+        })
+    }
+
     /// Register or refresh one downstream's interest. Refreshing
     /// re-arms `expires_at = now + ttl`; each downstream expires
     /// independently.
