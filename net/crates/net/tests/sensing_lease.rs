@@ -653,3 +653,179 @@ async fn refusal_partition_reanchors_consumer_cell_to_surviving_direct() {
         "the refusal partition removed the lease row; the cell re-anchored to the surviving direct 100 ms"
     );
 }
+
+/// L1 linearization (review round 3, interleaving 1): a concurrent direct
+/// registration and lease acquire cannot last-writer the shared consumer cell.
+/// A installs Direct 100 ms and PAUSES inside its projection transaction (table
+/// mutated, aggregate captured, apply pending); B's LeasedLocal 50 ms acquire
+/// must serialize BEHIND the transaction — it provably blocks — and the final
+/// state is the true aggregate. RED-coupled: without the projection mutex, B
+/// completes during A's pause and A's resumed apply overwrites the cell with
+/// its stale 100 ms capture.
+#[tokio::test]
+async fn concurrent_direct_and_lease_registration_linearizes_the_consumer_cadence() {
+    use std::sync::{mpsc, Barrier};
+
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    let paused = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+
+    // A: direct Local at 100 ms, held open inside the projection transaction.
+    let a_node = node.clone();
+    let a_spec = spec.clone();
+    let paused_a = paused.clone();
+    let release_a = release.clone();
+    let a = std::thread::spawn(move || {
+        a_node
+            .register_sensing_interest_paused_for_test(
+                &a_spec,
+                PROVIDER,
+                D,
+                Duration::from_secs(30),
+                &|| {
+                    paused_a.wait();
+                    release_a.wait();
+                },
+            )
+            .expect("direct registration");
+    });
+    paused.wait(); // A's transaction is open: mutation done, apply pending.
+
+    // B: a stricter lease acquire racing A.
+    let b_node = node.clone();
+    let b_spec = spec.clone();
+    let b = std::thread::spawn(move || {
+        let ticket = b_node
+            .acquire_sensing_interest_lease(&b_spec, PROVIDER, STRICT)
+            .expect("lease acquire");
+        b_done_tx.send(()).expect("send done");
+        ticket
+    });
+    // B must NOT complete inside A's open transaction (bounded wait, not sleep).
+    assert!(
+        matches!(
+            b_done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the rival lease acquire completed inside A's projection transaction"
+    );
+
+    release.wait(); // A applies its captured aggregate and returns.
+    a.join().expect("A thread");
+    let _ticket = b.join().expect("B thread");
+    b_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("B completes after A's transaction");
+
+    // Final table state: both rows at their own cadence (aggregate = 50 ms)…
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::Local)
+            .expect("direct row")
+            .requested_sample_interval,
+        D
+    );
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::LeasedLocal)
+            .expect("leased row")
+            .requested_sample_interval,
+        STRICT
+    );
+    // …and the shared consumer cell carries the aggregate, never A's stale
+    // last-writer capture.
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "the shared consumer cadence is the aggregate 50 ms, not the stale 100 ms"
+    );
+}
+
+/// L1 linearization (review round 3, interleaving 2): the maintenance sweep
+/// cannot apply a stale "no live local row" snapshot over a lease the rival
+/// refreshed concurrently. The sweep pauses inside its projection transaction
+/// with a stale verdict pending; the refresh acquire provably blocks behind it;
+/// after both complete, the refreshed row is live AND its consumer cell exists
+/// at the refreshed cadence. RED-coupled: without the mutex the refresh
+/// completes during the pause and the sweep's stale application erases the
+/// fresh cell (live row, no consumer projection — the org-routing shape).
+#[tokio::test]
+async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
+    use std::sync::{mpsc, Barrier};
+
+    let ttl = Duration::from_millis(200);
+    let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), PSK)
+        .with_sensing_coalescing(true)
+        .with_sensing_interest_ttl(ttl);
+    let node = node_with(cfg).await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    let t = Instant::now();
+    // First holder at 100 ms; its LeasedLocal row expires ≈ t + ttl.
+    let _t1 = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, D)
+        .expect("first acquire");
+    assert_eq!(node.sensing_consumer_cell_interval_for_test(&key), Some(D));
+
+    let paused = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let (r_done_tx, r_done_rx) = mpsc::channel::<()>();
+
+    // S: the sweep at a synthetic now PAST the row's expiry — its snapshot sees
+    // no live local row; the stale verdict is held open inside the transaction.
+    let s_node = node.clone();
+    let paused_s = paused.clone();
+    let release_s = release.clone();
+    let s = std::thread::spawn(move || {
+        s_node.run_sensing_consumer_cell_sweep_paused_for_test(
+            t + ttl + Duration::from_millis(15),
+            &|| {
+                paused_s.wait();
+                release_s.wait();
+            },
+        );
+    });
+    paused.wait(); // the sweep's stale snapshot is pending application.
+
+    // R: a stricter refresh acquire racing the sweep.
+    let r_node = node.clone();
+    let r_spec = spec.clone();
+    let r = std::thread::spawn(move || {
+        let ticket = r_node
+            .acquire_sensing_interest_lease(&r_spec, PROVIDER, STRICT)
+            .expect("refresh acquire");
+        r_done_tx.send(()).expect("send done");
+        ticket
+    });
+    assert!(
+        matches!(
+            r_done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the lease refresh completed inside the sweep's projection transaction"
+    );
+
+    release.wait(); // the sweep applies its verdict FIRST, then R proceeds.
+    s.join().expect("sweep thread");
+    let _t2 = r.join().expect("refresh thread");
+    r_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("refresh completes after the sweep");
+
+    // Final: the refreshed row is live and its consumer cell exists at 50 ms —
+    // the sweep's stale None was applied BEFORE the refresh, so it could not
+    // erase the state the refresh created.
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::LeasedLocal),
+        "the refreshed lease row is live"
+    );
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "the refreshed consumer cell exists at the refreshed cadence"
+    );
+}

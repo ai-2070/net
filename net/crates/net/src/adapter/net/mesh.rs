@@ -1247,6 +1247,9 @@ struct DispatchCtx {
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
+    /// Review L1 linearization: the local-projection transaction mutex. Same
+    /// `Arc` (and frozen lock order) as the matching `MeshNode` field.
+    sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -3806,13 +3809,23 @@ fn reconcile_local_consumer_cell(
 /// cells and never relaxed a survivor). Also picks up expiry: an expired local
 /// row is excluded from `local_consumer_interval`, so the surviving aggregate
 /// relaxes here on the next tick.
+///
+/// Review L1 linearization: the WHOLE snapshot→classify→apply sequence runs
+/// under `projection_mu`, so a concurrent lease/direct registration serializes
+/// against it — the sweep can never apply a stale `None` (or stale aggregate)
+/// snapshot over a cell a rival anchored after the snapshot was taken.
+/// `pause_before_apply` is the deterministic-witness seam: it fires between the
+/// snapshot and the apply, INSIDE the transaction.
 fn reconcile_materialized_consumer_cells(
+    projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
     overlay: &tokio::sync::watch::Sender<u64>,
     live_interests: &std::collections::HashSet<sensing::CapabilityInterestKey>,
     now: Instant,
+    pause_before_apply: Option<&(dyn Fn() + Sync)>,
 ) {
+    let _projection = projection_mu.lock();
     let branch_keys: std::collections::HashSet<sensing::ProviderInterestKey> = {
         let observations = observations.lock();
         observations
@@ -3839,6 +3852,11 @@ fn reconcile_materialized_consumer_cells(
             }
             reconcile.push((key.clone(), table.local_consumer_interval(&key, now)));
         }
+    }
+    // Witness seam: hold the transaction open between the snapshot and the
+    // apply so a rival registration provably serializes behind the sweep.
+    if let Some(pause) = pause_before_apply {
+        pause();
     }
     if dead_branches.is_empty() && reconcile.is_empty() {
         return;
@@ -5166,6 +5184,27 @@ pub struct MeshNode {
     /// installation generation would close it at the wire, but that is a
     /// deferred sensing-wire change (§4.3).
     sensing_lease_apply_mu: parking_lot::Mutex<()>,
+    /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
+    /// operation that changes OR applies the node-local consumer projection
+    /// (the `Local`/`LeasedLocal` rows' derived
+    /// [`sensing::InterestTable::local_consumer_interval`] aggregate feeding the
+    /// shared consumer cell) holds this across its
+    /// `table mutation → aggregate snapshot → consumer-cell apply` section, so a
+    /// concurrent registration can never apply a stale captured aggregate
+    /// last-writer style, and the maintenance sweep can never apply a stale
+    /// `None` snapshot over a concurrently refreshed lease cell. Each guarded
+    /// section is atomic mutation+snapshot+apply (or fresh-snapshot+apply);
+    /// sections deliberately END before the leader refusal fan-out
+    /// (`apply_sensing_leader_refusal` re-enters `feed_sensing_origin`, which
+    /// takes this mutex itself — holding across would self-deadlock; the
+    /// fan-out registers only `Leader` rows, which are not part of the local
+    /// projection).
+    ///
+    /// FROZEN lock order: `sensing_lease_apply_mu` → THIS →
+    /// `sensing_interest_table` → `sensing_observations` (the emitter is a leaf
+    /// never nested with the table). Never acquire in reverse. Shared `Arc` with
+    /// the dispatch context and the maintenance task.
+    sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
@@ -6580,6 +6619,7 @@ impl MeshNode {
             ),
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
+            sensing_local_projection_mu: Arc::new(parking_lot::Mutex::new(())),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
@@ -6908,6 +6948,33 @@ impl MeshNode {
             provider,
             requested_sample_interval,
             soft_state_ttl,
+            None,
+        )
+    }
+
+    /// Deterministic-witness seam (review L1 linearization): run a direct
+    /// registration that invokes `pause` INSIDE the local-projection
+    /// transaction — after the table mutation + aggregate capture, before the
+    /// consumer-cell apply. Exposed `pub` only so the concurrent-registration
+    /// race witness in `tests/sensing_lease.rs` can hold the transaction open
+    /// while a rival lease acquire attempts to interleave; not for production
+    /// use.
+    #[doc(hidden)]
+    pub fn register_sensing_interest_paused_for_test(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
+        self.register_sensing_interest_as(
+            sensing::DownstreamId::Local,
+            spec,
+            provider,
+            requested_sample_interval,
+            soft_state_ttl,
+            Some(pause),
         )
     }
 
@@ -6915,6 +6982,11 @@ impl MeshNode {
     /// downstream identity: `Local` for the direct API, `LeasedLocal` for the
     /// interest-lease path (review §1 — separating the identity keeps a lease
     /// mutation from ever touching a direct row, and vice versa).
+    ///
+    /// Review L1 linearization: the whole mutation→snapshot→apply sequence runs
+    /// under [`Self::sensing_local_projection_mu`], so the consumer-cell anchor
+    /// applies the aggregate captured WITH the mutation — a concurrent rival
+    /// cannot complete in between and be overwritten by a stale capture.
     fn register_sensing_interest_as(
         &self,
         downstream: sensing::DownstreamId,
@@ -6922,6 +6994,7 @@ impl MeshNode {
         provider: u64,
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
+        pause_before_apply: Option<&(dyn Fn() + Sync)>,
     ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
@@ -6954,6 +7027,11 @@ impl MeshNode {
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let now = Instant::now();
+        // Review L1 linearization: mutation → aggregate snapshot → consumer-cell
+        // apply is ONE transaction under the projection mutex (held to the end of
+        // this function — the self-provider refusal partition and capacity
+        // rollback below also mutate the projection).
+        let _projection = self.sensing_local_projection_mu.lock();
         let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
             let outcome = table.register(
@@ -6970,6 +7048,11 @@ impl MeshNode {
                 table.local_consumer_interval(&key, now),
             )
         };
+        // Witness seam: hold the transaction open between the capture and the
+        // apply so a concurrent rival provably serializes behind it.
+        if let Some(pause) = pause_before_apply {
+            pause();
+        }
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
             // SI-4 re-review item 5: a (re-)registration can move
             // both the branch aggregate (this hop's continuity
@@ -7238,6 +7321,7 @@ impl MeshNode {
                     provider,
                     interval,
                     self.config.sensing_interest_ttl,
+                    None,
                 )? {
                     sensing::RegisterOutcome::Registered(_) => Ok(()),
                     // The table installed nothing — do not let the lease claim
@@ -7288,6 +7372,9 @@ impl MeshNode {
         if !self.config.enable_sensing_coalescing {
             return;
         }
+        // Review L1 linearization: the removal and its consumer-cell
+        // reconciliation are one transaction under the projection mutex.
+        let _projection = self.sensing_local_projection_mu.lock();
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let now = Instant::now();
         // Closure item 7: stamp snapshot BEFORE the table mutation the
@@ -7935,6 +8022,27 @@ impl MeshNode {
     /// row's expiry, without racing the real maintenance cadence.
     #[doc(hidden)]
     pub fn run_sensing_consumer_cell_sweep_for_test(&self, now: Instant) {
+        self.run_sensing_consumer_cell_sweep_inner(now, None);
+    }
+
+    /// Deterministic-witness seam (review L1 linearization): the sweep with a
+    /// `pause` fired INSIDE its projection transaction — after the snapshot,
+    /// before the apply — so the sweep/refresh race witness can hold the
+    /// transaction open while a rival lease acquire attempts to interleave.
+    #[doc(hidden)]
+    pub fn run_sensing_consumer_cell_sweep_paused_for_test(
+        &self,
+        now: Instant,
+        pause: &(dyn Fn() + Sync),
+    ) {
+        self.run_sensing_consumer_cell_sweep_inner(now, Some(pause));
+    }
+
+    fn run_sensing_consumer_cell_sweep_inner(
+        &self,
+        now: Instant,
+        pause: Option<&(dyn Fn() + Sync)>,
+    ) {
         let live_interests: std::collections::HashSet<sensing::CapabilityInterestKey> = self
             .sensing_capability_interests
             .lock()
@@ -7942,11 +8050,13 @@ impl MeshNode {
             .cloned()
             .collect();
         reconcile_materialized_consumer_cells(
+            &self.sensing_local_projection_mu,
             &self.sensing_interest_table,
             &self.sensing_observations,
             &self.sensing_overlay_changed,
             &live_interests,
             now,
+            pause,
         );
     }
 
@@ -11529,6 +11639,7 @@ impl MeshNode {
             sensing_overlay_changed: self.sensing_overlay_changed.clone(),
             sensing_capability_interests: self.sensing_capability_interests.clone(),
             sensing_observations: self.sensing_observations.clone(),
+            sensing_local_projection_mu: self.sensing_local_projection_mu.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -14302,6 +14413,7 @@ impl MeshNode {
         let sensing_overlay_changed = self.sensing_overlay_changed.clone();
         let continuity_factor = self.config.continuity_factor;
         let sensing_capability_interests = self.sensing_capability_interests.clone();
+        let sensing_local_projection_mu = self.sensing_local_projection_mu.clone();
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -14456,6 +14568,18 @@ impl MeshNode {
                             // decisions rest on.
                             let emitter_stamp =
                                 sensing_emitter.lock().as_ref().map(|e| e.stamp());
+                            // Review L1 linearization: the expiry sweep's
+                            // row removals and their branch-death
+                            // applications are one projection transaction —
+                            // a lease/direct registration cannot interleave
+                            // between `expire` computing an action and
+                            // `reclaim_branch` applying it. Surviving
+                            // branches' consumer cells relax in the
+                            // same-tick materialized reconciliation below
+                            // (itself atomic under this mutex — hence the
+                            // explicit scope: the guard MUST drop before it).
+                            {
+                            let _projection = sensing_local_projection_mu.lock();
                             let actions =
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
@@ -14515,6 +14639,7 @@ impl MeshNode {
                                         );
                                     }
                                 }
+                            }
                             }
 
                             // Closure item 6: age out refusal
@@ -14602,6 +14727,12 @@ impl MeshNode {
                                     .collect();
                                 (continuities, slot_keys)
                             };
+                            // Review L1 linearization: the catch-up's local-
+                            // aggregate snapshot and its consumer-cell feeds are
+                            // one projection transaction (explicitly dropped
+                            // after the feed loop, before the network flushes
+                            // and leader feeds).
+                            let projection_guard = sensing_local_projection_mu.lock();
                             let mut live_pending = Vec::new();
                             let mut dead_slots = Vec::new();
                             // Review L1 follow-up: the shared consumer cell is fed
@@ -14745,6 +14876,11 @@ impl MeshNode {
                                     }
                                 }
                             }
+                            // The projection transaction ends before the
+                            // network flushes and leader feeds (the leader
+                            // delivery fan-out feeds cells with the wire's
+                            // promised cadence, outside the local projection).
+                            drop(projection_guard);
                             #[cfg(feature = "redex")]
                             for (branch, cached, bearing) in leader_feeds {
                                 let Ok(semantic) = sensing::semantic_attestation(
@@ -14832,11 +14968,13 @@ impl MeshNode {
                                 interests.keys().cloned().collect()
                             };
                             reconcile_materialized_consumer_cells(
+                                &sensing_local_projection_mu,
                                 &sensing_interest_table,
                                 &sensing_observations,
                                 &sensing_overlay_changed,
                                 &live_interests,
                                 poll_now,
+                                None,
                             );
                         }
 
@@ -17733,6 +17871,9 @@ impl MeshNode {
                 return;
             }
             Err((sensing::StreamRefusal::AtCapacity, _)) => {
+                // Review L1 linearization: rollback + reconcile are one
+                // projection transaction.
+                let _projection = ctx.sensing_local_projection_mu.lock();
                 let _ = ctx.sensing_interest_table.lock().deregister(
                     &key.interest.interest_digest,
                     Some(key.provider),
@@ -17762,10 +17903,26 @@ impl MeshNode {
         ctx.sensing_counters
             .cadence_refusals
             .fetch_add(1, Ordering::Relaxed);
-        let partition =
-            ctx.sensing_interest_table
-                .lock()
-                .on_refusal(key, refusal.minimum_supported, now);
+        // Review L1 linearization: the partition and its consumer-cell
+        // reconciliation are ONE projection transaction. The guard deliberately
+        // ends before the leader fan-out below — `apply_sensing_leader_refusal`
+        // re-enters this function (which takes the mutex itself) and registers
+        // only `Leader` rows, which are not part of the local projection.
+        let partition = {
+            let _projection = ctx.sensing_local_projection_mu.lock();
+            let partition =
+                ctx.sensing_interest_table
+                    .lock()
+                    .on_refusal(key, refusal.minimum_supported, now);
+            reconcile_local_consumer_cell(
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                key,
+                now,
+            );
+            partition
+        };
         let generation = ctx.capability_version.load(Ordering::Relaxed);
         let beat = {
             let mut slot = ctx.sensing_emitter.lock();
@@ -17819,16 +17976,8 @@ impl MeshNode {
         }
         #[cfg(not(feature = "redex"))]
         let _ = signed_refusal;
-        // Review L1 narrow-hold: the origin-hop refusal partition may have removed
-        // a local row — reconcile the shared consumer cell to the surviving
-        // aggregate (or drop it).
-        reconcile_local_consumer_cell(
-            &ctx.sensing_interest_table,
-            &ctx.sensing_observations,
-            &ctx.sensing_overlay_changed,
-            key,
-            now,
-        );
+        // (The consumer-cell reconcile ran inside the partition's projection
+        // transaction above; the leader fan-out touches only Leader rows.)
     }
 
     /// SI-3c: the 0x0C03 verified intake (plan §4.2/§4.6) — the
@@ -18167,11 +18316,27 @@ impl MeshNode {
                     );
                 }
             }
-            let partition = ctx.sensing_interest_table.lock().on_refusal(
-                &branch,
-                attestation.promised_cadence,
-                now,
-            );
+            // Review L1 linearization: the partition and its consumer-cell
+            // reconciliation are ONE projection transaction; the guard ends
+            // before the leader fan-out below (`apply_sensing_leader_refusal`
+            // re-enters `feed_sensing_origin`, which takes the mutex itself, and
+            // registers only `Leader` rows — not part of the local projection).
+            let partition = {
+                let _projection = ctx.sensing_local_projection_mu.lock();
+                let partition = ctx.sensing_interest_table.lock().on_refusal(
+                    &branch,
+                    attestation.promised_cadence,
+                    now,
+                );
+                reconcile_local_consumer_cell(
+                    &ctx.sensing_interest_table,
+                    &ctx.sensing_observations,
+                    &ctx.sensing_overlay_changed,
+                    &branch,
+                    now,
+                );
+                partition
+            };
             // SI-4 re-review item 4: a refused Leader row partitions
             // the leader relay's REAL per-consumer rows FIRST — the
             // exact signed refusal reaches every refused consumer,
@@ -18212,20 +18377,31 @@ impl MeshNode {
                 // consumers may have re-registered above — the
                 // branch is then alive again and must not be torn
                 // down under the pre-partition consequence.
-                let still_dead = ctx
-                    .sensing_interest_table
-                    .lock()
-                    .downstreams(&branch, now)
-                    .is_empty();
+                //
+                // Review L1 linearization: the liveness read and the branch-death
+                // application are one atomic projection transaction, so a
+                // concurrent local registration either lands before (the re-read
+                // sees its row → not dead) or after (its anchor re-creates the
+                // state this reclaim removed).
+                let still_dead = {
+                    let _projection = ctx.sensing_local_projection_mu.lock();
+                    let still_dead = ctx
+                        .sensing_interest_table
+                        .lock()
+                        .downstreams(&branch, now)
+                        .is_empty();
+                    if still_dead {
+                        // The partition emptied the branch — the warm-start
+                        // status and epoch memory reclaim now; the refusal
+                        // tombstone above ages out via the sweep.
+                        ctx.sensing_observations.lock().reclaim_status(&branch);
+                    }
+                    still_dead
+                };
                 if still_dead {
                     if branch.provider != ctx.local_node_id {
                         Self::send_sensing_deregister_upstream(ctx, &branch);
                     }
-                    // The partition emptied the branch — the
-                    // warm-start status and epoch memory reclaim
-                    // now; the refusal tombstone above ages out via
-                    // the sweep.
-                    ctx.sensing_observations.lock().reclaim_status(&branch);
                     return;
                 }
             }
@@ -18236,16 +18412,8 @@ impl MeshNode {
             ctx.sensing_observations
                 .lock()
                 .update_upstream_interval(&branch, aggregate);
-            // Review L1 narrow-hold: the refusal partition may have removed a
-            // local row while the branch survives — reconcile the shared consumer
-            // cell to the surviving local aggregate (or drop it).
-            reconcile_local_consumer_cell(
-                &ctx.sensing_interest_table,
-                &ctx.sensing_observations,
-                &ctx.sensing_overlay_changed,
-                &branch,
-                now,
-            );
+            // (The consumer-cell reconcile ran inside the partition's projection
+            // transaction above; the leader fan-out touches only Leader rows.)
             return;
         }
         // SI-4a: the frozen SI-0f relay semantics on real sessions.
@@ -18357,6 +18525,12 @@ impl MeshNode {
         bearing: bool,
         now: Instant,
     ) {
+        // Review L1 linearization: the row snapshot (whose local rows derive the
+        // aggregate below) and the consumer-cell feed are one projection
+        // transaction — a rival registration cannot complete in between and be
+        // overwritten by this beat applying a stale aggregate. Dropped before
+        // the peer forwards and leader feed below.
+        let projection_guard = ctx.sensing_local_projection_mu.lock();
         let rows: Vec<(sensing::DownstreamId, Duration)> = {
             let table = ctx.sensing_interest_table.lock();
             table
@@ -18437,6 +18611,9 @@ impl MeshNode {
                 }
             }
         }
+        // The projection transaction ends before the peer forwards and the
+        // leader feed (which touches only leader-relay state).
+        drop(projection_guard);
         if overlay_moved {
             ctx.sensing_overlay_changed.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
