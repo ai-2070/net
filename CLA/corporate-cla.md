@@ -149,10 +149,8 @@ need not be a party to, or separately consent to, such an assignment.
 
 ## 8. Miscellaneous
 
-**Governing law and venue.** This Agreement is governed by the laws of
-**Hungary**, without regard to its conflict-of-law provisions. The parties
-submit to the exclusive jurisdiction of the competent courts of
-**Sopron, Hungary**.
+**Governing law.** This Agreement is governed by the laws of **Hungary**,
+without regard to its conflict-of-law provisions.
 
 **Entire agreement.** This Agreement is the entire agreement between You and the
 Maintainer concerning Your Contributions, and supersedes any prior understanding
