@@ -704,4 +704,4 @@ at your option. The MIT arm exists so GPLv2-only projects — the Linux kernel, 
 
 ### Contribution
 
-Contributions are accepted under the [Contributor License Agreement](CONTRIBUTING.md#contributor-license-agreement) and are released under the same dual license.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project shall be licensed as MIT OR Apache-2.0, at the recipient's option. Contributions are also subject to the [Contributor License Agreement](CONTRIBUTING.md#contributor-license-agreement), which must be signed before a first contribution is merged.
