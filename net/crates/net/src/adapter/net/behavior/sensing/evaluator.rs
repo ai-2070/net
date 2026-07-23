@@ -189,8 +189,13 @@ pub struct SensingCounters {
     /// Every constraint rejection (any [`ConstraintError`]).
     pub invalid_constraints: AtomicU64,
     /// The security-relevant subset: protocol-invalid input —
-    /// constraint digest mismatches (plan §4.4) and wire scope
-    /// claims the session does not back (plan §4.10).
+    /// constraint digest mismatches (plan §4.4), wire scope claims the
+    /// session does not back (plan §4.10), and a LEGACY registration whose
+    /// declared audience is an organization-derived commitment while this
+    /// node holds organization authority (the C1 authority-aware
+    /// classification — an honest legacy sender never claims the org
+    /// audience, so the combination is a protocol violation, not merely an
+    /// authorization refusal).
     pub protocol_invalid: AtomicU64,
     /// Structured cadence refusals issued.
     pub cadence_refusals: AtomicU64,

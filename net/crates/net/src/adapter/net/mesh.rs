@@ -31107,7 +31107,10 @@ mod sensing_authority_witness_tests {
 
         // (a) A legacy provider claiming the fleet root (== org commitment): under
         // fleet admission its scope validation would PASS and key the row under the
-        // org commitment — the exact laundering. C1 refuses it at intake.
+        // org commitment — the exact laundering. C1 refuses it at intake and counts
+        // the refusal as protocol-invalid.
+        let protocol_invalid_before =
+            sensing::SensingCounters::get(&node.sensing_counters().protocol_invalid);
         let legacy_bytes =
             sensing::encode_interest_frame(&legacy_provider_frame(target, commitment))
                 .expect("encode");
@@ -31115,6 +31118,11 @@ mod sensing_authority_witness_tests {
         assert!(
             node.sensing_table_is_empty(),
             "C1 refuses the organization-derived legacy audience — no row"
+        );
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters().protocol_invalid),
+            protocol_invalid_before + 1,
+            "the C1 refusal increments the protocol_invalid security counter"
         );
 
         // (b) A valid OrgProviderRegistration for the SAME interest + target lands
@@ -31135,6 +31143,38 @@ mod sensing_authority_witness_tests {
             node.sensing_downstreams(&key).len(),
             1,
             "only the org row exists — no coalesced legacy demand on the shared key"
+        );
+    }
+
+    // C2 (configured-startup path) — the collision guard must also fire when the
+    // authority is loaded from `node_authority_dir` at construction, BEFORE
+    // networking begins. Adopt an authority on disk for this node's entity, then
+    // build a node whose explicit fleet root equals the org commitment: startup
+    // opens the authority, routes through the same guarded installer, and fails
+    // fast. RED-coupled to C2 through the distinct configured-startup path.
+    #[tokio::test]
+    async fn configured_startup_over_colliding_fleet_root_fails() {
+        let kp = EntityKeypair::generate();
+        let entity = kp.entity_id().clone();
+        let dir = scratch("startup-collide");
+        let cert =
+            OrgMembershipCert::try_issue(&org(), entity.clone(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("cert");
+        NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt authority to dir");
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        config.sensing_owner_root =
+            Some(sensing::canonical_org_sensing_commitment(&org().org_id()));
+        config.node_authority_dir = Some(dir);
+
+        let err = MeshNode::new(kp, config)
+            .await
+            .err()
+            .expect("configured startup over a colliding fleet root must fail before networking");
+        assert!(
+            err.to_string().contains("fleet root"),
+            "startup failure must name the fleet-root collision, got: {err}"
         );
     }
 }

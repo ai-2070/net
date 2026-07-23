@@ -22,6 +22,24 @@ rollout); three narrow implementation points pinned here —
 Per the verdict, once these are confirmed: **OLB-0 → OLB-1 → bounded
 stop-and-review**, with no further architecture review before OLB-0.
 
+**Implementation status (2026-07-23) — interim Option-A split.** The org
+sensing go-live ships **exact-provider first**: only the relay re-authoring of
+`OrgProviderRegistration` is live; the `OrgCapabilityRegistration` (leader /
+capability-resolution) path is deliberately **dark** until an owner-private
+candidate substrate exists (scoped-discovery projection, verified-EntityId→node
+mapping, authority-safe Node/Nodes selectors, per-interest resolution via the
+admitted seed's proven root, org-specific reconciliation, org-root in every
+leader/relay row). Kyra signed off the provider slice as
+**`SAFE_PROVIDER_LIVE_HEAD = b76f67284`** (distinct from the reserved global
+`SAFE_LIVE_HEAD`, which stays for the eventual full capability-sensing path).
+The slice closes the explicit-fleet-root cross-authority coalescence class:
+legacy sensing intake rejects an organization-derived audience when authority is
+installed, and authority installation (runtime and configured startup) is
+refused over an explicit fleet root equal to the org's canonical sensing
+commitment. Three-node transport witnesses (consumer → relay → provider, relay
+emits under its own live cert, no legacy fallback) remain the next slice; the
+reserved full-range ultrareview waits until that transport proof lands.
+
 v0.3 applied Kyra's performance ruling (2026-07-22):
 the public product shape was confirmed simple enough; the
 implementation is now pinned so a warmed `org.call` is **two

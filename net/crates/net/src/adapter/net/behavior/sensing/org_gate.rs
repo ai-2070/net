@@ -296,12 +296,12 @@ enum Leg {
 /// read again, and the upstream continuation frame kind is chosen exhaustively
 /// from [`Self::authority`] (no org → legacy fallback).
 ///
-/// Consumed incrementally across the org-auth part-2 series: the provider
-/// continuation ([`plan_provider_continuation`]) drives the legacy relay
-/// re-authoring seam through this wrapper today; the leader operation and the
-/// live org intake (which exercise `from_validated_org`, [`Self::leg`], and
-/// [`Self::proven_root`]) land next, at which point the residual
-/// `#[allow(dead_code)]` is removed.
+/// Consumed by the signed-off exact-provider path: [`Self::from_validated_org`],
+/// [`Self::leg`], [`Self::proven_root`], [`Self::authority`], and the provider
+/// continuation ([`plan_provider_continuation`]) all drive the live
+/// `OrgProviderRegistration` re-authoring seam. The residual
+/// `#[allow(dead_code)]` now covers only the capability-leg surface the
+/// still-dark organization LEADER path will consume when it lights up.
 ///
 /// **Immutable after construction.** All fields are private and exposed only
 /// through by-value/by-ref accessors: the complete spec AND the addressing leg
@@ -635,8 +635,10 @@ pub(crate) fn capture_current_sensing_stamp(
 /// The retained `Arc`s pin the exact authority + store the membership was
 /// proven against, alive from capture through the upstream re-authoring emit.
 ///
-/// The accessors land ahead of their consumer (the dispatch re-authoring emit,
-/// org-auth part-2 piece 4), so the `#[allow(dead_code)]` is removed then.
+/// The accessors are consumed by the live provider re-authoring emit
+/// ([`plan_provider_continuation`] captures this at the relay hop); the residual
+/// `#[allow(dead_code)]` now covers only the `_authority`/`_store` pins, held
+/// solely to keep the exact authority + store alive and never read directly.
 #[allow(dead_code)]
 pub(crate) struct LiveOrgRelayMembership {
     owner_cert: OrgMembershipCert,
